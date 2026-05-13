@@ -182,20 +182,26 @@ export class RunnerConfigBuilder {
 
 		input.logger.debug("Chat session allowed tools:", allowedTools);
 
+		// Shared auto-memory across all chat threads on this platform. Lives
+		// under cyrusHome (not the per-thread workspace) so memory built up in
+		// one Slack thread is available to every other Slack thread.
+		const autoMemoryDirectory = join(
+			input.cyrusHome,
+			`${input.platformName}-memory`,
+		);
+
 		return {
 			workingDirectory: input.workspacePath,
 			allowedTools,
 			disallowedTools: [] as string[],
-			allowedDirectories: [input.workspacePath, ...repositoryPaths],
+			allowedDirectories: [
+				input.workspacePath,
+				autoMemoryDirectory,
+				...repositoryPaths,
+			],
 			workspaceName: input.workspaceName,
 			cyrusHome: input.cyrusHome,
-			// Shared auto-memory across all chat threads on this platform. Lives
-			// under cyrusHome (not the per-thread workspace) so memory built up in
-			// one Slack thread is available to every other Slack thread.
-			autoMemoryDirectory: join(
-				input.cyrusHome,
-				`${input.platformName}-memory`,
-			),
+			autoMemoryDirectory,
 			appendSystemPrompt: input.systemPrompt,
 			...(mcpConfig ? { mcpConfig } : {}),
 			...(mcpConfigPath ? { mcpConfigPath } : {}),
