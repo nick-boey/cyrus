@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- Updated `@anthropic-ai/claude-agent-sdk` to `0.3.173` (parity with Claude Code v2.1.173; includes `skipMcpDiscovery` plugin option and fix for slash-followed-by-whitespace prompts). ([CYPACK-1306](https://linear.app/ceedar/issue/CYPACK-1306), [#1312](https://github.com/cyrusagents/cyrus/pull/1312))
 - Updated `@anthropic-ai/sdk` to `0.104.1` (latest), keeping Claude sessions on current Anthropic API capabilities. ([CYPACK-1303](https://linear.app/ceedar/issue/CYPACK-1303), [#1308](https://github.com/ceedaragents/cyrus/pull/1308))
 
 ## [0.2.63] - 2026-06-09
