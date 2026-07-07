@@ -5,6 +5,8 @@
  * ClaudeRunner (query options) and EdgeWorker (warmup / startup).
  */
 
+import { scrubCredentialEnv } from "cyrus-core";
+
 /**
  * Auth-related env vars forwarded from the parent process.
  * The SDK subprocess needs these for API calls.
@@ -69,6 +71,36 @@ export function buildBaseSessionEnv(
 		...env,
 		...CYRUS_SESSION_ENV,
 		...extra,
+	};
+}
+
+/**
+ * Compose the final env for a Claude session subprocess.
+ *
+ * Merge order: base (process.env + Cyrus flags) → repository .env →
+ * per-session additionalEnv. When `credentialIsolation` is set (multi-user
+ * mode with a per-user credential bundle), ALL credential groups — Claude
+ * auth, OpenAI auth, GitHub tokens, git author identity — are scrubbed from
+ * base + repository env BEFORE additionalEnv merges, so the session can
+ * never silently fall back to the host's shared identity. A stray global
+ * ANTHROPIC_API_KEY would otherwise take precedence inside Claude Code and
+ * shadow the injected per-user OAuth token.
+ */
+export function composeSessionEnv(options: {
+	repositoryEnv?: Record<string, string>;
+	additionalEnv?: Record<string, string>;
+	credentialIsolation?: boolean;
+}): Record<string, string> {
+	let env: Record<string, string> = {
+		...buildBaseSessionEnv(),
+		...(options.repositoryEnv ?? {}),
+	};
+	if (options.credentialIsolation) {
+		env = scrubCredentialEnv(env);
+	}
+	return {
+		...env,
+		...(options.additionalEnv ?? {}),
 	};
 }
 
