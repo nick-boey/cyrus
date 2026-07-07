@@ -560,6 +560,9 @@ describe("EdgeWorker - Missing Session/Repository Recovery (CYPACK-852)", () => 
 				[mockRepository],
 				mockAgentSessionManager,
 				"test-workspace",
+				undefined, // baseBranchOverrides
+				undefined, // routingMethod
+				expect.objectContaining({ name: "Test User" }), // session creator
 			);
 		});
 	});

@@ -27,6 +27,19 @@ const CREDENTIAL_ENV_KEYS = [
 export const DEFAULT_UNREGISTERED_USER_MESSAGE =
 	"{{userName}}, you don't have credentials registered with this Cyrus deployment, so I can't run this session as you. Ask your Cyrus admin to run `cyrus users add` on the host to register your Claude, Codex, and GitHub credentials.";
 
+/**
+ * Thrown by the fail-closed backstop when a Linear session reaches runner
+ * config assembly in multi-user mode without a resolvable credential
+ * profile (unregistered creator, pre-feature session with no stored
+ * creator, or a user deregistered mid-flight).
+ */
+export class UnregisteredUserError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "UnregisteredUserError";
+	}
+}
+
 export interface UserCredentialProfile {
 	credentialsDir: string;
 	/** Env vars to inject into the session subprocess (and its children). */
