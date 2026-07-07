@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { scrubCredentialEnv } from "cyrus-core";
 import type { ResolvedCodexConfig } from "../backend/types.js";
 import type {
 	CodexConfigOverrides,
@@ -104,14 +105,28 @@ export class CodexConfigBuilder {
 	private buildEnvOverride(
 		codexHome: string,
 	): Record<string, string> | undefined {
-		if (!this.config.codexHome) {
+		if (
+			!this.config.codexHome &&
+			!this.config.additionalEnv &&
+			!this.config.credentialIsolation
+		) {
 			return undefined;
 		}
-		const env: Record<string, string> = {};
+		let env: Record<string, string> = {};
 		for (const [key, value] of Object.entries(process.env)) {
 			if (typeof value === "string") {
 				env[key] = value;
 			}
+		}
+		// Multi-user credential isolation: drop every globally-inherited
+		// credential (notably OPENAI_API_KEY, which would shadow the per-user
+		// CODEX_HOME/auth.json subscription auth) before merging the per-user
+		// bundle.
+		if (this.config.credentialIsolation) {
+			env = scrubCredentialEnv(env);
+		}
+		if (this.config.additionalEnv) {
+			env = { ...env, ...this.config.additionalEnv };
 		}
 		env.CODEX_HOME = codexHome;
 		return env;
@@ -165,6 +180,11 @@ export class CodexConfigBuilder {
 		const fallback = this.config.fallbackModel;
 		if (!model || !fallback || fallback === model) return;
 
+		// Under multi-user credential isolation the global OPENAI_API_KEY is
+		// scrubbed from the session; probing the API with it would test the
+		// wrong identity. Per-user subscription auth handles model access.
+		if (this.config.credentialIsolation) return;
+
 		const apiKey = process.env.OPENAI_API_KEY;
 		if (!apiKey) return;
 
@@ -203,10 +223,18 @@ export class CodexConfigBuilder {
 			const { execFile } = await import("node:child_process");
 			const { promisify } = await import("node:util");
 			const execFileAsync = promisify(execFile);
+			// Run the check against the SAME Codex home the session will use —
+			// otherwise a per-user codexHome would be probed via the host's
+			// global ~/.codex login state.
 			const { stdout, stderr } = await execFileAsync(
 				codexBin,
 				["login", "status"],
-				{ timeout: 5_000 },
+				{
+					timeout: 5_000,
+					env: this.config.codexHome
+						? { ...process.env, CODEX_HOME: this.config.codexHome }
+						: process.env,
+				},
 			);
 			const result = /logged in using chatgpt/i.test(stdout + stderr);
 			console.log(
