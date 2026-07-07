@@ -1,7 +1,7 @@
 # PRD: Per-User Credentials for Cyrus Sessions
 
-**Date:** 2026-07-07
-**Status:** Draft — pending review
+**Date:** 2026-07-07 (revised 2026-07-08 after adversarial review)
+**Status:** Approved — revised per Codex GPT-5.5 adversarial review (session 019f3a75-1e6f-7843-904a-af4023d17452); see §13
 **Scope decision:** Implemented in this fork of Cyrus (additive, upstream-friendly changes), not as a separate application.
 
 ## 1. Problem Statement
@@ -333,3 +333,50 @@ Accepted risk (explicit product decision — all users are members of one organi
 2. Phase 2 — candidates, in no committed order: Gemini/Cursor slots, per-user warm
    pools, Slack/GitHub entry-point mapping, sandbox-enforced credential-dir isolation,
    upstream PR.
+
+## 13. Adversarial-review revisions (2026-07-08)
+
+An independent Codex (GPT-5.5) review of the implementation plan surfaced verified
+defects; the design is amended as follows:
+
+1. **Fail-closed enforcement boundary.** Blocking at the two webhook handlers alone is
+   bypassable: runner creation is also reachable via repository-selection responses,
+   parked-session auto-wake, and parked reprompts, and the prompted handler's early
+   branches precede any late-placed gate. Amendment: (a) the webhook gates move to the
+   **top** of both handlers (after the stop-signal branch — stopping a session never
+   requires credentials); (b) `buildAgentRunnerConfig` gains a **fail-closed backstop**:
+   in multi-user mode, a Linear session whose creator resolves to no profile posts the
+   registration message and throws instead of building a config. This also covers
+   pre-feature persisted sessions with no stored creator (they block; a fresh session
+   fixes it) and users deregistered while a session was parked.
+2. **Full credential-group scrubbing.** Scrubbing only Claude auth keys leaves the
+   global `GITHUB_TOKEN`/`GH_TOKEN`, `OPENAI_API_KEY`, and git author identity visible
+   to multi-user sessions. Amendment: a `credentialIsolation` flag on the runner config
+   (set whenever a per-user profile is active) scrubs **all** credential groups —
+   Claude auth, OpenAI auth, GitHub tokens, git author/committer — from the inherited
+   env before the per-user bundle merges. A user without a registered PAT gets a
+   visible push failure, never a silent push as the shared bot identity.
+3. **Codex runner env support.** `CodexConfigBuilder` builds its child env from
+   `process.env` + `CODEX_HOME` only; it ignores `additionalEnv`, forwards a global
+   `OPENAI_API_KEY` (which would shadow per-user subscription auth), and runs
+   `codex login status` against the wrong home. Amendment: `CodexRunnerConfig` gains
+   `additionalEnv` + `credentialIsolation`; the env builder merges/scrubs accordingly;
+   the subscription check runs with the resolved `CODEX_HOME`.
+4. **Config pass-through at boot.** `WorkerService` constructs `EdgeWorkerConfig` from
+   an explicit field list; `users`/`gitCommitAuthor` must be added there (in addition
+   to the ConfigManager hot-reload lists) or multi-user mode is off at startup.
+5. **Registration hardening.** `cyrus users add` chmods dirs (700) and files (600) on
+   every run including re-registration, sets 600 on the copied Codex `auth.json`, and
+   writes credential files **before** the config entry so a hot-reload can never
+   observe a profile whose files aren't ready. The resolver warns when multiple
+   registry entries match one creator (first match wins).
+6. **Debug-log redaction.** ClaudeRunner's local debug logging serializes full query
+   options including env; credential-shaped keys are now redacted there (Sentry
+   output was already projected).
+7. **F1 support.** Synthetic agent-session webhooks from `CLIIssueTrackerService` now
+   carry a `creator`, so F1 drives can validate creator-based credential routing.
+
+Explicitly **not** adopted from the review (spec-accepted risks reaffirmed): sandbox-off
+cross-user credential reads (§9) and Codex `auth.json` refresh races (§7.4) remain
+accepted same-org risks; a per-user GitHub PAT is not mandatory (isolation via
+scrubbing makes the failure visible instead).

@@ -8,6 +8,43 @@
 
 **Tech Stack:** TypeScript, Zod (config schemas), Vitest, dotenv, commander + node:readline/promises (CLI).
 
+## Post-review revisions (2026-07-08)
+
+A Codex GPT-5.5 adversarial review (verified against the codebase) amended this plan;
+spec §13 records the rationale. Deltas from the tasks as originally written:
+
+- **Task 1** also creates `packages/core/src/credential-env.ts` (credential env-key
+  groups + `scrubCredentialEnv`) and adds all new schema/type names to the **explicit**
+  export lists in `packages/core/src/index.ts` / `config-types.ts`.
+- **Task 2** also adds `users`/`gitCommitAuthor` to the `EdgeWorkerConfig` construction
+  in `apps/cli/src/services/WorkerService.ts` (explicit whitelist — fields dropped at
+  boot otherwise).
+- **Task 3** resolver warns when multiple registry entries match one creator.
+- **Task 4** replaces `scrubGlobalAuthKeys` with group-based scrubbing driven by a new
+  `ClaudeRunnerConfig.credentialIsolation` flag (scrubs Claude auth + OpenAI + GitHub +
+  git-author groups, applied over base+repositoryEnv), and redacts credential keys in
+  `serializeQueryOptionsReplacer` (local debug logs previously serialized full env).
+- **New Task 5 (codex-runner):** `CodexRunnerConfig` gains `additionalEnv` +
+  `credentialIsolation`; `buildEnvOverride` merges/scrubs; `resolveModelWithFallback`
+  skips the global-API-key probe under isolation; `hasCodexSubscription` runs
+  `codex login status` with the resolved `CODEX_HOME`.
+- **Task 6 (was 5)** also propagates `credentialIsolation` to Claude and Codex configs.
+- **Task 7 (was 6+7)** threads `creator` through `initializeAgentRunner` (first param
+  `agentSession` is available on all four entry paths: created flow, parked auto-wake,
+  parked reprompt, selection response); moves the webhook gates to the **top** of both
+  handlers (after the stop-signal branch); and adds a **fail-closed backstop** in
+  `buildAgentRunnerConfig` — Linear session + multi-user mode + no resolvable profile →
+  post registration message + throw. Pre-feature sessions without a stored creator
+  therefore block instead of falling back to global credentials.
+- **Task 8 (was CLI task)** hardening: `chmod` dirs/files on every run, `0600` on the
+  copied Codex `auth.json`, credential files written **before** the config entry,
+  duplicate-registration validation.
+- **New Task 9 (F1):** synthetic agent-session webhooks in `CLIIssueTrackerService`
+  carry a `creator` so F1 can validate creator-based routing.
+
+Not adopted (spec-accepted risks reaffirmed by the product owner): sandbox-off
+cross-user reads, Codex `auth.json` refresh races, mandatory per-user GitHub PATs.
+
 ## Global Constraints
 
 - Spec decisions: block unregistered users with a Linear message; env injection only (no containers); registry covers Claude + Codex + GitHub; commit authorship configurable via `gitCommitAuthor.mode` (`"user"` default, `"shared"` = global Cyrus identity); credentials follow the **session creator**, not the prompter.
