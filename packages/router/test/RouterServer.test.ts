@@ -58,3 +58,24 @@ describe("RouterServer /enroll", () => {
 		expect(body.error).toBe("invalid or expired code");
 	});
 });
+
+describe("RouterServer /healthz", () => {
+	let server: RouterServer | undefined;
+
+	afterEach(async () => {
+		if (server) {
+			await server.stop();
+			server = undefined;
+		}
+	});
+
+	it("returns 200 ok for liveness probes", async () => {
+		server = makeServer();
+		await server.start();
+
+		const res = await fetch(`http://127.0.0.1:${server.port}/healthz`);
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ status: "ok" });
+	});
+});

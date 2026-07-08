@@ -110,6 +110,11 @@ export class RouterServer {
 
 		registerEnrollmentRoute(this.fastify, this.store);
 
+		// Liveness probe for container orchestrators (Docker HEALTHCHECK,
+		// serverless platforms). Registered in the constructor because Fastify
+		// v5 forbids adding routes once the server is listening.
+		this.fastify.get("/healthz", async () => ({ status: "ok" }));
+
 		this.gateway.on("rpc", (deviceId: number, frame: RpcRequestFrame) => {
 			void this.executor
 				.dispatch(deviceId, frame)
