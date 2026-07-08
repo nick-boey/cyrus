@@ -1,0 +1,32 @@
+{
+	"name": "cyrus-router-client",
+	"version": "0.2.66",
+	"description": "Device-side WebSocket client for the Cyrus Router: dial, reconnect, RPC, acks, and durable offline buffer/inbox",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsc",
+		"dev": "tsc --watch",
+		"test": "vitest",
+		"test:run": "vitest run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"cyrus-router-protocol": "workspace:*",
+		"cyrus-core": "workspace:*",
+		"ws": "^8.18.0"
+	},
+	"devDependencies": {
+		"@types/ws": "^8.5.12",
+		"@types/node": "^20.0.0",
+		"typescript": "^5.3.3",
+		"vitest": "^4.1.0"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
