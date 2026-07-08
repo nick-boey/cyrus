@@ -545,6 +545,9 @@ importers:
 
   packages/router:
     dependencies:
+      '@linear/sdk':
+        specifier: ^64.0.0
+        version: 64.0.0(encoding@0.1.13)
       better-sqlite3:
         specifier: ^12.4.1
         version: 12.11.1
