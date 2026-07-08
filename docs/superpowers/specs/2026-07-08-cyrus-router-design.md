@@ -42,9 +42,10 @@ established.
   permanently; the creator-only prompting policy makes it unnecessary.
 - Live worktree synchronization between devices. The git remote is the sync
   layer (see Worktree continuity).
-- Replacing the single-host multi-user credential mode. It remains supported
-  for deployments that want one always-on box; the two modes are mutually
-  exclusive per process.
+- Retaining the single-host multi-user credential mode (`cyrus users`,
+  env-var injection). It is **removed** as part of this work — machine-inherited
+  auth on personal devices supersedes it. Only its `SessionCreator` threading
+  and F1 creator payloads are kept (the router's routing key).
 
 ## Architecture overview
 
@@ -133,9 +134,9 @@ already threaded end-to-end by the multi-user credentials work).
   3. Fallback: an app-created session with no affinity inherits the parent
      issue's owning device.
 - **Unroutable creator** (not enrolled, or enrolled with no device): the
-  router posts a fail-closed activity to the session (reusing the
-  unregistered-user message pattern from the multi-user credentials work) and
-  does not deliver.
+  router posts a fail-closed activity to the session with router-specific
+  enrollment instructions (`cyrus router users add` by the admin, then
+  `cyrus connect` on the user's machine) and does not deliver.
 
 Repository routing (`RepositoryRouter`) is untouched and runs on the device
 after delivery, exactly as today.
@@ -281,8 +282,8 @@ flow), webhook secret, device registry, queue database, and settings
 
 **Client device:** config shrinks to `{ routerUrl, deviceToken }` plus
 repository configuration. No Linear token, no webhook/tunnel config, no
-`users[]` credential profiles (machine auth replaces `UserCredentialResolver`,
-which remains a single-host-mode feature). Warm sessions may remain enabled
+`users[]` credential profiles (the env-injection feature is removed entirely;
+machine auth replaces it). Warm sessions may remain enabled
 in router-client mode: the device serves exactly one identity, so the
 multi-user warm-session guard does not apply.
 
@@ -326,8 +327,8 @@ Linear/webhook sections.
 
 ## Deferred
 
-- Hybrid fallback executor (an always-on host running credential-injection
-  mode serving offline users' sessions) — composes cleanly later via the
-  registry.
+- Hybrid fallback executor (an always-on host serving offline users'
+  sessions) — would require reintroducing a credential-injection mode;
+  composes later via the registry if ever needed.
 - Multiple Linear workspaces per router.
 - Router HA / multi-region.

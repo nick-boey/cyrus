@@ -16,7 +16,7 @@
 - Commit after every task with a conventional-commit message ending in the trailer `Claude-Session: https://claude.ai/code/session_019vb5x4gfKQH5Z7MY5BzZvM`.
 - **Boundary invariant (from spec):** router/client code interacts with core Cyrus only through `IAgentEventTransport` and `IIssueTrackerService`. Permitted exceptions, each deliberate and scoped: (1) the `platform: "router"` construction branch in `EdgeWorker.ts` mirroring the existing `"cli"` branch, (2) the `GitService` worktree-continuity change, (3) config schema additions in `cyrus-core`.
 - **ConfigManager gotcha (CLAUDE.md §9):** any new top-level `EdgeWorkerConfig` field MUST be added to the hardcoded merge list in `ConfigManager.loadConfigSafely()` AND the `globalKeys` array in `detectGlobalConfigChanges()` in `packages/edge-worker/src/ConfigManager.ts`.
-- **KEEP list for Phase 0 (do NOT remove):** `SessionCreator` type and `creator` field in `packages/core/src/CyrusAgentSession.ts`; creator threading at `EdgeWorker.ts:4494` and `EdgeWorker.ts:4914` (`creator: webhook.agentSession.creator` when creating sessions); `CLIIssueTrackerService.buildCreatorPayload()` and its attachment sites (`CLIIssueTrackerService.ts:821-834`, `:952`, `:1303-1305`); `UserIdentifierSchema` and `userMatchesIdentifier` (also used by user access control, reused by the router); `DEFAULT_UNREGISTERED_USER_MESSAGE` constant (reused by the router in Task 8).
+- **KEEP list for Phase 0 (do NOT remove):** `SessionCreator` type and `creator` field in `packages/core/src/CyrusAgentSession.ts`; creator threading at `EdgeWorker.ts:4494` and `EdgeWorker.ts:4914` (`creator: webhook.agentSession.creator` when creating sessions); `CLIIssueTrackerService.buildCreatorPayload()` and its attachment sites (`CLIIssueTrackerService.ts:821-834`, `:952`, `:1303-1305`); `UserIdentifierSchema` and `userMatchesIdentifier` (also used by user access control, reused by the router). `DEFAULT_UNREGISTERED_USER_MESSAGE` is NOT kept — its text instructs users to run the removed `cyrus users add` command (`UserCredentialResolver.ts:27`); the router defines its own enrollment message in Task 8.
 - Changelog rules: user-facing entries in `CHANGELOG.md` under `## [Unreleased]`; internal/refactor notes in `CHANGELOG.internal.md`.
 
 ## File Structure
@@ -50,6 +50,8 @@ apps/f1/server.ts                             MODIFY — remove env-gated users 
 ---
 
 # Phase 0 — Revert multi-user credential injection
+
+> The design spec's Non-goals section was amended (Codex adversarial review, finding 1) to make this removal explicit: single-host multi-user credential mode is **removed**, not retained alongside router mode.
 
 Reverts commits `4a223b19`, `8891281d`, `c0722c09` (partially — keep creator threading), `2af7366f`, `70ec7d09`, `3c59179b`, `4a9cb450`, `0a112f29`, and the schema halves of `13dd242e`. Work top-down (consumers before core) so typecheck stays green at every commit. After each removal step, run typecheck and let remaining compile errors point at stragglers — but the sites listed are believed complete.
 
@@ -112,7 +114,7 @@ git commit -m "revert(cli,f1): remove cyrus users command and multi-user config 
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `buildAgentRunnerConfig` no longer resolves/injects user profiles; `checkUserCredentialsOrBlock` and `UnregisteredUserError` are gone. **KEEP** creator threading (`creator: webhook.agentSession.creator` at lines 4494 and 4914) and the `DEFAULT_UNREGISTERED_USER_MESSAGE` constant (router reuses it in Task 8) — locate it with `grep -rn "DEFAULT_UNREGISTERED_USER_MESSAGE" packages`; if it is defined in edge-worker rather than core, move it to `packages/core/src/constants.ts` and export it from the core index in this task.
+- Produces: `buildAgentRunnerConfig` no longer resolves/injects user profiles; `checkUserCredentialsOrBlock` and `UnregisteredUserError` are gone. **KEEP** creator threading (`creator: webhook.agentSession.creator` at lines 4494 and 4914). Remove `DEFAULT_UNREGISTERED_USER_MESSAGE` along with the resolver — its text instructs users to run the removed `cyrus users add`; the router ships its own enrollment message (Task 8).
 
 - [ ] **Step 1: Remove the resolver field, construction, and hot-reload wiring**
 
@@ -367,6 +369,9 @@ const rpcRequestFrame = z.object({
 	id: z.string().min(1),
 	method: z.string().min(1),
 	params: z.array(z.unknown()),
+	// Present on mutating calls: stable across buffer replays so the router
+	// can dedupe (idempotent replay — see Task 9).
+	mutationId: z.string().min(1).optional(),
 });
 const sessionStateFrame = z.object({
 	type: z.literal("session_state"),
@@ -514,7 +519,11 @@ class RouterStore {
 	getDeviceByToken(token: string): { deviceId: number; userId: number } | undefined;
 	getDeviceForUser(userId: number): { deviceId: number } | undefined;
 	revokeDevice(email: string): boolean;
-	enqueueEvent(deviceId: number, payloadJson: string, nowMs: number, ttlMs: number): number; // returns seq (per-device monotonic)
+	enqueueEvent(deviceId: number, payloadJson: string, nowMs: number, ttlMs: number): number; // returns seq from the device's durable next_seq counter — never reused, even after acks drain the queue
+	recordMutation(deviceId: number, mutationId: string, responseJson: string, nowMs: number): void;
+	getMutation(deviceId: number, mutationId: string): string | undefined;
+	touchDevice(deviceId: number, nowMs: number): void; // updates last_seen_ms
+	devicesOfflineSince(cutoffMs: number): Array<{ deviceId: number; userId: number; email: string }>; // devices whose last_seen_ms < cutoff
 	pendingEvents(deviceId: number, afterSeq: number, nowMs: number): Array<{ seq: number; payloadJson: string }>;
 	ackEvent(deviceId: number, seq: number): void;
 	expireEvents(nowMs: number): Array<{ deviceId: number; seq: number; payloadJson: string }>; // deletes and returns expired unacked
@@ -527,7 +536,7 @@ class RouterStore {
 	acquireIssueLock(issueId: string, sessionId: string, deviceId: number): boolean; // false if held by another session
 	getIssueLock(issueId: string): { sessionId: string; deviceId: number } | undefined;
 	releaseIssueLockForSession(sessionId: string): void;
-	releaseLocksAndAffinityForDevice(deviceId: number): void; // used on revoke
+	releaseLocksAndAffinityForDevice(deviceId: number): Array<{ issueId: string; sessionId: string }>; // returns the released locks; used on revoke and offline sweeps
 	close(): void;
 }
 ```
@@ -591,6 +600,28 @@ describe("RouterStore", () => {
 		expect(store.pendingEvents(device.deviceId, 0, NOW).map((e) => e.seq)).toEqual([s2]);
 	});
 
+	it("never reuses a seq after the queue fully drains", () => {
+		const { store, device } = storeWithDevice();
+		const s1 = store.enqueueEvent(device.deviceId, '{"n":1}', NOW, 60_000);
+		store.ackEvent(device.deviceId, s1);
+		const s2 = store.enqueueEvent(device.deviceId, '{"n":2}', NOW, 60_000);
+		expect(s2).toBe(s1 + 1); // a MAX(seq)-based counter would reuse s1 here and the client would drop the event
+	});
+
+	it("records and replays mutation responses idempotently", () => {
+		const { store, device } = storeWithDevice();
+		expect(store.getMutation(device.deviceId, "m-1")).toBeUndefined();
+		store.recordMutation(device.deviceId, "m-1", '{"success":true}', NOW);
+		expect(store.getMutation(device.deviceId, "m-1")).toBe('{"success":true}');
+	});
+
+	it("tracks device last-seen for offline sweeps", () => {
+		const { store, device } = storeWithDevice();
+		store.touchDevice(device.deviceId, NOW);
+		expect(store.devicesOfflineSince(NOW - 1)).toHaveLength(0);
+		expect(store.devicesOfflineSince(NOW + 1).map((d) => d.deviceId)).toEqual([device.deviceId]);
+	});
+
 	it("expireEvents removes and returns events past their TTL", () => {
 		const { store, device } = storeWithDevice();
 		store.enqueueEvent(device.deviceId, '{"n":1}', NOW, 1000);
@@ -641,7 +672,9 @@ CREATE TABLE IF NOT EXISTS devices (
   device_id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL UNIQUE REFERENCES users(user_id) ON DELETE CASCADE,
   token_hash TEXT NOT NULL UNIQUE,
-  created_ms INTEGER NOT NULL
+  created_ms INTEGER NOT NULL,
+  next_seq INTEGER NOT NULL DEFAULT 1,
+  last_seen_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS enrollment_codes (
   code_hash TEXT PRIMARY KEY,
@@ -655,6 +688,13 @@ CREATE TABLE IF NOT EXISTS events (
   enqueued_ms INTEGER NOT NULL,
   expires_ms INTEGER NOT NULL,
   PRIMARY KEY (device_id, seq)
+);
+CREATE TABLE IF NOT EXISTS rpc_mutations (
+  device_id INTEGER NOT NULL,
+  mutation_id TEXT NOT NULL,
+  response_json TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  PRIMARY KEY (device_id, mutation_id)
 );
 CREATE TABLE IF NOT EXISTS session_affinity (
   session_id TEXT PRIMARY KEY, device_id INTEGER NOT NULL, creator_json TEXT
@@ -670,7 +710,7 @@ CREATE TABLE IF NOT EXISTS issue_locks (
 
 Set `PRAGMA journal_mode = WAL` in the constructor so CLI admin commands (Task 13) can operate on the db while the server holds it open.
 
-Key behaviors: tokens and codes are 32 random bytes hex (`crypto.randomBytes(32).toString("hex")`), stored as SHA-256 hashes (`crypto.createHash("sha256")`), plaintext returned once from mint/redeem. Enrollment codes expire 15 minutes after `nowMs` (constant `ENROLLMENT_CODE_TTL_MS = 15 * 60_000`). `redeemEnrollmentCode` runs in a transaction: validate + delete code, `INSERT OR REPLACE` the user's device row (UNIQUE user_id enforces single-device), return new token. `enqueueEvent` computes `seq = 1 + COALESCE(MAX(seq) WHERE device_id = ?, 0)` inside a transaction. `acquireIssueLock` returns true when no row exists or the row's `session_id` matches; inserts otherwise. All timestamps are caller-supplied `nowMs` (no `Date.now()` inside the store — keeps tests deterministic).
+Key behaviors: tokens and codes are 32 random bytes hex (`crypto.randomBytes(32).toString("hex")`), stored as SHA-256 hashes (`crypto.createHash("sha256")`), plaintext returned once from mint/redeem. Enrollment codes expire 15 minutes after `nowMs` (constant `ENROLLMENT_CODE_TTL_MS = 15 * 60_000`). `redeemEnrollmentCode` runs in a transaction: validate + delete code, `INSERT OR REPLACE` the user's device row (UNIQUE user_id enforces single-device), return new token. `enqueueEvent` reads and increments the device row's durable `next_seq` counter inside a transaction — NOT `MAX(seq)` over the queue, which would reuse sequence numbers once acks drain the queue and let a reconnecting client whose persisted `lastAckedSeq` is higher silently drop brand-new events (Codex finding 2). `acquireIssueLock` returns true when no row exists or the row's `session_id` matches; inserts otherwise. All timestamps are caller-supplied `nowMs` (no `Date.now()` inside the store — keeps tests deterministic).
 
 - [ ] **Step 4: Run tests + typecheck**
 
@@ -711,7 +751,7 @@ class DeviceGateway extends EventEmitter {
 //  "eventAck"          (deviceId: number, seq: number)
 ```
 
-Behavior contract: on connection, the first frame must be `hello` within 10s or the socket is closed. Token is looked up via `store.getDeviceByToken`; failure sends `hello_error` and closes. Success sends `hello_ack`, acks everything ≤ `lastAckedSeq` (`store.ackEvent` loop over pending ≤ that seq), then calls `deliverPending`. `event_ack` frames call `store.ackEvent`. Heartbeat uses ws-level `ping()`; a socket that misses two heartbeats is terminated. A second connection for the same device terminates the first (single device, newest wins).
+Behavior contract: on connection, the first frame must be `hello` within 10s or the socket is closed. Token is looked up via `store.getDeviceByToken`; failure sends `hello_error` and closes. Success sends `hello_ack`, acks everything ≤ `lastAckedSeq` (`store.ackEvent` loop over pending ≤ that seq), then calls `deliverPending`. Call `store.touchDevice(deviceId, Date.now())` on successful hello, on every `pong`, and on socket close — this last-seen tracking feeds the offline-lock sweep (Task 8). `event_ack` frames call `store.ackEvent`. Heartbeat uses ws-level `ping()`; a socket that misses two heartbeats is terminated. A second connection for the same device terminates the first (single device, newest wins).
 
 - [ ] **Step 1: Write failing tests (real ws over an ephemeral http server)**
 
@@ -818,7 +858,8 @@ git commit -m "feat(router): device gateway with ws auth, ordered delivery, and 
 - Test: `packages/router/test/EventRouter.test.ts`
 
 **Interfaces:**
-- Consumes: `RouterStore`, `DeviceGateway.isOnline/deliverPending`, an activity-posting callback (implemented by `LinearExecutor` in Task 9), webhook type guards `isAgentSessionCreatedWebhook` / `isAgentSessionPromptedWebhook` from `cyrus-core`, and `DEFAULT_UNREGISTERED_USER_MESSAGE` from `cyrus-core`.
+- Consumes: `RouterStore`, `DeviceGateway.isOnline/deliverPending`, an activity-posting callback (implemented by `LinearExecutor` in Task 9), and webhook type guards `isAgentSessionCreatedWebhook` / `isAgentSessionPromptedWebhook` from `cyrus-core`.
+- Also creates `packages/router/src/messages.ts` with `UNENROLLED_CREATOR_MESSAGE` (a `{{userName}}`-templated string: greets the creator, explains their Linear user has no enrolled Cyrus device, and instructs — ask your Cyrus admin to run `cyrus router users add <your-email>`, then run `cyrus connect <router-url> --code <code>` on your machine). Do NOT reuse `DEFAULT_UNREGISTERED_USER_MESSAGE`; it references the removed `cyrus users add` flow and is deleted in Phase 0.
 - Produces:
 
 ```ts
@@ -840,17 +881,17 @@ class EventRouter {
 
 Routing algorithm for `route(event)`:
 1. `agentSessionPrompted` → device = `store.getSessionAffinity(sessionId)`. If found and `creatorOnlyPrompting` is on: compare the prompt's actor (`event.agentActivity?.sourceCommentUser ?? event.agentSession.creator` — inspect the `AgentSessionPromptedWebhook` type in `cyrus-core` for the actual actor field and use that; the comparison target is `store.getSessionCreator(sessionId)`, persisted when the created event was routed) → if actor ≠ creator, post the polite rejection activity and return without enqueueing.
-2. `agentSessionCreated` → resolve device: `store.getSessionAffinity` (re-delivery) → `store.findUserForCreator(event.agentSession.creator)` + `getDeviceForUser` → `store.getIssueAffinity(issueId)` (app-created sub-issues, registered atomically at creation — Task 9) → if the webhook's issue payload carries a parent issue id, `store.getIssueAffinity(parentIssueId)`. Unresolvable → post `DEFAULT_UNREGISTERED_USER_MESSAGE` activity and return.
+2. `agentSessionCreated` → resolve device: `store.getSessionAffinity` (re-delivery) → `store.findUserForCreator(event.agentSession.creator)` + `getDeviceForUser` → `store.getIssueAffinity(issueId)` (app-created sub-issues, registered atomically at creation — Task 9) → if the webhook's issue payload carries a parent issue id, `store.getIssueAffinity(parentIssueId)`. Unresolvable → post `UNENROLLED_CREATOR_MESSAGE` activity and return.
 3. Issue lock (created events only, when `config.issueLock`): `acquireIssueLock(issueId, sessionId, deviceId)`; on failure post "An agent is already working on this issue (session owned by another user). Try again when it finishes." and return.
 4. Record `setSessionAffinity(sessionId, deviceId, creatorJson)` and `setIssueAffinity(issueId, deviceId)`.
 5. `enqueueEvent(deviceId, JSON.stringify(event), now(), config.eventTtlMs)`; if `gateway.isOnline(deviceId)` → `gateway.deliverPending(deviceId)`; else post (once per session — keep a `Set<string>` of notified sessionIds) "Waiting for <user email>'s machine to come online. This session will start when their Cyrus device reconnects."
 
-`sweepExpired()`: for each expired event, parse the payload, post "This request expired before <email>'s machine came online. Please re-delegate the issue." to its session, and log. When the expired event is an undelivered `agentSessionCreated`, also `releaseIssueLockForSession(sessionId)` and `clearSessionAffinity(sessionId)` so the issue is not locked by a session that never started.
+`sweepExpired()`: for each expired event, parse the payload, post "This request expired before <email>'s machine came online. Please re-delegate the issue." to its session, and log. When the expired event is an undelivered `agentSessionCreated`, also `releaseIssueLockForSession(sessionId)` and `clearSessionAffinity(sessionId)` so the issue is not locked by a session that never started. `sweepExpired()` additionally sweeps stale locks from *delivered* sessions whose device went dark (Codex finding 10): for each device in `store.devicesOfflineSince(now() - config.eventTtlMs)`, call `releaseLocksAndAffinityForDevice(deviceId)` and post "Released this issue's lock: <email>'s machine has been offline past the event TTL." to each session whose lock was released (`releaseLocksAndAffinityForDevice` returns the released `{issueId, sessionId}` rows — Task 6).
 `handleSessionState()`: on any terminal state call `releaseIssueLockForSession(sessionId)` and `clearSessionAffinity(sessionId)`.
 
 - [ ] **Step 1: Write failing tests**
 
-Use an in-memory store, a fake gateway (`{ isOnline: () => false, deliverPending: vi.fn() }`), and a recording `postActivity` spy. Cover: (a) created event routed by creator email → enqueued, offline notice posted exactly once for two events on the same session; (b) unknown creator → unregistered activity, nothing enqueued; (c) second created event on a locked issue from a different session → lock rejection activity, nothing enqueued; (d) prompted event with actor ≠ creator and `creatorOnlyPrompting: true` → rejection activity, nothing enqueued; with `false` → enqueued; (e) `handleSessionState("complete")` releases the lock so a new session can acquire it; (f) `sweepExpired` posts the TTL activity for an expired event. Construct minimal event objects satisfying the `cyrus-core` webhook type guards (copy the fixture shapes from existing `packages/edge-worker/test` webhook fixtures — `grep -rl "isAgentSessionCreatedWebhook" packages/edge-worker/test` shows files with ready-made payloads).
+Use an in-memory store, a fake gateway (`{ isOnline: () => false, deliverPending: vi.fn() }`), and a recording `postActivity` spy. Cover: (a) created event routed by creator email → enqueued, offline notice posted exactly once for two events on the same session; (b) unknown creator → unregistered activity, nothing enqueued; (c) second created event on a locked issue from a different session → lock rejection activity, nothing enqueued; (d) prompted event with actor ≠ creator and `creatorOnlyPrompting: true` → rejection activity, nothing enqueued; with `false` → enqueued; (e) `handleSessionState("complete")` releases the lock so a new session can acquire it; (f) `sweepExpired` posts the TTL activity for an expired event; (g) a lock held by a *delivered* session whose device's `last_seen_ms` is older than the TTL is released by `sweepExpired` with the offline-release activity posted. Construct minimal event objects satisfying the `cyrus-core` webhook type guards (copy the fixture shapes from existing `packages/edge-worker/test` webhook fixtures — `grep -rl "isAgentSessionCreatedWebhook" packages/edge-worker/test` shows files with ready-made payloads).
 
 - [ ] **Step 2: Run to verify failure** — `pnpm --filter cyrus-router test:run` → FAIL.
 
@@ -904,13 +945,13 @@ class RouterServer {
 }
 ```
 
-`dispatch` rules: method must be in `RPC_METHODS` else `{ok:false, error:"method not allowed"}`. Params arrive positional; call `(tracker as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)[method](...params)`. The FIRST param of every RPC is the `workspaceId` (the client prepends it — Task 11); pop it to select the tracker. For `SESSION_SCOPED_RPC_METHODS`, the next param is/contains the `agentSessionId` (for `createAgentActivity` it is `params[1].agentSessionId`; for `emitStopSignalEvent` it is `params[1]`): verify `store.getSessionAffinity(agentSessionId) === deviceId` else `{ok:false, error:"session not owned by this device"}`. `downloadAttachment(url)` is implemented in the executor itself: `fetch(url, { headers: { Authorization: \`Bearer ${linearToken}\` } })`, reject > `attachmentMaxBytes`, return `{ base64, contentType }`. Errors from tracker calls become `{ok:false, error: message}` — never a thrown exception across the socket. **Atomic sub-issue affinity (spec):** if the interface exposes an issue-creation method (check `IIssueTrackerService.ts` for a method taking `IssueCreateInput`; if none exists, skip — the parent-affinity fallback in Task 8 covers routing), then after a successful device-invoked issue creation call `store.setIssueAffinity(createdIssueId, deviceId)` before returning the response.
+`dispatch` rules: method must be in `RPC_METHODS` else `{ok:false, error:"method not allowed"}`. Params arrive positional; call `(tracker as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)[method](...params)`. The FIRST param of every RPC is the `workspaceId` (the client prepends it — Task 11); pop it to select the tracker. For `SESSION_SCOPED_RPC_METHODS`, index AFTER popping the workspaceId (Codex finding 8 — the interface methods take these as their first arg): for `createAgentActivity` the session id is `params[0].agentSessionId` (single input object, `IIssueTrackerService.ts:706`); for `emitStopSignalEvent` it is `params[0]` (`IIssueTrackerService.ts:651`). Verify `store.getSessionAffinity(agentSessionId) === deviceId` else `{ok:false, error:"session not owned by this device"}`. **Mutation idempotency:** when `frame.mutationId` is present, first check `store.getMutation(deviceId, mutationId)` — on a hit, return the stored response verbatim without invoking the tracker; after a successful dispatch, `store.recordMutation(deviceId, mutationId, JSON.stringify(response), Date.now())` before responding. This makes client buffer replay after reconnect safe against duplicate activities/comments (Codex finding 4). `downloadAttachment(url)` is implemented in the executor itself: `fetch(url, { headers: { Authorization: \`Bearer ${linearToken}\` } })`, reject > `attachmentMaxBytes`, return `{ base64, contentType }`. Errors from tracker calls become `{ok:false, error: message}` — never a thrown exception across the socket. **Atomic sub-issue affinity (spec):** if the interface exposes an issue-creation method (check `IIssueTrackerService.ts` for a method taking `IssueCreateInput`; if none exists, skip — the parent-affinity fallback in Task 8 covers routing), then after a successful device-invoked issue creation call `store.setIssueAffinity(createdIssueId, deviceId)` before returning the response.
 
 `enrollment.ts`: `registerEnrollmentRoute(fastify, store)` → `POST /enroll` body `{ code: string }` (zod-validated) → `store.redeemEnrollmentCode(code, Date.now())` → 200 `{ deviceToken }` or 401 `{ error: "invalid or expired code" }`.
 
 `RouterServer.start()` wiring: build trackers from `workspaces` via `trackerFactory ?? ((id, c) => new LinearIssueTrackerService(new LinearClient({ accessToken: c.linearToken }), undefined))` — check `LinearIssueTrackerService`'s constructor signature at `packages/linear-event-transport/src/LinearIssueTrackerService.ts:96` and pass the minimal second argument it allows. Create the webhook transport with `trackers.values().next().value.createEventTransport({ platform: "linear", verificationMode, secret, fastifyServer: fastify })`, `transport.on("event", (e) => eventRouter.route(e))`. Wire `gateway.on("rpc", async (deviceId, frame) => gateway.sendRpcResponse(deviceId, await executor.dispatch(deviceId, frame)))` and `gateway.on("sessionState", (d, f) => eventRouter.handleSessionState(d, f))` and `gateway.on("deviceConnected", (d) => gateway.deliverPending(d))`.
 
-- [ ] **Step 1: Write failing tests.** `LinearExecutor.test.ts`: with a stub tracker (`{ fetchIssue: vi.fn(async () => ({ id: "i1" })), createAgentActivity: vi.fn(async () => ({ success: true })) }` cast through `unknown` to `IIssueTrackerService`), assert (a) allowed method dispatches with workspace param popped, (b) disallowed method → `ok:false`, (c) `createAgentActivity` for a session with affinity to another device → `ok:false`, with own affinity → dispatched, (d) tracker throw → `ok:false` with message. `RouterServer.test.ts`: start on port 0 with `trackerFactory` returning a `CLIIssueTrackerService` (import from `cyrus-core`), POST /enroll with a minted code → 200 + token; bad code → 401.
+- [ ] **Step 1: Write failing tests.** `LinearExecutor.test.ts`: with a stub tracker (`{ fetchIssue: vi.fn(async () => ({ id: "i1" })), createAgentActivity: vi.fn(async () => ({ success: true })) }` cast through `unknown` to `IIssueTrackerService`), assert (a) allowed method dispatches with workspace param popped, (b) disallowed method → `ok:false`, (c) `createAgentActivity` for a session with affinity to another device → `ok:false`, with own affinity → dispatched, (d) tracker throw → `ok:false` with message, (e) two dispatches with the same `mutationId` invoke the tracker exactly once and return identical responses. `RouterServer.test.ts`: start on port 0 with `trackerFactory` returning a `CLIIssueTrackerService` (import from `cyrus-core`), POST /enroll with a minted code → 200 + token; bad code → 401.
 
 - [ ] **Step 2: Run to verify failure** — FAIL.
 
@@ -950,18 +991,18 @@ class RouterConnection extends EventEmitter {
 	connect(): void;   // begins dial loop; safe to call once
 	close(): void;
 	rpc(method: string, params: unknown[]): Promise<unknown>; // rejects on {ok:false} or timeout
-	bufferedRpc(method: string, params: unknown[]): Promise<void>; // append-to-buffer when offline, else rpc(); replayed FIFO on reconnect
+	bufferedRpc(method: string, params: unknown[]): Promise<unknown>; // mints a mutationId; online → rpc() carrying it; offline → durable append {mutationId, method, params}, resolve with a synthetic { success: true } payload compatible with AgentActivityPayload (LinearActivitySink.ts:90 reads .success / optional .agentActivity — Codex finding 7); replayed FIFO on reconnect with the SAME mutationId so the router dedupes (finding 4)
 	sendSessionState(sessionId: string, state: "complete" | "error" | "stopped"): void;
 	readonly connected: boolean;
 }
 // events: "connected" (helloAck: HelloAckFrame), "disconnected", "event" (event: unknown, seq: number)
 ```
 
-Behavior contract: on socket open, send `hello` with `lastAckedSeq` read from `<stateDir>/router-connection.json` (`{ lastAckedSeq: number }`, default 0). On `hello_ack`: mark connected, replay the outbound buffer (`<stateDir>/outbound-buffer.jsonl`, one `{method, params, id}` per line — delete each line's entry only after its rpc resolves), emit `"connected"`. On `hello_error`: emit `"error"` and stop reconnecting (bad token is fatal — surface to the user). On `event` frame: if `seq <= lastAckedSeq` drop (duplicate) and re-ack; else emit `"event"`, then immediately send `event_ack` and persist `lastAckedSeq = seq` (ack-on-dispatch: at-least-once from the router, dedupe here). On close/error: emit `"disconnected"`, schedule reconnect with backoff. RPC: assign `id = randomUUID()`, keep a pending map `id → {resolve, reject, timer}`; `rpc_response` resolves/rejects; disconnect rejects all pending with a retryable error.
+Behavior contract: on socket open, send `hello` with `lastAckedSeq` read from `<stateDir>/router-connection.json` (`{ lastAckedSeq: number }`, default 0). On `hello_ack`: mark connected, replay the outbound buffer (`<stateDir>/outbound-buffer.jsonl`, one `{method, params, id}` per line — delete each line's entry only after its rpc resolves), emit `"connected"`. On `hello_error`: emit `"error"` and stop reconnecting (bad token is fatal — surface to the user). On `event` frame: if `seq <= lastAckedSeq` drop (duplicate) and re-ack; else durably append the event to `<stateDir>/inbox.jsonl` FIRST, then send `event_ack` + persist `lastAckedSeq = seq`, then emit `"event"` and mark the inbox entry processed after the emit returns. On startup, replay surviving unprocessed inbox entries as `"event"` emissions before handling new frames — an acked event is never lost to a crash between ack and EdgeWorker dispatch (Codex finding 3; without the inbox, ack-before-processing silently drops events on crash). On close/error: emit `"disconnected"`, schedule reconnect with backoff. RPC: assign `id = randomUUID()`, keep a pending map `id → {resolve, reject, timer}`; `rpc_response` resolves/rejects; disconnect rejects all pending with a retryable error.
 
 - [ ] **Step 1: Write failing tests**
 
-Test against a minimal in-test ws server (raw `WebSocketServer` speaking the protocol — ~40 lines in the test file), covering: (a) hello carries persisted `lastAckedSeq`; (b) event → `"event"` emitted once, `event_ack` sent, duplicate seq dropped; (c) `rpc` resolves on `ok:true`, rejects with the error string on `ok:false`; (d) `bufferedRpc` while disconnected writes to the JSONL and replays after reconnect (start server after the call); (e) reconnect after server-side socket close (second `hello` observed).
+Test against a minimal in-test ws server (raw `WebSocketServer` speaking the protocol — ~40 lines in the test file), covering: (a) hello carries persisted `lastAckedSeq`; (b) event → `"event"` emitted once, `event_ack` sent, duplicate seq dropped; (c) `rpc` resolves on `ok:true`, rejects with the error string on `ok:false`; (d) `bufferedRpc` while disconnected writes to the JSONL and replays after reconnect (start server after the call); (e) reconnect after server-side socket close (second `hello` observed); (f) crash recovery: deliver an event, let the client ack, construct a NEW `RouterConnection` on the same `stateDir` without the first having emitted-and-marked-processed — assert the event is re-emitted from the inbox on startup; (g) `bufferedRpc` offline resolves `{ success: true }`, and its replay after reconnect carries the same `mutationId` as the buffered entry.
 
 - [ ] **Step 2: Run to verify failure** — `pnpm --filter cyrus-router-client test:run` → FAIL.
 
@@ -1009,7 +1050,7 @@ class RouterEventTransport implements IAgentEventTransport {
 
 - [ ] **Step 1: Write failing tests**
 
-With a stubbed connection (`{ rpc: vi.fn(async () => ({ id: "i1" })), bufferedRpc: vi.fn(async () => undefined) }` cast via `unknown`): (a) `fetchIssue("ABC-1")` calls `rpc("fetchIssue", ["ws-1", "ABC-1"])`; (b) `createAgentActivity(input)` calls `bufferedRpc` with the workspace prepended; (c) `getPlatformType()` returns `"linear"`; (d) `createEventTransport` returns an object whose `register()` does not throw and which re-emits a connection `"event"` as transport `"event"`. Type-level test: the file compiles with `const svc: IIssueTrackerService = new RouterIssueTrackerService(conn, "ws-1")` — this is the conformance gate; every interface method must exist with the right signature (write them all explicitly; ~27 one-line methods).
+With a stubbed connection (`{ rpc: vi.fn(async () => ({ id: "i1" })), bufferedRpc: vi.fn(async () => undefined) }` cast via `unknown`): (a) `fetchIssue("ABC-1")` calls `rpc("fetchIssue", ["ws-1", "ABC-1"])`; (b) `createAgentActivity(input)` calls `bufferedRpc` with the workspace prepended and its return value always satisfies the `AgentActivityPayload` contract (`success: true` present whether live or buffered — `LinearActivitySink.ts:90` reads it); (c) `getPlatformType()` returns `"linear"`; (d) `createEventTransport` returns an object whose `register()` does not throw and which re-emits a connection `"event"` as transport `"event"`. Type-level test: the file compiles with `const svc: IIssueTrackerService = new RouterIssueTrackerService(conn, "ws-1")` — this is the conformance gate; every interface method must exist with the right signature (write them all explicitly; ~27 one-line methods).
 
 - [ ] **Step 2: Run to verify failure** — FAIL.
 
@@ -1030,7 +1071,10 @@ git commit -m "feat(router-client): issue tracker and event transport adapters o
 
 **Files:**
 - Modify: `packages/core/src/config-schemas.ts` — extend the `platform` enum with `"router"`; add top-level `router: z.object({ url: z.string(), deviceToken: z.string() }).optional()`
-- Modify: `packages/edge-worker/src/ConfigManager.ts` — add `router` to the `loadConfigSafely()` merge and `globalKeys`
+- Modify: `packages/core/src/config-types.ts:133` — the non-zod `platform` union currently allows only `"linear" | "cli"` (Codex finding 5); add `"router"` and the `router` field here too
+- Modify: `packages/edge-worker/src/ConfigManager.ts` — add BOTH `platform` and `router` to the `loadConfigSafely()` merge (~line 201) and the `globalKeys` array (~line 343); neither is currently forwarded
+- Modify: `apps/cli/src/services/WorkerService.ts` (~line 200) — forward `platform: edgeConfig.platform` and `router: edgeConfig.router` into the EdgeWorkerConfig it builds. It currently forwards neither, so `cyrus connect` would write a config that `cyrus start` silently drops (Codex finding 5). Add a passthrough test mirroring the pattern of the removed users-passthrough test.
+- Modify: `packages/edge-worker/src/McpConfigService.ts` and `packages/mcp-tools/src/tools/cyrus-tools/index.ts` — cyrus-tools over the tracker interface (see Step 3)
 - Modify: `packages/edge-worker/src/EdgeWorker.ts` — construction branch (~line 526) and `initializeComponents()` (~line 741)
 - Modify: `packages/edge-worker/src/AttachmentService.ts` — optional download delegate
 - Modify: `packages/edge-worker/package.json` — add `cyrus-router-client@workspace:*`
@@ -1094,9 +1138,9 @@ Schema + ConfigManager first (both lists — see Global Constraints). Then in `E
 
 - Extend the tracker construction at line ~530 to a three-way branch: `"cli"` → existing; `"router"` → `new RouterIssueTrackerService(this.routerConnection, linearWorkspaceId)`; else Linear. Mirror the same in the per-repo fallback loop in `initializeComponents()` (line ~745).
 - In `initializeComponents()`, add a router branch alongside the CLI one: create the transport from the first router tracker, subscribe `"event"` → `handleWebhook` and `"error"` → `handleError` (same shape as lines 775-798), call `this.routerConnection.connect()`, and log the connection URL. Report session terminal states: at the same place(s) the CLI/Linear paths mark a session finished (`grep -n "sessionEnded\|handleSessionCompleted\|terminal" packages/edge-worker/src/AgentSessionManager.ts` — the AgentSessionManager completion path), call `this.routerConnection?.sendSessionState(sessionId, state)` guarded by platform.
-- `AttachmentService`: add constructor option `downloadDelegate?: (url: string) => Promise<{ base64: string; contentType: string }>`; in its download function (`grep -n "fetch\|download" packages/edge-worker/src/AttachmentService.ts`), use the delegate when set instead of the token-authenticated fetch. In router mode pass `(url) => routerTracker.downloadAttachment(url)`.
+- `AttachmentService`: add constructor option `downloadDelegate?: (url: string) => Promise<{ base64: string; contentType: string }>`. CRITICAL (Codex finding 9): the service short-circuits with an early return when no Linear token is available at TWO sites — issue attachments (`AttachmentService.ts:71`) and comment attachments (`AttachmentService.ts:300`); thread the delegate check ABOVE both token guards so router mode reaches the download path at all, then use the delegate instead of the token-authenticated fetch. In router mode pass `(url) => routerTracker.downloadAttachment(url)`. Add tests covering BOTH the issue-description and prompted-comment attachment paths with the delegate set and no token present.
 - Router mode must NOT start tunnels or register Linear webhook routes: the existing code paths gate these on config (`CLOUDFLARE_TOKEN`, linear transport setup at line 807+) — add `&& this.config.platform !== "router"` to the Linear transport setup condition.
-- Router mode must NOT emit the token-authenticated official Linear MCP server into session MCP configs (devices have no app token; users install the Linear MCP locally with their own OAuth — spec "two planes"). In `McpConfigService` (constructed at `EdgeWorker.ts:589` with `getLinearTokenForWorkspace`), have router mode's `getLinearTokenForWorkspace` return `undefined` and verify `McpConfigService.buildMcpConfig` skips the Linear server entry when the token is absent (`grep -n "linear" packages/edge-worker/src/McpConfigService.ts`); add that guard if missing. cyrus-tools stays enabled — it is backed by the issue tracker interface, which router mode forwards over RPC.
+- Router mode must NOT emit the token-authenticated official Linear MCP server into session MCP configs (devices have no app token; users install the Linear MCP locally with their own OAuth — spec "two planes"). In `McpConfigService` (constructed at `EdgeWorker.ts:589`), router mode's `getLinearTokenForWorkspace` returns `undefined`. **cyrus-tools does not survive that for free** (Codex finding 6): `McpConfigService.buildMcpConfig` currently returns only `cyrus-docs` when there is no Linear token / `getClient()` (`McpConfigService.ts:75`), and `createCyrusToolsServer` requires a `LinearClient` (`packages/mcp-tools/src/tools/cyrus-tools/index.ts:116`). Refactor `createCyrusToolsServer` to accept `{ issueTracker: IIssueTrackerService }` as an alternative backing to the LinearClient, implementing each tool over interface methods; any tool that genuinely requires raw LinearClient capabilities is omitted in router mode and the omission logged at session start. Have `McpConfigService` pass the workspace's tracker when the token is absent but a tracker exists. The exposed tool list must not change; if it does, update the cyrus-hosted `KNOWN_MCP_TOOLS` catalog per CLAUDE.md item 10. Add a router-mode test asserting the session MCP config contains `cyrus-tools` and does NOT contain the app-token Linear MCP entry.
 
 - [ ] **Step 4: Run tests + typecheck** — `pnpm --filter cyrus-edge-worker test:run && pnpm typecheck` → PASS.
 
@@ -1265,11 +1309,13 @@ Scenario, all in one vitest file with `RouterServer` on port 0 and `trackerFacto
 
 - [ ] **Step 2: Run it, implement fixes until green** — `pnpm --filter cyrus-router test:run`. This is the integration gate; expect to shake out wiring bugs here.
 
-- [ ] **Step 3: Write `docs/ROUTER.md`** — sibling to `docs/SELF_HOSTING.md`: what router mode is, admin setup (`router-config.json`, `cyrus router start`, `users add`), device setup (`cyrus connect`, Linear MCP note: install the official Linear MCP locally for user-attributed agent tool use), offline/queue semantics, issue lock + creator-only prompting defaults, worktree continuity rules.
+- [ ] **Step 3: Update the setup skill (Codex finding 11 — spec requires this migration path).** Extend the canonical shared skill `skills/cyrus-setup/SKILL.md` with two new setup paths: router-host (write `router-config.json`, `cyrus router start`, `cyrus router users add` per teammate) and router-client (`cyrus connect <url> --code`, install + OAuth the official Linear MCP locally, verify MCP auth health at connect). Per the repo's shared-skills design rule, put the workflow text in the canonical skill and re-run `./scripts/symlink-skills.sh`; keep harness wrappers thin.
 
-- [ ] **Step 4: Changelogs** — `CHANGELOG.md` `### Added`: "Router mode: run `cyrus router start` on an always-on host and `cyrus connect` on each team member's machine — sessions run on the creator's own device with its native credentials (az, gh, SSH, Claude subscription). Includes offline queueing, per-issue locks, and creator-only prompting."; "Worktrees now resume from the issue's pushed branch when one exists, and uncommitted work is auto-pushed as WIP before a worktree is removed." `CHANGELOG.internal.md`: new packages + boundary invariant note.
+- [ ] **Step 4: Write `docs/ROUTER.md`** — sibling to `docs/SELF_HOSTING.md`: what router mode is, admin setup (`router-config.json`, `cyrus router start`, `users add`), device setup (`cyrus connect`, Linear MCP note: install the official Linear MCP locally for user-attributed agent tool use), offline/queue semantics, issue lock + creator-only prompting defaults, worktree continuity rules.
 
-- [ ] **Step 5: Full verification + commit**
+- [ ] **Step 5: Changelogs** — `CHANGELOG.md` `### Added`: "Router mode: run `cyrus router start` on an always-on host and `cyrus connect` on each team member's machine — sessions run on the creator's own device with its native credentials (az, gh, SSH, Claude subscription). Includes offline queueing, per-issue locks, and creator-only prompting."; "Worktrees now resume from the issue's pushed branch when one exists, and uncommitted work is auto-pushed as WIP before a worktree is removed." `CHANGELOG.internal.md`: new packages + boundary invariant note.
+
+- [ ] **Step 6: Full verification + commit**
 
 Run: `pnpm typecheck && pnpm test:packages:run && pnpm build`
 Expected: all PASS.
@@ -1279,7 +1325,7 @@ git add -A
 git commit -m "feat(router): e2e coverage, self-host docs, and changelog for router mode"
 ```
 
-- [ ] **Step 6: F1 test drive (manual validation gate, per repo CLAUDE.md mandate)**
+- [ ] **Step 7: F1 test drive (manual validation gate, per repo CLAUDE.md mandate)**
 
 Using the f1-test-drive protocol: start an F1 server (`platform: "cli"` per `apps/f1/CLAUDE.md`) for baseline regression of single-user mode, then a router-mode smoke: `cyrus router start` with a CLI-tracker `trackerFactory` build or a scratch Linear workspace, one enrolled device, one delegated issue end-to-end (session runs on the device, activities appear, lock blocks a second session, disconnect mid-run queues a prompt and delivers on reconnect). Record findings in `apps/f1/test-drives/`.
 
