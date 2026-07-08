@@ -18,6 +18,7 @@
 	"dependencies": {
 		"cyrus-router-protocol": "workspace:*",
 		"cyrus-core": "workspace:*",
+		"cyrus-linear-event-transport": "workspace:*",
 		"ws": "^8.18.0"
 	},
 	"devDependencies": {
