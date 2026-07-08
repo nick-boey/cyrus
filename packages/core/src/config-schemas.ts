@@ -53,47 +53,6 @@ export const UserAccessControlConfigSchema = z.object({
 });
 
 /**
- * Git author identity (name + email) used for commit attribution.
- */
-export const GitAuthorSchema = z.object({
-	name: z.string(),
-	email: z.string(),
-});
-
-/**
- * A registered user's credential profile for multi-user deployments.
- * Secrets are NOT stored here — they live in `<credentialsDir>/.env`
- * (CLAUDE_CODE_OAUTH_TOKEN, GH_TOKEN, ...) plus `<credentialsDir>/codex/`
- * (per-user Codex CODEX_HOME with auth.json) and optionally
- * `<credentialsDir>/claude/` (per-user CLAUDE_CONFIG_DIR).
- */
-export const UserCredentialConfigSchema = z.object({
-	/** Linear identity this profile belongs to (id or email match). */
-	linearUser: UserIdentifierSchema,
-	/** Directory holding this user's credentials (supports `~/` prefix). */
-	credentialsDir: z.string(),
-	/** Commit author identity used when gitCommitAuthor.mode is "user". */
-	gitAuthor: GitAuthorSchema.optional(),
-});
-
-/**
- * Controls commit AUTHORSHIP for multi-user sessions. Push/PR auth is
- * always the session user's PAT regardless of this setting.
- * - "user" (default): commits are authored as the registered user's gitAuthor.
- * - "shared": commits are authored as `shared` (a global "Cyrus agent"
- *   identity); when `shared` is omitted, no author env is injected and the
- *   host's global git config applies.
- */
-export const GitCommitAuthorConfigSchema = z.object({
-	mode: z.enum(["user", "shared"]),
-	shared: GitAuthorSchema.optional(),
-});
-
-export type GitAuthor = z.infer<typeof GitAuthorSchema>;
-export type UserCredentialConfig = z.infer<typeof UserCredentialConfigSchema>;
-export type GitCommitAuthorConfig = z.infer<typeof GitCommitAuthorConfigSchema>;
-
-/**
  * Tool restriction options for label-based prompts
  */
 const ToolRestrictionSchema = z.union([
@@ -520,16 +479,6 @@ export const EdgeConfigSchema = z.object({
 	 * Applied to all repositories unless overridden.
 	 */
 	userAccessControl: UserAccessControlConfigSchema.optional(),
-
-	/**
-	 * Multi-user credential profiles. When non-empty, Linear sessions run
-	 * with the triggering user's credentials, and users without a profile
-	 * are blocked with registration instructions.
-	 */
-	users: z.array(UserCredentialConfigSchema).optional(),
-
-	/** Commit authorship policy for multi-user sessions (see schema docs). */
-	gitCommitAuthor: GitCommitAuthorConfigSchema.optional(),
 
 	/** Global defaults for prompt types (tool restrictions per prompt type) */
 	promptDefaults: PromptDefaultsSchema.optional(),

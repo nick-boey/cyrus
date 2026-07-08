@@ -315,10 +315,6 @@ export class EdgeWorker extends EventEmitter {
 			slackMcpConfigs: resolveList(config.slackMcpConfigs),
 			linearMcpConfigs: resolveList(config.linearMcpConfigs),
 			githubMcpConfigs: resolveList(config.githubMcpConfigs),
-			users: config.users?.map((u) => ({
-				...u,
-				credentialsDir: resolvePath(u.credentialsDir),
-			})),
 		};
 	}
 

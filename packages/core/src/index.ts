@@ -77,8 +77,6 @@ export type {
 	EdgeConfig,
 	EdgeConfigPayload,
 	EdgeWorkerConfig,
-	GitAuthor,
-	GitCommitAuthorConfig,
 	LinearWorkspaceConfig,
 	NetworkPolicy,
 	OAuthCallbackHandler,
@@ -90,15 +88,12 @@ export type {
 	RunnerType,
 	SandboxConfig,
 	UserAccessControlConfig,
-	UserCredentialConfig,
 	UserIdentifier,
 } from "./config-types.js";
 export {
 	EdgeConfigPayloadSchema,
 	// Zod schemas for runtime validation
 	EdgeConfigSchema,
-	GitAuthorSchema,
-	GitCommitAuthorConfigSchema,
 	LinearWorkspaceConfigSchema,
 	migrateEdgeConfig,
 	NetworkPolicySchema,
@@ -110,7 +105,6 @@ export {
 	SandboxConfigSchema,
 	TRUSTED_DOMAINS,
 	UserAccessControlConfigSchema,
-	UserCredentialConfigSchema,
 	UserIdentifierSchema,
 } from "./config-types.js";
 // Constants

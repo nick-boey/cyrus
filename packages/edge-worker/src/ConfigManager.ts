@@ -260,10 +260,6 @@ export class ConfigManager extends EventEmitter {
 					parsedConfig.prReviewTrigger ?? this.config.prReviewTrigger,
 				// Sandbox / egress proxy config
 				sandbox: parsedConfig.sandbox ?? this.config.sandbox,
-				// Multi-user credential profiles
-				users: parsedConfig.users || this.config.users,
-				gitCommitAuthor:
-					parsedConfig.gitCommitAuthor || this.config.gitCommitAuthor,
 			};
 
 			// Basic validation
@@ -364,8 +360,6 @@ export class ConfigManager extends EventEmitter {
 			"linearWorkspaces",
 			"userAccessControl",
 			"sandbox",
-			"users",
-			"gitCommitAuthor",
 		];
 
 		for (const key of globalKeys) {
