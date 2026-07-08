@@ -181,11 +181,6 @@ import { LinearActivitySink } from "./sinks/LinearActivitySink.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
 import type { AgentSessionData, EdgeWorkerEvents } from "./types.js";
 import { UserAccessControl } from "./UserAccessControl.js";
-import {
-	DEFAULT_UNREGISTERED_USER_MESSAGE,
-	UnregisteredUserError,
-	UserCredentialResolver,
-} from "./UserCredentialResolver.js";
 
 export declare interface EdgeWorker {
 	on<K extends keyof EdgeWorkerEvents>(
@@ -241,7 +236,6 @@ export class EdgeWorker extends EventEmitter {
 	private askUserQuestionHandler: AskUserQuestionHandler;
 	/** User access control for whitelisting/blacklisting Linear users */
 	private userAccessControl: UserAccessControl;
-	private userCredentialResolver: UserCredentialResolver;
 	private logger: ILogger;
 	// Extracted service modules
 	private attachmentService: AttachmentService;
@@ -567,14 +561,6 @@ export class EdgeWorker extends EventEmitter {
 			repoAccessConfigs,
 		);
 
-		// Per-user credential profiles (multi-user mode). Uses this.config so
-		// credentialsDir paths are already ~-normalized.
-		this.userCredentialResolver = new UserCredentialResolver(
-			this.config.users,
-			this.config.gitCommitAuthor,
-			this.logger,
-		);
-
 		// Initialize extracted service modules
 		this.attachmentService = new AttachmentService(
 			this.logger,
@@ -669,11 +655,6 @@ export class EdgeWorker extends EventEmitter {
 				this.configManager.setConfig(changes.newConfig);
 				this.runnerSelectionService.setConfig(changes.newConfig);
 				this.toolPermissionResolver.setConfig(changes.newConfig);
-				// this.config has the ~-normalized credentialsDir paths
-				this.userCredentialResolver.setConfig(
-					this.config.users,
-					this.config.gitCommitAuthor,
-				);
 			},
 		);
 		this.configManager.startConfigWatcher();
@@ -4261,12 +4242,6 @@ ${taskSection}`;
 		webhook: AgentSessionCreatedWebhook,
 		repos: RepositoryConfig[],
 	): Promise<void> {
-		// Multi-user mode: block unregistered creators BEFORE any routing or
-		// selection elicitation happens (fail closed).
-		if (!(await this.checkUserCredentialsOrBlock(webhook))) {
-			return;
-		}
-
 		const issueId = webhook.agentSession?.issue?.id;
 
 		// Check the cache first, as the agentSessionCreated webhook may have been triggered by an @mention
@@ -5092,14 +5067,6 @@ ${taskSection}`;
 		// IMPORTANT: Stop signals do NOT require repository lookup
 		if (signal === "stop" || isTextStopRequest) {
 			await this.handleStopSignal(webhook);
-			return;
-		}
-
-		// Multi-user mode: block unregistered creators BEFORE the parked /
-		// repository-selection / normal-prompt branches (fail closed).
-		// Deliberately placed after the stop branch — stopping a session
-		// never requires credentials.
-		if (!(await this.checkUserCredentialsOrBlock(webhook))) {
 			return;
 		}
 
@@ -6510,36 +6477,6 @@ ${input.userComment}
 				resolvedSkillContext,
 			);
 
-		// Multi-user mode fail-closed backstop: every Linear issue session
-		// must run with a resolved per-user credential profile. This covers
-		// entry paths that don't pass a webhook gate (parked-session
-		// auto-wake, resumes of pre-feature sessions with no stored creator,
-		// users deregistered while a session was parked). Credentials follow
-		// the session creator stored at creation time.
-		const userProfile = this.userCredentialResolver.resolve(session.creator);
-		if (
-			this.userCredentialResolver.isEnabled() &&
-			session.issueContext?.trackerId === "linear" &&
-			!userProfile
-		) {
-			const userName = session.creator?.name || "Hi there";
-			await this.agentSessionManager.createResponseActivity(
-				sessionId,
-				DEFAULT_UNREGISTERED_USER_MESSAGE.replace(
-					/\{\{userName\}\}/g,
-					userName,
-				),
-			);
-			throw new UnregisteredUserError(
-				`No credential profile for session creator ${session.creator?.email ?? session.creator?.id ?? "(unknown)"} (session ${sessionId})`,
-			);
-		}
-		if (userProfile) {
-			log.info(
-				`Injecting per-user credentials for session creator (${session.creator?.email ?? session.creator?.id})`,
-			);
-		}
-
 		const result = this.runnerConfigBuilder.buildIssueConfig({
 			session,
 			repository,
@@ -6552,8 +6489,6 @@ ${input.userComment}
 			labels,
 			issueDescription,
 			maxTurns,
-			// Per-user credential env bundle (multi-user mode)
-			userEnv: userProfile?.env,
 			// Per-platform MCP config paths — GitHub + GitLab share the
 			// `githubMcpConfigs` knob (single-repo PR contexts both); Linear
 			// gets `linearMcpConfigs`. Not a blanket override: the builder
@@ -6750,53 +6685,6 @@ ${input.userComment}
 	}
 
 	/**
-	 * Multi-user mode gate: when user credential profiles are configured,
-	 * the webhook creator must resolve to a registered profile. Unregistered
-	 * users get a response activity with registration instructions and the
-	 * session does not proceed (fail closed — including when the webhook
-	 * carries no creator at all). Runs at the TOP of both agent-session
-	 * webhook handlers so every branch (routing/selection elicitation,
-	 * parked-session reprompts, repository-selection responses, normal
-	 * prompts) is covered; `buildAgentRunnerConfig` has a fail-closed
-	 * backstop for non-webhook entry paths. Returns true when the session
-	 * may proceed.
-	 */
-	private async checkUserCredentialsOrBlock(
-		webhook: AgentSessionCreatedWebhook | AgentSessionPromptedWebhook,
-	): Promise<boolean> {
-		if (!this.userCredentialResolver.isEnabled()) {
-			return true;
-		}
-		const creator = webhook.agentSession.creator;
-		if (this.userCredentialResolver.resolve(creator ?? undefined)) {
-			return true;
-		}
-
-		const userName = creator?.name || "Hi there";
-		this.logger.info(
-			`Blocking session for unregistered user ${creator?.email ?? creator?.id ?? "(unknown)"}`,
-		);
-		const issueTracker = this.issueTrackers.get(webhook.organizationId);
-		if (issueTracker) {
-			await this.postActivityDirect(
-				issueTracker,
-				{
-					agentSessionId: webhook.agentSession.id,
-					content: {
-						type: "response",
-						body: DEFAULT_UNREGISTERED_USER_MESSAGE.replace(
-							/\{\{userName\}\}/g,
-							userName,
-						),
-					},
-				},
-				"unregistered user message",
-			);
-		}
-		return false;
-	}
-
-	/**
 	 * Load persisted EdgeWorker state for all repositories
 	 */
 	private async loadPersistedState(): Promise<void> {
@@ -6822,12 +6710,6 @@ ${input.userComment}
 	 * `CYRUS_ENABLE_WARM_SESSIONS=1` (or `=true`).
 	 */
 	private isWarmSessionsEnabled(): boolean {
-		// Warm sessions pre-spawn Claude subprocesses with GLOBAL env before
-		// the session creator is known — incompatible with per-user
-		// credentials. Force-disabled in multi-user mode.
-		if (this.userCredentialResolver?.isEnabled()) {
-			return false;
-		}
 		const raw = process.env.CYRUS_ENABLE_WARM_SESSIONS;
 		if (!raw) return false;
 		const v = raw.toLowerCase().trim();
