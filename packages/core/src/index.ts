@@ -123,12 +123,6 @@ export {
 	getDefaultReposDir,
 	getDefaultWorktreesDir,
 } from "./constants.js";
-// Credential env isolation (multi-user mode)
-export {
-	ALL_CREDENTIAL_ENV_KEYS,
-	CREDENTIAL_ENV_GROUPS,
-	scrubCredentialEnv,
-} from "./credential-env.js";
 // Issue Tracker Abstraction
 export type {
 	AgentActivity,

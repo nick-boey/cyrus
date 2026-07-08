@@ -23,7 +23,6 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentPendingWork, AskUserQuestionInput } from "cyrus-core";
 import {
-	ALL_CREDENTIAL_ENV_KEYS,
 	createLogger,
 	type IAgentRunner,
 	type ILogger,
@@ -58,16 +57,7 @@ export class AbortError extends Error {
  * callbacks, pre-warmed sessions) — replace them with diagnostic placeholders
  * so debug logs remain valid JSON.
  */
-export function serializeQueryOptionsReplacer(
-	key: string,
-	value: unknown,
-): unknown {
-	// Never serialize credential values — with multi-user credential
-	// injection, per-user tokens flow through query options' env and would
-	// otherwise land in local debug logs.
-	if (ALL_CREDENTIAL_ENV_KEYS.includes(key)) {
-		return "[REDACTED]";
-	}
+function serializeQueryOptionsReplacer(_key: string, value: unknown): unknown {
 	if (typeof value === "function") {
 		return `[Function${value.name ? `: ${value.name}` : ""}]`;
 	}
@@ -681,12 +671,10 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 						// above so the diagnostics remain available when we re-enable.
 						// See: CYPACK-1108.
 						// composeSessionEnv merges base env → repository .env →
-						// additionalEnv, scrubbing global credential groups first when
-						// multi-user credential isolation is active.
+						// additionalEnv.
 						...composeSessionEnv({
 							repositoryEnv: this.repositoryEnv,
 							additionalEnv: this.config.additionalEnv,
-							credentialIsolation: this.config.credentialIsolation,
 						}),
 						// When logging at DEBUG level, enable the SDK's own debug output so
 						// --debug-to-stderr and DEBUG=1 propagate to the Claude subprocess.

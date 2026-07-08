@@ -33,17 +33,9 @@ export interface CodexRunnerConfig extends AgentRunnerConfig {
 	codexHome?: string;
 	/**
 	 * Additional environment variables for the Codex child process, merged
-	 * over the inherited env (per-user GH_TOKEN, git author identity, etc.).
+	 * over the inherited env.
 	 */
 	additionalEnv?: Record<string, string>;
-	/**
-	 * Multi-user credential isolation: scrub ALL globally-inherited credential
-	 * groups (Claude auth, OpenAI auth, GitHub tokens, git author identity)
-	 * from the child env before `additionalEnv` merges. In particular this
-	 * stops a global OPENAI_API_KEY from shadowing per-user
-	 * ChatGPT-subscription auth resolved from CODEX_HOME/auth.json.
-	 */
-	credentialIsolation?: boolean;
 	/**
 	 * Override Codex reasoning effort.
 	 * If omitted, CodexRunner applies a safe default for known model constraints.

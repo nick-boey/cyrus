@@ -71,13 +71,6 @@ export interface ClaudeRunnerConfig {
 	sandbox?: SandboxSettings; // Sandbox settings (enabled, network proxy ports, etc.)
 	/** Additional environment variables to pass to the Claude child process (merged after process.env) */
 	additionalEnv?: Record<string, string>;
-	/**
-	 * Multi-user credential isolation: scrub ALL globally-inherited credential
-	 * groups (Claude auth, OpenAI auth, GitHub tokens, git author identity)
-	 * from the session env before `additionalEnv` merges, so the session can
-	 * never silently fall back to the host's shared identity.
-	 */
-	credentialIsolation?: boolean;
 	pathToClaudeCodeExecutable?: string; // Explicit path to Claude Code CLI executable (auto-resolved if not set)
 	extraArgs?: Record<string, string | null>; // Additional CLI arguments to pass to Claude Code (e.g., { 'output-format': 'json' } for --output-format=json, or { verbose: null } for boolean flags)
 	/**
