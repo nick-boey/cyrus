@@ -57,6 +57,7 @@ import {
 	CLIRPCServer,
 	createLogger,
 	DEFAULT_PROXY_URL,
+	getDefaultWorktreesDir,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isContentUpdateMessage,
@@ -3554,6 +3555,39 @@ ${taskSection}`;
 		for (const repoId of repoIds) {
 			const repo = this.repositories.get(repoId);
 			if (repo) teardownRepositories.push(repo);
+		}
+
+		// Push any uncommitted WIP to origin before teardown scripts run and
+		// worktrees are removed, so a session on another device can resume this
+		// issue via GitService.remoteBranchExists (worktree continuity). A push
+		// failure must never block cleanup — log a warning and continue.
+		if (teardownRepositories.length > 0) {
+			const rawBranchName = sessions.find(
+				(session) => session.issue?.branchName,
+			)?.issue?.branchName;
+			if (rawBranchName) {
+				const branchName = this.gitService.sanitizeBranchName(rawBranchName);
+				// Mirrors the worktree layout GitService.deleteWorktree resolves
+				// internally: single repo -> workspace root IS the worktree;
+				// multi-repo -> each repo's worktree is a named subdirectory.
+				const workspacePath = join(
+					getDefaultWorktreesDir(this.cyrusHome),
+					message.workItemIdentifier,
+				);
+				const worktreePaths =
+					teardownRepositories.length > 1
+						? teardownRepositories.map((repo) => join(workspacePath, repo.name))
+						: [workspacePath];
+				for (const worktreePath of worktreePaths) {
+					try {
+						await this.gitService.pushWipIfDirty(worktreePath, branchName);
+					} catch (error) {
+						this.logger.warn(
+							`Failed to push WIP for ${message.workItemIdentifier} at ${worktreePath} before teardown: ${(error as Error).message}`,
+						);
+					}
+				}
+			}
 		}
 
 		// Delete worktrees for this issue, keyed by the Linear issue identifier.
