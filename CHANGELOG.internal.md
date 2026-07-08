@@ -4,6 +4,17 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Added
+- Cyrus Router per-user device routing. Three new packages: `cyrus-router-protocol` (wire-frame Zod schemas + the RPC method allowlist), `cyrus-router` (SQLite-backed device registry/event queue/RPC executor: `RouterStore`, `DeviceGateway`, `EventRouter`, `LinearExecutor`, `RouterServer` + `POST /enroll`), and `cyrus-router-client` (device-side `RouterConnection` with durable inbox/outbound buffers, `RouterEventTransport`, and `RouterIssueTrackerService`). EdgeWorker gains a `platform: "router"` mode; the CLI gains `cyrus router start|users|devices|unlock` and `cyrus connect`.
+- In-process end-to-end integration test (`packages/router/test/e2e.test.ts`): a real `RouterServer` on port 0 backed by a `CLIIssueTrackerService`, driven by a real `RouterConnection`/`RouterEventTransport`/`RouterIssueTrackerService` over localhost. Covers enrollment, online routed delivery + queue drain, offline queue + one-time waiting notice + reconnect delivery, issue-lock rejection, creator-only prompt gating, the webhook→`"message"` (SessionStart/UserPrompt) translation round-trip, and session-scoped RPC authorization.
+
+### Fixed
+- Router RPC dispatch (`LinearExecutor.dispatch`) invoked the tracker method through a bare extracted function reference (`fn(...rest)`), dropping the `this` binding so every real `LinearIssueTrackerService` RPC threw `Cannot read properties of undefined (reading 'linearClient')`. Now invoked via `fn.call(tracker, …)`. Unit tests missed it because they used mock trackers; the in-process e2e (real tracker over the wire) caught it.
+- `DeviceGateway.close()` now detaches per-socket lifecycle handlers before closing, so a late `ws` "close" event during shutdown no longer calls `store.touchDevice()` against an already-closed database.
+
+### Boundary invariant
+- Package layering is one-directional: `cyrus-router-protocol` (frames only, no cyrus-core dependency) ← `cyrus-router` (server; never imports `cyrus-router-client`) and `cyrus-router-client` (device). The e2e test's dependency on `cyrus-router-client` is a **devDependency** of `cyrus-router` — test-only, so the runtime server→client non-dependency invariant is preserved.
+
 ### Removed
 - Reverted multi-user env-var credential injection (UserCredentialResolver, credential-env scrub, cyrus users CLI); SessionCreator threading and F1 creator payloads retained for the router architecture.
 

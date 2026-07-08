@@ -49,10 +49,16 @@ export interface RouterServerConfig {
  */
 export class RouterServer {
 	readonly store: RouterStore;
+	/**
+	 * Exposed read-only as an integration-test seam: the e2e suite feeds
+	 * webhook fixtures straight into {@link EventRouter.route} to exercise the
+	 * routing/queueing/lock/prompt-gate paths without standing up a real Linear
+	 * webhook source. Not part of the runtime wiring surface.
+	 */
+	readonly eventRouter: EventRouter;
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;
 	private readonly gateway: DeviceGateway;
-	private readonly eventRouter: EventRouter;
 	private readonly executor: LinearExecutor;
 	private readonly trackers: Map<string, IIssueTrackerService>;
 	private readonly logger: { info(msg: string): void; warn(msg: string): void };
@@ -130,6 +136,16 @@ export class RouterServer {
 		// (right after emitting "deviceConnected"), so adding it here would deliver
 		// every queued event twice on reconnect. The gateway owns hello-time
 		// delivery — do not re-add.
+	}
+
+	/**
+	 * Test seam: reports whether a device currently holds an open WebSocket to
+	 * the gateway. Lets the e2e suite wait deterministically for the server to
+	 * observe a disconnect (so a subsequent routed event takes the offline
+	 * queue-and-notice path) instead of racing a fixed sleep.
+	 */
+	isDeviceOnline(deviceId: number): boolean {
+		return this.gateway.isOnline(deviceId);
 	}
 
 	/** Actual bound TCP port (useful after `start({ port: 0 })`). */

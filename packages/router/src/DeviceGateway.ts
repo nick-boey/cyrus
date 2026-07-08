@@ -96,6 +96,14 @@ export class DeviceGateway extends EventEmitter {
 			this.heartbeatInterval = undefined;
 		}
 		for (const ws of this.sockets.values()) {
+			// Detach our lifecycle handlers BEFORE closing: the "close" handler
+			// calls store.touchDevice(), and on a full gateway shutdown the store
+			// may be torn down moments later — a late close event would then throw
+			// "database connection is not open". A swallowing error handler absorbs
+			// any socket error surfaced during the close. Disconnect bookkeeping is
+			// irrelevant once the whole gateway is going away.
+			ws.removeAllListeners();
+			ws.on("error", () => {});
 			ws.close();
 		}
 		this.sockets.clear();

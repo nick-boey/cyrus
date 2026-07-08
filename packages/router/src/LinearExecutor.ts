@@ -129,7 +129,12 @@ export class LinearExecutor {
 				if (typeof fn !== "function") {
 					throw new Error(`method not implemented by tracker: ${method}`);
 				}
-				result = await fn(...rest);
+				// Invoke through `.call(tracker, …)` (NOT `fn(...rest)`): the
+				// tracker's methods are ordinary prototype methods that read
+				// `this` (e.g. `this.state` / `this.client`), so calling the
+				// extracted function reference bare would run them with
+				// `this === undefined` and throw. Bind the receiver explicitly.
+				result = await fn.call(tracker, ...rest);
 			}
 			const response: RpcResponseFrame = {
 				type: "rpc_response",
