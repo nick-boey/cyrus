@@ -44,7 +44,8 @@
 	},
 	"pnpm": {
 		"onlyBuiltDependencies": [
-			"sqlite3"
+			"sqlite3",
+			"better-sqlite3"
 		],
 		"overrides": {
 			"jws": ">=4.0.1",
