@@ -252,24 +252,33 @@ export class EventRouter {
 
 		if (this.config.creatorOnlyPrompting) {
 			const creatorId = this.storedCreatorId(sessionId);
-			// Actor of the prompt: the user who created the prompt activity. Falls
-			// back to the session creator when the activity omits a user (then the
-			// actor is, by definition, the creator and the prompt is allowed).
-			const actorId =
-				webhook.agentActivity?.userId ??
-				webhook.agentSession.creator?.id ??
-				undefined;
-			if (creatorId !== undefined && actorId !== creatorId) {
-				await this.postActivity(
-					workspaceId,
-					sessionId,
-					PROMPT_REJECTION_MESSAGE,
-				);
-				this.logger.info(
-					`Rejected non-creator prompt on session ${sessionId} (actor ${actorId ?? "unknown"} != creator ${creatorId})`,
-				);
-				return;
+			if (creatorId !== undefined) {
+				// Actor of the prompt: ONLY the activity's own `userId` identifies
+				// who is actually prompting right now. Do NOT fall back to
+				// `agentSession.creator?.id` — that field is always the session's
+				// original creator, regardless of who sent this prompt, so using it
+				// as a fallback would let a non-creator's prompt masquerade as the
+				// creator's whenever the activity omits `userId` (a fail-open bug).
+				// Fail closed instead: an actor we can't positively identify is
+				// rejected exactly like one we can identify as a mismatch.
+				const actorId = webhook.agentActivity?.userId ?? undefined;
+				if (actorId === undefined || actorId !== creatorId) {
+					await this.postActivity(
+						workspaceId,
+						sessionId,
+						PROMPT_REJECTION_MESSAGE,
+					);
+					this.logger.info(
+						`Rejected non-creator prompt on session ${sessionId} (actor ${actorId ?? "unknown"} != creator ${creatorId})`,
+					);
+					return;
+				}
 			}
+			// else: creatorId is unknown (e.g. a session routed via issue/parent
+			// affinity with no stored creator). There is nothing to compare the
+			// actor against, so the gate is intentionally skipped and the prompt
+			// is allowed through — a deliberate can't-compare-so-allow case, not
+			// an oversight.
 		}
 
 		const email = webhook.agentSession.creator?.email ?? DEFAULT_EMAIL;
@@ -321,6 +330,15 @@ export class EventRouter {
 		}
 
 		const parentIssueId = extractParentIssueId(webhook);
+		if (parentIssueId === undefined) {
+			// Nothing else resolved the target above, so this fallback was our
+			// last resort before falling through to UNENROLLED. Make the gap
+			// visible: the typed webhook carries no parent-issue id today, so
+			// this branch never actually fires (see extractParentIssueId).
+			this.logger.info(
+				"Parent-issue affinity fallback skipped: webhook carries no parent issue id (resolved in Task 9)",
+			);
+		}
 		if (parentIssueId !== undefined) {
 			const parentDevice = this.store.getIssueAffinity(parentIssueId);
 			if (parentDevice !== undefined) {

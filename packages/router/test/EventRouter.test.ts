@@ -278,6 +278,44 @@ describe("EventRouter", () => {
 		);
 	});
 
+	it("(d2) rejects a prompt whose actor cannot be identified (fails closed, not open)", async () => {
+		// Regression test: a real non-creator webhook may omit `agentActivity.userId`.
+		// `agentSession.creator` is ALWAYS the session's original creator (Alice)
+		// regardless of who is actually prompting, so falling back to it would
+		// make the actor look identical to the creator and let a stranger's
+		// prompt through. The gate must fail CLOSED when the actor is unknown.
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, postActivity } = makeRouter(store, {
+			config: { creatorOnlyPrompting: true },
+		});
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+		postActivity.mockClear();
+		const queuedBefore = store.pendingEvents(aliceDevice, 0, ROUTE_NOW).length;
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				// No actorUserId → agentActivity is omitted entirely, so
+				// agentActivity?.userId is undefined. agentSession.creator still
+				// reports Alice (the true session creator), as it always does.
+				creator: ALICE,
+			}),
+		);
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_REJECTION_MESSAGE,
+		);
+		expect(store.pendingEvents(aliceDevice, 0, ROUTE_NOW)).toHaveLength(
+			queuedBefore,
+		);
+	});
+
 	it("(e) handleSessionState(complete) releases the lock so a new session can acquire it", async () => {
 		const aliceDevice = enroll(store, "alice@example.com", {
 			linearId: "lin-alice",
