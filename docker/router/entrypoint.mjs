@@ -29,6 +29,15 @@ function fail(message) {
 	process.exit(1);
 }
 
+/** Coerce a numeric env var, failing fast on malformed values. */
+function toNumber(name, value) {
+	const n = Number(value);
+	if (!Number.isFinite(n)) {
+		fail(`${name} must be a number, got: ${value}`);
+	}
+	return n;
+}
+
 /** workspaces map from env: JSON escape hatch wins over the single ID+token pair. */
 function buildWorkspaces(env) {
 	if (env.CYRUS_ROUTER_WORKSPACES_JSON) {
@@ -93,7 +102,9 @@ function generateConfig(env) {
 	}
 
 	const config = {
-		port: Number(env.CYRUS_ROUTER_PORT ?? 8787),
+		port: env.CYRUS_ROUTER_PORT
+			? toNumber("CYRUS_ROUTER_PORT", env.CYRUS_ROUTER_PORT)
+			: 8787,
 		host: env.CYRUS_ROUTER_HOST ?? "0.0.0.0",
 		workspaces,
 		webhook: {
@@ -102,7 +113,10 @@ function generateConfig(env) {
 		},
 	};
 	if (env.CYRUS_ROUTER_EVENT_TTL_MS) {
-		config.eventTtlMs = Number(env.CYRUS_ROUTER_EVENT_TTL_MS);
+		config.eventTtlMs = toNumber(
+			"CYRUS_ROUTER_EVENT_TTL_MS",
+			env.CYRUS_ROUTER_EVENT_TTL_MS,
+		);
 	}
 	if (env.CYRUS_ROUTER_ISSUE_LOCK) {
 		config.issueLock = env.CYRUS_ROUTER_ISSUE_LOCK === "true";
@@ -112,7 +126,10 @@ function generateConfig(env) {
 			env.CYRUS_ROUTER_CREATOR_ONLY_PROMPTING === "true";
 	}
 	if (env.CYRUS_ROUTER_HEARTBEAT_MS) {
-		config.heartbeatMs = Number(env.CYRUS_ROUTER_HEARTBEAT_MS);
+		config.heartbeatMs = toNumber(
+			"CYRUS_ROUTER_HEARTBEAT_MS",
+			env.CYRUS_ROUTER_HEARTBEAT_MS,
+		);
 	}
 
 	mkdirSync(DATA_DIR, { recursive: true });
