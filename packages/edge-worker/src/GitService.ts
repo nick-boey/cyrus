@@ -313,6 +313,34 @@ export class GitService {
 	}
 
 	/**
+	 * Derive the git branch name a worktree should be created on / continued
+	 * from for a given issue: Linear's suggested `branchName` when present
+	 * (non-empty), otherwise a generated `<identifier>-<slugified-title>`
+	 * fallback (title lowercased, whitespace collapsed to dashes, truncated
+	 * to 30 chars), always passed through `sanitizeBranchName` so the result
+	 * is a valid git ref.
+	 *
+	 * This is the single source of truth for that fallback — used by
+	 * `createSingleRepoWorktree` when it first creates the worktree, and by
+	 * `EdgeWorker`'s pre-teardown WIP push, so both agree on which branch a
+	 * given issue's worktree actually lives on even when Linear never
+	 * suggested a branch name.
+	 */
+	public deriveWorktreeBranchName(issue: {
+		identifier: string;
+		title: string;
+		branchName?: string;
+	}): string {
+		const rawBranchName =
+			issue.branchName ||
+			`${issue.identifier}-${issue.title
+				?.toLowerCase()
+				.replace(/\s+/g, "-")
+				.substring(0, 30)}`;
+		return this.sanitizeBranchName(rawBranchName);
+	}
+
+	/**
 	 * Resolve mutable Git metadata directories for a repository/worktree.
 	 * This includes linked worktree metadata paths (for example
 	 * `.git/worktrees/<name>/FETCH_HEAD`) that must be writable by sandboxes.
@@ -767,13 +795,7 @@ export class GitService {
 			}
 
 			// Use Linear's preferred branch name, or generate one if not available
-			const rawBranchName =
-				issue.branchName ||
-				`${issue.identifier}-${issue.title
-					?.toLowerCase()
-					.replace(/\s+/g, "-")
-					.substring(0, 30)}`;
-			const branchName = this.sanitizeBranchName(rawBranchName);
+			const branchName = this.deriveWorktreeBranchName(issue);
 			const workspacePath =
 				workspacePathOverride ??
 				join(repository.workspaceBaseDir, issue.identifier);

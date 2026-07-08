@@ -3515,15 +3515,13 @@ ${taskSection}`;
 	 * otherwise `<identifier>-<slugified-title-30-chars>`). Used by
 	 * pre-teardown WIP push so the push targets the same branch the worktree
 	 * was actually created on, even when Linear didn't suggest a branch name.
+	 *
+	 * Delegates to GitService.deriveWorktreeBranchName — the single source
+	 * of truth for this fallback — so worktree creation and teardown's WIP
+	 * push can never drift onto different branches.
 	 */
 	private deriveWorktreeBranchName(issue: IssueMinimal): string {
-		return (
-			issue.branchName ||
-			`${issue.identifier}-${issue.title
-				.toLowerCase()
-				.replace(/\s+/g, "-")
-				.substring(0, 30)}`
-		);
+		return this.gitService.deriveWorktreeBranchName(issue);
 	}
 
 	/**
@@ -3588,10 +3586,12 @@ ${taskSection}`;
 			// issue Linear didn't suggest a branch name for.
 			const sessionWithIssue = sessions.find((session) => session.issue);
 			if (sessionWithIssue?.issue) {
-				const rawBranchName = this.deriveWorktreeBranchName(
+				// deriveWorktreeBranchName already returns a sanitized branch
+				// name (it delegates to GitService.deriveWorktreeBranchName,
+				// which sanitizes internally) — no further sanitization needed.
+				const branchName = this.deriveWorktreeBranchName(
 					sessionWithIssue.issue,
 				);
-				const branchName = this.gitService.sanitizeBranchName(rawBranchName);
 				// Mirrors the worktree layout GitService.deleteWorktree resolves
 				// internally: single repo -> workspace root IS the worktree;
 				// multi-repo -> each repo's worktree is a named subdirectory.
@@ -4691,9 +4691,12 @@ ${taskSection}`;
 		await this.postInstantAcknowledgment(sessionId, linearWorkspaceId);
 
 		// Create the session using the shared method (pass full repositories array)
-		// agentSession.creator is threaded onto the session so per-user
-		// credential resolution works on every entry path (created webhook,
-		// parked auto-wake, parked reprompt, repository-selection response).
+		// agentSession.creator is threaded onto the session on every entry path
+		// (created webhook, parked auto-wake, parked reprompt,
+		// repository-selection response) for session provenance/bookkeeping —
+		// e.g. display attribution and router-mode device routing (see
+		// EventRouter.resolveTarget's creator-based user/device lookup) —
+		// not for per-user credential resolution, which was removed.
 		const sessionData = await this.createCyrusAgentSession(
 			sessionId,
 			issue,

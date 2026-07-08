@@ -76,6 +76,30 @@ describe("DeviceGateway", () => {
 		httpServer.close();
 	});
 
+	it("rejects a mismatched protocolVersion with hello_error and closes the socket, even with a valid token", async () => {
+		const { device, port, gateway, httpServer } = await setup();
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		const closed = new Promise<void>((r) => ws.once("close", () => r()));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: 999,
+				lastAckedSeq: 0,
+			}),
+		);
+		const msg = JSON.parse(await nextMessage());
+		expect(msg.type).toBe("hello_error");
+		expect(msg.reason).toMatch(/protocol version mismatch/i);
+		await closed;
+		// A version-mismatched hello must never authenticate the device.
+		expect(gateway.isOnline(device.deviceId)).toBe(false);
+		gateway.close();
+		httpServer.close();
+	});
+
 	it("delivers queued events in order after hello and removes them on ack", async () => {
 		const { store, gateway, device, port, httpServer } = await setup();
 		// Anchor to real time: the gateway now enforces TTL at delivery using

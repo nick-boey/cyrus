@@ -3,6 +3,7 @@ import type { Server as HttpServer } from "node:http";
 import {
 	type DeviceFrame,
 	type HelloFrame,
+	PROTOCOL_VERSION,
 	parseDeviceFrame,
 	type RpcResponseFrame,
 } from "cyrus-router-protocol";
@@ -197,6 +198,22 @@ export class DeviceGateway extends EventEmitter {
 		if (state.helloTimer) {
 			clearTimeout(state.helloTimer);
 			state.helloTimer = undefined;
+		}
+
+		// Fail closed on a protocol version mismatch, checked BEFORE token
+		// lookup so a version-skewed device never reaches authentication —
+		// this turns a future protocol/device skew into a clean handshake
+		// rejection (the client treats hello_error as fatal and stops
+		// reconnecting) instead of an opaque frame-parse failure later on.
+		if (frame.protocolVersion !== PROTOCOL_VERSION) {
+			ws.send(
+				JSON.stringify({
+					type: "hello_error",
+					reason: `protocol version mismatch: server expects ${PROTOCOL_VERSION}, device sent ${frame.protocolVersion}`,
+				}),
+			);
+			ws.close();
+			return;
 		}
 
 		const found = this.store.getDeviceByToken(frame.deviceToken);

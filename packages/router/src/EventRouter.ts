@@ -336,7 +336,7 @@ export class EventRouter {
 			// visible: the typed webhook carries no parent-issue id today, so
 			// this branch never actually fires (see extractParentIssueId).
 			this.logger.info(
-				"Parent-issue affinity fallback skipped: webhook carries no parent issue id (resolved in Task 9)",
+				"Parent-issue affinity fallback: webhook carries no parent issue id (app-attributed sub-issue affinity not implemented)",
 			);
 		}
 		if (parentIssueId !== undefined) {
