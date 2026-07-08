@@ -12,6 +12,9 @@ This changelog documents internal development changes, refactors, tooling update
 - Router RPC dispatch (`LinearExecutor.dispatch`) invoked the tracker method through a bare extracted function reference (`fn(...rest)`), dropping the `this` binding so every real `LinearIssueTrackerService` RPC threw `Cannot read properties of undefined (reading 'linearClient')`. Now invoked via `fn.call(tracker, …)`. Unit tests missed it because they used mock trackers; the in-process e2e (real tracker over the wire) caught it.
 - `DeviceGateway.close()` now detaches per-socket lifecycle handlers before closing, so a late `ws` "close" event during shutdown no longer calls `store.touchDevice()` against an already-closed database.
 
+### Changed
+- Corrected the CLAUDE.md Dependency Security Policy to reflect that pnpm ≥10 (`packageManager: pnpm@10.33.1`) no longer reads the `pnpm` field in root `package.json`; `overrides` and `onlyBuiltDependencies` now live in `pnpm-workspace.yaml`. Flagged that override entries still in `package.json`'s `pnpm` block are inert until migrated (a separate, `pnpm audit`-verified follow-up).
+
 ### Boundary invariant
 - Package layering is one-directional: `cyrus-router-protocol` (frames only, no cyrus-core dependency) ← `cyrus-router` (server; never imports `cyrus-router-client`) and `cyrus-router-client` (device). The e2e test's dependency on `cyrus-router-client` is a **devDependency** of `cyrus-router` — test-only, so the runtime server→client non-dependency invariant is preserved.
 
