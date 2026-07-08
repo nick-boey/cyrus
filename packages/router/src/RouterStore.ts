@@ -149,10 +149,48 @@ export class RouterStore {
 	}
 
 	removeUser(email: string): boolean {
-		const result = this.db
-			.prepare("DELETE FROM users WHERE email = ? COLLATE NOCASE")
-			.run(email);
-		return result.changes > 0;
+		const txn = this.db.transaction(() => {
+			const user = this.db
+				.prepare("SELECT user_id FROM users WHERE email = ? COLLATE NOCASE")
+				.get(email) as Pick<UserRow, "user_id"> | undefined;
+			if (!user) return false;
+			const deviceRow = this.db
+				.prepare("SELECT device_id FROM devices WHERE user_id = ?")
+				.get(user.user_id) as Pick<DeviceRow, "device_id"> | undefined;
+			// The devices/events rows cascade away via ON DELETE CASCADE, but
+			// session_affinity/issue_affinity/issue_locks/rpc_mutations have no
+			// FK — purge them explicitly so they don't strand a dead device_id.
+			if (deviceRow) {
+				this.purgeDeviceScopedRows(deviceRow.device_id);
+			}
+			const result = this.db
+				.prepare("DELETE FROM users WHERE user_id = ?")
+				.run(user.user_id);
+			return result.changes > 0;
+		});
+		return txn();
+	}
+
+	/**
+	 * Deletes all rows keyed by device_id in the tables that have no foreign
+	 * key back to `devices` (session_affinity, issue_affinity, issue_locks,
+	 * rpc_mutations). Callers that delete or replace a device row (directly
+	 * or via cascading a user delete) MUST call this first/atomically so
+	 * those rows don't strand pointing at a device_id that no longer exists.
+	 */
+	private purgeDeviceScopedRows(deviceId: number): void {
+		this.db
+			.prepare("DELETE FROM issue_locks WHERE device_id = ?")
+			.run(deviceId);
+		this.db
+			.prepare("DELETE FROM issue_affinity WHERE device_id = ?")
+			.run(deviceId);
+		this.db
+			.prepare("DELETE FROM session_affinity WHERE device_id = ?")
+			.run(deviceId);
+		this.db
+			.prepare("DELETE FROM rpc_mutations WHERE device_id = ?")
+			.run(deviceId);
 	}
 
 	findUserForCreator(creator: {
@@ -217,6 +255,18 @@ export class RouterStore {
 
 			const token = generateTokenHex();
 			const tokenHash = sha256Hex(token);
+			// The old device row (if any) is about to be deleted by INSERT OR
+			// REPLACE below. foreign_keys=ON only cascades that delete into
+			// `events` — session_affinity/issue_affinity/issue_locks/
+			// rpc_mutations have no FK and would otherwise strand rows keyed
+			// by the dead device_id (e.g. an issue lock the new device could
+			// never acquire). Purge them first, atomically, in this txn.
+			const oldDeviceRow = this.db
+				.prepare("SELECT device_id FROM devices WHERE user_id = ?")
+				.get(codeRow.user_id) as Pick<DeviceRow, "device_id"> | undefined;
+			if (oldDeviceRow) {
+				this.purgeDeviceScopedRows(oldDeviceRow.device_id);
+			}
 			// INSERT OR REPLACE: UNIQUE(user_id) means any existing device row
 			// for this user is deleted and a fresh row is inserted (getting a
 			// new AUTOINCREMENT device_id, never reused, and — with
@@ -368,6 +418,9 @@ export class RouterStore {
 	}
 
 	ackEvent(deviceId: number, seq: number): void {
+		// Cumulative ack: deletes every queued event with seq <= the given
+		// seq (not just the exact seq), since a client acking N implicitly
+		// confirms receipt of everything before N too.
 		this.db
 			.prepare("DELETE FROM events WHERE device_id = ? AND seq <= ?")
 			.run(deviceId, seq);
@@ -502,15 +555,7 @@ export class RouterStore {
 					"SELECT issue_id, session_id FROM issue_locks WHERE device_id = ?",
 				)
 				.all(deviceId) as Array<Pick<IssueLockRow, "issue_id" | "session_id">>;
-			this.db
-				.prepare("DELETE FROM issue_locks WHERE device_id = ?")
-				.run(deviceId);
-			this.db
-				.prepare("DELETE FROM issue_affinity WHERE device_id = ?")
-				.run(deviceId);
-			this.db
-				.prepare("DELETE FROM session_affinity WHERE device_id = ?")
-				.run(deviceId);
+			this.purgeDeviceScopedRows(deviceId);
 			return rows.map((row) => ({
 				issueId: row.issue_id,
 				sessionId: row.session_id,

@@ -118,4 +118,56 @@ describe("RouterStore", () => {
 		expect(store.getSessionAffinity("sess-1")).toBe(device.deviceId);
 		expect(store.getIssueAffinity("ISS-1")).toBe(device.deviceId);
 	});
+
+	it("re-enrollment releases the old device's lock and affinity", () => {
+		const { store, device } = storeWithDevice();
+		store.setSessionAffinity("sess-1", device.deviceId);
+		store.setIssueAffinity("ISS-1", device.deviceId);
+		expect(store.acquireIssueLock("ISS-1", "sess-1", device.deviceId)).toBe(
+			true,
+		);
+
+		// Re-enroll: get a fresh device for the same user.
+		const code2 = store.mintEnrollmentCode("alice@example.com", NOW);
+		const device2 = store.redeemEnrollmentCode(code2, NOW);
+		expect(device2).toBeDefined();
+		if (!device2) throw new Error("redeem failed");
+		expect(device2.deviceId).not.toBe(device.deviceId);
+
+		// The stale lock/affinity rows tied to the old device_id must be gone,
+		// so a new session on the new device can acquire the same issue lock.
+		expect(store.acquireIssueLock("ISS-1", "sess-2", device2.deviceId)).toBe(
+			true,
+		);
+		// The purged affinity was never re-created for device2 — it must
+		// resolve to undefined, not silently point at the dead old device.
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+		expect(store.getIssueAffinity("ISS-1")).toBeUndefined();
+	});
+
+	it("removeUser purges the device's locks and affinity", () => {
+		const { store, device } = storeWithDevice();
+		store.setSessionAffinity("sess-1", device.deviceId);
+		store.setIssueAffinity("ISS-1", device.deviceId);
+		expect(store.acquireIssueLock("ISS-1", "sess-1", device.deviceId)).toBe(
+			true,
+		);
+		store.recordMutation(device.deviceId, "m-1", '{"success":true}', NOW);
+
+		expect(store.removeUser("alice@example.com")).toBe(true);
+
+		// Re-add the user and enroll a fresh device; the old device's rows
+		// must not strand the issue lock or leak stale affinity.
+		store.addUser({ email: "alice@example.com", name: "Alice" });
+		const code2 = store.mintEnrollmentCode("alice@example.com", NOW);
+		const device2 = store.redeemEnrollmentCode(code2, NOW);
+		expect(device2).toBeDefined();
+		if (!device2) throw new Error("redeem failed");
+
+		expect(store.acquireIssueLock("ISS-1", "sess-new", device2.deviceId)).toBe(
+			true,
+		);
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+		expect(store.getMutation(device2.deviceId, "m-1")).toBeUndefined();
+	});
 });
