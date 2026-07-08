@@ -67,15 +67,12 @@ export class DeviceGateway extends EventEmitter {
 	deliverPending(deviceId: number): void {
 		const ws = this.sockets.get(deviceId);
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
-		// nowMs=0 intentionally disables the TTL filter here: expiry
-		// enforcement (comparing expires_ms against a real wall clock) is a
-		// separate concern owned by the periodic sweep over
-		// store.expireEvents(Date.now()), which physically deletes stale
-		// rows. deliverPending's only job is to drain whatever is still
-		// physically queued and un-acked, regardless of the (possibly
-		// synthetic/test) clock the enqueuing caller used relative to this
-		// process's real clock.
-		const pending = this.store.pendingEvents(deviceId, 0, 0);
+		// Enforce TTL at delivery time: an event whose expires_ms has already
+		// passed must never be handed to a reconnecting client, even if the
+		// periodic store.expireEvents(Date.now()) sweep (owned elsewhere)
+		// hasn't physically deleted the row yet. Delivering a stale prompt to
+		// a returning device is worse than failing, per the design spec.
+		const pending = this.store.pendingEvents(deviceId, 0, Date.now());
 		for (const { seq, payloadJson } of pending) {
 			ws.send(
 				JSON.stringify({
@@ -223,11 +220,14 @@ export class DeviceGateway extends EventEmitter {
 
 		this.store.touchDevice(deviceId, Date.now());
 
-		// Ack everything <= lastAckedSeq the client already has. Same
-		// nowMs=0 rationale as deliverPending: TTL expiry is not this
-		// query's concern.
+		// Ack everything <= lastAckedSeq the client already has. Uses the
+		// same real-clock nowMs as deliverPending for consistency; an
+		// already-expired row simply won't be returned here and is left for
+		// the periodic store.expireEvents(Date.now()) sweep to remove
+		// instead — functionally equivalent, since deliverPending would
+		// filter it out too.
 		const alreadyAcked = this.store
-			.pendingEvents(deviceId, 0, 0)
+			.pendingEvents(deviceId, 0, Date.now())
 			.filter((e) => e.seq <= frame.lastAckedSeq);
 		for (const e of alreadyAcked) {
 			this.store.ackEvent(deviceId, e.seq);
