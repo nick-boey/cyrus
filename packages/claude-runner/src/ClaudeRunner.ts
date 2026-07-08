@@ -23,6 +23,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentPendingWork, AskUserQuestionInput } from "cyrus-core";
 import {
+	ALL_CREDENTIAL_ENV_KEYS,
 	createLogger,
 	type IAgentRunner,
 	type ILogger,
@@ -36,10 +37,7 @@ import {
 	checkLinuxSandboxRequirements,
 	logSandboxRequirementFailures,
 } from "./sandbox-requirements.js";
-import {
-	buildBaseSessionEnv,
-	normalizeMcpHttpTransport,
-} from "./session-env.js";
+import { composeSessionEnv, normalizeMcpHttpTransport } from "./session-env.js";
 import type {
 	ClaudeRunnerConfig,
 	ClaudeRunnerEvents,
@@ -60,7 +58,16 @@ export class AbortError extends Error {
  * callbacks, pre-warmed sessions) — replace them with diagnostic placeholders
  * so debug logs remain valid JSON.
  */
-function serializeQueryOptionsReplacer(_key: string, value: unknown): unknown {
+export function serializeQueryOptionsReplacer(
+	key: string,
+	value: unknown,
+): unknown {
+	// Never serialize credential values — with multi-user credential
+	// injection, per-user tokens flow through query options' env and would
+	// otherwise land in local debug logs.
+	if (ALL_CREDENTIAL_ENV_KEYS.includes(key)) {
+		return "[REDACTED]";
+	}
 	if (typeof value === "function") {
 		return `[Function${value.name ? `: ${value.name}` : ""}]`;
 	}
@@ -668,14 +675,19 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					// see: https://docs.claude.com/en/docs/claude-code/sdk/migration-guide#settings-sources-no-longer-loaded-by-default
 					settingSources: ["user", "project", "local"],
 					env: {
-						...buildBaseSessionEnv(),
 						// CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is intentionally NOT set while
 						// the Linux bubblewrap sandbox side effects it triggers are being
 						// investigated. The sandbox requirements precheck is still run
 						// above so the diagnostics remain available when we re-enable.
 						// See: CYPACK-1108.
-						...this.repositoryEnv,
-						...this.config.additionalEnv,
+						// composeSessionEnv merges base env → repository .env →
+						// additionalEnv, scrubbing global credential groups first when
+						// multi-user credential isolation is active.
+						...composeSessionEnv({
+							repositoryEnv: this.repositoryEnv,
+							additionalEnv: this.config.additionalEnv,
+							credentialIsolation: this.config.credentialIsolation,
+						}),
 						// When logging at DEBUG level, enable the SDK's own debug output so
 						// --debug-to-stderr and DEBUG=1 propagate to the Claude subprocess.
 						// Explicitly set or unset to override any leaked value from process.env.

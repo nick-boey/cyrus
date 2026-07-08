@@ -814,6 +814,25 @@ export class CLIIssueTrackerService
 	/**
 	 * Fetch a user by ID.
 	 */
+	/**
+	 * Build the `creator` field for synthetic agent-session webhooks from the
+	 * current CLI user, mirroring Linear's AgentSession payload shape.
+	 */
+	private buildCreatorPayload():
+		| { id: string; name: string; email: string; url: string }
+		| undefined {
+		const userData = this.state.users.get(this.state.currentUserId);
+		if (!userData) {
+			return undefined;
+		}
+		return {
+			id: userData.id,
+			name: userData.name,
+			email: userData.email,
+			url: userData.url,
+		};
+	}
+
 	async fetchUser(userId: string): Promise<User> {
 		const userData = this.state.users.get(userId);
 		if (!userData) {
@@ -928,6 +947,9 @@ export class CLIIssueTrackerService
 					updatedAt: nowIso,
 					status: "active",
 					type: "issue",
+					// Mirror Linear's payload: the user who created the session.
+					// Required for F1 validation of per-user credential routing.
+					creator: this.buildCreatorPayload(),
 					issue: {
 						id: issue.id,
 						identifier: issue.identifier,
@@ -1278,6 +1300,9 @@ export class CLIIssueTrackerService
 						updatedAt: nowIso,
 						status: sessionData.status,
 						type: "issue",
+						// Mirror Linear's payload: the session creator (stable across
+						// created/prompted webhooks, independent of the prompter).
+						creator: this.buildCreatorPayload(),
 						issue: {
 							id: issue.id,
 							identifier: issue.identifier,

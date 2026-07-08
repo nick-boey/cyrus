@@ -67,6 +67,17 @@ export interface RepositoryContext {
 	baseBranchName?: string;
 }
 
+/**
+ * The tracker-side user who created the session (from
+ * `webhook.agentSession.creator`). Used to resolve per-user credentials —
+ * credentials follow the session creator, not later prompters.
+ */
+export interface SessionCreator {
+	id?: string;
+	email?: string;
+	name?: string;
+}
+
 export interface CyrusAgentSession {
 	/** Unique session identifier (was linearAgentActivitySessionId in v2.0) */
 	id: string;
@@ -89,6 +100,8 @@ export interface CyrusAgentSession {
 	/** Repository contexts for this session (always array, never undefined) */
 	repositories: RepositoryContext[];
 	workspace: Workspace;
+	/** Linear user who created the session (set for Linear sessions only). */
+	creator?: SessionCreator;
 	// NOTE: Only one of these will be populated
 	claudeSessionId?: string; // Claude-specific session ID (assigned once it initializes)
 	geminiSessionId?: string; // Gemini-specific session ID (assigned once it initializes)

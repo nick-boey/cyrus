@@ -23,6 +23,7 @@ import {
 	type RepositoryContext,
 	type SerializedCyrusAgentSession,
 	type SerializedCyrusAgentSessionEntry,
+	type SessionCreator,
 	type Workspace,
 } from "cyrus-core";
 
@@ -157,6 +158,7 @@ export class AgentSessionManager extends EventEmitter {
 		workspace: Workspace,
 		platform: "linear" | "github" | "gitlab" | "slack" = "linear",
 		repositories: RepositoryContext[] = [],
+		creator?: SessionCreator,
 	): CyrusAgentSession {
 		const log = this.logger.withContext({
 			sessionId,
@@ -183,6 +185,7 @@ export class AgentSessionManager extends EventEmitter {
 			issue: issueMinimal,
 			repositories,
 			workspace: workspace,
+			creator,
 		};
 
 		// Store locally
