@@ -137,6 +137,10 @@ import {
 	type ResolvedSession,
 } from "cyrus-mcp-tools";
 import {
+	RouterConnection,
+	RouterIssueTrackerService,
+} from "cyrus-router-client";
+import {
 	SlackEventTransport,
 	type SlackWebhookEvent,
 } from "cyrus-slack-event-transport";
@@ -222,6 +226,7 @@ export class EdgeWorker extends EventEmitter {
 	private gitHubCommentService: GitHubCommentService; // Service for posting comments back to GitHub PRs
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
+	private routerConnection?: RouterConnection; // Shared device-side WebSocket connection to the Cyrus Router (router platform mode)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
 	private persistenceManager: PersistenceManager;
 	private sharedApplicationServer: SharedApplicationServer;
@@ -453,7 +458,11 @@ export class EdgeWorker extends EventEmitter {
 		// Initialize shared application server
 		const serverPort = config.serverPort || config.webhookPort || 3456;
 		const serverHost = config.serverHost || "localhost";
-		const skipTunnel = config.platform === "cli"; // Skip Cloudflare tunnel in CLI mode
+		// Skip the Cloudflare tunnel when there is no inbound webhook surface to
+		// expose: CLI mode (in-memory tracker) and router mode (events arrive
+		// over the device WebSocket, not an HTTP webhook).
+		const skipTunnel =
+			config.platform === "cli" || config.platform === "router";
 		this.sharedApplicationServer = new SharedApplicationServer(
 			serverPort,
 			serverHost,
@@ -490,6 +499,18 @@ export class EdgeWorker extends EventEmitter {
 			},
 		);
 
+		// Router mode: when a session reaches a terminal state, tell the router
+		// so it can release the issue lock + session affinity. Guarded by
+		// platform inside the handler so the subscription is harmless otherwise.
+		this.agentSessionManager.on(
+			"sessionTerminal",
+			(sessionId: string, state: "complete" | "error" | "stopped") => {
+				if (this.config.platform === "router") {
+					this.routerConnection?.sendSessionState(sessionId, state);
+				}
+			},
+		);
+
 		// Initialize repositories with path resolution
 		for (const repo of config.repositories) {
 			if (repo.isActive !== false) {
@@ -512,6 +533,37 @@ export class EdgeWorker extends EventEmitter {
 			}
 		}
 
+		// Router mode: create ONE shared device-side connection to the router.
+		// The device holds no Linear tokens — every issue-tracker operation is
+		// forwarded to the router over this connection.
+		if (this.config.platform === "router") {
+			if (!config.router) {
+				throw new Error(
+					"platform 'router' requires config.router { url, deviceToken }",
+				);
+			}
+			this.routerConnection = new RouterConnection({
+				url: config.router.url,
+				deviceToken: config.router.deviceToken,
+				stateDir: join(this.cyrusHome, "router-client"),
+			});
+		}
+
+		// Router mode has no linearWorkspaces block (the device holds no Linear
+		// tokens — the router does). Build one RouterIssueTrackerService per
+		// unique repo workspace id, backed by the shared RouterConnection.
+		if (this.config.platform === "router") {
+			for (const repo of this.repositories.values()) {
+				const wsId = repo.linearWorkspaceId;
+				if (wsId && !this.issueTrackers.has(wsId)) {
+					this.issueTrackers.set(
+						wsId,
+						new RouterIssueTrackerService(this.getRouterConnection(), wsId),
+					);
+				}
+			}
+		}
+
 		// Initialize issue trackers per workspace (one per workspace, not per repo)
 		if (config.linearWorkspaces) {
 			for (const [linearWorkspaceId, wsConfig] of Object.entries(
@@ -524,13 +576,20 @@ export class EdgeWorker extends EventEmitter {
 								service.seedDefaultData();
 								return service;
 							})()
-						: new LinearIssueTrackerService(
-								new LinearClient({
-									accessToken: wsConfig.linearToken,
-								}),
-								this.buildOAuthConfig(linearWorkspaceId),
-							);
-				this.issueTrackers.set(linearWorkspaceId, issueTracker);
+						: this.config.platform === "router"
+							? new RouterIssueTrackerService(
+									this.getRouterConnection(),
+									linearWorkspaceId,
+								)
+							: new LinearIssueTrackerService(
+									new LinearClient({
+										accessToken: wsConfig.linearToken,
+									}),
+									this.buildOAuthConfig(linearWorkspaceId),
+								);
+				if (!this.issueTrackers.has(linearWorkspaceId)) {
+					this.issueTrackers.set(linearWorkspaceId, issueTracker);
+				}
 			}
 		}
 
@@ -557,11 +616,16 @@ export class EdgeWorker extends EventEmitter {
 			repoAccessConfigs,
 		);
 
-		// Initialize extracted service modules
+		// Initialize extracted service modules. In router mode the device has no
+		// Linear token, so attachment downloads are proxied through the router
+		// via a delegate that reaches the download RPC above both token guards.
 		this.attachmentService = new AttachmentService(
 			this.logger,
 			this.cyrusHome,
 			this.config.linearWorkspaces || {},
+			this.config.platform === "router"
+				? (url) => this.downloadAttachmentViaRouter(url)
+				: undefined,
 		);
 		this.runnerSelectionService = new RunnerSelectionService(this.config);
 		this.toolPermissionResolver = new ToolPermissionResolver(
@@ -778,6 +842,79 @@ export class EdgeWorker extends EventEmitter {
 				this.logger.info(
 					"   Event listener: listening for AgentSessionCreated events",
 				);
+			}
+		} else if (this.config.platform === "router") {
+			// Router mode: events arrive over the shared device WebSocket, not an
+			// HTTP webhook. Ensure a RouterIssueTrackerService exists per repo
+			// workspace (the constructor already created these; this mirrors the
+			// CLI fallback loop for robustness/idempotency).
+			for (const repo of this.repositories.values()) {
+				const wsId = repo.linearWorkspaceId;
+				if (wsId && !this.issueTrackers.has(wsId)) {
+					const tracker = new RouterIssueTrackerService(
+						this.getRouterConnection(),
+						wsId,
+					);
+					this.issueTrackers.set(wsId, tracker);
+					this.activitySinks.set(wsId, new LinearActivitySink(tracker, wsId));
+				}
+			}
+
+			const firstRouterTracker = Array.from(this.issueTrackers.values()).find(
+				(tracker): tracker is RouterIssueTrackerService =>
+					tracker instanceof RouterIssueTrackerService,
+			);
+
+			if (firstRouterTracker) {
+				const routerConnection = this.getRouterConnection();
+
+				// Surface fatal connection errors (e.g. a rejected device token →
+				// hello_error, emitted by RouterConnection as "error") instead of
+				// letting them go unhandled. Attach BEFORE connect().
+				routerConnection.on("error", (error: Error) => {
+					this.handleError(error);
+				});
+
+				// SYNCHRONOUS-CONSUMER CONTRACT: RouterConnection marks its durable
+				// inbox entry processed the instant its "event" emit returns, and
+				// RouterEventTransport re-emits synchronously. So the transport
+				// "event" → handleWebhook handoff MUST be wired synchronously and
+				// BEFORE connect() — mirroring the CLI/Linear "event" wiring exactly,
+				// with no extra await/defer inserted between transport "event" and
+				// handleWebhook. The transport ignores this config (no HTTP surface).
+				const routerEventTransport = firstRouterTracker.createEventTransport({
+					platform: "linear",
+					verificationMode: "proxy",
+					secret: "",
+					fastifyServer: this.sharedApplicationServer.getFastifyInstance(),
+				});
+
+				// Listen for legacy webhook events (mirrors CLI/Linear "event" path)
+				routerEventTransport.on("event", (event: AgentEvent) => {
+					const repos = Array.from(this.repositories.values());
+					this.handleWebhook(event as unknown as Webhook, repos);
+				});
+
+				// Listen for unified internal messages (new message bus)
+				routerEventTransport.on("message", (message: InternalMessage) => {
+					this.handleMessage(message);
+				});
+
+				// Listen for transport errors
+				routerEventTransport.on("error", (error: Error) => {
+					this.handleError(error);
+				});
+
+				// No-op for the router transport (no HTTP endpoint to mount), but
+				// call it to honor the IAgentEventTransport contract.
+				routerEventTransport.register();
+
+				// Begin the dial loop AFTER listeners are attached so no replayed or
+				// live event is emitted with zero "event" consumers.
+				routerConnection.connect();
+
+				this.logger.info("✅ Router event transport registered");
+				this.logger.info(`   Connecting to router: ${this.config.router?.url}`);
 			}
 		} else {
 			// Linear mode: Create and register LinearEventTransport
@@ -4032,9 +4169,44 @@ ${taskSection}`;
 	private getLinearTokenForWorkspace(linearWorkspaceId: string): string | null {
 		const workspaceConfig = this.config.linearWorkspaces?.[linearWorkspaceId];
 		if (!workspaceConfig) {
-			return null; // CLI platform or unconfigured workspace
+			return null; // CLI platform / router platform / unconfigured workspace
 		}
 		return workspaceConfig.linearToken;
+	}
+
+	/**
+	 * Return the shared RouterConnection, asserting it exists. Only valid to
+	 * call in router mode (the constructor creates it when
+	 * `platform === "router"`).
+	 */
+	private getRouterConnection(): RouterConnection {
+		if (!this.routerConnection) {
+			throw new Error(
+				"RouterConnection is not initialized (platform is not 'router')",
+			);
+		}
+		return this.routerConnection;
+	}
+
+	/**
+	 * Download an attachment's bytes through the router (router mode). The
+	 * device holds no Linear token, so it asks the router — which does — to
+	 * fetch the attachment URL and return the bytes. Uses the first available
+	 * router-backed tracker; a router device is bound to its own workspace(s)
+	 * through a single connection, so any router tracker resolves the same
+	 * download RPC.
+	 */
+	private downloadAttachmentViaRouter(
+		url: string,
+	): Promise<{ base64: string; contentType: string }> {
+		for (const tracker of this.issueTrackers.values()) {
+			if (tracker instanceof RouterIssueTrackerService) {
+				return tracker.downloadAttachment(url);
+			}
+		}
+		return Promise.reject(
+			new Error("No router issue tracker available for attachment download"),
+		);
 	}
 
 	/**
@@ -5747,12 +5919,26 @@ ${taskSection}`;
 					);
 				}
 
-				const sdkServer =
-					context.prebuiltServer ||
-					createCyrusToolsServer(
-						context.linearClient,
+				let sdkServer = context.prebuiltServer;
+				if (!sdkServer) {
+					// Rebuild for a subsequent connection to the same context (the
+					// prebuilt server is cleared after first use). Router-mode
+					// contexts carry a tracker backing instead of a LinearClient.
+					const backing = context.linearClient
+						? context.linearClient
+						: context.issueTracker
+							? { issueTracker: context.issueTracker }
+							: undefined;
+					if (!backing) {
+						throw new Error(
+							`No cyrus-tools backing available for context '${contextId}'`,
+						);
+					}
+					sdkServer = createCyrusToolsServer(
+						backing,
 						this.createCyrusToolsOptions(context.parentSessionId),
 					);
+				}
 				this.mcpConfigService.clearPrebuiltServer(contextId);
 
 				return sdkServer.server;

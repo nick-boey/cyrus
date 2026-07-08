@@ -362,6 +362,9 @@ importers:
       cyrus-mcp-tools:
         specifier: workspace:*
         version: link:../mcp-tools
+      cyrus-router-client:
+        specifier: workspace:*
+        version: link:../router-client
       cyrus-simple-agent-runner:
         specifier: workspace:*
         version: link:../simple-agent-runner
@@ -520,6 +523,9 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: '>=1.26.0'
         version: 1.29.0(zod@4.3.6)
+      cyrus-core:
+        specifier: workspace:*
+        version: link:../core
       fs-extra:
         specifier: ^11.3.2
         version: 11.3.4

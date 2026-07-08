@@ -8,8 +8,12 @@ import {
 
 type CyrusToolsMcpContextEntry = {
 	contextId: string;
-	linearToken: string;
-	linearClient: LinearClient;
+	/** Present in token-authenticated Linear mode; absent in router mode. */
+	linearToken?: string;
+	/** Present in token-authenticated Linear mode; absent in router mode. */
+	linearClient?: LinearClient;
+	/** Present in router mode: backs cyrus-tools over the tracker interface. */
+	issueTracker?: IIssueTrackerService;
 	parentSessionId?: string;
 	prebuiltServer?: ReturnType<typeof createCyrusToolsServer>;
 	createdAt: number;
@@ -74,8 +78,30 @@ export class McpConfigService {
 		// Prebuild one SDK server for this context so callback wiring remains deterministic.
 		const linearToken = this.deps.getLinearTokenForWorkspace(linearWorkspaceId);
 		const issueTracker = this.deps.getIssueTracker(linearWorkspaceId);
-		if (!linearToken || !issueTracker?.getClient) {
-			// CLI platform mode — no Linear client available, return config without cyrus-tools
+		// Router mode: the device holds no Linear token, but a router-backed
+		// tracker exists — back cyrus-tools with the tracker interface instead.
+		const isRouterTracker =
+			issueTracker?.getPlatformMetadata?.().transport === "router";
+
+		let linearClient: LinearClient | undefined;
+		let trackerBacking: IIssueTrackerService | undefined;
+		let prebuiltServer: ReturnType<typeof createCyrusToolsServer>;
+		if (linearToken && issueTracker?.getClient) {
+			// Token-authenticated Linear mode — back cyrus-tools with the SDK client.
+			linearClient = issueTracker.getClient();
+			prebuiltServer = createCyrusToolsServer(
+				linearClient,
+				this.deps.createCyrusToolsOptions(parentSessionId),
+			);
+		} else if (isRouterTracker && issueTracker) {
+			// Router mode — back cyrus-tools with the tracker interface (no token).
+			trackerBacking = issueTracker;
+			prebuiltServer = createCyrusToolsServer(
+				{ issueTracker },
+				this.deps.createCyrusToolsOptions(parentSessionId),
+			);
+		} else {
+			// CLI platform mode / unconfigured — no cyrus-tools backing available.
 			const mcpConfig: Record<string, McpServerConfig> = {
 				"cyrus-docs": {
 					type: "http",
@@ -84,16 +110,12 @@ export class McpConfigService {
 			};
 			return mcpConfig;
 		}
-		const linearClient = issueTracker.getClient();
-		const prebuiltServer = createCyrusToolsServer(
-			linearClient,
-			this.deps.createCyrusToolsOptions(parentSessionId),
-		);
 
 		this.contexts.set(contextId, {
 			contextId,
-			linearToken,
-			linearClient,
+			...(linearToken ? { linearToken } : {}),
+			...(linearClient ? { linearClient } : {}),
+			...(trackerBacking ? { issueTracker: trackerBacking } : {}),
 			parentSessionId,
 			prebuiltServer,
 			createdAt: Date.now(),
@@ -102,16 +124,23 @@ export class McpConfigService {
 
 		const cyrusToolsAuthorizationHeader = this.getAuthorizationHeaderValue();
 
-		// Workspace-level MCP servers — configured once regardless of repo count
-		// https://linear.app/docs/mcp
+		// Workspace-level MCP servers — configured once regardless of repo count.
+		// The token-authenticated official Linear MCP server (https://linear.app/docs/mcp)
+		// is only emitted when we actually hold a Linear token; router-mode
+		// devices have none (users install the Linear MCP locally with their own
+		// OAuth), so it is omitted there.
 		const mcpConfig: Record<string, McpServerConfig> = {
-			linear: {
-				type: "http",
-				url: "https://mcp.linear.app/mcp",
-				headers: {
-					Authorization: `Bearer ${linearToken}`,
-				},
-			},
+			...(linearToken
+				? {
+						linear: {
+							type: "http",
+							url: "https://mcp.linear.app/mcp",
+							headers: {
+								Authorization: `Bearer ${linearToken}`,
+							},
+						} satisfies McpServerConfig,
+					}
+				: {}),
 			"cyrus-tools": {
 				type: "http",
 				url: this.deps.getCyrusToolsMcpUrl(),

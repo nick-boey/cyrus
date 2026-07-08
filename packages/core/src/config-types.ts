@@ -123,8 +123,20 @@ export interface EdgeWorkerRuntimeConfig {
 	 * Issue tracker platform type (default: "linear")
 	 * - "linear": Uses Linear as the issue tracker (default production mode)
 	 * - "cli": Uses an in-memory issue tracker for CLI-based testing and development
+	 * - "router": Routes issue-tracker operations through the Cyrus Router over
+	 *   a WebSocket (device holds no Linear tokens — the router does)
 	 */
-	platform?: "linear" | "cli";
+	platform?: "linear" | "cli" | "router";
+
+	/**
+	 * Router connection config. Required when `platform === "router"`.
+	 * `url` is the base router WebSocket URL (the `/device` path is appended by
+	 * the client); `deviceToken` authenticates this device to the router.
+	 */
+	router?: {
+		url: string;
+		deviceToken: string;
+	};
 
 	// --- Agent Configuration (for CLI mode) ---
 

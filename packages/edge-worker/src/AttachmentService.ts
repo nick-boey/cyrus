@@ -8,19 +8,57 @@ import type {
 } from "cyrus-core";
 import { fileTypeFromBuffer } from "file-type";
 
+/**
+ * Map a small set of common MIME types to file extensions. Used only as a
+ * fallback in router mode when the downloaded buffer's binary signature is
+ * unrecognized by `file-type` but the download delegate supplied a content
+ * type.
+ */
+function extensionFromContentType(contentType: string): string | undefined {
+	const normalized = contentType.split(";")[0]?.trim().toLowerCase();
+	const map: Record<string, string> = {
+		"image/png": ".png",
+		"image/jpeg": ".jpg",
+		"image/gif": ".gif",
+		"image/webp": ".webp",
+		"image/svg+xml": ".svg",
+		"application/pdf": ".pdf",
+		"text/plain": ".txt",
+		"text/markdown": ".md",
+		"text/csv": ".csv",
+		"application/json": ".json",
+		"application/zip": ".zip",
+	};
+	return normalized ? map[normalized] : undefined;
+}
+
 export class AttachmentService {
 	private logger: ILogger;
 	private cyrusHome: string;
 	private linearWorkspaces: Record<string, LinearWorkspaceConfig>;
+	/**
+	 * Optional delegate that fetches attachment bytes without a Linear token —
+	 * used in router mode, where the device has no Linear credentials and the
+	 * router (which does) proxies the download. When set, it takes precedence
+	 * over the token-authenticated `fetch` path, and its presence lets the
+	 * attachment flow proceed even when no Linear token is configured.
+	 */
+	private downloadDelegate?: (
+		url: string,
+	) => Promise<{ base64: string; contentType: string }>;
 
 	constructor(
 		logger: ILogger,
 		cyrusHome: string,
 		linearWorkspaces: Record<string, LinearWorkspaceConfig>,
+		downloadDelegate?: (
+			url: string,
+		) => Promise<{ base64: string; contentType: string }>,
 	) {
 		this.logger = logger;
 		this.cyrusHome = cyrusHome;
 		this.linearWorkspaces = linearWorkspaces;
+		this.downloadDelegate = downloadDelegate;
 	}
 
 	/**
@@ -69,7 +107,9 @@ export class AttachmentService {
 		issueTracker?: IIssueTrackerService,
 	): Promise<{ manifest: string; attachmentsDir: string | null }> {
 		const linearToken = this.getLinearTokenForWorkspace(linearWorkspaceId);
-		if (!linearToken) {
+		// Router mode: a download delegate can fetch attachments without a token.
+		// Only skip when neither a delegate NOR a token is available.
+		if (!this.downloadDelegate && !linearToken) {
 			// CLI platform or unconfigured workspace — skip attachment download
 			return { manifest: "", attachmentsDir: null };
 		}
@@ -225,25 +265,43 @@ export class AttachmentService {
 	async downloadAttachment(
 		attachmentUrl: string,
 		destinationPath: string,
-		linearToken: string,
+		linearToken: string | null,
 	): Promise<{ success: boolean; fileType?: string; isImage?: boolean }> {
 		try {
 			this.logger.debug(`Downloading attachment from: ${attachmentUrl}`);
 
-			const response = await fetch(attachmentUrl, {
-				headers: {
-					Authorization: `Bearer ${linearToken}`,
-				},
-			});
+			// Router mode: fetch bytes via the delegate (which proxies through the
+			// router that holds the Linear token). Otherwise use the
+			// token-authenticated direct fetch.
+			let buffer: Buffer;
+			let delegateContentType: string | undefined;
+			if (this.downloadDelegate) {
+				const { base64, contentType } =
+					await this.downloadDelegate(attachmentUrl);
+				buffer = Buffer.from(base64, "base64");
+				delegateContentType = contentType;
+			} else {
+				if (!linearToken) {
+					this.logger.error(
+						"Attachment download skipped: no download delegate and no Linear token",
+					);
+					return { success: false };
+				}
+				const response = await fetch(attachmentUrl, {
+					headers: {
+						Authorization: `Bearer ${linearToken}`,
+					},
+				});
 
-			if (!response.ok) {
-				this.logger.error(
-					`Attachment download failed: ${response.status} ${response.statusText}`,
-				);
-				return { success: false };
+				if (!response.ok) {
+					this.logger.error(
+						`Attachment download failed: ${response.status} ${response.statusText}`,
+					);
+					return { success: false };
+				}
+
+				buffer = Buffer.from(await response.arrayBuffer());
 			}
-
-			const buffer = Buffer.from(await response.arrayBuffer());
 
 			// Detect the file type from the buffer
 			const fileType = await fileTypeFromBuffer(buffer);
@@ -256,6 +314,16 @@ export class AttachmentService {
 				this.logger.debug(
 					`Detected file type: ${fileType.mime} (${fileType.ext}), is image: ${isImage}`,
 				);
+			} else if (delegateContentType) {
+				// Fall back to the delegate-provided content type when the buffer
+				// signature is unrecognized.
+				isImage = delegateContentType.startsWith("image/");
+				detectedExtension = extensionFromContentType(delegateContentType);
+				if (detectedExtension) {
+					this.logger.debug(
+						`Using extension from delegate content type: ${detectedExtension}`,
+					);
+				}
 			} else {
 				// Try to get extension from URL
 				const urlPath = new URL(attachmentUrl).pathname;
@@ -297,7 +365,9 @@ export class AttachmentService {
 		totalNewAttachments: number;
 		failedCount: number;
 	}> {
-		if (!linearToken) {
+		// Router mode: a download delegate can fetch attachments without a token.
+		// Only bail when neither a delegate NOR a token is available.
+		if (!this.downloadDelegate && !linearToken) {
 			return {
 				newAttachmentMap: {},
 				newImageMap: {},

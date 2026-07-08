@@ -41,8 +41,17 @@ import type {
 /**
  * Events emitted by AgentSessionManager
  */
-// biome-ignore lint/complexity/noBannedTypes: Empty events type (events removed in CYPACK-996 skill refactor)
-export type AgentSessionManagerEvents = {};
+export type AgentSessionManagerEvents = {
+	/**
+	 * Emitted when a session reaches a terminal state (complete/error/stopped).
+	 * Router platform mode listens for this to release the router-side issue
+	 * lock + session affinity via RouterConnection.sendSessionState.
+	 */
+	sessionTerminal: (
+		sessionId: string,
+		state: "complete" | "error" | "stopped",
+	) => void;
+};
 
 /**
  * Type-safe event emitter interface for AgentSessionManager
@@ -376,6 +385,16 @@ export class AgentSessionManager extends EventEmitter {
 			totalCostUsd: resultMessage.total_cost_usd,
 			usage: resultMessage.usage,
 		});
+
+		// Notify terminal-state observers (router mode releases the issue lock +
+		// session affinity via RouterConnection.sendSessionState). Emitted for
+		// every terminal case, including a user-requested stop.
+		const terminalState: "complete" | "error" | "stopped" = wasStopRequested
+			? "stopped"
+			: status === AgentSessionStatus.Complete
+				? "complete"
+				: "error";
+		this.emit("sessionTerminal", sessionId, terminalState);
 
 		if (wasStopRequested) {
 			log.info(`Session was stopped by user`);

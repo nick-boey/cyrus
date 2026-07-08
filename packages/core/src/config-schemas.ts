@@ -489,6 +489,30 @@ export const EdgeConfigSchema = z.object({
 	 * all agent network traffic through it for inspection and filtering.
 	 */
 	sandbox: SandboxConfigSchema.optional(),
+
+	/**
+	 * Issue tracker platform type (default: "linear").
+	 * - "linear": Uses Linear directly (default production mode)
+	 * - "cli": Uses an in-memory issue tracker for CLI-based testing
+	 * - "router": Routes every issue-tracker operation through the Cyrus Router
+	 *   over a WebSocket. The device holds no Linear tokens — the router does.
+	 *
+	 * Persisted here (not just on the runtime config) so `cyrus connect` can
+	 * write it and `cyrus start` reads it back on load.
+	 */
+	platform: z.enum(["linear", "cli", "router"]).optional(),
+
+	/**
+	 * Router connection config. Required when `platform === "router"`.
+	 * `url` is the base router WebSocket URL (the `/device` path is appended by
+	 * the client); `deviceToken` authenticates this device to the router.
+	 */
+	router: z
+		.object({
+			url: z.string(),
+			deviceToken: z.string(),
+		})
+		.optional(),
 });
 
 /**

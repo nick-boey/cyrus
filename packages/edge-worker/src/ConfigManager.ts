@@ -260,6 +260,11 @@ export class ConfigManager extends EventEmitter {
 					parsedConfig.prReviewTrigger ?? this.config.prReviewTrigger,
 				// Sandbox / egress proxy config
 				sandbox: parsedConfig.sandbox ?? this.config.sandbox,
+				// Platform mode + router connection config. Without these explicit
+				// merges the freshly-parsed file values would be dropped on reload
+				// (only the `...this.config` runtime value would survive).
+				platform: parsedConfig.platform || this.config.platform,
+				router: parsedConfig.router || this.config.router,
 			};
 
 			// Basic validation
@@ -360,6 +365,8 @@ export class ConfigManager extends EventEmitter {
 			"linearWorkspaces",
 			"userAccessControl",
 			"sandbox",
+			"platform",
+			"router",
 		];
 
 		for (const key of globalKeys) {

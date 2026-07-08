@@ -957,6 +957,23 @@
 			},
 			"required": ["httpProxyPort", "socksProxyPort"],
 			"additionalProperties": false
+		},
+		"platform": {
+			"type": "string",
+			"enum": ["linear", "cli", "router"]
+		},
+		"router": {
+			"type": "object",
+			"properties": {
+				"url": {
+					"type": "string"
+				},
+				"deviceToken": {
+					"type": "string"
+				}
+			},
+			"required": ["url", "deviceToken"],
+			"additionalProperties": false
 		}
 	},
 	"required": ["repositories"],
