@@ -45,10 +45,18 @@ single router serves a single Linear workspace unless you configure multiple
 
 ## Admin setup (the router host)
 
+> **Guided path.** Run `/cyrus-setup` and choose **Router host** at the mode
+> prompt (or invoke the `cyrus-setup-router` skill directly). It walks through
+> everything in this section — prerequisites, the tunnel (pointed at the router
+> port), the Linear OAuth app, writing `router-config.json`, starting the router,
+> and enrolling teammates. The steps below are the manual reference.
+
 Pick a machine that stays on (a small VPS or an always-on box). It needs the
 same Linear OAuth app + public webhook URL you would set up for self-hosting —
 follow [SELF_HOSTING.md](./SELF_HOSTING.md) to obtain the workspace Linear token
 and webhook secret, then configure the router instead of the single-host worker.
+A router host **never runs Claude and never needs GitHub** — git operations
+happen on each client device with that person's own `gh` credentials.
 
 ### 1. Write `router-config.json`
 
@@ -119,6 +127,12 @@ token.
 ---
 
 ## Device setup (each client)
+
+> **Guided path.** Run `/cyrus-setup` and choose **Client device** at the mode
+> prompt (or invoke the `cyrus-setup-client` skill directly). It walks through
+> prerequisites, Claude auth, native `gh`/git config, `cyrus connect`, the local
+> Linear MCP OAuth, adding repositories, and launching. The steps below are the
+> manual reference.
 
 On your own machine, in the repo(s) you want Cyrus to work in:
 

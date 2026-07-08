@@ -9,6 +9,18 @@ description: Configure the public webhook endpoint for Cyrus — ngrok, Cloudfla
 
 Configures a public URL so Linear (and other integrations) can send webhooks to your Cyrus instance.
 
+> **Target upstream port.** By default this skill points the tunnel at the
+> single-host Cyrus port **`3456`**. When invoked from `cyrus-setup-router`
+> (**router variant**), the caller passes the **router port `8787`** instead —
+> substitute it for `3456` everywhere below (the ngrok `upstream.url`, the
+> Cloudflare/own-URL guidance, and the "start ngrok" messaging).
+>
+> **Router variant also changes Step 4:** a router host reads
+> `~/.cyrus/router-config.json`, not the single-host env vars. In router variant,
+> write **only** `CYRUS_BASE_URL` and **skip** `CYRUS_SERVER_PORT`,
+> `LINEAR_DIRECT_WEBHOOKS`, and `CYRUS_HOST_EXTERNAL`. In the default
+> (standalone) variant, write all of them as usual.
+
 ## Step 1: Check Existing Configuration
 
 ```bash
@@ -91,7 +103,7 @@ endpoints:
   - name: cyrus
     url: <domain>
     upstream:
-      url: 3456
+      url: 3456 # standalone port; router variant uses 8787
 ```
 
 For the authtoken, use a clipboard-to-file approach:
@@ -107,7 +119,7 @@ endpoints:
   - name: cyrus
     url: <domain>
     upstream:
-      url: 3456
+      url: 3456 # standalone port; router variant uses 8787
 EOF
 ```
 
@@ -121,7 +133,7 @@ endpoints:
   - name: cyrus
     url: <domain>
     upstream:
-      url: 3456
+      url: 3456 # standalone port; router variant uses 8787
 EOF
 echo " ✓ Saved"
 ```
@@ -173,7 +185,11 @@ printf 'CYRUS_BASE_URL=%s\n' "<url>" >> ~/.cyrus/.env
 
 ## Step 4: Write Common Config
 
-Ensure these are present in `~/.cyrus/.env` (add only if missing):
+**Router variant:** skip this entire step except confirming `CYRUS_BASE_URL` is
+set (written in Step 3). A router host reads `~/.cyrus/router-config.json`, so
+the vars below do not apply — do **not** write them.
+
+**Standalone variant:** ensure these are present in `~/.cyrus/.env` (add only if missing):
 
 ```bash
 grep -q '^CYRUS_SERVER_PORT=' ~/.cyrus/.env 2>/dev/null || printf 'CYRUS_SERVER_PORT=3456\n' >> ~/.cyrus/.env

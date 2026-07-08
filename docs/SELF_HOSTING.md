@@ -14,7 +14,18 @@ Then in your agent:
 /cyrus-setup
 ```
 
-The setup skill walks you through everything below — automatically.
+The setup skill first asks which **deployment mode** you want, then walks you
+through it automatically:
+
+- **Standalone (single-host)** — one machine receives webhooks *and* runs every
+  session. This guide describes that mode.
+- **Router host** — a shared always-on coordinator that routes each session to
+  the teammate who owns it (Linear + tunnel only; no Claude, no GitHub).
+- **Client device** — a teammate's own machine that runs *their* sessions locally
+  with *their* native credentials, connected to a router.
+
+The router/client modes are documented in [ROUTER.md](./ROUTER.md). The rest of
+this guide covers **standalone**.
 
 ---
 

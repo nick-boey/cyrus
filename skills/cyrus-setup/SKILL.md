@@ -1,6 +1,6 @@
 ---
 name: cyrus-setup
-description: Set up Cyrus end-to-end — install prerequisites, configure authentication, create integrations (Linear, GitHub, Slack), add repositories, and launch. Run this once to get Cyrus running as a background agent.
+description: Set up Cyrus end-to-end. First choose a deployment mode — standalone (single-host), router host, or client device — then the skill installs prerequisites, configures authentication and integrations (Linear, GitHub, Slack), adds repositories, and launches. Run this once to get Cyrus running as a background agent.
 ---
 
 # Cyrus Setup
@@ -87,12 +87,20 @@ lsof -ti :<port> | xargs kill 2>/dev/null
 
 This skill runs sub-skills in order, skipping any that are already complete. You can re-run `/cyrus-setup` at any time to add integrations or fix configuration.
 
-> **Two topologies.** The Steps below set up **single-host** Cyrus: one machine
-> receives webhooks *and* runs every session under one identity. If instead you
-> want **router mode** — sessions run on each teammate's own machine with their
-> native credentials, behind a shared always-on router — jump to
-> [Router Mode Setup](#router-mode-setup-split-host--device) at the end of this
-> skill. Full reference: `docs/ROUTER.md`.
+> **Three deployment modes.** The very first thing this skill does
+> ([Step -1](#step--1-choose-deployment-mode)) is ask which mode you want:
+>
+> - **Standalone** (single-host) — one machine receives webhooks *and* runs every
+>   session under one identity. This is the default and the flow the Steps below
+>   describe.
+> - **Router host** — a shared always-on machine that receives Linear webhooks and
+>   routes each session to the owning teammate's device. Never runs Claude, never
+>   touches GitHub. Handed off to the `cyrus-setup-router` sub-skill.
+> - **Client device** — a teammate's own machine that runs *their* sessions locally
+>   with *their* native credentials, connected to a router. Handed off to the
+>   `cyrus-setup-client` sub-skill.
+>
+> Full router/client reference: `docs/ROUTER.md`.
 
 ### Loading Sub-Skills
 
@@ -109,10 +117,47 @@ Each step references a sub-skill file. To execute a sub-skill, **read the SKILL.
 | 6 | setup-slack | `cyrus-setup-slack/SKILL.md` |
 | 7 | setup-repository | `cyrus-setup-repository/SKILL.md` |
 | 8 | setup-launch | `cyrus-setup-launch/SKILL.md` |
+| Router mode | setup-router | `cyrus-setup-router/SKILL.md` |
+| Client mode | setup-client | `cyrus-setup-client/SKILL.md` |
+
+The **Standalone** mode runs Steps 1–8 inline (below). The **Router host** and
+**Client device** modes hand off to `cyrus-setup-router` and
+`cyrus-setup-client` respectively — those sub-skills invoke the shared sub-skills
+above (prerequisites, endpoint, Linear, etc.) with mode-appropriate options.
 
 To find the files, look for them relative to this file's directory (go up one level, then into the sub-skill directory). For example, if this file is at `~/.claude/skills/cyrus-setup/SKILL.md`, the sub-skills are at `~/.claude/skills/cyrus-setup-prerequisites/SKILL.md`, etc.
 
 If a sub-skill file is not found, use `Glob` to search for it: `**/cyrus-setup-prerequisites/SKILL.md`
+
+---
+
+## Step -1: Choose Deployment Mode
+
+**This is the first thing to do — before identity, surfaces, or any install.**
+**Use the `AskUserQuestion` tool if available.** Ask the user which deployment
+mode they want to set up:
+
+- **Standalone (single-host)** — *default, recommended for individuals.* One
+  machine receives Linear/GitHub/Slack webhooks and runs every Claude session
+  under one identity. Sets up Linear + GitHub + Claude Code + a public tunnel.
+- **Router host** — a shared always-on machine that receives Linear webhooks and
+  routes each session to the teammate who owns it. It coordinates a team but
+  **never runs Claude and never touches GitHub**. Sets up Linear + a public
+  tunnel, writes `router-config.json`, starts the router, and enrolls teammates.
+- **Client device** — a teammate's own laptop/workstation that runs *their*
+  sessions locally with *their* native credentials, connected to a router. Sets
+  up Claude Code + native `gh`/git + a locally-OAuth'd Linear MCP, then connects
+  to the router. **No Linear OAuth app, no tunnel, no GitHub App.**
+
+Then branch:
+
+- **Standalone** → continue with **Step 0** below and run Steps 0–8 in order.
+- **Router host** → **Read** the `cyrus-setup-router/SKILL.md` sub-skill and
+  follow it. Do **not** run Steps 0–8 of this orchestrator.
+- **Client device** → **Read** the `cyrus-setup-client/SKILL.md` sub-skill and
+  follow it. Do **not** run Steps 0–8 of this orchestrator.
+
+Everything from Step 0 onward in this file is the **Standalone** flow.
 
 ---
 
@@ -209,96 +254,6 @@ Pass the user's package manager preference from Step 0.
 ## Step 8: Launch
 
 **Read** the `cyrus-setup-launch/SKILL.md` sub-skill and follow its instructions.
-
----
-
-## Router Mode Setup (split host + device)
-
-Use this instead of single-host mode when each teammate should run their own
-sessions locally (native `az`/`gh`/SSH/Claude credentials), coordinated by one
-always-on router. There are **two roles** — set up the host once, then each
-device once. Full reference and rationale live in `docs/ROUTER.md`.
-
-Which role am I setting up?
-
-- **Router host** — the shared always-on machine that receives Linear webhooks
-  and coordinates everyone. Follow **Path H**.
-- **Client device** — a teammate's own laptop/workstation that runs their
-  sessions. Follow **Path C**.
-
-### Path H — Router host
-
-Prereqs are the same Linear OAuth app + public webhook URL as single-host: run
-**Steps 1–4** above (prerequisites, Claude auth, endpoint, Linear) to obtain the
-workspace Linear token and webhook secret. Then, instead of Steps 5–8:
-
-1. **Write `~/.cyrus/router-config.json`.** Do NOT read/write files under
-   `~/.cyrus/` directly (secrets) — write it via a `Bash` heredoc the user can
-   review, e.g.:
-
-   ```bash
-   cat > ~/.cyrus/router-config.json <<'JSON'
-   {
-     "port": 8787,
-     "workspaces": {
-       "<linear-organization-id>": { "linearToken": "<workspace-linear-token>" }
-     },
-     "webhook": { "verificationMode": "direct", "secret": "<linear-webhook-secret>" }
-   }
-   JSON
-   chmod 600 ~/.cyrus/router-config.json
-   ```
-
-   Optional keys: `eventTtlMs` (default 48h), `issueLock` (default `true`),
-   `creatorOnlyPrompting` (default `true`), `heartbeatMs`, `host`. See
-   `docs/ROUTER.md` for the field table.
-
-2. **Start the router** (put it behind a process manager + TLS reverse proxy so
-   devices can dial `wss://`):
-
-   ```bash
-   cyrus router start
-   ```
-
-3. **Enroll each teammate — one `users add` per person.** Each call prints a
-   **one-time, 15-minute** enrollment code; hand it to that teammate out-of-band
-   with the router URL:
-
-   ```bash
-   cyrus router users add alice@example.com --name "Alice"
-   ```
-
-   Management: `cyrus router users list|remove <email>`,
-   `cyrus router devices revoke <email>`, `cyrus router unlock <issueId>`.
-
-### Path C — Client device
-
-On the teammate's own machine (no Linear app, no webhook/tunnel setup needed):
-
-1. **Prerequisites + Claude auth.** Run **Steps 1–2** above only.
-
-2. **Connect to the router** using the code from the admin (`<url>` is the
-   router's HTTP(S) origin; the CLI derives `ws://`/`wss://`):
-
-   ```bash
-   cyrus connect https://router.example.com --code <enrollment-code>
-   ```
-
-   This writes `platform: "router"` + a `0600` device token into `config.json`.
-   The code is single-use.
-
-3. **Install + OAuth the official Linear MCP locally, and verify auth health
-   now.** In router mode Cyrus does NOT configure the app-token Linear MCP — the
-   agent's own Linear tool use runs through the teammate's **own** locally-OAuth'd
-   Linear MCP so actions are attributed to them and scoped to their real Linear
-   permissions. Complete the one-time interactive browser OAuth at connect time:
-   a headless session cannot complete a browser flow, so expired/missing auth
-   must surface **at connect / session start**, not mid-run. Confirm the MCP
-   reports healthy auth before continuing; re-run the OAuth if it has expired.
-
-4. **Add repositories** (Step 7 above) and **launch** with `cyrus start`. The
-   device dials the router and begins running the sessions this teammate creates
-   in Linear.
 
 ---
 
