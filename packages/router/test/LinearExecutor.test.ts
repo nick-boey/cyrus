@@ -1,6 +1,6 @@
 import type { IIssueTrackerService } from "cyrus-core";
 import type { RpcRequestFrame } from "cyrus-router-protocol";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LinearExecutor } from "../src/LinearExecutor.js";
 import { RouterStore } from "../src/RouterStore.js";
 
@@ -151,6 +151,24 @@ describe("LinearExecutor.dispatch", () => {
 		expect(first.ok).toBe(true);
 		expect(second).toEqual(first);
 	});
+
+	it("never rejects: a pre-invoke store throw becomes an ok:false response", async () => {
+		// getMutation runs before the invoke — a corrupt row / DB error here must
+		// still return a response frame, never reject across the socket.
+		vi.spyOn(store, "getMutation").mockImplementation(() => {
+			throw new Error("db boom");
+		});
+		const response = await executor.dispatch(
+			DEVICE_A,
+			frame("fetchIssue", ["TEAM-1"], { mutationId: "m9" }),
+		);
+		expect(response).toEqual({
+			type: "rpc_response",
+			id: "req-1",
+			ok: false,
+			error: "db boom",
+		});
+	});
 });
 
 describe("LinearExecutor.postActivity", () => {
@@ -167,5 +185,120 @@ describe("LinearExecutor.postActivity", () => {
 		const { executor, tracker } = makeExecutor();
 		await executor.postActivity("ws-unknown", "s1", "hello");
 		expect(tracker.createAgentActivity).not.toHaveBeenCalled();
+	});
+});
+
+describe("LinearExecutor.downloadAttachment (token host allowlist)", () => {
+	const TOKEN = "secret-linear-token";
+	let store: RouterStore;
+	let executor: LinearExecutor;
+	let fetchMock: ReturnType<typeof vi.fn>;
+
+	function okResponse(): Response {
+		return {
+			ok: true,
+			status: 200,
+			headers: new Headers({
+				"content-type": "image/png",
+				"content-length": "3",
+			}),
+			arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+		} as unknown as Response;
+	}
+
+	/** Authorization header (if any) sent on the Nth fetch call. */
+	function authHeader(callIndex = 0): string | undefined {
+		const init = fetchMock.mock.calls[callIndex]?.[1] as
+			| { headers?: Record<string, string> }
+			| undefined;
+		return init?.headers?.Authorization;
+	}
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+		const tracker: StubTracker = {
+			fetchIssue: vi.fn(),
+			createAgentActivity: vi.fn(),
+		};
+		const trackers = new Map<string, IIssueTrackerService>([
+			[WS, tracker as unknown as IIssueTrackerService],
+		]);
+		executor = new LinearExecutor({
+			trackers,
+			store,
+			workspaceTokens: new Map([[WS, TOKEN]]),
+		});
+		fetchMock = vi.fn(async () => okResponse());
+		vi.stubGlobal("fetch", fetchMock);
+	});
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("sends the Bearer token to a canonical Linear host (uploads.linear.app)", async () => {
+		const res = await executor.dispatch(
+			DEVICE_A,
+			frame("downloadAttachment", ["https://uploads.linear.app/a/file.png"]),
+		);
+		expect(res.ok).toBe(true);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(authHeader()).toBe(`Bearer ${TOKEN}`);
+	});
+
+	it("sends the Bearer token to a *.linear.app subdomain", async () => {
+		const res = await executor.dispatch(
+			DEVICE_A,
+			frame("downloadAttachment", ["https://cdn.linear.app/a/file.png"]),
+		);
+		expect(res.ok).toBe(true);
+		expect(authHeader()).toBe(`Bearer ${TOKEN}`);
+	});
+
+	it("does NOT send the token to an arbitrary attacker host", async () => {
+		const res = await executor.dispatch(
+			DEVICE_A,
+			frame("downloadAttachment", ["https://attacker.example/collect"]),
+		);
+		// External images still download — just without the credential.
+		expect(res.ok).toBe(true);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(authHeader()).toBeUndefined();
+	});
+
+	it("treats lookalike hosts as non-Linear (leading-dot suffix check)", async () => {
+		for (const host of [
+			"https://evil-linear.app/x",
+			"https://uploads.linear.app.attacker.com/x",
+		]) {
+			fetchMock.mockClear();
+			const res = await executor.dispatch(
+				DEVICE_A,
+				frame("downloadAttachment", [host]),
+			);
+			expect(res.ok).toBe(true);
+			expect(authHeader()).toBeUndefined();
+		}
+	});
+
+	it("does NOT send the token over plain http, even to a Linear host", async () => {
+		const res = await executor.dispatch(
+			DEVICE_A,
+			frame("downloadAttachment", ["http://uploads.linear.app/a/file.png"]),
+		);
+		expect(res.ok).toBe(true);
+		expect(authHeader()).toBeUndefined();
+	});
+
+	it("returns ok:false for an unparseable url without fetching", async () => {
+		const res = await executor.dispatch(
+			DEVICE_A,
+			frame("downloadAttachment", ["not a url"]),
+		);
+		expect(res.ok).toBe(false);
+		if (!res.ok) {
+			expect(res.error).toBe("invalid attachment url");
+		}
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });

@@ -107,7 +107,17 @@ export class RouterServer {
 		this.gateway.on("rpc", (deviceId: number, frame: RpcRequestFrame) => {
 			void this.executor
 				.dispatch(deviceId, frame)
-				.then((response) => this.gateway.sendRpcResponse(deviceId, response));
+				.then((response) => this.gateway.sendRpcResponse(deviceId, response))
+				.catch((err: unknown) => {
+					// dispatch() is designed never to reject, but guarantee a response
+					// frame even if it somehow does — never leave a device RPC hanging.
+					this.gateway.sendRpcResponse(deviceId, {
+						type: "rpc_response",
+						id: frame.id,
+						ok: false,
+						error: String(err),
+					});
+				});
 		});
 		this.gateway.on(
 			"sessionState",
@@ -115,9 +125,11 @@ export class RouterServer {
 				this.eventRouter.handleSessionState(deviceId, frame);
 			},
 		);
-		this.gateway.on("deviceConnected", (deviceId: number) => {
-			this.gateway.deliverPending(deviceId);
-		});
+		// NOTE: no "deviceConnected" → deliverPending wiring here. DeviceGateway
+		// already calls this.deliverPending() internally at the end of handleHello
+		// (right after emitting "deviceConnected"), so adding it here would deliver
+		// every queued event twice on reconnect. The gateway owns hello-time
+		// delivery — do not re-add.
 	}
 
 	/** Actual bound TCP port (useful after `start({ port: 0 })`). */
