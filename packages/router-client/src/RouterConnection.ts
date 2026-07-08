@@ -95,9 +95,26 @@ interface PersistedState {
  *    consumer dispatch replays the event on the next startup rather than
  *    dropping it (Codex finding 3).
  *  - Issues RPCs with a pending map + per-call timeout.
- *  - Buffers mutating RPCs while offline (`bufferedRpc`) to a durable JSONL
- *    file and replays them FIFO — carrying a stable `mutationId` so the router
+ *  - Buffers mutating RPCs while offline (`bufferedRpc`) — and now also when a
+ *    mid-call router outage rejects an in-flight RPC retryably — to a durable
+ *    JSONL file, replaying them FIFO with a stable `mutationId` so the router
  *    dedupes idempotent replays (finding 4).
+ *
+ * ── CONSUMER CONTRACT for the "event" listener (read before wiring this up) ──
+ * The `"event"` listener MUST be attached synchronously, before/around
+ * `connect()`, and MUST complete its durable handoff **synchronously within the
+ * emit** (i.e. before the listener returns). This is load-bearing:
+ *  - `lastAckedSeq` is persisted and the durable inbox entry is marked
+ *    processed **immediately after `emit("event", …)` returns**. A listener that
+ *    returns a still-pending promise (async handoff) can lose the event if the
+ *    process crashes mid-dispatch, because the inbox entry may already be gone.
+ *  - If `emit("event", …)` reaches **zero** listeners it returns `false`; in
+ *    that case the inbox entry is deliberately left unprocessed on disk (and a
+ *    warning is logged) so it survives to the next startup/replay rather than
+ *    being silently dropped. Attaching the listener a tick late therefore
+ *    delays — but never loses — the event.
+ * (Task 12's RouterEventTransport/EdgeWorker integration depends on honoring
+ * this: do the durable write inside the listener body, synchronously.)
  */
 export class RouterConnection extends EventEmitter {
 	private readonly wsUrl: string;
@@ -179,14 +196,33 @@ export class RouterConnection extends EventEmitter {
 	 * resolve immediately with a synthetic `{ success: true }` payload
 	 * (compatible with AgentActivityPayload — LinearActivitySink reads
 	 * `.success`). Replayed FIFO on reconnect with the same `mutationId`.
+	 *
+	 * Mid-call outage: if the connection is online at call time but the socket
+	 * drops (or the call times out) WHILE the RPC is in flight, `sendRpc`
+	 * rejects with a *retryable* `RouterRpcError`. Rather than lose the mutation
+	 * (the activity post), we durably buffer it and resolve with the same
+	 * synthetic `{ success: true }` — the router dedupes by the shared
+	 * `mutationId`, so a partially-delivered-then-replayed call is idempotent. A
+	 * non-retryable rejection is a genuine server-side `{ok:false}` and still
+	 * rejects.
 	 */
-	bufferedRpc(method: string, params: unknown[]): Promise<unknown> {
+	async bufferedRpc(method: string, params: unknown[]): Promise<unknown> {
 		const mutationId = randomUUID();
 		if (this.isOnline()) {
-			return this.sendRpc(method, params, mutationId);
+			try {
+				return await this.sendRpc(method, params, mutationId);
+			} catch (err) {
+				if (err instanceof RouterRpcError && err.retryable) {
+					// Mid-call router outage (disconnect/timeout): buffer for replay
+					// instead of dropping the mutation. Idempotent via mutationId.
+					this.appendOutboundEntry({ mutationId, method, params });
+					return { success: true };
+				}
+				throw err;
+			}
 		}
 		this.appendOutboundEntry({ mutationId, method, params });
-		return Promise.resolve({ success: true });
+		return { success: true };
 	}
 
 	/** Sends a session_state frame (best-effort; dropped if offline). */
@@ -310,7 +346,19 @@ export class RouterConnection extends EventEmitter {
 		}
 		this._connected = false;
 		this.teardownSocket();
-		this.emit("error", new Error(`hello rejected: ${frame.reason}`));
+		const error = new Error(`hello rejected: ${frame.reason}`);
+		// Node's EventEmitter THROWS on `emit("error")` when there is no "error"
+		// listener — that would turn this fatal-but-expected bad-token case into
+		// an uncaught exception that crashes the whole EdgeWorker process. Guard
+		// it: emit if someone is listening, otherwise log. Either way we stay
+		// stopped (no reconnect).
+		if (this.listenerCount("error") > 0) {
+			this.emit("error", error);
+		} else {
+			console.error(
+				`[RouterConnection] fatal (no error listener attached; not reconnecting): ${error.message}`,
+			);
+		}
 	}
 
 	private onEvent(frame: EventFrame): void {
@@ -325,10 +373,23 @@ export class RouterConnection extends EventEmitter {
 		this.sendAck(frame.seq);
 		this.lastAckedSeq = frame.seq;
 		this.persistLastAckedSeq(frame.seq);
-		this.emit("event", frame.event, frame.seq);
+		// CONSUMER CONTRACT (see class doc): the "event" listener must complete
+		// its durable handoff synchronously within this emit — the inbox entry is
+		// marked processed the instant emit returns.
+		const delivered = this.emit("event", frame.event, frame.seq);
 		// If we were shut down/closed during the emit (e.g. a crash), leave the
 		// entry unprocessed so it replays on the next startup.
-		if (!this.stopped) this.markInboxProcessed(frame.seq);
+		if (this.stopped) return;
+		if (delivered) {
+			this.markInboxProcessed(frame.seq);
+		} else {
+			// Zero "event" listeners: do NOT mark processed — leave the entry on
+			// disk so it survives to the next startup/replay rather than being
+			// silently dropped (already acked, so the router won't resend it).
+			console.warn(
+				`[RouterConnection] inbox event seq=${frame.seq} had no consumer; kept on disk for replay`,
+			);
+		}
 	}
 
 	private onRpcResponse(frame: RpcResponseFrame): void {
@@ -396,9 +457,19 @@ export class RouterConnection extends EventEmitter {
 				// it replays on the next reconnect with the same mutationId.
 				if (err instanceof RouterRpcError && err.retryable) return;
 				// Non-retryable (server rejected): the call was delivered, so drop
-				// it to avoid an infinite replay loop.
+				// it below to avoid an infinite replay loop.
 			}
-			this.removeOutboundEntry(entry.mutationId);
+			// Remove the (delivered or server-rejected) entry. Guard the disk I/O:
+			// this method is `void`-ed from onHelloAck, so a write/rename failure
+			// here would otherwise become an UNHANDLED promise rejection.
+			try {
+				this.removeOutboundEntry(entry.mutationId);
+			} catch (err) {
+				console.error(
+					`[RouterConnection] failed to remove replayed outbound entry ${entry.mutationId}:`,
+					err,
+				);
+			}
 		}
 	}
 
@@ -407,9 +478,19 @@ export class RouterConnection extends EventEmitter {
 	private replayInbox(): void {
 		const surviving = [...this.inboxEntries];
 		for (const entry of surviving) {
-			this.emit("event", entry.event, entry.seq);
+			const delivered = this.emit("event", entry.event, entry.seq);
 			if (this.stopped) return;
-			this.markInboxProcessed(entry.seq);
+			if (delivered) {
+				this.markInboxProcessed(entry.seq);
+			} else {
+				// No "event" consumer attached yet: leave the entry unprocessed so
+				// it replays on the next startup rather than being silently dropped
+				// (e.g. the consumer attached its listener a tick late). We do NOT
+				// loop/retry here — the entry simply stays on disk for next time.
+				console.warn(
+					`[RouterConnection] inbox replay for seq=${entry.seq} had no consumer; kept on disk for next replay`,
+				);
+			}
 		}
 	}
 

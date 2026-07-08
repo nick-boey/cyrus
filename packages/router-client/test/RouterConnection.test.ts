@@ -348,4 +348,109 @@ describe("RouterConnection", () => {
 		expect(conn.connected).toBe(false);
 		conn.close();
 	});
+
+	it("(i) bufferedRpc buffers the mutation when the socket drops mid-call", async () => {
+		const conn = makeConn();
+		conn.connect();
+		await once(conn, "connected");
+
+		// The server accepts the rpc frame but closes without replying — a
+		// mid-call router outage. sendRpc will reject retryably; the mutation must
+		// be durably buffered rather than lost.
+		let sawRpc = false;
+		router.onFrame = (ws, frame) => {
+			if (frame.type === "rpc_request") {
+				sawRpc = true;
+				ws.close();
+			}
+		};
+
+		const result = await conn.bufferedRpc("createAgentActivity", [{ a: 1 }]);
+		expect(result).toEqual({ success: true });
+		expect(sawRpc).toBe(true);
+
+		// The outbound buffer now holds the entry (the whole point of bufferedRpc).
+		const buffered = readJsonl(
+			join(stateDir, "outbound-buffer.jsonl"),
+		) as Array<{ mutationId: string; method: string }>;
+		expect(buffered).toHaveLength(1);
+		expect(buffered[0]?.method).toBe("createAgentActivity");
+		const bufferedMutationId = buffered[0]?.mutationId;
+		expect(bufferedMutationId).toBeTruthy();
+
+		// On auto-reconnect it replays with the SAME mutationId (idempotent).
+		const replayed: RpcRequestFrame[] = [];
+		router.onFrame = (ws, frame) => {
+			if (frame.type === "rpc_request") {
+				replayed.push(frame);
+				router.rpcOk(ws, frame.id, { ok: 1 });
+			}
+		};
+		await vi.waitFor(() => expect(replayed).toHaveLength(1));
+		expect(replayed[0]?.mutationId).toBe(bufferedMutationId);
+
+		// Buffer drained after the replay resolves.
+		await vi.waitFor(() =>
+			expect(readJsonl(join(stateDir, "outbound-buffer.jsonl"))).toHaveLength(
+				0,
+			),
+		);
+		conn.close();
+	});
+
+	it("(j) inbox replay with no event listener keeps the entry on disk (not dropped)", async () => {
+		// Seed a durable inbox entry as if a prior crash left it unprocessed.
+		writeFileSync(
+			join(stateDir, "inbox.jsonl"),
+			`${JSON.stringify({ seq: 5, event: { prompt: "hi" } })}\n`,
+		);
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		// Deliberately attach NO "event" listener before connect.
+		const conn = makeConn();
+		conn.connect();
+		await once(conn, "connected");
+		// Let the microtask-scheduled replay run.
+		await new Promise((r) => setTimeout(r, 20));
+
+		// The event had no consumer, so it must survive on disk, and be warned.
+		expect(readJsonl(join(stateDir, "inbox.jsonl"))).toHaveLength(1);
+		expect(warn).toHaveBeenCalled();
+		conn.close();
+		warn.mockRestore();
+
+		// A later run WITH a listener drains it.
+		const conn2 = makeConn();
+		const seen: Array<{ event: unknown; seq: number }> = [];
+		conn2.on("event", (event: unknown, seq: number) => {
+			seen.push({ event, seq });
+		});
+		conn2.connect();
+		await once(conn2, "event");
+		expect(seen).toEqual([{ event: { prompt: "hi" }, seq: 5 }]);
+		expect(readJsonl(join(stateDir, "inbox.jsonl"))).toHaveLength(0);
+		conn2.close();
+	});
+
+	it("(k) hello_error with no error listener does not throw and stops reconnecting", async () => {
+		router.rejectHello = true;
+		const err = vi.spyOn(console, "error").mockImplementation(() => {});
+		const conn = makeConn();
+		// No "error" listener attached — emit("error") would otherwise throw.
+		conn.connect();
+
+		// The hello is sent and rejected; the process must survive.
+		await vi.waitFor(() =>
+			expect(router.hellos.length).toBeGreaterThanOrEqual(1),
+		);
+		await vi.waitFor(() => expect(err).toHaveBeenCalled());
+
+		// No further hello attempts after the fatal error (reconnect stopped).
+		const hellosAfter = router.hellos.length;
+		await new Promise((r) => setTimeout(r, 60));
+		expect(router.hellos.length).toBe(hellosAfter);
+		expect(conn.connected).toBe(false);
+		conn.close();
+		err.mockRestore();
+	});
 });
