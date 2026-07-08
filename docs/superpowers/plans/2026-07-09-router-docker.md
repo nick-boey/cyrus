@@ -313,7 +313,7 @@ git commit -m "feat(docker): env-driven entrypoint for the router container"
 
 - [ ] **Step 1: Write the root `.dockerignore`**
 
-Keep every workspace `package.json` in context (pnpm's `--frozen-lockfile` validates the full importer set against `pnpm-lock.yaml`, so do NOT exclude any `apps/*` or `packages/*` directory wholesale):
+Keep every workspace `package.json` in context (pnpm's `--frozen-lockfile` validates the full importer set against `pnpm-lock.yaml`, so do NOT exclude any `apps/*` or `packages/*` directory wholesale). `skills/` must also stay in context: `packages/edge-worker/cyrus-skills-plugin/skills/*` are symlinks into it and the edge-worker build (`cp -rL`) dereferences them:
 
 ```
 .git
@@ -326,7 +326,6 @@ node_modules
 docs
 spec
 code
-skills
 .claude
 .codex
 .opencode
