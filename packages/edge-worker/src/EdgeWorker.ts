@@ -3510,6 +3510,23 @@ ${taskSection}`;
 	}
 
 	/**
+	 * Derive the git branch name for an issue exactly the way
+	 * GitService.createSingleRepoWorktree does (`issue.branchName` when set,
+	 * otherwise `<identifier>-<slugified-title-30-chars>`). Used by
+	 * pre-teardown WIP push so the push targets the same branch the worktree
+	 * was actually created on, even when Linear didn't suggest a branch name.
+	 */
+	private deriveWorktreeBranchName(issue: IssueMinimal): string {
+		return (
+			issue.branchName ||
+			`${issue.identifier}-${issue.title
+				.toLowerCase()
+				.replace(/\s+/g, "-")
+				.substring(0, 30)}`
+		);
+	}
+
+	/**
 	 * Handle issue state change message (terminal state reached).
 	 * Stops active sessions and deletes worktrees for the issue.
 	 */
@@ -3562,10 +3579,18 @@ ${taskSection}`;
 		// issue via GitService.remoteBranchExists (worktree continuity). A push
 		// failure must never block cleanup — log a warning and continue.
 		if (teardownRepositories.length > 0) {
-			const rawBranchName = sessions.find(
-				(session) => session.issue?.branchName,
-			)?.issue?.branchName;
-			if (rawBranchName) {
+			// A session's `issue.branchName` can be empty even when an issue is
+			// attached (Linear doesn't always suggest one) — GitService's own
+			// worktree creation falls back to a derived name in that case
+			// (see createSingleRepoWorktree), so mirror that fallback here via
+			// deriveWorktreeBranchName rather than requiring a truthy
+			// branchName, which would otherwise silently skip this push for any
+			// issue Linear didn't suggest a branch name for.
+			const sessionWithIssue = sessions.find((session) => session.issue);
+			if (sessionWithIssue?.issue) {
+				const rawBranchName = this.deriveWorktreeBranchName(
+					sessionWithIssue.issue,
+				);
 				const branchName = this.gitService.sanitizeBranchName(rawBranchName);
 				// Mirrors the worktree layout GitService.deleteWorktree resolves
 				// internally: single repo -> workspace root IS the worktree;
@@ -3587,6 +3612,15 @@ ${taskSection}`;
 						);
 					}
 				}
+			} else {
+				// No session carries any issue data at all (e.g. only
+				// standalone/no-issue sessions were found for this issueId) —
+				// there is no branch name to derive from, so the push is
+				// genuinely un-performable. Warn rather than silently
+				// stranding any uncommitted WIP.
+				this.logger.warn(
+					`Skipping pre-teardown WIP push for ${message.workItemIdentifier}: no session has issue data to derive a branch name from`,
+				);
 			}
 		}
 
