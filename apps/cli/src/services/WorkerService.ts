@@ -246,9 +246,6 @@ export class WorkerService {
 			// User access control configuration
 			userAccessControl: edgeConfig.userAccessControl,
 			sandbox: edgeConfig.sandbox,
-			// Multi-user credential profiles
-			users: edgeConfig.users,
-			gitCommitAuthor: edgeConfig.gitCommitAuthor,
 			handlers: {
 				createWorkspace: async (
 					issue: Issue,

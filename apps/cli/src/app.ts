@@ -14,7 +14,6 @@ import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
 import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
 import { SelfAuthCommand } from "./commands/SelfAuthCommand.js";
 import { StartCommand } from "./commands/StartCommand.js";
-import { UsersCommand } from "./commands/UsersCommand.js";
 import { createErrorReporter } from "./services/createErrorReporter.js";
 
 // Get the directory of the current module for reading package.json
@@ -164,42 +163,6 @@ program
 			await new SelfAddRepoCommand(app).execute(args);
 		},
 	);
-
-// Users command - manage per-user credential profiles (multi-user mode)
-const usersCommand = program
-	.command("users")
-	.description(
-		"Manage per-user credential profiles (multi-user mode). Sessions started by a registered Linear user run with that user's Claude/Codex/GitHub credentials.",
-	);
-const makeUsersAction =
-	(...prefix: string[]) =>
-	async (...actionArgs: unknown[]) => {
-		const opts = program.opts();
-		const app = new Application(
-			opts.cyrusHome,
-			opts.envFile,
-			packageJson.version,
-			errorReporter,
-		);
-		const positional = actionArgs.filter(
-			(a): a is string => typeof a === "string",
-		);
-		await new UsersCommand(app).execute([...prefix, ...positional]);
-	};
-usersCommand
-	.command("add")
-	.description(
-		"Register a user's Claude/Codex/GitHub credentials interactively",
-	)
-	.action(makeUsersAction("add"));
-usersCommand
-	.command("list")
-	.description("List registered users (no secrets shown)")
-	.action(makeUsersAction("list"));
-usersCommand
-	.command("remove <email>")
-	.description("Remove a user from the registry (credential files are kept)")
-	.action(makeUsersAction("remove"));
 
 // Parse and execute
 (async () => {
