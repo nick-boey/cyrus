@@ -25,6 +25,7 @@ import type {
 	FileUploadRequest,
 	FileUploadResponse,
 	Issue,
+	IssueRelationSummary,
 	IssueTrackerAgentSession,
 	IssueTrackerAgentSessionPayload,
 	IssueUpdateInput,
@@ -261,6 +262,28 @@ export interface IIssueTrackerService {
 	fetchIssueAttachments(
 		issueId: string,
 	): Promise<Array<{ title: string; url: string }>>;
+
+	/**
+	 * Fetch an issue's inverse relations (relations where this issue is the
+	 * *related* issue) with each relation's issues already resolved.
+	 *
+	 * @param issueId - Issue UUID or identifier
+	 * @returns The inverse relations, with resolved `issue`/`relatedIssue`
+	 *
+	 * @example
+	 * ```typescript
+	 * const relations = await service.fetchIssueInverseRelations(issue.id);
+	 * const blockers = relations.filter((r) => r.type === 'blocks');
+	 * ```
+	 *
+	 * @remarks
+	 * Exists so callers never have to touch `Issue.inverseRelations()`, whose
+	 * `IssueRelation.issue` is a lazily-resolved `Promise` that cannot survive a
+	 * JSON transport (it serializes to `{}`). Implementations resolve those
+	 * promises before returning, yielding the wire-safe
+	 * {@link IssueRelationSummary}.
+	 */
+	fetchIssueInverseRelations(issueId: string): Promise<IssueRelationSummary[]>;
 
 	// ========================================================================
 	// COMMENT OPERATIONS

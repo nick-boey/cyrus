@@ -169,6 +169,28 @@ describe("LinearExecutor.dispatch", () => {
 			error: "db boom",
 		});
 	});
+
+	// Dispatch checks the RPC_METHODS allowlist before reflecting onto the
+	// tracker, so a method absent from that list is rejected at runtime even
+	// though it typechecks against the interface.
+	it("dispatches fetchIssueInverseRelations (i.e. it is on the allowlist)", async () => {
+		const relations = [
+			{ id: "rel-1", type: "blocks", issue: { id: "blocker" } },
+		];
+		const stub = tracker as unknown as Record<string, unknown>;
+		stub.fetchIssueInverseRelations = vi.fn(async () => relations);
+
+		const response = await executor.dispatch(
+			DEVICE_A,
+			frame("fetchIssueInverseRelations", ["issue-uuid"]),
+		);
+
+		expect(response.ok).toBe(true);
+		if (response.ok) {
+			expect(response.result).toEqual(relations);
+		}
+		expect(stub.fetchIssueInverseRelations).toHaveBeenCalledWith("issue-uuid");
+	});
 });
 
 describe("LinearExecutor.postActivity", () => {

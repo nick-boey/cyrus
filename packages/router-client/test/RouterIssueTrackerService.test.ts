@@ -158,3 +158,237 @@ describe("RouterEventTransport", () => {
 		expect((conn as unknown as EventEmitter).listenerCount("event")).toBe(1);
 	});
 });
+
+/**
+ * The router serializes issues to JSON, which strips every lazy member of
+ * `Issue` — the five async getters and six methods all live on the SDK class's
+ * prototype. These tests pin the reconstruction.
+ *
+ * The two failure modes they guard against were both observed in production:
+ *   - `TypeError: issue.labels is not a function` (methods vanish outright)
+ *   - `await issue.team` → `undefined` (getters vanish *silently*, because
+ *     `await undefined` is `undefined`, so the caller concludes "no team")
+ */
+describe("RouterIssueTrackerService issue hydration", () => {
+	/** The data-only payload a real router sends for an issue. */
+	const RAW_ISSUE = {
+		id: "issue-uuid",
+		identifier: "PAR-87",
+		title: "Add slash commands",
+		description: "body",
+		url: "https://linear.app/x/issue/PAR-87",
+		branchName: "nboey/par-87",
+		assigneeId: "user-1",
+		stateId: "state-1",
+		teamId: "team-1",
+		parentId: "parent-1",
+		labelIds: ["label-1", "label-2"],
+		priority: 0,
+	};
+
+	/** Routes each RPC method to a canned payload, and records the calls. */
+	function makeRoutingConnection(overrides: Record<string, unknown> = {}) {
+		const responses: Record<string, unknown> = {
+			fetchIssue: RAW_ISSUE,
+			fetchWorkflowState: { id: "state-1", name: "In Progress" },
+			fetchUser: { id: "user-1", name: "Nick" },
+			fetchTeam: { id: "team-1", key: "PAR", name: "Parrot" },
+			fetchLabel: { id: "label-1", name: "bug" },
+			fetchIssueAttachments: [{ title: "Sentry", url: "https://sentry.io/1" }],
+			fetchComments: { nodes: [{ id: "c1", body: "hi" }] },
+			fetchIssueChildren: { ...RAW_ISSUE, children: [], childCount: 0 },
+			fetchIssueInverseRelations: [],
+			updateIssue: RAW_ISSUE,
+			...overrides,
+		};
+		const calls: Array<{ method: string; params: unknown[] }> = [];
+		const rpc = vi.fn(async (method: string, params: unknown[]) => {
+			calls.push({ method, params });
+			if (!(method in responses)) throw new Error(`unstubbed rpc: ${method}`);
+			return responses[method];
+		});
+		return { conn: { rpc, bufferedRpc: vi.fn(), on: vi.fn() }, calls };
+	}
+
+	function makeService(overrides?: Record<string, unknown>) {
+		const { conn, calls } = makeRoutingConnection(overrides);
+		const svc = new RouterIssueTrackerService(
+			conn as unknown as RouterConnection,
+			"ws-1",
+		);
+		return { svc, conn, calls };
+	}
+
+	it("preserves the raw data fields", async () => {
+		const { svc } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		expect(issue.id).toBe("issue-uuid");
+		expect(issue.identifier).toBe("PAR-87");
+		expect(issue.title).toBe("Add slash commands");
+	});
+
+	// Regression: `await issue.team` silently yielded undefined, so EdgeWorker
+	// logged "No team found" and never moved the issue to In Progress.
+	it("resolves the team getter through fetchTeam instead of yielding undefined", async () => {
+		const { svc, conn } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		const team = await issue.team;
+
+		expect(team).toBeDefined();
+		expect(team?.key).toBe("PAR");
+		expect(conn.rpc).toHaveBeenCalledWith("fetchTeam", ["ws-1", "team-1"]);
+	});
+
+	it("resolves the state getter through fetchWorkflowState", async () => {
+		const { svc } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		expect((await issue.state)?.name).toBe("In Progress");
+	});
+
+	it("resolves the assignee getter through fetchUser", async () => {
+		const { svc } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		expect((await issue.assignee)?.name).toBe("Nick");
+	});
+
+	it("resolves the parent getter through fetchIssue", async () => {
+		const { svc, conn } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		const parent = await issue.parent;
+
+		expect(parent?.id).toBe("issue-uuid");
+		expect(conn.rpc).toHaveBeenCalledWith("fetchIssue", ["ws-1", "parent-1"]);
+	});
+
+	it("returns undefined for getters whose id is absent, without an RPC", async () => {
+		const { svc, conn } = makeService({
+			fetchIssue: {
+				...RAW_ISSUE,
+				teamId: null,
+				assigneeId: null,
+				parentId: null,
+			},
+		});
+		const issue = await svc.fetchIssue("PAR-87");
+
+		expect(issue.team).toBeUndefined();
+		expect(issue.assignee).toBeUndefined();
+		expect(issue.parent).toBeUndefined();
+		expect(conn.rpc).not.toHaveBeenCalledWith("fetchTeam", expect.anything());
+	});
+
+	it("memoizes a getter so repeated reads cost one round trip", async () => {
+		const { svc, calls } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		await issue.state;
+		await issue.state;
+		await issue.state;
+
+		expect(calls.filter((c) => c.method === "fetchWorkflowState")).toHaveLength(
+			1,
+		);
+	});
+
+	// Regression: `TypeError: issue.labels is not a function`
+	it("rebuilds labels() as real Label objects from labelIds", async () => {
+		const { svc, calls } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		const labels = await issue.labels();
+
+		expect(labels.nodes).toHaveLength(2);
+		expect(labels.nodes[0]?.name).toBe("bug");
+		expect(calls.filter((c) => c.method === "fetchLabel")).toHaveLength(2);
+	});
+
+	// Regression: `TypeError: issue.attachments is not a function`
+	it("rebuilds attachments() with title and url", async () => {
+		const { svc } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		const attachments = await issue.attachments();
+
+		expect(attachments.nodes).toEqual([
+			{ title: "Sentry", url: "https://sentry.io/1" },
+		]);
+	});
+
+	it("rebuilds comments()", async () => {
+		const { svc } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		expect((await issue.comments()).nodes[0]?.body).toBe("hi");
+	});
+
+	// Regression: `TypeError: issue.inverseRelations is not a function`.
+	// The relation's `issue` is a Promise on the type, which JSON-serializes to
+	// `{}` — so the router sends resolved data and the client re-wraps it.
+	it("rebuilds inverseRelations() with awaitable, hydrated relation issues", async () => {
+		const { svc } = makeService({
+			fetchIssueInverseRelations: [
+				{
+					id: "rel-1",
+					type: "blocks",
+					issue: { ...RAW_ISSUE, id: "blocker", identifier: "PAR-1" },
+					relatedIssue: undefined,
+				},
+			],
+		});
+		const issue = await svc.fetchIssue("PAR-87");
+
+		const relations = await issue.inverseRelations();
+
+		expect(relations.nodes).toHaveLength(1);
+		expect(relations.nodes[0]?.type).toBe("blocks");
+
+		// The exact access pattern PromptBuilder.fetchBlockingIssues uses.
+		const blocking = await relations.nodes[0]?.issue;
+		expect(blocking?.identifier).toBe("PAR-1");
+		// …and the relation's issue is itself hydrated, not a bare payload.
+		expect(typeof blocking?.labels).toBe("function");
+	});
+
+	it("hydrates children returned by fetchIssueChildren", async () => {
+		const { svc } = makeService({
+			fetchIssueChildren: {
+				...RAW_ISSUE,
+				children: [{ ...RAW_ISSUE, id: "kid", identifier: "PAR-88" }],
+				childCount: 1,
+			},
+		});
+
+		const withChildren = await svc.fetchIssueChildren("PAR-87");
+
+		expect(withChildren.childCount).toBe(1);
+		const child = withChildren.children[0];
+		expect(child?.identifier).toBe("PAR-88");
+		expect(typeof child?.labels).toBe("function");
+		expect(await child?.team).toBeDefined();
+	});
+
+	it("hydrates the issue returned by updateIssue", async () => {
+		const { svc } = makeService();
+
+		const updated = await svc.updateIssue("issue-uuid", { title: "x" });
+
+		expect(typeof updated.labels).toBe("function");
+		expect(await updated.team).toBeDefined();
+	});
+
+	it("fetchIssueInverseRelations prepends the workspace id", async () => {
+		const { svc, conn } = makeService();
+
+		await svc.fetchIssueInverseRelations("issue-uuid");
+
+		expect(conn.rpc).toHaveBeenCalledWith("fetchIssueInverseRelations", [
+			"ws-1",
+			"issue-uuid",
+		]);
+	});
+});

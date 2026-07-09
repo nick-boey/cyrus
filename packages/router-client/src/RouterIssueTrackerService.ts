@@ -25,6 +25,8 @@ import type {
 	IAgentEventTransport,
 	IIssueTrackerService,
 	Issue,
+	IssueRelation,
+	IssueRelationSummary,
 	IssueUpdateInput,
 	IssueWithChildren,
 	Label,
@@ -35,6 +37,45 @@ import type {
 } from "cyrus-core";
 import type { RouterConnection } from "./RouterConnection.js";
 import { RouterEventTransport } from "./RouterEventTransport.js";
+
+/**
+ * The data-only shape of an `Issue` as it arrives off the wire.
+ *
+ * `Issue` is `Pick<LinearSDK.Issue, …plain fields>` intersected with lazy
+ * members — five async getters (`state`, `assignee`, `team`, `parent`,
+ * `project`) and six methods (`labels()`, `comments()`, `attachments()`,
+ * `children()`, `inverseRelations()`, `update()`). Those live on the SDK class's
+ * prototype, so `JSON.stringify` drops every one of them; only own enumerable
+ * properties survive. `parentId`/`projectId` are absent from `Issue`'s `Pick`
+ * but *are* set as own properties by the SDK constructor, so they do arrive —
+ * which is what makes the `parent`/`project` getters rebuildable.
+ */
+type RawIssue = Pick<
+	Issue,
+	| "id"
+	| "identifier"
+	| "title"
+	| "description"
+	| "url"
+	| "branchName"
+	| "assigneeId"
+	| "stateId"
+	| "teamId"
+	| "labelIds"
+	| "priority"
+	| "createdAt"
+	| "updatedAt"
+	| "archivedAt"
+> & {
+	parentId?: string | null;
+	projectId?: string | null;
+};
+
+/** The wire form of `fetchIssueChildren`, before its issues are hydrated. */
+type RawIssueWithChildren = RawIssue & {
+	children: RawIssue[];
+	childCount: number;
+};
 
 /**
  * Forwards every `IIssueTrackerService` method to the router as
@@ -65,33 +106,195 @@ export class RouterIssueTrackerService implements IIssueTrackerService {
 	) {}
 
 	// ========================================================================
+	// ISSUE HYDRATION
+	// ========================================================================
+
+	/**
+	 * Rebuilds an `Issue`'s lazy members on top of the data-only payload the
+	 * router sends, backing each one with an RPC.
+	 *
+	 * Without this, `fetchIssue` would satisfy its `Promise<Issue>` signature by
+	 * a cast alone while returning an object that has none of `Issue`'s methods.
+	 * Callers that reach for one get a runtime `TypeError` (`issue.labels is not
+	 * a function`), and callers that read an async getter get the quieter,
+	 * nastier failure: `await undefined` is `undefined`, so `await issue.team`
+	 * silently yields nothing and the caller concludes the issue has no team.
+	 *
+	 * Each getter is memoized per hydrated issue, so re-reading `issue.state`
+	 * costs one round trip rather than one per access.
+	 */
+	private hydrateIssue(raw: RawIssue): Issue {
+		const memo = new Map<string, Promise<unknown>>();
+		const once = <T>(key: string, load: () => Promise<T>): Promise<T> => {
+			const cached = memo.get(key) as Promise<T> | undefined;
+			if (cached) return cached;
+			const pending = load();
+			memo.set(key, pending);
+			return pending;
+		};
+
+		// Getters in an object literal bind `this` to the literal, not the service,
+		// so capture the service explicitly.
+		const self = this;
+
+		// `Issue`'s getters are typed against the Linear SDK's own WorkflowState /
+		// User / Team / Issue classes, while these RPCs resolve `cyrus-core`'s
+		// structural equivalents. The casts bridge exactly that gap — the same
+		// trade this class already makes for every other method. `router-client`
+		// deliberately does not depend on @linear/sdk, so the SDK types are
+		// referenced indirectly via `Issue[...]`.
+		const hydrated: Issue = {
+			...raw,
+
+			get state(): Issue["state"] {
+				if (!raw.stateId) return undefined;
+				return once("state", () =>
+					self.fetchWorkflowState(raw.stateId as string),
+				) as unknown as Issue["state"];
+			},
+
+			get assignee(): Issue["assignee"] {
+				if (!raw.assigneeId) return undefined;
+				return once("assignee", () =>
+					self.fetchUser(raw.assigneeId as string),
+				) as unknown as Issue["assignee"];
+			},
+
+			get team(): Issue["team"] {
+				if (!raw.teamId) return undefined;
+				return once("team", () =>
+					self.fetchTeam(raw.teamId as string),
+				) as unknown as Issue["team"];
+			},
+
+			get parent(): Issue["parent"] {
+				if (!raw.parentId) return undefined;
+				return once("parent", () =>
+					self.fetchIssue(raw.parentId as string),
+				) as unknown as Issue["parent"];
+			},
+
+			/**
+			 * No `fetchProject` RPC exists, so this stays `undefined` rather than
+			 * inventing one. `undefined` is a legal value for `Issue["project"]`
+			 * and matches what an issue with no project returns.
+			 */
+			get project(): Issue["project"] {
+				return undefined;
+			},
+
+			/**
+			 * Rebuilt from `labelIds` via `fetchLabel`, which yields real `Label`
+			 * objects. The `getIssueLabels` RPC returns names only and could not
+			 * satisfy `Connection<Label>`.
+			 */
+			labels: async (): Promise<Connection<Label>> => {
+				const ids = raw.labelIds ?? [];
+				const nodes = await Promise.all(ids.map((id) => this.fetchLabel(id)));
+				return { nodes };
+			},
+
+			/**
+			 * The `fetchIssueAttachments` RPC returns `{ title, url }` only, so the
+			 * reconstructed nodes carry just those two fields — every other
+			 * `Attachment` property is absent. That is what the one caller
+			 * (`AttachmentService`) reads.
+			 */
+			attachments: async () => {
+				const list = await this.fetchIssueAttachments(raw.id);
+				return { nodes: list } as unknown as Awaited<
+					ReturnType<Issue["attachments"]>
+				>;
+			},
+
+			children: async (): Promise<Connection<Issue>> => {
+				const withChildren = await this.fetchIssueChildren(raw.id);
+				return { nodes: withChildren.children };
+			},
+
+			comments: async (): Promise<Connection<Comment>> =>
+				this.fetchComments(raw.id),
+
+			inverseRelations: async (): Promise<Connection<IssueRelation>> => {
+				const summaries = await this.fetchIssueInverseRelations(raw.id);
+				return { nodes: summaries.map((s) => this.hydrateRelation(s)) };
+			},
+
+			update: async (input) => {
+				const updated = await this.updateIssue(
+					raw.id,
+					input as IssueUpdateInput,
+				);
+				return { success: true, issue: updated } as unknown as Awaited<
+					ReturnType<Issue["update"]>
+				>;
+			},
+		};
+
+		return hydrated;
+	}
+
+	/**
+	 * Restores an `IssueRelation` from its wire-safe summary: the router resolved
+	 * `issue`/`relatedIssue` to plain data (a `Promise` serializes to `{}`), and
+	 * `IssueRelation` declares them as promises, so re-wrap each hydrated issue.
+	 */
+	private hydrateRelation(summary: IssueRelationSummary): IssueRelation {
+		return {
+			id: summary.id,
+			type: summary.type,
+			createdAt: summary.createdAt,
+			updatedAt: summary.updatedAt,
+			archivedAt: summary.archivedAt,
+			issue: summary.issue
+				? Promise.resolve(this.hydrateIssue(summary.issue as RawIssue))
+				: undefined,
+			relatedIssue: summary.relatedIssue
+				? Promise.resolve(this.hydrateIssue(summary.relatedIssue as RawIssue))
+				: undefined,
+		};
+	}
+
+	// ========================================================================
 	// ISSUE OPERATIONS
 	// ========================================================================
 
-	fetchIssue(idOrIdentifier: string): Promise<Issue> {
-		return this.connection.rpc("fetchIssue", [
+	async fetchIssue(idOrIdentifier: string): Promise<Issue> {
+		const raw = (await this.connection.rpc("fetchIssue", [
 			this.workspaceId,
 			idOrIdentifier,
-		]) as Promise<Issue>;
+		])) as RawIssue;
+		return this.hydrateIssue(raw);
 	}
 
-	fetchIssueChildren(
+	async fetchIssueChildren(
 		issueId: string,
 		options?: FetchChildrenOptions,
 	): Promise<IssueWithChildren> {
-		return this.connection.rpc("fetchIssueChildren", [
+		const raw = (await this.connection.rpc("fetchIssueChildren", [
 			this.workspaceId,
 			issueId,
 			options,
-		]) as Promise<IssueWithChildren>;
+		])) as RawIssueWithChildren;
+		// Hydrate the parent *and* each child: children are `Issue`s, so a caller
+		// reading `child.state` must get a promise, not `undefined`.
+		return {
+			...this.hydrateIssue(raw),
+			children: (raw.children ?? []).map((child) => this.hydrateIssue(child)),
+			childCount: raw.childCount,
+		};
 	}
 
-	updateIssue(issueId: string, updates: IssueUpdateInput): Promise<Issue> {
-		return this.connection.rpc("updateIssue", [
+	async updateIssue(
+		issueId: string,
+		updates: IssueUpdateInput,
+	): Promise<Issue> {
+		const raw = (await this.connection.rpc("updateIssue", [
 			this.workspaceId,
 			issueId,
 			updates,
-		]) as Promise<Issue>;
+		])) as RawIssue;
+		return this.hydrateIssue(raw);
 	}
 
 	fetchIssueAttachments(
@@ -101,6 +304,13 @@ export class RouterIssueTrackerService implements IIssueTrackerService {
 			this.workspaceId,
 			issueId,
 		]) as Promise<Array<{ title: string; url: string }>>;
+	}
+
+	fetchIssueInverseRelations(issueId: string): Promise<IssueRelationSummary[]> {
+		return this.connection.rpc("fetchIssueInverseRelations", [
+			this.workspaceId,
+			issueId,
+		]) as Promise<IssueRelationSummary[]>;
 	}
 
 	// ========================================================================
