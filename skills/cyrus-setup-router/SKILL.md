@@ -24,6 +24,13 @@ Full reference and rationale: `docs/ROUTER.md`.
 > `cyrus-setup/SKILL.md` apply here too (browser automation is used for the
 > Linear OAuth app creation).
 
+> **Docker deployment.** To run the router as a Docker container instead of a
+> bare process on this machine — configuration via environment variables,
+> state in a Docker volume, prebuilt images from GHCR — **read**
+> `../cyrus-setup-router-docker/SKILL.md` and follow it instead of the steps
+> below. The Linear and endpoint steps are shared; only prerequisites,
+> config, and launch differ.
+
 ---
 
 ## Step 1: Prerequisites
