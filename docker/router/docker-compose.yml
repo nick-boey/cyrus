@@ -1,0 +1,29 @@
+services:
+  cyrus-router:
+    build:
+      context: ../..
+      dockerfile: docker/router/Dockerfile
+    # To use the prebuilt image instead of building locally, comment out
+    # `build:` above and uncomment:
+    # image: ghcr.io/nick-boey/cyrus-router:latest
+    env_file: .env
+    ports:
+      # Localhost-only: TLS/wss termination belongs to a fronting reverse
+      # proxy or the cloudflared sidecar below, never the container itself.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - cyrus-router-data:/data
+    restart: unless-stopped
+
+  # Optional public tunnel: docker compose --profile tunnel up -d
+  # Point the Cloudflare tunnel's public hostname at http://cyrus-router:8787.
+  cloudflared:
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:latest
+    command: tunnel run --token ${TUNNEL_TOKEN}
+    restart: unless-stopped
+    depends_on:
+      - cyrus-router
+
+volumes:
+  cyrus-router-data:
