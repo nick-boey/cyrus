@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - The router host can now run as a Docker container: configuration via environment variables, one persistent volume for all state, a compose file with an optional Cloudflare tunnel sidecar, and prebuilt images on GHCR. A guided `cyrus-setup-router-docker` skill walks through the whole setup. See "Running the router in Docker" in `docs/ROUTER.md`.
 
 ### Fixed
+- `cyrus auth`, `cyrus check-tokens`, and `cyrus refresh-token` no longer hang after finishing their work. Each command completed successfully but never exited, leaving you to press Ctrl-C — which made them unusable in scripts and CI.
 - Forwarded and shared Slack messages are now included when you @mention Cyrus. Previously, forwarding a message (for example a Sentry alert) into a channel and @mentioning Cyrus passed along only your typed comment — the forwarded message's contents were dropped, so a forward with no comment gave Cyrus nothing to work with. The forwarded content is now part of the prompt. ([#1326](https://github.com/cyrusagents/cyrus/pull/1326))
 
 ### Changed

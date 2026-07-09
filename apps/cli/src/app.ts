@@ -81,7 +81,11 @@ program
 			packageJson.version,
 			errorReporter,
 		);
-		await new AuthCommand(app).execute([authKey]);
+		try {
+			await new AuthCommand(app).execute([authKey]);
+		} finally {
+			app.disposeWatchers();
+		}
 	});
 
 // Check tokens command
@@ -96,7 +100,11 @@ program
 			packageJson.version,
 			errorReporter,
 		);
-		await new CheckTokensCommand(app).execute([]);
+		try {
+			await new CheckTokensCommand(app).execute([]);
+		} finally {
+			app.disposeWatchers();
+		}
 	});
 
 // Refresh token command
@@ -111,7 +119,11 @@ program
 			packageJson.version,
 			errorReporter,
 		);
-		await new RefreshTokenCommand(app).execute([]);
+		try {
+			await new RefreshTokenCommand(app).execute([]);
+		} finally {
+			app.disposeWatchers();
+		}
 	});
 
 // Self-auth-linear command - Linear OAuth directly from CLI
@@ -173,6 +185,11 @@ const routerCommand = program
 		"Manage a Cyrus Router server: registered users, enrolled devices, and stuck issue locks.",
 	);
 
+/**
+ * Action for the one-shot `router` admin subcommands. Disposes the
+ * Application's file watchers once the command is done so the process exits
+ * instead of idling on live `fs.watch` handles.
+ */
 const makeRouterAction =
 	(...prefix: string[]) =>
 	async (...actionArgs: unknown[]) => {
@@ -186,7 +203,11 @@ const makeRouterAction =
 		const positional = actionArgs.filter(
 			(a): a is string => typeof a === "string",
 		);
-		await new RouterCommand(app).execute([...prefix, ...positional]);
+		try {
+			await new RouterCommand(app).execute([...prefix, ...positional]);
+		} finally {
+			app.disposeWatchers();
+		}
 	};
 
 routerCommand
@@ -194,7 +215,18 @@ routerCommand
 	.description(
 		"Start the router server (reads <cyrus-home>/router-config.json)",
 	)
-	.action(makeRouterAction("start"));
+	.action(async () => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		// No disposeWatchers(): the server is long-running and relies on the
+		// .env watcher for hot-reload.
+		await new RouterCommand(app).execute(["start"]);
+	});
 
 const routerUsersCommand = routerCommand
 	.command("users")
@@ -218,7 +250,11 @@ routerUsersCommand
 			packageJson.version,
 			errorReporter,
 		);
-		await new RouterCommand(app).execute(["users", ...args]);
+		try {
+			await new RouterCommand(app).execute(["users", ...args]);
+		} finally {
+			app.disposeWatchers();
+		}
 	});
 
 routerUsersCommand
@@ -262,7 +298,11 @@ program
 			packageJson.version,
 			errorReporter,
 		);
-		await new ConnectCommand(app).execute([url, "--code", cmdOpts.code]);
+		try {
+			await new ConnectCommand(app).execute([url, "--code", cmdOpts.code]);
+		} finally {
+			app.disposeWatchers();
+		}
 	});
 
 // Parse and execute
