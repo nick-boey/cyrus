@@ -1,5 +1,53 @@
 # TODO
 
+## Run this host's Cyrus under systemd instead of a detached background process
+
+**Status:** open.
+**Where:** this host (`nb-cyrus-runner`), not the codebase.
+
+### Symptom
+
+Cyrus is running as PID 71835 (`node /root/.local/share/pnpm/bin/cyrus start`),
+reparented to init with `SID == PID` — it was `setsid`'d away from the shell that
+launched it. There is no supervisor: pm2 is not installed, and no systemd unit,
+user unit, or supervisor config references Cyrus.
+
+Consequences:
+
+- **No restart on failure.** If the process dies, nothing brings it back, and the
+  only symptom is Linear issues silently going unprocessed.
+- **No start on boot.**
+- **Logs land in `/tmp`.** stdout/stderr point at
+  `/tmp/claude-0/-root-cyrus/e4b5321b-.../scratchpad/cyrus-v3.log` — the scratchpad
+  of a Claude Code session that has since ended. Nothing rotates it, and a reboot
+  or `/tmp` sweep takes the logs with it.
+
+It was started as a background job from an agent session and orphaned when that
+session exited.
+
+### Fix
+
+`skills/cyrus-setup-launch/SKILL.md` step 3, "Option 2: systemd (Linux only)",
+already has the unit file and the enable/start commands. Two corrections are
+needed before that recipe works on this host, and both should be fixed in the
+skill so the next host doesn't hit them:
+
+1. `EnvironmentFile=/home/$CYRUS_USER/.cyrus/.env` hardcodes `/home/$USER`. We run
+   as root, whose home is `/root`, not `/home/root`. Use `$HOME` (or
+   `getent passwd "$CYRUS_USER" | cut -d: -f6`) rather than interpolating
+   `/home/`.
+2. `ExecStart=$CYRUS_BIN` resolves to the `cyrus` symlink with no subcommand. That
+   happens to work — `start` is registered with `isDefault: true` in
+   `apps/cli/dist/src/app.js` — but the unit should say `ExecStart=$CYRUS_BIN start`
+   explicitly so the behaviour doesn't depend on the default staying put.
+
+Also note `which cyrus` here points at `/root/cyrus/apps/cli/dist/src/app.js`, the
+local dev build from this working tree, not the published `cyrus-ai` package. The
+unit will pin whatever that symlink resolves to.
+
+Cut over when no sessions are in flight — installing the unit means killing the
+current process and any Claude Agent SDK children still working an issue.
+
 ## `sessionTerminal` is emitted too early, killing the device's session ownership
 
 **Status:** open. Not fixed by `bbc0c33` (which fixes the *opposite* failure mode).
