@@ -247,7 +247,30 @@ interactive browser OAuth **now**, at connect time:
 
 Verify MCP auth health before relying on it; re-run the OAuth if it has expired.
 
-### 3. Run
+### 3. Add repositories
+
+Add each repo to the `repositories` array of your `config.json`. A router-mode
+entry carries **no** `linearToken` (the router holds it), but it does need
+`linearWorkspaceId` — `EdgeWorker` keys its issue trackers by workspace id, so a
+mismatched id makes the device accept routed events and then silently drop them
+for want of a tracker.
+
+`cyrus self-add-repo` does **not** work here: it resolves the workspace from a
+local `linearToken` and exits with `No Linear credentials found` on a client
+device. Write the entry directly instead.
+
+You do not need to copy the workspace id off the router host. At enrollment
+`cyrus connect` calls `GET /workspaces` (authenticated with the device token) and
+stores the result at `router.workspaceIds`:
+
+```bash
+jq -r '.router.workspaceIds // [] | .[]' ~/.cyrus/config.json
+```
+
+An empty result means the router predates that route — update it, or read the key
+under `workspaces` in the router's `router-config.json`.
+
+### 4. Run
 
 ```bash
 cyrus start

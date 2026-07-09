@@ -511,6 +511,13 @@ export const EdgeConfigSchema = z.object({
 		.object({
 			url: z.string(),
 			deviceToken: z.string(),
+			/**
+			 * Linear workspace ids the router serves, fetched from `GET /workspaces`
+			 * at enrollment. Advisory: used to fill `repositories[].linearWorkspaceId`
+			 * without hand-copying the id off the router host. Absent when enrolling
+			 * against a router predating that route.
+			 */
+			workspaceIds: z.array(z.string()).optional(),
 		})
 		.optional(),
 });

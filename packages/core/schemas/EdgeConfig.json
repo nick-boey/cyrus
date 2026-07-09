@@ -976,6 +976,12 @@
 				},
 				"deviceToken": {
 					"type": "string"
+				},
+				"workspaceIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
 				}
 			},
 			"required": ["url", "deviceToken"],

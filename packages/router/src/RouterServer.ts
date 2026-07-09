@@ -12,6 +12,7 @@ import { EventRouter } from "./EventRouter.js";
 import { registerEnrollmentRoute } from "./enrollment.js";
 import { LinearExecutor } from "./LinearExecutor.js";
 import { RouterStore } from "./RouterStore.js";
+import { registerWorkspacesRoute } from "./workspaces.js";
 
 /** 48 hours — default TTL for queued offline events. */
 const DEFAULT_EVENT_TTL_MS = 48 * 60 * 60 * 1000;
@@ -109,6 +110,11 @@ export class RouterServer {
 		});
 
 		registerEnrollmentRoute(this.fastify, this.store);
+		registerWorkspacesRoute(
+			this.fastify,
+			this.store,
+			Object.keys(config.workspaces),
+		);
 
 		// Liveness probe for container orchestrators (Docker HEALTHCHECK,
 		// serverless platforms). Registered in the constructor because Fastify
