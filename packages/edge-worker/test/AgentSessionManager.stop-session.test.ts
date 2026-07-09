@@ -134,4 +134,76 @@ describe("AgentSessionManager stop-session behavior", () => {
 		expect(errorActivity).toBeDefined();
 		expect(errorActivity![1].body).toBe(usageLimitError);
 	});
+
+	// ── terminal-state signalling ──────────────────────────────────────────
+	// "sessionTerminal" is what releases the router's issue lock + session
+	// affinity. Emitting it is NOT optional: a session that ends without it
+	// strands the issue on the router until an admin runs `cyrus router unlock`,
+	// because the router's sweep only reclaims locks from devices that go
+	// offline past the event TTL — not from a device that stays connected.
+
+	it("abortSession emits sessionTerminal('stopped') when the query is killed without a result", () => {
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+
+		// The full-kill stop path: the runner is torn down, so the SDK never
+		// yields an SDKResultMessage and completeSession() is never reached.
+		manager.requestSessionStop(sessionId);
+		manager.abortSession(sessionId);
+
+		expect(terminal).toHaveBeenCalledTimes(1);
+		expect(terminal).toHaveBeenCalledWith(sessionId, "stopped");
+	});
+
+	it("emits sessionTerminal at most once even if a killed session later yields a result", async () => {
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+
+		manager.requestSessionStop(sessionId);
+		manager.abortSession(sessionId);
+
+		// A late/duplicate result must not double-notify observers.
+		await manager.completeSession(sessionId, {
+			type: "result",
+			subtype: "success",
+			duration_ms: 1,
+			duration_api_ms: 1,
+			is_error: false,
+			num_turns: 1,
+			result: "done",
+			total_cost_usd: 0,
+			usage: {},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: "result-late",
+			session_id: "sdk-session",
+		} as any);
+
+		expect(terminal).toHaveBeenCalledTimes(1);
+		expect(terminal).toHaveBeenCalledWith(sessionId, "stopped");
+	});
+
+	it("still emits sessionTerminal('complete') on a normal finish", async () => {
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+
+		await manager.completeSession(sessionId, {
+			type: "result",
+			subtype: "success",
+			duration_ms: 1,
+			duration_api_ms: 1,
+			is_error: false,
+			num_turns: 1,
+			result: "done",
+			total_cost_usd: 0,
+			usage: {},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: "result-ok",
+			session_id: "sdk-session",
+		} as any);
+
+		expect(terminal).toHaveBeenCalledTimes(1);
+		expect(terminal).toHaveBeenCalledWith(sessionId, "complete");
+	});
 });

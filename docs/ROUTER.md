@@ -354,6 +354,15 @@ A lock is released when: the session reaches a terminal state (complete / error 
 stopped), the device's token is revoked, the device stays offline past the TTL,
 or an admin runs `cyrus router unlock <issueId>`.
 
+The terminal-state signal is delivered durably. The device writes the
+`session_state` frame to `session-state-buffer.jsonl` before sending it, and
+replays it on every reconnect until the router acknowledges with
+`session_state_ack`. Delivery is therefore at-least-once, and the router's
+release is idempotent so a replayed frame is a no-op. This matters because the
+offline-past-TTL sweep only reclaims locks from devices that have gone *dark*: a
+device that stays connected but loses its terminal frame would otherwise strand
+the issue indefinitely, recoverable only via `cyrus router unlock`.
+
 ### Creator-only prompting
 
 **Default on** (`creatorOnlyPrompting: true`). A session runs under its creator's

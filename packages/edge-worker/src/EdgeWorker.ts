@@ -506,8 +506,19 @@ export class EdgeWorker extends EventEmitter {
 		this.agentSessionManager.on(
 			"sessionTerminal",
 			(sessionId: string, state: "complete" | "error" | "stopped") => {
-				if (this.config.platform === "router") {
+				if (this.config.platform !== "router") return;
+				try {
 					this.routerConnection?.sendSessionState(sessionId, state);
+				} catch (error) {
+					// sendSessionState persists the frame to disk before transmitting.
+					// A failure there must not abort session teardown (this listener
+					// runs synchronously inside the emit, e.g. from the stop handler),
+					// but it does mean the router keeps this issue locked until an
+					// admin runs `cyrus router unlock` — so say so loudly.
+					this.logger.error(
+						`Failed to signal terminal state '${state}' for session ${sessionId} to the router; its issue lock may need \`cyrus router unlock\``,
+						error,
+					);
 				}
 			},
 		);
@@ -4935,6 +4946,12 @@ ${taskSection}`;
 						: `Stopped session ${agentSessionId} (interrupt not supported)`,
 				);
 			}
+			// The kill tears the query down before it can yield a result, so
+			// completeSession() — and with it the "sessionTerminal" emit — never
+			// runs. Signal the terminal state explicitly, or router mode holds this
+			// issue's lock until an admin runs `cyrus router unlock`. The interrupt
+			// branch below needs no such call: the query still returns a result.
+			this.agentSessionManager.abortSession(agentSessionId);
 			this.lastStopTimeBySession.delete(agentSessionId);
 			await this.agentSessionManager.createResponseActivity(
 				agentSessionId,

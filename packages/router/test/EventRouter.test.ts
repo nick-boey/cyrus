@@ -329,6 +329,7 @@ describe("EventRouter", () => {
 
 		router.handleSessionState(aliceDevice, {
 			type: "session_state",
+			id: "ss-1",
 			sessionId: "sess-1",
 			state: "complete",
 		});

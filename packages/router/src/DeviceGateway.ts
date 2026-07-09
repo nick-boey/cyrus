@@ -91,6 +91,18 @@ export class DeviceGateway extends EventEmitter {
 		ws.send(JSON.stringify(frame));
 	}
 
+	/**
+	 * Confirms a `session_state` frame so the device can drop it from its
+	 * durable buffer. Only sent AFTER the lock/affinity release has been applied
+	 * — an unacked frame is replayed on the device's next reconnect, and the
+	 * release is idempotent, so at-least-once delivery is safe.
+	 */
+	sendSessionStateAck(deviceId: number, id: string): void {
+		const ws = this.sockets.get(deviceId);
+		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+		ws.send(JSON.stringify({ type: "session_state_ack", id }));
+	}
+
 	close(): void {
 		if (this.heartbeatInterval) {
 			clearInterval(this.heartbeatInterval);

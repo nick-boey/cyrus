@@ -7,6 +7,7 @@ import {
 	type DeviceFrame,
 	PROTOCOL_VERSION,
 	type RpcRequestFrame,
+	type SessionStateFrame,
 } from "cyrus-router-protocol";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type RawData, type WebSocket, WebSocketServer } from "ws";
@@ -452,5 +453,103 @@ describe("RouterConnection", () => {
 		expect(conn.connected).toBe(false);
 		conn.close();
 		err.mockRestore();
+	});
+
+	// ── session_state durability ───────────────────────────────────────────
+	// The terminal frame is the ONLY thing that releases the router's issue
+	// lock; the router's own sweep only reclaims locks from devices offline past
+	// the 48h event TTL. Losing this frame on a live device strands the issue
+	// until an operator runs `cyrus router unlock`, so it must be durable.
+
+	const bufferPath = () => join(stateDir, "session-state-buffer.jsonl");
+	const ackAll = (ws: WebSocket, frame: DeviceFrame) => {
+		if (frame.type === "session_state") {
+			ws.send(JSON.stringify({ type: "session_state_ack", id: frame.id }));
+		}
+	};
+	const sessionStates = () =>
+		router.received.filter(
+			(f): f is SessionStateFrame => f.type === "session_state",
+		);
+
+	it("(h) sendSessionState while offline persists the frame instead of dropping it", async () => {
+		const conn = makeConn(); // never connected
+		conn.sendSessionState("sess-1", "complete");
+
+		const buffered = readJsonl(bufferPath());
+		expect(buffered).toHaveLength(1);
+		expect(buffered[0]).toMatchObject({
+			sessionId: "sess-1",
+			state: "complete",
+		});
+		expect(sessionStates()).toHaveLength(0);
+		conn.close();
+	});
+
+	it("(i) sendSessionState online is acked and clears the durable buffer", async () => {
+		router.onFrame = ackAll;
+		const conn = makeConn();
+		conn.connect();
+		await once(conn, "connected");
+
+		conn.sendSessionState("sess-1", "complete");
+
+		await vi.waitFor(() => expect(readJsonl(bufferPath())).toHaveLength(0));
+		const sent = sessionStates();
+		expect(sent).toHaveLength(1);
+		expect(sent[0]).toMatchObject({ sessionId: "sess-1", state: "complete" });
+		expect(sent[0]?.id).toBeTruthy();
+		conn.close();
+	});
+
+	it("(j) an unacked session_state survives a restart and replays with the same id", async () => {
+		// Router deliberately never acks: the frame is delivered but unconfirmed.
+		const conn1 = makeConn();
+		conn1.connect();
+		await once(conn1, "connected");
+		conn1.sendSessionState("sess-1", "stopped");
+		await vi.waitFor(() => expect(sessionStates()).toHaveLength(1));
+
+		// Unacked → still on disk.
+		expect(readJsonl(bufferPath())).toHaveLength(1);
+		const originalId = sessionStates()[0]?.id;
+		conn1.close();
+
+		// Restart against the same stateDir; this time the router acks.
+		router.onFrame = ackAll;
+		const conn2 = makeConn();
+		conn2.connect();
+		await once(conn2, "connected");
+
+		await vi.waitFor(() => expect(readJsonl(bufferPath())).toHaveLength(0));
+		const all = sessionStates();
+		expect(all.length).toBeGreaterThanOrEqual(2);
+		// Same id across the replay, so the router's idempotent release dedupes it.
+		expect(all[all.length - 1]?.id).toBe(originalId);
+		expect(all[all.length - 1]).toMatchObject({
+			sessionId: "sess-1",
+			state: "stopped",
+		});
+		conn2.close();
+	});
+
+	it("(k) an ack for an unknown id leaves the buffer intact", async () => {
+		router.onFrame = (ws, frame) => {
+			if (frame.type === "session_state") {
+				ws.send(
+					JSON.stringify({ type: "session_state_ack", id: "not-the-id" }),
+				);
+			}
+		};
+		const conn = makeConn();
+		conn.sendSessionState("sess-1", "error"); // buffered while offline
+		conn.connect();
+		await once(conn, "connected");
+
+		// The replay reaches the router, but the bogus ack must not clear it.
+		await vi.waitFor(() => expect(sessionStates()).toHaveLength(1));
+		await new Promise((r) => setTimeout(r, 50));
+		expect(readJsonl(bufferPath())).toHaveLength(1);
+		conn.close();
 	});
 });

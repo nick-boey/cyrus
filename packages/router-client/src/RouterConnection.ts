@@ -18,6 +18,7 @@ import {
 	type RpcRequestFrame,
 	type RpcResponseFrame,
 	type ServerFrame,
+	type SessionStateAckFrame,
 } from "cyrus-router-protocol";
 import { WebSocket } from "ws";
 
@@ -80,6 +81,18 @@ interface InboxEntry {
 	event: unknown;
 }
 
+/**
+ * A terminal `session_state` frame awaiting the router's `session_state_ack`.
+ * Durable: the router releases the issue lock + session affinity only on this
+ * frame, so losing it strands the issue until an operator runs
+ * `cyrus router unlock`.
+ */
+interface SessionStateEntry {
+	id: string;
+	sessionId: string;
+	state: "complete" | "error" | "stopped";
+}
+
 interface PersistedState {
 	lastAckedSeq: number;
 }
@@ -125,6 +138,7 @@ export class RouterConnection extends EventEmitter {
 	private readonly stateFile: string;
 	private readonly outboundFile: string;
 	private readonly inboxFile: string;
+	private readonly sessionStateFile: string;
 
 	private ws: WebSocket | undefined;
 	private started = false;
@@ -136,6 +150,7 @@ export class RouterConnection extends EventEmitter {
 	private lastAckedSeq: number;
 	private outboundEntries: OutboundEntry[];
 	private inboxEntries: InboxEntry[];
+	private sessionStateEntries: SessionStateEntry[];
 	private readonly pending = new Map<string, PendingRpc>();
 
 	constructor(opts: RouterConnectionOptions) {
@@ -149,10 +164,12 @@ export class RouterConnection extends EventEmitter {
 		this.stateFile = join(opts.stateDir, "router-connection.json");
 		this.outboundFile = join(opts.stateDir, "outbound-buffer.jsonl");
 		this.inboxFile = join(opts.stateDir, "inbox.jsonl");
+		this.sessionStateFile = join(opts.stateDir, "session-state-buffer.jsonl");
 
 		this.lastAckedSeq = this.loadLastAckedSeq();
 		this.outboundEntries = this.loadOutboundEntries();
 		this.inboxEntries = this.loadInboxEntries();
+		this.sessionStateEntries = this.loadSessionStateEntries();
 	}
 
 	get connected(): boolean {
@@ -225,13 +242,50 @@ export class RouterConnection extends EventEmitter {
 		return { success: true };
 	}
 
-	/** Sends a session_state frame (best-effort; dropped if offline). */
+	/**
+	 * Durably records a terminal `session_state` and sends it.
+	 *
+	 * This frame is the ONLY thing that releases the router's issue lock and
+	 * session affinity, and the router's own sweep reclaims locks only for
+	 * devices that have been offline past the event TTL (48h by default). So a
+	 * frame lost here — sent while the socket was down, or dropped in flight —
+	 * strands the issue indefinitely on an otherwise-healthy device, recoverable
+	 * only via `cyrus router unlock`. It is therefore persisted before any send
+	 * attempt and replayed on every reconnect until the router acks it.
+	 *
+	 * Delivery is at-least-once: a lost ack replays the frame, and the router's
+	 * release is idempotent.
+	 */
 	sendSessionState(
 		sessionId: string,
 		state: "complete" | "error" | "stopped",
 	): void {
+		const entry: SessionStateEntry = { id: randomUUID(), sessionId, state };
+		this.appendSessionStateEntry(entry);
+		this.trySendSessionState(entry);
+	}
+
+	/** Best-effort transmit; the durable entry survives until acked. */
+	private trySendSessionState(entry: SessionStateEntry): void {
 		if (!this.isOnline() || !this.ws) return;
-		this.ws.send(JSON.stringify({ type: "session_state", sessionId, state }));
+		this.ws.send(
+			JSON.stringify({
+				type: "session_state",
+				id: entry.id,
+				sessionId: entry.sessionId,
+				state: entry.state,
+			}),
+		);
+	}
+
+	private replaySessionStateBuffer(): void {
+		for (const entry of [...this.sessionStateEntries]) {
+			this.trySendSessionState(entry);
+		}
+	}
+
+	private onSessionStateAck(frame: SessionStateAckFrame): void {
+		this.removeSessionStateEntry(frame.id);
 	}
 
 	// ── Dialing / lifecycle ────────────────────────────────────────────────
@@ -326,12 +380,19 @@ export class RouterConnection extends EventEmitter {
 			case "rpc_response":
 				this.onRpcResponse(frame);
 				break;
+			case "session_state_ack":
+				this.onSessionStateAck(frame);
+				break;
 		}
 	}
 
 	private onHelloAck(frame: HelloAckFrame): void {
 		this._connected = true;
 		this.reconnectAttempts = 0;
+		// Resend any terminal frames the router never acked. Done before the
+		// outbound replay so a stranded issue lock is released as early as
+		// possible; both are independent of each other.
+		this.replaySessionStateBuffer();
 		// Replay the outbound buffer FIFO, then announce the connection.
 		void this.replayOutboundBuffer();
 		this.emit("connected", frame);
@@ -553,6 +614,50 @@ export class RouterConnection extends EventEmitter {
 			(e) => e.mutationId !== mutationId,
 		);
 		this.rewriteJsonl(this.outboundFile, this.outboundEntries);
+	}
+
+	private loadSessionStateEntries(): SessionStateEntry[] {
+		return this.readJsonlLines(
+			this.sessionStateFile,
+			(value): SessionStateEntry | undefined => {
+				if (typeof value !== "object" || value === null) return undefined;
+				const v = value as Record<string, unknown>;
+				if (
+					typeof v.id === "string" &&
+					typeof v.sessionId === "string" &&
+					(v.state === "complete" ||
+						v.state === "error" ||
+						v.state === "stopped")
+				) {
+					return { id: v.id, sessionId: v.sessionId, state: v.state };
+				}
+				return undefined;
+			},
+		);
+	}
+
+	private appendSessionStateEntry(entry: SessionStateEntry): void {
+		this.sessionStateEntries.push(entry);
+		appendFileSync(this.sessionStateFile, `${JSON.stringify(entry)}\n`);
+	}
+
+	private removeSessionStateEntry(id: string): void {
+		const before = this.sessionStateEntries.length;
+		this.sessionStateEntries = this.sessionStateEntries.filter(
+			(e) => e.id !== id,
+		);
+		if (this.sessionStateEntries.length === before) return; // unknown/duplicate ack
+		try {
+			this.rewriteJsonl(this.sessionStateFile, this.sessionStateEntries);
+		} catch (err) {
+			// A failed rewrite would otherwise leave the entry on disk to be
+			// replayed forever. It is harmless (the release is idempotent), but
+			// surface it rather than failing silently.
+			console.error(
+				`[RouterConnection] failed to remove acked session_state entry ${id}:`,
+				err,
+			);
+		}
 	}
 
 	private loadInboxEntries(): InboxEntry[] {

@@ -139,7 +139,12 @@ export class RouterServer {
 		this.gateway.on(
 			"sessionState",
 			(deviceId: number, frame: SessionStateFrame) => {
+				// Apply the release BEFORE acking: if the process dies in between,
+				// the device never sees an ack and replays the frame on reconnect.
+				// handleSessionState is idempotent, so a replay of an already-applied
+				// release is a no-op.
 				this.eventRouter.handleSessionState(deviceId, frame);
+				this.gateway.sendSessionStateAck(deviceId, frame.id);
 			},
 		);
 		// NOTE: no "deviceConnected" → deliverPending wiring here. DeviceGateway

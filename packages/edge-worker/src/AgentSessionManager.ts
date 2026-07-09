@@ -92,6 +92,14 @@ export class AgentSessionManager extends EventEmitter {
 	private taskSubjectsById: Map<string, string> = new Map(); // Cache task subjects by task ID (e.g., "1" → "Fix login bug")
 	private activeStatusActivitiesBySession: Map<string, string> = new Map(); // Maps session ID to active compacting status activity ID
 	private stopRequestedSessions: Set<string> = new Set(); // Sessions explicitly stopped by user signal
+	/**
+	 * Sessions for which "sessionTerminal" has already been emitted. A session
+	 * can reach a terminal state either by the SDK yielding a result
+	 * ({@link completeSession}) or by being killed outright
+	 * ({@link abortSession}); this keeps the observer notified exactly once even
+	 * if both happen.
+	 */
+	private terminalEmittedSessions: Set<string> = new Set();
 	// Per-session serialization queue for handleClaudeMessage. The EdgeWorker's
 	// onMessage callback is fire-and-forget, so without serialization the async
 	// handlers can interleave — causing tool_result to be processed before its
@@ -387,14 +395,18 @@ export class AgentSessionManager extends EventEmitter {
 		});
 
 		// Notify terminal-state observers (router mode releases the issue lock +
-		// session affinity via RouterConnection.sendSessionState). Emitted for
-		// every terminal case, including a user-requested stop.
+		// session affinity via RouterConnection.sendSessionState).
+		//
+		// This covers only terminations where the SDK yielded a result — i.e. a
+		// normal finish, an error, or an *interrupt* (which lets the query return).
+		// A stop that kills the query outright never reaches here; EdgeWorker calls
+		// abortSession() on that path instead. See the note on abortSession().
 		const terminalState: "complete" | "error" | "stopped" = wasStopRequested
 			? "stopped"
 			: status === AgentSessionStatus.Complete
 				? "complete"
 				: "error";
-		this.emit("sessionTerminal", sessionId, terminalState);
+		this.emitTerminalOnce(sessionId, terminalState);
 
 		if (wasStopRequested) {
 			log.info(`Session was stopped by user`);
@@ -458,6 +470,45 @@ export class AgentSessionManager extends EventEmitter {
 
 	requestSessionStop(linearAgentActivitySessionId: string): void {
 		this.stopRequestedSessions.add(linearAgentActivitySessionId);
+	}
+
+	/**
+	 * Emits "sessionTerminal" at most once per session.
+	 *
+	 * {@link completeSession} and {@link abortSession} are independent entry
+	 * points into the terminal path, and a killed query could still — in
+	 * principle — surface a late result. Router mode's lock release is
+	 * idempotent, so a duplicate would be harmless there, but other observers
+	 * should not have to assume that.
+	 */
+	private emitTerminalOnce(
+		sessionId: string,
+		state: "complete" | "error" | "stopped",
+	): void {
+		if (this.terminalEmittedSessions.has(sessionId)) return;
+		this.terminalEmittedSessions.add(sessionId);
+		this.emit("sessionTerminal", sessionId, state);
+	}
+
+	/**
+	 * Marks a session terminal when it was killed without the SDK ever yielding
+	 * an `SDKResultMessage`.
+	 *
+	 * `completeSession` — the only other place "sessionTerminal" is emitted — is
+	 * reached exclusively from the `case "result"` branch of the message loop. So
+	 * a stop that calls `AgentRunner.stop()` (a non-warm runner, or the
+	 * double-stop full abort) tears the query down before any result arrives, and
+	 * the terminal signal is never sent. In router mode that stranded the issue
+	 * lock and session affinity on the router **permanently**: the router's sweep
+	 * only reclaims locks from devices that go offline past the event TTL, so a
+	 * device that stayed connected held the issue until an admin ran
+	 * `cyrus router unlock`. `requestSessionStop()` alone does not help — it only
+	 * sets a flag that `completeSession` consumes, and `completeSession` never
+	 * runs on this path.
+	 */
+	abortSession(linearAgentActivitySessionId: string): void {
+		this.activeTasksBySession.delete(linearAgentActivitySessionId);
+		this.emitTerminalOnce(linearAgentActivitySessionId, "stopped");
 	}
 
 	/**
@@ -1661,6 +1712,7 @@ export class AgentSessionManager extends EventEmitter {
 		this.activeTasksBySession.delete(sessionId);
 		this.activeStatusActivitiesBySession.delete(sessionId);
 		this.stopRequestedSessions.delete(sessionId);
+		this.terminalEmittedSessions.delete(sessionId);
 		this.lastAssistantBodyBySession.delete(sessionId);
 		this.bufferedAssistantEntryBySession.delete(sessionId);
 		this.messageProcessingQueues.delete(sessionId);
