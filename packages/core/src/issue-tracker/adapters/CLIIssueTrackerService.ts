@@ -40,6 +40,7 @@ import {
 	type FileUploadResponse,
 	type Issue,
 	type IssueCreateInput,
+	type IssueRelationSummary,
 	type IssueTrackerAgentSession,
 	type IssueTrackerAgentSessionPayload,
 	type IssueUpdateInput,
@@ -442,6 +443,16 @@ export class CLIIssueTrackerService
 			title: "Untitled attachment",
 			url: "",
 		}));
+	}
+
+	/**
+	 * The CLI tracker models no cross-issue relations, so nothing ever blocks
+	 * anything here.
+	 */
+	async fetchIssueInverseRelations(
+		_issueId: string,
+	): Promise<IssueRelationSummary[]> {
+		return [];
 	}
 
 	// ========================================================================

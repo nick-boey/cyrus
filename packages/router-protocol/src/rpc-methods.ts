@@ -8,6 +8,7 @@ export const RPC_METHODS = [
 	"fetchIssueChildren",
 	"updateIssue",
 	"fetchIssueAttachments",
+	"fetchIssueInverseRelations",
 	"fetchComments",
 	"fetchComment",
 	"fetchCommentWithAttachments",

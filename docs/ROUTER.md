@@ -282,6 +282,42 @@ git worktrees exactly as in single-host mode.
 
 ---
 
+## Issue payloads cross a JSON boundary
+
+`Issue` is not plain data. Alongside its fields it carries five async getters
+(`state`, `assignee`, `team`, `parent`, `project`) and six methods (`labels()`,
+`comments()`, `attachments()`, `children()`, `inverseRelations()`, `update()`),
+all defined on the Linear SDK class's prototype. `JSON.stringify` keeps only own
+enumerable properties, so **every one of them is lost** when an issue is sent
+over the device RPC.
+
+`RouterIssueTrackerService.hydrateIssue` rebuilds them on the device, backing
+each with an RPC (`fetchTeam`, `fetchWorkflowState`, `fetchUser`, `fetchLabel`,
+`fetchIssueAttachments`, `fetchIssueInverseRelations`, …). Getters are memoized
+per issue.
+
+Two rules follow for anyone adding to the RPC surface:
+
+1. **Never send a `Promise` across the wire** — it serializes to `{}`. Resolve it
+   on the router, where the Linear token lives, and send data. This is why
+   `IssueRelation` (whose `issue` is a `Promise`) has the wire-safe twin
+   `IssueRelationSummary`, and why `fetchIssueInverseRelations` exists rather
+   than callers reaching for `issue.inverseRelations()`.
+2. **Any new `Issue`-returning RPC must hydrate its result**, including nested
+   issues (`fetchIssueChildren` hydrates each child).
+
+Skipping hydration does not fail loudly. A missing method throws
+`TypeError: issue.labels is not a function`, but a missing getter is worse:
+`await undefined` is `undefined`, so `await issue.team` silently yields nothing
+and the caller concludes the issue has no team.
+
+Adding a method to `IIssueTrackerService` is not enough to make it callable —
+`RPC_METHODS` in `packages/router-protocol` is an allowlist checked before
+dispatch reflects onto the tracker. Omit it there and the call typechecks, then
+fails at runtime.
+
+---
+
 ## Offline and queue semantics
 
 The router ACKs Linear immediately, enqueues each event in a durable per-device

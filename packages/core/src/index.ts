@@ -147,6 +147,7 @@ export type {
 	Issue,
 	IssueDeletedWebhook,
 	IssueRelation,
+	IssueRelationSummary,
 	IssueStateChangeWebhook,
 	IssueUnassignedWebhook,
 	IssueUpdateInput,
