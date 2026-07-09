@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - Guided setup (`/cyrus-setup`) now starts by asking which deployment mode you want — **standalone** (single-host), **router host**, or **client device** — and walks you through only the steps that mode needs. Router-host and client-device setup are first-class guided flows instead of a manual appendix.
 - Worktrees now resume from the issue's pushed branch when one exists, and uncommitted work is auto-pushed as WIP before a worktree is removed.
 - The router now exposes a `GET /healthz` liveness endpoint for container health checks and uptime monitors.
+- The router host can now run as a Docker container: configuration via environment variables, one persistent volume for all state, a compose file with an optional Cloudflare tunnel sidecar, and prebuilt images on GHCR. A guided `cyrus-setup-router-docker` skill walks through the whole setup. See "Running the router in Docker" in `docs/ROUTER.md`.
 
 ### Fixed
 - Forwarded and shared Slack messages are now included when you @mention Cyrus. Previously, forwarding a message (for example a Sentry alert) into a channel and @mentioning Cyrus passed along only your typed comment — the forwarded message's contents were dropped, so a forward with no comment gave Cyrus nothing to work with. The forwarded content is now part of the prompt. ([#1326](https://github.com/cyrusagents/cyrus/pull/1326))

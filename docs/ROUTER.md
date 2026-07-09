@@ -126,6 +126,84 @@ token.
 
 ---
 
+## Running the router in Docker
+
+> **Guided path.** Run the `cyrus-setup-router-docker` skill. The steps below
+> are the manual reference.
+
+The router ships as a container image configured entirely by environment
+variables. All state — the generated `router-config.json` and the SQLite
+database — lives in a single volume mounted at `/data`.
+
+### Quickstart (compose)
+
+```bash
+cd docker/router
+cp .env.example .env      # fill in the three required values
+docker compose up -d --build
+curl -fsS http://127.0.0.1:8787/healthz   # → {"status":"ok"}
+```
+
+Or pull the prebuilt image instead of building: in `docker-compose.yml`,
+replace the `build:` block with `image: ghcr.io/nick-boey/cyrus-router:latest`.
+(If the GHCR package is private, `docker login ghcr.io` with a `read:packages`
+PAT first — or make the package public once in its GitHub settings.)
+
+Images are published by `.github/workflows/docker-router.yml`: `latest` on the
+default branch, `v*` semver tags on releases, branch and `sha-*` tags for
+everything else (amd64 + arm64).
+
+### Environment variables
+
+| Variable | Required | Default | Maps to (`router-config.json`) |
+|----------|----------|---------|--------------------------------|
+| `LINEAR_WORKSPACE_ID` | yes | — | key of `workspaces` |
+| `LINEAR_WORKSPACE_TOKEN` | yes | — | `workspaces[id].linearToken` |
+| `LINEAR_WEBHOOK_SECRET` | yes | — | `webhook.secret` |
+| `CYRUS_ROUTER_PORT` | no | `8787` | `port` |
+| `CYRUS_ROUTER_HOST` | no | `0.0.0.0` | `host` |
+| `CYRUS_ROUTER_WEBHOOK_MODE` | no | `direct` | `webhook.verificationMode` |
+| `CYRUS_ROUTER_EVENT_TTL_MS` | no | `172800000` | `eventTtlMs` |
+| `CYRUS_ROUTER_ISSUE_LOCK` | no | `true` | `issueLock` |
+| `CYRUS_ROUTER_CREATOR_ONLY_PROMPTING` | no | `true` | `creatorOnlyPrompting` |
+| `CYRUS_ROUTER_HEARTBEAT_MS` | no | `30000` | `heartbeatMs` |
+| `CYRUS_ROUTER_WORKSPACES_JSON` | no | — | full `workspaces` map (supersedes the ID/token pair) |
+
+On every start, if the required variables are set the entrypoint regenerates
+`/data/router-config.json` from them (env is the source of truth). With no
+config variables set, an existing (e.g. bind-mounted) `router-config.json` is
+used as-is. Neither → the container exits 1 naming the missing variables.
+
+### Admin commands
+
+The image bundles a `cyrus` shim pointing at `/data`:
+
+```bash
+docker compose exec cyrus-router cyrus router users add alice@example.com --name "Alice"
+docker compose exec cyrus-router cyrus router users list
+docker compose exec cyrus-router cyrus router devices revoke alice@example.com
+docker compose exec cyrus-router cyrus router unlock <issueId>
+```
+
+### Deployment constraints
+
+- **Exactly one replica.** SQLite plus in-memory WebSocket/device state means
+  the router cannot scale horizontally. On serverless container platforms pin
+  min = max = 1 instance, and confirm the platform supports WebSockets and
+  long-lived connections.
+- **The `/data` volume must be a real local filesystem.** Network-backed
+  storage (Azure Files, GCS FUSE, EFS/NFS) is unsafe for SQLite WAL mode. A
+  small VM running the compose file is the recommended default; serverless
+  only with block-storage volumes.
+- **TLS stays in front.** The container serves plain HTTP on 8787; put a
+  TLS-terminating reverse proxy or the bundled cloudflared sidecar
+  (`docker compose --profile tunnel up -d`) in front so devices can dial
+  `wss://` and Linear can reach `https://…/linear-webhook`.
+- **Backups:** the `cyrus-router-data` volume is the only state; snapshot it
+  (or `sqlite3 /data/router/router.db ".backup …"`) to back up the router.
+
+---
+
 ## Device setup (each client)
 
 > **Guided path.** Run `/cyrus-setup` and choose **Client device** at the mode
