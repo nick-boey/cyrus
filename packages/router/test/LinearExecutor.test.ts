@@ -210,6 +210,118 @@ describe("LinearExecutor.postActivity", () => {
 	});
 });
 
+describe("LinearExecutor.moveIssueToStartedState", () => {
+	/** A tracker whose `fetchIssue` returns an issue with the given state/team. */
+	function makeStartedStateExecutor(issue: {
+		state?: { type: string; name: string };
+		team?: { id: string };
+		states?: Array<{
+			id: string;
+			name: string;
+			type: string;
+			position: number;
+		}>;
+	}) {
+		const store = new RouterStore(":memory:");
+		const tracker = {
+			fetchIssue: vi.fn(async () => ({
+				id: "i1",
+				state: issue.state ? Promise.resolve(issue.state) : undefined,
+				team: issue.team ? Promise.resolve(issue.team) : undefined,
+			})),
+			fetchWorkflowStates: vi.fn(async () => ({ nodes: issue.states ?? [] })),
+			updateIssue: vi.fn(async () => ({ id: "i1" })),
+		};
+		const trackers = new Map<string, IIssueTrackerService>([
+			[WS, tracker as unknown as IIssueTrackerService],
+		]);
+		return {
+			executor: new LinearExecutor({ trackers, store }),
+			tracker,
+		};
+	}
+
+	const IN_PROGRESS = {
+		id: "st-progress",
+		name: "In Progress",
+		type: "started",
+		position: 1,
+	};
+	const IN_REVIEW = {
+		id: "st-review",
+		name: "In Review",
+		type: "started",
+		position: 2,
+	};
+	const BACKLOG = {
+		id: "st-backlog",
+		name: "Backlog",
+		type: "backlog",
+		position: 0,
+	};
+
+	it("moves a backlog issue to the lowest-position started state", async () => {
+		const { executor, tracker } = makeStartedStateExecutor({
+			state: { type: "backlog", name: "Backlog" },
+			team: { id: "team-1" },
+			// Deliberately out of order: selection must sort by position, not input order.
+			states: [IN_REVIEW, BACKLOG, IN_PROGRESS],
+		});
+
+		await expect(executor.moveIssueToStartedState(WS, "i1")).resolves.toBe(
+			"In Progress",
+		);
+		expect(tracker.fetchWorkflowStates).toHaveBeenCalledWith("team-1");
+		expect(tracker.updateIssue).toHaveBeenCalledWith("i1", {
+			stateId: "st-progress",
+		});
+	});
+
+	it("is a no-op when the issue is already started", async () => {
+		const { executor, tracker } = makeStartedStateExecutor({
+			state: { type: "started", name: "In Progress" },
+			team: { id: "team-1" },
+			states: [IN_PROGRESS],
+		});
+
+		await expect(
+			executor.moveIssueToStartedState(WS, "i1"),
+		).resolves.toBeUndefined();
+		expect(tracker.updateIssue).not.toHaveBeenCalled();
+	});
+
+	it("is a no-op for an unknown workspace", async () => {
+		const { executor, tracker } = makeStartedStateExecutor({
+			team: { id: "team-1" },
+		});
+		await expect(
+			executor.moveIssueToStartedState("ws-unknown", "i1"),
+		).resolves.toBeUndefined();
+		expect(tracker.fetchIssue).not.toHaveBeenCalled();
+	});
+
+	it("throws when the team has no started state", async () => {
+		const { executor, tracker } = makeStartedStateExecutor({
+			state: { type: "backlog", name: "Backlog" },
+			team: { id: "team-1" },
+			states: [BACKLOG],
+		});
+		await expect(executor.moveIssueToStartedState(WS, "i1")).rejects.toThrow(
+			/no workflow state of type "started"/,
+		);
+		expect(tracker.updateIssue).not.toHaveBeenCalled();
+	});
+
+	it("throws when the issue has no team", async () => {
+		const { executor } = makeStartedStateExecutor({
+			state: { type: "backlog", name: "Backlog" },
+		});
+		await expect(executor.moveIssueToStartedState(WS, "i1")).rejects.toThrow(
+			/has no team/,
+		);
+	});
+});
+
 describe("LinearExecutor.downloadAttachment (token host allowlist)", () => {
 	const TOKEN = "secret-linear-token";
 	let store: RouterStore;

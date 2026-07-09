@@ -180,6 +180,58 @@ export class LinearExecutor {
 	}
 
 	/**
+	 * Moves an issue into its team's first `started` workflow state ("In
+	 * Progress"), mirroring what a non-router EdgeWorker does when it accepts a
+	 * delegation.
+	 *
+	 * This lives on the router, not the device, for two reasons. The device holds
+	 * no Linear token, so every step here would have to be three extra RPC round
+	 * trips. More decisively, the device *cannot* do it at all today: the router
+	 * serializes a Linear SDK `Issue` with `JSON.stringify`, and the SDK exposes
+	 * `stateId`/`teamId` as prototype getters over private `_state`/`_team`
+	 * fields, so neither id survives the wire. `RouterIssueTrackerService`'s
+	 * rebuilt `issue.state` / `issue.team` getters then resolve to `undefined`
+	 * and the device's own promotion silently no-ops.
+	 *
+	 * Returns the name of the state it moved the issue to, or `undefined` when
+	 * nothing needed doing (already started, or the workspace has no tracker).
+	 * Throws on Linear API failures — the caller decides whether that is fatal.
+	 */
+	async moveIssueToStartedState(
+		workspaceId: string,
+		issueId: string,
+	): Promise<string | undefined> {
+		const tracker = this.trackers.get(workspaceId);
+		if (!tracker) return undefined;
+
+		const issue = await tracker.fetchIssue(issueId);
+
+		const currentState = await issue.state;
+		if (currentState?.type === "started") return undefined;
+
+		const team = await issue.team;
+		if (!team) {
+			throw new Error(`issue ${issueId} has no team`);
+		}
+
+		// Lowest-position `started` state wins, so "In Progress" is chosen over a
+		// later "In Review" — both carry type `started` in Linear's taxonomy.
+		const states = await tracker.fetchWorkflowStates(team.id);
+		const startedState = states.nodes
+			.filter((state) => state.type === "started")
+			.sort((a, b) => a.position - b.position)[0];
+
+		if (!startedState) {
+			throw new Error(
+				`team ${team.id} has no workflow state of type "started"`,
+			);
+		}
+
+		await tracker.updateIssue(issueId, { stateId: startedState.id });
+		return startedState.name;
+	}
+
+	/**
 	 * Router extension (not an {@link IIssueTrackerService} method): fetches an
 	 * attachment and returns its bytes as base64. Rejects bodies larger than
 	 * {@link attachmentMaxBytes}.

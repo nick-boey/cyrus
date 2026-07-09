@@ -47,6 +47,17 @@ export interface EventRouterOptions {
 		agentSessionId: string,
 		body: string,
 	) => Promise<void>;
+	/**
+	 * Moves an issue into its team's first `started` state, resolving with the
+	 * state's name (or `undefined` when it was already started). Only the router
+	 * holds a Linear token, so only the router can do this — see
+	 * {@link LinearExecutor.moveIssueToStartedState}. Optional: omitting it
+	 * disables promotion (tests that don't exercise it).
+	 */
+	moveIssueToStartedState?: (
+		workspaceId: string,
+		issueId: string,
+	) => Promise<string | undefined>;
 	config: {
 		eventTtlMs: number;
 		issueLock: boolean;
@@ -75,6 +86,9 @@ export class EventRouter {
 		agentSessionId: string,
 		body: string,
 	) => Promise<void>;
+	private readonly moveIssueToStartedState:
+		| ((workspaceId: string, issueId: string) => Promise<string | undefined>)
+		| undefined;
 	private readonly config: {
 		eventTtlMs: number;
 		issueLock: boolean;
@@ -97,6 +111,7 @@ export class EventRouter {
 		this.store = opts.store;
 		this.gateway = opts.gateway;
 		this.postActivity = opts.postActivity;
+		this.moveIssueToStartedState = opts.moveIssueToStartedState;
 		this.config = opts.config;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
@@ -236,6 +251,42 @@ export class EventRouter {
 		this.sessionWorkspace.set(sessionId, workspaceId);
 
 		await this.deliverOrNotify(webhook, target, sessionId, workspaceId);
+
+		// Delivery first, promotion second: the device only needs the queued event
+		// to start work, and promotion costs several Linear round trips.
+		if (issueId !== undefined) {
+			await this.promoteIssue(workspaceId, issueId);
+		}
+	}
+
+	/**
+	 * Marks a delegated issue as started in Linear. Reached only once the event
+	 * has been accepted — an unenrolled creator or a lock rejection returns from
+	 * {@link routeCreated} before this, so a rejected issue is never promoted.
+	 *
+	 * Best-effort: a Linear failure here must not fail the routing that already
+	 * succeeded, so it is logged and swallowed.
+	 */
+	private async promoteIssue(
+		workspaceId: string,
+		issueId: string,
+	): Promise<void> {
+		if (!this.moveIssueToStartedState) return;
+		try {
+			const stateName = await this.moveIssueToStartedState(
+				workspaceId,
+				issueId,
+			);
+			if (stateName !== undefined) {
+				this.logger.info(`Moved issue ${issueId} to '${stateName}'`);
+			}
+		} catch (err) {
+			this.logger.warn(
+				`Failed to move issue ${issueId} to a started state: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			);
+		}
 	}
 
 	private async routePrompted(webhook: SessionEvent): Promise<void> {

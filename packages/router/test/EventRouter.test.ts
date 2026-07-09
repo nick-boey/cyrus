@@ -102,6 +102,9 @@ function makeRouter(
 	const postActivity = vi.fn<
 		(workspaceId: string, agentSessionId: string, body: string) => Promise<void>
 	>(async () => {});
+	const moveIssueToStartedState = vi.fn<
+		(workspaceId: string, issueId: string) => Promise<string | undefined>
+	>(async () => "In Progress");
 	const clock = { value: ROUTE_NOW };
 	const gateway: Gateway = overrides?.gateway ?? {
 		isOnline: () => false,
@@ -111,6 +114,7 @@ function makeRouter(
 		store,
 		gateway,
 		postActivity,
+		moveIssueToStartedState,
 		config: {
 			eventTtlMs: TTL_MS,
 			issueLock: true,
@@ -120,7 +124,7 @@ function makeRouter(
 		logger: { info: () => {}, warn: () => {} },
 		now: () => clock.value,
 	});
-	return { router, postActivity, gateway, clock };
+	return { router, postActivity, moveIssueToStartedState, gateway, clock };
 }
 
 const ALICE: Creator = {
@@ -393,5 +397,119 @@ describe("EventRouter", () => {
 		);
 		expect(store.getIssueLock("ISS-1")).toBeUndefined();
 		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(true);
+	});
+});
+
+describe("EventRouter issue promotion to a started state", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	it("promotes the issue once a created event is accepted", async () => {
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		const { router, moveIssueToStartedState } = makeRouter(store);
+
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		expect(moveIssueToStartedState).toHaveBeenCalledTimes(1);
+		expect(moveIssueToStartedState).toHaveBeenCalledWith("ws-1", "ISS-1");
+	});
+
+	it("promotes even when the target device is offline (the event is queued, not dropped)", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, moveIssueToStartedState } = makeRouter(store, {
+			gateway: { isOnline: () => false, deliverPending: vi.fn() },
+		});
+
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		expect(store.pendingEvents(aliceDevice, 0, ROUTE_NOW)).toHaveLength(1);
+		expect(moveIssueToStartedState).toHaveBeenCalledWith("ws-1", "ISS-1");
+	});
+
+	it("does not promote an issue whose creator has no enrolled device", async () => {
+		const { router, moveIssueToStartedState } = makeRouter(store);
+
+		await router.route(
+			createdEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				creator: { id: "lin-charlie", email: "c@example.com", name: "Charlie" },
+			}),
+		);
+
+		expect(moveIssueToStartedState).not.toHaveBeenCalled();
+	});
+
+	it("does not promote an issue whose lock is held by another session", async () => {
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		enroll(store, "bob@example.com", { linearId: "lin-bob" });
+		const { router, moveIssueToStartedState } = makeRouter(store);
+
+		await router.route(
+			createdEvent({ sessionId: "sess-a", issueId: "ISS-1", creator: ALICE }),
+		);
+		moveIssueToStartedState.mockClear();
+
+		await router.route(
+			createdEvent({ sessionId: "sess-b", issueId: "ISS-1", creator: BOB }),
+		);
+
+		expect(moveIssueToStartedState).not.toHaveBeenCalled();
+	});
+
+	it("does not promote on a prompted event (the issue is already started)", async () => {
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		const { router, moveIssueToStartedState } = makeRouter(store);
+
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+		moveIssueToStartedState.mockClear();
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				actorUserId: "lin-alice",
+				creator: ALICE,
+			}),
+		);
+
+		expect(moveIssueToStartedState).not.toHaveBeenCalled();
+	});
+
+	it("still delivers the event when promotion fails", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, moveIssueToStartedState } = makeRouter(store);
+		moveIssueToStartedState.mockRejectedValueOnce(new Error("Linear is down"));
+
+		await expect(
+			router.route(
+				createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+			),
+		).resolves.toBeUndefined();
+
+		expect(store.pendingEvents(aliceDevice, 0, ROUTE_NOW)).toHaveLength(1);
+		expect(store.getSessionAffinity("sess-1")).toBe(aliceDevice);
+	});
+
+	it("skips promotion for a session with no issue", async () => {
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		const { router, moveIssueToStartedState } = makeRouter(store);
+
+		await router.route(createdEvent({ sessionId: "sess-1", creator: ALICE }));
+
+		expect(moveIssueToStartedState).not.toHaveBeenCalled();
 	});
 });

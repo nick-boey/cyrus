@@ -101,6 +101,8 @@ export class RouterServer {
 			gateway: this.gateway,
 			postActivity: (workspaceId, agentSessionId, body) =>
 				this.executor.postActivity(workspaceId, agentSessionId, body),
+			moveIssueToStartedState: (workspaceId, issueId) =>
+				this.executor.moveIssueToStartedState(workspaceId, issueId),
 			config: {
 				eventTtlMs: config.eventTtlMs ?? DEFAULT_EVENT_TTL_MS,
 				issueLock: config.issueLock ?? true,
