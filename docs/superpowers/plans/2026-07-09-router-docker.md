@@ -724,9 +724,10 @@ test -n "$WS_ID" && test -n "$LINEAR_TOKEN" && test -n "$WEBHOOK_SECRET" \
 
 ## Step 4: Write `docker/router/.env`
 
-From the repo's `docker/router/` directory (still holding the shell vars):
+From the repo root (still holding the shell vars):
 
 ```bash
+cd docker/router
 cat > .env <<EOF
 LINEAR_WORKSPACE_ID=$WS_ID
 LINEAR_WORKSPACE_TOKEN=$LINEAR_TOKEN
@@ -737,16 +738,18 @@ echo "✓ wrote docker/router/.env"
 ```
 
 Optional overrides (append only if needed): `CYRUS_ROUTER_PORT`,
-`CYRUS_ROUTER_EVENT_TTL_MS`, `CYRUS_ROUTER_ISSUE_LOCK`,
-`CYRUS_ROUTER_CREATOR_ONLY_PROMPTING`, `CYRUS_ROUTER_HEARTBEAT_MS`,
-`CYRUS_ROUTER_WORKSPACES_JSON`, `TUNNEL_TOKEN` — see `.env.example`.
+`CYRUS_ROUTER_HOST`, `CYRUS_ROUTER_WEBHOOK_MODE`, `CYRUS_ROUTER_EVENT_TTL_MS`,
+`CYRUS_ROUTER_ISSUE_LOCK`, `CYRUS_ROUTER_CREATOR_ONLY_PROMPTING`,
+`CYRUS_ROUTER_HEARTBEAT_MS`, `CYRUS_ROUTER_WORKSPACES_JSON`, `TUNNEL_TOKEN` —
+see `.env.example`.
 
 ## Step 5: Launch
 
 ```bash
 cd docker/router
 docker compose up -d --build        # building from source
-# or, using the prebuilt image (edit docker-compose.yml to use `image:`):
+# or, using the prebuilt image (in docker-compose.yml, comment out the
+# `build:` block and uncomment `image:`):
 # docker compose pull && docker compose up -d
 # with the cloudflared sidecar:
 # docker compose --profile tunnel up -d --build
