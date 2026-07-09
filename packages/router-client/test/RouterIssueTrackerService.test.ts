@@ -170,21 +170,81 @@ describe("RouterEventTransport", () => {
  *     `await undefined` is `undefined`, so the caller concludes "no team")
  */
 describe("RouterIssueTrackerService issue hydration", () => {
-	/** The data-only payload a real router sends for an issue. */
-	const RAW_ISSUE = {
-		id: "issue-uuid",
-		identifier: "PAR-87",
-		title: "Add slash commands",
-		description: "body",
-		url: "https://linear.app/x/issue/PAR-87",
-		branchName: "nboey/par-87",
-		assigneeId: "user-1",
-		stateId: "state-1",
-		teamId: "team-1",
-		parentId: "parent-1",
-		labelIds: ["label-1", "label-2"],
-		priority: 0,
-	};
+	/** A relation reference as the SDK stores it: `{ id }` and nothing more. */
+	type Ref = { id: string } | null;
+
+	/**
+	 * Stands in for `LinearSDK.Issue`, reproducing the one structural detail that
+	 * decides whether hydration works: the relation ids are **prototype getters**
+	 * over private backing fields, not own properties. `JSON.stringify` keeps only
+	 * own enumerable properties, so `stateId` and friends never cross the wire —
+	 * only `_state`, `_team`, … do.
+	 *
+	 * Hand-writing the payload with `stateId` as an own property (what this
+	 * fixture used to do) is precisely what let the hydration bug ship green.
+	 */
+	class SdkLikeIssue {
+		id = "issue-uuid";
+		identifier = "PAR-87";
+		title = "Add slash commands";
+		description = "body";
+		url = "https://linear.app/x/issue/PAR-87";
+		branchName = "nboey/par-87";
+		labelIds = ["label-1", "label-2"];
+		priority = 0;
+
+		_state: Ref;
+		_team: Ref;
+		_assignee: Ref;
+		_parent: Ref;
+		_project: Ref;
+
+		constructor(rel: Partial<Record<string, Ref>> = {}) {
+			this._state = rel.state !== undefined ? rel.state : { id: "state-1" };
+			this._team = rel.team !== undefined ? rel.team : { id: "team-1" };
+			this._assignee =
+				rel.assignee !== undefined ? rel.assignee : { id: "user-1" };
+			this._parent = rel.parent !== undefined ? rel.parent : { id: "parent-1" };
+			this._project = rel.project !== undefined ? rel.project : null;
+		}
+
+		get stateId() {
+			return this._state?.id;
+		}
+		get teamId() {
+			return this._team?.id;
+		}
+		get assigneeId() {
+			return this._assignee?.id;
+		}
+		get parentId() {
+			return this._parent?.id;
+		}
+		get projectId() {
+			return this._project?.id;
+		}
+	}
+
+	/** The data-only payload a real router sends: an SDK issue through JSON. */
+	function sdkWireIssue(
+		rel?: Partial<Record<string, Ref>>,
+	): Record<string, unknown> {
+		return JSON.parse(JSON.stringify(new SdkLikeIssue(rel)));
+	}
+
+	const RAW_ISSUE = sdkWireIssue();
+
+	// Guards the fixture itself. If this ever fails, the payload has stopped
+	// modelling the SDK and every hydration test below is testing a fiction.
+	it("fixture check: serializing an SDK issue drops the relation ids", () => {
+		expect(RAW_ISSUE.stateId).toBeUndefined();
+		expect(RAW_ISSUE.teamId).toBeUndefined();
+		expect(RAW_ISSUE.parentId).toBeUndefined();
+		expect(RAW_ISSUE.assigneeId).toBeUndefined();
+		// Only the private backing fields survive.
+		expect(RAW_ISSUE._state).toEqual({ id: "state-1" });
+		expect(RAW_ISSUE._team).toEqual({ id: "team-1" });
+	});
 
 	/** Routes each RPC method to a canned payload, and records the calls. */
 	function makeRoutingConnection(overrides: Record<string, unknown> = {}) {
@@ -265,14 +325,9 @@ describe("RouterIssueTrackerService issue hydration", () => {
 		expect(conn.rpc).toHaveBeenCalledWith("fetchIssue", ["ws-1", "parent-1"]);
 	});
 
-	it("returns undefined for getters whose id is absent, without an RPC", async () => {
+	it("returns undefined for getters whose relation is absent, without an RPC", async () => {
 		const { svc, conn } = makeService({
-			fetchIssue: {
-				...RAW_ISSUE,
-				teamId: null,
-				assigneeId: null,
-				parentId: null,
-			},
+			fetchIssue: sdkWireIssue({ team: null, assignee: null, parent: null }),
 		});
 		const issue = await svc.fetchIssue("PAR-87");
 
@@ -280,6 +335,40 @@ describe("RouterIssueTrackerService issue hydration", () => {
 		expect(issue.assignee).toBeUndefined();
 		expect(issue.parent).toBeUndefined();
 		expect(conn.rpc).not.toHaveBeenCalledWith("fetchTeam", expect.anything());
+	});
+
+	// A non-Linear tracker (CLIIssueTrackerService) builds plain objects that set
+	// `stateId` directly and have no `_state` backing field. Both shapes must work.
+	it("resolves getters from explicit ids when the payload has no backing fields", async () => {
+		const { svc, conn } = makeService({
+			fetchIssue: {
+				id: "issue-uuid",
+				identifier: "PAR-87",
+				title: "Add slash commands",
+				labelIds: [],
+				priority: 0,
+				stateId: "state-1",
+				teamId: "team-1",
+				assigneeId: "user-1",
+			},
+		});
+		const issue = await svc.fetchIssue("PAR-87");
+
+		expect((await issue.team)?.key).toBe("PAR");
+		expect((await issue.state)?.name).toBe("In Progress");
+		expect((await issue.assignee)?.name).toBe("Nick");
+		expect(conn.rpc).toHaveBeenCalledWith("fetchTeam", ["ws-1", "team-1"]);
+	});
+
+	// The ids callers read directly (e.g. `issue.teamId`) must be present on the
+	// hydrated object even though they never arrived as own properties.
+	it("re-projects the resolved relation ids as own properties", async () => {
+		const { svc } = makeService();
+		const issue = await svc.fetchIssue("PAR-87");
+
+		expect(issue.stateId).toBe("state-1");
+		expect(issue.teamId).toBe("team-1");
+		expect(issue.assigneeId).toBe("user-1");
 	});
 
 	it("memoizes a getter so repeated reads cost one round trip", async () => {

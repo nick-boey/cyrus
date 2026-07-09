@@ -46,30 +46,69 @@ import { RouterEventTransport } from "./RouterEventTransport.js";
  * `project`) and six methods (`labels()`, `comments()`, `attachments()`,
  * `children()`, `inverseRelations()`, `update()`). Those live on the SDK class's
  * prototype, so `JSON.stringify` drops every one of them; only own enumerable
- * properties survive. `parentId`/`projectId` are absent from `Issue`'s `Pick`
- * but *are* set as own properties by the SDK constructor, so they do arrive —
- * which is what makes the `parent`/`project` getters rebuildable.
+ * properties survive.
+ *
+ * The relation *ids* are lost for the same reason: `stateId`/`teamId`/
+ * `assigneeId`/`parentId`/`projectId` are ALSO prototype getters on the SDK
+ * class, each reading a private backing field (`_state`, `_team`, …). Only
+ * those backing fields are own properties, so only they cross the wire:
+ *
+ *     live getters:  stateId=st1 teamId=tm1 parentId=p1
+ *     after JSON:    stateId=undefined teamId=undefined parentId=undefined
+ *     what survives: _assignee, _parent, _project, _state, _team
+ *
+ * A non-Linear tracker (e.g. `CLIIssueTrackerService`) builds plain objects
+ * that set `stateId` directly and have no backing fields at all. Both shapes
+ * are therefore optional here, and {@link relationId} reads whichever arrived.
  */
-type RawIssue = Pick<
-	Issue,
-	| "id"
-	| "identifier"
-	| "title"
-	| "description"
-	| "url"
-	| "branchName"
-	| "assigneeId"
-	| "stateId"
-	| "teamId"
-	| "labelIds"
-	| "priority"
-	| "createdAt"
-	| "updatedAt"
-	| "archivedAt"
-> & {
-	parentId?: string | null;
-	projectId?: string | null;
-};
+type RawIssue = Partial<Pick<Issue, "assigneeId" | "stateId" | "teamId">> &
+	Pick<
+		Issue,
+		| "id"
+		| "identifier"
+		| "title"
+		| "description"
+		| "url"
+		| "branchName"
+		| "labelIds"
+		| "priority"
+		| "createdAt"
+		| "updatedAt"
+		| "archivedAt"
+	> & {
+		parentId?: string | null;
+		projectId?: string | null;
+	} & RawIssueBackingFields;
+
+/** A serialized SDK relation reference: everything but `id` is dropped too. */
+type BackingRef = { id?: string | null } | null | undefined;
+
+/**
+ * The Linear SDK's private backing fields for an issue's relations. These are
+ * assigned in the class constructor (`this._state = data.state`), making them
+ * own enumerable properties — the only trace of the relation ids that survives
+ * `JSON.stringify`.
+ */
+interface RawIssueBackingFields {
+	_state?: BackingRef;
+	_team?: BackingRef;
+	_assignee?: BackingRef;
+	_parent?: BackingRef;
+	_project?: BackingRef;
+}
+
+/**
+ * Resolves a relation id from whichever form the router sent: the explicit
+ * `<name>Id` field (plain-data trackers) or the SDK's private backing field
+ * (a serialized `LinearSDK.Issue`). Returns `undefined` when the relation is
+ * genuinely absent — an unassigned issue, or one with no parent.
+ */
+function relationId(
+	explicit: string | null | undefined,
+	backing: BackingRef,
+): string | undefined {
+	return explicit ?? backing?.id ?? undefined;
+}
 
 /** The wire form of `fetchIssueChildren`, before its issues are hydrated. */
 type RawIssueWithChildren = RawIssue & {
@@ -137,6 +176,14 @@ export class RouterIssueTrackerService implements IIssueTrackerService {
 		// so capture the service explicitly.
 		const self = this;
 
+		// Resolved once, up front: a serialized SDK issue carries these only in
+		// its private backing fields, a plain-data tracker only in the explicit
+		// `<name>Id` fields. See `relationId`.
+		const stateId = relationId(raw.stateId, raw._state);
+		const assigneeId = relationId(raw.assigneeId, raw._assignee);
+		const teamId = relationId(raw.teamId, raw._team);
+		const parentId = relationId(raw.parentId, raw._parent);
+
 		// `Issue`'s getters are typed against the Linear SDK's own WorkflowState /
 		// User / Team / Issue classes, while these RPCs resolve `cyrus-core`'s
 		// structural equivalents. The casts bridge exactly that gap — the same
@@ -146,31 +193,39 @@ export class RouterIssueTrackerService implements IIssueTrackerService {
 		const hydrated: Issue = {
 			...raw,
 
+			// Re-project the resolved ids as own properties. `...raw` spreads only
+			// what arrived, so on a serialized SDK issue these would otherwise stay
+			// undefined even though the getters below work — and callers do read
+			// `issue.teamId` directly.
+			stateId,
+			assigneeId,
+			teamId,
+
 			get state(): Issue["state"] {
-				if (!raw.stateId) return undefined;
+				if (!stateId) return undefined;
 				return once("state", () =>
-					self.fetchWorkflowState(raw.stateId as string),
+					self.fetchWorkflowState(stateId),
 				) as unknown as Issue["state"];
 			},
 
 			get assignee(): Issue["assignee"] {
-				if (!raw.assigneeId) return undefined;
+				if (!assigneeId) return undefined;
 				return once("assignee", () =>
-					self.fetchUser(raw.assigneeId as string),
+					self.fetchUser(assigneeId),
 				) as unknown as Issue["assignee"];
 			},
 
 			get team(): Issue["team"] {
-				if (!raw.teamId) return undefined;
+				if (!teamId) return undefined;
 				return once("team", () =>
-					self.fetchTeam(raw.teamId as string),
+					self.fetchTeam(teamId),
 				) as unknown as Issue["team"];
 			},
 
 			get parent(): Issue["parent"] {
-				if (!raw.parentId) return undefined;
+				if (!parentId) return undefined;
 				return once("parent", () =>
-					self.fetchIssue(raw.parentId as string),
+					self.fetchIssue(parentId),
 				) as unknown as Issue["parent"];
 			},
 
