@@ -150,8 +150,8 @@ replace the `build:` block with `image: ghcr.io/nick-boey/cyrus-router:latest`.
 PAT first — or make the package public once in its GitHub settings.)
 
 Images are published by `.github/workflows/docker-router.yml`: `latest` on the
-default branch, `v*` semver tags on releases, branch and `sha-*` tags for
-everything else (amd64 + arm64).
+default branch, `v*` semver tags on releases, and — on manual `workflow_dispatch`
+runs — branch and `sha-*` tags (amd64 + arm64).
 
 ### Environment variables
 
@@ -173,6 +173,8 @@ On every start, if the required variables are set the entrypoint regenerates
 `/data/router-config.json` from them (env is the source of truth). With no
 config variables set, an existing (e.g. bind-mounted) `router-config.json` is
 used as-is. Neither → the container exits 1 naming the missing variables.
+
+If you change the router port — via `CYRUS_ROUTER_PORT` or a mounted config — set `CYRUS_ROUTER_PORT` in the container environment either way (the image's HEALTHCHECK reads it) and adjust the compose port mapping to match.
 
 ### Admin commands
 

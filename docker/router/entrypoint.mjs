@@ -31,11 +31,19 @@ function fail(message) {
 
 /** Coerce a numeric env var, failing fast on malformed values. */
 function toNumber(name, value) {
-	const n = Number(value);
+	const n = String(value).trim() === "" ? Number.NaN : Number(value);
 	if (!Number.isFinite(n)) {
 		fail(`${name} must be a number, got: ${value}`);
 	}
 	return n;
+}
+
+/** Coerce a boolean env var, failing fast on anything but "true"/"false". */
+function toBoolean(name, value) {
+	if (value !== "true" && value !== "false") {
+		fail(`${name} must be "true" or "false", got: ${value}`);
+	}
+	return value === "true";
 }
 
 /** workspaces map from env: JSON escape hatch wins over the single ID+token pair. */
@@ -119,11 +127,10 @@ function generateConfig(env) {
 		);
 	}
 	if (env.CYRUS_ROUTER_ISSUE_LOCK) {
-		config.issueLock = env.CYRUS_ROUTER_ISSUE_LOCK === "true";
+		config.issueLock = toBoolean("CYRUS_ROUTER_ISSUE_LOCK", env.CYRUS_ROUTER_ISSUE_LOCK);
 	}
 	if (env.CYRUS_ROUTER_CREATOR_ONLY_PROMPTING) {
-		config.creatorOnlyPrompting =
-			env.CYRUS_ROUTER_CREATOR_ONLY_PROMPTING === "true";
+		config.creatorOnlyPrompting = toBoolean("CYRUS_ROUTER_CREATOR_ONLY_PROMPTING", env.CYRUS_ROUTER_CREATOR_ONLY_PROMPTING);
 	}
 	if (env.CYRUS_ROUTER_HEARTBEAT_MS) {
 		config.heartbeatMs = toNumber(
