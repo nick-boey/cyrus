@@ -60,6 +60,10 @@ webhook** and, behind TLS, for **devices to dial `wss://`**.
   below reads it to build the webhook/callback URLs). **Skip** the single-host
   common vars (`CYRUS_SERVER_PORT`, `LINEAR_DIRECT_WEBHOOKS`,
   `CYRUS_HOST_EXTERNAL`) — the router reads `router-config.json`, not those.
+- Not writing `CYRUS_SERVER_PORT` does not make it unused: `cyrus
+  self-auth-linear` binds its temporary OAuth callback server to
+  `CYRUS_SERVER_PORT || 3456`. Step 3 passes it inline (`CYRUS_SERVER_PORT=8787`)
+  so the callback lands on the port the tunnel actually forwards to.
 
 After this step you should have `CYRUS_BASE_URL` set to your public router URL
 (e.g. `https://router.example.com`).
@@ -75,14 +79,40 @@ The router needs (a) a Linear OAuth app whose webhook points at the router, and
   and callback URL `<CYRUS_BASE_URL>/callback` (same paths the router serves).
 - Have you paste `LINEAR_CLIENT_ID`, `LINEAR_CLIENT_SECRET`, and
   `LINEAR_WEBHOOK_SECRET` into `~/.cyrus/.env`.
-- Run `cyrus self-auth-linear`, which authorizes the workspace and writes the
-  workspace token into `~/.cyrus/config.json` under
+- Run the OAuth flow, which authorizes the workspace and writes the workspace
+  token into `~/.cyrus/config.json` under
   `linearWorkspaces["<workspace-id>"].linearToken`.
 
-> On a headless VPS the OAuth browser step of `self-auth-linear` still needs a
-> browser to click **Authorize**. Complete it from a machine that can reach both
-> the callback URL and a browser, or use SSH port-forwarding for the temporary
-> callback server. See `docs/ROUTER.md` / `docs/SELF_HOSTING.md`.
+**Run it with the router port set inline, the tunnel up, and the router not yet
+started** (Step 5 is what starts it, so on a first pass `8787` is already free):
+
+```bash
+CYRUS_SERVER_PORT=8787 cyrus self-auth-linear
+```
+
+Without `CYRUS_SERVER_PORT=8787` the temporary callback server binds `3456`
+while the tunnel forwards `<CYRUS_BASE_URL>/callback` to `8787`, so Linear's
+redirect reaches nothing and the command waits forever. Do **not** persist the
+variable in `.env`; the router ignores it.
+
+> `self-auth-linear` requires `~/.cyrus/config.json` to already exist and parse,
+> or it exits with `Config file not found`. If you have never run `cyrus` on this
+> host, seed a minimal one first:
+>
+> ```bash
+> [ -f ~/.cyrus/config.json ] || printf '{\n\t"repositories": []\n}\n' > ~/.cyrus/config.json
+> ```
+
+> On a headless VPS the OAuth browser step still needs a browser to click
+> **Authorize**. The command prints a `https://linear.app/oauth/authorize?…` URL —
+> open that in a browser anywhere; the redirect goes to your public
+> `CYRUS_BASE_URL`, so no SSH port-forwarding is needed. If the app was authorized
+> before (you will see **Manage** instead of **Authorize**), revoke it under
+> Linear **Settings → Administration → Applications → Revoke access**, then retry.
+>
+> Do not fetch `<CYRUS_BASE_URL>/callback` yourself to "test" it: the handler
+> treats a request without a `?code=` as a fatal error and aborts the flow.
+> See `docs/ROUTER.md` / `docs/SELF_HOSTING.md`.
 
 ## Step 4: Write `~/.cyrus/router-config.json`
 

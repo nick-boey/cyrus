@@ -56,8 +56,23 @@ After this step you have a public router URL (`CYRUS_BASE_URL`), e.g.
 
 **Read** `../cyrus-setup-linear/SKILL.md` and follow it — webhook URL
 `<CYRUS_BASE_URL>/linear-webhook`, callback `<CYRUS_BASE_URL>/callback`. The
-one-time browser OAuth (`cyrus self-auth-linear`) cannot run inside the
-container; run it on the setup machine via `npx cyrus-ai self-auth-linear`.
+one-time browser OAuth cannot run inside the container; run it on the setup
+machine, **before `docker compose up`**, with the router port set inline:
+
+```bash
+CYRUS_SERVER_PORT=8787 npx cyrus-ai self-auth-linear
+```
+
+`self-auth-linear` binds its temporary callback server to
+`CYRUS_SERVER_PORT || 3456`, but the tunnel forwards `<CYRUS_BASE_URL>/callback`
+to `8787`. Without the inline override the redirect reaches nothing and the
+command waits forever. The container must not be running yet, or it will already
+hold `8787`. If `~/.cyrus/config.json` does not exist, seed it first —
+`self-auth-linear` exits with `Config file not found` otherwise:
+
+```bash
+[ -f ~/.cyrus/config.json ] || printf '{\n\t"repositories": []\n}\n' > ~/.cyrus/config.json
+```
 
 Then extract the values for the container env (do NOT print the secrets):
 
