@@ -137,4 +137,132 @@ describe("ConnectCommand", () => {
 			command.execute(["https://x", "--code", "bad-code"]),
 		).rejects.toThrow(/process.exit called/);
 	});
+
+	/**
+	 * Routes /enroll and /workspaces to separate responses so the two-call
+	 * sequence can be asserted independently.
+	 */
+	function stubRouterFetch(workspaces: {
+		ok: boolean;
+		status: number;
+		body: unknown;
+	}) {
+		const fetchMock = vi.fn(async (url: string) => {
+			if (url.endsWith("/enroll")) {
+				return {
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({ deviceToken: "tok" }),
+					text: async () => "",
+				};
+			}
+			return {
+				ok: workspaces.ok,
+				status: workspaces.status,
+				statusText: "",
+				json: async () => workspaces.body,
+				text: async () => JSON.stringify(workspaces.body),
+			};
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		return fetchMock;
+	}
+
+	it("fetches workspace ids with the device token and persists them", async () => {
+		const fetchMock = stubRouterFetch({
+			ok: true,
+			status: 200,
+			body: { workspaceIds: ["ws-1", "ws-2"] },
+		});
+		const app = createApp();
+		const command = new ConnectCommand(app as any);
+
+		await command.execute(["https://x", "--code", "the-code"]);
+
+		expect(fetchMock).toHaveBeenCalledWith(
+			"https://x/workspaces",
+			expect.objectContaining({
+				headers: { authorization: "Bearer tok" },
+			}),
+		);
+
+		const written = JSON.parse(
+			readFileSync(app.config.getConfigPath(), "utf-8"),
+		);
+		expect(written.router.workspaceIds).toEqual(["ws-1", "ws-2"]);
+	});
+
+	// An older router (predating GET /workspaces) 404s. Enrollment has already
+	// burned the one-time code by then, so connect must still succeed.
+	it("still writes router config when the router has no /workspaces route", async () => {
+		stubRouterFetch({ ok: false, status: 404, body: { error: "Not Found" } });
+		const app = createApp();
+		const command = new ConnectCommand(app as any);
+
+		await command.execute(["https://x", "--code", "the-code"]);
+
+		const written = JSON.parse(
+			readFileSync(app.config.getConfigPath(), "utf-8"),
+		);
+		expect(written.platform).toBe("router");
+		expect(written.router.deviceToken).toBe("tok");
+		expect(written.router.workspaceIds).toBeUndefined();
+	});
+
+	it("still writes router config when the /workspaces request throws", async () => {
+		const fetchMock = vi.fn(async (url: string) => {
+			if (url.endsWith("/enroll")) {
+				return {
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({ deviceToken: "tok" }),
+					text: async () => "",
+				};
+			}
+			throw new Error("network down");
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const app = createApp();
+		const command = new ConnectCommand(app as any);
+
+		await command.execute(["https://x", "--code", "the-code"]);
+
+		const written = JSON.parse(
+			readFileSync(app.config.getConfigPath(), "utf-8"),
+		);
+		expect(written.router.deviceToken).toBe("tok");
+		expect(written.router.workspaceIds).toBeUndefined();
+	});
+
+	it("ignores a malformed workspaceIds payload", async () => {
+		stubRouterFetch({
+			ok: true,
+			status: 200,
+			body: { workspaceIds: [1, 2] },
+		});
+		const app = createApp();
+		const command = new ConnectCommand(app as any);
+
+		await command.execute(["https://x", "--code", "the-code"]);
+
+		const written = JSON.parse(
+			readFileSync(app.config.getConfigPath(), "utf-8"),
+		);
+		expect(written.router.workspaceIds).toBeUndefined();
+	});
+
+	it("omits workspaceIds when the router reports none", async () => {
+		stubRouterFetch({ ok: true, status: 200, body: { workspaceIds: [] } });
+		const app = createApp();
+		const command = new ConnectCommand(app as any);
+
+		await command.execute(["https://x", "--code", "the-code"]);
+
+		const written = JSON.parse(
+			readFileSync(app.config.getConfigPath(), "utf-8"),
+		);
+		expect(written.router.workspaceIds).toBeUndefined();
+	});
 });

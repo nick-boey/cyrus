@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - Guided setup (`/cyrus-setup`) now starts by asking which deployment mode you want — **standalone** (single-host), **router host**, or **client device** — and walks you through only the steps that mode needs. Router-host and client-device setup are first-class guided flows instead of a manual appendix.
 - Worktrees now resume from the issue's pushed branch when one exists, and uncommitted work is auto-pushed as WIP before a worktree is removed.
 - The router now exposes a `GET /healthz` liveness endpoint for container health checks and uptime monitors.
+- `cyrus connect` now asks the router which Linear workspace it serves and records the answer, so you no longer have to copy the workspace id off the router host by hand when adding repositories on a client device. Getting that id wrong used to fail silently — the device would connect, receive events, and quietly drop them. Connecting against an older router still works; the id is simply left for you to fill in.
 - The router host can now run as a Docker container: configuration via environment variables, one persistent volume for all state, a compose file with an optional Cloudflare tunnel sidecar, and prebuilt images on GHCR. A guided `cyrus-setup-router-docker` skill walks through the whole setup. See "Running the router in Docker" in `docs/ROUTER.md`.
 
 ### Fixed

@@ -8,3 +8,4 @@ export {
 } from "./LinearExecutor.js";
 export { RouterServer, type RouterServerConfig } from "./RouterServer.js";
 export { RouterStore } from "./RouterStore.js";
+export { registerWorkspacesRoute } from "./workspaces.js";

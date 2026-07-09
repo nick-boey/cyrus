@@ -97,8 +97,73 @@ continuing. Re-run the OAuth if it has expired.
 
 ## Step 6: Add Repositories
 
-**Read** the `cyrus-setup-repository/SKILL.md` sub-skill and follow it to add the
-repositories you want Cyrus to work in on this machine.
+> **Do not use `cyrus self-add-repo` on a client device.** It resolves the target
+> workspace from `config.linearWorkspaces[].linearToken`, which a router-mode
+> device never has — the router holds the workspace token. It exits with
+> `No Linear credentials found. Run 'cyrus self-auth-linear' first.` Ignore that
+> advice: a client device must **not** hold a Linear workspace token.
+>
+> Do not read `cyrus-setup-repository/SKILL.md` for this step either — it assumes
+> the standalone token model, and it tells you to `cat ~/.cyrus/config.json`,
+> which would print your `deviceToken`.
+
+Instead, add each repository directly to the `repositories` array in
+`~/.cyrus/config.json`. A router-mode entry carries **no** `linearToken`:
+
+| Field | Required | Notes |
+|---|---|---|
+| `id` | yes | Any stable unique string. |
+| `name` | yes | Display name. |
+| `repositoryPath` | yes | Absolute path to the local clone. |
+| `baseBranch` | yes | e.g. `main`. |
+| `workspaceBaseDir` | yes | Where per-issue git worktrees are created. |
+| `linearWorkspaceId` | yes *(in practice)* | Your Linear **organization id**. Schema-optional, but `EdgeWorker` keys its issue trackers by it. |
+| `linearToken` | **no** | Router-held. Never put one here. |
+
+### Getting `linearWorkspaceId`
+
+`cyrus connect` asks the router (`GET /workspaces`, authenticated with the device
+token) and records the answer at `router.workspaceIds` in `config.json`. Read it
+back with `jq` — **never `cat` the file**, it holds the device token:
+
+```bash
+jq -r '.router.workspaceIds // [] | .[]' ~/.cyrus/config.json
+```
+
+If that prints nothing, the router predates the `/workspaces` route. Either
+update the router, or ask your admin for the key under `workspaces` in the
+router's `~/.cyrus/router-config.json` (it *is* the Linear organization id).
+
+**Getting this wrong fails silently**: the device connects and receives events,
+then drops each one because no tracker is registered for the incoming workspace
+id. Verify it matches before launching.
+
+### Clone and register
+
+```bash
+git clone <git-url> ~/.cyrus/repos/<name>
+```
+
+Then append the entry with `jq` (writes via a temp file; preserves the rest of
+the config and its `0600` mode):
+
+```bash
+CFG=~/.cyrus/config.json
+WS=$(jq -r '.router.workspaceIds[0] // empty' "$CFG")
+jq --arg ws "$WS" --arg path "$HOME/.cyrus/repos/<name>" '.repositories += [{
+  id: "<name>", name: "<name>",
+  repositoryPath: $path,
+  baseBranch: "main",
+  workspaceBaseDir: ($path + "/../../workspaces/<name>"),
+  linearWorkspaceId: $ws
+}]' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG" && chmod 0600 "$CFG"
+```
+
+Verify without printing secrets:
+
+```bash
+jq -r '.repositories[] | "\(.name) ws=\(.linearWorkspaceId)"' ~/.cyrus/config.json
+```
 
 ## Step 7: Launch
 
@@ -121,7 +186,7 @@ layer (Cyrus resumes from a pushed issue branch and pushes WIP at teardown). See
 > ✓ GitHub CLI + git identity configured (native credentials for PRs)
 > ✓ Connected to router — `platform: "router"` device token written
 > ✓ Local official Linear MCP installed and OAuth'd (auth verified healthy)
-> ✓ Repositories added
+> ✓ Repositories added (no `linearToken`; `linearWorkspaceId` matches the router)
 > ✓ Running via `cyrus start` — receiving the sessions you create in Linear
 >
 > Delegate a Linear issue to the agent to see it run on this machine!
