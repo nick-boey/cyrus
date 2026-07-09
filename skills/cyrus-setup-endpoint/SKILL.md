@@ -20,6 +20,23 @@ Configures a public URL so Linear (and other integrations) can send webhooks to 
 > write **only** `CYRUS_BASE_URL` and **skip** `CYRUS_SERVER_PORT`,
 > `LINEAR_DIRECT_WEBHOOKS`, and `CYRUS_HOST_EXTERNAL`. In the default
 > (standalone) variant, write all of them as usual.
+>
+> **Router variant — `self-auth-linear` still needs the port.** Leaving
+> `CYRUS_SERVER_PORT` unset does *not* mean nothing reads it. `cyrus
+> self-auth-linear` starts a temporary OAuth callback server on
+> `CYRUS_SERVER_PORT || 3456` and registers the redirect URI as
+> `<CYRUS_BASE_URL>/callback`. Since the tunnel forwards to the **router port
+> (`8787`)**, the callback would land on a port nothing is listening on and the
+> OAuth flow hangs forever. Run that one command with the port set inline:
+>
+> ```bash
+> CYRUS_SERVER_PORT=8787 cyrus self-auth-linear
+> ```
+>
+> Do this **while the tunnel is up and the router is stopped**, so `8787` is free
+> for the temporary callback server. Pass it inline rather than writing it to
+> `.env` — the router ignores the variable, and persisting it would silently
+> change the port a future `cyrus start` binds on this host.
 
 ## Step 1: Check Existing Configuration
 

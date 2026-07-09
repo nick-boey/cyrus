@@ -104,6 +104,11 @@ describe("EdgeWorker - Missing Session/Repository Recovery (CYPACK-852)", () => 
 			createResponseActivity: vi.fn().mockResolvedValue(undefined),
 			postAnalyzingThought: vi.fn().mockResolvedValue(undefined),
 			requestSessionStop: vi.fn(),
+			// The full-kill stop path calls this to emit "sessionTerminal", which is
+			// what releases the router's issue lock. Without it on the mock the call
+			// throws — and handleWebhook's catch-all swallows the error, so the test
+			// would go green while the release never happened.
+			abortSession: vi.fn(),
 			setActivitySink: vi.fn(),
 			on: vi.fn(),
 		};
@@ -425,6 +430,29 @@ describe("EdgeWorker - Missing Session/Repository Recovery (CYPACK-852)", () => 
 				postCommentSpy.mock.calls.length > 0;
 
 			expect(anyFeedbackPosted).toBe(true);
+		});
+
+		it("aborts the session on a full kill so the router releases the issue lock", async () => {
+			// A non-warm runner (no interrupt) forces the full-kill branch. That kill
+			// tears the SDK query down before it can yield a result, so
+			// completeSession() — the only other place "sessionTerminal" is emitted —
+			// never runs. Without an explicit abortSession() the router keeps the
+			// issue locked until an admin runs `cyrus router unlock`.
+			const stop = vi.fn();
+			mockAgentSessionManager.getSession.mockReturnValue({
+				agentRunner: { stop }, // no interrupt/isWarm ⇒ supportsInterrupt === false
+			});
+
+			const webhook = createStopSignalWebhook();
+			await (edgeWorker as any).handleWebhook(webhook, [mockRepository]);
+
+			expect(stop).toHaveBeenCalled();
+			expect(mockAgentSessionManager.requestSessionStop).toHaveBeenCalledWith(
+				"agent-session-legacy-456",
+			);
+			expect(mockAgentSessionManager.abortSession).toHaveBeenCalledWith(
+				"agent-session-legacy-456",
+			);
 		});
 	});
 

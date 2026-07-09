@@ -1,5 +1,7 @@
 import { CLIIssueTrackerService } from "cyrus-core";
+import { PROTOCOL_VERSION } from "cyrus-router-protocol";
 import { afterEach, describe, expect, it } from "vitest";
+import WebSocket from "ws";
 import { RouterServer } from "../src/RouterServer.js";
 
 function makeServer(): RouterServer {
@@ -56,6 +58,115 @@ describe("RouterServer /enroll", () => {
 		expect(res.status).toBe(401);
 		const body = (await res.json()) as { error: string };
 		expect(body.error).toBe("invalid or expired code");
+	});
+});
+
+describe("RouterServer session_state", () => {
+	let server: RouterServer | undefined;
+
+	afterEach(async () => {
+		if (server) {
+			await server.stop();
+			server = undefined;
+		}
+	});
+
+	/** Enrolls a device and returns an authenticated socket + a frame reader. */
+	async function connectDevice(srv: RouterServer) {
+		srv.store.addUser({ email: "alice@example.com" });
+		const code = srv.store.mintEnrollmentCode("alice@example.com", Date.now());
+		const res = await fetch(`http://127.0.0.1:${srv.port}/enroll`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ code }),
+		});
+		const { deviceToken } = (await res.json()) as { deviceToken: string };
+
+		const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/device`);
+		const queue: string[] = [];
+		const waiters: Array<(m: string) => void> = [];
+		ws.on("message", (d) => {
+			const msg = d.toString();
+			const w = waiters.shift();
+			if (w) w(msg);
+			else queue.push(msg);
+		});
+		const next = () =>
+			new Promise<string>((resolve) => {
+				const q = queue.shift();
+				if (q !== undefined) resolve(q);
+				else waiters.push(resolve);
+			});
+
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+		expect(JSON.parse(await next()).type).toBe("hello_ack");
+		return { ws, next };
+	}
+
+	it("acks a session_state frame and releases the issue lock before acking", async () => {
+		server = makeServer();
+		await server.start();
+		const { ws, next } = await connectDevice(server);
+
+		// Hold a lock the terminal frame is expected to release.
+		const deviceId = 1;
+		expect(server.store.acquireIssueLock("ISS-1", "sess-1", deviceId)).toBe(
+			true,
+		);
+
+		ws.send(
+			JSON.stringify({
+				type: "session_state",
+				id: "ss-42",
+				sessionId: "sess-1",
+				state: "complete",
+			}),
+		);
+
+		const ack = JSON.parse(await next());
+		expect(ack).toEqual({ type: "session_state_ack", id: "ss-42" });
+
+		// The ack is only sent after the release is applied, so by the time the
+		// device sees it the issue must be re-acquirable by another session.
+		expect(server.store.acquireIssueLock("ISS-1", "sess-2", deviceId)).toBe(
+			true,
+		);
+		ws.terminate();
+	});
+
+	it("re-acks a replayed session_state (at-least-once delivery is idempotent)", async () => {
+		server = makeServer();
+		await server.start();
+		const { ws, next } = await connectDevice(server);
+
+		const frame = JSON.stringify({
+			type: "session_state",
+			id: "ss-dup",
+			sessionId: "sess-1",
+			state: "stopped",
+		});
+		ws.send(frame);
+		expect(JSON.parse(await next())).toEqual({
+			type: "session_state_ack",
+			id: "ss-dup",
+		});
+
+		// A device whose first ack was lost replays the same frame. The router
+		// must ack again rather than ignore it, or the device buffers forever.
+		ws.send(frame);
+		expect(JSON.parse(await next())).toEqual({
+			type: "session_state_ack",
+			id: "ss-dup",
+		});
+		ws.terminate();
 	});
 });
 

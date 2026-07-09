@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { PROTOCOL_VERSION } from "cyrus-router-protocol";
 import { describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { DeviceGateway } from "../src/DeviceGateway.js";
@@ -66,7 +67,7 @@ describe("DeviceGateway", () => {
 			JSON.stringify({
 				type: "hello",
 				deviceToken: "bad",
-				protocolVersion: 1,
+				protocolVersion: PROTOCOL_VERSION,
 				lastAckedSeq: 0,
 			}),
 		);
@@ -115,7 +116,7 @@ describe("DeviceGateway", () => {
 			JSON.stringify({
 				type: "hello",
 				deviceToken: device.deviceToken,
-				protocolVersion: 1,
+				protocolVersion: PROTOCOL_VERSION,
 				lastAckedSeq: 0,
 			}),
 		);
@@ -154,7 +155,7 @@ describe("DeviceGateway", () => {
 			JSON.stringify({
 				type: "hello",
 				deviceToken: device.deviceToken,
-				protocolVersion: 1,
+				protocolVersion: PROTOCOL_VERSION,
 				lastAckedSeq: 0,
 			}),
 		);
@@ -186,7 +187,7 @@ describe("DeviceGateway", () => {
 			JSON.stringify({
 				type: "hello",
 				deviceToken: device.deviceToken,
-				protocolVersion: 1,
+				protocolVersion: PROTOCOL_VERSION,
 				lastAckedSeq: 0,
 			}),
 		);
@@ -207,7 +208,7 @@ describe("DeviceGateway", () => {
 			JSON.stringify({
 				type: "hello",
 				deviceToken: device.deviceToken,
-				protocolVersion: 1,
+				protocolVersion: PROTOCOL_VERSION,
 				lastAckedSeq: 0,
 			}),
 		);
@@ -255,7 +256,7 @@ describe("DeviceGateway", () => {
 			JSON.stringify({
 				type: "hello",
 				deviceToken: device.deviceToken,
-				protocolVersion: 1,
+				protocolVersion: PROTOCOL_VERSION,
 				lastAckedSeq: 0,
 			}),
 		);
@@ -292,7 +293,7 @@ describe("DeviceGateway", () => {
 			JSON.stringify({
 				type: "hello",
 				deviceToken: device.deviceToken,
-				protocolVersion: 1,
+				protocolVersion: PROTOCOL_VERSION,
 				lastAckedSeq: 0,
 			}),
 		);
