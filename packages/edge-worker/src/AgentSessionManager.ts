@@ -401,8 +401,16 @@ export class AgentSessionManager extends EventEmitter {
 				: "error";
 
 		if (wasStopRequested) {
-			// Nothing further is posted on this path, so the session is done with
-			// the issue tracker and it is safe to go terminal here.
+			// Post before going terminal. Linear derives session state from the last
+			// emitted activity, so returning without one leaves the session at
+			// `active` ("Working...") even though the runner is gone. Best-effort:
+			// a post failure must not strand the issue lock, which only the
+			// terminal signal releases.
+			try {
+				await this.createErrorActivity(sessionId, "Session stopped by user.");
+			} catch (err) {
+				log.error("Failed to post stop activity:", err);
+			}
 			this.emitTerminalOnce(sessionId, terminalState);
 			log.info(`Session was stopped by user`);
 			return;
@@ -512,6 +520,22 @@ export class AgentSessionManager extends EventEmitter {
 
 	requestSessionStop(linearAgentActivitySessionId: string): void {
 		this.stopRequestedSessions.add(linearAgentActivitySessionId);
+	}
+
+	/**
+	 * Drops a pending stop request without acting on it.
+	 *
+	 * {@link consumeStopRequest} only fires from {@link completeSession}, which is
+	 * reached exclusively when a *live* runner yields a result. A stop delivered
+	 * to a session whose runner already died (OOM kill, crash) therefore latches
+	 * forever, and the next resumed turn consumes it instead — silently
+	 * swallowing the user's prompt and reporting the session as stopped.
+	 *
+	 * A prompt is an explicit instruction to continue, so any stop request that
+	 * predates it is stale. Called from `EdgeWorker.resumeAgentSession`.
+	 */
+	clearStopRequest(linearAgentActivitySessionId: string): void {
+		this.stopRequestedSessions.delete(linearAgentActivitySessionId);
 	}
 
 	/**
@@ -834,6 +858,16 @@ export class AgentSessionManager extends EventEmitter {
 					? resultMessage.errors.join("\n")
 					: resultText
 			).trim();
+			// A runner torn down mid-turn (OOM kill, SIGTERM) yields an error
+			// result with neither `errors[]` nor `result` text. Falling through to
+			// the empty-content guard below would post nothing at all, and Linear
+			// derives session state from the last emitted activity — so the session
+			// would sit at `active` ("Working...") forever, indistinguishable from
+			// one still running. Synthesize a body so the `error` activity is
+			// always posted.
+			if (!content) {
+				content = `Session ended unexpectedly (${resultMessage.subtype}).`;
+			}
 		} else if (bufferedIsToolInput) {
 			// Turn ended on a tool call. Render a friendly response for a
 			// ScheduleWakeup (gated on the runner actually reporting a pending
@@ -856,6 +890,9 @@ export class AgentSessionManager extends EventEmitter {
 		// Never post an empty/blank "response" activity — that renders as a
 		// bare "Finished" with no body. Skip it entirely (the timeline already
 		// shows the trailing action, and pending work has its own thought).
+		// An empty *error* never reaches here: it is given a synthesized body
+		// above, because a silently-dropped error leaves the session "Working..."
+		// in Linear rather than reporting the failure.
 		if (!content.trim()) {
 			return;
 		}
@@ -1456,6 +1493,68 @@ export class AgentSessionManager extends EventEmitter {
 		return Array.from(this.sessions.values()).filter(
 			(session) => session.status === AgentSessionStatus.Active,
 		);
+	}
+
+	/**
+	 * Reports sessions that a host crash interrupted, so they stop looking alive.
+	 *
+	 * A SIGKILL (OOM kill, `pm2 delete`, power loss) gives no in-process handler a
+	 * chance to run: no result message, so no {@link completeSession}, so neither
+	 * a terminal activity nor a "sessionTerminal" emit. Linear derives session
+	 * state from the last emitted activity, so the session stays `active`
+	 * ("Working...") indefinitely — indistinguishable from one still running — and
+	 * in router mode the issue lock and session affinity stay held forever,
+	 * because the router only releases them when the device says the session
+	 * ended.
+	 *
+	 * Runners are runtime-only and never serialized, so after
+	 * {@link restoreState} a persisted session that is still `active`/`pending`
+	 * yet has no runner is exactly a session the previous process was running when
+	 * it died. A clean shutdown does not produce these: it stops each runner,
+	 * which yields a result and drives the session to `complete`/`error` first.
+	 *
+	 * `awaitingInput` is deliberately excluded — that is a legitimate paused state
+	 * waiting on a user answer, and the next prompt resumes it.
+	 *
+	 * MUST run once at startup, after {@link restoreState} and before any new
+	 * runner is attached. Both the activity post and the terminal signal are
+	 * durable across a router disconnect, so it is safe to call before the device
+	 * has connected.
+	 *
+	 * @returns the ids of the sessions it reconciled
+	 */
+	async reconcileInterruptedSessions(): Promise<string[]> {
+		const interrupted: string[] = [];
+
+		for (const [sessionId, session] of this.sessions) {
+			if (session.agentRunner) continue;
+			if (
+				session.status !== AgentSessionStatus.Active &&
+				session.status !== AgentSessionStatus.Pending
+			) {
+				continue;
+			}
+
+			interrupted.push(sessionId);
+			const log = this.sessionLog(sessionId);
+			await this.updateSessionStatus(sessionId, AgentSessionStatus.Error);
+
+			// Best-effort: a failed post must not stop the terminal signal, which is
+			// the only thing that releases the router's issue lock and affinity.
+			try {
+				await this.createErrorActivity(
+					sessionId,
+					"Session interrupted — the agent host restarted before this session finished. Send a new message to resume it.",
+				);
+			} catch (err) {
+				log.error("Failed to post interrupted-session activity:", err);
+			}
+
+			this.emitTerminalOnce(sessionId, "error");
+			log.info("Reconciled session interrupted by a host restart");
+		}
+
+		return interrupted;
 	}
 
 	/**

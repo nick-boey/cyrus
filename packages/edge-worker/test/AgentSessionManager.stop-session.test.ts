@@ -339,3 +339,230 @@ describe("AgentSessionManager stop-session behavior", () => {
 		expect(terminal).toHaveBeenCalledWith(sessionId, "complete");
 	});
 });
+
+// ── crash / stop reporting to Linear ─────────────────────────────────────
+// Linear derives session state from the LAST EMITTED ACTIVITY. A path that
+// goes terminal without posting one leaves the session at `active`
+// ("Working...") forever, indistinguishable from a session still running.
+describe("AgentSessionManager reports terminal state to Linear", () => {
+	let manager: AgentSessionManager;
+	let mockActivitySink: IActivitySink;
+	let postActivitySpy: any;
+	const sessionId = "test-session-terminal";
+	const issueId = "issue-terminal";
+
+	const errorActivity = () =>
+		postActivitySpy.mock.calls.find((c: any[]) => c[1]?.type === "error")?.[1];
+	const responseActivity = () =>
+		postActivitySpy.mock.calls.find(
+			(c: any[]) => c[1]?.type === "response",
+		)?.[1];
+
+	function result(overrides: Record<string, unknown>) {
+		return {
+			type: "result",
+			subtype: "success",
+			duration_ms: 1,
+			duration_api_ms: 1,
+			is_error: false,
+			num_turns: 1,
+			stop_reason: null,
+			total_cost_usd: 0,
+			usage: {
+				input_tokens: 1,
+				output_tokens: 1,
+				cache_creation_input_tokens: 0,
+				cache_read_input_tokens: 0,
+				cache_creation: null,
+			},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: "result-x",
+			session_id: "sdk-session",
+			...overrides,
+		} as any;
+	}
+
+	function newSession(id: string) {
+		manager.createCyrusAgentSession(
+			id,
+			issueId,
+			{
+				id: issueId,
+				identifier: "TEST-TERM",
+				title: "Terminal Test",
+				description: "test",
+				branchName: "test-term",
+			},
+			{ path: "/tmp/workspace", isGitWorktree: false },
+		);
+		manager.setActivitySink(id, mockActivitySink);
+	}
+
+	beforeEach(() => {
+		mockActivitySink = {
+			id: "test-workspace",
+			postActivity: vi.fn().mockResolvedValue({ activityId: "activity-1" }),
+			createAgentSession: vi.fn().mockResolvedValue("session-1"),
+		};
+		postActivitySpy = vi.spyOn(mockActivitySink, "postActivity");
+		manager = new AgentSessionManager();
+		newSession(sessionId);
+	});
+
+	it("posts an error activity when the user stops the session", async () => {
+		manager.requestSessionStop(sessionId);
+
+		await manager.completeSession(sessionId, result({ result: "ignored" }));
+
+		// Without this the session sits at "Working..." in Linear forever.
+		expect(errorActivity()).toBeDefined();
+		expect(errorActivity().body).toBe("Session stopped by user.");
+	});
+
+	it("still goes terminal when the stop activity fails to post", async () => {
+		// The terminal signal is the only thing that releases the router's issue
+		// lock, so a post failure must not strand it.
+		postActivitySpy.mockRejectedValue(new Error("linear is down"));
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+		manager.requestSessionStop(sessionId);
+
+		await manager.completeSession(sessionId, result({ result: "ignored" }));
+
+		expect(terminal).toHaveBeenCalledWith(sessionId, "stopped");
+	});
+
+	it("posts a synthesized error when a killed runner yields an empty error result", async () => {
+		// A SIGTERM'd SDK yields is_error with neither errors[] nor result text.
+		await manager.completeSession(
+			sessionId,
+			result({
+				subtype: "error_during_execution",
+				is_error: true,
+				errors: [],
+				result: "",
+			}),
+		);
+
+		expect(errorActivity()).toBeDefined();
+		expect(errorActivity().body).toBe(
+			"Session ended unexpectedly (error_during_execution).",
+		);
+	});
+
+	it("still posts nothing for an empty SUCCESS result (no bare 'Finished')", async () => {
+		await manager.completeSession(sessionId, result({ result: "   " }));
+
+		expect(responseActivity()).toBeUndefined();
+	});
+
+	it("clearStopRequest drops a stale latch so the next turn is not swallowed", async () => {
+		// A stop delivered to an already-dead runner never gets consumed, and
+		// would otherwise poison the first turn of the next resume.
+		manager.requestSessionStop(sessionId);
+		manager.clearStopRequest(sessionId);
+
+		await manager.completeSession(sessionId, result({ result: "real answer" }));
+
+		expect(manager.getSession(sessionId)?.status).toBe(
+			AgentSessionStatus.Complete,
+		);
+		expect(responseActivity()?.body).toBe("real answer");
+		expect(errorActivity()).toBeUndefined();
+	});
+});
+
+describe("AgentSessionManager.reconcileInterruptedSessions", () => {
+	let manager: AgentSessionManager;
+	let mockActivitySink: IActivitySink;
+	let postActivitySpy: any;
+
+	function newSession(id: string) {
+		manager.createCyrusAgentSession(
+			id,
+			`issue-${id}`,
+			{
+				id: `issue-${id}`,
+				identifier: "TEST-REC",
+				title: "Reconcile Test",
+				description: "test",
+				branchName: "test-rec",
+			},
+			{ path: "/tmp/workspace", isGitWorktree: false },
+		);
+		manager.setActivitySink(id, mockActivitySink);
+	}
+
+	beforeEach(() => {
+		mockActivitySink = {
+			id: "test-workspace",
+			postActivity: vi.fn().mockResolvedValue({ activityId: "activity-1" }),
+			createAgentSession: vi.fn().mockResolvedValue("session-1"),
+		};
+		postActivitySpy = vi.spyOn(mockActivitySink, "postActivity");
+		manager = new AgentSessionManager();
+	});
+
+	it("reports an active runner-less session as errored and signals terminal", async () => {
+		// Exactly the SIGKILL shape: restored from disk as active, no runner,
+		// because runners are never serialized.
+		newSession("crashed");
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+
+		const reconciled = await manager.reconcileInterruptedSessions();
+
+		expect(reconciled).toEqual(["crashed"]);
+		expect(manager.getSession("crashed")?.status).toBe(
+			AgentSessionStatus.Error,
+		);
+		// Releases the router's issue lock + affinity.
+		expect(terminal).toHaveBeenCalledWith("crashed", "error");
+		const posted = postActivitySpy.mock.calls.find(
+			(c: any[]) => c[1]?.type === "error",
+		);
+		expect(posted).toBeDefined();
+		expect(posted[1].body).toContain("Session interrupted");
+	});
+
+	it("leaves a session that still has a runner alone", async () => {
+		newSession("live");
+		manager.addAgentRunner("live", { isRunning: () => true } as any);
+
+		expect(await manager.reconcileInterruptedSessions()).toEqual([]);
+		expect(manager.getSession("live")?.status).toBe(AgentSessionStatus.Active);
+	});
+
+	it("leaves an already-completed session alone", async () => {
+		newSession("done");
+		const session = manager.getSession("done");
+		if (session) session.status = AgentSessionStatus.Complete;
+
+		expect(await manager.reconcileInterruptedSessions()).toEqual([]);
+		expect(manager.getSession("done")?.status).toBe(
+			AgentSessionStatus.Complete,
+		);
+	});
+
+	it("leaves an awaitingInput session alone (a legitimate paused state)", async () => {
+		newSession("asking");
+		const session = manager.getSession("asking");
+		if (session) session.status = AgentSessionStatus.AwaitingInput;
+
+		expect(await manager.reconcileInterruptedSessions()).toEqual([]);
+		expect(manager.getSession("asking")?.status).toBe(
+			AgentSessionStatus.AwaitingInput,
+		);
+	});
+
+	it("still signals terminal when the activity post fails", async () => {
+		newSession("crashed");
+		postActivitySpy.mockRejectedValue(new Error("router offline"));
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+
+		expect(await manager.reconcileInterruptedSessions()).toEqual(["crashed"]);
+		expect(terminal).toHaveBeenCalledWith("crashed", "error");
+	});
+});

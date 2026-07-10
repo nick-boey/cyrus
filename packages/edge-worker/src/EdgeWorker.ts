@@ -784,6 +784,22 @@ export class EdgeWorker extends EventEmitter {
 
 		// Start shared application server (this also starts Cloudflare tunnel if CLOUDFLARE_TOKEN is set)
 		await this.sharedApplicationServer.start();
+
+		// Report any session the previous process was running when it died. Runs
+		// after initializeComponents() so the activity sinks and issue trackers
+		// exist, and before any webhook can create a new runner. Non-fatal: a
+		// worker that cannot reconcile must still come up and serve new work.
+		try {
+			const interrupted =
+				await this.agentSessionManager.reconcileInterruptedSessions();
+			if (interrupted.length > 0) {
+				this.logger.warn(
+					`Reconciled ${interrupted.length} session(s) interrupted by a host restart`,
+				);
+			}
+		} catch (error) {
+			this.logger.error("Failed to reconcile interrupted sessions:", error);
+		}
 	}
 
 	/**
@@ -7428,6 +7444,15 @@ ${input.userComment}
 		commentTimestamp?: string,
 	): Promise<void> {
 		const log = this.logger.withContext({ sessionId });
+
+		// A prompt is an explicit instruction to continue, so drop any stop request
+		// left over from a previous turn. Without this, a stop delivered while the
+		// runner was already dead (OOM kill, crash) stays latched and is consumed
+		// by this turn's result — swallowing the prompt and reporting the session
+		// as stopped. Cleared before both branches: the streaming path completes
+		// through the same `completeSession`.
+		agentSessionManager.clearStopRequest(sessionId);
+
 		// Check for existing runner
 		const existingRunner = session.agentRunner;
 
