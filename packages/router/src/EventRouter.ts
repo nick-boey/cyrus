@@ -14,6 +14,7 @@ import {
 	offlineReleaseMessage,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
+	PROMPT_UNROUTABLE_MESSAGE,
 	UNENROLLED_CREATOR_MESSAGE,
 } from "./messages.js";
 import type { RouterStore } from "./RouterStore.js";
@@ -209,12 +210,7 @@ export class EventRouter {
 			undefined;
 		const creator = webhook.agentSession.creator ?? undefined;
 
-		const target = this.resolveCreatedTarget(
-			webhook,
-			sessionId,
-			issueId,
-			creator,
-		);
+		const target = this.resolveTarget(webhook, sessionId, issueId, creator);
 		if (!target) {
 			const userName = creator?.name ?? creator?.email ?? "there";
 			await this.postActivity(
@@ -292,17 +288,42 @@ export class EventRouter {
 	private async routePrompted(webhook: SessionEvent): Promise<void> {
 		const sessionId = webhook.agentSession.id;
 		const workspaceId = webhook.organizationId;
+		const issueId =
+			webhook.agentSession.issueId ??
+			webhook.agentSession.issue?.id ??
+			undefined;
+		const creator = webhook.agentSession.creator ?? undefined;
 
-		const deviceId = this.store.getSessionAffinity(sessionId);
-		if (deviceId === undefined) {
+		// A prompt must resolve through the SAME chain as a created event, not
+		// through session affinity alone. Affinity is deleted the moment a session
+		// reports a terminal state, but a Linear agent session outlives its turns:
+		// the user can always prompt it again. Resolving on affinity only meant
+		// every follow-up prompt after the first completion was dropped, leaving
+		// the session in "Waiting for Cyrus" forever.
+		const target = this.resolveTarget(webhook, sessionId, issueId, creator);
+		if (!target) {
+			await this.postActivity(
+				workspaceId,
+				sessionId,
+				PROMPT_UNROUTABLE_MESSAGE,
+			);
 			this.logger.warn(
-				`Prompted event for unknown session ${sessionId}; no affinity, dropping`,
+				`Prompted event for session ${sessionId} resolved to no device; notified and dropping`,
 			);
 			return;
 		}
+		const deviceId = target.deviceId;
 
 		if (this.config.creatorOnlyPrompting) {
-			const creatorId = this.storedCreatorId(sessionId);
+			// Reference creator: the stored one, else the session creator carried on
+			// the webhook. The webhook's `agentSession.creator` is ALWAYS the
+			// session's original creator, which is exactly what we want on the
+			// *creator* side of this comparison — and it is the only thing we have
+			// once a terminal state has cleared the stored affinity row. Without
+			// this fallback, a session rescued by resolveTarget() above would have
+			// no stored creator and the gate would silently skip, letting anyone
+			// prompt someone else's finished session onto that person's machine.
+			const creatorId = this.storedCreatorId(sessionId) ?? creator?.id;
 			if (creatorId !== undefined) {
 				// Actor of the prompt: ONLY the activity's own `userId` identifies
 				// who is actually prompting right now. Do NOT fall back to
@@ -325,11 +346,24 @@ export class EventRouter {
 					return;
 				}
 			}
-			// else: creatorId is unknown (e.g. a session routed via issue/parent
-			// affinity with no stored creator). There is nothing to compare the
-			// actor against, so the gate is intentionally skipped and the prompt
-			// is allowed through — a deliberate can't-compare-so-allow case, not
-			// an oversight.
+			// else: creatorId is unknown — neither stored nor on the webhook (e.g. a
+			// session routed via issue/parent affinity that never carried a creator).
+			// There is nothing to compare the actor against, so the gate is
+			// intentionally skipped and the prompt is allowed through — a deliberate
+			// can't-compare-so-allow case, not an oversight.
+		}
+
+		// Re-establish affinity. When we got here via the fallback chain the row was
+		// missing (or pointed at a device that has since been replaced), so writing
+		// it back means the next prompt resolves on the fast path — and restores the
+		// stored creator that the creator-only gate above compares against.
+		this.store.setSessionAffinity(
+			sessionId,
+			deviceId,
+			creator ? JSON.stringify(creator) : undefined,
+		);
+		if (issueId !== undefined) {
+			this.store.setIssueAffinity(issueId, deviceId);
 		}
 
 		const email = webhook.agentSession.creator?.email ?? DEFAULT_EMAIL;
@@ -343,11 +377,14 @@ export class EventRouter {
 	}
 
 	/**
-	 * Resolves the device a created event routes to, in priority order:
+	 * Resolves the device an event routes to, in priority order:
 	 * existing session affinity (re-delivery) -> creator's enrolled device ->
 	 * issue affinity (app-created sub-issues) -> parent-issue affinity.
+	 *
+	 * Shared by created and prompted events so a prompt to a session whose
+	 * affinity was released still reaches its owner's device.
 	 */
-	private resolveCreatedTarget(
+	private resolveTarget(
 		webhook: SessionEvent,
 		sessionId: string,
 		issueId: string | undefined,

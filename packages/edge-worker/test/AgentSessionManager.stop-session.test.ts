@@ -1,3 +1,4 @@
+import { ClaudeMessageFormatter } from "cyrus-claude-runner";
 import { AgentSessionStatus } from "cyrus-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
@@ -202,6 +203,137 @@ describe("AgentSessionManager stop-session behavior", () => {
 			uuid: "result-ok",
 			session_id: "sdk-session",
 		} as any);
+
+		expect(terminal).toHaveBeenCalledTimes(1);
+		expect(terminal).toHaveBeenCalledWith(sessionId, "complete");
+	});
+
+	// ── terminal-state ordering ────────────────────────────────────────────
+	// The router drops this device's ownership of the session as soon as it sees
+	// the terminal state, so anything posted afterwards is rejected with
+	// "session not owned by this device". The emit must therefore come last.
+
+	it("emits sessionTerminal only AFTER the final result has been posted", async () => {
+		const order: string[] = [];
+		postActivitySpy.mockImplementation(async () => {
+			order.push("postActivity");
+			return { activityId: "activity-1" };
+		});
+		manager.on("sessionTerminal", () => order.push("sessionTerminal"));
+
+		await manager.completeSession(sessionId, {
+			type: "result",
+			subtype: "success",
+			duration_ms: 1,
+			duration_api_ms: 1,
+			is_error: false,
+			num_turns: 1,
+			result: "the final answer",
+			total_cost_usd: 0,
+			usage: {},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: "result-order",
+			session_id: "sdk-session",
+		} as any);
+
+		// At least one activity (the result entry) must precede the terminal
+		// signal, and nothing may follow it.
+		expect(order).toContain("postActivity");
+		expect(order.at(-1)).toBe("sessionTerminal");
+		expect(order.indexOf("sessionTerminal")).toBe(order.length - 1);
+	});
+
+	// ── turn-terminal vs session-terminal ──────────────────────────────────
+	// An SDKResultMessage ends a TURN. When the runner still holds scheduled or
+	// backgrounded work it keeps the session open and streams more messages in
+	// later, so going terminal here would strand the rest of the run unowned.
+
+	it("does NOT emit sessionTerminal when the runner reports pending work", async () => {
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+		manager.addAgentRunner(sessionId, {
+			getFormatter: () => new ClaudeMessageFormatter(),
+			getPendingWork: () => ({
+				sessionCrons: [
+					{
+						id: "cron-1",
+						schedule: "27 12 * * *",
+						recurring: false,
+						prompt: "WAKEUP: check CI",
+					},
+				],
+				backgroundTasks: [],
+			}),
+			constructor: { name: "ClaudeRunner" },
+		} as unknown as Parameters<typeof manager.addAgentRunner>[1]);
+
+		await manager.completeSession(sessionId, {
+			type: "result",
+			subtype: "success",
+			duration_ms: 1,
+			duration_api_ms: 1,
+			is_error: false,
+			num_turns: 1,
+			result: "turn done, wakeup scheduled",
+			total_cost_usd: 0,
+			usage: {},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: "result-pending",
+			session_id: "sdk-session",
+		} as any);
+
+		expect(terminal).not.toHaveBeenCalled();
+	});
+
+	it("emits sessionTerminal on the follow-up turn once pending work has drained", async () => {
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+		let pending = true;
+		manager.addAgentRunner(sessionId, {
+			getFormatter: () => new ClaudeMessageFormatter(),
+			getPendingWork: () =>
+				pending
+					? {
+							sessionCrons: [
+								{
+									id: "cron-1",
+									schedule: "27 12 * * *",
+									recurring: false,
+									prompt: "WAKEUP: check CI",
+								},
+							],
+							backgroundTasks: [],
+						}
+					: { sessionCrons: [], backgroundTasks: [] },
+			constructor: { name: "ClaudeRunner" },
+		} as unknown as Parameters<typeof manager.addAgentRunner>[1]);
+
+		const result = (uuid: string) =>
+			({
+				type: "result",
+				subtype: "success",
+				duration_ms: 1,
+				duration_api_ms: 1,
+				is_error: false,
+				num_turns: 1,
+				result: "done",
+				total_cost_usd: 0,
+				usage: {},
+				modelUsage: {},
+				permission_denials: [],
+				uuid,
+				session_id: "sdk-session",
+			}) as any;
+
+		// Turn 1 ends with a wakeup scheduled: still owned, no terminal.
+		await manager.completeSession(sessionId, result("result-turn-1"));
+		expect(terminal).not.toHaveBeenCalled();
+
+		// The wakeup fires, work drains, and turn 2 genuinely ends the session.
+		pending = false;
+		await manager.completeSession(sessionId, result("result-turn-2"));
 
 		expect(terminal).toHaveBeenCalledTimes(1);
 		expect(terminal).toHaveBeenCalledWith(sessionId, "complete");

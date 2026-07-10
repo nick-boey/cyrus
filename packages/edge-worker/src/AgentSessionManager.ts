@@ -394,67 +394,86 @@ export class AgentSessionManager extends EventEmitter {
 			usage: resultMessage.usage,
 		});
 
-		// This covers only terminations where the SDK yielded a result — i.e. a
-		// normal finish, an error, or an *interrupt* (which lets the query return).
-		// A stop that kills the query outright never reaches here; EdgeWorker calls
-		// abortSession() on that path instead. See the note on abortSession().
 		const terminalState: "complete" | "error" | "stopped" = wasStopRequested
 			? "stopped"
 			: status === AgentSessionStatus.Complete
 				? "complete"
 				: "error";
 
-		// A stop posts no result entry, so nothing is left to own: signal now.
 		if (wasStopRequested) {
+			// Nothing further is posted on this path, so the session is done with
+			// the issue tracker and it is safe to go terminal here.
 			this.emitTerminalOnce(sessionId, terminalState);
 			log.info(`Session was stopped by user`);
 			return;
 		}
 
-		// An SDKResultMessage ends a *turn*, not necessarily the *session*. When
-		// the runner still holds scheduled or in-flight work (ScheduleWakeup/cron
-		// timers, backgrounded tasks) it keeps its query open and streams more
-		// messages after the wakeup. Sampled BEFORE the awaits below so the
-		// decision to signal terminal cannot race a background task finishing
-		// mid-post.
-		const pendingWork = this.getRunnerPendingWork(sessionId);
+		// Assigned inside the `try` below, and read from the `finally`. A throw
+		// before it is set therefore leaves it null and the terminal state still
+		// fires — a lost result entry is recoverable, an issue locked until an
+		// admin runs `cyrus router unlock` is not.
+		let pendingWork: AgentPendingWork | null = null;
 
 		try {
 			// Post final result to issue tracker.
-			//
-			// ORDERING IS LOAD-BEARING: "sessionTerminal" makes the router release
-			// this session's issue lock AND its device affinity, and the router
-			// authorizes `createAgentActivity` against that affinity. Emitting
-			// before this await disowns the device while it is still speaking, so
-			// the final result is rejected with "session not owned by this device"
-			// and the Linear timeline just stops mid-flow. Emit only once every
-			// activity for this session has been posted.
 			await this.addResultEntry(sessionId, resultMessage);
 
-			// Post the pending-work thought AFTER the response so Linear's agent
-			// panel returns to its working state and the user can see what the
-			// session is waiting on.
-			if (resultMessage.subtype === "success" && pendingWork) {
-				const thoughtBody = formatPendingWorkThought(pendingWork);
-				if (thoughtBody) {
-					await this.createThoughtActivity(sessionId, thoughtBody);
-					log.info(
-						`Posted pending-work thought (${pendingWork.sessionCrons.length} crons, ${pendingWork.backgroundTasks.length} background tasks)`,
-					);
+			// When the turn ended with work still scheduled or in flight
+			// (ScheduleWakeup/cron timers, backgrounded tasks), the runner holds
+			// its session open and the wakeup will stream new messages in later.
+			// Post a thought AFTER the response so Linear's agent panel returns
+			// to its working state and the user can see what the session is
+			// waiting on.
+			//
+			// Sampled here rather than before the posts: a background task that
+			// finished while we were writing to Linear should let the session go
+			// terminal now, not defer it to a wakeup that may never arrive. Only
+			// on `success` — an errored result ends the session regardless, and
+			// deferring on it would strand the lock.
+			if (resultMessage.subtype === "success") {
+				pendingWork = this.getRunnerPendingWork(sessionId);
+				if (pendingWork) {
+					const thoughtBody = formatPendingWorkThought(pendingWork);
+					if (thoughtBody) {
+						await this.createThoughtActivity(sessionId, thoughtBody);
+						log.info(
+							`Posted pending-work thought (${pendingWork.sessionCrons.length} crons, ${pendingWork.backgroundTasks.length} background tasks)`,
+						);
+					}
 				}
 			}
+
+			// Handle child session completion. It posts to the *parent* session,
+			// never to this one, so it does not strictly need to precede the
+			// terminal signal — but keeping it inside the `try` means a throw here
+			// still releases this session's lock.
+			const parentSessionId = this.getParentSessionId?.(sessionId);
+			if (parentSessionId && this.resumeParentSession) {
+				await this.handleChildSessionCompletion(sessionId, resultMessage);
+			}
 		} finally {
-			// `finally`, so an unexpected throw while posting still relinquishes
-			// the lock — a lost result entry is recoverable, an issue locked until
-			// an admin runs `cyrus router unlock` is not. (Sink failures are
-			// swallowed by syncEntryToActivitySink today, so this is belt and
-			// braces; it must not depend on that staying true.)
+			// Notify terminal-state observers (router mode releases the issue lock +
+			// session affinity via RouterConnection.sendSessionState) — LAST, and only
+			// once the session has genuinely finished.
 			//
-			// Skipped entirely while work is in flight: the runner will yield
-			// another result when it actually closes, and this same path emits
-			// then (emitTerminalOnce keeps it exactly-once). Signalling now would
-			// leave the session ownership-dead for the rest of its run — every
-			// later activity rejected.
+			// Two ordering rules, both learned the hard way:
+			//
+			// 1. Emit *after* every write above. The router drops this device's
+			//    ownership of the session the instant it sees the terminal state, so
+			//    anything posted afterwards is rejected with "session not owned by this
+			//    device". Emitting first cost every completing session its final result.
+			//
+			// 2. An `SDKResultMessage` is only *turn*-terminal. With pending work the
+			//    runner keeps its session open and streams more messages in on the
+			//    wakeup, so going terminal here would strand the rest of the run
+			//    unowned. Stay non-terminal; the wakeup's own result lands back here
+			//    with no pending work and emits then. A session killed before that
+			//    reaches abortSession(), which emits instead — so the lock cannot leak.
+			//
+			// This covers only terminations where the SDK yielded a result — i.e. a
+			// normal finish, an error, or an *interrupt* (which lets the query return).
+			// A stop that kills the query outright never reaches here; EdgeWorker calls
+			// abortSession() on that path instead. See the note on abortSession().
 			if (!pendingWork) {
 				this.emitTerminalOnce(sessionId, terminalState);
 			} else {
@@ -462,14 +481,6 @@ export class AgentSessionManager extends EventEmitter {
 					`Deferring terminal signal: runner has pending work (${pendingWork.sessionCrons.length} crons, ${pendingWork.backgroundTasks.length} background tasks)`,
 				);
 			}
-		}
-
-		// Handle child session completion. Runs after the terminal signal: it
-		// posts to the *parent* session, never to this one, so this session's
-		// released affinity cannot reject it.
-		const parentSessionId = this.getParentSessionId?.(sessionId);
-		if (parentSessionId && this.resumeParentSession) {
-			await this.handleChildSessionCompletion(sessionId, resultMessage);
 		}
 
 		log.info(`Session completed (subtype: ${resultMessage.subtype})`);
