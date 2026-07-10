@@ -49,3 +49,6 @@ CLAUDE.local.md
 .claude/scheduled_tasks.lock
 
 docker/router/.env
+
+# Claude worktrees
+.claude/worktrees

@@ -50,7 +50,22 @@ current process and any Claude Agent SDK children still working an issue.
 
 ## `sessionTerminal` is emitted too early, killing the device's session ownership
 
-**Status:** open. Not fixed by `bbc0c33` (which fixes the *opposite* failure mode).
+**Status:** FIXED. Both parts of the proposed fix landed in `completeSession()`:
+the emit moved after `addResultEntry()` (inside a `finally`, so a throw still
+releases the lock), and it is skipped entirely while `getRunnerPendingWork()`
+reports work in flight — the runner emits on the later result when it actually
+closes. Regression coverage:
+`packages/edge-worker/test/AgentSessionManager.terminal-signal.test.ts`
+(5 of its 7 tests fail against the old ordering).
+
+The "one unverified link" below was confirmed on the router host before patching:
+`EventRouter.handleSessionState` calls `releaseIssueLockForSession` **and**
+`clearSessionAffinity`, and `createAgentActivity` is in
+`SESSION_SCOPED_RPC_METHODS`, so `LinearExecutor.dispatch` rejects it once
+affinity is gone. PAR-98's session `85303860` was observed losing its final
+result exactly this way: last activity 22:00:56, terminal 'complete' 22:01:35,
+zero `Response` activities across all 625.
+
 **Where:** `packages/edge-worker/src/AgentSessionManager.ts`, `completeSession()`.
 
 ### Symptom
