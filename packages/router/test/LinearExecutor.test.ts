@@ -327,6 +327,7 @@ describe("LinearExecutor.downloadAttachment (token host allowlist)", () => {
 	let store: RouterStore;
 	let executor: LinearExecutor;
 	let fetchMock: ReturnType<typeof vi.fn>;
+	let workspaceTokens: Map<string, string>;
 
 	function okResponse(): Response {
 		return {
@@ -357,10 +358,11 @@ describe("LinearExecutor.downloadAttachment (token host allowlist)", () => {
 		const trackers = new Map<string, IIssueTrackerService>([
 			[WS, tracker as unknown as IIssueTrackerService],
 		]);
+		workspaceTokens = new Map([[WS, TOKEN]]);
 		executor = new LinearExecutor({
 			trackers,
 			store,
-			workspaceTokens: new Map([[WS, TOKEN]]),
+			workspaceTokens,
 		});
 		fetchMock = vi.fn(async () => okResponse());
 		vi.stubGlobal("fetch", fetchMock);
@@ -387,6 +389,22 @@ describe("LinearExecutor.downloadAttachment (token host allowlist)", () => {
 		);
 		expect(res.ok).toBe(true);
 		expect(authHeader()).toBe(`Bearer ${TOKEN}`);
+	});
+
+	// RouterServer shares this map by reference with the tracker's refresh
+	// callback, so a token rotated by a 401-triggered refresh must be picked up
+	// here. Holding a snapshot instead would 401 every attachment download for
+	// the ~24h until the next restart.
+	it("reads the token through the shared map, so a refresh is picked up", async () => {
+		workspaceTokens.set(WS, "rotated-linear-token");
+
+		const res = await executor.dispatch(
+			DEVICE_A,
+			frame("downloadAttachment", ["https://uploads.linear.app/a/file.png"]),
+		);
+
+		expect(res.ok).toBe(true);
+		expect(authHeader()).toBe("Bearer rotated-linear-token");
 	});
 
 	it("does NOT send the token to an arbitrary attacker host", async () => {

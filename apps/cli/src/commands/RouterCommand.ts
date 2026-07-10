@@ -1,4 +1,10 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { resolvePath } from "cyrus-core";
 import {
@@ -17,7 +23,16 @@ import { BaseCommand } from "./ICommand.js";
  */
 const RouterConfigFileSchema = z.object({
 	port: z.number(),
-	workspaces: z.record(z.string(), z.object({ linearToken: z.string() })),
+	workspaces: z.record(
+		z.string(),
+		z.object({
+			linearToken: z.string(),
+			// Optional for backward compatibility with configs written before token
+			// refresh existed. Absent, the router warns at startup and the access
+			// token stops working when Linear expires it (~24h).
+			linearRefreshToken: z.string().optional(),
+		}),
+	),
 	webhook: z.object({
 		verificationMode: z.enum(["direct", "proxy"]),
 		secret: z.string(),
@@ -108,6 +123,9 @@ export class RouterCommand extends BaseCommand {
 		const config: RouterServerConfig = {
 			...parsed.data,
 			dbPath,
+			oauth: this.resolveOAuthCredentials(),
+			onTokenRefresh: (workspaceId, tokens) =>
+				this.persistRefreshedTokens(configPath, workspaceId, tokens),
 			logger: {
 				info: (msg: string) => this.logger.info(msg),
 				warn: (msg: string) => this.logger.warn(msg),
@@ -128,6 +146,68 @@ export class RouterCommand extends BaseCommand {
 		};
 		process.on("SIGINT", () => void shutdown());
 		process.on("SIGTERM", () => void shutdown());
+	}
+
+	/**
+	 * Linear OAuth app credentials, read from the environment (the CLI loads
+	 * `<cyrusHome>/.env` at startup) rather than from `router-config.json`, so
+	 * the client secret is never duplicated into a second file. Returning
+	 * `undefined` disables token refresh; {@link RouterServer} warns about it.
+	 */
+	private resolveOAuthCredentials():
+		| { clientId: string; clientSecret: string }
+		| undefined {
+		const clientId = process.env.LINEAR_CLIENT_ID;
+		const clientSecret = process.env.LINEAR_CLIENT_SECRET;
+		if (!clientId || !clientSecret) return undefined;
+		return { clientId, clientSecret };
+	}
+
+	/**
+	 * Writes a refreshed token pair back to `router-config.json`.
+	 *
+	 * Re-reads the file rather than mutating the parsed startup copy: an operator
+	 * may have edited an unrelated field (ports, webhook secret) while the router
+	 * was running, and a refresh must not revert it. The write is atomic
+	 * (tmp + rename) so a crash mid-write cannot leave a truncated config that
+	 * fails to parse on the next start — which would strand the router with no
+	 * credentials at all.
+	 */
+	private persistRefreshedTokens(
+		configPath: string,
+		workspaceId: string,
+		tokens: { accessToken: string; refreshToken: string },
+	): void {
+		try {
+			const current = JSON.parse(readFileSync(configPath, "utf-8")) as {
+				workspaces?: Record<
+					string,
+					{ linearToken: string; linearRefreshToken?: string }
+				>;
+			};
+			const workspace = current.workspaces?.[workspaceId];
+			if (!workspace) {
+				this.logger.warn(
+					`Refreshed token for unknown workspace ${workspaceId}; not persisted`,
+				);
+				return;
+			}
+			workspace.linearToken = tokens.accessToken;
+			workspace.linearRefreshToken = tokens.refreshToken;
+
+			const tmpPath = `${configPath}.tmp`;
+			writeFileSync(tmpPath, `${JSON.stringify(current, null, 2)}\n`, {
+				mode: 0o600,
+			});
+			renameSync(tmpPath, configPath);
+		} catch (error) {
+			// Never fatal: the in-memory client already holds the new token, so the
+			// router keeps working. Only a restart before the next refresh would
+			// fall back to the stale pair on disk.
+			this.logger.warn(
+				`Failed to persist refreshed Linear token for workspace ${workspaceId}: ${(error as Error).message}`,
+			);
+		}
 	}
 
 	private async users(rest: string[]): Promise<void> {

@@ -1,8 +1,9 @@
 import { CLIIssueTrackerService } from "cyrus-core";
+import type { LinearOAuthConfig } from "cyrus-linear-event-transport";
 import { PROTOCOL_VERSION } from "cyrus-router-protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import { RouterServer } from "../src/RouterServer.js";
+import { RouterServer, type RouterServerConfig } from "../src/RouterServer.js";
 
 function makeServer(): RouterServer {
 	return new RouterServer({
@@ -291,5 +292,85 @@ describe("RouterServer /workspaces", () => {
 		});
 
 		expect(res.status).toBe(401);
+	});
+});
+
+describe("RouterServer Linear token refresh wiring", () => {
+	const OAUTH = { clientId: "client-id", clientSecret: "client-secret" };
+
+	/**
+	 * Builds a server with a capturing trackerFactory, returning the oauthConfig
+	 * that the default (Linear-backed) tracker would have been constructed with.
+	 */
+	function captureOAuthConfig(overrides: Partial<RouterServerConfig> = {}): {
+		server: RouterServer;
+		oauthConfigs: Map<string, LinearOAuthConfig | undefined>;
+		warnings: string[];
+	} {
+		const oauthConfigs = new Map<string, LinearOAuthConfig | undefined>();
+		const warnings: string[] = [];
+		const server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: {
+				"ws-1": { linearToken: "token-1", linearRefreshToken: "refresh-1" },
+			},
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			oauth: OAUTH,
+			logger: { info: () => {}, warn: (msg) => warnings.push(msg) },
+			trackerFactory: (id, _cfg, oauthConfig) => {
+				oauthConfigs.set(id, oauthConfig);
+				return new CLIIssueTrackerService();
+			},
+			...overrides,
+		});
+		return { server, oauthConfigs, warnings };
+	}
+
+	it("passes an oauthConfig built from the workspace refresh token", () => {
+		const { oauthConfigs } = captureOAuthConfig();
+		const cfg = oauthConfigs.get("ws-1");
+
+		expect(cfg).toBeDefined();
+		expect(cfg?.clientId).toBe("client-id");
+		expect(cfg?.clientSecret).toBe("client-secret");
+		expect(cfg?.refreshToken).toBe("refresh-1");
+		expect(cfg?.workspaceId).toBe("ws-1");
+	});
+
+	it("disables refresh and warns when the workspace has no refresh token", () => {
+		const { oauthConfigs, warnings } = captureOAuthConfig({
+			workspaces: { "ws-1": { linearToken: "token-1" } },
+		});
+
+		expect(oauthConfigs.get("ws-1")).toBeUndefined();
+		expect(warnings.join("\n")).toContain("No linearRefreshToken");
+	});
+
+	it("disables refresh and warns when OAuth client credentials are absent", () => {
+		const { oauthConfigs, warnings } = captureOAuthConfig({ oauth: undefined });
+
+		expect(oauthConfigs.get("ws-1")).toBeUndefined();
+		expect(warnings.join("\n")).toContain("token refresh disabled");
+	});
+
+	it("forwards a rotated token pair to onTokenRefresh for persistence", async () => {
+		const persisted: Array<
+			[string, { accessToken: string; refreshToken: string }]
+		> = [];
+		const { oauthConfigs } = captureOAuthConfig({
+			onTokenRefresh: (workspaceId, tokens) => {
+				persisted.push([workspaceId, tokens]);
+			},
+		});
+
+		await oauthConfigs.get("ws-1")?.onTokenRefresh?.({
+			accessToken: "token-2",
+			refreshToken: "refresh-2",
+		});
+
+		expect(persisted).toEqual([
+			["ws-1", { accessToken: "token-2", refreshToken: "refresh-2" }],
+		]);
 	});
 });

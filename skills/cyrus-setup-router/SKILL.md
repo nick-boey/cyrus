@@ -122,16 +122,18 @@ Transplant the workspace token and webhook secret into the router config. Do
 First, read back the values you need (these come from the previous steps):
 
 ```bash
-# Workspace id + token from config.json (written by `cyrus self-auth-linear`)
+# Workspace id + tokens from config.json (written by `cyrus self-auth-linear`)
 WS_ID=$(jq -r '.linearWorkspaces | keys[0]' ~/.cyrus/config.json)
 LINEAR_TOKEN=$(jq -r --arg ws "$WS_ID" '.linearWorkspaces[$ws].linearToken' ~/.cyrus/config.json)
+LINEAR_REFRESH_TOKEN=$(jq -r --arg ws "$WS_ID" '.linearWorkspaces[$ws].linearRefreshToken' ~/.cyrus/config.json)
 
 # Webhook signing secret from .env
 WEBHOOK_SECRET=$(grep '^LINEAR_WEBHOOK_SECRET=' ~/.cyrus/.env | cut -d= -f2-)
 
 # Sanity check (values must be non-empty; do NOT print the secrets themselves)
 test -n "$WS_ID" && test -n "$LINEAR_TOKEN" && test -n "$WEBHOOK_SECRET" \
-  && echo "✓ have workspace id, token, and webhook secret" \
+  && test -n "$LINEAR_REFRESH_TOKEN" && test "$LINEAR_REFRESH_TOKEN" != "null" \
+  && echo "✓ have workspace id, both tokens, and webhook secret" \
   || echo "✗ missing one or more values — re-check Steps 2–3"
 ```
 
@@ -148,7 +150,10 @@ cat > ~/.cyrus/router-config.json <<JSON
 {
   "port": 8787,
   "workspaces": {
-    "$WS_ID": { "linearToken": "$LINEAR_TOKEN" }
+    "$WS_ID": {
+      "linearToken": "$LINEAR_TOKEN",
+      "linearRefreshToken": "$LINEAR_REFRESH_TOKEN"
+    }
   },
   "webhook": { "verificationMode": "direct", "secret": "$WEBHOOK_SECRET" }
 }
@@ -156,6 +161,15 @@ JSON
 chmod 600 ~/.cyrus/router-config.json
 echo "✓ wrote ~/.cyrus/router-config.json"
 ```
+
+> **`linearRefreshToken` is not optional in practice.** Linear expires the access
+> token about 24 hours after it is minted. With the refresh token present (and
+> `LINEAR_CLIENT_ID` / `LINEAR_CLIENT_SECRET` in `~/.cyrus/.env`), the router
+> re-mints it automatically on the first 401 and rewrites this file. Without it,
+> every Linear call starts failing with `Authentication required, not
+> authenticated` a day after setup, and Linear shows *"Agent didn't start. The
+> request may not have reached the agent."* on delegated issues. The router logs
+> `token refresh disabled` at startup when either piece is missing.
 
 **Optional keys** (add inside the JSON object if you want to override defaults):
 

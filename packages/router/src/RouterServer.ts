@@ -4,7 +4,10 @@ import type {
 	IAgentEventTransport,
 	IIssueTrackerService,
 } from "cyrus-core";
-import { LinearIssueTrackerService } from "cyrus-linear-event-transport";
+import {
+	LinearIssueTrackerService,
+	type LinearOAuthConfig,
+} from "cyrus-linear-event-transport";
 import type { RpcRequestFrame, SessionStateFrame } from "cyrus-router-protocol";
 import Fastify, { type FastifyInstance } from "fastify";
 import { DeviceGateway } from "./DeviceGateway.js";
@@ -19,22 +22,55 @@ const DEFAULT_EVENT_TTL_MS = 48 * 60 * 60 * 1000;
 /** How often {@link EventRouter.sweepExpired} runs. */
 const SWEEP_INTERVAL_MS = 60_000;
 
+/** Per-workspace Linear credentials as stored in `router-config.json`. */
+export interface RouterWorkspaceConfig {
+	linearToken: string;
+	/**
+	 * Needed to re-mint `linearToken`, which Linear expires after ~24h. Omit it
+	 * and the router keeps a token that dies a day later — see
+	 * {@link RouterServer.buildOAuthConfig}.
+	 */
+	linearRefreshToken?: string;
+}
+
 export interface RouterServerConfig {
 	port: number;
 	dbPath: string;
 	/** workspaceId → per-workspace Linear credentials. */
-	workspaces: Record<string, { linearToken: string }>;
+	workspaces: Record<string, RouterWorkspaceConfig>;
 	webhook: { verificationMode: "direct" | "proxy"; secret: string };
+	/**
+	 * Linear OAuth application credentials, used together with a workspace's
+	 * `linearRefreshToken` to refresh an expired access token. Supplied by the
+	 * caller (the CLI reads them from the environment) so this package stays
+	 * free of `process.env` reads. Omit to disable refresh.
+	 */
+	oauth?: { clientId: string; clientSecret: string };
+	/**
+	 * Called after a workspace's access token is refreshed, so the caller can
+	 * persist the rotated pair. Linear rotates the refresh token on every
+	 * refresh, so failing to persist this leaves the *old* refresh token on
+	 * disk — still usable today, but a restart replays a stale pair.
+	 */
+	onTokenRefresh?: (
+		workspaceId: string,
+		tokens: { accessToken: string; refreshToken: string },
+	) => void | Promise<void>;
 	/** Default 48h. */
 	eventTtlMs?: number;
 	/** Default true. */
 	issueLock?: boolean;
 	/** Default true. */
 	creatorOnlyPrompting?: boolean;
-	/** Test seam; defaults to a Linear-backed tracker per workspace. */
+	/**
+	 * Test seam; defaults to a Linear-backed tracker per workspace. Receives the
+	 * resolved OAuth config (`undefined` when refresh is disabled) so tests can
+	 * assert on how refresh was wired.
+	 */
 	trackerFactory?: (
 		workspaceId: string,
-		cfg: { linearToken: string },
+		cfg: RouterWorkspaceConfig,
+		oauthConfig: LinearOAuthConfig | undefined,
 	) => IIssueTrackerService;
 	logger?: { info(msg: string): void; warn(msg: string): void };
 	/** Forwarded to {@link DeviceGateway} for heartbeat tuning in tests. */
@@ -72,18 +108,27 @@ export class RouterServer {
 		this.store = new RouterStore(config.dbPath);
 		this.fastify = Fastify();
 
+		// Shared by reference with LinearExecutor, so a refresh that writes here is
+		// immediately visible to the attachment-download path.
+		const workspaceTokens = new Map<string, string>();
+
 		const factory =
 			config.trackerFactory ??
-			((_id, cfg): IIssueTrackerService =>
+			((_id, cfg, oauthConfig): IIssueTrackerService =>
 				new LinearIssueTrackerService(
 					new LinearClient({ accessToken: cfg.linearToken }),
+					oauthConfig,
 				));
 
 		this.trackers = new Map();
-		const workspaceTokens = new Map<string, string>();
 		for (const [workspaceId, cfg] of Object.entries(config.workspaces)) {
-			this.trackers.set(workspaceId, factory(workspaceId, cfg));
 			workspaceTokens.set(workspaceId, cfg.linearToken);
+			const oauthConfig = this.buildOAuthConfig(
+				workspaceId,
+				cfg,
+				workspaceTokens,
+			);
+			this.trackers.set(workspaceId, factory(workspaceId, cfg, oauthConfig));
 		}
 
 		this.executor = new LinearExecutor({
@@ -214,6 +259,51 @@ export class RouterServer {
 		this.transport = undefined;
 		await this.fastify.close();
 		this.store.close();
+	}
+
+	/**
+	 * Builds the OAuth config that lets {@link LinearIssueTrackerService} refresh
+	 * an expired access token in place. Returning `undefined` disables refresh:
+	 * the tracker then leaves its SDK client unpatched and a 401 propagates to
+	 * the caller.
+	 *
+	 * Both inputs are required. Without them the router runs on a token that
+	 * Linear expires ~24h after it was minted, at which point every Linear call
+	 * fails with `Authentication required, not authenticated` until an operator
+	 * hand-edits `router-config.json`.
+	 */
+	private buildOAuthConfig(
+		workspaceId: string,
+		cfg: RouterWorkspaceConfig,
+		workspaceTokens: Map<string, string>,
+	): LinearOAuthConfig | undefined {
+		const { oauth, onTokenRefresh } = this.config;
+		if (!oauth) {
+			this.logger.warn(
+				`Linear OAuth client credentials not set; token refresh disabled for workspace ${workspaceId}. The access token will stop working when it expires.`,
+			);
+			return undefined;
+		}
+		if (!cfg.linearRefreshToken) {
+			this.logger.warn(
+				`No linearRefreshToken for workspace ${workspaceId}; token refresh disabled. The access token will stop working when it expires.`,
+			);
+			return undefined;
+		}
+
+		return {
+			clientId: oauth.clientId,
+			clientSecret: oauth.clientSecret,
+			refreshToken: cfg.linearRefreshToken,
+			workspaceId,
+			onTokenRefresh: async (tokens) => {
+				// The attachment path reads the raw token out of this map rather than
+				// off the tracker, so it goes stale unless refreshed here too.
+				workspaceTokens.set(workspaceId, tokens.accessToken);
+				this.logger.info(`Refreshed Linear token for workspace ${workspaceId}`);
+				await onTokenRefresh?.(workspaceId, tokens);
+			},
+		};
 	}
 
 	/**
