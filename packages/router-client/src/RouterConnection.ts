@@ -21,6 +21,7 @@ import {
 	type SessionStateAckFrame,
 } from "cyrus-router-protocol";
 import { WebSocket } from "ws";
+import { reviveDates } from "./date-revival.js";
 
 const BACKOFF_CAP_MS = 60_000;
 const DEFAULT_RECONNECT_BASE_MS = 1_000;
@@ -459,7 +460,10 @@ export class RouterConnection extends EventEmitter {
 		this.pending.delete(frame.id);
 		clearTimeout(pending.timer);
 		if (frame.ok) {
-			pending.resolve(frame.result);
+			// The issue-tracker types promise `Date` for createdAt/updatedAt/
+			// archivedAt, but JSON.parse yields strings. Revive here, at the single
+			// point every RPC result passes through, rather than at each call site.
+			pending.resolve(reviveDates(frame.result));
 		} else {
 			pending.reject(new RouterRpcError(frame.error ?? "rpc failed", false));
 		}

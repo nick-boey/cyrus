@@ -224,6 +224,38 @@ describe("RouterConnection", () => {
 		conn.close();
 	});
 
+	it("(c2) rpc revives Date fields the wire flattened to ISO strings", async () => {
+		// The router serializes the SDK's Date fields to strings. Without revival
+		// at this boundary, EdgeWorker's `comment.createdAt.toISOString()` throws
+		// "is not a function" on every prompted webhook carrying a comment.
+		router.onFrame = (ws, frame) => {
+			if (frame.type === "rpc_request") {
+				router.rpcOk(ws, frame.id, {
+					id: "c-1",
+					title: "2026-01-01T00:00:00.000Z",
+					createdAt: "2026-07-10T04:25:41.345Z",
+					nodes: [{ updatedAt: "2026-07-10T05:00:00.000Z" }],
+				});
+			}
+		};
+		const conn = makeConn();
+		conn.connect();
+		await once(conn, "connected");
+
+		const result = (await conn.rpc("fetchComment", ["c-1"])) as {
+			title: string;
+			createdAt: Date;
+			nodes: Array<{ updatedAt: Date }>;
+		};
+
+		expect(result.createdAt).toBeInstanceOf(Date);
+		expect(result.createdAt.toISOString()).toBe("2026-07-10T04:25:41.345Z");
+		expect(result.nodes[0]?.updatedAt).toBeInstanceOf(Date);
+		// A date-shaped value under a non-date key stays a string.
+		expect(result.title).toBe("2026-01-01T00:00:00.000Z");
+		conn.close();
+	});
+
 	it("(d) bufferedRpc while disconnected writes JSONL and replays after reconnect", async () => {
 		// Point at the real router but do not connect yet: bufferedRpc is offline.
 		const conn = makeConn();
