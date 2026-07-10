@@ -50,8 +50,36 @@ current process and any Claude Agent SDK children still working an issue.
 
 ## `sessionTerminal` is emitted too early, killing the device's session ownership
 
-**Status:** open. Not fixed by `bbc0c33` (which fixes the *opposite* failure mode).
-**Where:** `packages/edge-worker/src/AgentSessionManager.ts`, `completeSession()`.
+**Status:** FIXED on `fix/router-prompted-affinity`. Both the premature emit and a
+second, previously unrecorded consequence of it (below) are addressed.
+**Where:** `packages/edge-worker/src/AgentSessionManager.ts`, `completeSession()`,
+and `packages/router/src/EventRouter.ts`, `routePrompted()`.
+
+### The half this TODO missed: the session also becomes unpromptable
+
+`handleSessionState()` on the router releases the issue lock **and calls
+`clearSessionAffinity()`**. `routePrompted()` resolved a prompt through session
+affinity *and nothing else*, then `return`ed without posting anything when the
+lookup missed. So the premature emit did not merely lose the final result entry —
+it permanently severed the session's routing, and every later prompt was dropped
+silently, leaving the Linear agent session in "Waiting for Cyrus" forever. Starting
+a new session was the only recovery, because `routeCreated()` re-resolves through
+the creator.
+
+Confirmed in the router logs: 10 prompts dropped on 2026-07-09, every one for a
+session that had earlier logged `reached terminal state ... released lock and
+affinity` — including `4c16c133` (PAR-97) dropped at 13:05 and again at 21:48,
+hours after it "completed".
+
+The fix therefore has two halves, and both are needed:
+
+1. **Edge worker** — emit `sessionTerminal` last (after every Linear write) and
+   only when the runner reports no pending work. Stops sessions being bricked.
+2. **Router** — give `routePrompted()` the same creator → issue-affinity fallback
+   chain `routeCreated()` already has, re-establish affinity on success, and post
+   a message instead of dropping when nothing resolves. Rescues sessions already
+   bricked, and makes affinity loss (router restart, DB loss, offline sweep)
+   recoverable rather than terminal.
 
 ### Symptom
 
@@ -111,31 +139,46 @@ with pending background work to go ownership-dead for the rest of its run.
 So the terminal signal has two opposite bugs: fired *never* on the kill path
 (fixed), and fired *too early* on the result path (open).
 
-### Proposed fix
+### Fix as applied
 
 In `completeSession()`:
 
-1. Move `emitTerminalOnce()` to **after** the final result is posted.
-2. Do not emit terminal at all when `getRunnerPendingWork(sessionId)` reports work
-   still in flight — that is already the exact condition checked a few lines below
-   for the pending-work thought. Emit when the runner actually closes.
+1. `emitTerminalOnce()` moved to **after** the final result is posted (and after
+   the pending-work thought and any parent-session resume — every write needs
+   ownership, not just the result entry).
+2. No terminal emit at all when `getRunnerPendingWork(sessionId)` reports work
+   still in flight. The wakeup's own result lands back in `completeSession()` with
+   no pending work and emits then; a session killed before that reaches
+   `abortSession()`, which emits instead — so the lock still cannot leak.
 
-Keep `abortSession()` on the kill path as-is.
+`abortSession()` on the kill path is unchanged.
 
-### Before patching — one unverified link
+In `routePrompted()`: resolve through the shared `resolveTarget()` chain (session
+affinity → creator's enrolled device → issue affinity → parent-issue affinity),
+write the affinity back on success, and post `PROMPT_UNROUTABLE_MESSAGE` when
+nothing resolves.
 
-The conclusion that the router drops **session affinity** on receiving
-`session_state` (rather than the rejection originating elsewhere) was inferred
-from the client log plus the edge-worker source. It has not been confirmed against
-`RouterStore` / `DeviceGateway` on the router host. 177 consecutive rejections
-starting 6ms before PAR-97's first completion make it hard to explain otherwise,
-but confirm router-side before writing the patch.
+### The unverified link, now verified
 
-### Regression test
+The TODO flagged one inference to confirm before patching: that the router drops
+**session affinity** on receiving `session_state`, rather than the rejection
+originating elsewhere. Confirmed router-side — `EventRouter.handleSessionState()`
+calls `store.releaseIssueLockForSession()` *and* `store.clearSessionAffinity()`,
+and `RouterStore.clearSessionAffinity()` deletes the row outright.
 
-`packages/edge-worker/test/AgentSessionManager.stop-session.test.ts` covers the
-kill path. Add coverage for the result path:
+### Regression tests
 
-- a session whose runner reports pending work emits **no** `sessionTerminal` on
-  the first `SDKResultMessage`;
-- `sessionTerminal` is emitted only after `addResultEntry()` has resolved.
+`packages/edge-worker/test/AgentSessionManager.stop-session.test.ts`:
+
+- `sessionTerminal` is emitted only after the final result has been posted;
+- a runner reporting pending work emits **no** `sessionTerminal` on the first
+  `SDKResultMessage`;
+- it *is* emitted on the follow-up turn once pending work has drained.
+
+`packages/router/test/EventRouter.test.ts`:
+
+- a prompt whose affinity was released by a terminal state still routes, and
+  affinity is re-established;
+- an unroutable prompt notifies the user instead of being dropped silently.
+
+All five fail against the pre-fix code.

@@ -8,6 +8,7 @@ import {
 	offlineReleaseMessage,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
+	PROMPT_UNROUTABLE_MESSAGE,
 	UNENROLLED_CREATOR_MESSAGE,
 } from "../src/messages.js";
 import { RouterStore } from "../src/RouterStore.js";
@@ -317,6 +318,119 @@ describe("EventRouter", () => {
 		);
 		expect(store.pendingEvents(aliceDevice, 0, ROUTE_NOW)).toHaveLength(
 			queuedBefore,
+		);
+	});
+
+	it("(d3) routes a prompt whose session affinity was released by a terminal state", async () => {
+		// Regression: a Linear agent session outlives its turns — the user can
+		// prompt it again after it completes. The terminal state releases session
+		// affinity, and routePrompted used to resolve on affinity ALONE, so every
+		// follow-up prompt was dropped silently and the session sat in "Waiting
+		// for Cyrus" forever. A new session was the only way out.
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, postActivity } = makeRouter(store);
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		// The session finishes: the router releases its lock AND its affinity.
+		router.handleSessionState(aliceDevice, {
+			sessionId: "sess-1",
+			state: "complete",
+		} as any);
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+
+		postActivity.mockClear();
+		const queuedBefore = store.pendingEvents(aliceDevice, 0, ROUTE_NOW).length;
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				actorUserId: "lin-alice",
+				creator: ALICE,
+			}),
+		);
+
+		// Falls back to the creator's enrolled device rather than dropping.
+		expect(store.pendingEvents(aliceDevice, 0, ROUTE_NOW).length).toBe(
+			queuedBefore + 1,
+		);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
+		// ...and affinity is re-established, so the next prompt takes the fast path
+		// and the creator-only gate has a stored creator to compare against again.
+		expect(store.getSessionAffinity("sess-1")).toBe(aliceDevice);
+	});
+
+	it("(d3b) still enforces creator-only prompting on a session rescued by the fallback", async () => {
+		// The fallback in (d3) must not become a way around the creator gate. A
+		// rescued session has no STORED creator (the terminal state deleted the
+		// affinity row), so the gate has to fall back to the session creator the
+		// webhook carries — otherwise Bob could prompt Alice's finished session
+		// onto Alice's machine.
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, postActivity } = makeRouter(store, {
+			config: { creatorOnlyPrompting: true },
+		});
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+		router.handleSessionState(aliceDevice, {
+			sessionId: "sess-1",
+			state: "complete",
+		} as any);
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+
+		postActivity.mockClear();
+		const queuedBefore = store.pendingEvents(aliceDevice, 0, ROUTE_NOW).length;
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				actorUserId: "lin-bob",
+				creator: ALICE,
+			}),
+		);
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_REJECTION_MESSAGE,
+		);
+		expect(store.pendingEvents(aliceDevice, 0, ROUTE_NOW)).toHaveLength(
+			queuedBefore,
+		);
+		// Rejected prompts must not resurrect affinity either.
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+	});
+
+	it("(d4) tells the user when a prompt cannot be routed instead of dropping it silently", async () => {
+		// Nothing resolves: no session affinity, no enrolled device for the
+		// creator, no issue affinity. The session must not be left waiting.
+		const { router, postActivity } = makeRouter(store);
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-unknown",
+				issueId: "ISS-unknown",
+				actorUserId: "lin-bob",
+				creator: BOB,
+			}),
+		);
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-unknown",
+			PROMPT_UNROUTABLE_MESSAGE,
 		);
 	});
 

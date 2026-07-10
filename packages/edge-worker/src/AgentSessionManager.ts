@@ -394,21 +394,16 @@ export class AgentSessionManager extends EventEmitter {
 			usage: resultMessage.usage,
 		});
 
-		// Notify terminal-state observers (router mode releases the issue lock +
-		// session affinity via RouterConnection.sendSessionState).
-		//
-		// This covers only terminations where the SDK yielded a result — i.e. a
-		// normal finish, an error, or an *interrupt* (which lets the query return).
-		// A stop that kills the query outright never reaches here; EdgeWorker calls
-		// abortSession() on that path instead. See the note on abortSession().
 		const terminalState: "complete" | "error" | "stopped" = wasStopRequested
 			? "stopped"
 			: status === AgentSessionStatus.Complete
 				? "complete"
 				: "error";
-		this.emitTerminalOnce(sessionId, terminalState);
 
 		if (wasStopRequested) {
+			// Nothing further is posted on this path, so the session is done with
+			// the issue tracker and it is safe to go terminal here.
+			this.emitTerminalOnce(sessionId, terminalState);
 			log.info(`Session was stopped by user`);
 			return;
 		}
@@ -422,8 +417,9 @@ export class AgentSessionManager extends EventEmitter {
 		// Post a thought AFTER the response so Linear's agent panel returns
 		// to its working state and the user can see what the session is
 		// waiting on.
+		let pendingWork: AgentPendingWork | null = null;
 		if (resultMessage.subtype === "success") {
-			const pendingWork = this.getRunnerPendingWork(sessionId);
+			pendingWork = this.getRunnerPendingWork(sessionId);
 			if (pendingWork) {
 				const thoughtBody = formatPendingWorkThought(pendingWork);
 				if (thoughtBody) {
@@ -439,6 +435,32 @@ export class AgentSessionManager extends EventEmitter {
 		const parentSessionId = this.getParentSessionId?.(sessionId);
 		if (parentSessionId && this.resumeParentSession) {
 			await this.handleChildSessionCompletion(sessionId, resultMessage);
+		}
+
+		// Notify terminal-state observers (router mode releases the issue lock +
+		// session affinity via RouterConnection.sendSessionState) — LAST, and only
+		// once the session has genuinely finished.
+		//
+		// Two ordering rules, both learned the hard way:
+		//
+		// 1. Emit *after* every write above. The router drops this device's
+		//    ownership of the session the instant it sees the terminal state, so
+		//    anything posted afterwards is rejected with "session not owned by this
+		//    device". Emitting first cost every completing session its final result.
+		//
+		// 2. An `SDKResultMessage` is only *turn*-terminal. With pending work the
+		//    runner keeps its session open and streams more messages in on the
+		//    wakeup, so going terminal here would strand the rest of the run
+		//    unowned. Stay non-terminal; the wakeup's own result lands back here
+		//    with no pending work and emits then. A session killed before that
+		//    reaches abortSession(), which emits instead — so the lock cannot leak.
+		//
+		// This covers only terminations where the SDK yielded a result — i.e. a
+		// normal finish, an error, or an *interrupt* (which lets the query return).
+		// A stop that kills the query outright never reaches here; EdgeWorker calls
+		// abortSession() on that path instead. See the note on abortSession().
+		if (!pendingWork) {
+			this.emitTerminalOnce(sessionId, terminalState);
 		}
 
 		log.info(`Session completed (subtype: ${resultMessage.subtype})`);

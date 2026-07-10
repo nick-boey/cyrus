@@ -27,6 +27,15 @@ export const ISSUE_LOCKED_MESSAGE =
 	"An agent is already working on this issue (session owned by another user). Try again when it finishes.";
 
 /**
+ * Posted when a prompt arrives for a session we cannot route to any device:
+ * no session affinity, no enrolled device for the creator, and no issue
+ * affinity. Without this the prompt was dropped silently and the Linear agent
+ * session sat in "Waiting for Cyrus" forever.
+ */
+export const PROMPT_UNROUTABLE_MESSAGE =
+	"I can't pick this up: there's no enrolled Cyrus device associated with this session any more. Please re-delegate the issue to start a fresh session.";
+
+/**
  * Posted when creator-only prompting is enabled and a non-creator tries to
  * prompt someone else's session.
  */
