@@ -79,8 +79,8 @@ Providers in scope: `FlyMachinesProvider` (primary), `CodespacesProvider`, `Loca
   - `PUT /artifacts/issues/:issueKey/bundle` — tarball of Claude transcripts + workspace metadata
   - `GET /artifacts/issues/:issueKey/bundle`
   Stored under `<cyrusHome>/router/artifacts/`. At 3–10 users this is megabytes, not gigabytes; it joins `router.db` in the router backup story.
-- **Session-state persistence**: `session_state` frames (already in protocol v2) are persisted to SQLite as the authoritative copy of per-session metadata (`claudeSessionId`, workspace path, repo set), and hydrated back to a freshly booted container so its `edge-worker-state.json` can be reconstructed.
-- **Lifecycle policies**: stop a container after an idle timeout (no active sessions; default 15 min). Destroy (and delete volume/codespace) when the issue reaches a terminal state — after `cyrus-teardown.sh` and a final floor sync run inside the container — or after a stale timeout (default 14 days). Aggressive GC is safe *because* of the floor.
+- **Session-state persistence**: per-session metadata (`claudeSessionId`, workspace path, repo set) travels inside the artifact bundle (`state/sessions.json`) rather than over new protocol frames — `PROTOCOL_VERSION` stays at 2 and `session_state` frames keep their existing terminal-state-only role. A freshly booted container reconstructs its `edge-worker-state.json` from the downloaded bundle.
+- **Lifecycle policies**: stop a container after an idle timeout (no sessions holding affinity; default 15 min). Destroy (and delete volume/codespace) after a stale timeout (default 14 days) or via `cyrus router containers destroy <issueKey>`. Issue-terminal-state destruction is a future enhancement — the router does not currently forward issue-update webhooks to devices, and the floor sync at session end already guarantees WIP is pushed before any destroy. Aggressive GC is safe *because* of the floor.
 
 ### 3. Container image + entrypoint contract
 
@@ -93,7 +93,7 @@ Providers in scope: `FlyMachinesProvider` (primary), `CodespacesProvider`, `Loca
   3. Else (brand-new issue): fresh worktree from the base branch, run `cyrus-setup.sh`.
 
   Then apply dotfiles, hydrate session state from the router, and start `RouterConnection` + `EdgeWorker` (`platform: "router"`).
-- **Hard requirement — graceful resume degradation**: if `claudeSessionId` exists but the transcript file is missing (or the cwd differs, e.g. device → container switch), the EdgeWorker must start a *fresh* runner session re-primed from the Linear thread and the restored branch rather than failing the prompt. This is the floor's escape hatch and must be covered by tests.
+- **Hard requirement — graceful resume degradation**: if a session's transcript file is missing at restore time (e.g. device → container switch, lost volume), the runner session id is stripped during bundle restore so the EdgeWorker's existing `needsNewSession` path starts a *fresh* runner session re-primed from the Linear thread and the restored branch rather than failing the prompt. This is the floor's escape hatch and must be covered by tests.
 
 ## Persistence model
 
@@ -115,7 +115,7 @@ Layered: the **floor applies to every executor**; native persistence sits on top
 
 ### Executor switching
 
-`cyrus router users set-executor <user> <type>` drains the user's running containers (stop after final floor sync), flips config; the next event boots on the new executor via the restore ladder. Branch + WIP always survive. Claude-native session resume survives **container ↔ container** switches (canonical cwd + transcript bundle). **Device → container** switches lose in-flight Claude resume (device cwds are arbitrary paths) and fall back to the re-prime path; committed/WIP work is preserved.
+`cyrus router users set-executor <user> <type>` flips the stored config; the floor sync at each session end means idle containers already hold a current bundle, the old provider's container is destroyed lazily when the issue next routes (provider-mismatch replacement) or by the idle/stale sweeps, and the next event boots on the new executor via the restore ladder. Branch + WIP always survive. Claude-native session resume survives **container ↔ container** switches (canonical cwd + transcript bundle). **Device → container** switches lose in-flight Claude resume (device cwds are arbitrary paths) and fall back to the re-prime path; committed/WIP work is preserved.
 
 ## Credentials
 
