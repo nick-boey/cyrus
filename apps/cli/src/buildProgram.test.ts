@@ -19,6 +19,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const routerExecute = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const applicationDisposeWatchers = vi.hoisted(() => vi.fn());
+const containerBootExecute = vi.hoisted(() =>
+	vi.fn().mockResolvedValue(undefined),
+);
 
 // Plain `function`s (not arrows) so they're usable as constructors via `new`
 // — `buildProgram.ts` does `new Application(...)` / `new RouterCommand(...)`.
@@ -32,6 +35,14 @@ vi.mock("./commands/RouterCommand.js", () => ({
 	RouterCommand: vi.fn().mockImplementation(function FakeRouterCommand() {
 		return { execute: routerExecute };
 	}),
+}));
+
+vi.mock("./commands/ContainerBootCommand.js", () => ({
+	ContainerBootCommand: vi
+		.fn()
+		.mockImplementation(function FakeContainerBootCommand() {
+			return { execute: containerBootExecute };
+		}),
 }));
 
 const { buildProgram } = await import("./buildProgram.js");
@@ -48,6 +59,7 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 	beforeEach(() => {
 		routerExecute.mockClear();
 		applicationDisposeWatchers.mockClear();
+		containerBootExecute.mockClear();
 	});
 
 	it("registers `router users set-executor <email> <type>`", async () => {
@@ -112,6 +124,12 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 			"destroy",
 			"CYPACK-1",
 		]);
+	});
+
+	it("registers `container-boot`", async () => {
+		await run(["container-boot"]);
+
+		expect(containerBootExecute).toHaveBeenCalledWith([]);
 	});
 
 	it("still rejects a genuinely unregistered router subcommand", async () => {

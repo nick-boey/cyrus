@@ -6,6 +6,7 @@ import { Application } from "./Application.js";
 import { AuthCommand } from "./commands/AuthCommand.js";
 import { CheckTokensCommand } from "./commands/CheckTokensCommand.js";
 import { ConnectCommand } from "./commands/ConnectCommand.js";
+import { ContainerBootCommand } from "./commands/ContainerBootCommand.js";
 import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
 import { RouterCommand } from "./commands/RouterCommand.js";
 import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
@@ -307,6 +308,18 @@ export function buildProgram(
 		.command("unlock <issueId>")
 		.description("Release a stuck issue lock")
 		.action(makeRouterAction("unlock"));
+
+	// Container-boot command - entrypoint for ephemeral worker containers (see
+	// docker/worker/). Driven entirely by environment variables; not intended
+	// for interactive use.
+	program
+		.command("container-boot")
+		.description(
+			"Internal: boots an ephemeral worker container (restore ladder + launch `cyrus start`). Used as the worker image's ENTRYPOINT.",
+		)
+		.action(async () => {
+			await new ContainerBootCommand().execute([]);
+		});
 
 	// Connect command - enroll this device with a running Cyrus Router server
 	program
