@@ -458,6 +458,16 @@ The agent automatically moves issues to the "started" state when assigned. Linea
 
 ## Dependency Security Policy (MANDATE)
 
+> **Config location (pnpm ≥10):** The root `package.json` `pnpm` field
+> (`pnpm.overrides`, `pnpm.onlyBuiltDependencies`) is **no longer read** by the
+> pinned pnpm (`packageManager: pnpm@10.33.1` emits a warning and ignores it).
+> Both settings now live in the root **`pnpm-workspace.yaml`** (`overrides:` and
+> `onlyBuiltDependencies:` top-level keys). Add/edit overrides and native-build
+> allowlist entries **there**, not in `package.json`. A new native dependency
+> (e.g. `better-sqlite3`) must be added to `pnpm-workspace.yaml`'s
+> `onlyBuiltDependencies` list. Any overrides still sitting in `package.json`'s
+> `pnpm` block are inert until migrated to `pnpm-workspace.yaml`.
+
 Our team's mandated approach for addressing Dependabot advisories and other
 transitive-dependency vulnerabilities:
 
@@ -468,18 +478,19 @@ transitive-dependency vulnerabilities:
    transitive. Regenerate the lockfile and let pnpm's natural resolution do the
    work.
 
-2. **Only use root `pnpm.overrides` when a direct-dep bump cannot reach the
-   vulnerable transitive.** This is the fallback for deep transitives (3+
-   levels deep) whose owning direct dep has no released version that resolves
-   to the patched transitive — typically because upstream hasn't released yet
-   or pins its transitive too loosely for us to reach. Document the reason
-   inline with a brief comment or commit message.
+2. **Only use the root `overrides` map in `pnpm-workspace.yaml` when a
+   direct-dep bump cannot reach the vulnerable transitive.** This is the
+   fallback for deep transitives (3+ levels deep) whose owning direct dep has no
+   released version that resolves to the patched transitive — typically because
+   upstream hasn't released yet or pins its transitive too loosely for us to
+   reach. Document the reason inline with a brief comment or commit message.
 
 3. **Always clean up overrides when a future dep bump makes them redundant.**
    When you update a direct dependency (security or otherwise), check whether
-   any existing entry in `pnpm.overrides` is now satisfied naturally by the
-   new resolution. If so, **remove that override in the same change**. Verify
-   with `pnpm install && pnpm audit` that the removal is safe before committing.
+   any existing entry in `pnpm-workspace.yaml`'s `overrides` is now satisfied
+   naturally by the new resolution. If so, **remove that override in the same
+   change**. Verify with `pnpm install && pnpm audit` that the removal is safe
+   before committing.
 
 4. **Verify with `pnpm audit`.** After any dependency change, `pnpm audit`
    must report zero advisories. Commit the regenerated `pnpm-lock.yaml`

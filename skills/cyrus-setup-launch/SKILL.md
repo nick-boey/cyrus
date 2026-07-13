@@ -9,6 +9,14 @@ description: Print a summary of the Cyrus setup and offer to start the agent.
 
 Prints a summary of the completed setup and offers to start Cyrus.
 
+> **Client variant.** When invoked from `cyrus-setup-client` (a router client
+> device), two things change: **skip Step 4 (Start ngrok)** entirely — a client
+> device has no public endpoint — and print the **client summary** in Step 2
+> instead of the surface summary. Everything else (persistence via pm2/systemd/
+> foreground, verify) is the same; `cyrus` and `cyrus start` are the same default
+> command, so `pm2 start cyrus` works for a client too (its `config.json` has
+> `platform: "router"`, so it dials the router instead of listening for webhooks).
+
 ## Step 1: Gather Configuration
 
 Read current state:
@@ -31,11 +39,37 @@ cat ~/.cyrus/config.json 2>/dev/null
 
 # Claude auth
 grep -c -E '^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=' ~/.cyrus/.env 2>/dev/null
+
+# Deployment mode — "router" means this is a client device
+jq -r '.platform // "standalone"' ~/.cyrus/config.json 2>/dev/null
+
+# Router URL (client mode only)
+jq -r '.router.url // empty' ~/.cyrus/config.json 2>/dev/null
 ```
 
 ## Step 2: Print Summary
 
-Print a formatted summary:
+**Client variant** (deployment mode is `router`): print a client-oriented
+summary instead of the surface table below — a client device has no Linear
+OAuth app, tunnel, or Slack bot of its own:
+
+```
+┌─────────────────────────────────────┐
+│      Cyrus Client Device Ready      │
+├─────────────────────────────────────┤
+│                                     │
+│  Router:   https://router.example…  │
+│  Claude:   ✓ authenticated          │
+│  GitHub:   ✓ CLI (native creds)     │
+│  Linear:   ✓ local MCP OAuth'd      │
+│                                     │
+│  Repositories:                      │
+│    • yourorg/yourrepo               │
+│                                     │
+└─────────────────────────────────────┘
+```
+
+**Standalone variant:** print a formatted summary:
 
 ```
 ┌─────────────────────────────────────┐
@@ -134,6 +168,9 @@ cyrus
 ```
 
 ## Step 4: Start ngrok (if applicable)
+
+**Client variant: skip this step entirely** — a client device has no public
+endpoint or tunnel.
 
 If the user configured ngrok in the endpoint step, the agent should start it:
 

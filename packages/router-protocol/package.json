@@ -1,0 +1,29 @@
+{
+	"name": "cyrus-router-protocol",
+	"version": "0.2.66",
+	"description": "Wire frame schemas and RPC method allowlist for Cyrus Router per-user device routing",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsc",
+		"dev": "tsc --watch",
+		"test": "vitest",
+		"test:run": "vitest run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"zod": "4.3.6"
+	},
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"typescript": "^5.3.3",
+		"vitest": "^4.1.0"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}

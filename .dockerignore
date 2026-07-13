@@ -1,0 +1,16 @@
+.git
+node_modules
+**/node_modules
+**/dist
+**/coverage
+**/worktrees
+**/.env
+docs
+spec
+code
+.claude
+.codex
+.opencode
+.superpowers
+.husky
+.github

@@ -1,0 +1,39 @@
+{
+	"name": "cyrus-router",
+	"version": "0.2.66",
+	"description": "SQLite-backed device registry, event queue, and RPC router for Cyrus per-user device routing",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsc",
+		"dev": "tsc --watch",
+		"test": "vitest",
+		"test:run": "vitest run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@linear/sdk": "^64.0.0",
+		"better-sqlite3": "^12.4.1",
+		"cyrus-router-protocol": "workspace:*",
+		"cyrus-core": "workspace:*",
+		"cyrus-linear-event-transport": "workspace:*",
+		"fastify": "^5.8.5",
+		"ws": "^8.18.0",
+		"zod": "4.3.6"
+	},
+	"devDependencies": {
+		"@types/better-sqlite3": "^7.6.11",
+		"@types/ws": "^8.5.12",
+		"@types/node": "^20.0.0",
+		"cyrus-router-client": "workspace:*",
+		"typescript": "^5.3.3",
+		"vitest": "^4.1.0"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}

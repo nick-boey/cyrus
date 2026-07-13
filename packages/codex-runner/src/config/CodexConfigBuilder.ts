@@ -1,7 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { scrubCredentialEnv } from "cyrus-core";
 import type { ResolvedCodexConfig } from "../backend/types.js";
 import type {
 	CodexConfigOverrides,
@@ -105,28 +104,17 @@ export class CodexConfigBuilder {
 	private buildEnvOverride(
 		codexHome: string,
 	): Record<string, string> | undefined {
-		if (
-			!this.config.codexHome &&
-			!this.config.additionalEnv &&
-			!this.config.credentialIsolation
-		) {
+		if (!this.config.codexHome && !this.config.additionalEnv) {
 			return undefined;
 		}
-		let env: Record<string, string> = {};
+		const env: Record<string, string> = {};
 		for (const [key, value] of Object.entries(process.env)) {
 			if (typeof value === "string") {
 				env[key] = value;
 			}
 		}
-		// Multi-user credential isolation: drop every globally-inherited
-		// credential (notably OPENAI_API_KEY, which would shadow the per-user
-		// CODEX_HOME/auth.json subscription auth) before merging the per-user
-		// bundle.
-		if (this.config.credentialIsolation) {
-			env = scrubCredentialEnv(env);
-		}
 		if (this.config.additionalEnv) {
-			env = { ...env, ...this.config.additionalEnv };
+			Object.assign(env, this.config.additionalEnv);
 		}
 		env.CODEX_HOME = codexHome;
 		return env;
@@ -179,11 +167,6 @@ export class CodexConfigBuilder {
 		const model = this.config.model;
 		const fallback = this.config.fallbackModel;
 		if (!model || !fallback || fallback === model) return;
-
-		// Under multi-user credential isolation the global OPENAI_API_KEY is
-		// scrubbed from the session; probing the API with it would test the
-		// wrong identity. Per-user subscription auth handles model access.
-		if (this.config.credentialIsolation) return;
 
 		const apiKey = process.env.OPENAI_API_KEY;
 		if (!apiKey) return;

@@ -195,6 +195,8 @@ describe("EdgeWorker - Runner Selection Based on Labels", () => {
 		// Mock AgentSessionManager
 		mockAgentSessionManager = {
 			createCyrusAgentSession: vi.fn(),
+			// resumeAgentSession clears any stale stop request before resuming.
+			clearStopRequest: vi.fn(),
 			getSession: vi.fn().mockReturnValue({
 				issueId: "issue-123",
 				workspace: { path: "/test/workspaces/TEST-123" },

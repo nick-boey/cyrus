@@ -42,6 +42,7 @@ import type {
 	IAgentEventTransport,
 	IIssueTrackerService,
 	Issue,
+	IssueRelationSummary,
 	IssueUpdateInput,
 	IssueWithChildren,
 	Label,
@@ -432,6 +433,45 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 		} catch (error) {
 			const err = new Error(
 				`Failed to fetch attachments for issue ${issueId}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			if (error instanceof Error) {
+				err.cause = error;
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Fetch inverse relations with `issue`/`relatedIssue` resolved.
+	 *
+	 * The SDK exposes those as lazily-resolved promises. Awaiting them here — on
+	 * the side that holds the Linear token — is what lets this result cross a
+	 * JSON transport intact (a `Promise` would serialize to `{}`).
+	 */
+	async fetchIssueInverseRelations(
+		issueId: string,
+	): Promise<IssueRelationSummary[]> {
+		try {
+			const issue = await this.linearClient.issue(issueId);
+			if (!issue) {
+				throw new Error(`Issue ${issueId} not found`);
+			}
+
+			const relations = await issue.inverseRelations();
+			return await Promise.all(
+				relations.nodes.map(async (relation) => ({
+					id: relation.id,
+					type: relation.type,
+					createdAt: relation.createdAt,
+					updatedAt: relation.updatedAt,
+					archivedAt: relation.archivedAt,
+					issue: (await relation.issue) as Issue | undefined,
+					relatedIssue: (await relation.relatedIssue) as Issue | undefined,
+				})),
+			);
+		} catch (error) {
+			const err = new Error(
+				`Failed to fetch inverse relations for issue ${issueId}: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			if (error instanceof Error) {
 				err.cause = error;
