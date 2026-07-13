@@ -48,7 +48,10 @@ so the image is available even if the router restarts on a different host.
 
 Add a top-level `containers` object to `~/.cyrus/router-config.json` (the same
 file [docs/ROUTER.md](../../docs/ROUTER.md) has you write for router mode).
-Here is a complete, copy-pasteable example with every field:
+Here is a copy-pasteable example. It deliberately **omits** `artifactsDir` and
+`secretsPath` — both are optional and their defaults are already correct on
+every platform; see the optional-fields table below for why you should leave
+them out unless you have a specific reason to relocate those paths:
 
 ```json
 {
@@ -68,8 +71,6 @@ Here is a complete, copy-pasteable example with every field:
         "baseBranch": "main"
       }
     ],
-    "artifactsDir": "/home/cyrus/.cyrus/router/artifacts",
-    "secretsPath": "/home/cyrus/.cyrus/router/user-secrets.json",
     "idleStopMs": 900000,
     "staleDestroyMs": 1209600000,
     "docker": {
@@ -79,6 +80,17 @@ Here is a complete, copy-pasteable example with every field:
   }
 }
 ```
+
+> **This is not a complete `router-config.json`.** `port`, `workspaces`, and
+> `webhook` above are reproduced only for context, so you can see where
+> `containers` slots into the file you already wrote for
+> [docs/ROUTER.md](../../docs/ROUTER.md) — copy the `containers` block into
+> your existing file, don't replace the whole file with this snippet. In
+> particular, each entry under `workspaces` also needs a `linearRefreshToken`
+> (not shown above), or the router's Linear access token silently stops
+> working ~24 hours after setup — see the `## [Unreleased]` "Fixed" entry in
+> `CHANGELOG.md` about router token refresh, and `docs/ROUTER.md` for the full
+> field list.
 
 **Required fields:**
 
@@ -92,8 +104,8 @@ Here is a complete, copy-pasteable example with every field:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `artifactsDir` | `<dirname of router.db>/artifacts` | Where the router stores per-issue floor bundles (git branch + Claude transcripts) uploaded by containers. |
-| `secretsPath` | `<dirname of router.db>/user-secrets.json` | Where per-user container secrets (Claude token, git identity, GitHub PAT) are stored. `cyrus router secrets set` writes here. |
+| `artifactsDir` | `<cyrusHome>/router/artifacts` (e.g. `~/.cyrus/router/artifacts`) | Where the router stores per-issue floor bundles (git branch + Claude transcripts) uploaded by containers. **Leave this unset** — only set it if you deliberately want the bundles stored somewhere other than the default. Setting it to a Linux path like `/home/cyrus/...` will fail on macOS, where `/home` is an unwritable autofs mount. |
+| `secretsPath` | `<cyrusHome>/router/user-secrets.json` (e.g. `~/.cyrus/router/user-secrets.json`) | Where per-user container secrets (Claude token, git identity, GitHub PAT) are stored. `cyrus router secrets set` writes here. **Leave this unset** for the same reason as `artifactsDir` above. |
 | `idleStopMs` | `900000` (15 min) | A running container with no active session is `stop()`ped after this long — parked, volume retained, cheap to resume. |
 | `staleDestroyMs` | `1209600000` (14 days) | A container untouched this long is fully destroyed (container **and** volume). Safe because the floor (git branch + artifact bundle) survives — a later prompt rebuilds the workspace from scratch via the restore ladder. |
 | `docker.memoryLimit` | (none — host default) | Passed as `docker run --memory <value>`, e.g. `"2g"`. Strongly recommended if you're running several containers on one host — this is the fix for the small-VM OOM problem the design doc mentions. |
@@ -325,10 +337,15 @@ when a container restarts after being stopped mid-session.
 | `CYRUS_WORKSPACES_DIR` | `/workspaces` | Root of the persistent volume. Test seam — the Dockerfile relies on the default. |
 | `CYRUS_REPO_CACHE_DIR` | `/var/cache/repos` | Optional local bare-repo cache used via `git clone --reference-if-able` to speed up repeat clones. |
 
-All five of these (except `CYRUS_ROUTER_URL`, which comes from
-`containers.routerUrlForContainers` verbatim) are populated automatically by
-the router from `router-config.json` and the per-user secret bundle — you
-don't set them by hand except in the manual smoke test above.
+`GIT_TOKEN`, `GIT_USER_NAME`, `GIT_USER_EMAIL`, and `DOTFILES_REPO` are
+populated automatically from the per-user secret bundle (`cyrus router
+secrets set <email> <key> <value>` in step 3) whenever that secret has been
+set for the user — omitted entirely otherwise, in which case the container
+falls back to its own defaults shown above. `CYRUS_WORKSPACES_DIR` and
+`CYRUS_REPO_CACHE_DIR` are never populated by the router at all (`docker
+run`'s env never includes them); the container always falls back to the
+defaults above for those two. You don't set any of these six by hand except
+in the manual smoke test above.
 
 ## Why the workspace path matters
 

@@ -37,10 +37,7 @@ import type {
 } from "cyrus-router-executors";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ContainerLifecycle } from "../src/ContainerLifecycle.js";
-import {
-	containerBootFailedMessage,
-	offlineWaitingMessage,
-} from "../src/messages.js";
+import { containerBootFailedMessage } from "../src/messages.js";
 import {
 	type RouterContainersConfig,
 	RouterServer,
@@ -248,6 +245,48 @@ class FakeBootExecutor implements ContainerExecutor {
 	}
 }
 
+/**
+ * A `ContainerExecutor` whose `ensureRunning` parks on a manually-released
+ * gate instead of resolving on its own — used by scenario 5 to reliably hold
+ * a boot "still cold-booting" (i.e. `ensureRunning` genuinely pending) across
+ * two separate webhook deliveries, without racing real timers or a real
+ * WebSocket connect. Unlike `FakeBootExecutor`, this double never connects a
+ * device stack: scenario 5 only cares about how many times `ensureRunning`
+ * is invoked, not about queue drain.
+ */
+class GatedBootExecutor implements ContainerExecutor {
+	readonly ensureRunningCalls: IssueExecutionContext[] = [];
+	/** Incremented each time a parked `ensureRunning` call is released. */
+	resolvedCount = 0;
+	private releaseGate!: () => void;
+	private readonly gate = new Promise<void>((resolve) => {
+		this.releaseGate = resolve;
+	});
+
+	/** Unblocks every `ensureRunning` call currently parked on the gate. */
+	release(): void {
+		this.releaseGate();
+	}
+
+	async ensureRunning(ctx: IssueExecutionContext): Promise<void> {
+		this.ensureRunningCalls.push(ctx);
+		await this.gate;
+		this.resolvedCount++;
+	}
+
+	async stop(): Promise<void> {}
+
+	async destroy(): Promise<void> {}
+
+	async status(): Promise<ContainerStatus> {
+		return "absent";
+	}
+
+	async listManaged(): Promise<string[]> {
+		return [];
+	}
+}
+
 describe("router container-executor e2e (real RouterServer + fake ContainerExecutor over real WebSocket)", () => {
 	let server: RouterServer;
 	let tracker: CLIIssueTrackerService;
@@ -257,6 +296,7 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 	let dockerExec: FakeBootExecutor;
 	let flyExec: FakeBootExecutor;
 	let brokenExec: FakeBootExecutor;
+	let gatedExec: GatedBootExecutor;
 
 	beforeAll(async () => {
 		tracker = new CLIIssueTrackerService();
@@ -269,6 +309,7 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 		seedSession(tracker, "sess-switch-1", "issue-switch-1");
 		seedSession(tracker, "sess-switch-2", "issue-switch-1");
 		seedSession(tracker, "sess-boot-fail", "issue-boot-fail");
+		seedSession(tracker, "sess-gated-1", "issue-gated-1");
 
 		stateDir = mkdtempSync(join(tmpdir(), "cyrus-router-containers-e2e-"));
 		secretsDir = mkdtempSync(
@@ -293,6 +334,7 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 			join(stateDir, "brokendocker"),
 		);
 		brokenExec.shouldFail = true;
+		gatedExec = new GatedBootExecutor();
 
 		const containers: RouterContainersConfig = {
 			image: "cyrus-worker:test",
@@ -327,6 +369,7 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 					["docker", dockerExec],
 					["fly", flyExec],
 					["brokendocker", brokenExec],
+					["gateddocker", gatedExec],
 				]),
 		});
 		await server.start();
@@ -365,12 +408,20 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 			"claudeOauthToken",
 			"fake-claude-token-3",
 		);
+
+		server.store.addUser({ email: "gated@example.com", linearId: "lin-gated" });
+		server.store.setUserExecutor(
+			"gated@example.com",
+			JSON.stringify({ type: "gateddocker" }),
+		);
+		secrets.set("gated@example.com", "claudeOauthToken", "fake-claude-token-4");
 	});
 
 	afterAll(async () => {
 		dockerExec?.closeAll();
 		flyExec?.closeAll();
 		brokenExec?.closeAll();
+		gatedExec?.release();
 		await server.stop();
 		rmSync(stateDir, { recursive: true, force: true });
 		rmSync(secretsDir, { recursive: true, force: true });
@@ -404,11 +455,12 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 			dockerExec.ensureRunningCalls.some((c) => c.issueKey === "CYPACK-100"),
 		).toBe(true);
 
-		// A cold-booting container is NOT an outage: no "waiting for your
-		// machine" notice should ever be posted for it.
-		expect(
-			tracker.listAgentActivities("sess-cold-1").map((a) => a.content),
-		).not.toContain(offlineWaitingMessage("cold@example.com"));
+		// A cold-booting container is NOT an outage: no activity of any kind —
+		// not just no offline-waiting notice specifically — should ever be
+		// posted for it. Asserting on the exact wording of one message would
+		// let a differently-worded (or repurposed) outage notice slip through;
+		// the actual property under test is that a cold boot stays silent.
+		expect(tracker.listAgentActivities("sess-cold-1")).toHaveLength(0);
 
 		// The fake device connects with its minted token and receives the
 		// queued "created" event frame over the real WebSocket.
@@ -589,5 +641,66 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 			.map((a) => a.content)
 			.filter((content) => content === expectedNotice);
 		expect(notices).toHaveLength(1);
+	});
+
+	it("5. created then prompted for the same still-cold-booting issue coalesce into exactly one ensureRunning call (inFlightBoots dedup, keyed by device id)", async () => {
+		const GATED: Creator = {
+			id: "lin-gated",
+			email: "gated@example.com",
+			name: "Gated",
+		};
+		const issue = {
+			id: "issue-gated-1",
+			identifier: "CYPACK-400",
+			title: "Still cold-booting",
+		};
+
+		await server.eventRouter.route(
+			createdFixture({ sessionId: "sess-gated-1", issue, creator: GATED }),
+		);
+
+		// `ContainerTargetService.boot` is fire-and-forget (it never awaits
+		// `ensureRunning`), but its synchronous prefix — resolving the device,
+		// checking `inFlightBoots`, and calling `ensureRunning`, all the way
+		// down to `gatedExec` recording the call and parking on its gate — runs
+		// to completion inside the same call stack as `deliverOrNotify`, before
+		// `route()`'s own promise settles. So this is already deterministic
+		// with no real wait needed: the container is now "still cold-booting"
+		// (ensureRunning genuinely pending), exactly the window
+		// `inFlightBoots` exists to dedupe across.
+		expect(gatedExec.ensureRunningCalls).toHaveLength(1);
+
+		// A follow-up prompt on the SAME session, seconds later per Linear's
+		// created-then-prompted webhook pattern, while the container is still
+		// cold-booting. This resolves via the session affinity set by the
+		// created webhook above — NOT via ensureDevice/executorFor — but still
+		// reaches the shared deliverOrNotify choke point and calls boot()
+		// again for the SAME device id. This is exactly the race
+		// `inFlightBoots` exists to dedupe (see its doc comment in
+		// ContainerTargets.ts): `inFlightBoots` was just rekeyed from issue key
+		// to device id, and unit tests only cover the dedup by calling
+		// `boot(deviceId)` twice directly — they can't catch a future change
+		// that makes two separate *webhooks* resolve to different device ids.
+		// If the dedup were broken, this second boot() would mint a second
+		// device token and start a second ensureRunning, orphaning the
+		// container that actually started.
+		await server.eventRouter.route(
+			promptedFixture({
+				sessionId: "sess-gated-1",
+				actorUserId: GATED.id,
+				creator: GATED,
+				issue,
+				body: "already going?",
+			}),
+		);
+
+		expect(gatedExec.ensureRunningCalls).toHaveLength(1);
+
+		// Release the parked call and confirm it settles cleanly — proof that
+		// exactly one ensureRunning call was ever in flight for this device.
+		gatedExec.release();
+		await vi.waitFor(() => {
+			expect(gatedExec.resolvedCount).toBe(1);
+		});
 	});
 });
