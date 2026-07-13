@@ -1,4 +1,5 @@
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -56,18 +57,36 @@ export class SecretStore {
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const tmp = `${this.filePath}.tmp`;
 		writeFileSync(tmp, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
+		// `mode` on writeFileSync only applies when the file is created. If
+		// `${filePath}.tmp` already existed (crash leftover, older code,
+		// tampering) it may have looser permissions, so force 0600
+		// unconditionally before the rename makes it the real secrets file.
+		chmodSync(tmp, 0o600);
 		renameSync(tmp, this.filePath);
 	}
 
 	private readAll(): Record<string, UserSecretBundle> {
+		// A missing file is the documented "no secrets yet" state.
 		if (!existsSync(this.filePath)) return {};
+		// Once the file exists, any failure to read or parse it is a real
+		// error (corruption, a transient I/O error, a TOCTOU race) and must
+		// not be swallowed into `{}` — doing so would let a subsequent
+		// `set()` silently overwrite the file and destroy every other
+		// user's stored secrets.
+		let raw: string;
 		try {
-			return JSON.parse(readFileSync(this.filePath, "utf-8")) as Record<
-				string,
-				UserSecretBundle
-			>;
-		} catch {
-			return {};
+			raw = readFileSync(this.filePath, "utf-8");
+		} catch (err) {
+			throw new Error(
+				`SecretStore: failed to read ${this.filePath}: ${(err as Error).message}`,
+			);
+		}
+		try {
+			return JSON.parse(raw) as Record<string, UserSecretBundle>;
+		} catch (err) {
+			throw new Error(
+				`SecretStore: failed to parse ${this.filePath} as JSON: ${(err as Error).message}`,
+			);
 		}
 	}
 }
