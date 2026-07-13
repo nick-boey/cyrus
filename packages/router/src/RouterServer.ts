@@ -12,6 +12,7 @@ import {
 import type { RpcRequestFrame, SessionStateFrame } from "cyrus-router-protocol";
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerArtifactsRoute } from "./artifacts.js";
+import type { ContainerLifecycle } from "./ContainerLifecycle.js";
 import { DeviceGateway } from "./DeviceGateway.js";
 import { EventRouter } from "./EventRouter.js";
 import { registerEnrollmentRoute } from "./enrollment.js";
@@ -101,6 +102,13 @@ export class RouterServer {
 	 * webhook source. Not part of the runtime wiring surface.
 	 */
 	readonly eventRouter: EventRouter;
+	/**
+	 * Idle-stop / stale-destroy / orphan-GC sweep for ephemeral containers.
+	 * Optional and unset today — Task 8 constructs it (it needs the executor
+	 * registry, which isn't wired up yet) and assigns it here. Left optional
+	 * rather than required so this file compiles ahead of that wiring.
+	 */
+	containerLifecycle?: ContainerLifecycle;
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;
 	private readonly gateway: DeviceGateway;
@@ -260,6 +268,7 @@ export class RouterServer {
 
 		this.sweepInterval = setInterval(() => {
 			void this.eventRouter.sweepExpired();
+			void this.containerLifecycle?.sweep();
 		}, SWEEP_INTERVAL_MS);
 	}
 
