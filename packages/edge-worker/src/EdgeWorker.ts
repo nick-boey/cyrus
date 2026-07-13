@@ -186,6 +186,7 @@ import { LinearActivitySink } from "./sinks/LinearActivitySink.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
 import type { AgentSessionData, EdgeWorkerEvents } from "./types.js";
 import { UserAccessControl } from "./UserAccessControl.js";
+import { WorkspaceSyncService } from "./WorkspaceSyncService.js";
 
 export declare interface EdgeWorker {
 	on<K extends keyof EdgeWorkerEvents>(
@@ -228,6 +229,7 @@ export class EdgeWorker extends EventEmitter {
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
 	private routerConnection?: RouterConnection; // Shared device-side WebSocket connection to the Cyrus Router (router platform mode)
+	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, floorSync !== false)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
 	private persistenceManager: PersistenceManager;
 	private sharedApplicationServer: SharedApplicationServer;
@@ -520,6 +522,17 @@ export class EdgeWorker extends EventEmitter {
 						error,
 					);
 				}
+
+				// Persistence floor: WIP-push + bundle-upload this issue now that a
+				// session on it just ended. touch() + syncIssue() are independent of
+				// the sendSessionState try/catch above — a router-lock signalling
+				// failure must not skip the floor sync, and vice versa.
+				const session = this.agentSessionManager.getSession(sessionId);
+				const identifier = session?.issue?.identifier;
+				if (identifier) {
+					this.workspaceSync?.touch(identifier);
+					void this.workspaceSync?.syncIssue(identifier);
+				}
 			},
 		);
 
@@ -559,6 +572,22 @@ export class EdgeWorker extends EventEmitter {
 				deviceToken: config.router.deviceToken,
 				stateDir: join(this.cyrusHome, "router-client"),
 			});
+
+			// Persistence floor: WIP-push + bundle-upload sync so container death
+			// (idle-stop, crash, host loss, executor switch) never loses work.
+			// Runs on physical devices too — that's what enables device ->
+			// container migration. Opt-out via `router.floorSync: false` (e.g.
+			// the router host's own device connection, which has no worktrees).
+			if (config.router.floorSync !== false) {
+				this.workspaceSync = new WorkspaceSyncService({
+					cyrusHome: this.cyrusHome,
+					routerUrl: config.router.url,
+					deviceToken: config.router.deviceToken,
+					gitService: this.gitService,
+					logger: this.logger,
+				});
+				this.workspaceSync.start();
+			}
 		}
 
 		// Router mode has no linearWorkspaces block (the device holds no Linear
@@ -2764,6 +2793,12 @@ ${taskSection}`;
 				error,
 			);
 		}
+
+		// Persistence floor: this is the last chance to WIP-push + upload
+		// session bundles before the process (and possibly the container it
+		// runs in) is gone. stop() never throws — every per-issue sync
+		// swallows and logs its own errors.
+		await this.workspaceSync?.stop();
 
 		// get all agent runners (including chat platform sessions)
 		const agentRunners: IAgentRunner[] = [

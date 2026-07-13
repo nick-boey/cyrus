@@ -136,6 +136,12 @@ export interface EdgeWorkerRuntimeConfig {
 	router?: {
 		url: string;
 		deviceToken: string;
+		/**
+		 * Enables the persistence-floor `WorkspaceSyncService`. Defaults to on;
+		 * set `false` to opt this device out. See `EdgeConfigSchema.router` in
+		 * config-schemas.ts for the persisted-config counterpart.
+		 */
+		floorSync?: boolean;
 	};
 
 	// --- Agent Configuration (for CLI mode) ---

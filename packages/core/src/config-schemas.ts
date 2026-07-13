@@ -518,6 +518,14 @@ export const EdgeConfigSchema = z.object({
 			 * against a router predating that route.
 			 */
 			workspaceIds: z.array(z.string()).optional(),
+			/**
+			 * Enables the persistence-floor `WorkspaceSyncService` (WIP-push +
+			 * session bundle upload) on session end, on shutdown, and on a
+			 * timer. Defaults to on for router-platform devices; set `false` to
+			 * opt a device out (e.g. a router host itself, which has no
+			 * worktrees of its own to sync).
+			 */
+			floorSync: z.boolean().optional(),
 		})
 		.optional(),
 });

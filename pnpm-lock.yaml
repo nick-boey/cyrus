@@ -374,6 +374,9 @@ importers:
       cyrus-slack-event-transport:
         specifier: workspace:*
         version: link:../slack-event-transport
+      cyrus-workspace-sync:
+        specifier: workspace:*
+        version: link:../workspace-sync
       dotenv:
         specifier: ^16.6.1
         version: 16.6.1
