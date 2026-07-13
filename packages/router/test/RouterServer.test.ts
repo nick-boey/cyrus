@@ -1,6 +1,11 @@
 import type { AgentEvent } from "cyrus-core";
 import { CLIIssueTrackerService } from "cyrus-core";
 import type { LinearOAuthConfig } from "cyrus-linear-event-transport";
+import type {
+	ContainerExecutor,
+	ExecutorRegistry,
+	IssueExecutionContext,
+} from "cyrus-router-executors";
 import { PROTOCOL_VERSION } from "cyrus-router-protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
@@ -10,30 +15,28 @@ import {
 	type RouterServerConfig,
 } from "../src/RouterServer.js";
 
-// LocalDockerProvider's default exec shells out to the real `docker` binary
-// via `node:child_process`. Routing a container-executor user's session
-// fire-and-forgets a `ContainerTargetService.boot()` call (see EventRouter's
-// deliverOrNotify), which — if left un-mocked on a machine that actually has
-// Docker installed — would spawn a real `docker volume create`/`docker run`
-// against a throwaway image in the background of every test run in this
-// file: a real side effect on the developer's Docker daemon, plus a
-// long-lived child-process handle that can keep the test process alive past
-// the run's assertions. Mocking `execFile` makes every `docker` invocation
-// fail instantly and deterministically (mirroring "Docker not installed"),
-// which is exactly the failure path ContainerTargetService already handles
-// (see ContainerTargets.test.ts's "posts a boot-failure activity" case) —
-// the device-row assertions below never depend on the boot actually
-// succeeding.
-vi.mock("node:child_process", () => ({
-	execFile: (
-		_cmd: string,
-		_args: string[],
-		_opts: unknown,
-		callback: (err: Error, stdout: string, stderr: string) => void,
-	) => {
-		callback(new Error("docker unavailable in tests"), "", "");
-	},
-}));
+/**
+ * Minimal fake ContainerExecutor whose ensureRunning is an inspectable mock
+ * that never shells out. Injected via `executorRegistryFactory` — the
+ * composition-root seam — so the container tests below can never reach a
+ * real Docker daemon, regardless of whether the developer's machine has
+ * Docker installed. See ContainerTargets.test.ts's `fakeExecutor` for the
+ * same pattern used one layer down.
+ */
+function fakeExecutor(provider: string): ContainerExecutor & {
+	ensureRunning: ReturnType<typeof vi.fn>;
+} {
+	return {
+		provider,
+		ensureRunning: vi.fn<(ctx: IssueExecutionContext) => Promise<void>>(
+			async () => {},
+		),
+		stop: vi.fn(async () => {}),
+		destroy: vi.fn(async () => {}),
+		status: vi.fn(async () => "running" as const),
+		listManaged: vi.fn(async () => []),
+	};
+}
 
 function makeServer(): RouterServer {
 	return new RouterServer({
@@ -455,6 +458,9 @@ describe("RouterServer containers wiring", () => {
 	});
 
 	it("constructs containerLifecycle and routes a docker-executor user's session to a per-issue container device when `containers` is configured", async () => {
+		const executors: ExecutorRegistry = new Map([
+			["docker", fakeExecutor("docker")],
+		]);
 		server = new RouterServer({
 			port: 0,
 			dbPath: ":memory:",
@@ -462,6 +468,7 @@ describe("RouterServer containers wiring", () => {
 			webhook: { verificationMode: "direct", secret: "test-secret" },
 			trackerFactory: () => new CLIIssueTrackerService(),
 			containers: CONTAINERS_CONFIG,
+			executorRegistryFactory: () => executors,
 		});
 		expect(server.containerLifecycle).toBeDefined();
 

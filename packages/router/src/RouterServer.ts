@@ -116,6 +116,18 @@ export interface RouterServerConfig {
 		cfg: RouterWorkspaceConfig,
 		oauthConfig: LinearOAuthConfig | undefined,
 	) => IIssueTrackerService;
+	/**
+	 * Test seam; defaults to a registry containing a single real
+	 * {@link LocalDockerProvider} built from `containers.image` +
+	 * `containers.docker`, keyed "docker" — today's behavior, unchanged. Lets
+	 * tests (and later phases adding "fly"/"codespaces" providers) inject fake
+	 * {@link ContainerExecutor}s instead, so the router test suite never has to
+	 * shell out to a real Docker daemon. Only consulted when `containers` is set;
+	 * see {@link RouterServer.buildContainerTargets}.
+	 */
+	executorRegistryFactory?: (
+		containers: RouterContainersConfig,
+	) => ExecutorRegistry;
 	logger?: { info(msg: string): void; warn(msg: string): void };
 	/** Forwarded to {@link DeviceGateway} for heartbeat tuning in tests. */
 	heartbeatMs?: number;
@@ -366,15 +378,19 @@ export class RouterServer {
 			join(dirname(this.config.dbPath), "user-secrets.json");
 		const secrets = new SecretStore(secretsPath);
 
-		const executors: ExecutorRegistry = new Map([
-			[
-				"docker",
-				new LocalDockerProvider({
-					image: containers.image,
-					...containers.docker,
-				}),
-			],
-		]);
+		const executorRegistryFactory =
+			this.config.executorRegistryFactory ??
+			((cfg: RouterContainersConfig): ExecutorRegistry =>
+				new Map([
+					[
+						"docker",
+						new LocalDockerProvider({
+							image: cfg.image,
+							...cfg.docker,
+						}),
+					],
+				]));
+		const executors = executorRegistryFactory(containers);
 
 		const containerTargets = new ContainerTargetService({
 			store: this.store,
