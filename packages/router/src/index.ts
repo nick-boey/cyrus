@@ -12,4 +12,9 @@ export {
 	type RouterWorkspaceConfig,
 } from "./RouterServer.js";
 export { type ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
+export {
+	SecretStore,
+	USER_SECRET_KEYS,
+	type UserSecretBundle,
+} from "./SecretStore.js";
 export { registerWorkspacesRoute } from "./workspaces.js";
