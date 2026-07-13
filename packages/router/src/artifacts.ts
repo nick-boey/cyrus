@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { access, mkdir, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { RouterStore } from "./RouterStore.js";
@@ -90,10 +91,28 @@ export function registerArtifactsRoute(
 			// atomic at the filesystem level regardless of whether the JS call
 			// that issues it is awaited — so a partial/failed PUT can never
 			// leave a corrupt bundle at `dest`.
+			//
+			// The tmp filename MUST be unique per request, not just per
+			// destination. These are now async calls, so `await writeFile`
+			// yields the event loop — two concurrent PUTs to the SAME issueKey
+			// (e.g. a physical device's floor-sync overlapping the owning
+			// container's flush, an expected multi-device scenario) can
+			// genuinely interleave. A shared `${dest}.tmp` would let both
+			// writers share one file, producing a corrupted or truncated
+			// bundle after rename. Suffixing with a random token gives each
+			// request its own tmp file, so the two writes can never collide —
+			// only the final `rename` (atomic) determines which upload wins,
+			// which is fine: last-writer-wins on the destination is expected.
 			await mkdir(dirname(dest), { recursive: true });
-			const tmp = `${dest}.tmp`;
-			await writeFile(tmp, request.body as Buffer);
-			await rename(tmp, dest);
+			const tmp = `${dest}.${randomUUID()}.tmp`;
+			try {
+				await writeFile(tmp, request.body as Buffer);
+				await rename(tmp, dest);
+			} catch (err) {
+				// Don't leak the per-request tmp file on a failed write/rename.
+				await rm(tmp, { force: true });
+				throw err;
+			}
 			return { ok: true };
 		},
 	);

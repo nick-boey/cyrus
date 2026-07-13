@@ -175,4 +175,63 @@ describe("artifact endpoints", () => {
 
 		await freshFastify.close();
 	});
+
+	it("never corrupts a bundle when two concurrent PUTs target the same issue", async () => {
+		// Regression guard for a race introduced when the tmp-file+rename dance
+		// moved from Sync fs calls to async fs/promises calls. With the *Sync*
+		// variants, Node's single-threaded blocking execution made two same-
+		// issueKey PUTs mutually exclusive by accident (the whole sequence ran
+		// with no yield point). The async conversion introduced yield points
+		// at every `await`, so if the tmp path were shared (the old
+		// `${dest}.tmp`), two concurrent PUTs to the SAME issueKey could
+		// interleave writes to that one file — producing a corrupted or
+		// truncated bundle after rename. This is reachable in normal
+		// operation: a physical device's floor-sync can overlap the owning
+		// container's flush for the same issue.
+		//
+		// Each payload is several hundred KB of a single repeated byte so
+		// that any interleaving (a naive shared-tmp implementation writing
+		// buffer A then buffer B into the same fd, or truncating mid-write)
+		// would produce a result that is neither payload exactly — bytes
+		// from one pattern where the other should be, or a length that
+		// matches neither. We assert the retrieved bytes exactly equal ONE
+		// of the two payloads in full: never a mixture, never truncated.
+		const size = 500 * 1024;
+		const payloadA = Buffer.alloc(size, 0xaa);
+		const payloadB = Buffer.alloc(size, 0xbb);
+
+		const putBuffer = (payload: Buffer) =>
+			fastify.inject({
+				method: "PUT",
+				url: "/artifacts/issues/CYPACK-1/bundle",
+				headers: {
+					"content-type": "application/gzip",
+					authorization: `Bearer ${token}`,
+				},
+				payload,
+			});
+
+		const [resA, resB] = await Promise.all([
+			putBuffer(payloadA),
+			putBuffer(payloadB),
+		]);
+		expect(resA.statusCode).toBe(200);
+		expect(resB.statusCode).toBe(200);
+
+		const getRes = await fastify.inject({
+			method: "GET",
+			url: "/artifacts/issues/CYPACK-1/bundle",
+			headers: { authorization: `Bearer ${token}` },
+		});
+		expect(getRes.statusCode).toBe(200);
+
+		const finalBytes = getRes.rawPayload;
+		const matchesA = finalBytes.equals(payloadA);
+		const matchesB = finalBytes.equals(payloadB);
+		expect(matchesA || matchesB).toBe(true);
+		// Extra-explicit guard against a "close but not quite" result (wrong
+		// length, or right length but mixed content) slipping past the OR
+		// above due to a subtle assertion bug.
+		expect(finalBytes.length).toBe(size);
+	});
 });
