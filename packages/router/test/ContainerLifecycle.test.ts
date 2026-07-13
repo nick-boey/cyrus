@@ -242,6 +242,114 @@ describe("ContainerLifecycle", () => {
 		);
 	});
 
+	it("does not destroy an orphan whose device row was created concurrently mid-sweep (TOCTOU race)", async () => {
+		// Simulates the real race: sweep() snapshots `knownKeys` at the top
+		// (empty here — no device rows exist yet), then while the orphan-GC
+		// loop is awaiting listManaged(), a concurrent route for the same
+		// issue lands (ContainerTargetService.ensureDevice() writes the device
+		// row, boot() starts ensureRunning()) and the new container becomes
+		// visible to listManaged() before it ever existed in the stale
+		// snapshot. The store must have the final say, not the snapshot.
+		const docker = fakeExecutor("docker", {
+			listManagedImpl: vi.fn(async () => {
+				// Side effect standing in for the concurrent route landing
+				// mid-sweep, after knownKeys was already captured.
+				store.createContainerDevice(userId, "CYPACK-RACE", "docker");
+				return ["CYPACK-RACE"];
+			}),
+		});
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs: 900_000,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			logger,
+			now: () => 1_000_000,
+		});
+
+		await lifecycle.sweep();
+
+		expect(docker.destroy).not.toHaveBeenCalled();
+		// The concurrently-created device row must survive untouched.
+		expect(store.getContainerDeviceForIssue("CYPACK-RACE")).toBeDefined();
+	});
+
+	it("logs and returns cleanly when listContainerDevices throws, instead of rejecting the sweep", async () => {
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>(),
+			idleStopMs: 900_000,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			logger,
+			now: () => 1_000_000,
+		});
+		vi.spyOn(store, "listContainerDevices").mockImplementation(() => {
+			throw new Error("SQLITE_BUSY");
+		});
+
+		await expect(lifecycle.sweep()).resolves.toBeUndefined();
+
+		expect(logger.warn).toHaveBeenCalled();
+		expect(String(logger.warn.mock.calls[0]?.[0])).toContain("SQLITE_BUSY");
+	});
+
+	it("idle-stops off a stale lastRoutedMs even when lastSeenMs is fresh (idle-stop deliberately ignores lastSeenMs)", async () => {
+		// Locks in the documented asymmetry: idle-stop uses
+		// `lastRoutedMs ?? createdMs` only. A container that is merely
+		// connected (fresh lastSeenMs, e.g. a heartbeat) but hasn't been
+		// routed anything recently must still be idle-stopped — a future
+		// "fix" that folds lastSeenMs into idle-stop would silently keep
+		// idle-but-connected containers running forever.
+		const { createdMs, deviceId } = makeContainerDevice("CYPACK-5", "docker");
+		const idleStopMs = 900_000;
+
+		// Routed once, shortly after creation — stale relative to `now` below.
+		store.enqueueEvent(deviceId, "{}", createdMs + 1_000, 48 * 60 * 60_000);
+		const now = createdMs + idleStopMs * 5;
+		// Seen (connected/heartbeated) moments before `now` — fresh.
+		store.touchDevice(deviceId, now - 1_000);
+
+		const docker = fakeExecutor("docker", { status: "running" });
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			logger,
+			now: () => now,
+		});
+
+		await lifecycle.sweep();
+
+		expect(docker.stop).toHaveBeenCalledWith("CYPACK-5");
+		expect(docker.destroy).not.toHaveBeenCalled();
+	});
+
+	it("does not sweep a brand-new container (no lastRoutedMs/lastSeenMs) under a realistic post-creation clock", async () => {
+		const { createdMs, deviceId } = makeContainerDevice("CYPACK-6", "docker");
+		const idleStopMs = 900_000;
+		const staleDestroyMs = 14 * 24 * 60 * 60_000;
+		const docker = fakeExecutor("docker", { status: "running" });
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs,
+			staleDestroyMs,
+			logger,
+			// A realistic clock: a few seconds after creation, not artificially
+			// advanced — well within both idleStopMs and staleDestroyMs.
+			now: () => createdMs + 5_000,
+		});
+
+		await lifecycle.sweep();
+
+		expect(docker.stop).not.toHaveBeenCalled();
+		expect(docker.destroy).not.toHaveBeenCalled();
+		expect(store.getContainerDeviceForIssue("CYPACK-6")?.deviceId).toBe(
+			deviceId,
+		);
+	});
+
 	it("logs and skips a throwing executor during orphan GC, without aborting GC for other providers", async () => {
 		const brokenDocker = fakeExecutor("brokenDocker", {
 			listManagedImpl: vi.fn(async () => {

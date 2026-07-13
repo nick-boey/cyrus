@@ -1,5 +1,5 @@
 import type { ExecutorRegistry } from "cyrus-router-executors";
-import type { RouterStore } from "./RouterStore.js";
+import type { ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
 
 export interface ContainerLifecycleOptions {
 	store: RouterStore;
@@ -56,7 +56,21 @@ export class ContainerLifecycle {
 
 	async sweep(): Promise<void> {
 		const now = this.now();
-		const rows = this.store.listContainerDevices();
+		let rows: ContainerDeviceInfo[];
+		try {
+			rows = this.store.listContainerDevices();
+		} catch (err) {
+			// A store-level failure here (e.g. SQLITE_BUSY) must not reject the
+			// whole sweep: RouterServer's sweep interval fires this every 60s, and
+			// an uncaught rejection there is an unhandled rejection that (Node
+			// >=15 default) crashes the router process for every teammate, not
+			// just container-executor users. Log and degrade to a no-op tick; the
+			// next interval retries.
+			this.logger.warn(
+				`lifecycle sweep failed to list container devices: ${String(err)}`,
+			);
+			return;
+		}
 		const knownKeys = new Set(rows.map((r) => r.issueKey));
 
 		for (const row of rows) {
@@ -95,7 +109,19 @@ export class ContainerLifecycle {
 		for (const [provider, executor] of this.executors) {
 			try {
 				for (const key of await executor.listManaged()) {
-					if (!knownKeys.has(key)) {
+					// `knownKeys` is a snapshot taken before this loop's `await`s —
+					// it's a cheap pre-filter only, never the final say. A route
+					// landing mid-sweep (ContainerTargetService.ensureDevice writing
+					// the device row + boot() starting ensureRunning concurrently)
+					// can make a brand-new, still-booting container visible to
+					// listManaged() before it existed in that snapshot, which would
+					// otherwise misidentify it as an orphan and destroy() it — TOCTOU.
+					// Re-check the store immediately before each destroy() so a
+					// device row created after the snapshot still saves the container.
+					if (
+						!knownKeys.has(key) &&
+						!this.store.getContainerDeviceForIssue(key)
+					) {
 						await executor.destroy(key);
 						this.logger.info(
 							`Destroyed orphan ${provider} container for ${key}`,

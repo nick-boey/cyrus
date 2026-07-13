@@ -267,8 +267,20 @@ export class RouterServer {
 		this.gateway.attach(this.fastify.server, "/device");
 
 		this.sweepInterval = setInterval(() => {
-			void this.eventRouter.sweepExpired();
-			void this.containerLifecycle?.sweep();
+			// Both sweeps run detached from any caller that could catch a
+			// rejection, so each needs its own .catch(): with none, a transient
+			// failure (e.g. a store SQLITE_BUSY) becomes an unhandled promise
+			// rejection at this setInterval callback boundary, which (Node >=15
+			// default `--unhandled-rejections=throw`) crashes the whole router
+			// process — every teammate's webhooks stop routing, not just the one
+			// affected by the failure. Logging here lets the tick degrade to a
+			// warning and the next interval retry.
+			this.eventRouter.sweepExpired().catch((err: unknown) => {
+				this.logger.warn(`event sweep failed: ${String(err)}`);
+			});
+			this.containerLifecycle?.sweep().catch((err: unknown) => {
+				this.logger.warn(`container lifecycle sweep failed: ${String(err)}`);
+			});
 		}, SWEEP_INTERVAL_MS);
 	}
 
