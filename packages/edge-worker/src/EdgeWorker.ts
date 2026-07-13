@@ -524,14 +524,16 @@ export class EdgeWorker extends EventEmitter {
 				}
 
 				// Persistence floor: WIP-push + bundle-upload this issue now that a
-				// session on it just ended. touch() + syncIssue() are independent of
-				// the sendSessionState try/catch above — a router-lock signalling
-				// failure must not skip the floor sync, and vice versa.
+				// session on it just ended. syncIssueOnTermination() is independent
+				// of the sendSessionState try/catch above — a router-lock signalling
+				// failure must not skip the floor sync, and vice versa. It only
+				// stops protecting this issue (removes it from the touched set) once
+				// this terminal sync actually succeeds; a failure leaves it touched
+				// so the next periodic tick retries it.
 				const session = this.agentSessionManager.getSession(sessionId);
 				const identifier = session?.issue?.identifier;
 				if (identifier) {
-					this.workspaceSync?.touch(identifier);
-					void this.workspaceSync?.syncIssue(identifier);
+					void this.workspaceSync?.syncIssueOnTermination(identifier);
 				}
 			},
 		);
@@ -2794,12 +2796,6 @@ ${taskSection}`;
 			);
 		}
 
-		// Persistence floor: this is the last chance to WIP-push + upload
-		// session bundles before the process (and possibly the container it
-		// runs in) is gone. stop() never throws — every per-issue sync
-		// swallows and logs its own errors.
-		await this.workspaceSync?.stop();
-
 		// get all agent runners (including chat platform sessions)
 		const agentRunners: IAgentRunner[] = [
 			...this.agentSessionManager.getAllAgentRunners(),
@@ -2836,6 +2832,15 @@ ${taskSection}`;
 
 		// Stop shared application server (this also stops Cloudflare tunnel if running)
 		await this.sharedApplicationServer.stop();
+
+		// Persistence floor: this is the last chance to WIP-push + upload
+		// session bundles before the process (and possibly the container it
+		// runs in) is gone. Deliberately LAST — runner kill, egress-proxy
+		// stop, and server stop must not wait behind a potentially slow git
+		// push / router upload. `stop()` never throws (every per-issue sync
+		// swallows and logs its own errors) and is internally time-capped, so
+		// it can't block process exit indefinitely either.
+		await this.workspaceSync?.stop();
 	}
 
 	/**
@@ -4714,6 +4719,14 @@ ${taskSection}`;
 			this.logger.warn("Cannot initialize Claude runner without issue");
 			return;
 		}
+
+		// Persistence floor: this issue is about to get a runner that may work
+		// for a long time before its session ever reaches a terminal state.
+		// touch() here (rather than only at session end) is what lets the
+		// periodic timer keep re-syncing it on every tick while it runs. A
+		// no-op on non-router platforms — `workspaceSync` is only constructed
+		// when `platform === "router"`.
+		this.workspaceSync?.touch(issue.identifier);
 
 		const primaryRepo = repositories[0]!;
 
@@ -7479,6 +7492,16 @@ ${input.userComment}
 		commentTimestamp?: string,
 	): Promise<void> {
 		const log = this.logger.withContext({ sessionId });
+
+		// Persistence floor: this turn (new or resumed) may run for a long time
+		// before the session next reaches a terminal state. Touching here —
+		// not only at session end — is what lets the periodic timer keep
+		// re-syncing this issue on every tick while the runner is active. A
+		// no-op on non-router platforms (`workspaceSync` is only constructed
+		// when `platform === "router"`).
+		if (session.issue?.identifier) {
+			this.workspaceSync?.touch(session.issue.identifier);
+		}
 
 		// A prompt is an explicit instruction to continue, so drop any stop request
 		// left over from a previous turn. Without this, a stop delivered while the

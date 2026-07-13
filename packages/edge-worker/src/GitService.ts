@@ -272,6 +272,12 @@ export class GitService {
 	 * Commit-and-push dirty worktree state so another device can resume this
 	 * issue via {@link remoteBranchExists}. Returns true when a WIP commit was
 	 * created and pushed; false when the tree was already clean (no-op).
+	 *
+	 * Every step has a timeout: this now runs on every session end and every
+	 * persistence-floor timer tick (`WorkspaceSyncService`), not just its
+	 * original one-off caller, so an unbounded `execSync` here would stall
+	 * that hot path (and, being synchronous, the whole edge worker's event
+	 * loop) indefinitely.
 	 */
 	async pushWipIfDirty(
 		worktreePath: string,
@@ -280,12 +286,13 @@ export class GitService {
 		const status = execSync("git status --porcelain", {
 			cwd: worktreePath,
 			encoding: "utf-8",
+			timeout: 30_000,
 		});
 		if (status.trim().length === 0) return false;
-		execSync("git add -A", { cwd: worktreePath });
+		execSync("git add -A", { cwd: worktreePath, timeout: 30_000 });
 		execSync(
 			'git -c user.email=cyrus@localhost -c user.name="Cyrus WIP" commit -m "wip: auto-saved by cyrus before session end"',
-			{ cwd: worktreePath },
+			{ cwd: worktreePath, timeout: 30_000 },
 		);
 		execSync(`git push origin HEAD:${JSON.stringify(branchName)}`, {
 			cwd: worktreePath,
