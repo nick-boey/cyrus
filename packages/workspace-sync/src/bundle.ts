@@ -141,7 +141,11 @@ export async function restoreBundle(opts: {
 				.workspace?.path;
 			for (const key of RUNNER_ID_KEYS) {
 				const runnerId = session[key];
-				if (typeof runnerId !== "string" || !workspacePath) continue;
+				if (typeof runnerId !== "string") continue;
+				if (!workspacePath) {
+					delete session[key]; // fail safe: can't validate without a workspace path
+					continue;
+				}
 				const transcript = join(
 					opts.claudeProjectsDir,
 					sanitizeCwdForClaudeProjects(workspacePath),
