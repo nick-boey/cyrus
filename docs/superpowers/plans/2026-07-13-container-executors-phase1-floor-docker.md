@@ -1727,7 +1727,9 @@ git add packages/router/src/ContainerLifecycle.ts packages/router/src/RouterServ
 git commit -m "feat(router): container idle-stop, stale-destroy, and orphan GC sweeps"
 ```
 
----### Task 8: Config schema + RouterServer wiring
+---
+
+### Task 8: Config schema + RouterServer wiring
 
 **Files:**
 - Modify: `packages/router/src/RouterServer.ts`, `apps/cli/src/commands/RouterCommand.ts` (the `RouterConfigFileSchema`)
