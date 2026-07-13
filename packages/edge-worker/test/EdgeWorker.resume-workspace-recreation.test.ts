@@ -399,4 +399,99 @@ Issue: {{issue_identifier}}`;
 			.trim();
 		expect(headAfterResume).toBe(originalHead);
 	});
+
+	/**
+	 * Regression guard for the base-branch-override drop: a session created
+	 * with an explicit `[repo=name#branch]` description selector persists
+	 * that resolution as `RepositoryContext.baseBranchName` +
+	 * `baseBranchSource: "commit-ish"` (see `createCyrusAgentSession`). If
+	 * the worktree is later destroyed and recreated on resume, it must be
+	 * rebuilt from that same persisted override — NOT the repository's own
+	 * default base branch — or the session silently continues on the wrong
+	 * base.
+	 */
+	it("recreates a missing worktree from the session's persisted base-branch override, not the repo's default base branch", async () => {
+		const { clone } = makeOriginAndClone();
+		const branchName = "RESTORE-3-base-override-test-issue";
+
+		// A release branch, diverged from `main`, marked by a file that only
+		// exists there — proof of which branch the recreated worktree came from.
+		execSync(`git -C ${clone} checkout -b release/2.0`);
+		execSync(`echo release-marker > ${join(clone, "release-marker.txt")}`);
+		execSync(`git -C ${clone} add release-marker.txt`);
+		execSync(
+			`git -C ${clone} -c user.email=t@t -c user.name=t commit -m "release 2.0 marker"`,
+		);
+		execSync(`git -C ${clone} push origin release/2.0`);
+		execSync(`git -C ${clone} checkout main`);
+
+		const workspaceBaseDir = mkdtempSync(join(tmpdir(), "cyrus-resume-ws-"));
+		const missingWorkspacePath = join(workspaceBaseDir, "RESTORE-3");
+		expect(existsSync(missingWorkspacePath)).toBe(false);
+
+		const mockRepository: RepositoryConfig = {
+			id: "repo-1",
+			name: "test-repo",
+			repositoryPath: clone,
+			workspaceBaseDir,
+			// The repo's own default base branch — deliberately NOT the branch
+			// the session should recreate from, so the test fails if the
+			// override is dropped and `determineBaseBranch` falls back to this.
+			baseBranch: "main",
+			linearWorkspaceId: "test-workspace",
+			isActive: true,
+		} as RepositoryConfig;
+
+		const issueFixture = makeIssueFixture({
+			identifier: "RESTORE-3",
+			branchName,
+		});
+		const edgeWorker = buildEdgeWorker(mockRepository, issueFixture);
+
+		const session: any = {
+			id: "agent-session-3",
+			issueId: "issue-RESTORE-3",
+			issueContext: {
+				trackerId: "linear",
+				issueId: "issue-RESTORE-3",
+				issueIdentifier: "RESTORE-3",
+			},
+			issue: {
+				id: "issue-RESTORE-3",
+				identifier: "RESTORE-3",
+				title: "Base override test issue",
+				branchName,
+			},
+			repositories: [
+				// Persisted from the original `[repo=test-repo#release/2.0]`
+				// selector — this is what `ensureSessionWorkspaceExists` must
+				// reuse. `baseBranchSource: "commit-ish"` is what marks this as
+				// a real override rather than an ordinary default/graphite/
+				// parent-issue resolution.
+				{
+					repositoryId: "repo-1",
+					branchName,
+					baseBranchName: "release/2.0",
+					baseBranchSource: "commit-ish",
+				},
+			],
+			workspace: { path: missingWorkspacePath, isGitWorktree: true },
+			claudeSessionId: "prior-claude-session-override",
+		};
+
+		await (edgeWorker as any).resumeAgentSession(
+			session,
+			mockRepository,
+			"agent-session-3",
+			mockAgentSessionManager,
+			"please continue",
+		);
+
+		// The recreated worktree must be based on the session's persisted
+		// override (release/2.0) — proven by the marker file only present on
+		// that branch — not the repo's default base branch (main).
+		expect(existsSync(join(missingWorkspacePath, "release-marker.txt"))).toBe(
+			true,
+		);
+	});
 });

@@ -4438,6 +4438,7 @@ ${taskSection}`;
 			branchName: issueMinimal.branchName,
 			baseBranchName:
 				workspace.resolvedBaseBranches?.[repo.id]?.branch ?? repo.baseBranch,
+			baseBranchSource: workspace.resolvedBaseBranches?.[repo.id]?.source,
 		}));
 
 		agentSessionManager.createCyrusAgentSession(
@@ -7537,11 +7538,41 @@ ${input.userComment}
 		const resolvedRepositories =
 			repositoriesForSession.length > 0 ? repositoriesForSession : [repository];
 
+		// Recreation must land the worktree on the same EXPLICIT base branch
+		// the session originally resolved to (e.g. a `[repo=name#branch]`
+		// description selector), not whatever `determineBaseBranch` would
+		// re-derive today. The session's own persisted
+		// `RepositoryContext.baseBranchName` already carries that resolved
+		// branch per repo (set once in `createCyrusAgentSession`), so reuse
+		// it here as a `baseBranchOverrides` map — the same mechanism
+		// `createCyrusAgentSession` itself passes through — instead of
+		// re-deriving from scratch.
+		//
+		// Only repos whose `baseBranchSource === "commit-ish"` are pinned
+		// this way. Passing an override unconditionally would also disable
+		// worktree continuity (`createSingleRepoWorktree`'s check for an
+		// already-pushed `origin/<issueBranch>`, which only runs when NO
+		// override is given) for the common case where `baseBranchName` is
+		// just an ordinary "default"/graphite/parent-issue resolution rather
+		// than a real user-specified override — silently discarding any WIP
+		// already pushed to the issue's own branch by the persistence floor
+		// and rebranching fresh from the base instead. Leaving those repos
+		// out of the map lets `determineBaseBranch` recompute exactly as it
+		// would for a brand-new session, so continuity keeps working.
+		const baseBranchOverrides = new Map<string, string>();
+		for (const ctx of session.repositories) {
+			if (ctx.baseBranchName && ctx.baseBranchSource === "commit-ish") {
+				baseBranchOverrides.set(ctx.repositoryId, ctx.baseBranchName);
+			}
+		}
+
 		const workspace = this.config.handlers?.createWorkspace
 			? await this.config.handlers.createWorkspace(
 					fullIssue,
 					resolvedRepositories,
 					{
+						baseBranchOverrides:
+							baseBranchOverrides.size > 0 ? baseBranchOverrides : undefined,
 						onRepoSetupHookEvent: (activity) =>
 							this.activityPoster.postRepoSetupHookActivity(
 								sessionId,
@@ -7554,6 +7585,8 @@ ${input.userComment}
 					fullIssue,
 					resolvedRepositories,
 					{
+						baseBranchOverrides:
+							baseBranchOverrides.size > 0 ? baseBranchOverrides : undefined,
 						onRepoSetupHookEvent: (activity) =>
 							this.activityPoster.postRepoSetupHookActivity(
 								sessionId,

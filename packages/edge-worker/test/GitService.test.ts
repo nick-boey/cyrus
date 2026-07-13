@@ -2061,4 +2061,153 @@ describe("GitService", () => {
 			expect(result).toHaveLength(0);
 		});
 	});
+
+	describe("isWorkspaceValid", () => {
+		it("returns true for a genuinely plain (0-repo) workspace even when the path is missing on disk", () => {
+			// No repository was ever configured for this workspace (createGitWorktree's
+			// 0-repo path never sets resolvedBaseBranches) — existence isn't even
+			// checked, since a missing plain directory is already handled correctly by
+			// a plain `mkdir`.
+			mockExistsSync.mockReturnValue(false);
+
+			const result = gitService.isWorkspaceValid({
+				path: "/home/user/.cyrus/worktrees/DEF-1",
+				isGitWorktree: false,
+			});
+
+			expect(result).toBe(true);
+		});
+
+		it("returns false for a failed single-repo worktree creation that fell back to a plain mkdir", () => {
+			// This is createSingleRepoWorktree's catch-block fallback shape: a
+			// worktree creation attempt was made for a configured repository (hence
+			// resolvedBaseBranches is populated) but failed, falling back to
+			// mkdirSync. The path exists, but has no `.git` — it's just an empty
+			// directory, not a repaired worktree.
+			mockExistsSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-1") return true;
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/.git") return false;
+				return false;
+			});
+
+			const result = gitService.isWorkspaceValid({
+				path: "/home/user/.cyrus/worktrees/DEF-1",
+				isGitWorktree: false,
+				resolvedBaseBranches: {
+					"repo-1": { branch: "main", source: "default" },
+				},
+			});
+
+			expect(result).toBe(false);
+		});
+
+		it("returns true for a failed single-repo worktree creation whose directory was later repaired into a real worktree", () => {
+			mockExistsSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-1") return true;
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/.git") return true;
+				return false;
+			});
+			mockStatSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/.git") {
+					return { isFile: () => true } as any;
+				}
+				return { isFile: () => false } as any;
+			});
+
+			const result = gitService.isWorkspaceValid({
+				path: "/home/user/.cyrus/worktrees/DEF-1",
+				isGitWorktree: false,
+				resolvedBaseBranches: {
+					"repo-1": { branch: "main", source: "default" },
+				},
+			});
+
+			expect(result).toBe(true);
+		});
+
+		it("returns false for a single-repo git worktree whose directory is missing entirely", () => {
+			mockExistsSync.mockReturnValue(false);
+
+			const result = gitService.isWorkspaceValid({
+				path: "/home/user/.cyrus/worktrees/DEF-1",
+				isGitWorktree: true,
+			});
+
+			expect(result).toBe(false);
+		});
+
+		it("returns true for a single-repo git worktree that resolves to a real .git file on disk", () => {
+			mockExistsSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/.git") return true;
+				return false;
+			});
+			mockStatSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/.git") {
+					return { isFile: () => true } as any;
+				}
+				return { isFile: () => false } as any;
+			});
+
+			const result = gitService.isWorkspaceValid({
+				path: "/home/user/.cyrus/worktrees/DEF-1",
+				isGitWorktree: true,
+			});
+
+			expect(result).toBe(true);
+		});
+
+		it("returns false for a multi-repo workspace when any one repo's worktree is missing", () => {
+			mockExistsSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/repo-a/.git") return true;
+				// repo-b's worktree is gone
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/repo-b/.git") return false;
+				return false;
+			});
+			mockStatSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/repo-a/.git") {
+					return { isFile: () => true } as any;
+				}
+				return { isFile: () => false } as any;
+			});
+
+			const result = gitService.isWorkspaceValid({
+				path: "/home/user/.cyrus/worktrees/DEF-1",
+				isGitWorktree: true,
+				repoPaths: {
+					"repo-a": "/home/user/.cyrus/worktrees/DEF-1/repo-a",
+					"repo-b": "/home/user/.cyrus/worktrees/DEF-1/repo-b",
+				},
+			});
+
+			expect(result).toBe(false);
+		});
+
+		it("returns true for a multi-repo workspace when every repo's worktree is intact", () => {
+			mockExistsSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/repo-a/.git") return true;
+				if (p === "/home/user/.cyrus/worktrees/DEF-1/repo-b/.git") return true;
+				return false;
+			});
+			mockStatSync.mockReturnValue({ isFile: () => true } as any);
+
+			const result = gitService.isWorkspaceValid({
+				path: "/home/user/.cyrus/worktrees/DEF-1",
+				isGitWorktree: true,
+				repoPaths: {
+					"repo-a": "/home/user/.cyrus/worktrees/DEF-1/repo-a",
+					"repo-b": "/home/user/.cyrus/worktrees/DEF-1/repo-b",
+				},
+			});
+
+			expect(result).toBe(true);
+		});
+	});
 });

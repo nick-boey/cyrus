@@ -1429,9 +1429,30 @@ export class GitService {
 	 */
 	public isWorkspaceValid(workspace: Workspace): boolean {
 		if (!workspace.isGitWorktree) {
-			// Plain (no-repo) workspace: existence alone is sufficient, and a
-			// missing one is already handled correctly by a plain `mkdir`.
-			return true;
+			// `resolvedBaseBranches` is only ever populated when at least one
+			// repository was configured for this workspace (see
+			// `createGitWorktree`/`createSingleRepoWorktree`) — a genuinely
+			// plain (0-repo) workspace never sets it. So its presence here
+			// means `isGitWorktree: false` did NOT come from the 0-repo path,
+			// but from `createSingleRepoWorktree`'s catch-block fallback: a
+			// worktree creation attempt was made and failed (e.g. a transient
+			// `git fetch` failure during first boot), falling back to a plain
+			// `mkdirSync`. Don't short-circuit true for that case — it would
+			// let a failed-creation session resume into an empty directory
+			// forever, on every future resume, with no way to repair it.
+			// Instead fall through to the same on-disk check a real worktree
+			// gets, so a later resume's `ensureSessionWorkspaceExists` can
+			// detect the gap and recreate the worktree properly.
+			const hasConfiguredRepositories =
+				workspace.resolvedBaseBranches !== undefined &&
+				Object.keys(workspace.resolvedBaseBranches).length > 0;
+			if (!hasConfiguredRepositories) {
+				// Genuinely non-git (0-repo) workspace: existence alone is
+				// sufficient, and a missing one is already handled correctly
+				// by a plain `mkdir`.
+				return true;
+			}
+			return this.isGitWorktree(workspace.path);
 		}
 		if (workspace.repoPaths && Object.keys(workspace.repoPaths).length > 0) {
 			return Object.values(workspace.repoPaths).every((p) =>

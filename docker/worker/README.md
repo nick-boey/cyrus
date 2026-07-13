@@ -115,6 +115,12 @@ them out unless you have a specific reason to relocate those paths:
 > by a loopback-bound router. If you skip this, see
 > [Troubleshooting](#troubleshooting) below — it's the first thing to check
 > when a container starts but never connects.
+>
+> Binding `0.0.0.0` also exposes the router's device WebSocket and artifact
+> endpoints (which serve issue bundles containing Claude transcripts) on
+> **every** network interface, not just the Docker bridge — auth is
+> device-token-only, so do this on a trusted network or behind a firewall
+> (not on open café/office Wi-Fi without one).
 
 **Required fields:**
 
@@ -264,8 +270,19 @@ physical device in is to enable migrating a session from their laptop onto a
 container later.
 
 ```bash
-docker stop cyrus-issue-<ISSUE-KEY>
+docker stop -t 30 cyrus-issue-<ISSUE-KEY>
 ```
+
+**Use `-t 30`, not the bare `docker stop`.** `docker stop`'s default grace
+period is 10 seconds before Docker SIGKILLs the container. But
+`EdgeWorker.stop()` runs `WorkspaceSyncService`'s final floor flush (WIP
+branch push + bundle upload) **last**, and that flush is capped at 20 seconds
+(`DEFAULT_STOP_FLUSH_TIMEOUT_MS`) — comfortably inside a 30-second grace
+period, but not a 10-second one. Stop with the default timeout here and
+Docker kills the container mid-`git push`, so this exact verification step
+would show fewer WIP commits than expected (or none) — not because
+persistence is broken, but because the container never got time to finish
+writing them.
 
 Then send a follow-up prompt to the same Linear agent session (a comment
 mentioning Cyrus, or a new message in the agent session thread). You should see
