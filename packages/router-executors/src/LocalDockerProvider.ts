@@ -8,17 +8,25 @@ import type {
 export type ExecFn = (
 	cmd: string,
 	args: string[],
-) => Promise<{ stdout: string; exitCode: number }>;
+) => Promise<{ stdout: string; stderr?: string; exitCode: number }>;
+
+/**
+ * A container's first `docker run` triggers a pull of the worker image,
+ * which can easily take several minutes. Keep the exec timeout generous
+ * enough to cover that, rather than a value tuned for steady-state calls.
+ */
+const DEFAULT_EXEC_TIMEOUT_MS = 600_000;
 
 const defaultExec: ExecFn = (cmd, args) =>
 	new Promise((resolve) => {
 		execFile(
 			cmd,
 			args,
-			{ timeout: 120_000, maxBuffer: 8 * 1024 * 1024 },
-			(err, stdout) => {
+			{ timeout: DEFAULT_EXEC_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
+			(err, stdout, stderr) => {
 				resolve({
 					stdout: stdout?.toString() ?? "",
+					stderr: stderr?.toString() ?? "",
 					exitCode: err ? ((err as { code?: number }).code ?? 1) : 0,
 				});
 			},
@@ -127,10 +135,11 @@ export class LocalDockerProvider implements ContainerExecutor {
 	}
 
 	private async mustSucceed(cmd: string, args: string[]): Promise<void> {
-		const { exitCode, stdout } = await this.exec(cmd, args);
+		const { exitCode, stdout, stderr } = await this.exec(cmd, args);
 		if (exitCode !== 0) {
+			const detail = [stderr, stdout].filter(Boolean).join(" | ").trim();
 			throw new Error(
-				`${cmd} ${args[0]} ${args[1] ?? ""} failed (${exitCode}): ${stdout}`.trim(),
+				`${cmd} ${args[0]} ${args[1] ?? ""} failed (${exitCode}): ${detail}`.trim(),
 			);
 		}
 	}

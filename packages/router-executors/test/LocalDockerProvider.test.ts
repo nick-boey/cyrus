@@ -7,7 +7,16 @@ function fakeExec(
 	const calls: string[][] = [];
 	const exec = async (cmd: string, args: string[]) => {
 		calls.push([cmd, ...args]);
-		const key = args.slice(0, 2).join(" "); // e.g. "inspect -f", "run -d"
+		// Two-token commands (e.g. "inspect -f", "volume create", "ps -a")
+		// have a static second token, so keying on it is unambiguous. But
+		// commands like ["stop", name] / ["start", name] carry a *dynamic*
+		// second token (the container name) — keying on both would fold the
+		// name into the lookup key and never match a script keyed by verb
+		// alone. Prefer the two-token key when the script defines one;
+		// otherwise fall back to the bare first token.
+		const twoToken = args.slice(0, 2).join(" "); // e.g. "inspect -f", "run -d"
+		const oneToken = args[0] ?? ""; // e.g. "stop", "start"
+		const key = twoToken in script ? twoToken : oneToken;
 		const hit = script[key] ?? {};
 		return { stdout: hit.stdout ?? "", exitCode: hit.exitCode ?? 0 };
 	};
@@ -47,6 +56,15 @@ describe("LocalDockerProvider", () => {
 		await p.ensureRunning({ ...ctx(), mintDeviceToken });
 		expect(minted).toBe(0);
 		expect(calls.some((c) => c[1] === "start")).toBe(true);
+	});
+
+	it("propagates a failure to start an existing stopped container (unlike stop, ensureRunning does not tolerate this)", async () => {
+		const { exec } = fakeExec({
+			"inspect -f": { stdout: "false\timg:1\n" },
+			start: { exitCode: 1 },
+		});
+		const p = new LocalDockerProvider({ image: "img:1", exec });
+		await expect(p.ensureRunning(ctx())).rejects.toThrow(/start/);
 	});
 
 	it("recreates (rm -f, then run) when the image is stale", async () => {
@@ -157,6 +175,48 @@ describe("LocalDockerProvider", () => {
 		).toBe(true);
 		const run = calls.find((c) => c[1] === "run");
 		expect(run).toContain("cyrus-issue-team-CYPACK-1");
+	});
+
+	it("round-trips the raw (unsanitized) issue key through the label so listManaged() and orphan GC can match it back to the router's issue key", async () => {
+		const dirtyKey = "team/CYPACK 1";
+		const { exec, calls } = fakeExec({
+			"inspect -f": { exitCode: 1 },
+			"ps -a": { stdout: `${dirtyKey}\n` },
+		});
+		const p = new LocalDockerProvider({ image: "img:1", exec });
+		await p.ensureRunning(ctx(dirtyKey));
+
+		const run = calls.find((c) => c[1] === "run");
+		// The label carries the raw key, NOT the sanitized resource name.
+		expect(run).toContain(`cyrus.issue=${dirtyKey}`);
+		expect(run).not.toContain("cyrus.issue=cyrus-issue-team-CYPACK-1");
+		// But the container/volume name IS sanitized.
+		expect(run).toContain("cyrus-issue-team-CYPACK-1");
+
+		// listManaged() hands back the original, unsanitized key.
+		expect(await p.listManaged()).toEqual([dirtyKey]);
+	});
+
+	it("stop and destroy sanitize the container/volume name for a dirty issue key", async () => {
+		const dirtyKey = "team/CYPACK 1";
+
+		const { exec: stopExec, calls: stopCalls } = fakeExec({});
+		await new LocalDockerProvider({ image: "img:1", exec: stopExec }).stop(
+			dirtyKey,
+		);
+		expect(stopCalls).toEqual([
+			["docker", "stop", "cyrus-issue-team-CYPACK-1"],
+		]);
+
+		const { exec: destroyExec, calls: destroyCalls } = fakeExec({});
+		await new LocalDockerProvider({
+			image: "img:1",
+			exec: destroyExec,
+		}).destroy(dirtyKey);
+		expect(destroyCalls).toEqual([
+			["docker", "rm", "-f", "cyrus-issue-team-CYPACK-1"],
+			["docker", "volume", "rm", "cyrus-issue-team-CYPACK-1"],
+		]);
 	});
 
 	it("applies memory limit and network flags to the run command when configured", async () => {
