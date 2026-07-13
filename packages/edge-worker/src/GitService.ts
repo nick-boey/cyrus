@@ -127,6 +127,23 @@ function isIndexLockError(error: unknown): boolean {
 	return typeof stderr === "string" && /index\.lock/.test(stderr);
 }
 
+/**
+ * True when a `git rev-list`/`rev-parse`-style invocation failed because the
+ * revision it referenced (typically a remote-tracking ref like
+ * `origin/<branch>`) doesn't exist locally, as opposed to some other git
+ * failure. Used by {@link GitService.pushWipIfDirty}'s unpushed-commit
+ * check: a branch that has never been pushed (no `origin/<branch>` ref
+ * fetched/created locally yet) has everything unpushed, by definition,
+ * rather than nothing to retry.
+ */
+function isUnknownRevisionError(error: unknown): boolean {
+	const stderr = (error as GitExecError | undefined)?.stderr;
+	return (
+		typeof stderr === "string" &&
+		/unknown revision|bad revision|ambiguous argument/i.test(stderr)
+	);
+}
+
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -307,14 +324,14 @@ export class GitService {
 
 	/**
 	 * Commit-and-push dirty worktree state so another device can resume this
-	 * issue via {@link remoteBranchExists}. Returns true when a WIP commit was
-	 * created and pushed; false when the tree was already clean, or when the
-	 * commit had to be skipped because another git process holds the index
-	 * lock (no-op either way — nothing was committed).
+	 * issue via {@link remoteBranchExists}. Returns true when a WIP commit
+	 * and/or push actually happened; false when there was nothing to do
+	 * (clean tree, nothing unpushed), or when the commit had to be skipped
+	 * because another git process holds the index lock.
 	 *
 	 * This runs on every session end AND every persistence-floor timer tick
 	 * (`WorkspaceSyncService`, every 5 minutes) — concurrently with whatever
-	 * git commands the agent itself is running in the same worktree. Three
+	 * git commands the agent itself is running in the same worktree. Several
 	 * things follow from that:
 	 *
 	 *  - Every step uses `execFile` (async, non-blocking), not `execSync`: an
@@ -323,15 +340,25 @@ export class GitService {
 	 *    shutdown cap in `WorkspaceSyncService.stop()` inert (it races via
 	 *    `setTimeout`, which can't fire while the loop is blocked). See
 	 *    {@link execFileAsync}.
-	 *  - The commit uses `--no-verify`: this is a safety-net commit, not a
-	 *    real one, and must never run the repository's pre-commit hooks
-	 *    (which would otherwise fire ~12x/hour inside the user's own
-	 *    worktree and can get SIGTERM'd by this method's own timeout).
+	 *  - Both the commit AND the push use `--no-verify`: this is a
+	 *    safety-net operation, not a real one, and must never run the
+	 *    repository's pre-commit/pre-push hooks (which would otherwise fire
+	 *    ~12x/hour inside the user's own worktree and can get SIGTERM'd by
+	 *    this method's own timeout). The floor must be invisible.
 	 *  - If `.git/index.lock` is already held (the agent's own git command is
 	 *    mid-flight), this backs off rather than racing or forcing past it:
 	 *    the lock file is never deleted or overridden, and the failure is
 	 *    logged at debug (expected contention, not an error) so it doesn't
 	 *    spam warnings every tick. The next periodic tick tries again.
+	 *  - A **clean** working tree is NOT sufficient grounds to skip: a prior
+	 *    cycle may have committed successfully and then failed to push
+	 *    (network blip, router/GitHub unreachable, auth hiccup) —
+	 *    `pushWipSafely` in `WorkspaceSyncService` swallows that error and
+	 *    logs it, so without a further check the commit would sit
+	 *    local-only forever, silently lost the moment the container is
+	 *    destroyed. So when the tree is clean, this still checks whether
+	 *    `HEAD` has commits `origin/<branchName>` doesn't (via
+	 *    {@link hasUnpushedCommits}) and retries the push alone if so.
 	 *
 	 * WIP commits always land on the issue's own branch (`branchName`), the
 	 * same branch the `git-gh` subroutine's own commit lands on — so even if
@@ -361,7 +388,18 @@ export class GitService {
 			}
 			throw error;
 		}
-		if (status.stdout.trim().length === 0) return false;
+
+		if (status.stdout.trim().length === 0) {
+			// Clean tree — but that alone doesn't mean there's nothing to do.
+			// See the "clean working tree is NOT sufficient" doc note above.
+			const hasUnpushedCommits = await this.hasUnpushedCommits(git, branchName);
+			if (!hasUnpushedCommits) return false;
+			await git(
+				["push", "--no-verify", "origin", `HEAD:${branchName}`],
+				60_000,
+			);
+			return true;
+		}
 
 		try {
 			await git(["add", "-A"], 30_000);
@@ -388,8 +426,33 @@ export class GitService {
 			throw error;
 		}
 
-		await git(["push", "origin", `HEAD:${branchName}`], 60_000);
+		await git(["push", "--no-verify", "origin", `HEAD:${branchName}`], 60_000);
 		return true;
+	}
+
+	/**
+	 * True when `HEAD` has commits that `origin/<branchName>` does not — the
+	 * clean-tree counterpart to a dirty-tree check, so
+	 * {@link pushWipIfDirty} can retry a push that failed after its commit
+	 * already succeeded (see that method's doc). When `origin/<branchName>`
+	 * doesn't exist as a local remote-tracking ref (branch never pushed, or
+	 * this worktree has never fetched/pushed it), there's no known basis for
+	 * "already pushed" — the whole local branch counts as unpushed.
+	 */
+	private async hasUnpushedCommits(
+		git: (args: string[], timeoutMs: number) => Promise<{ stdout: string }>,
+		branchName: string,
+	): Promise<boolean> {
+		try {
+			const result = await git(
+				["rev-list", "--count", `origin/${branchName}..HEAD`],
+				30_000,
+			);
+			return Number.parseInt(result.stdout.trim(), 10) > 0;
+		} catch (error) {
+			if (isUnknownRevisionError(error)) return true;
+			throw error;
+		}
 	}
 
 	/**

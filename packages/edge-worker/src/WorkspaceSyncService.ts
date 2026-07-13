@@ -114,23 +114,48 @@ interface SyncOutcome {
  * successful terminal sync for session A must not un-protect an issue that
  * session B is still actively working on.
  *
- * Once an issue has no live sessions, removal itself converges through
- * {@link syncIssue}: every successful sync (whether triggered by
+ * Once an issue's live-session set IS empty, removal itself converges
+ * through {@link syncIssue}: every successful sync (whether triggered by
  * {@link syncIssueOnTermination} or by the ordinary periodic
- * {@link flushTouched} tick) removes the issue from the touched set when its
- * live-session set is empty. This means a terminal sync that fails (e.g. a
- * router blip) is NOT stuck forever — the very next periodic tick retries
- * the same issue (it's still in the touched set) and, on success, completes
- * the removal. Without this, a session that ends abnormally (crash, OOM,
- * `kill -9`) without ever reaching {@link syncIssueOnTermination} — or whose
- * terminal sync simply fails — would stay touched, WIP-pushed, and
- * re-bundled every tick for the life of the process.
+ * {@link flushTouched} tick) removes the issue from the touched set in that
+ * case. This means a terminal sync that fails (e.g. a router blip) is NOT
+ * stuck forever: {@link syncIssueOnTermination} already removed that
+ * session's id from the refcount before attempting the sync, so once the
+ * set is empty, the very next periodic tick retries the same issue (it's
+ * still in the touched set) and, on success, completes the removal.
+ *
+ * **This convergence has one known, bounded gap: a session that ends
+ * abnormally (crash, OOM, `kill -9`) WITHOUT ever reaching
+ * {@link syncIssueOnTermination} never has its session id removed from
+ * `liveSessionsByIssue` at all.** There is no reliable in-process signal
+ * that distinguishes "this session's underlying process died silently"
+ * from "this session is still legitimately running" — the persisted
+ * edge-worker state's session status is not updated on an unexpected
+ * process exit; it simply keeps whatever value it had before the crash
+ * (this was confirmed against `AgentSessionManager`, not assumed: only a
+ * full EdgeWorker *process* restart reconciles interrupted sessions, via
+ * `reconcileInterruptedSessions()`, which itself relies on "no live runner
+ * object attached" — a signal only available once runners are guaranteed
+ * not to be rehydrated, i.e. after a restart, not while the same process
+ * keeps running with a stale runner reference). So `liveSessions.size` for
+ * that issue can never reach 0 on account of that one session, and the
+ * issue keeps being WIP-pushed and re-bundled every periodic tick for the
+ * remainder of the process's life — exactly as originally reported. This
+ * is wasted work, not lost work (the floor's operations are idempotent
+ * no-ops once nothing has changed), and it is bounded: it ends when either
+ * the issue's worktree is deleted (see the workspace-gone paragraph below,
+ * which drops the issue unconditionally regardless of the stale refcount)
+ * or the edge-worker process itself restarts (which discards
+ * `liveSessionsByIssue` in memory and rebuilds it from scratch via
+ * session-start `touch()` calls).
  *
  * Separately, if an issue's workspace has been removed from disk entirely
  * (torn down through some path that never told this service), retrying is
  * pointless (every attempt would just hit ENOENT). `doSyncIssue` detects
  * this and {@link syncIssue} drops the issue from the touched set
- * unconditionally in that case — see {@link SyncOutcome.workspaceGone}.
+ * unconditionally in that case — see {@link SyncOutcome.workspaceGone}. This
+ * is what eventually rescues the crash gap described above, once the
+ * worktree is torn down through whatever path handles that.
  */
 export class WorkspaceSyncService {
 	private readonly cyrusHome: string;
@@ -219,10 +244,16 @@ export class WorkspaceSyncService {
 	 * handled inside {@link syncIssue} itself (via the live-session refcount
 	 * and the workspace-gone check), so a periodic tick converges exactly
 	 * like a terminal one: an issue whose live-session set is already empty
-	 * (e.g. a prior terminal sync failed, or the session crashed without
-	 * ever calling {@link syncIssueOnTermination}) gets dropped here too, as
-	 * soon as a sync for it actually succeeds — see the class doc's
-	 * "Touched-set lifecycle" section.
+	 * (e.g. a prior terminal sync failed, leaving the refcount at zero from
+	 * the earlier {@link syncIssueOnTermination} call) gets dropped here
+	 * too, as soon as a sync for it actually succeeds. A session that
+	 * crashed WITHOUT ever calling {@link syncIssueOnTermination} does NOT
+	 * leave the live-session set empty — its id is simply never removed —
+	 * so this periodic path can't converge that case via the refcount
+	 * either; only the workspace-gone check (unconditional, ignores the
+	 * refcount entirely) eventually rescues it. See the class doc's
+	 * "Touched-set lifecycle" section for the full picture, including that
+	 * known gap.
 	 */
 	private async flushTouched(): Promise<void> {
 		const issueKeys = [...this.touchedIssues];

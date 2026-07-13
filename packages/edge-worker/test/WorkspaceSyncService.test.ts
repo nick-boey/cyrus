@@ -3,6 +3,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -676,6 +677,58 @@ describe("WorkspaceSyncService — touched-set convergence", () => {
 });
 
 /**
+ * Task 10 fix pass 3 — Finding 2. The class doc previously claimed a
+ * convergence guarantee it did not actually provide: a session that dies
+ * without a terminal event (crash, OOM, `kill -9`) never has its id removed
+ * from `liveSessionsByIssue`, because that only happens inside
+ * `syncIssueOnTermination` — which, by definition, a crashed session never
+ * calls. This is a real (bounded) leak, not a doc typo; this test proves it
+ * rather than merely asserting the corrected prose. Contrast with "leaves
+ * the issue touched when the terminal sync fails..." above, which DOES
+ * converge because `syncIssueOnTermination` was called (so the refcount was
+ * already at zero) — the difference is entirely whether that method ever ran.
+ */
+describe("WorkspaceSyncService — documented gap: a crashed session never converges via the refcount alone", () => {
+	it("keeps re-syncing an issue on every flush indefinitely when its only live session never reaches syncIssueOnTermination", async () => {
+		const cyrusHome = mkCyrusHome();
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+
+		const pushWipIfDirty = vi.fn(async () => true);
+		const fetchMock = stubFetchOk();
+
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService: {
+				pushWipIfDirty,
+				deriveWorktreeBranchName: vi.fn(() => "branch"),
+			},
+			logger: makeLogger(),
+		});
+
+		// Session-start touch(), simulating a session whose underlying process
+		// is later killed (crash/OOM/kill -9) WITHOUT ever calling
+		// syncIssueOnTermination — the refcount is never decremented, unlike
+		// every other scenario covered above.
+		service.touch("CYPACK-9", "sess-crashed");
+
+		// Three independent flush cycles (three periodic ticks / shutdown
+		// attempts) must each still sync the issue — proving it was never
+		// dropped from the touched set. If this ever starts failing (i.e. the
+		// issue stops being re-synced after the first flush), the documented
+		// gap has been closed and the class doc should be revisited.
+		await service.stop();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+
+		await service.stop();
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+
+		await service.stop();
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+	});
+});
+
+/**
  * Writes a fake `git` executable that sleeps for `delayMs` before responding
  * to any invocation, and returns the directory it lives in (prepend this to
  * `PATH` so `execFile("git", ...)` resolves to it instead of the real git).
@@ -806,6 +859,10 @@ describe("WorkspaceSyncService.stop bounded flush", () => {
 			await expect(syncPromise).resolves.toBe(true);
 		} finally {
 			process.env.PATH = originalPath;
+			// Test hygiene: mkdtempSync leaves this directory (and the fake git
+			// binary inside it) on disk otherwise — clean it up regardless of
+			// pass/fail so repeated runs don't accumulate temp dirs.
+			rmSync(slowGitDir, { recursive: true, force: true });
 		}
 	});
 });
