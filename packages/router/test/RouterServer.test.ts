@@ -1,9 +1,39 @@
+import type { AgentEvent } from "cyrus-core";
 import { CLIIssueTrackerService } from "cyrus-core";
 import type { LinearOAuthConfig } from "cyrus-linear-event-transport";
 import { PROTOCOL_VERSION } from "cyrus-router-protocol";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
-import { RouterServer, type RouterServerConfig } from "../src/RouterServer.js";
+import {
+	type RouterContainersConfig,
+	RouterServer,
+	type RouterServerConfig,
+} from "../src/RouterServer.js";
+
+// LocalDockerProvider's default exec shells out to the real `docker` binary
+// via `node:child_process`. Routing a container-executor user's session
+// fire-and-forgets a `ContainerTargetService.boot()` call (see EventRouter's
+// deliverOrNotify), which — if left un-mocked on a machine that actually has
+// Docker installed — would spawn a real `docker volume create`/`docker run`
+// against a throwaway image in the background of every test run in this
+// file: a real side effect on the developer's Docker daemon, plus a
+// long-lived child-process handle that can keep the test process alive past
+// the run's assertions. Mocking `execFile` makes every `docker` invocation
+// fail instantly and deterministically (mirroring "Docker not installed"),
+// which is exactly the failure path ContainerTargetService already handles
+// (see ContainerTargets.test.ts's "posts a boot-failure activity" case) —
+// the device-row assertions below never depend on the boot actually
+// succeeding.
+vi.mock("node:child_process", () => ({
+	execFile: (
+		_cmd: string,
+		_args: string[],
+		_opts: unknown,
+		callback: (err: Error, stdout: string, stderr: string) => void,
+	) => {
+		callback(new Error("docker unavailable in tests"), "", "");
+	},
+}));
 
 function makeServer(): RouterServer {
 	return new RouterServer({
@@ -372,5 +402,86 @@ describe("RouterServer Linear token refresh wiring", () => {
 		expect(persisted).toEqual([
 			["ws-1", { accessToken: "token-2", refreshToken: "refresh-2" }],
 		]);
+	});
+});
+
+describe("RouterServer containers wiring", () => {
+	let server: RouterServer | undefined;
+
+	afterEach(async () => {
+		if (server) {
+			await server.stop();
+			server = undefined;
+		}
+	});
+
+	const CONTAINERS_CONFIG: RouterContainersConfig = {
+		image: "ghcr.io/example/cyrus-worker:0.0.0-test",
+		routerUrlForContainers: "ws://host.docker.internal:3456",
+		repositories: [
+			{
+				name: "cyrus",
+				githubSlug: "ceedaragents/cyrus",
+				linearWorkspaceId: "ws-1",
+			},
+		],
+	};
+
+	/** Minimal object that satisfies isAgentSessionCreatedWebhook + the fields EventRouter reads. */
+	function createdEvent(opts: {
+		sessionId: string;
+		issueId: string;
+		identifier: string;
+		creatorEmail: string;
+	}): AgentEvent {
+		return {
+			type: "AgentSessionEvent",
+			action: "created",
+			organizationId: "ws-1",
+			agentSession: {
+				id: opts.sessionId,
+				organizationId: "ws-1",
+				issueId: opts.issueId,
+				issue: { id: opts.issueId, identifier: opts.identifier },
+				creator: { email: opts.creatorEmail },
+			},
+		} as unknown as AgentEvent;
+	}
+
+	it("leaves containerLifecycle unset when `containers` is absent from config (today's behavior, unchanged)", () => {
+		server = makeServer();
+
+		expect(server.containerLifecycle).toBeUndefined();
+	});
+
+	it("constructs containerLifecycle and routes a docker-executor user's session to a per-issue container device when `containers` is configured", async () => {
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			containers: CONTAINERS_CONFIG,
+		});
+		expect(server.containerLifecycle).toBeDefined();
+
+		server.store.addUser({ email: "docker-user@example.com" });
+		server.store.setUserExecutor(
+			"docker-user@example.com",
+			'{"type":"docker"}',
+		);
+
+		await server.eventRouter.route(
+			createdEvent({
+				sessionId: "sess-container-1",
+				issueId: "issue-1",
+				identifier: "CYPACK-1",
+				creatorEmail: "docker-user@example.com",
+			}),
+		);
+
+		expect(server.store.getContainerDeviceForIssue("CYPACK-1")).toMatchObject({
+			provider: "docker",
+		});
 	});
 });

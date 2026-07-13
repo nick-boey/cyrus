@@ -572,6 +572,9 @@ importers:
       cyrus-router-protocol:
         specifier: workspace:*
         version: link:../router-protocol
+      cyrus-workspace-sync:
+        specifier: workspace:*
+        version: link:../workspace-sync
       fastify:
         specifier: ^5.8.5
         version: 5.8.5

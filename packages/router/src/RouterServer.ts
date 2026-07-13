@@ -9,21 +9,29 @@ import {
 	LinearIssueTrackerService,
 	type LinearOAuthConfig,
 } from "cyrus-linear-event-transport";
+import type { ExecutorRegistry } from "cyrus-router-executors";
+import { LocalDockerProvider } from "cyrus-router-executors";
 import type { RpcRequestFrame, SessionStateFrame } from "cyrus-router-protocol";
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerArtifactsRoute } from "./artifacts.js";
-import type { ContainerLifecycle } from "./ContainerLifecycle.js";
+import { ContainerLifecycle } from "./ContainerLifecycle.js";
+import { ContainerTargetService } from "./ContainerTargets.js";
 import { DeviceGateway } from "./DeviceGateway.js";
 import { EventRouter } from "./EventRouter.js";
 import { registerEnrollmentRoute } from "./enrollment.js";
 import { LinearExecutor } from "./LinearExecutor.js";
 import { RouterStore } from "./RouterStore.js";
+import { SecretStore } from "./SecretStore.js";
 import { registerWorkspacesRoute } from "./workspaces.js";
 
 /** 48 hours — default TTL for queued offline events. */
 const DEFAULT_EVENT_TTL_MS = 48 * 60 * 60 * 1000;
 /** How often {@link EventRouter.sweepExpired} runs. */
 const SWEEP_INTERVAL_MS = 60_000;
+/** 15 minutes — default {@link RouterContainersConfig.idleStopMs}. */
+const DEFAULT_IDLE_STOP_MS = 900_000;
+/** 14 days — default {@link RouterContainersConfig.staleDestroyMs}. */
+const DEFAULT_STALE_DESTROY_MS = 1_209_600_000;
 
 /** Per-workspace Linear credentials as stored in `router-config.json`. */
 export interface RouterWorkspaceConfig {
@@ -34,6 +42,39 @@ export interface RouterWorkspaceConfig {
 	 * {@link RouterServer.buildOAuthConfig}.
 	 */
 	linearRefreshToken?: string;
+}
+
+/**
+ * Opt-in ephemeral container executor settings. Omitting {@link RouterServerConfig.containers}
+ * entirely (the default) leaves every container field unset and the router
+ * routes every user to their enrolled physical device — today's behavior,
+ * unchanged.
+ */
+export interface RouterContainersConfig {
+	/** Worker image, e.g. "ghcr.io/org/cyrus-worker:0.2.66". */
+	image: string;
+	/**
+	 * Router URL reachable FROM inside a container, e.g.
+	 * "ws://host.docker.internal:3456" on Docker Desktop, or a public `wss://`
+	 * URL for cloud providers. NOT the same as the router's own listen
+	 * address/port — that's only reachable from the router's own host.
+	 */
+	routerUrlForContainers: string;
+	repositories: Array<{
+		name: string;
+		githubSlug: string;
+		linearWorkspaceId: string;
+		baseBranch?: string;
+	}>;
+	/** Default `<dirname(dbPath)>/artifacts`. */
+	artifactsDir?: string;
+	/** Default `<dirname(dbPath)>/user-secrets.json`. */
+	secretsPath?: string;
+	/** Default 900_000 (15 minutes). */
+	idleStopMs?: number;
+	/** Default 1_209_600_000 (14 days). */
+	staleDestroyMs?: number;
+	docker?: { memoryLimit?: string; network?: string };
 }
 
 export interface RouterServerConfig {
@@ -81,11 +122,11 @@ export interface RouterServerConfig {
 	/** Host to bind; defaults to 127.0.0.1. */
 	host?: string;
 	/**
-	 * Ephemeral container executor settings. `artifactsDir` is fully wired in a
-	 * later task; until then {@link RouterServer} falls back to a directory next
-	 * to `dbPath`.
+	 * Ephemeral container executor settings. Opt-in: omitting this field is the
+	 * default and leaves every container field undefined — see
+	 * {@link RouterContainersConfig}.
 	 */
-	containers?: { artifactsDir?: string };
+	containers?: RouterContainersConfig;
 }
 
 /**
@@ -104,9 +145,9 @@ export class RouterServer {
 	readonly eventRouter: EventRouter;
 	/**
 	 * Idle-stop / stale-destroy / orphan-GC sweep for ephemeral containers.
-	 * Optional and unset today — Task 8 constructs it (it needs the executor
-	 * registry, which isn't wired up yet) and assigns it here. Left optional
-	 * rather than required so this file compiles ahead of that wiring.
+	 * Constructed in {@link buildContainerTargets} only when
+	 * `config.containers` is set; otherwise stays `undefined` and the sweep
+	 * interval's `this.containerLifecycle?.sweep()` call is a no-op.
 	 */
 	containerLifecycle?: ContainerLifecycle;
 	private readonly config: RouterServerConfig;
@@ -157,6 +198,8 @@ export class RouterServer {
 			heartbeatMs: config.heartbeatMs,
 		});
 
+		const containerTargets = this.buildContainerTargets(config.containers);
+
 		this.eventRouter = new EventRouter({
 			store: this.store,
 			gateway: this.gateway,
@@ -164,6 +207,7 @@ export class RouterServer {
 				this.executor.postActivity(workspaceId, agentSessionId, body),
 			moveIssueToStartedState: (workspaceId, issueId) =>
 				this.executor.moveIssueToStartedState(workspaceId, issueId),
+			containerTargets,
 			config: {
 				eventTtlMs: config.eventTtlMs ?? DEFAULT_EVENT_TTL_MS,
 				issueLock: config.issueLock ?? true,
@@ -294,6 +338,66 @@ export class RouterServer {
 		this.transport = undefined;
 		await this.fastify.close();
 		this.store.close();
+	}
+
+	/**
+	 * Builds the container-executor wiring — {@link SecretStore},
+	 * {@link ExecutorRegistry}, {@link ContainerTargetService} — and assigns
+	 * {@link containerLifecycle}, when `containers` is configured.
+	 *
+	 * Returns `undefined` (and never touches {@link containerLifecycle}) when
+	 * `containers` is absent, so {@link EventRouter} keeps every user on the
+	 * physical-device path and the sweep interval's
+	 * `this.containerLifecycle?.sweep()` stays a no-op — today's behavior,
+	 * unchanged.
+	 *
+	 * The `postActivity` closure below is bound the same way EventRouter's own
+	 * `postActivity` is (see the constructor): both route through
+	 * `this.executor.postActivity`, which is already assigned by the time this
+	 * runs.
+	 */
+	private buildContainerTargets(
+		containers: RouterContainersConfig | undefined,
+	): ContainerTargetService | undefined {
+		if (!containers) return undefined;
+
+		const secretsPath =
+			containers.secretsPath ??
+			join(dirname(this.config.dbPath), "user-secrets.json");
+		const secrets = new SecretStore(secretsPath);
+
+		const executors: ExecutorRegistry = new Map([
+			[
+				"docker",
+				new LocalDockerProvider({
+					image: containers.image,
+					...containers.docker,
+				}),
+			],
+		]);
+
+		const containerTargets = new ContainerTargetService({
+			store: this.store,
+			secrets,
+			executors,
+			containersConfig: {
+				routerUrlForContainers: containers.routerUrlForContainers,
+				repositories: containers.repositories,
+			},
+			postActivity: (workspaceId, agentSessionId, body) =>
+				this.executor.postActivity(workspaceId, agentSessionId, body),
+			logger: this.logger,
+		});
+
+		this.containerLifecycle = new ContainerLifecycle({
+			store: this.store,
+			executors,
+			idleStopMs: containers.idleStopMs ?? DEFAULT_IDLE_STOP_MS,
+			staleDestroyMs: containers.staleDestroyMs ?? DEFAULT_STALE_DESTROY_MS,
+			logger: this.logger,
+		});
+
+		return containerTargets;
 	}
 
 	/**

@@ -42,6 +42,34 @@ const RouterConfigFileSchema = z.object({
 	creatorOnlyPrompting: z.boolean().optional(),
 	heartbeatMs: z.number().optional(),
 	host: z.string().optional(),
+	// Opt-in ephemeral container executor settings — see
+	// RouterContainersConfig in cyrus-router. Omitting this field entirely (the
+	// default) leaves the router routing every user to their enrolled physical
+	// device, identical to today's behavior.
+	containers: z
+		.object({
+			image: z.string(),
+			routerUrlForContainers: z.string(),
+			repositories: z.array(
+				z.object({
+					name: z.string(),
+					githubSlug: z.string(),
+					linearWorkspaceId: z.string(),
+					baseBranch: z.string().optional(),
+				}),
+			),
+			artifactsDir: z.string().optional(),
+			secretsPath: z.string().optional(),
+			idleStopMs: z.number().optional(),
+			staleDestroyMs: z.number().optional(),
+			docker: z
+				.object({
+					memoryLimit: z.string().optional(),
+					network: z.string().optional(),
+				})
+				.optional(),
+		})
+		.optional(),
 });
 
 /**

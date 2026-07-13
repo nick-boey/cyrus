@@ -11,6 +11,7 @@ export {
 	type LinearExecutorOptions,
 } from "./LinearExecutor.js";
 export {
+	type RouterContainersConfig,
 	RouterServer,
 	type RouterServerConfig,
 	type RouterWorkspaceConfig,
