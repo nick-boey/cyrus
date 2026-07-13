@@ -1,7 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { GitService } from "../src/GitService.js";
 import { WorkspaceSyncService } from "../src/WorkspaceSyncService.js";
 
 /**
@@ -209,7 +216,7 @@ describe("WorkspaceSyncService.syncIssue", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("never throws when the state file is missing", async () => {
+	it("resolves false (not success) when the state file is missing, so a racing terminal sync doesn't drop protection", async () => {
 		const cyrusHome = mkCyrusHome();
 		const fetchMock = stubFetchOk();
 
@@ -222,11 +229,46 @@ describe("WorkspaceSyncService.syncIssue", () => {
 			logger: makeLogger(),
 		});
 
-		// Nothing to sync is not a failure — resolves `true` so the issue
-		// isn't kept touched forever waiting for a state file that may never
-		// appear.
-		await expect(service.syncIssue("CYPACK-9")).resolves.toBe(true);
+		// Task 10 fix pass 2 — Finding 2 minor fix: a missing state file (e.g.
+		// a terminal sync racing EdgeWorker's very first
+		// `savePersistedState()`) is "nothing synced", NOT success. Resolving
+		// `true` here used to let `syncIssueOnTermination` untouch an issue
+		// whose work was never actually captured anywhere — resolving
+		// `false` instead means the issue stays protected until a later tick
+		// finds real state to sync.
+		await expect(service.syncIssue("CYPACK-9")).resolves.toBe(false);
 		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("keeps a terminal sync's issue touched when it races a missing state file, and syncs it once state appears", async () => {
+		const cyrusHome = mkCyrusHome();
+		const fetchMock = stubFetchOk();
+		const gitService = {
+			pushWipIfDirty: vi.fn(async () => true),
+			deriveWorktreeBranchName: vi.fn(() => "branch"),
+		};
+
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService,
+			logger: makeLogger(),
+		});
+
+		service.touch("CYPACK-9", "sess-a");
+		// State file does not exist yet — session ended before EdgeWorker's
+		// first savePersistedState() call.
+		await service.syncIssueOnTermination("CYPACK-9", "sess-a");
+		expect(fetchMock).not.toHaveBeenCalled();
+
+		// State now appears (EdgeWorker's own periodic state save caught up).
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+
+		// A later flush (periodic tick or shutdown) must still retry this
+		// issue — proving it was NOT dropped by the earlier no-state-file
+		// attempt — and this time it actually syncs.
+		await service.stop();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
 	it("resolves false (and leaves the issue eligible for retry) when the router rejects the upload", async () => {
@@ -348,8 +390,8 @@ describe("WorkspaceSyncService.stop", () => {
 			intervalMs: 60_000,
 		});
 		service.start();
-		service.touch("CYPACK-1");
-		service.touch("CYPACK-2");
+		service.touch("CYPACK-1", "sess-a");
+		service.touch("CYPACK-2", "sess-b");
 
 		await service.stop();
 
@@ -410,7 +452,7 @@ describe("WorkspaceSyncService — protects a live (un-ended) session", () => {
 			// `initializeAgentRunner` / `resumeAgentSession`) with no
 			// session-end ever occurring during this test — the agent is
 			// still working.
-			service.touch("CYPACK-9");
+			service.touch("CYPACK-9", "sess-a");
 			service.start();
 
 			// Wait for the first tick to sync the still-running session.
@@ -455,7 +497,7 @@ describe("WorkspaceSyncService — protects a live (un-ended) session", () => {
 
 		// Session start touch(), no terminal sync — mirrors a container
 		// receiving SIGTERM while the agent is still mid-task.
-		service.touch("CYPACK-9");
+		service.touch("CYPACK-9", "sess-a");
 
 		await service.stop();
 
@@ -482,8 +524,8 @@ describe("WorkspaceSyncService.syncIssueOnTermination", () => {
 			logger: makeLogger(),
 		});
 
-		service.touch("CYPACK-9"); // session start
-		await service.syncIssueOnTermination("CYPACK-9"); // session end, sync succeeds
+		service.touch("CYPACK-9", "sess-a"); // session start
+		await service.syncIssueOnTermination("CYPACK-9", "sess-a"); // session end, sync succeeds
 		expect(pushWipIfDirty).toHaveBeenCalledTimes(1);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 
@@ -494,7 +536,7 @@ describe("WorkspaceSyncService.syncIssueOnTermination", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("leaves the issue touched when the terminal sync fails, so a later flush retries it", async () => {
+	it("leaves the issue touched when the terminal sync fails, converges once a later flush succeeds, and does not re-sync after that", async () => {
 		const cyrusHome = mkCyrusHome();
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
@@ -523,26 +565,159 @@ describe("WorkspaceSyncService.syncIssueOnTermination", () => {
 			logger,
 		});
 
-		service.touch("CYPACK-9");
-		await service.syncIssueOnTermination("CYPACK-9");
+		service.touch("CYPACK-9", "sess-a");
+		await service.syncIssueOnTermination("CYPACK-9", "sess-a");
 		expect(uploadAttempts).toBe(1);
 		expect(logger.warn).toHaveBeenCalled();
 
 		// Router recovered — a subsequent flush (periodic tick or shutdown)
-		// retries the same issue and this time it succeeds.
+		// retries the same issue and this time it succeeds. Task 10 fix pass
+		// 2 — Finding 2: `syncIssue` (used by both the terminal path and the
+		// periodic `flushTouched` path) now completes the removal here, not
+		// just `syncIssueOnTermination`.
+		await service.stop();
+		expect(uploadAttempts).toBe(2);
+
+		// Convergence proof: a THIRD flush must not touch this issue again —
+		// if the touched set never converged (the pre-fix bug), this would
+		// re-sync forever.
 		await service.stop();
 		expect(uploadAttempts).toBe(2);
 	});
 });
 
-describe("WorkspaceSyncService.stop bounded flush", () => {
-	it("gives up waiting after stopFlushTimeoutMs so shutdown is never blocked indefinitely", async () => {
+/**
+ * Task 10 fix pass 2 — Finding 2 (workspace-gone) and the paired minor fix
+ * (session-keyed refcount instead of issue-keyed removal).
+ */
+describe("WorkspaceSyncService — touched-set convergence", () => {
+	it("drops an issue whose workspace no longer exists on disk, without warning, instead of retrying forever", async () => {
+		const cyrusHome = mkCyrusHome();
+		// Deliberately never created — simulates a worktree torn down through
+		// a path that never told WorkspaceSyncService (e.g. the session
+		// crashed without reaching syncIssueOnTermination, then the issue
+		// was independently cleaned up elsewhere).
+		const missingWorkspacePath = join(tmpdir(), `cyrus-gone-${Date.now()}`);
+		writeState(cyrusHome, {
+			"sess-1": makeSession("CYPACK-9", missingWorkspacePath),
+		});
+
+		const pushWipIfDirty = vi.fn(async () => true);
+		const fetchMock = stubFetchOk();
+		const logger = makeLogger();
+
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService: {
+				pushWipIfDirty,
+				deriveWorktreeBranchName: vi.fn(() => "branch"),
+			},
+			logger,
+		});
+
+		service.touch("CYPACK-9", "sess-a");
+		await service.syncIssue("CYPACK-9");
+
+		// No git push was attempted against the missing path, and no warning
+		// was logged for it (this is an expected, one-time condition, not a
+		// recurring error).
+		expect(pushWipIfDirty).not.toHaveBeenCalled();
+		expect(logger.warn).not.toHaveBeenCalled();
+
+		// The issue must be gone from the touched set now — a later flush
+		// (periodic tick or shutdown) must not attempt it again.
+		fetchMock.mockClear();
+		await service.stop();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("keeps protecting an issue with a live session even after a DIFFERENT session on the same issue terminates successfully (refcount)", async () => {
 		const cyrusHome = mkCyrusHome();
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		// Never resolves — simulates a hung git push against an unreachable
-		// router, or any other stuck sync step.
+		const pushWipIfDirty = vi.fn(async () => true);
+		const fetchMock = stubFetchOk();
+
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService: {
+				pushWipIfDirty,
+				deriveWorktreeBranchName: vi.fn(() => "branch"),
+			},
+			logger: makeLogger(),
+		});
+
+		// Two sessions (e.g. a parent and a child) both running against the
+		// same Linear issue.
+		service.touch("CYPACK-9", "session-a");
+		service.touch("CYPACK-9", "session-b");
+
+		// Session A ends and its terminal sync succeeds.
+		await service.syncIssueOnTermination("CYPACK-9", "session-a");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+
+		// Session B is still live — a later flush MUST still protect this
+		// issue. Before the refcount fix, session A's successful terminal
+		// sync would have removed the issue from the touched set outright,
+		// silently un-protecting session B's still-uncommitted work.
+		await service.stop();
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+
+		// Now session B also ends successfully — only now should the issue
+		// actually leave the touched set.
+		await service.syncIssueOnTermination("CYPACK-9", "session-b");
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+
+		fetchMock.mockClear();
+		await service.stop();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * Writes a fake `git` executable that sleeps for `delayMs` before responding
+ * to any invocation, and returns the directory it lives in (prepend this to
+ * `PATH` so `execFile("git", ...)` resolves to it instead of the real git).
+ * Reports a dirty tree for `status --porcelain` so the real
+ * `GitService.pushWipIfDirty` proceeds through add/commit/push, each of
+ * which also pays the `delayMs` cost — letting a test assert real wall-clock
+ * behavior without touching an actual repo or network.
+ */
+function makeSlowGitBinary(delayMs: number): string {
+	const dir = mkdtempSync(join(tmpdir(), "cyrus-slow-git-"));
+	const gitPath = join(dir, "git");
+	const delaySeconds = (delayMs / 1000).toFixed(3);
+	writeFileSync(
+		gitPath,
+		[
+			"#!/bin/sh",
+			`sleep ${delaySeconds}`,
+			'for arg in "$@"; do',
+			'  if [ "$arg" = "status" ]; then',
+			'    echo " M file.txt"',
+			"    exit 0",
+			"  fi",
+			"done",
+			"exit 0",
+			"",
+		].join("\n"),
+	);
+	chmodSync(gitPath, 0o755);
+	return dir;
+}
+
+describe("WorkspaceSyncService.stop bounded flush", () => {
+	it("gives up waiting after stopFlushTimeoutMs when a sync step hangs forever (e.g. an unreachable router)", async () => {
+		const cyrusHome = mkCyrusHome();
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+
+		// Never resolves — simulates a hung fetch against an unreachable
+		// router, or any other stuck async sync step. This is a legitimate
+		// hang mode (async work that genuinely never settles), distinct from
+		// the synchronous-blocking mode covered by the real-subprocess test
+		// below.
 		const pushWipIfDirty = vi.fn(() => new Promise<boolean>(() => {}));
 
 		const service = new WorkspaceSyncService({
@@ -555,7 +730,7 @@ describe("WorkspaceSyncService.stop bounded flush", () => {
 			stopFlushTimeoutMs: 50,
 		});
 
-		service.touch("CYPACK-9");
+		service.touch("CYPACK-9", "sess-a");
 
 		const start = Date.now();
 		await service.stop();
@@ -564,5 +739,73 @@ describe("WorkspaceSyncService.stop bounded flush", () => {
 		// Well under the hang duration (which is infinite) — proves stop()
 		// gave up rather than waiting forever.
 		expect(elapsed).toBeLessThan(2000);
+	});
+
+	/**
+	 * Task 10 fix pass 2 — Finding 3. The test above mocks `pushWipIfDirty`
+	 * as a promise that never resolves, which `Promise.race` always wins
+	 * against regardless of whether the *real* implementation blocks the
+	 * event loop — so it gave false confidence about the actual regression
+	 * (`GitService.pushWipIfDirty` used `execSync`, which blocks the whole
+	 * JS thread for as long as git takes; while blocked, the `setTimeout`
+	 * backing `stopFlushTimeout()` cannot fire no matter how small
+	 * `stopFlushTimeoutMs` is, so the cap was inert against that hang mode).
+	 *
+	 * This test drives the REAL (unmocked) `GitService.pushWipIfDirty`
+	 * against a real, slow child process — a fake `git` binary — so it would
+	 * fail against the old `execSync`-based implementation (stop() would
+	 * take at least `delayMs` per git invocation to return, since the whole
+	 * synchronous chain has to finish before the overdue timer ever gets a
+	 * turn) and passes against the current `execFile`-based one (stop()
+	 * returns close to `stopFlushTimeoutMs`, while the slow git calls keep
+	 * running in the background, unawaited).
+	 */
+	it("gives up waiting after stopFlushTimeoutMs against a real, slow (non-mocked) git subprocess", async () => {
+		const cyrusHome = mkCyrusHome();
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+		stubFetchOk();
+
+		const slowGitDir = makeSlowGitBinary(300);
+		const originalPath = process.env.PATH;
+		process.env.PATH = `${slowGitDir}${originalPath ? `:${originalPath}` : ""}`;
+
+		try {
+			// Real implementation, not mocked. `console as never` matches the
+			// convention in GitService.continuity.test.ts.
+			const gitService = new GitService(undefined, console as never);
+			const service = new WorkspaceSyncService({
+				...baseOpts(cyrusHome),
+				gitService,
+				logger: makeLogger(),
+				stopFlushTimeoutMs: 50,
+			});
+
+			service.touch("CYPACK-9", "sess-a");
+			// Kick off the sync explicitly first — `stop()`'s `flushTouched()`
+			// then coalesces onto this SAME in-flight promise (the existing
+			// per-issue in-flight map), so we can await it to completion below
+			// without racing `process.env.PATH` restoration against a step
+			// that hasn't been spawned yet.
+			const syncPromise = service.syncIssue("CYPACK-9");
+
+			const start = Date.now();
+			await service.stop();
+			const elapsed = Date.now() - start;
+
+			// The full status+add+commit chain against the fake git would take
+			// at least ~900ms (3 x 300ms) if awaited to completion. Returning
+			// well under that — close to stopFlushTimeoutMs — proves the cap
+			// preempted a real, slow subprocess rather than blocking on it.
+			expect(elapsed).toBeLessThan(700);
+
+			// Drain the background sync (still against the fake, slow git)
+			// before restoring PATH in `finally` — otherwise a step that
+			// hasn't been spawned yet could resolve to the REAL `git` acting
+			// on `workspacePath`'s non-initialized `.git` directory.
+			await expect(syncPromise).resolves.toBe(true);
+		} finally {
+			process.env.PATH = originalPath;
+		}
 	});
 });

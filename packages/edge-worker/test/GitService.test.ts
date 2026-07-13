@@ -14,6 +14,11 @@ import { GitService } from "../src/GitService.js";
 vi.mock("node:child_process", () => ({
 	execSync: vi.fn(),
 	spawn: vi.fn(),
+	// Not exercised by this file's tests (pushWipIfDirty is covered in
+	// GitService.continuity.test.ts against a real repo) — only needed so
+	// GitService.ts's module-level `promisify(execFile)` doesn't blow up on
+	// an undefined import when this mock replaces the whole module.
+	execFile: vi.fn(),
 }));
 
 vi.mock("node:fs", () => ({

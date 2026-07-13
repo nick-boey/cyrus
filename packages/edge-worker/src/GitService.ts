@@ -1,4 +1,4 @@
-import { execSync, spawn } from "node:child_process";
+import { execFile, execSync, spawn } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve as pathResolve } from "node:path";
+import { promisify } from "node:util";
 
 import type {
 	BaseBranchResolution,
@@ -88,6 +89,42 @@ interface NodeExecError {
 
 function isNodeExecError(value: unknown): value is NodeExecError {
 	return typeof value === "object" && value !== null;
+}
+
+/**
+ * Promisified `execFile` for the WIP-push path ({@link GitService.pushWipIfDirty}).
+ * Deliberately NOT `execSync`: that hot path now runs on every persistence-floor
+ * timer tick (every 5 minutes, per issue, per repo) while the agent may be
+ * concurrently running its own git commands in the same worktree — an
+ * `execSync` call blocks the entire Node event loop (webhook handling,
+ * activity streaming, the router WebSocket heartbeat, `WorkspaceSyncService`'s
+ * own shutdown timeout) for as long as the subprocess takes, which for a
+ * hanging `git push` against a slow/unreachable remote can be minutes.
+ * `execFile` spawns without blocking the JS thread, so a caller like
+ * `WorkspaceSyncService.stop()`'s `Promise.race` shutdown cap can actually
+ * preempt it.
+ */
+const execFileAsync = promisify(execFile);
+
+interface GitExecError extends Error {
+	stdout?: string;
+	stderr?: string;
+	code?: number | string | null;
+	signal?: string | null;
+}
+
+/**
+ * True when a git invocation failed because `.git/index.lock` (or the
+ * worktree-specific equivalent) is already held by another git process —
+ * i.e. genuine contention with a concurrently-running `git` command (the
+ * agent's own tooling, or another sync cycle that hasn't finished), not a
+ * real error. Detected from git's own stderr message rather than by
+ * computing the lock path ourselves, since the exact location varies between
+ * a plain repo and a linked worktree.
+ */
+function isIndexLockError(error: unknown): boolean {
+	const stderr = (error as GitExecError | undefined)?.stderr;
+	return typeof stderr === "string" && /index\.lock/.test(stderr);
 }
 
 function escapeRegExp(value: string): string {
@@ -271,33 +308,87 @@ export class GitService {
 	/**
 	 * Commit-and-push dirty worktree state so another device can resume this
 	 * issue via {@link remoteBranchExists}. Returns true when a WIP commit was
-	 * created and pushed; false when the tree was already clean (no-op).
+	 * created and pushed; false when the tree was already clean, or when the
+	 * commit had to be skipped because another git process holds the index
+	 * lock (no-op either way — nothing was committed).
 	 *
-	 * Every step has a timeout: this now runs on every session end and every
-	 * persistence-floor timer tick (`WorkspaceSyncService`), not just its
-	 * original one-off caller, so an unbounded `execSync` here would stall
-	 * that hot path (and, being synchronous, the whole edge worker's event
-	 * loop) indefinitely.
+	 * This runs on every session end AND every persistence-floor timer tick
+	 * (`WorkspaceSyncService`, every 5 minutes) — concurrently with whatever
+	 * git commands the agent itself is running in the same worktree. Three
+	 * things follow from that:
+	 *
+	 *  - Every step uses `execFile` (async, non-blocking), not `execSync`: an
+	 *    unbounded synchronous call here would stall the whole edge worker's
+	 *    event loop for as long as git takes, and would make the outer
+	 *    shutdown cap in `WorkspaceSyncService.stop()` inert (it races via
+	 *    `setTimeout`, which can't fire while the loop is blocked). See
+	 *    {@link execFileAsync}.
+	 *  - The commit uses `--no-verify`: this is a safety-net commit, not a
+	 *    real one, and must never run the repository's pre-commit hooks
+	 *    (which would otherwise fire ~12x/hour inside the user's own
+	 *    worktree and can get SIGTERM'd by this method's own timeout).
+	 *  - If `.git/index.lock` is already held (the agent's own git command is
+	 *    mid-flight), this backs off rather than racing or forcing past it:
+	 *    the lock file is never deleted or overridden, and the failure is
+	 *    logged at debug (expected contention, not an error) so it doesn't
+	 *    spam warnings every tick. The next periodic tick tries again.
+	 *
+	 * WIP commits always land on the issue's own branch (`branchName`), the
+	 * same branch the `git-gh` subroutine's own commit lands on — so even if
+	 * this pre-empts that subroutine's commit (it finds a clean tree and
+	 * commits nothing further), no work is lost either way.
 	 */
 	async pushWipIfDirty(
 		worktreePath: string,
 		branchName: string,
 	): Promise<boolean> {
-		const status = execSync("git status --porcelain", {
-			cwd: worktreePath,
-			encoding: "utf-8",
-			timeout: 30_000,
-		});
-		if (status.trim().length === 0) return false;
-		execSync("git add -A", { cwd: worktreePath, timeout: 30_000 });
-		execSync(
-			'git -c user.email=cyrus@localhost -c user.name="Cyrus WIP" commit -m "wip: auto-saved by cyrus before session end"',
-			{ cwd: worktreePath, timeout: 30_000 },
-		);
-		execSync(`git push origin HEAD:${JSON.stringify(branchName)}`, {
-			cwd: worktreePath,
-			timeout: 60_000,
-		});
+		const git = (args: string[], timeoutMs: number) =>
+			execFileAsync("git", args, {
+				cwd: worktreePath,
+				encoding: "utf-8",
+				timeout: timeoutMs,
+			});
+
+		let status: { stdout: string };
+		try {
+			status = await git(["status", "--porcelain"], 30_000);
+		} catch (error) {
+			if (isIndexLockError(error)) {
+				this.logger.debug(
+					`pushWipIfDirty: index is locked in ${worktreePath} (another git process is running); skipping this sync cycle`,
+				);
+				return false;
+			}
+			throw error;
+		}
+		if (status.stdout.trim().length === 0) return false;
+
+		try {
+			await git(["add", "-A"], 30_000);
+			await git(
+				[
+					"-c",
+					"user.email=cyrus@localhost",
+					"-c",
+					"user.name=Cyrus WIP",
+					"commit",
+					"--no-verify",
+					"-m",
+					"wip: auto-saved by cyrus before session end",
+				],
+				30_000,
+			);
+		} catch (error) {
+			if (isIndexLockError(error)) {
+				this.logger.debug(
+					`pushWipIfDirty: index is locked in ${worktreePath} (another git process is running); skipping this sync cycle`,
+				);
+				return false;
+			}
+			throw error;
+		}
+
+		await git(["push", "origin", `HEAD:${branchName}`], 60_000);
 		return true;
 	}
 

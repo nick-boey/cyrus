@@ -526,14 +526,21 @@ export class EdgeWorker extends EventEmitter {
 				// Persistence floor: WIP-push + bundle-upload this issue now that a
 				// session on it just ended. syncIssueOnTermination() is independent
 				// of the sendSessionState try/catch above — a router-lock signalling
-				// failure must not skip the floor sync, and vice versa. It only
-				// stops protecting this issue (removes it from the touched set) once
-				// this terminal sync actually succeeds; a failure leaves it touched
-				// so the next periodic tick retries it.
+				// failure must not skip the floor sync, and vice versa. It removes
+				// this session from the issue's live-session refcount immediately,
+				// then stops protecting the issue (removes it from the touched set)
+				// once BOTH that refcount is empty (no other session on the same
+				// issue is still running) AND a sync actually succeeds — a failed
+				// sync, or another still-live session on the issue, leaves it
+				// touched so a later periodic tick retries/re-evaluates it instead
+				// of dropping protection forever.
 				const session = this.agentSessionManager.getSession(sessionId);
 				const identifier = session?.issue?.identifier;
 				if (identifier) {
-					void this.workspaceSync?.syncIssueOnTermination(identifier);
+					void this.workspaceSync?.syncIssueOnTermination(
+						identifier,
+						sessionId,
+					);
 				}
 			},
 		);
@@ -4723,10 +4730,13 @@ ${taskSection}`;
 		// Persistence floor: this issue is about to get a runner that may work
 		// for a long time before its session ever reaches a terminal state.
 		// touch() here (rather than only at session end) is what lets the
-		// periodic timer keep re-syncing it on every tick while it runs. A
-		// no-op on non-router platforms — `workspaceSync` is only constructed
-		// when `platform === "router"`.
-		this.workspaceSync?.touch(issue.identifier);
+		// periodic timer keep re-syncing it on every tick while it runs, and
+		// registers `sessionId` as a live session on the issue (a refcount —
+		// see WorkspaceSyncService's class doc — so a sibling session on the
+		// same issue can't be un-protected by this one's eventual termination).
+		// A no-op on non-router platforms — `workspaceSync` is only
+		// constructed when `platform === "router"`.
+		this.workspaceSync?.touch(issue.identifier, sessionId);
 
 		const primaryRepo = repositories[0]!;
 
@@ -7496,11 +7506,12 @@ ${input.userComment}
 		// Persistence floor: this turn (new or resumed) may run for a long time
 		// before the session next reaches a terminal state. Touching here —
 		// not only at session end — is what lets the periodic timer keep
-		// re-syncing this issue on every tick while the runner is active. A
-		// no-op on non-router platforms (`workspaceSync` is only constructed
-		// when `platform === "router"`).
+		// re-syncing this issue on every tick while the runner is active, and
+		// (re-)registers this sessionId as live on the issue (idempotent — see
+		// WorkspaceSyncService's refcount). A no-op on non-router platforms
+		// (`workspaceSync` is only constructed when `platform === "router"`).
 		if (session.issue?.identifier) {
-			this.workspaceSync?.touch(session.issue.identifier);
+			this.workspaceSync?.touch(session.issue.identifier, sessionId);
 		}
 
 		// A prompt is an explicit instruction to continue, so drop any stop request
