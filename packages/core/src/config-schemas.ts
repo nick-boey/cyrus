@@ -521,9 +521,18 @@ export const EdgeConfigSchema = z.object({
 			/**
 			 * Enables the persistence-floor `WorkspaceSyncService` (WIP-push +
 			 * session bundle upload) on session end, on shutdown, and on a
-			 * timer. Defaults to on for router-platform devices; set `false` to
-			 * opt a device out (e.g. a router host itself, which has no
-			 * worktrees of its own to sync).
+			 * timer. Defaults to OFF for router-platform devices — set `true`
+			 * to opt a device in. Every ephemeral container gets this
+			 * automatically (`ContainerBootCommand.writeConfig` always sets
+			 * `floorSync: true` for containers it boots); a physical device
+			 * (e.g. a teammate's laptop connected via `cyrus connect`) opts in
+			 * explicitly, typically to enable device -> container migration.
+			 * Defaulting off is deliberate: without it, this would otherwise
+			 * push `wip: auto-saved by cyrus…` commits onto a teammate's issue
+			 * branches (including open PRs) on every session end and every
+			 * 5-minute tick, with no opt-in on their part — existing
+			 * router+physical-device behavior must not change underneath
+			 * someone who never asked for the floor.
 			 */
 			floorSync: z.boolean().optional(),
 		})

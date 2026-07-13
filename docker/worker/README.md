@@ -56,6 +56,7 @@ them out unless you have a specific reason to relocate those paths:
 ```json
 {
   "port": 8787,
+  "host": "0.0.0.0",
   "workspaces": {
     "<linear-organization-id>": { "linearToken": "<workspace-linear-token>" }
   },
@@ -81,16 +82,39 @@ them out unless you have a specific reason to relocate those paths:
 }
 ```
 
-> **This is not a complete `router-config.json`.** `port`, `workspaces`, and
-> `webhook` above are reproduced only for context, so you can see where
+> **This is not a complete `router-config.json`.** `port`, `host`, `workspaces`,
+> and `webhook` above are reproduced only for context, so you can see where
 > `containers` slots into the file you already wrote for
-> [docs/ROUTER.md](../../docs/ROUTER.md) — copy the `containers` block into
-> your existing file, don't replace the whole file with this snippet. In
+> [docs/ROUTER.md](../../docs/ROUTER.md) — copy the `containers` block (and
+> the `"host": "0.0.0.0"` line — see the callout immediately below) into your
+> existing file, don't replace the whole file with this snippet. In
 > particular, each entry under `workspaces` also needs a `linearRefreshToken`
 > (not shown above), or the router's Linear access token silently stops
 > working ~24 hours after setup — see the `## [Unreleased]` "Fixed" entry in
 > `CHANGELOG.md` about router token refresh, and `docs/ROUTER.md` for the full
 > field list.
+
+> ### `"host": "0.0.0.0"` is required for container mode — read this before you skip it
+>
+> The router binds `127.0.0.1` (loopback-only) by default, which is the right
+> secure default when nothing but your own CLI ever talks to it. **Container
+> mode breaks that assumption.** A worker container reaches the router at
+> `routerUrlForContainers` (e.g. `ws://host.docker.internal:8787` on Docker
+> Desktop) — and `host.docker.internal` resolves to Docker Desktop's internal
+> gateway IP, **not** `127.0.0.1`. The connection arrives at your router
+> process over that gateway interface, not loopback, so a router still bound
+> to `127.0.0.1` refuses it outright before your application code ever sees
+> the request. The same is true on Linux with the default bridge network: the
+> connection arrives over the `docker0` bridge IP, not loopback.
+>
+> Add `"host": "0.0.0.0"` (bind every interface) to `router-config.json`
+> whenever `containers` is configured. This is a router-config change only —
+> **do not** try to "fix" this by editing `routerUrlForContainers` instead;
+> that field controls where the *container* dials out to, not where the
+> *router* listens, and changing it will not fix a refused connection caused
+> by a loopback-bound router. If you skip this, see
+> [Troubleshooting](#troubleshooting) below — it's the first thing to check
+> when a container starts but never connects.
 
 **Required fields:**
 
@@ -99,6 +123,12 @@ them out unless you have a specific reason to relocate those paths:
 | `image` | The image tag built in step 1 (or pulled from a registry). |
 | `routerUrlForContainers` | The router's WebSocket URL **as reachable from inside a container** — see the callout below, this is the single most common setup mistake. |
 | `repositories[]` | The repos worker containers may clone: `name`, `githubSlug` (`owner/repo`), `linearWorkspaceId` (must match a key in `workspaces` above), optional `baseBranch` (defaults to the repo's default branch). |
+
+**Also required, but lives at the top level of `router-config.json` (not inside `containers`) — see the callout above:**
+
+| Field | Meaning |
+|---|---|
+| `host` | Must be `"0.0.0.0"` whenever `containers` is configured — a container reaches the router over the Docker bridge, not loopback, and the router's own default (`127.0.0.1`) refuses that connection. Not needed (and not recommended) for a router with no containers. |
 
 **Optional fields (with defaults):**
 
@@ -141,6 +171,14 @@ them out unless you have a specific reason to relocate those paths:
 > list` never shows fresh `LAST SEEN` timestamps for it, and no activity ever
 > reaches Linear. Check the container's own logs (`docker logs
 > cyrus-issue-<KEY>`) for a WebSocket connection error.
+
+**Restart the router after saving `router-config.json`.** `cyrus router
+start` reads this file once at startup — there is no watcher, so neither the
+new `containers` block nor the `host`/`port` bind change take effect on a
+process that's already running. Stop the running `cyrus router start` (Ctrl-C
+in its terminal, or via whatever process manager runs it — see
+[Troubleshooting](#troubleshooting) below for `journalctl`/`pm2` examples) and
+start it again before moving on to step 3.
 
 ## 3. Point a user at the `docker` executor and set their secrets
 
@@ -204,7 +242,26 @@ the `routerUrlForContainers` mistake described in step 2 above.
 ## 5. Verify persistence: stop mid-session and re-prompt
 
 This is the point of the whole design — work should survive a container being
-killed:
+killed. It works because every container this image boots has the
+persistence floor turned on automatically: `cyrus container-boot` always
+writes `"floorSync": true` into the container's generated `config.json`
+(alongside `platform: "router"` and the `router` block), which is what makes
+`WorkspaceSyncService` push WIP branches and upload session bundles to the
+router in the first place. **You never set this yourself for a container —
+it is not one of the environment variables in [Environment
+variables](#environment-variables) below.**
+
+`floorSync` defaults to **off** for everything else — in particular, a
+physical device a teammate connected via `cyrus connect` does NOT get this
+behavior unless they explicitly add `"floorSync": true` to their own
+`config.json`'s `router` block. This is deliberate: before this feature, a
+WIP push only ever happened when a worktree was torn down. Defaulting the
+floor on for every router-platform device would have made every teammate's
+laptop start pushing `wip: auto-saved by cyrus…` commits onto their issue
+branches — including open PRs — on every session end and every 5-minute
+tick, whether or not they asked for it. The one reason a teammate would opt a
+physical device in is to enable migrating a session from their laptop onto a
+container later.
 
 ```bash
 docker stop cyrus-issue-<ISSUE-KEY>
@@ -229,10 +286,42 @@ the **restore ladder** run:
 
 To exercise the harder case — the volume itself is gone, not just the
 container — `docker rm -f cyrus-issue-<ISSUE-KEY> && docker volume rm
-cyrus-issue-<ISSUE-KEY>` before re-prompting. The container-boot restore ladder
-should then pull from the router's artifact bundle (git branch + Claude
-transcripts) instead of the volume, and the session should resume from the
-last synced state rather than starting over.
+cyrus-issue-<ISSUE-KEY>` before re-prompting. Here is what actually happens
+now, in order (this scenario has a specific fix behind it — see the note at
+the end of this section):
+
+1. **`container-boot` restores the floor bundle, not a worktree.**
+   `docker logs cyrus-issue-<ISSUE-KEY>` shows no warm state on the fresh
+   volume, so it downloads the issue's floor bundle from the router (git
+   branch + Claude transcripts + edge-worker session state), unpacks the
+   Claude transcripts and state file, and rewrites the restored session's
+   workspace path to the canonical `/workspaces/<ISSUE-KEY>` — relocating the
+   transcript to match that path. It then clones the repo(s) fresh into
+   `/workspaces/repos/<name>` and launches `cyrus start`. **The per-issue git
+   worktree itself is not created at this point** — nothing has put anything
+   at `/workspaces/<ISSUE-KEY>` yet, only the state that *describes* it has
+   been restored.
+2. **The worktree is rebuilt on the next resume, not during boot.** When your
+   follow-up prompt reaches the container, `cyrus start`'s `EdgeWorker` notices
+   the workspace path from the restored state doesn't exist and recreates it
+   using the exact same worktree-creation path a brand-new session uses.
+   Because the persistence floor already pushed the issue's branch (and any
+   WIP commits) to origin, this checks out `origin/<issue-branch>` rather than
+   branching fresh from the base branch — so the recreated worktree is not
+   empty. Look for a log line containing `recreating the worktree from the
+   issue branch before resuming`.
+3. **What you should actually see:** the worktree directory reappears at
+   `/workspaces/<ISSUE-KEY>` populated with the issue's branch, including any
+   `wip: auto-saved by cyrus…` commits the floor had already pushed before you
+   destroyed the volume — not an empty directory with no code and no history.
+   The Claude session resumes with its prior conversation visible in Linear
+   (the transcript relocation in step 1 is what makes this possible), rather
+   than starting a brand-new session with no memory of earlier turns.
+
+This exact scenario used to fail: the worktree was never recreated, so a
+session resumed straight into an empty, freshly-`mkdir`'d directory with no
+repo and no history. If you're on a build predating that fix, you will not
+see the behavior described above — update first.
 
 ## Troubleshooting
 
@@ -258,10 +347,25 @@ for a boot failure looks like `container boot failed for <issueKey>: <error>`.
 
 **Common causes of a boot failure / a container that never connects:**
 
-- `routerUrlForContainers` isn't reachable from inside the container — see the
-  callout in step 2. Confirm with `docker exec cyrus-issue-<KEY> curl -v
-  <routerUrlForContainers as http(s)>` (swap `ws(s)://` for `http(s)://`) if
-  the container is still running long enough to exec into.
+- **Check this FIRST: the router is still bound to loopback (`127.0.0.1`,
+  the default) instead of `"host": "0.0.0.0"` in `router-config.json`.** This
+  is the single most common cause of "the container starts (`docker ps` shows
+  it) but never connects" — see the callout in step 2. The symptom is
+  distinctive: `docker exec cyrus-issue-<KEY> curl -v <routerUrlForContainers
+  as http(s)>` (swap `ws(s)://` for `http(s)://`) returns "connection refused"
+  from *inside* the container even though `routerUrlForContainers` itself is
+  spelled correctly (e.g. `host.docker.internal` resolves fine) — because the
+  connection reaches your host's network stack, over the Docker gateway/bridge
+  rather than loopback, and the router process itself isn't listening there.
+  Fixing this is a `router-config.json` change (`"host": "0.0.0.0"`), **not** a
+  `routerUrlForContainers` change — don't waste time re-checking or rewriting
+  that field if `host` is the actual problem.
+- `routerUrlForContainers` is misspelled or points somewhere that genuinely
+  isn't reachable at all (wrong hostname, container on an isolated Docker
+  network, firewall) — see the callout in step 2. The same `curl -v` above
+  distinguishes this from the `host` problem above: a bad
+  `routerUrlForContainers` typically fails to resolve or times out, rather
+  than returning an immediate "connection refused".
 - No Claude OAuth token stored for the user — the error detail will read `no
   Claude OAuth token stored for <email>`. Run `cyrus router secrets set
   <email> claudeOauthToken <token>`.

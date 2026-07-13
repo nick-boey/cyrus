@@ -112,6 +112,14 @@ function promptedEvent(opts: {
 	actorUserId?: string;
 	creator?: Creator;
 	issueId?: string;
+	/**
+	 * The issue's human-readable key, e.g. "CYPACK-1" (drives container
+	 * issueKey resolution). Omit to model a webhook whose `agentSession.issue`
+	 * carries no `identifier` at all (`issue` itself is `Maybe<...>` on the
+	 * real Linear payload type, so this is a real, not merely theoretical,
+	 * shape) — see the "fails closed" tests below.
+	 */
+	identifier?: string;
 	organizationId?: string;
 }): AgentEvent {
 	const org = opts.organizationId ?? "ws-1";
@@ -126,6 +134,9 @@ function promptedEvent(opts: {
 			id: opts.sessionId,
 			organizationId: org,
 			issueId: opts.issueId,
+			issue: opts.issueId
+				? { id: opts.issueId, identifier: opts.identifier }
+				: undefined,
 			creator: opts.creator,
 		},
 	} as unknown as AgentEvent;
@@ -639,6 +650,7 @@ describe("EventRouter container routing", () => {
 			promptedEvent({
 				sessionId: "sess-1",
 				issueId: "ISS-1",
+				identifier: "ISS-1",
 				actorUserId: "lin-dave",
 				creator: DAVE,
 			}),
@@ -713,20 +725,18 @@ describe("EventRouter container routing", () => {
 		);
 	});
 
-	it("(l) posts the same invalid-issue-key message for a prompted event, not the generic unroutable message", async () => {
+	it("(l) posts the same invalid-issue-key message for a prompted event with a malformed identifier, not the generic unroutable message", async () => {
 		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
 		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
 		const { containerTargets } = makeContainerTargets(store);
 		const { router, postActivity } = makeRouter(store, { containerTargets });
 
-		// promptedEvent() carries no issue `identifier`, so extractIssueKey()
-		// falls back to `issueId` — make THAT the malformed value so
-		// resolution still lands on ensureDevice's format gate.
 		await expect(
 			router.route(
 				promptedEvent({
 					sessionId: "sess-1",
-					issueId: "bad issue/key!",
+					issueId: "ISS-1",
+					identifier: "bad issue/key!",
 					actorUserId: "lin-dave",
 					creator: DAVE,
 				}),
@@ -738,6 +748,74 @@ describe("EventRouter container routing", () => {
 			"ws-1",
 			"sess-1",
 			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: "bad issue/key!" }),
+		);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
+	});
+
+	it("(m) fails closed for a created event whose webhook carries no issue identifier at all, instead of minting a container keyed by the UUID issueId", async () => {
+		// Regression test: extractIssueKey() used to fall back to `issueId` (or
+		// `sessionId`) when the webhook's `agentSession.issue.identifier` was
+		// missing. Both are Linear-internal UUIDs that pass ISSUE_KEY_RE fine,
+		// so the old code would silently create a container device keyed by a
+		// UUID the in-container edge worker's floor uploads (keyed by the
+		// human-readable `session.issue.identifier`) can never match — every
+		// floor upload for that container's life would 403, silently. The fix
+		// treats a missing identifier as an invalid issue key up front.
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets } = makeContainerTargets(store);
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await expect(
+			router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "11111111-2222-3333-4444-555555555555",
+					// identifier deliberately omitted.
+					creator: DAVE,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(store.listContainerDevices()).toHaveLength(0);
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, {
+				issueKey: "11111111-2222-3333-4444-555555555555",
+			}),
+		);
+	});
+
+	it("(n) fails closed for a prompted event whose webhook carries no issue identifier at all", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets } = makeContainerTargets(store);
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await expect(
+			router.route(
+				promptedEvent({
+					sessionId: "sess-1",
+					issueId: "11111111-2222-3333-4444-555555555555",
+					// identifier deliberately omitted.
+					actorUserId: "lin-dave",
+					creator: DAVE,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(store.listContainerDevices()).toHaveLength(0);
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, {
+				issueKey: "11111111-2222-3333-4444-555555555555",
+			}),
 		);
 		expect(postActivity).not.toHaveBeenCalledWith(
 			"ws-1",

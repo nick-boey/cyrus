@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { LocalDockerProvider } from "../src/LocalDockerProvider.js";
 
 function fakeExec(
@@ -77,6 +77,38 @@ describe("LocalDockerProvider", () => {
 		expect(calls.some((c) => c[1] === "run")).toBe(true);
 	});
 
+	it("warns and names the issue key when replacing a RUNNING container due to an image mismatch", async () => {
+		const { exec } = fakeExec({
+			"inspect -f": { stdout: "true\timg:0\n" }, // running, stale image
+		});
+		const warn = vi.fn();
+		const p = new LocalDockerProvider({
+			image: "img:1",
+			exec,
+			logger: { info: () => {}, warn },
+		});
+		await p.ensureRunning(ctx("CYPACK-9"));
+		expect(warn).toHaveBeenCalledTimes(1);
+		const message = warn.mock.calls[0]?.[0] as string;
+		expect(message).toContain("CYPACK-9");
+		expect(message).toContain("img:0");
+		expect(message).toContain("img:1");
+	});
+
+	it("does NOT warn when replacing a STOPPED (not running) container due to an image mismatch", async () => {
+		const { exec } = fakeExec({
+			"inspect -f": { stdout: "false\timg:0\n" }, // stopped, stale image
+		});
+		const warn = vi.fn();
+		const p = new LocalDockerProvider({
+			image: "img:1",
+			exec,
+			logger: { info: () => {}, warn },
+		});
+		await p.ensureRunning(ctx());
+		expect(warn).not.toHaveBeenCalled();
+	});
+
 	it("re-mints the device token when recreating a container with a stale image", async () => {
 		const { exec } = fakeExec({
 			"inspect -f": { stdout: "false\timg:0\n" },
@@ -140,10 +172,15 @@ describe("LocalDockerProvider", () => {
 		).toBe("stopped");
 	});
 
-	it("stop calls docker stop by container name and ignores non-zero exit", async () => {
+	it("stop calls docker stop with a grace period longer than the flush cap, by container name, and ignores non-zero exit", async () => {
 		const { exec, calls } = fakeExec({ stop: { exitCode: 1 } });
 		await new LocalDockerProvider({ image: "img:1", exec }).stop("CYPACK-1");
-		expect(calls).toEqual([["docker", "stop", "cyrus-issue-CYPACK-1"]]);
+		// -t must exceed WorkspaceSyncService's 20s stop-flush cap, or an
+		// idle-stop can SIGKILL a container mid-flush and drop its last WIP
+		// push. Docker's own default (10s, i.e. no -t) is NOT enough.
+		expect(calls).toEqual([
+			["docker", "stop", "-t", "30", "cyrus-issue-CYPACK-1"],
+		]);
 	});
 
 	it("destroy removes container then volume, tolerating absence", async () => {
@@ -205,7 +242,7 @@ describe("LocalDockerProvider", () => {
 			dirtyKey,
 		);
 		expect(stopCalls).toEqual([
-			["docker", "stop", "cyrus-issue-team-CYPACK-1"],
+			["docker", "stop", "-t", "30", "cyrus-issue-team-CYPACK-1"],
 		]);
 
 		const { exec: destroyExec, calls: destroyCalls } = fakeExec({});

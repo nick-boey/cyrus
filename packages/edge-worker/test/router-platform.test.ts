@@ -43,10 +43,18 @@ describe("router platform", () => {
 
 /**
  * Task 10 — `WorkspaceSyncService` (the persistence-floor sync) must only be
- * constructed for router-platform devices, and only when the operator hasn't
- * explicitly opted out via `router.floorSync: false` (e.g. the router host's
- * own device connection, which has no worktrees of its own to sync). Every
- * other platform must see zero behavior change — no field is even set.
+ * constructed for router-platform devices, and only when the operator has
+ * explicitly opted IN via `router.floorSync: true`. This is opt-in (not
+ * opt-out) so that every EXISTING router+physical-device deployment sees zero
+ * behavior change: before this feature, a WIP push only ran on worktree
+ * teardown, so defaulting this service on for everyone would have started
+ * pushing `wip: auto-saved by cyrus…` commits onto every teammate's issue
+ * branches (including open PRs) on every session end and every 5-minute tick
+ * — with nobody having asked for it. Only ephemeral containers (via
+ * `ContainerBootCommand.writeConfig`, which always sets `floorSync: true`)
+ * and any physical device that deliberately opts in (e.g. to enable device ->
+ * container migration) get the floor. Every other platform must see zero
+ * behavior change — no field is even set.
  */
 describe("router platform floor sync wiring", () => {
 	function getWorkspaceSync(
@@ -56,7 +64,7 @@ describe("router platform floor sync wiring", () => {
 			.workspaceSync;
 	}
 
-	it("constructs and starts WorkspaceSyncService by default for platform 'router'", () => {
+	it("does NOT construct WorkspaceSyncService by default for platform 'router' (opt-in, not opt-out)", () => {
 		const worker = new EdgeWorker({
 			platform: "router",
 			router: { url: "ws://127.0.0.1:9", deviceToken: "tok" },
@@ -64,10 +72,21 @@ describe("router platform floor sync wiring", () => {
 			repositories: [],
 		} as never);
 
+		expect(getWorkspaceSync(worker)).toBeUndefined();
+	});
+
+	it("constructs and starts WorkspaceSyncService when router.floorSync is true", () => {
+		const worker = new EdgeWorker({
+			platform: "router",
+			router: { url: "ws://127.0.0.1:9", deviceToken: "tok", floorSync: true },
+			cyrusHome: "/tmp/cyrus-router-test",
+			repositories: [],
+		} as never);
+
 		expect(getWorkspaceSync(worker)).toBeDefined();
 	});
 
-	it("does NOT construct WorkspaceSyncService when router.floorSync is false", () => {
+	it("does NOT construct WorkspaceSyncService when router.floorSync is explicitly false", () => {
 		const worker = new EdgeWorker({
 			platform: "router",
 			router: { url: "ws://127.0.0.1:9", deviceToken: "tok", floorSync: false },

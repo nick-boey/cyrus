@@ -387,6 +387,7 @@ export class RouterServer {
 						new LocalDockerProvider({
 							image: cfg.image,
 							...cfg.docker,
+							logger: this.logger,
 						}),
 					],
 				]));

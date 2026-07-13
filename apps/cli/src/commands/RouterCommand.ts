@@ -409,6 +409,17 @@ export class RouterCommand extends BaseCommand {
 			const removed = store.removeUser(email);
 			if (removed) {
 				this.logSuccess(`Removed ${email}.`);
+				// Unlike `devices revoke` (scoped to the physical device only),
+				// removing a user is total: RouterStore.removeUser cascades away
+				// every device row they owned, physical AND per-issue container.
+				// This command has no executor/Docker wiring of its own, so any
+				// running containers are reaped the same deliberate way `cyrus
+				// router containers destroy <issueKey>` already reaps one — by
+				// ContainerLifecycle's orphan-GC sweep on its next tick, not
+				// immediately.
+				this.logger.raw(
+					"Any running containers this user owned will be stopped and removed (container and volume) by the lifecycle sweep, not immediately.",
+				);
 			} else {
 				this.exitWithError(`No registered user with email ${email}`);
 			}

@@ -229,7 +229,7 @@ export class EdgeWorker extends EventEmitter {
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
 	private routerConnection?: RouterConnection; // Shared device-side WebSocket connection to the Cyrus Router (router platform mode)
-	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, floorSync !== false)
+	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, opt-in via floorSync === true)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
 	private persistenceManager: PersistenceManager;
 	private sharedApplicationServer: SharedApplicationServer;
@@ -584,10 +584,21 @@ export class EdgeWorker extends EventEmitter {
 
 			// Persistence floor: WIP-push + bundle-upload sync so container death
 			// (idle-stop, crash, host loss, executor switch) never loses work.
-			// Runs on physical devices too — that's what enables device ->
-			// container migration. Opt-out via `router.floorSync: false` (e.g.
-			// the router host's own device connection, which has no worktrees).
-			if (config.router.floorSync !== false) {
+			// Opt-IN via `router.floorSync: true` — defaults OFF so this is a
+			// no-op for every router-platform device that hasn't asked for it.
+			// Before this feature, a WIP push only ran on worktree teardown; this
+			// service additionally runs on every session end and on a 5-minute
+			// timer, which would otherwise push `wip: auto-saved by cyrus…`
+			// commits onto a teammate's issue branches (including open PRs)
+			// roughly 12x/hour with no opt-in on their part — a real behavior
+			// change for existing router+physical-device deployments, which the
+			// container-executors design explicitly promised would be
+			// unaffected. `ContainerBootCommand.writeConfig` sets `floorSync:
+			// true` for every container it boots (that's what makes the
+			// container restore ladder work); a physical-device user who wants
+			// the floor too (e.g. to enable device -> container migration) opts
+			// in the same way, by setting `floorSync: true` themselves.
+			if (config.router.floorSync === true) {
 				this.workspaceSync = new WorkspaceSyncService({
 					cyrusHome: this.cyrusHome,
 					routerUrl: config.router.url,

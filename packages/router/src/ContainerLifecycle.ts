@@ -25,9 +25,14 @@ export interface ContainerLifecycleOptions {
  *    bundle survive, so a later prompt rebuilds the workspace from the
  *    restore ladder.
  *  - Orphan GC: any container a provider still owns with no matching device
- *    row gets `destroy()`ed — reclaims containers left behind when a user is
- *    revoked (`revokeDevice` deletes device rows without touching providers)
- *    or a device row is manually destroyed via the CLI.
+ *    row gets `destroy()`ed — reclaims containers left behind when a
+ *    container device row is deleted without touching the provider itself:
+ *    `cyrus router containers destroy <issueKey>` deletes just the
+ *    bookkeeping row, or a user is removed entirely (`removeUser` cascades
+ *    away every device row it owns, physical and container). Note
+ *    `revokeDevice` (a physical-device swap, e.g. a new laptop) is scoped to
+ *    `kind = 'device'` and never touches a user's container rows, so it does
+ *    NOT feed this path — see its doc comment in `RouterStore`.
  *
  * A device with active session affinity is NEVER stopped or destroyed,
  * regardless of timestamps — this is the safety invariant that keeps work in

@@ -223,6 +223,58 @@ describe("RouterStore", () => {
 		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
 		expect(store.getMutation(device2.deviceId, "m-1")).toBeUndefined();
 	});
+
+	it("removeUser purges scoped rows for EVERY device the user owned, not just the first", () => {
+		// Regression test: removeUser used to purge only the first device row
+		// returned by `.get()`. A user with a physical device AND container
+		// devices would leave the others' issue_locks/session_affinity/
+		// rpc_mutations rows stranded once the cascade delete removed their
+		// `devices` rows out from under them.
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "multi@example.com" });
+		const code = store.mintEnrollmentCode("multi@example.com", NOW);
+		const physical = store.redeemEnrollmentCode(code, NOW);
+		if (!physical) throw new Error("redeem failed");
+		const container1 = store.createContainerDevice(
+			userId,
+			"CYPACK-1",
+			"docker",
+		);
+		const container2 = store.createContainerDevice(
+			userId,
+			"CYPACK-2",
+			"docker",
+		);
+
+		store.setSessionAffinity("sess-phys", physical.deviceId);
+		store.setSessionAffinity("sess-c1", container1.deviceId);
+		store.setSessionAffinity("sess-c2", container2.deviceId);
+		store.acquireIssueLock("ISS-phys", "sess-phys", physical.deviceId);
+		store.acquireIssueLock("CYPACK-1", "sess-c1", container1.deviceId);
+		store.acquireIssueLock("CYPACK-2", "sess-c2", container2.deviceId);
+		store.recordMutation(container2.deviceId, "m-1", '{"ok":true}', NOW);
+
+		expect(store.removeUser("multi@example.com")).toBe(true);
+
+		// Re-add the user and mint fresh devices at the same issue keys/locks;
+		// none of them should be blocked by a stranded row left behind by a
+		// device this fix now purges.
+		store.addUser({ email: "multi@example.com" });
+		const { userId: userId2 } = {
+			userId: store.findUserForCreator({ email: "multi@example.com" })!.userId,
+		};
+		const freshContainer1 = store.createContainerDevice(
+			userId2,
+			"CYPACK-1",
+			"docker",
+		);
+		expect(
+			store.acquireIssueLock("CYPACK-1", "sess-new", freshContainer1.deviceId),
+		).toBe(true);
+		expect(store.getSessionAffinity("sess-c1")).toBeUndefined();
+		expect(store.getSessionAffinity("sess-c2")).toBeUndefined();
+		expect(store.getMutation(freshContainer1.deviceId, "m-1")).toBeUndefined();
+	});
 });
 
 describe("container devices (schema v2)", () => {
@@ -257,6 +309,44 @@ describe("container devices (schema v2)", () => {
 		expect(enrolled).toBeDefined();
 		// getDeviceForUser returns ONLY the physical device
 		expect(store.getDeviceForUser(userId)?.deviceId).toBe(enrolled?.deviceId);
+	});
+
+	it("revokeDevice removes only the physical device row; container devices for the same user survive", () => {
+		// Regression test for the bug where `revokeDevice` ran `DELETE FROM
+		// devices WHERE user_id = ?` with no `kind` filter: an operator
+		// revoking a teammate's laptop (e.g. after a new-laptop enrollment)
+		// would ALSO delete every one of that user's running container
+		// devices, which ContainerLifecycle's orphan-GC sweep then reaps
+		// (container AND volume) within one tick, killing any in-flight
+		// session with no session-affinity guard.
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const code = store.mintEnrollmentCode("alice@example.com", NOW);
+		const physical = store.redeemEnrollmentCode(code, NOW);
+		if (!physical) throw new Error("redeem failed");
+		const container = store.createContainerDevice(userId, "CYPACK-1", "docker");
+
+		expect(store.revokeDevice("alice@example.com")).toBe(true);
+
+		expect(store.getDeviceForUser(userId)).toBeUndefined();
+		expect(store.getDeviceByToken(physical.deviceToken)).toBeUndefined();
+		// The container device must be untouched.
+		expect(store.getContainerDeviceForIssue("CYPACK-1")).toMatchObject({
+			deviceId: container.deviceId,
+			provider: "docker",
+		});
+		expect(store.getDeviceInfo(container.deviceId)).toMatchObject({
+			kind: "container",
+		});
+	});
+
+	it("revokeDevice is a no-op (returns false) for a user with only container devices", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "docker-only@example.com" });
+		store.createContainerDevice(userId, "CYPACK-1", "docker");
+
+		expect(store.revokeDevice("docker-only@example.com")).toBe(false);
+		expect(store.getContainerDeviceForIssue("CYPACK-1")).toBeDefined();
 	});
 
 	it("enforces one container per issue", () => {

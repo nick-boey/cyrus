@@ -137,9 +137,16 @@ export interface EdgeWorkerRuntimeConfig {
 		url: string;
 		deviceToken: string;
 		/**
-		 * Enables the persistence-floor `WorkspaceSyncService`. Defaults to on;
-		 * set `false` to opt this device out. See `EdgeConfigSchema.router` in
-		 * config-schemas.ts for the persisted-config counterpart.
+		 * Enables the persistence-floor `WorkspaceSyncService`. Defaults to OFF
+		 * — set `true` to opt this device in (every ephemeral container gets
+		 * this automatically via `ContainerBootCommand.writeConfig`; a physical
+		 * device opts in explicitly, e.g. to enable device -> container
+		 * migration). Defaulting off preserves existing router+physical-device
+		 * behavior: without this, every session end and a 5-minute timer would
+		 * start pushing `wip: auto-saved by cyrus…` commits onto a teammate's
+		 * issue branches (including open PRs) with no opt-in on their part. See
+		 * `EdgeConfigSchema.router` in config-schemas.ts for the
+		 * persisted-config counterpart.
 		 */
 		floorSync?: boolean;
 	};

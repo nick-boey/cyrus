@@ -17,6 +17,19 @@ export type ExecFn = (
  */
 const DEFAULT_EXEC_TIMEOUT_MS = 600_000;
 
+/**
+ * Grace period passed to `docker stop -t <seconds>` before Docker escalates
+ * to SIGKILL. Docker's own default is 10s — shorter than
+ * `WorkspaceSyncService`'s 20s stop-flush cap (`DEFAULT_STOP_FLUSH_TIMEOUT_MS`
+ * in `packages/edge-worker/src/WorkspaceSyncService.ts`), and `EdgeWorker.stop()`
+ * runs that flush LAST, right before the process would otherwise exit. An
+ * idle-stop landing mid-flush with the default 10s grace would SIGKILL the
+ * container out from under its own final git-push, discarding whatever WIP
+ * the floor was mid-way through persisting. 30s comfortably covers the 20s
+ * flush cap plus headroom for the SIGTERM handler itself to start unwinding.
+ */
+const DOCKER_STOP_TIMEOUT_SECONDS = 30;
+
 const defaultExec: ExecFn = (cmd, args) =>
 	new Promise((resolve) => {
 		execFile(
@@ -43,17 +56,20 @@ export class LocalDockerProvider implements ContainerExecutor {
 	private readonly memoryLimit: string | undefined;
 	private readonly network: string | undefined;
 	private readonly exec: ExecFn;
+	private readonly logger: { info(msg: string): void; warn(msg: string): void };
 
 	constructor(opts: {
 		image: string;
 		memoryLimit?: string;
 		network?: string;
 		exec?: ExecFn;
+		logger?: { info(msg: string): void; warn(msg: string): void };
 	}) {
 		this.image = opts.image;
 		this.memoryLimit = opts.memoryLimit;
 		this.network = opts.network;
 		this.exec = opts.exec ?? defaultExec;
+		this.logger = opts.logger ?? { info: () => {}, warn: () => {} };
 	}
 
 	private name(issueKey: string): string {
@@ -88,6 +104,18 @@ export class LocalDockerProvider implements ContainerExecutor {
 			return;
 		}
 		if (found.status !== "absent") {
+			if (found.status === "running") {
+				// `ContainerLifecycle`'s idle/stale sweep never destroys a
+				// container with active session affinity — this codepath has no
+				// equivalent guard. Bumping `containers.image` while a session is
+				// mid-run silently kills it the next time this issue is routed;
+				// at minimum, name the issue key and the image mismatch so an
+				// operator can tell why a session died instead of it looking
+				// like an unrelated crash.
+				this.logger.warn(
+					`Replacing RUNNING container for issue ${ctx.issueKey}: image changed from ${found.image ?? "unknown"} to ${this.image}. Any session currently active inside it is being killed now.`,
+				);
+			}
 			await this.exec("docker", ["rm", "-f", name]); // volume survives
 		}
 		await this.mustSucceed("docker", ["volume", "create", name]);
@@ -111,7 +139,14 @@ export class LocalDockerProvider implements ContainerExecutor {
 	}
 
 	async stop(issueKey: string): Promise<void> {
-		await this.exec("docker", ["stop", this.name(issueKey)]);
+		// -t: see DOCKER_STOP_TIMEOUT_SECONDS above — gives WorkspaceSyncService's
+		// stop-time flush room to finish before Docker SIGKILLs the container.
+		await this.exec("docker", [
+			"stop",
+			"-t",
+			String(DOCKER_STOP_TIMEOUT_SECONDS),
+			this.name(issueKey),
+		]);
 	}
 
 	async destroy(issueKey: string): Promise<void> {

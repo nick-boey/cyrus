@@ -257,19 +257,48 @@ export class RouterStore {
 		}));
 	}
 
+	/**
+	 * Removes a user entirely — a deliberate, total operation, unlike
+	 * {@link revokeDevice} (which only detaches a physical device, e.g. a
+	 * laptop swap, and must never touch that user's containers — see its own
+	 * doc comment). A user can own MULTIPLE device rows at once: at most one
+	 * physical `kind = 'device'` row, plus any number of per-issue `kind =
+	 * 'container'` rows. All of them cascade away via `devices.user_id ON
+	 * DELETE CASCADE` when the `users` row below is deleted — that part was
+	 * already correct. What was NOT correct: only the FIRST device row
+	 * (`.get()`, not `.all()`) had its scoped rows purged, so a second/third
+	 * device (typically a container) would cascade its `devices` row away
+	 * while stranding its `issue_locks`/`session_affinity`/`issue_affinity`/
+	 * `rpc_mutations` rows pointed at a now-nonexistent device_id — those
+	 * tables have no FK back to `devices`. Loop over every device row so none
+	 * of them strand anything, matching the single-device guarantee
+	 * {@link redeemEnrollmentCode} already gives.
+	 *
+	 * Note this does NOT call into any {@link ExecutorRegistry} to
+	 * `destroy()` a removed user's live containers — `RouterStore` is a pure
+	 * DB layer with no executor wiring. Their container/volume are reaped the
+	 * same deliberate way `cyrus router containers destroy <issueKey>`
+	 * already reaps one: `ContainerLifecycle`'s orphan-GC sweep destroys any
+	 * provider-managed container whose device row is gone, on its next tick.
+	 * That is an accepted, documented latency (see `ContainerLifecycle`'s
+	 * class doc comment), not an oversight — removing a user is exactly the
+	 * case where reaping their containers IS the intended outcome, unlike the
+	 * `revokeDevice` bug this fix-pass also closes.
+	 */
 	removeUser(email: string): boolean {
 		const txn = this.db.transaction(() => {
 			const user = this.db
 				.prepare("SELECT user_id FROM users WHERE email = ? COLLATE NOCASE")
 				.get(email) as Pick<UserRow, "user_id"> | undefined;
 			if (!user) return false;
-			const deviceRow = this.db
+			const deviceRows = this.db
 				.prepare("SELECT device_id FROM devices WHERE user_id = ?")
-				.get(user.user_id) as Pick<DeviceRow, "device_id"> | undefined;
+				.all(user.user_id) as Array<Pick<DeviceRow, "device_id">>;
 			// The devices/events rows cascade away via ON DELETE CASCADE, but
 			// session_affinity/issue_affinity/issue_locks/rpc_mutations have no
-			// FK — purge them explicitly so they don't strand a dead device_id.
-			if (deviceRow) {
+			// FK — purge them explicitly, for EVERY device row, so none of them
+			// strand a dead device_id.
+			for (const deviceRow of deviceRows) {
 				this.purgeDeviceScopedRows(deviceRow.device_id);
 			}
 			const result = this.db
@@ -416,13 +445,27 @@ export class RouterStore {
 		return { deviceId: row.device_id };
 	}
 
+	/**
+	 * Revokes a user's PHYSICAL device only (e.g. they got a new laptop) —
+	 * scoped to `kind = 'device'`, matching {@link getDeviceForUser}. Must
+	 * NEVER delete a user's `kind = 'container'` rows: those back live,
+	 * possibly mid-session ephemeral containers, and this call has no
+	 * `active session affinity` guard the way {@link ContainerLifecycle}'s
+	 * idle/stale sweep does. Before this scoping, revoking a teammate's
+	 * laptop deleted every device row for that user_id — physical AND
+	 * container — and `ContainerLifecycle`'s orphan-GC pass would then
+	 * `destroy()` (container AND volume) every one of their running
+	 * containers within one sweep tick, unconditionally killing in-flight
+	 * sessions. Removing a user ENTIRELY (rather than just their physical
+	 * device) is a separate, deliberate operation — see {@link removeUser}.
+	 */
 	revokeDevice(email: string): boolean {
 		const user = this.db
 			.prepare("SELECT user_id FROM users WHERE email = ? COLLATE NOCASE")
 			.get(email) as Pick<UserRow, "user_id"> | undefined;
 		if (!user) return false;
 		const result = this.db
-			.prepare("DELETE FROM devices WHERE user_id = ?")
+			.prepare("DELETE FROM devices WHERE user_id = ? AND kind = 'device'")
 			.run(user.user_id);
 		return result.changes > 0;
 	}

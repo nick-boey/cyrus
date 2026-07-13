@@ -510,7 +510,24 @@ export class EventRouter {
 				const provider = containerTargets?.executorFor(user.userId);
 				if (containerTargets && provider) {
 					try {
-						const issueKey = extractIssueKey(webhook) ?? issueId ?? sessionId;
+						// Fail CLOSED when the webhook carries no issue identifier —
+						// do NOT fall back to `issueId`/`sessionId`. Both are Linear
+						// internal UUIDs: they pass `ISSUE_KEY_RE` (alphanumeric +
+						// dashes) just fine, so a silent fallback would happily mint
+						// a container keyed by a UUID that can never round-trip. The
+						// in-container edge worker always uploads its floor bundle
+						// under `session.issue.identifier` (the human-readable key,
+						// e.g. "CYPACK-11") — a UUID-keyed device means every upload
+						// for that container's entire life 403s against the
+						// artifact endpoint's issue-key scoping, silently. Treating
+						// a missing identifier as an invalid issue key (rather than
+						// a routable-but-wrong one) surfaces the same user-facing
+						// notice as a malformed identifier instead of quietly
+						// creating a container nothing can ever sync to.
+						const issueKey = extractIssueKey(webhook);
+						if (issueKey === undefined) {
+							throw new InvalidIssueKeyError(issueId ?? sessionId);
+						}
 						const { deviceId } = containerTargets.ensureDevice(user, issueKey);
 						return { deviceId, email: user.email, kind: "container", issueKey };
 					} catch (err) {
