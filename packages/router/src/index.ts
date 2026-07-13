@@ -11,5 +11,5 @@ export {
 	type RouterServerConfig,
 	type RouterWorkspaceConfig,
 } from "./RouterServer.js";
-export { RouterStore } from "./RouterStore.js";
+export { type ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
 export { registerWorkspacesRoute } from "./workspaces.js";
