@@ -540,6 +540,13 @@ export class RouterStore {
 		return row?.executor_json ?? undefined;
 	}
 
+	getUserEmail(userId: number): string | undefined {
+		const row = this.db
+			.prepare("SELECT email FROM users WHERE user_id = ?")
+			.get(userId) as { email: string } | undefined;
+		return row?.email;
+	}
+
 	enqueueEvent(
 		deviceId: number,
 		payloadJson: string,

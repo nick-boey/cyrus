@@ -1,5 +1,13 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentEvent } from "cyrus-core";
+import type {
+	ContainerExecutor,
+	IssueExecutionContext,
+} from "cyrus-router-executors";
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import { ContainerTargetService } from "../src/ContainerTargets.js";
 import { EventRouter } from "../src/EventRouter.js";
 import {
 	expiredMessage,
@@ -12,6 +20,7 @@ import {
 	UNENROLLED_CREATOR_MESSAGE,
 } from "../src/messages.js";
 import { RouterStore } from "../src/RouterStore.js";
+import { SecretStore } from "../src/SecretStore.js";
 
 const ROUTE_NOW = 1_000_000;
 const TTL_MS = 60_000;
@@ -26,6 +35,8 @@ interface Creator {
 function createdEvent(opts: {
 	sessionId: string;
 	issueId?: string;
+	/** The issue's human-readable key, e.g. "CYPACK-1" (drives container issueKey resolution). */
+	identifier?: string;
 	creator?: Creator;
 	organizationId?: string;
 	parentIssueId?: string;
@@ -40,11 +51,58 @@ function createdEvent(opts: {
 			organizationId: org,
 			issueId: opts.issueId,
 			issue: opts.issueId
-				? { id: opts.issueId, parentId: opts.parentIssueId }
+				? {
+						id: opts.issueId,
+						identifier: opts.identifier,
+						parentId: opts.parentIssueId,
+					}
 				: undefined,
 			creator: opts.creator,
 		},
 	} as unknown as AgentEvent;
+}
+
+/** Minimal fake ContainerExecutor whose ensureRunning is an inspectable mock. */
+function fakeExecutor(
+	provider: string,
+	overrides?: { ensureRunning?: Mock },
+): ContainerExecutor & { ensureRunning: Mock } {
+	return {
+		provider,
+		ensureRunning:
+			overrides?.ensureRunning ??
+			vi.fn<(ctx: IssueExecutionContext) => Promise<void>>(async () => {}),
+		destroy: vi.fn(async () => {}),
+		stop: vi.fn(async () => {}),
+		status: vi.fn(async () => "running" as const),
+		listManaged: vi.fn(async () => []),
+	};
+}
+
+/** A real ContainerTargetService over the same store, backed by a fake executor. */
+function makeContainerTargets(
+	store: RouterStore,
+	overrides?: { executor?: ReturnType<typeof fakeExecutor> },
+) {
+	const secrets = new SecretStore(
+		join(mkdtempSync(join(tmpdir(), "event-router-secrets-")), "secrets.json"),
+	);
+	const postActivity = vi.fn<
+		(workspaceId: string, agentSessionId: string, body: string) => Promise<void>
+	>(async () => {});
+	const executor = overrides?.executor ?? fakeExecutor("docker");
+	const containerTargets = new ContainerTargetService({
+		store,
+		secrets,
+		executors: new Map([["docker", executor]]),
+		containersConfig: {
+			routerUrlForContainers: "wss://router.example.com",
+			repositories: [],
+		},
+		postActivity,
+		logger: { info: () => {}, warn: () => {} },
+	});
+	return { containerTargets, executor, secrets, postActivity };
 }
 
 /** Minimal object that satisfies isAgentSessionPromptedWebhook + fields we read. */
@@ -93,6 +151,7 @@ function makeRouter(
 	store: RouterStore,
 	overrides?: {
 		gateway?: Gateway;
+		containerTargets?: ContainerTargetService;
 		config?: Partial<{
 			eventTtlMs: number;
 			issueLock: boolean;
@@ -116,6 +175,7 @@ function makeRouter(
 		gateway,
 		postActivity,
 		moveIssueToStartedState,
+		containerTargets: overrides?.containerTargets,
 		config: {
 			eventTtlMs: TTL_MS,
 			issueLock: true,
@@ -511,6 +571,139 @@ describe("EventRouter", () => {
 		);
 		expect(store.getIssueLock("ISS-1")).toBeUndefined();
 		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(true);
+	});
+});
+
+describe("EventRouter container routing", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	const DAVE: Creator = {
+		id: "lin-dave",
+		email: "dave@example.com",
+		name: "Dave",
+	};
+
+	it("(h) routes a created event for a container-executor user to the issue's container device and skips the offline notice", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets, executor, secrets } = makeContainerTargets(store);
+		// A genuine claudeOauthToken so boot() actually reaches ensureRunning
+		// (a boot-failure notice is a separate, already-covered concern).
+		secrets.set("dave@example.com", "claudeOauthToken", "tok-1");
+		const bootSpy = vi.spyOn(containerTargets, "boot");
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await router.route(
+			createdEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				identifier: "CYPACK-1",
+				creator: DAVE,
+			}),
+		);
+
+		const device = store.getContainerDeviceForIssue("CYPACK-1");
+		expect(device).toMatchObject({ provider: "docker" });
+		expect(
+			store.pendingEvents(device?.deviceId ?? -1, 0, ROUTE_NOW),
+		).toHaveLength(1);
+		expect(bootSpy).toHaveBeenCalledWith(device?.deviceId, {
+			workspaceId: "ws-1",
+			sessionId: "sess-1",
+		});
+		// A cold boot is expected, not an outage: the offline notice must never fire.
+		expect(postActivity).not.toHaveBeenCalled();
+
+		await vi.waitFor(() =>
+			expect(executor.ensureRunning).toHaveBeenCalledTimes(1),
+		);
+	});
+
+	it("(i) falls through and heals when session affinity points at a deleted container device", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets, secrets } = makeContainerTargets(store);
+		secrets.set("dave@example.com", "claudeOauthToken", "tok-1");
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		// Session affinity points at a device id that was never created (as if
+		// its container had since been destroyed and the row removed).
+		store.setSessionAffinity("sess-1", 999_999);
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				actorUserId: "lin-dave",
+				creator: DAVE,
+			}),
+		);
+
+		// Re-resolved via the creator chain into a fresh container device, not
+		// left pointing at the deleted id — and the caller is told nothing was
+		// unroutable.
+		const device = store.getContainerDeviceForIssue("ISS-1");
+		expect(device).toBeDefined();
+		expect(store.getSessionAffinity("sess-1")).toBe(device?.deviceId);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
+	});
+
+	it("(j) keeps physical-device routing unchanged when containerTargets is not configured", async () => {
+		const deviceId = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		// executor_json exists and says "device" — with no containerTargets
+		// wired up at all, the container codepath must never even be
+		// consulted, and routing must be byte-identical to today.
+		store.setUserExecutor("alice@example.com", '{"type":"device"}');
+		const { router, postActivity } = makeRouter(store);
+
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(1);
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			offlineWaitingMessage("alice@example.com"),
+		);
+	});
+
+	it("(k) refuses to route a malformed issue key into the store instead of crashing or creating a broken container", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets } = makeContainerTargets(store);
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await expect(
+			router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "ISS-1",
+					identifier: "bad issue/key!",
+					creator: DAVE,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		// The gate refused: nothing was created in the store...
+		expect(store.listContainerDevices()).toHaveLength(0);
+		// ...and the router fell back to its existing "can't route" notice
+		// rather than throwing out of route().
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(UNENROLLED_CREATOR_MESSAGE, { userName: "Dave" }),
+		);
 	});
 });
 

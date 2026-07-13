@@ -6,6 +6,7 @@ import {
 	type Webhook,
 } from "cyrus-core";
 import type { SessionStateFrame } from "cyrus-router-protocol";
+import type { ContainerTargetService } from "./ContainerTargets.js";
 import type { DeviceGateway } from "./DeviceGateway.js";
 import {
 	expiredMessage,
@@ -38,6 +39,14 @@ interface ResolvedTarget {
 	deviceId: number;
 	/** Email used in offline/expiry notices. */
 	email: string;
+	/**
+	 * "device" for a physical enrolled device, "container" for a per-issue
+	 * ephemeral container device. Determines whether an offline target is an
+	 * outage (post the waiting notice) or an expected cold start (boot it).
+	 */
+	kind: "device" | "container";
+	/** Set for container targets: the issue key the container was minted for. */
+	issueKey?: string;
 }
 
 export interface EventRouterOptions {
@@ -59,6 +68,12 @@ export interface EventRouterOptions {
 		workspaceId: string,
 		issueId: string,
 	) => Promise<string | undefined>;
+	/**
+	 * Routes container-executor users to per-issue ephemeral container
+	 * devices instead of a physical enrolled device. Optional: omitting it
+	 * keeps every user on the physical-device path (today's behavior).
+	 */
+	containerTargets?: ContainerTargetService;
 	config: {
 		eventTtlMs: number;
 		issueLock: boolean;
@@ -90,6 +105,7 @@ export class EventRouter {
 	private readonly moveIssueToStartedState:
 		| ((workspaceId: string, issueId: string) => Promise<string | undefined>)
 		| undefined;
+	private readonly containerTargets: ContainerTargetService | undefined;
 	private readonly config: {
 		eventTtlMs: number;
 		issueLock: boolean;
@@ -113,6 +129,7 @@ export class EventRouter {
 		this.gateway = opts.gateway;
 		this.postActivity = opts.postActivity;
 		this.moveIssueToStartedState = opts.moveIssueToStartedState;
+		this.containerTargets = opts.containerTargets;
 		this.config = opts.config;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
@@ -370,7 +387,7 @@ export class EventRouter {
 		this.sessionWorkspace.set(sessionId, workspaceId);
 		await this.deliverOrNotify(
 			webhook,
-			{ deviceId, email },
+			{ ...target, deviceId, email },
 			sessionId,
 			workspaceId,
 		);
@@ -378,8 +395,9 @@ export class EventRouter {
 
 	/**
 	 * Resolves the device an event routes to, in priority order:
-	 * existing session affinity (re-delivery) -> creator's enrolled device ->
-	 * issue affinity (app-created sub-issues) -> parent-issue affinity.
+	 * existing session affinity (re-delivery) -> creator's enrolled/container
+	 * device -> issue affinity (app-created sub-issues) -> parent-issue
+	 * affinity.
 	 *
 	 * Shared by created and prompted events so a prompt to a session whose
 	 * affinity was released still reaches its owner's device.
@@ -394,7 +412,23 @@ export class EventRouter {
 
 		const affinityDevice = this.store.getSessionAffinity(sessionId);
 		if (affinityDevice !== undefined) {
-			return { deviceId: affinityDevice, email: fallbackEmail };
+			const info = this.store.getDeviceInfo(affinityDevice);
+			if (info) {
+				return {
+					deviceId: affinityDevice,
+					email: fallbackEmail,
+					kind: info.kind,
+					issueKey: info.issueKey,
+				};
+			}
+			// Dangling affinity: the device row it pointed at is gone (e.g. its
+			// container was destroyed and replaced under a different device
+			// id). Clear it and fall through the chain below instead of
+			// routing into the void.
+			this.store.clearSessionAffinity(sessionId);
+			this.logger.warn(
+				`Session ${sessionId} affinity pointed at deleted device ${affinityDevice}; clearing and re-resolving`,
+			);
 		}
 
 		if (creator) {
@@ -403,9 +437,34 @@ export class EventRouter {
 				email: creator.email,
 			});
 			if (user) {
+				const containerTargets = this.containerTargets;
+				const provider = containerTargets?.executorFor(user.userId);
+				if (containerTargets && provider) {
+					try {
+						const issueKey = extractIssueKey(webhook) ?? issueId ?? sessionId;
+						const { deviceId } = containerTargets.ensureDevice(user, issueKey);
+						return { deviceId, email: user.email, kind: "container", issueKey };
+					} catch (err) {
+						// The container service is the gate against a malformed issue
+						// key (or a store error) ever reaching the store/provider — a
+						// user-facing "can't route this" message is a safer failure
+						// mode than either crashing the router or falling back
+						// silently to some other device.
+						this.logger.warn(
+							`Failed to resolve container device for ${user.email}: ${
+								err instanceof Error ? err.message : String(err)
+							}`,
+						);
+						return undefined;
+					}
+				}
 				const device = this.store.getDeviceForUser(user.userId);
 				if (device) {
-					return { deviceId: device.deviceId, email: user.email };
+					return {
+						deviceId: device.deviceId,
+						email: user.email,
+						kind: "device",
+					};
 				}
 			}
 		}
@@ -413,7 +472,13 @@ export class EventRouter {
 		if (issueId !== undefined) {
 			const issueDevice = this.store.getIssueAffinity(issueId);
 			if (issueDevice !== undefined) {
-				return { deviceId: issueDevice, email: fallbackEmail };
+				const info = this.store.getDeviceInfo(issueDevice);
+				return {
+					deviceId: issueDevice,
+					email: fallbackEmail,
+					kind: info?.kind ?? "device",
+					issueKey: info?.issueKey,
+				};
 			}
 		}
 
@@ -430,7 +495,13 @@ export class EventRouter {
 		if (parentIssueId !== undefined) {
 			const parentDevice = this.store.getIssueAffinity(parentIssueId);
 			if (parentDevice !== undefined) {
-				return { deviceId: parentDevice, email: fallbackEmail };
+				const info = this.store.getDeviceInfo(parentDevice);
+				return {
+					deviceId: parentDevice,
+					email: fallbackEmail,
+					kind: info?.kind ?? "device",
+					issueKey: info?.issueKey,
+				};
 			}
 		}
 
@@ -452,6 +523,15 @@ export class EventRouter {
 
 		if (this.gateway.isOnline(target.deviceId)) {
 			this.gateway.deliverPending(target.deviceId);
+			return;
+		}
+
+		if (target.kind === "container") {
+			// A container that isn't running yet is NOT an outage — cold-booting
+			// it is the expected path, so no offlineWaitingMessage. boot() posts
+			// its own (once-per-issue) failure notice only if ensureRunning
+			// actually rejects; the queue drains once the container connects.
+			this.containerTargets?.boot(target.deviceId, { workspaceId, sessionId });
 			return;
 		}
 
@@ -526,4 +606,24 @@ function extractParentIssueId(webhook: SessionEvent): string | undefined {
 	}
 
 	return undefined;
+}
+
+/**
+ * Extracts the issue's human-readable key (e.g. "CYPACK-123") for routing a
+ * container-executor user to their per-issue container. The typed webhook
+ * issue payload exposes `identifier` directly, but this still reads it
+ * defensively (like {@link extractParentIssueId}) rather than trusting the
+ * compile-time type, since it flows into `ContainerTargetService.ensureDevice`
+ * and from there into filesystem paths and Docker object names.
+ */
+function extractIssueKey(webhook: SessionEvent): string | undefined {
+	const issue = webhook.agentSession.issue as unknown as
+		| Record<string, unknown>
+		| null
+		| undefined;
+	if (!issue) return undefined;
+	const identifier = issue.identifier;
+	return typeof identifier === "string" && identifier.length > 0
+		? identifier
+		: undefined;
 }

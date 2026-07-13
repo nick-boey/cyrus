@@ -307,6 +307,13 @@ describe("container devices (schema v2)", () => {
 		expect(store.getUserExecutor(userId)).toBeUndefined();
 	});
 
+	it("reads a user's email by id, and undefined for an unknown user", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		expect(store.getUserEmail(userId)).toBe("a@example.com");
+		expect(store.getUserEmail(userId + 999)).toBeUndefined();
+	});
+
 	it("counts session affinity rows per device and tracks last_routed_ms", () => {
 		const store = new RouterStore(":memory:");
 		const { userId } = store.addUser({ email: "a@example.com" });

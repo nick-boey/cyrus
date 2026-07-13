@@ -58,6 +58,21 @@ export function offlineReleaseMessage(email: string): string {
 }
 
 /**
+ * Posted when a container-executor user's per-issue container fails to boot
+ * (`ContainerExecutor.ensureRunning` rejected). Posted once per issue until a
+ * boot succeeds — a cold boot itself is expected and NOT what this message is
+ * for; only an actual failure is.
+ */
+export const CONTAINER_BOOT_FAILED_MESSAGE =
+	"I couldn't start the workspace container for this issue ({{issueKey}}): {{detail}}. An operator should check the router logs; I'll retry on the next prompt.";
+export function containerBootFailedMessage(
+	issueKey: string,
+	detail: string,
+): string {
+	return fillTemplate(CONTAINER_BOOT_FAILED_MESSAGE, { issueKey, detail });
+}
+
+/**
  * Replaces `{{key}}` placeholders in `template` with the matching value from
  * `vars`. Unknown placeholders are left intact.
  */

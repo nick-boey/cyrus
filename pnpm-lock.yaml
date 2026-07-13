@@ -566,6 +566,9 @@ importers:
       cyrus-linear-event-transport:
         specifier: workspace:*
         version: link:../linear-event-transport
+      cyrus-router-executors:
+        specifier: workspace:*
+        version: link:../router-executors
       cyrus-router-protocol:
         specifier: workspace:*
         version: link:../router-protocol

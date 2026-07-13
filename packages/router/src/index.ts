@@ -1,3 +1,7 @@
+export {
+	type ContainerRoutingDeps,
+	ContainerTargetService,
+} from "./ContainerTargets.js";
 export { DeviceGateway } from "./DeviceGateway.js";
 export { EventRouter, type EventRouterOptions } from "./EventRouter.js";
 export { registerEnrollmentRoute } from "./enrollment.js";
