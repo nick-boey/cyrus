@@ -87,7 +87,13 @@ export async function buildBundle(opts: {
 	}
 }
 
-const RUNNER_ID_KEYS = [
+/**
+ * Exported so callers outside this module (e.g. `container-boot`'s
+ * device -> container migration handling) can reuse the exact same
+ * "which fields identify a resumable runner session" list rather than
+ * re-declaring it and risking drift.
+ */
+export const RUNNER_ID_KEYS = [
 	"claudeSessionId",
 	"geminiSessionId",
 	"codexSessionId",

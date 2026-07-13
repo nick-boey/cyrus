@@ -7477,6 +7477,85 @@ ${input.userComment}
 	}
 
 	/**
+	 * Restore-ladder gap-closer: re-creates a session's git-worktree workspace
+	 * if it no longer exists (or was reduced to an empty/invalid directory)
+	 * before a resume attempts to use it as the runner's cwd.
+	 *
+	 * This is the single choke point for every resume path — new-comment
+	 * continuation (`handleNormalPromptedActivity`), parent-resume-from-child,
+	 * and feedback-to-child all funnel through `resumeAgentSession`, which
+	 * calls this before `buildAgentRunnerConfig` sets `cwd = session.workspace.path`.
+	 * Without it, a destroyed-and-recreated container (or a worktree deleted by
+	 * hand on a physical device) would resume the Claude transcript into a
+	 * directory `ClaudeRunner`'s own `mkdirSync(cwd, { recursive: true })`
+	 * silently manufactures empty — no repo, no `.git`, and no visibility of
+	 * any WIP commits the persistence floor already pushed to origin.
+	 *
+	 * A no-op on the happy path: `GitService.isWorkspaceValid` is a cheap
+	 * filesystem check, and plain (non-git) workspaces always report valid
+	 * (a missing one is already handled correctly by a plain `mkdir`).
+	 *
+	 * Reuses the exact same workspace-creation path `createCyrusAgentSession`
+	 * uses for brand-new sessions — the custom `handlers.createWorkspace`
+	 * override when configured (the path production takes), else
+	 * `GitService.createGitWorktree` directly. Both already implement
+	 * "worktree continuity": when the issue's branch already exists on
+	 * origin (which it will, since the floor pushes WIP there), the new
+	 * worktree is checked out from `origin/<branch>` instead of branching
+	 * fresh from the base branch — so re-creation here never loses
+	 * committed-but-unmerged work.
+	 */
+	private async ensureSessionWorkspaceExists(
+		session: CyrusAgentSession,
+		repository: RepositoryConfig,
+		fullIssue: Issue,
+		sessionId: string,
+		linearWorkspaceId: string,
+	): Promise<void> {
+		if (this.gitService.isWorkspaceValid(session.workspace)) {
+			return;
+		}
+
+		this.logger.warn(
+			`Workspace missing/invalid for session ${sessionId} (issue ${fullIssue.identifier}) at ${session.workspace.path} — recreating the worktree from the issue branch before resuming. Likely cause: destroyed/recreated container or a manually removed worktree.`,
+		);
+
+		const repositoriesForSession = session.repositories
+			.map((ctx) => this.repositories.get(ctx.repositoryId))
+			.filter((r): r is RepositoryConfig => Boolean(r));
+		const resolvedRepositories =
+			repositoriesForSession.length > 0 ? repositoriesForSession : [repository];
+
+		const workspace = this.config.handlers?.createWorkspace
+			? await this.config.handlers.createWorkspace(
+					fullIssue,
+					resolvedRepositories,
+					{
+						onRepoSetupHookEvent: (activity) =>
+							this.activityPoster.postRepoSetupHookActivity(
+								sessionId,
+								linearWorkspaceId,
+								activity,
+							),
+					},
+				)
+			: await this.gitService.createGitWorktree(
+					fullIssue,
+					resolvedRepositories,
+					{
+						onRepoSetupHookEvent: (activity) =>
+							this.activityPoster.postRepoSetupHookActivity(
+								sessionId,
+								linearWorkspaceId,
+								activity,
+							),
+					},
+				);
+
+		session.workspace = workspace;
+	}
+
+	/**
 	 * Resume or create an Agent session with the given prompt
 	 * This is the core logic for handling prompted agent activities
 	 * @param session The Cyrus agent session
@@ -7574,6 +7653,17 @@ ${input.userComment}
 				`Failed to fetch full issue details for ${issueIdForResume}`,
 			);
 		}
+
+		// Restore-ladder gap-closer: re-create the workspace if it no longer
+		// exists (or was reduced to an empty/invalid directory) before it's
+		// used as the runner's cwd below. See ensureSessionWorkspaceExists.
+		await this.ensureSessionWorkspaceExists(
+			session,
+			repository,
+			fullIssue,
+			sessionId,
+			resolvedWorkspaceId,
+		);
 
 		// Fetch issue labels early to determine runner type
 		const labels = await this.fetchIssueLabels(fullIssue);

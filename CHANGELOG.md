@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - Sessions can now run in ephemeral Docker containers managed by the router: assign a user to the `docker` executor and their issues each get an isolated, auto-stopping container, with work persisted across restarts. See `docker/worker/README.md` for the setup runbook.
 
 ### Fixed
+- Ephemeral containers: resuming a session after its container was destroyed and recreated no longer drops the repository. The session's git worktree is now re-created from the issue's branch (including any in-progress work already pushed) before work resumes, instead of silently continuing in an empty folder with no code and no history. A session moved from a teammate's device onto a container now also keeps its Claude conversation history where possible, instead of always starting a fresh one.
 - Sessions killed by a machine restart, a crash, or the system running out of memory no longer sit at "Working…" forever. Cyrus now reports them as errored when it comes back up, so you can tell at a glance which sessions died and which finished. Send a new message to resume one.
 - A session that fails no longer goes silent. Some failures ended the run without telling Linear anything, leaving the session looking like it was still working. The failure is now always reported.
 - Stopping a session now says so in Linear instead of leaving it stuck on "Working…".

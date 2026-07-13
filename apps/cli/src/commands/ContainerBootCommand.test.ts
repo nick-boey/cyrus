@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EdgeConfigSchema, RepositoryConfigSchema } from "cyrus-core";
+import { sanitizeCwdForClaudeProjects } from "cyrus-workspace-sync";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	ContainerBootCommand,
@@ -366,6 +367,159 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 					"edge-worker-state.json",
 				),
 			});
+		});
+	});
+
+	describe("canonicalizeRestoredWorkspaces (device -> container migration)", () => {
+		function writeStateFile(
+			stateFile: string,
+			agentSessions: Record<string, Record<string, unknown>>,
+		) {
+			mkdirSync(join(workspacesDir, ".cyrus", "state"), { recursive: true });
+			writeFileSync(
+				stateFile,
+				JSON.stringify({
+					version: "4.0",
+					savedAt: new Date().toISOString(),
+					state: { agentSessions, agentSessionEntries: {} },
+				}),
+			);
+		}
+
+		function readStateFile(stateFile: string) {
+			return JSON.parse(readFileSync(stateFile, "utf-8")) as {
+				state: { agentSessions: Record<string, Record<string, unknown>> };
+			};
+		}
+
+		it("rewrites a foreign (physical-device) workspace path to the canonical path and relocates the Claude transcript, so the claudeSessionId survives the migration", () => {
+			const stateFile = join(
+				workspacesDir,
+				".cyrus",
+				"state",
+				"edge-worker-state.json",
+			);
+			const claudeProjectsDir = join(workspacesDir, ".claude-projects");
+			const foreignPath = "/Users/alice/code/repo/worktrees/CYPACK-11";
+			writeStateFile(stateFile, {
+				"agent-session-1": {
+					id: "agent-session-1",
+					issue: { id: "issue-1", identifier: "CYPACK-11" },
+					workspace: { path: foreignPath, isGitWorktree: true },
+					claudeSessionId: "claude-session-abc",
+				},
+			});
+
+			// Simulate what `restoreBundle` already unpacked: the transcript
+			// directory, still keyed by the OLD (foreign, device) sanitized path.
+			const oldTranscriptDir = join(
+				claudeProjectsDir,
+				sanitizeCwdForClaudeProjects(foreignPath),
+			);
+			mkdirSync(oldTranscriptDir, { recursive: true });
+			writeFileSync(
+				join(oldTranscriptDir, "claude-session-abc.jsonl"),
+				'{"type":"summary"}\n',
+			);
+
+			const cmd = newCommand();
+			cmd.canonicalizeRestoredWorkspaces({
+				workspacesDir,
+				issueKey: "CYPACK-11",
+				stateFile,
+				claudeProjectsDir,
+			});
+
+			const { state } = readStateFile(stateFile);
+			const session = state.agentSessions["agent-session-1"]!;
+			const canonicalPath = join(workspacesDir, "CYPACK-11");
+
+			expect((session.workspace as { path: string }).path).toBe(canonicalPath);
+			// The claudeSessionId is untouched: this is a successful migration,
+			// not the graceful-degradation fallback.
+			expect(session.claudeSessionId).toBe("claude-session-abc");
+
+			// The transcript is now findable under the NEW canonical sanitized
+			// name — exactly where the Claude Agent SDK will look for it next
+			// time this session resumes at the canonical cwd.
+			const newTranscriptPath = join(
+				claudeProjectsDir,
+				sanitizeCwdForClaudeProjects(canonicalPath),
+				"claude-session-abc.jsonl",
+			);
+			expect(existsSync(newTranscriptPath)).toBe(true);
+			expect(existsSync(oldTranscriptDir)).toBe(false);
+		});
+
+		it("strips runner session ids when the transcript cannot be relocated (fallback: re-prime instead of resuming into an empty tree)", () => {
+			const stateFile = join(
+				workspacesDir,
+				".cyrus",
+				"state",
+				"edge-worker-state.json",
+			);
+			const claudeProjectsDir = join(workspacesDir, ".claude-projects");
+			const foreignPath = "/Users/alice/code/repo/worktrees/CYPACK-12";
+			writeStateFile(stateFile, {
+				"agent-session-2": {
+					id: "agent-session-2",
+					issue: { id: "issue-2", identifier: "CYPACK-12" },
+					workspace: { path: foreignPath, isGitWorktree: true },
+					claudeSessionId: "claude-session-def",
+				},
+			});
+			// Deliberately do NOT create a transcript directory for foreignPath —
+			// e.g. the device never floor-synced, or the transcript was lost —
+			// so relocation has nothing to move.
+
+			const cmd = newCommand();
+			cmd.canonicalizeRestoredWorkspaces({
+				workspacesDir,
+				issueKey: "CYPACK-12",
+				stateFile,
+				claudeProjectsDir,
+			});
+
+			const { state } = readStateFile(stateFile);
+			const session = state.agentSessions["agent-session-2"]!;
+			const canonicalPath = join(workspacesDir, "CYPACK-12");
+
+			// The workspace path is still canonicalized...
+			expect((session.workspace as { path: string }).path).toBe(canonicalPath);
+			// ...but the runner session id is stripped, so the EdgeWorker's
+			// `needsNewSession` path re-primes a fresh session against the
+			// restored branch instead of resuming into an empty directory.
+			expect(session.claudeSessionId).toBeUndefined();
+		});
+
+		it("is a no-op when every session's workspace path is already canonical", () => {
+			const stateFile = join(
+				workspacesDir,
+				".cyrus",
+				"state",
+				"edge-worker-state.json",
+			);
+			const claudeProjectsDir = join(workspacesDir, ".claude-projects");
+			const canonicalPath = join(workspacesDir, "CYPACK-13");
+			writeStateFile(stateFile, {
+				"agent-session-3": {
+					id: "agent-session-3",
+					issue: { id: "issue-3", identifier: "CYPACK-13" },
+					workspace: { path: canonicalPath, isGitWorktree: true },
+					claudeSessionId: "claude-session-ghi",
+				},
+			});
+			const before = readFileSync(stateFile, "utf-8");
+
+			const cmd = newCommand();
+			cmd.canonicalizeRestoredWorkspaces({
+				workspacesDir,
+				issueKey: "CYPACK-13",
+				stateFile,
+				claudeProjectsDir,
+			});
+
+			expect(readFileSync(stateFile, "utf-8")).toBe(before);
 		});
 	});
 

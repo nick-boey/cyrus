@@ -1,9 +1,11 @@
 import { execFile, spawn } from "node:child_process";
 import {
 	chmodSync,
+	cpSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
+	readFileSync,
 	renameSync,
 	rmSync,
 	symlinkSync,
@@ -11,11 +13,13 @@ import {
 } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { EdgeConfigSchema, RepositoryConfigSchema } from "cyrus-core";
 import {
 	downloadBundle as defaultDownloadBundle,
 	restoreBundle as defaultRestoreBundle,
+	RUNNER_ID_KEYS,
+	sanitizeCwdForClaudeProjects,
 	toHttpBase,
 } from "cyrus-workspace-sync";
 import { z } from "zod";
@@ -355,12 +359,182 @@ export class ContainerBootCommand implements ICommand {
 				claudeProjectsDir,
 				stateFile,
 			});
+			this.canonicalizeRestoredWorkspaces({
+				workspacesDir: opts.workspacesDir,
+				issueKey: opts.issueKey,
+				stateFile,
+				claudeProjectsDir,
+			});
 			this.logger.info(
 				`Restored ${restoredSessions} session(s) from the floor bundle.`,
 			);
 			return "restored";
 		} finally {
 			await rm(tmpDir, { recursive: true, force: true });
+		}
+	}
+
+	/**
+	 * Canonicalizes a restored session's workspace path and relocates its
+	 * Claude transcript alongside it — the fix for **device -> container
+	 * migration**.
+	 *
+	 * A session bundled from a **physical device** carries a host path (e.g.
+	 * `/Users/alice/code/repo/worktrees/CYC-1`) in `workspace.path`. That path
+	 * can never exist inside this container: left as-is, the next resume
+	 * would hand the runner a `cwd` that doesn't exist, and `ClaudeRunner`'s
+	 * own `mkdirSync(cwd, { recursive: true })` would silently manufacture an
+	 * empty directory there instead of failing loudly.
+	 *
+	 * This rewrites `workspace.path` (and any multi-repo `repoPaths` entries)
+	 * to the canonical `$CYRUS_WORKSPACES_DIR/<ISSUE-KEY>` path — the same
+	 * path `GitService.createGitWorktree` independently computes, so the
+	 * edge-worker's "recreate a missing worktree on resume" logic and this
+	 * rewrite always agree on where the worktree belongs.
+	 *
+	 * Because the Claude Agent SDK keys transcript directories by the
+	 * sanitized, realpath-resolved cwd (`~/.claude/projects/<sanitized-cwd>/`,
+	 * see `sanitizeCwdForClaudeProjects`), a path rewrite alone would orphan
+	 * the transcript the bundle just restored under the OLD sanitized name.
+	 * So the transcript directory is relocated alongside the rewrite — get
+	 * this right and a Claude session survives a device -> container
+	 * migration, which the original design assumed was impossible.
+	 *
+	 * If relocation isn't possible (no transcript was ever captured for this
+	 * workspace, or an I/O error), this falls back to the existing
+	 * graceful-degradation mechanism already implemented by
+	 * `restoreBundle`/`RUNNER_ID_KEYS`: the runner session ids are stripped so
+	 * the EdgeWorker's `needsNewSession` path re-primes a fresh session
+	 * against the restored branch instead of resuming into an empty tree.
+	 *
+	 * A no-op (including the file read) when the state file doesn't exist,
+	 * and a no-op write when nothing needed rewriting (e.g. every session's
+	 * workspace path is already canonical, as on a warm volume this boot
+	 * created itself).
+	 */
+	canonicalizeRestoredWorkspaces(opts: {
+		workspacesDir: string;
+		issueKey: string;
+		stateFile: string;
+		claudeProjectsDir: string;
+	}): void {
+		if (!existsSync(opts.stateFile)) return;
+
+		let parsed: {
+			version: string;
+			savedAt: string;
+			state: {
+				agentSessions?: Record<string, Record<string, unknown>>;
+				agentSessionEntries?: Record<string, unknown[]>;
+			};
+		};
+		try {
+			parsed = JSON.parse(readFileSync(opts.stateFile, "utf-8"));
+		} catch (error) {
+			this.logger.warn(
+				`Failed to parse ${opts.stateFile} while canonicalizing restored workspaces: ${(error as Error).message}`,
+			);
+			return;
+		}
+
+		const sessions = parsed.state?.agentSessions;
+		if (!sessions) return;
+
+		const canonicalPath = join(opts.workspacesDir, opts.issueKey);
+		// Cache relocation outcomes by old path — multiple sessions on the same
+		// issue (or repos within one multi-repo session) can share the same
+		// old workspace path, and relocation must only ever run once per path.
+		const relocatedFrom = new Map<string, boolean>();
+		let changed = false;
+
+		for (const session of Object.values(sessions)) {
+			const issue = session.issue as { identifier?: string } | undefined;
+			if (issue?.identifier !== opts.issueKey) continue;
+
+			const workspace = session.workspace as
+				| { path?: string; repoPaths?: Record<string, string> }
+				| undefined;
+			const oldPath = workspace?.path;
+			if (!workspace || !oldPath || oldPath === canonicalPath) continue;
+
+			changed = true;
+			let relocated = relocatedFrom.get(oldPath);
+			if (relocated === undefined) {
+				relocated = this.relocateTranscriptDir(
+					opts.claudeProjectsDir,
+					oldPath,
+					canonicalPath,
+				);
+				relocatedFrom.set(oldPath, relocated);
+			}
+
+			if (workspace.repoPaths) {
+				for (const [repoId, repoPath] of Object.entries(workspace.repoPaths)) {
+					workspace.repoPaths[repoId] = join(
+						canonicalPath,
+						relative(oldPath, repoPath),
+					);
+				}
+			}
+			workspace.path = canonicalPath;
+
+			if (!relocated) {
+				this.logger.warn(
+					`${opts.issueKey}: could not relocate the Claude transcript for a restored session from ${oldPath} — stripping runner session ids so the EdgeWorker re-primes a fresh session against the restored branch instead of resuming into an empty tree.`,
+				);
+				for (const key of RUNNER_ID_KEYS) {
+					delete session[key];
+				}
+			}
+		}
+
+		if (!changed) return;
+
+		const tmpPath = `${opts.stateFile}.tmp`;
+		writeFileSync(tmpPath, `${JSON.stringify(parsed, null, 2)}\n`);
+		renameSync(tmpPath, opts.stateFile);
+	}
+
+	/**
+	 * Moves (or, if the canonical directory already has content, merges into)
+	 * the Claude transcript directory for `oldWorkspacePath` to the directory
+	 * `newWorkspacePath` sanitizes to. Returns `false` — never throws — when
+	 * there is nothing to relocate (no transcript was ever bundled for this
+	 * workspace) or the move fails, so the caller can fall back to stripping
+	 * runner session ids.
+	 */
+	private relocateTranscriptDir(
+		claudeProjectsDir: string,
+		oldWorkspacePath: string,
+		newWorkspacePath: string,
+	): boolean {
+		const oldDir = join(
+			claudeProjectsDir,
+			sanitizeCwdForClaudeProjects(oldWorkspacePath),
+		);
+		const newDir = join(
+			claudeProjectsDir,
+			sanitizeCwdForClaudeProjects(newWorkspacePath),
+		);
+		if (oldDir === newDir) return true;
+		if (!existsSync(oldDir)) return false;
+
+		try {
+			if (existsSync(newDir)) {
+				// Defensive: a previous (interrupted) boot may have already
+				// relocated some files here. Merge rather than clobber.
+				cpSync(oldDir, newDir, { recursive: true });
+				rmSync(oldDir, { recursive: true, force: true });
+			} else {
+				mkdirSync(dirname(newDir), { recursive: true });
+				renameSync(oldDir, newDir);
+			}
+			return true;
+		} catch (error) {
+			this.logger.warn(
+				`Failed to relocate Claude transcript from ${oldDir} to ${newDir}: ${(error as Error).message}`,
+			);
+			return false;
 		}
 	}
 

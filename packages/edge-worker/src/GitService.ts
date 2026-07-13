@@ -1412,6 +1412,36 @@ export class GitService {
 	}
 
 	/**
+	 * True iff `workspace` is currently usable on disk: a plain (non-git)
+	 * workspace only needs its `path` to exist, while a git-worktree
+	 * workspace — single- or multi-repo — needs every worktree path it
+	 * claims (`repoPaths` values, or `path` itself for the single-repo
+	 * layout) to actually resolve to a real git worktree, not merely an
+	 * empty directory.
+	 *
+	 * This is the check that closes the restore-ladder gap where a
+	 * destroyed-and-recreated container (or a manually deleted worktree on
+	 * a physical device) left `workspace.path` pointing at nothing: without
+	 * it, the runner's own `mkdirSync(cwd, { recursive: true })` would
+	 * silently manufacture an empty placeholder directory and resume the
+	 * Claude transcript there, with no repo, no `.git`, and no visibility of
+	 * any WIP commits the persistence floor had already pushed to origin.
+	 */
+	public isWorkspaceValid(workspace: Workspace): boolean {
+		if (!workspace.isGitWorktree) {
+			// Plain (no-repo) workspace: existence alone is sufficient, and a
+			// missing one is already handled correctly by a plain `mkdir`.
+			return true;
+		}
+		if (workspace.repoPaths && Object.keys(workspace.repoPaths).length > 0) {
+			return Object.values(workspace.repoPaths).every((p) =>
+				this.isGitWorktree(p),
+			);
+		}
+		return this.isGitWorktree(workspace.path);
+	}
+
+	/**
 	 * Check if a directory is a git worktree (has a .git file, not a .git directory).
 	 */
 	private isGitWorktree(dirPath: string): boolean {
