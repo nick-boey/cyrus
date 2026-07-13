@@ -1,3 +1,4 @@
+import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
 	AgentEvent,
@@ -10,6 +11,7 @@ import {
 } from "cyrus-linear-event-transport";
 import type { RpcRequestFrame, SessionStateFrame } from "cyrus-router-protocol";
 import Fastify, { type FastifyInstance } from "fastify";
+import { registerArtifactsRoute } from "./artifacts.js";
 import { DeviceGateway } from "./DeviceGateway.js";
 import { EventRouter } from "./EventRouter.js";
 import { registerEnrollmentRoute } from "./enrollment.js";
@@ -77,6 +79,12 @@ export interface RouterServerConfig {
 	heartbeatMs?: number;
 	/** Host to bind; defaults to 127.0.0.1. */
 	host?: string;
+	/**
+	 * Ephemeral container executor settings. `artifactsDir` is fully wired in a
+	 * later task; until then {@link RouterServer} falls back to a directory next
+	 * to `dbPath`.
+	 */
+	containers?: { artifactsDir?: string };
 }
 
 /**
@@ -161,6 +169,12 @@ export class RouterServer {
 			this.fastify,
 			this.store,
 			Object.keys(config.workspaces),
+		);
+		registerArtifactsRoute(
+			this.fastify,
+			this.store,
+			config.containers?.artifactsDir ??
+				join(dirname(config.dbPath), "artifacts"),
 		);
 
 		// Liveness probe for container orchestrators (Docker HEALTHCHECK,
