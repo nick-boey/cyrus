@@ -158,14 +158,6 @@ export interface IssueRunnerConfigInput {
 	sandboxSettings?: SandboxSettings;
 	/** CA cert path for MITM TLS termination — passed via child process env */
 	egressCaCertPath?: string;
-	/**
-	 * Per-user credential env bundle (multi-user mode) resolved from the
-	 * session creator. Injected into the session subprocess env so child
-	 * processes (gh, git, the Codex CLI) inherit the user's identity. Its
-	 * presence also switches on credential isolation: globally-inherited
-	 * credential groups are scrubbed from the session env by the runner.
-	 */
-	userEnv?: Record<string, string>;
 }
 
 export function resolveIssueMcpConfigPath(
@@ -481,23 +473,6 @@ export class RunnerConfigBuilder {
 				allowWrite: [input.session.workspace.path],
 				allowRead: [input.session.workspace.path, ...input.allowedDirectories],
 			};
-		}
-
-		// Per-user credential env (multi-user mode). Merged AFTER
-		// buildSandboxConfig's CA-cert additionalEnv so both survive; user
-		// keys win on conflict. credentialIsolation makes the runner scrub
-		// globally-inherited credential groups so a session can never fall
-		// back to the host's shared identity (see cyrus-core credential-env).
-		if (input.userEnv && Object.keys(input.userEnv).length > 0) {
-			config.additionalEnv = {
-				...(config.additionalEnv as Record<string, string> | undefined),
-				...input.userEnv,
-			};
-			config.credentialIsolation = true;
-			// Codex-as-primary reads auth from CODEX_HOME, not env injection.
-			if (runnerType === "codex" && input.userEnv.CODEX_HOME) {
-				config.codexHome = input.userEnv.CODEX_HOME;
-			}
 		}
 
 		if (input.resumeSessionId) {

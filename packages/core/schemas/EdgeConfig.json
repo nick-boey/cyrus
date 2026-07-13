@@ -682,83 +682,6 @@
 			},
 			"additionalProperties": false
 		},
-		"users": {
-			"type": "array",
-			"items": {
-				"type": "object",
-				"properties": {
-					"linearUser": {
-						"anyOf": [
-							{
-								"type": "string"
-							},
-							{
-								"type": "object",
-								"properties": {
-									"id": {
-										"type": "string"
-									}
-								},
-								"required": ["id"],
-								"additionalProperties": false
-							},
-							{
-								"type": "object",
-								"properties": {
-									"email": {
-										"type": "string"
-									}
-								},
-								"required": ["email"],
-								"additionalProperties": false
-							}
-						]
-					},
-					"credentialsDir": {
-						"type": "string"
-					},
-					"gitAuthor": {
-						"type": "object",
-						"properties": {
-							"name": {
-								"type": "string"
-							},
-							"email": {
-								"type": "string"
-							}
-						},
-						"required": ["name", "email"],
-						"additionalProperties": false
-					}
-				},
-				"required": ["linearUser", "credentialsDir"],
-				"additionalProperties": false
-			}
-		},
-		"gitCommitAuthor": {
-			"type": "object",
-			"properties": {
-				"mode": {
-					"type": "string",
-					"enum": ["user", "shared"]
-				},
-				"shared": {
-					"type": "object",
-					"properties": {
-						"name": {
-							"type": "string"
-						},
-						"email": {
-							"type": "string"
-						}
-					},
-					"required": ["name", "email"],
-					"additionalProperties": false
-				}
-			},
-			"required": ["mode"],
-			"additionalProperties": false
-		},
 		"promptDefaults": {
 			"type": "object",
 			"properties": {
@@ -1039,6 +962,29 @@
 				}
 			},
 			"required": ["httpProxyPort", "socksProxyPort"],
+			"additionalProperties": false
+		},
+		"platform": {
+			"type": "string",
+			"enum": ["linear", "cli", "router"]
+		},
+		"router": {
+			"type": "object",
+			"properties": {
+				"url": {
+					"type": "string"
+				},
+				"deviceToken": {
+					"type": "string"
+				},
+				"workspaceIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": ["url", "deviceToken"],
 			"additionalProperties": false
 		}
 	},

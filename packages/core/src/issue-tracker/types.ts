@@ -157,6 +157,26 @@ export type IssueRelation = Pick<
 };
 
 /**
+ * Wire-safe form of {@link IssueRelation}: `issue`/`relatedIssue` are already
+ * resolved values rather than `Promise`s.
+ *
+ * {@link IssueRelation} cannot cross a JSON boundary — a `Promise` serializes to
+ * `{}`, so a router-mode device would receive relations whose issues are empty
+ * objects. Transports that serialize (the Cyrus Router's RPC) resolve the
+ * promises server-side and send this shape instead; the client re-wraps each
+ * issue in `Promise.resolve()` to rebuild an {@link IssueRelation}.
+ */
+export type IssueRelationSummary = Pick<
+	LinearSDK.IssueRelation,
+	"id" | "type" | "createdAt" | "updatedAt" | "archivedAt"
+> & {
+	/** The issue whose relationship is being described (resolved). */
+	readonly issue: Issue | undefined;
+	/** The related issue (resolved). */
+	readonly relatedIssue: Issue | undefined;
+};
+
+/**
  * Team type - Combines Pick selections with custom method signatures.
  * Uses simplified Connection<T> for collection methods.
  *

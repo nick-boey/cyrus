@@ -9,6 +9,35 @@ description: Configure the public webhook endpoint for Cyrus — ngrok, Cloudfla
 
 Configures a public URL so Linear (and other integrations) can send webhooks to your Cyrus instance.
 
+> **Target upstream port.** By default this skill points the tunnel at the
+> single-host Cyrus port **`3456`**. When invoked from `cyrus-setup-router`
+> (**router variant**), the caller passes the **router port `8787`** instead —
+> substitute it for `3456` everywhere below (the ngrok `upstream.url`, the
+> Cloudflare/own-URL guidance, and the "start ngrok" messaging).
+>
+> **Router variant also changes Step 4:** a router host reads
+> `~/.cyrus/router-config.json`, not the single-host env vars. In router variant,
+> write **only** `CYRUS_BASE_URL` and **skip** `CYRUS_SERVER_PORT`,
+> `LINEAR_DIRECT_WEBHOOKS`, and `CYRUS_HOST_EXTERNAL`. In the default
+> (standalone) variant, write all of them as usual.
+>
+> **Router variant — `self-auth-linear` still needs the port.** Leaving
+> `CYRUS_SERVER_PORT` unset does *not* mean nothing reads it. `cyrus
+> self-auth-linear` starts a temporary OAuth callback server on
+> `CYRUS_SERVER_PORT || 3456` and registers the redirect URI as
+> `<CYRUS_BASE_URL>/callback`. Since the tunnel forwards to the **router port
+> (`8787`)**, the callback would land on a port nothing is listening on and the
+> OAuth flow hangs forever. Run that one command with the port set inline:
+>
+> ```bash
+> CYRUS_SERVER_PORT=8787 cyrus self-auth-linear
+> ```
+>
+> Do this **while the tunnel is up and the router is stopped**, so `8787` is free
+> for the temporary callback server. Pass it inline rather than writing it to
+> `.env` — the router ignores the variable, and persisting it would silently
+> change the port a future `cyrus start` binds on this host.
+
 ## Step 1: Check Existing Configuration
 
 ```bash
@@ -91,7 +120,7 @@ endpoints:
   - name: cyrus
     url: <domain>
     upstream:
-      url: 3456
+      url: 3456 # standalone port; router variant uses 8787
 ```
 
 For the authtoken, use a clipboard-to-file approach:
@@ -107,7 +136,7 @@ endpoints:
   - name: cyrus
     url: <domain>
     upstream:
-      url: 3456
+      url: 3456 # standalone port; router variant uses 8787
 EOF
 ```
 
@@ -121,7 +150,7 @@ endpoints:
   - name: cyrus
     url: <domain>
     upstream:
-      url: 3456
+      url: 3456 # standalone port; router variant uses 8787
 EOF
 echo " ✓ Saved"
 ```
@@ -173,7 +202,11 @@ printf 'CYRUS_BASE_URL=%s\n' "<url>" >> ~/.cyrus/.env
 
 ## Step 4: Write Common Config
 
-Ensure these are present in `~/.cyrus/.env` (add only if missing):
+**Router variant:** skip this entire step except confirming `CYRUS_BASE_URL` is
+set (written in Step 3). A router host reads `~/.cyrus/router-config.json`, so
+the vars below do not apply — do **not** write them.
+
+**Standalone variant:** ensure these are present in `~/.cyrus/.env` (add only if missing):
 
 ```bash
 grep -q '^CYRUS_SERVER_PORT=' ~/.cyrus/.env 2>/dev/null || printf 'CYRUS_SERVER_PORT=3456\n' >> ~/.cyrus/.env

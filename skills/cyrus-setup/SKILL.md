@@ -1,6 +1,6 @@
 ---
 name: cyrus-setup
-description: Set up Cyrus end-to-end — install prerequisites, configure authentication, create integrations (Linear, GitHub, Slack), add repositories, and launch. Run this once to get Cyrus running as a background agent.
+description: Set up Cyrus end-to-end. First choose a deployment mode — standalone (single-host), router host, or client device — then the skill installs prerequisites, configures authentication and integrations (Linear, GitHub, Slack), adds repositories, and launches. Run this once to get Cyrus running as a background agent.
 ---
 
 # Cyrus Setup
@@ -87,6 +87,21 @@ lsof -ti :<port> | xargs kill 2>/dev/null
 
 This skill runs sub-skills in order, skipping any that are already complete. You can re-run `/cyrus-setup` at any time to add integrations or fix configuration.
 
+> **Three deployment modes.** The very first thing this skill does
+> ([Step -1](#step--1-choose-deployment-mode)) is ask which mode you want:
+>
+> - **Standalone** (single-host) — one machine receives webhooks *and* runs every
+>   session under one identity. This is the default and the flow the Steps below
+>   describe.
+> - **Router host** — a shared always-on machine that receives Linear webhooks and
+>   routes each session to the owning teammate's device. Never runs Claude, never
+>   touches GitHub. Handed off to the `cyrus-setup-router` sub-skill.
+> - **Client device** — a teammate's own machine that runs *their* sessions locally
+>   with *their* native credentials, connected to a router. Handed off to the
+>   `cyrus-setup-client` sub-skill.
+>
+> Full router/client reference: `docs/ROUTER.md`.
+
 ### Loading Sub-Skills
 
 Each step references a sub-skill file. To execute a sub-skill, **read the SKILL.md file** using the `Read` tool and follow its instructions. The sub-skill files are sibling directories to this skill:
@@ -102,10 +117,47 @@ Each step references a sub-skill file. To execute a sub-skill, **read the SKILL.
 | 6 | setup-slack | `cyrus-setup-slack/SKILL.md` |
 | 7 | setup-repository | `cyrus-setup-repository/SKILL.md` |
 | 8 | setup-launch | `cyrus-setup-launch/SKILL.md` |
+| Router mode | setup-router | `cyrus-setup-router/SKILL.md` |
+| Client mode | setup-client | `cyrus-setup-client/SKILL.md` |
+
+The **Standalone** mode runs Steps 1–8 inline (below). The **Router host** and
+**Client device** modes hand off to `cyrus-setup-router` and
+`cyrus-setup-client` respectively — those sub-skills invoke the shared sub-skills
+above (prerequisites, endpoint, Linear, etc.) with mode-appropriate options.
 
 To find the files, look for them relative to this file's directory (go up one level, then into the sub-skill directory). For example, if this file is at `~/.claude/skills/cyrus-setup/SKILL.md`, the sub-skills are at `~/.claude/skills/cyrus-setup-prerequisites/SKILL.md`, etc.
 
 If a sub-skill file is not found, use `Glob` to search for it: `**/cyrus-setup-prerequisites/SKILL.md`
+
+---
+
+## Step -1: Choose Deployment Mode
+
+**This is the first thing to do — before identity, surfaces, or any install.**
+**Use the `AskUserQuestion` tool if available.** Ask the user which deployment
+mode they want to set up:
+
+- **Standalone (single-host)** — *default, recommended for individuals.* One
+  machine receives Linear/GitHub/Slack webhooks and runs every Claude session
+  under one identity. Sets up Linear + GitHub + Claude Code + a public tunnel.
+- **Router host** — a shared always-on machine that receives Linear webhooks and
+  routes each session to the teammate who owns it. It coordinates a team but
+  **never runs Claude and never touches GitHub**. Sets up Linear + a public
+  tunnel, writes `router-config.json`, starts the router, and enrolls teammates.
+- **Client device** — a teammate's own laptop/workstation that runs *their*
+  sessions locally with *their* native credentials, connected to a router. Sets
+  up Claude Code + native `gh`/git + a locally-OAuth'd Linear MCP, then connects
+  to the router. **No Linear OAuth app, no tunnel, no GitHub App.**
+
+Then branch:
+
+- **Standalone** → continue with **Step 0** below and run Steps 0–8 in order.
+- **Router host** → **Read** the `cyrus-setup-router/SKILL.md` sub-skill and
+  follow it. Do **not** run Steps 0–8 of this orchestrator.
+- **Client device** → **Read** the `cyrus-setup-client/SKILL.md` sub-skill and
+  follow it. Do **not** run Steps 0–8 of this orchestrator.
+
+Everything from Step 0 onward in this file is the **Standalone** flow.
 
 ---
 

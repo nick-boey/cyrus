@@ -53,47 +53,6 @@ export const UserAccessControlConfigSchema = z.object({
 });
 
 /**
- * Git author identity (name + email) used for commit attribution.
- */
-export const GitAuthorSchema = z.object({
-	name: z.string(),
-	email: z.string(),
-});
-
-/**
- * A registered user's credential profile for multi-user deployments.
- * Secrets are NOT stored here — they live in `<credentialsDir>/.env`
- * (CLAUDE_CODE_OAUTH_TOKEN, GH_TOKEN, ...) plus `<credentialsDir>/codex/`
- * (per-user Codex CODEX_HOME with auth.json) and optionally
- * `<credentialsDir>/claude/` (per-user CLAUDE_CONFIG_DIR).
- */
-export const UserCredentialConfigSchema = z.object({
-	/** Linear identity this profile belongs to (id or email match). */
-	linearUser: UserIdentifierSchema,
-	/** Directory holding this user's credentials (supports `~/` prefix). */
-	credentialsDir: z.string(),
-	/** Commit author identity used when gitCommitAuthor.mode is "user". */
-	gitAuthor: GitAuthorSchema.optional(),
-});
-
-/**
- * Controls commit AUTHORSHIP for multi-user sessions. Push/PR auth is
- * always the session user's PAT regardless of this setting.
- * - "user" (default): commits are authored as the registered user's gitAuthor.
- * - "shared": commits are authored as `shared` (a global "Cyrus agent"
- *   identity); when `shared` is omitted, no author env is injected and the
- *   host's global git config applies.
- */
-export const GitCommitAuthorConfigSchema = z.object({
-	mode: z.enum(["user", "shared"]),
-	shared: GitAuthorSchema.optional(),
-});
-
-export type GitAuthor = z.infer<typeof GitAuthorSchema>;
-export type UserCredentialConfig = z.infer<typeof UserCredentialConfigSchema>;
-export type GitCommitAuthorConfig = z.infer<typeof GitCommitAuthorConfigSchema>;
-
-/**
  * Tool restriction options for label-based prompts
  */
 const ToolRestrictionSchema = z.union([
@@ -521,16 +480,6 @@ export const EdgeConfigSchema = z.object({
 	 */
 	userAccessControl: UserAccessControlConfigSchema.optional(),
 
-	/**
-	 * Multi-user credential profiles. When non-empty, Linear sessions run
-	 * with the triggering user's credentials, and users without a profile
-	 * are blocked with registration instructions.
-	 */
-	users: z.array(UserCredentialConfigSchema).optional(),
-
-	/** Commit authorship policy for multi-user sessions (see schema docs). */
-	gitCommitAuthor: GitCommitAuthorConfigSchema.optional(),
-
 	/** Global defaults for prompt types (tool restrictions per prompt type) */
 	promptDefaults: PromptDefaultsSchema.optional(),
 
@@ -540,6 +489,37 @@ export const EdgeConfigSchema = z.object({
 	 * all agent network traffic through it for inspection and filtering.
 	 */
 	sandbox: SandboxConfigSchema.optional(),
+
+	/**
+	 * Issue tracker platform type (default: "linear").
+	 * - "linear": Uses Linear directly (default production mode)
+	 * - "cli": Uses an in-memory issue tracker for CLI-based testing
+	 * - "router": Routes every issue-tracker operation through the Cyrus Router
+	 *   over a WebSocket. The device holds no Linear tokens — the router does.
+	 *
+	 * Persisted here (not just on the runtime config) so `cyrus connect` can
+	 * write it and `cyrus start` reads it back on load.
+	 */
+	platform: z.enum(["linear", "cli", "router"]).optional(),
+
+	/**
+	 * Router connection config. Required when `platform === "router"`.
+	 * `url` is the base router WebSocket URL (the `/device` path is appended by
+	 * the client); `deviceToken` authenticates this device to the router.
+	 */
+	router: z
+		.object({
+			url: z.string(),
+			deviceToken: z.string(),
+			/**
+			 * Linear workspace ids the router serves, fetched from `GET /workspaces`
+			 * at enrollment. Advisory: used to fill `repositories[].linearWorkspaceId`
+			 * without hand-copying the id off the router host. Absent when enrolling
+			 * against a router predating that route.
+			 */
+			workspaceIds: z.array(z.string()).optional(),
+		})
+		.optional(),
 });
 
 /**

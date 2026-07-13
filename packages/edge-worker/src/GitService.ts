@@ -252,6 +252,49 @@ export class GitService {
 	}
 
 	/**
+	 * True when origin has a branch of this name (worktree continuity across
+	 * devices — lets a worktree resume an issue branch that was pushed from
+	 * another device/session instead of branching fresh from the base branch).
+	 */
+	remoteBranchExists(repoPath: string, branchName: string): boolean {
+		try {
+			const out = execSync(
+				`git ls-remote --heads origin ${JSON.stringify(branchName)}`,
+				{ cwd: repoPath, encoding: "utf-8", timeout: 30_000 },
+			);
+			return out.trim().length > 0;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Commit-and-push dirty worktree state so another device can resume this
+	 * issue via {@link remoteBranchExists}. Returns true when a WIP commit was
+	 * created and pushed; false when the tree was already clean (no-op).
+	 */
+	async pushWipIfDirty(
+		worktreePath: string,
+		branchName: string,
+	): Promise<boolean> {
+		const status = execSync("git status --porcelain", {
+			cwd: worktreePath,
+			encoding: "utf-8",
+		});
+		if (status.trim().length === 0) return false;
+		execSync("git add -A", { cwd: worktreePath });
+		execSync(
+			'git -c user.email=cyrus@localhost -c user.name="Cyrus WIP" commit -m "wip: auto-saved by cyrus before session end"',
+			{ cwd: worktreePath },
+		);
+		execSync(`git push origin HEAD:${JSON.stringify(branchName)}`, {
+			cwd: worktreePath,
+			timeout: 60_000,
+		});
+		return true;
+	}
+
+	/**
 	 * Sanitize branch name by removing characters invalid in git refs.
 	 * Git branch names cannot contain: space, ~, ^, :, ?, *, [, \, backtick,
 	 * consecutive dots (..), ASCII control chars, or start/end with dot or slash.
@@ -267,6 +310,34 @@ export class GitService {
 			.replace(/^[.\-/]+/, "") // strip leading dots, dashes, slashes
 			.replace(/[.\-/]+$/, "") // strip trailing dots, dashes, slashes
 			.replace(/-{2,}/g, "-"); // collapse consecutive dashes
+	}
+
+	/**
+	 * Derive the git branch name a worktree should be created on / continued
+	 * from for a given issue: Linear's suggested `branchName` when present
+	 * (non-empty), otherwise a generated `<identifier>-<slugified-title>`
+	 * fallback (title lowercased, whitespace collapsed to dashes, truncated
+	 * to 30 chars), always passed through `sanitizeBranchName` so the result
+	 * is a valid git ref.
+	 *
+	 * This is the single source of truth for that fallback — used by
+	 * `createSingleRepoWorktree` when it first creates the worktree, and by
+	 * `EdgeWorker`'s pre-teardown WIP push, so both agree on which branch a
+	 * given issue's worktree actually lives on even when Linear never
+	 * suggested a branch name.
+	 */
+	public deriveWorktreeBranchName(issue: {
+		identifier: string;
+		title: string;
+		branchName?: string;
+	}): string {
+		const rawBranchName =
+			issue.branchName ||
+			`${issue.identifier}-${issue.title
+				?.toLowerCase()
+				.replace(/\s+/g, "-")
+				.substring(0, 30)}`;
+		return this.sanitizeBranchName(rawBranchName);
 	}
 
 	/**
@@ -724,13 +795,7 @@ export class GitService {
 			}
 
 			// Use Linear's preferred branch name, or generate one if not available
-			const rawBranchName =
-				issue.branchName ||
-				`${issue.identifier}-${issue.title
-					?.toLowerCase()
-					.replace(/\s+/g, "-")
-					.substring(0, 30)}`;
-			const branchName = this.sanitizeBranchName(rawBranchName);
+			const branchName = this.deriveWorktreeBranchName(issue);
 			const workspacePath =
 				workspacePathOverride ??
 				join(repository.workspaceBaseDir, issue.identifier);
@@ -845,7 +910,22 @@ export class GitService {
 			// Create the worktree - use determined base branch
 			let worktreeCmd: string;
 			if (createBranch) {
-				if (hasRemote) {
+				// Worktree continuity: if this issue's own branch was already
+				// pushed to origin by a previous device/session, and no explicit
+				// base-branch override was requested, resume from it directly
+				// instead of branching from the resolved base branch. An
+				// explicit override always wins over this preference.
+				if (
+					!baseBranchOverride &&
+					hasRemote &&
+					this.remoteBranchExists(repository.repositoryPath, branchName)
+				) {
+					const remoteIssueBranch = `origin/${branchName}`;
+					this.logger.info(
+						`Resuming issue branch ${remoteIssueBranch} from remote (worktree continuity)`,
+					);
+					worktreeCmd = `git worktree add --track -b "${branchName}" "${workspacePath}" "${remoteIssueBranch}"`;
+				} else if (hasRemote) {
 					// Check if the base branch exists remotely
 					let useRemoteBranch = false;
 					try {

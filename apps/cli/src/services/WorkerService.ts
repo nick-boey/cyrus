@@ -246,9 +246,11 @@ export class WorkerService {
 			// User access control configuration
 			userAccessControl: edgeConfig.userAccessControl,
 			sandbox: edgeConfig.sandbox,
-			// Multi-user credential profiles
-			users: edgeConfig.users,
-			gitCommitAuthor: edgeConfig.gitCommitAuthor,
+			// Platform mode + router connection config. `cyrus connect` writes
+			// these to config.json; forward them so `cyrus start` doesn't drop
+			// them (Codex finding 5).
+			platform: edgeConfig.platform,
+			router: edgeConfig.router,
 			handlers: {
 				createWorkspace: async (
 					issue: Issue,

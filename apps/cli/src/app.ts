@@ -10,11 +10,12 @@ import dotenv from "dotenv";
 import { Application } from "./Application.js";
 import { AuthCommand } from "./commands/AuthCommand.js";
 import { CheckTokensCommand } from "./commands/CheckTokensCommand.js";
+import { ConnectCommand } from "./commands/ConnectCommand.js";
 import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
+import { RouterCommand } from "./commands/RouterCommand.js";
 import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
 import { SelfAuthCommand } from "./commands/SelfAuthCommand.js";
 import { StartCommand } from "./commands/StartCommand.js";
-import { UsersCommand } from "./commands/UsersCommand.js";
 import { createErrorReporter } from "./services/createErrorReporter.js";
 
 // Get the directory of the current module for reading package.json
@@ -80,7 +81,11 @@ program
 			packageJson.version,
 			errorReporter,
 		);
-		await new AuthCommand(app).execute([authKey]);
+		try {
+			await new AuthCommand(app).execute([authKey]);
+		} finally {
+			app.disposeWatchers();
+		}
 	});
 
 // Check tokens command
@@ -95,7 +100,11 @@ program
 			packageJson.version,
 			errorReporter,
 		);
-		await new CheckTokensCommand(app).execute([]);
+		try {
+			await new CheckTokensCommand(app).execute([]);
+		} finally {
+			app.disposeWatchers();
+		}
 	});
 
 // Refresh token command
@@ -110,7 +119,11 @@ program
 			packageJson.version,
 			errorReporter,
 		);
-		await new RefreshTokenCommand(app).execute([]);
+		try {
+			await new RefreshTokenCommand(app).execute([]);
+		} finally {
+			app.disposeWatchers();
+		}
 	});
 
 // Self-auth-linear command - Linear OAuth directly from CLI
@@ -165,13 +178,19 @@ program
 		},
 	);
 
-// Users command - manage per-user credential profiles (multi-user mode)
-const usersCommand = program
-	.command("users")
+// Router command - administer a Cyrus Router server (multi-user device routing)
+const routerCommand = program
+	.command("router")
 	.description(
-		"Manage per-user credential profiles (multi-user mode). Sessions started by a registered Linear user run with that user's Claude/Codex/GitHub credentials.",
+		"Manage a Cyrus Router server: registered users, enrolled devices, and stuck issue locks.",
 	);
-const makeUsersAction =
+
+/**
+ * Action for the one-shot `router` admin subcommands. Disposes the
+ * Application's file watchers once the command is done so the process exits
+ * instead of idling on live `fs.watch` handles.
+ */
+const makeRouterAction =
 	(...prefix: string[]) =>
 	async (...actionArgs: unknown[]) => {
 		const opts = program.opts();
@@ -184,22 +203,107 @@ const makeUsersAction =
 		const positional = actionArgs.filter(
 			(a): a is string => typeof a === "string",
 		);
-		await new UsersCommand(app).execute([...prefix, ...positional]);
+		try {
+			await new RouterCommand(app).execute([...prefix, ...positional]);
+		} finally {
+			app.disposeWatchers();
+		}
 	};
-usersCommand
-	.command("add")
+
+routerCommand
+	.command("start")
 	.description(
-		"Register a user's Claude/Codex/GitHub credentials interactively",
+		"Start the router server (reads <cyrus-home>/router-config.json)",
 	)
-	.action(makeUsersAction("add"));
-usersCommand
+	.action(async () => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		// No disposeWatchers(): the server is long-running and relies on the
+		// .env watcher for hot-reload.
+		await new RouterCommand(app).execute(["start"]);
+	});
+
+const routerUsersCommand = routerCommand
+	.command("users")
+	.description("Manage router-registered users");
+
+routerUsersCommand
+	.command("add <email>")
+	.description(
+		"Register a user and mint a one-time, 15-minute enrollment code for `cyrus connect`",
+	)
+	.option("--name <name>", "Display name for the user")
+	.action(async (email: string, cmdOpts: { name?: string }) => {
+		const args = ["add", email];
+		if (cmdOpts.name) {
+			args.push("--name", cmdOpts.name);
+		}
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		try {
+			await new RouterCommand(app).execute(["users", ...args]);
+		} finally {
+			app.disposeWatchers();
+		}
+	});
+
+routerUsersCommand
 	.command("list")
-	.description("List registered users (no secrets shown)")
-	.action(makeUsersAction("list"));
-usersCommand
+	.description("List registered users")
+	.action(makeRouterAction("users", "list"));
+
+routerUsersCommand
 	.command("remove <email>")
-	.description("Remove a user from the registry (credential files are kept)")
-	.action(makeUsersAction("remove"));
+	.description("Remove a registered user")
+	.action(makeRouterAction("users", "remove"));
+
+const routerDevicesCommand = routerCommand
+	.command("devices")
+	.description("Manage enrolled devices");
+
+routerDevicesCommand
+	.command("revoke <email>")
+	.description(
+		"Revoke a user's enrolled device, releasing any issue locks it held",
+	)
+	.action(makeRouterAction("devices", "revoke"));
+
+routerCommand
+	.command("unlock <issueId>")
+	.description("Release a stuck issue lock")
+	.action(makeRouterAction("unlock"));
+
+// Connect command - enroll this device with a running Cyrus Router server
+program
+	.command("connect <url>")
+	.description(
+		"Enroll this device with a Cyrus Router server using a one-time code from `cyrus router users add`",
+	)
+	.requiredOption("--code <code>", "One-time enrollment code")
+	.action(async (url: string, cmdOpts: { code: string }) => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		try {
+			await new ConnectCommand(app).execute([url, "--code", cmdOpts.code]);
+		} finally {
+			app.disposeWatchers();
+		}
+	});
 
 // Parse and execute
 (async () => {

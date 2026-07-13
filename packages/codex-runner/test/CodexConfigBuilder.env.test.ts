@@ -47,7 +47,7 @@ describe("CodexConfigBuilder env handling", () => {
 		} as CodexRunnerConfig;
 	}
 
-	it("keeps returning undefined env without codexHome/additionalEnv/isolation", async () => {
+	it("keeps returning undefined env without codexHome/additionalEnv", async () => {
 		const resolved = await new CodexConfigBuilder(makeConfig()).build();
 		expect(resolved.env).toBeUndefined();
 	});
@@ -69,29 +69,5 @@ describe("CodexConfigBuilder env handling", () => {
 		).build();
 		expect(resolved.env?.GH_TOKEN).toBe("user-pat");
 		expect(resolved.env?.GIT_AUTHOR_NAME).toBe("Alice");
-	});
-
-	it("scrubs global credential groups under credentialIsolation", async () => {
-		const resolved = await new CodexConfigBuilder(
-			makeConfig({
-				codexHome,
-				credentialIsolation: true,
-				additionalEnv: { GH_TOKEN: "user-pat" },
-			}),
-		).build();
-		// Global OPENAI_API_KEY must not shadow per-user CODEX_HOME auth.json
-		expect(resolved.env?.OPENAI_API_KEY).toBeUndefined();
-		expect(resolved.env?.GITHUB_TOKEN).toBeUndefined();
-		expect(resolved.env?.GIT_AUTHOR_NAME).toBeUndefined();
-		expect(resolved.env?.GH_TOKEN).toBe("user-pat");
-		expect(resolved.env?.CODEX_HOME).toBe(codexHome);
-	});
-
-	it("builds an env under isolation even without a codexHome override", async () => {
-		const resolved = await new CodexConfigBuilder(
-			makeConfig({ credentialIsolation: true }),
-		).build();
-		expect(resolved.env).toBeDefined();
-		expect(resolved.env?.OPENAI_API_KEY).toBeUndefined();
 	});
 });

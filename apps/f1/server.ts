@@ -174,17 +174,6 @@ function createEdgeWorkerConfig(): EdgeWorkerConfig {
 				| "cursor",
 		}),
 		codexDefaultModel: process.env.CODEX_MODEL || "gpt-5.5",
-		// Multi-user credential profiles for F1 validation. Set
-		// CYRUS_F1_USERS_JSON to a JSON array of UserCredentialConfig entries
-		// (and optionally CYRUS_F1_GIT_COMMIT_AUTHOR_JSON) to exercise
-		// per-user credential routing against the synthetic CLI creator
-		// (user-default / test@example.com).
-		...(process.env.CYRUS_F1_USERS_JSON && {
-			users: JSON.parse(process.env.CYRUS_F1_USERS_JSON),
-		}),
-		...(process.env.CYRUS_F1_GIT_COMMIT_AUTHOR_JSON && {
-			gitCommitAuthor: JSON.parse(process.env.CYRUS_F1_GIT_COMMIT_AUTHOR_JSON),
-		}),
 		// Enable all tools including Edit(**), Bash, etc. for full testing capability
 		linearAllowedTools: getAllTools(),
 		// CLI platform needs a linearWorkspaces entry so the CLIIssueTrackerService
