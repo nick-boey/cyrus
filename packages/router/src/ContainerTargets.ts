@@ -140,21 +140,33 @@ export class ContainerTargetService {
 	}
 
 	/**
-	 * In-flight boot attempts keyed by issue key. Linear's `created`
-	 * (delegation) and `prompted` (first user message) webhooks for the same
-	 * issue routinely arrive seconds apart, both while the container is still
-	 * cold-booting (a first `docker run` pulls the image and can take
-	 * minutes). Without this, two concurrent `boot()` calls each drive their
-	 * own `ensureRunning`, and both observe `status: "absent"` and both mint
-	 * a fresh device token (via `mintDeviceToken`/`rotateContainerDeviceToken`)
-	 * before either `docker run` lands — the second rotation invalidates the
-	 * token the first, successfully started, container was launched with, so
-	 * it can never authenticate and its queued events never drain. A `boot()`
-	 * for an issue already in this map joins the existing attempt instead of
+	 * In-flight boot attempts keyed by DEVICE ID (not issue key — see below).
+	 * Linear's `created` (delegation) and `prompted` (first user message)
+	 * webhooks for the same issue routinely arrive seconds apart, both while
+	 * the container is still cold-booting (a first `docker run` pulls the
+	 * image and can take minutes). Without this, two concurrent `boot()`
+	 * calls each drive their own `ensureRunning`, and both observe `status:
+	 * "absent"` and both mint a fresh device token (via
+	 * `mintDeviceToken`/`rotateContainerDeviceToken`) before either `docker
+	 * run` lands — the second rotation invalidates the token the first,
+	 * successfully started, container was launched with, so it can never
+	 * authenticate and its queued events never drain. A `boot()` for a
+	 * device already in this map joins the existing attempt instead of
 	 * starting a second one. Cleared once the attempt settles (success or
 	 * failure) so a later retry can boot again.
+	 *
+	 * Keyed by device id rather than issue key: `ensureDevice` destroys and
+	 * replaces a device row (new device id, same issue key) when a user's
+	 * executor provider changes. If this map were keyed by issue key, a
+	 * `boot()` for the NEW device — routed while the OLD device's boot is
+	 * still in-flight (a real window: cold boots take minutes) — would join
+	 * the stale attempt for the destroyed device instead of starting a real
+	 * boot for the new provider, and the new container would never actually
+	 * start. Keying by device id keeps the same-device dedup (both webhooks
+	 * still resolve to the same device id when no switch happened) while
+	 * making an executor switch's new device id always start a fresh attempt.
 	 */
-	private readonly inFlightBoots = new Map<string, Promise<void>>();
+	private readonly inFlightBoots = new Map<number, Promise<void>>();
 
 	/**
 	 * Fire-and-forget boot, serialized per issue via {@link inFlightBoots}. On
@@ -212,10 +224,10 @@ export class ContainerTargetService {
 		const provider = device.provider;
 		const userId = device.userId;
 
-		const inFlight = this.inFlightBoots.get(issueKey);
+		const inFlight = this.inFlightBoots.get(deviceId);
 		if (inFlight) {
-			// Already booting this issue's container elsewhere — join it
-			// rather than start a second ensureRunning/mintDeviceToken.
+			// Already booting this exact device elsewhere — join it rather
+			// than start a second ensureRunning/mintDeviceToken.
 			return inFlight;
 		}
 
@@ -226,12 +238,12 @@ export class ContainerTargetService {
 			issueKey,
 			notify,
 		);
-		this.inFlightBoots.set(issueKey, attempt);
+		this.inFlightBoots.set(deviceId, attempt);
 		try {
 			await attempt;
 		} finally {
-			if (this.inFlightBoots.get(issueKey) === attempt) {
-				this.inFlightBoots.delete(issueKey);
+			if (this.inFlightBoots.get(deviceId) === attempt) {
+				this.inFlightBoots.delete(deviceId);
 			}
 		}
 	}

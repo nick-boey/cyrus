@@ -1,7 +1,7 @@
 # Ephemeral Container Executors for the Cyrus Router
 
 **Date:** 2026-07-13
-**Status:** Draft for review
+**Status:** Implemented (phase 1)
 **Scope:** `packages/router`, `packages/router-protocol`, `packages/router-client`, new `packages/router-executors`, container entrypoint assets
 
 ## Goals
@@ -86,7 +86,7 @@ Providers in scope: `FlyMachinesProvider` (primary), `CodespacesProvider`, `Loca
 
 - **Image**: per-repo runtime image built in GitHub Actions from the repo's `devcontainer.json` (via the devcontainer CLI), pushed to GHCR. Includes the Cyrus client, a baked bare-repo cache, and warmed dependency/build caches where feasible. This is the "prebuild" for non-Codespaces providers; Codespaces uses native prebuilds from the same `devcontainer.json`.
 - **Boot env**: `ROUTER_URL`, `DEVICE_TOKEN`, `ISSUE_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, git identity, GitHub token bootstrap.
-- **Canonical workspace path**: `/workspaces/<ISSUE-KEY>` in **every** container executor. The Claude Agent SDK keys transcripts by sanitized cwd (`~/.claude/projects/<sanitized-cwd>/`), so an identical cwd string across executors is what makes Claude-session resume survive an executor switch. Where a platform dictates its own clone location (Codespaces uses `/workspaces/<repo>`), the entrypoint creates `/workspaces/<ISSUE-KEY>` as a symlink and the EdgeWorker uses the symlink as cwd — the SDK only sees the canonical string.
+- **Canonical workspace path**: `/workspaces/<ISSUE-KEY>` must be a **real directory** — not a symlink — in **every** container executor. **Corrected during Task 3, verified against the live `claude` CLI (v2.1.207):** the Agent SDK keys transcripts by the **realpath-resolved** session cwd (`~/.claude/projects/<sanitized-cwd>/`), not the literal cwd string passed to it. An earlier draft of this section proposed satisfying platform-dictated clone locations (e.g. Codespaces' `/workspaces/<repo>`) by symlinking `/workspaces/<ISSUE-KEY>` to the real location and having the EdgeWorker use the symlink as cwd — that does NOT work: the SDK resolves the symlink before sanitizing, so it sees wherever the symlink points, not the canonical string, and two executors (or two boots) whose symlink targets differ silently break Claude-session resume. Every executor must therefore make `/workspaces/<ISSUE-KEY>` itself a real directory containing the worktree (clone/checkout directly there, or bind/volume-mount it there) — never a symlink to elsewhere.
 - **Restore ladder** (run at boot, in order):
   1. Workspace already present on the volume / codespace disk → use it (fast path).
   2. Else: `GET` the artifact bundle from the router (transcripts + metadata), clone from the baked repo cache, fetch and check out the issue branch — including remote WIP commits if present.

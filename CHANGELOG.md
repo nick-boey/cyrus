@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - The router now exposes a `GET /healthz` liveness endpoint for container health checks and uptime monitors.
 - `cyrus connect` now asks the router which Linear workspace it serves and records the answer, so you no longer have to copy the workspace id off the router host by hand when adding repositories on a client device. Getting that id wrong used to fail silently — the device would connect, receive events, and quietly drop them. Connecting against an older router still works; the id is simply left for you to fill in.
 - The router host can now run as a Docker container: configuration via environment variables, one persistent volume for all state, a compose file with an optional Cloudflare tunnel sidecar, and prebuilt images on GHCR. A guided `cyrus-setup-router-docker` skill walks through the whole setup. See "Running the router in Docker" in `docs/ROUTER.md`.
+- Sessions can now run in ephemeral Docker containers managed by the router: assign a user to the `docker` executor and their issues each get an isolated, auto-stopping container, with work persisted across restarts. See `docker/worker/README.md` for the setup runbook.
 
 ### Fixed
 - Sessions killed by a machine restart, a crash, or the system running out of memory no longer sit at "Working…" forever. Cyrus now reports them as errored when it comes back up, so you can tell at a glance which sessions died and which finished. Send a new message to resume one.
