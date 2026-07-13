@@ -366,4 +366,42 @@ describe("container devices (schema v2)", () => {
 		expect(deviceId).toBeGreaterThan(1); // AUTOINCREMENT sequence preserved
 		store.close();
 	});
+
+	it("keeps foreign_keys enforcement live after migrating a v1 database", () => {
+		// migrate() turns foreign_keys OFF for the duration of the v1->v2
+		// devices rebuild (so DROP TABLE devices doesn't cascade-delete
+		// queued events) and must restore it to ON afterwards no matter how
+		// the rebuild transaction exits. Verify restoration on the success
+		// path by proving ON DELETE CASCADE still fires on this connection:
+		// deleting a user must cascade users -> devices -> events.
+		const dir = mkdtempSync(join(tmpdir(), "router-store-fk-"));
+		const dbPath = join(dir, "router.db");
+		const raw = new Database(dbPath);
+		raw.exec(V1_SCHEMA);
+		raw.prepare("INSERT INTO users (email) VALUES ('b@example.com')").run();
+		raw
+			.prepare(
+				"INSERT INTO devices (user_id, token_hash, created_ms, next_seq) VALUES (1, ?, 1, 2)",
+			)
+			.run(createHash("sha256").update("tok2").digest("hex"));
+		raw
+			.prepare(
+				"INSERT INTO events (device_id, seq, payload_json, enqueued_ms, expires_ms) VALUES (1, 1, '{}', 1, 99999999999999)",
+			)
+			.run();
+		raw.close();
+
+		const store = new RouterStore(dbPath);
+		const device = store.getDeviceByToken("tok2");
+		expect(device).toEqual({ deviceId: 1, userId: 1 });
+		expect(store.pendingEvents(device!.deviceId, 0, 2)).toHaveLength(1);
+
+		expect(store.removeUser("b@example.com")).toBe(true);
+		// If foreign_keys enforcement had been left OFF, both rows below
+		// would still be present since the cascade would never have fired.
+		expect(store.getDeviceByToken("tok2")).toBeUndefined();
+		expect(store.pendingEvents(device!.deviceId, 0, 2)).toHaveLength(0);
+
+		store.close();
+	});
 });

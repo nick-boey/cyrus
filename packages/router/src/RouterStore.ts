@@ -207,8 +207,11 @@ export class RouterStore {
 						SELECT 'devices', COALESCE(MAX(device_id), 0) FROM devices;
 				`);
 			});
-			txn();
-			this.db.pragma("foreign_keys = ON");
+			try {
+				txn();
+			} finally {
+				this.db.pragma("foreign_keys = ON");
+			}
 		}
 
 		const userCols = this.db
