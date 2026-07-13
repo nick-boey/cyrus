@@ -736,6 +736,19 @@ export class RouterStore {
 		return row?.device_id;
 	}
 
+	/**
+	 * Deletes a single issue's affinity row. Used by {@link EventRouter} to
+	 * heal a dangling row that points at a device that no longer exists (e.g.
+	 * `revokeDevice` deletes the `devices` row without purging
+	 * `issue_affinity`, and `issue_affinity.device_id` has no FK cascade) —
+	 * without this, a live row can keep pointing at nothing forever.
+	 */
+	clearIssueAffinity(issueId: string): void {
+		this.db
+			.prepare("DELETE FROM issue_affinity WHERE issue_id = ?")
+			.run(issueId);
+	}
+
 	acquireIssueLock(
 		issueId: string,
 		sessionId: string,

@@ -12,6 +12,7 @@ import { EventRouter } from "../src/EventRouter.js";
 import {
 	expiredMessage,
 	fillTemplate,
+	INVALID_ISSUE_KEY_MESSAGE,
 	ISSUE_LOCKED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
@@ -697,12 +698,51 @@ describe("EventRouter container routing", () => {
 
 		// The gate refused: nothing was created in the store...
 		expect(store.listContainerDevices()).toHaveLength(0);
-		// ...and the router fell back to its existing "can't route" notice
-		// rather than throwing out of route().
+		// ...and the router posts a message about the issue's identifier, NOT
+		// the unenrolled-creator message — Dave IS enrolled with a container
+		// executor, it's this issue's key that's the problem (Finding 4).
 		expect(postActivity).toHaveBeenCalledWith(
 			"ws-1",
 			"sess-1",
+			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: "bad issue/key!" }),
+		);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
 			fillTemplate(UNENROLLED_CREATOR_MESSAGE, { userName: "Dave" }),
+		);
+	});
+
+	it("(l) posts the same invalid-issue-key message for a prompted event, not the generic unroutable message", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets } = makeContainerTargets(store);
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		// promptedEvent() carries no issue `identifier`, so extractIssueKey()
+		// falls back to `issueId` — make THAT the malformed value so
+		// resolution still lands on ensureDevice's format gate.
+		await expect(
+			router.route(
+				promptedEvent({
+					sessionId: "sess-1",
+					issueId: "bad issue/key!",
+					actorUserId: "lin-dave",
+					creator: DAVE,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(store.listContainerDevices()).toHaveLength(0);
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: "bad issue/key!" }),
+		);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
 		);
 	});
 });
@@ -818,5 +858,99 @@ describe("EventRouter issue promotion to a started state", () => {
 		await router.route(createdEvent({ sessionId: "sess-1", creator: ALICE }));
 
 		expect(moveIssueToStartedState).not.toHaveBeenCalled();
+	});
+});
+
+describe("EventRouter dangling issue/parent affinity healing", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	it("heals a dangling issue-affinity row instead of routing into the void", async () => {
+		// No session affinity, no user enrolled that matches the creator, but a
+		// stale issue_affinity row pointing at a device_id that was never
+		// created — as if `revokeDevice` deleted the devices row (it does not
+		// purge issue_affinity; see RouterStore.revokeDevice).
+		store.setIssueAffinity("ISS-1", 999_999);
+		const { router, postActivity } = makeRouter(store);
+
+		// Before the fix this would resolve to { deviceId: 999_999, kind:
+		// "device" } and enqueueEvent() would throw "Unknown device: 999999",
+		// rejecting out of route() with no .catch() upstream (RouterServer) —
+		// an unhandled rejection that takes the whole router process down.
+		await expect(
+			router.route(
+				promptedEvent({
+					sessionId: "sess-1",
+					issueId: "ISS-1",
+					actorUserId: "lin-bob",
+					creator: BOB,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
+		// The stale row was cleared, not left dangling for the next event.
+		expect(store.getIssueAffinity("ISS-1")).toBeUndefined();
+	});
+
+	it("heals a dangling parent-issue-affinity row instead of routing into the void", async () => {
+		store.setIssueAffinity("ISS-parent", 999_999);
+		const { router, postActivity } = makeRouter(store);
+		const creator: Creator = {
+			id: "lin-x",
+			email: "x@example.com",
+			name: "X",
+		};
+
+		await expect(
+			router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "ISS-child",
+					parentIssueId: "ISS-parent",
+					creator,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(UNENROLLED_CREATOR_MESSAGE, { userName: "X" }),
+		);
+		expect(store.getIssueAffinity("ISS-parent")).toBeUndefined();
+	});
+
+	it("re-resolves through a healthy issue-affinity row once it points at a live device (regression guard)", async () => {
+		// A live issue-affinity row must still work exactly as before — the
+		// healing branch must only fire when getDeviceInfo() is undefined.
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		store.setIssueAffinity("ISS-1", aliceDevice);
+		const { router, postActivity } = makeRouter(store);
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-new",
+				issueId: "ISS-1",
+				actorUserId: "lin-charlie",
+				creator: { id: "lin-charlie", email: "charlie@example.com", name: "C" },
+			}),
+		);
+
+		expect(store.pendingEvents(aliceDevice, 0, ROUTE_NOW)).toHaveLength(1);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-new",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
 	});
 });

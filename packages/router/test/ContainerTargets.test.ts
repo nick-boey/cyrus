@@ -254,6 +254,139 @@ describe("ContainerTargetService", () => {
 		expect(service.isContainerDevice(physical?.deviceId ?? -1)).toBe(false);
 	});
 
+	it("serializes concurrent boots for the same issue: a second boot() while the first is still cold-booting joins it instead of racing ensureRunning/mintDeviceToken", async () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "claudeOauthToken", "claude-tok");
+
+		let resolveFirst: () => void = () => {};
+		const firstAttempt = new Promise<void>((resolve) => {
+			resolveFirst = resolve;
+		});
+		const ensureRunning = vi.fn(async (ctx: IssueExecutionContext) => {
+			// Mirrors what LocalDockerProvider actually does: mint the device
+			// token as part of the call that launches the container, before
+			// the (slow) docker run itself resolves.
+			ctx.mintDeviceToken();
+			await firstAttempt;
+		});
+		const docker = fakeExecutor("docker", { ensureRunning });
+		const service = makeService(new Map([["docker", docker]]));
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+		const rotateSpy = vi.spyOn(store, "rotateContainerDeviceToken");
+
+		// Both calls land synchronously back-to-back, mirroring `created` then
+		// `prompted` webhooks arriving while the container is still booting.
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-2" });
+
+		expect(ensureRunning).toHaveBeenCalledTimes(1);
+		expect(rotateSpy).toHaveBeenCalledTimes(1);
+
+		resolveFirst();
+		// Flush the microtask queue (ensureRunning's continuation, bootInner's
+		// completion, and the in-flight-map cleanup) before booting again.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// The first attempt has settled, so a later boot for the same issue
+		// starts a genuinely new attempt.
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-3" });
+		await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(2));
+		expect(rotateSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("resets the boot-failed latch on success, so a later failure posts a fresh notice", async () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "claudeOauthToken", "claude-tok");
+		let shouldFail = true;
+		const ensureRunning = vi.fn(async () => {
+			if (shouldFail) throw new Error("docker daemon unreachable");
+		});
+		const docker = fakeExecutor("docker", { ensureRunning });
+		const service = makeService(new Map([["docker", docker]]));
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+		// `ensureRunning`'s rejection is synchronous (no internal await), so
+		// `vi.waitFor`'s condition can already be true on its very first,
+		// synchronous check — which resolves without ever going through a
+		// macrotask, so it does NOT guarantee the in-flight boot's `finally`
+		// cleanup (another few microtask hops away) has run yet. Flush an
+		// explicit macrotask boundary between calls instead, so each `boot()`
+		// call below only ever sees a fully-settled (or fully in-flight)
+		// prior attempt, matching real production timing.
+		const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+		// First failure: posts the boot-failed notice.
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		await flush();
+		expect(ensureRunning).toHaveBeenCalledTimes(1);
+		expect(postActivity).toHaveBeenCalledTimes(1);
+
+		// Second failure while still failing: the once-per-issue latch
+		// suppresses a second notice.
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		await flush();
+		expect(ensureRunning).toHaveBeenCalledTimes(2);
+		expect(postActivity).toHaveBeenCalledTimes(1);
+
+		// Boot succeeds: the latch (`bootFailedNotified.delete`) is cleared.
+		shouldFail = false;
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		await flush();
+		expect(ensureRunning).toHaveBeenCalledTimes(3);
+		expect(postActivity).toHaveBeenCalledTimes(1);
+
+		// A fresh failure after that success posts a NEW notice — the "...
+		// until a boot succeeds" half of the once-per-issue requirement.
+		shouldFail = true;
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		await flush();
+		expect(ensureRunning).toHaveBeenCalledTimes(4);
+		expect(postActivity).toHaveBeenCalledTimes(2);
+	});
+
+	it("logs a warning instead of silently leaking when the old provider is no longer registered", () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		const docker = fakeExecutor("docker");
+		const service = makeService(new Map([["docker", docker]]));
+		const original = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+
+		// Operator migrates the user to "fly" and removes "docker" from the
+		// registry entirely (e.g. restarted the router with a new executor
+		// config) — "docker" is no longer resolvable at all.
+		store.setUserExecutor("a@example.com", '{"type":"fly"}');
+		const fly = fakeExecutor("fly");
+		const service2 = new ContainerTargetService({
+			store,
+			secrets,
+			executors: new Map([["fly", fly]]),
+			containersConfig: CONTAINERS_CONFIG,
+			postActivity,
+			logger,
+		});
+
+		const replaced = service2.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+
+		expect(replaced.deviceId).not.toBe(original.deviceId);
+		expect(store.getDeviceInfo(original.deviceId)).toBeUndefined();
+		expect(logger.warn).toHaveBeenCalledWith(
+			expect.stringContaining("no executor registered for provider 'docker'"),
+		);
+	});
+
 	it("executorFor returns the provider type, undefined for device/corrupt/missing", () => {
 		const { userId: dockerUser } = store.addUser({
 			email: "docker@example.com",

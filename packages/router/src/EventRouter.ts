@@ -6,11 +6,15 @@ import {
 	type Webhook,
 } from "cyrus-core";
 import type { SessionStateFrame } from "cyrus-router-protocol";
-import type { ContainerTargetService } from "./ContainerTargets.js";
+import {
+	type ContainerTargetService,
+	InvalidIssueKeyError,
+} from "./ContainerTargets.js";
 import type { DeviceGateway } from "./DeviceGateway.js";
 import {
 	expiredMessage,
 	fillTemplate,
+	INVALID_ISSUE_KEY_MESSAGE,
 	ISSUE_LOCKED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
@@ -227,7 +231,23 @@ export class EventRouter {
 			undefined;
 		const creator = webhook.agentSession.creator ?? undefined;
 
-		const target = this.resolveTarget(webhook, sessionId, issueId, creator);
+		const { target, invalidIssueKey } = this.resolveTargetOrInvalidKey(
+			webhook,
+			sessionId,
+			issueId,
+			creator,
+		);
+		if (invalidIssueKey !== undefined) {
+			await this.postActivity(
+				workspaceId,
+				sessionId,
+				fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: invalidIssueKey }),
+			);
+			this.logger.info(
+				`Refused to route session ${sessionId}: issue key ${JSON.stringify(invalidIssueKey)} can't be used for a container workspace`,
+			);
+			return;
+		}
 		if (!target) {
 			const userName = creator?.name ?? creator?.email ?? "there";
 			await this.postActivity(
@@ -317,7 +337,23 @@ export class EventRouter {
 		// the user can always prompt it again. Resolving on affinity only meant
 		// every follow-up prompt after the first completion was dropped, leaving
 		// the session in "Waiting for Cyrus" forever.
-		const target = this.resolveTarget(webhook, sessionId, issueId, creator);
+		const { target, invalidIssueKey } = this.resolveTargetOrInvalidKey(
+			webhook,
+			sessionId,
+			issueId,
+			creator,
+		);
+		if (invalidIssueKey !== undefined) {
+			await this.postActivity(
+				workspaceId,
+				sessionId,
+				fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: invalidIssueKey }),
+			);
+			this.logger.info(
+				`Refused to route prompted session ${sessionId}: issue key ${JSON.stringify(invalidIssueKey)} can't be used for a container workspace`,
+			);
+			return;
+		}
 		if (!target) {
 			await this.postActivity(
 				workspaceId,
@@ -394,6 +430,33 @@ export class EventRouter {
 	}
 
 	/**
+	 * Wraps {@link resolveTarget}, translating an {@link InvalidIssueKeyError}
+	 * into a returned `invalidIssueKey` field instead of letting it propagate
+	 * as an exception. Callers (`routeCreated`/`routePrompted`) use this to
+	 * post the accurate "this issue's identifier can't be used" notice
+	 * instead of treating a container-executor user as unenrolled or a prompt
+	 * as unroutable (Finding 4). Any other error is not ours to translate and
+	 * propagates unchanged.
+	 */
+	private resolveTargetOrInvalidKey(
+		webhook: SessionEvent,
+		sessionId: string,
+		issueId: string | undefined,
+		creator: SessionEvent["agentSession"]["creator"] | undefined,
+	): { target: ResolvedTarget | undefined; invalidIssueKey?: string } {
+		try {
+			return {
+				target: this.resolveTarget(webhook, sessionId, issueId, creator),
+			};
+		} catch (err) {
+			if (err instanceof InvalidIssueKeyError) {
+				return { target: undefined, invalidIssueKey: err.issueKey };
+			}
+			throw err;
+		}
+	}
+
+	/**
 	 * Resolves the device an event routes to, in priority order:
 	 * existing session affinity (re-delivery) -> creator's enrolled/container
 	 * device -> issue affinity (app-created sub-issues) -> parent-issue
@@ -401,6 +464,12 @@ export class EventRouter {
 	 *
 	 * Shared by created and prompted events so a prompt to a session whose
 	 * affinity was released still reaches its owner's device.
+	 *
+	 * @throws {InvalidIssueKeyError} when the creator resolves to a
+	 * container-executor user whose issue key fails the container service's
+	 * safety gate. Callers should use {@link resolveTargetOrInvalidKey}
+	 * rather than calling this directly, unless they intend to handle that
+	 * exception themselves.
 	 */
 	private resolveTarget(
 		webhook: SessionEvent,
@@ -445,11 +514,20 @@ export class EventRouter {
 						const { deviceId } = containerTargets.ensureDevice(user, issueKey);
 						return { deviceId, email: user.email, kind: "container", issueKey };
 					} catch (err) {
-						// The container service is the gate against a malformed issue
-						// key (or a store error) ever reaching the store/provider — a
-						// user-facing "can't route this" message is a safer failure
-						// mode than either crashing the router or falling back
-						// silently to some other device.
+						if (err instanceof InvalidIssueKeyError) {
+							// Distinct from "can't route this at all": the user IS
+							// enrolled with a container executor, but THIS issue's
+							// identifier can't name a workspace. Propagate so the
+							// caller can post the accurate message instead of
+							// UNENROLLED_CREATOR_MESSAGE (Finding 4).
+							throw err;
+						}
+						// Anything else (e.g. a store error): the container service is
+						// the gate against a malformed issue key (or a store error)
+						// ever reaching the store/provider — a user-facing "can't
+						// route this" message is a safer failure mode than either
+						// crashing the router or falling back silently to some other
+						// device.
 						this.logger.warn(
 							`Failed to resolve container device for ${user.email}: ${
 								err instanceof Error ? err.message : String(err)
@@ -473,12 +551,26 @@ export class EventRouter {
 			const issueDevice = this.store.getIssueAffinity(issueId);
 			if (issueDevice !== undefined) {
 				const info = this.store.getDeviceInfo(issueDevice);
-				return {
-					deviceId: issueDevice,
-					email: fallbackEmail,
-					kind: info?.kind ?? "device",
-					issueKey: info?.issueKey,
-				};
+				if (info) {
+					return {
+						deviceId: issueDevice,
+						email: fallbackEmail,
+						kind: info.kind,
+						issueKey: info.issueKey,
+					};
+				}
+				// Dangling issue affinity: the device it pointed at is gone.
+				// `revokeDevice` deletes the `devices` row WITHOUT calling
+				// `purgeDeviceScopedRows`, and `issue_affinity.device_id` has no
+				// FK cascade, so a live row can point at nothing. Heal it the
+				// same way the session-affinity fast path above does — clear and
+				// fall through — instead of returning a target that would blow
+				// up in `enqueueEvent` ("Unknown device") and take the router
+				// process down (Finding 3).
+				this.store.clearIssueAffinity(issueId);
+				this.logger.warn(
+					`Issue ${issueId} affinity pointed at deleted device ${issueDevice}; clearing and re-resolving`,
+				);
 			}
 		}
 
@@ -496,12 +588,21 @@ export class EventRouter {
 			const parentDevice = this.store.getIssueAffinity(parentIssueId);
 			if (parentDevice !== undefined) {
 				const info = this.store.getDeviceInfo(parentDevice);
-				return {
-					deviceId: parentDevice,
-					email: fallbackEmail,
-					kind: info?.kind ?? "device",
-					issueKey: info?.issueKey,
-				};
+				if (info) {
+					return {
+						deviceId: parentDevice,
+						email: fallbackEmail,
+						kind: info.kind,
+						issueKey: info.issueKey,
+					};
+				}
+				// Same healing as the issue-affinity branch above: a dangling
+				// row must be cleared and fallen through, not returned as a
+				// target (Finding 3).
+				this.store.clearIssueAffinity(parentIssueId);
+				this.logger.warn(
+					`Parent issue ${parentIssueId} affinity pointed at deleted device ${parentDevice}; clearing and re-resolving`,
+				);
 			}
 		}
 

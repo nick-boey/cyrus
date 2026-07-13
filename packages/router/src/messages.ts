@@ -22,6 +22,21 @@ To get set up:
 
 Once your device is connected, re-delegate this issue and I'll get started.`;
 
+/**
+ * Posted when a container-executor user's issue key fails the container
+ * workspace's identifier gate (`ContainerTargetService`'s `ISSUE_KEY_RE`).
+ * Distinct from {@link UNENROLLED_CREATOR_MESSAGE}: the user IS enrolled with
+ * a container executor — it's this particular issue's identifier that can't
+ * name a workspace/container, so telling them to ask an admin to enroll them
+ * (the unenrolled message) would send them chasing the wrong problem.
+ *
+ * Templated with `{{issueKey}}` — render with {@link fillTemplate} before
+ * posting.
+ */
+export const INVALID_ISSUE_KEY_MESSAGE = `I can't start a container workspace for this issue: its identifier ({{issueKey}}) can't be used to name one.
+
+This is unusual — Linear issue identifiers are normally safe for this. An operator should check the router logs for the exact key that was rejected.`;
+
 /** Posted when an issue is already locked by another user's session. */
 export const ISSUE_LOCKED_MESSAGE =
 	"An agent is already working on this issue (session owned by another user). Try again when it finishes.";

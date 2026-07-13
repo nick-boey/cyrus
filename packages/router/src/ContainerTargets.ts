@@ -13,6 +13,23 @@ import type { SecretStore } from "./SecretStore.js";
  */
 const ISSUE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
+/**
+ * Thrown by {@link ContainerTargetService.ensureDevice} specifically when
+ * `issueKey` fails {@link ISSUE_KEY_RE}. Kept distinct from other
+ * `ensureDevice` failures (e.g. a store error) so {@link EventRouter} can
+ * tell an enrolled container-executor user that THIS issue's identifier is
+ * the problem, rather than falling back to the generic "you're not
+ * enrolled" message, which would point them at the wrong fix.
+ */
+export class InvalidIssueKeyError extends Error {
+	constructor(public readonly issueKey: string) {
+		super(
+			`refusing to create a container device for invalid issue key ${JSON.stringify(issueKey)}`,
+		);
+		this.name = "InvalidIssueKeyError";
+	}
+}
+
 export interface ContainerRoutingDeps {
 	store: RouterStore;
 	secrets: SecretStore;
@@ -75,9 +92,7 @@ export class ContainerTargetService {
 		issueKey: string,
 	): { deviceId: number } {
 		if (!ISSUE_KEY_RE.test(issueKey)) {
-			throw new Error(
-				`refusing to create a container device for invalid issue key ${JSON.stringify(issueKey)}`,
-			);
+			throw new InvalidIssueKeyError(issueKey);
 		}
 		const provider = this.executorFor(user.userId);
 		if (!provider) {
@@ -85,13 +100,30 @@ export class ContainerTargetService {
 		}
 		let existing = this.deps.store.getContainerDeviceForIssue(issueKey);
 		if (existing && existing.provider !== provider) {
-			const old = this.deps.executors.get(existing.provider);
-			void old?.destroy(issueKey).catch((err: unknown) => {
+			// Capture before the `existing = undefined` below — `old?.destroy`'s
+			// `.catch()` callback runs later (after this function has returned),
+			// so it must not read these off a `let` that's about to be reassigned.
+			const staleProvider = existing.provider;
+			const staleDeviceId = existing.deviceId;
+			const old = this.deps.executors.get(staleProvider);
+			if (old) {
+				void old.destroy(issueKey).catch((err: unknown) => {
+					this.deps.logger.warn(
+						`destroy of ${staleProvider} container for ${issueKey} failed: ${String(err)}`,
+					);
+				});
+			} else {
+				// The operator removed/renamed this provider (e.g. migrating
+				// docker -> fly) while a container still exists under it.
+				// Nothing will ever destroy() it or its volume now that we're
+				// deleting the device row below — make that leak visible instead
+				// of letting the old `old?.destroy(...)` optional chain swallow
+				// it silently (Finding 5).
 				this.deps.logger.warn(
-					`destroy of ${existing?.provider} container for ${issueKey} failed: ${String(err)}`,
+					`no executor registered for provider '${staleProvider}'; its container (and volume) for issue ${issueKey} will not be destroyed and may leak`,
 				);
-			});
-			this.deps.store.deleteContainerDevice(existing.deviceId);
+			}
+			this.deps.store.deleteContainerDevice(staleDeviceId);
 			existing = undefined;
 		}
 		if (existing) return { deviceId: existing.deviceId };
@@ -108,21 +140,66 @@ export class ContainerTargetService {
 	}
 
 	/**
-	 * Fire-and-forget boot. On `ensureRunning` rejection, posts a
-	 * container-boot-failed activity (once per issue until a boot succeeds).
+	 * In-flight boot attempts keyed by issue key. Linear's `created`
+	 * (delegation) and `prompted` (first user message) webhooks for the same
+	 * issue routinely arrive seconds apart, both while the container is still
+	 * cold-booting (a first `docker run` pulls the image and can take
+	 * minutes). Without this, two concurrent `boot()` calls each drive their
+	 * own `ensureRunning`, and both observe `status: "absent"` and both mint
+	 * a fresh device token (via `mintDeviceToken`/`rotateContainerDeviceToken`)
+	 * before either `docker run` lands — the second rotation invalidates the
+	 * token the first, successfully started, container was launched with, so
+	 * it can never authenticate and its queued events never drain. A `boot()`
+	 * for an issue already in this map joins the existing attempt instead of
+	 * starting a second one. Cleared once the attempt settles (success or
+	 * failure) so a later retry can boot again.
+	 */
+	private readonly inFlightBoots = new Map<string, Promise<void>>();
+
+	/**
+	 * Fire-and-forget boot, serialized per issue via {@link inFlightBoots}. On
+	 * `ensureRunning` rejection, posts a container-boot-failed activity (once
+	 * per issue until a boot succeeds).
+	 *
+	 * Never leaves an unhandled rejection: `bootStart`/`bootInner` are written
+	 * so nothing inside them should reject, but the `.catch()` here is
+	 * belt-and-suspenders — a detached promise with no rejection handler
+	 * crashes the whole router process (Node >= 15 defaults to
+	 * `--unhandled-rejections=throw`), which would stop routing webhooks for
+	 * every teammate, not just the one whose container failed to boot.
 	 */
 	boot(
 		deviceId: number,
 		notify: { workspaceId: string; sessionId: string },
 	): void {
-		void this.bootInner(deviceId, notify);
+		void this.bootStart(deviceId, notify).catch((err: unknown) => {
+			this.deps.logger.warn(
+				`container boot for device ${deviceId} threw unexpectedly: ${String(err)}`,
+			);
+		});
 	}
 
-	private async bootInner(
+	/**
+	 * Resolves the device's issue key and either joins an in-flight boot for
+	 * that issue or starts a new one. Defensive: resolving the device is in
+	 * its own try/catch (not just the one inside {@link bootInner}) so a
+	 * store error (e.g. SQLITE_BUSY) degrades to a logged warning instead of
+	 * rejecting — this call happens outside `bootInner`'s try, so nothing
+	 * else covers it.
+	 */
+	private async bootStart(
 		deviceId: number,
 		notify: { workspaceId: string; sessionId: string },
 	): Promise<void> {
-		const device = this.deps.store.getDeviceInfo(deviceId);
+		let device: ReturnType<RouterStore["getDeviceInfo"]>;
+		try {
+			device = this.deps.store.getDeviceInfo(deviceId);
+		} catch (err) {
+			this.deps.logger.warn(
+				`failed to load device ${deviceId} info while booting: ${String(err)}`,
+			);
+			return;
+		}
 		if (
 			!device ||
 			device.kind !== "container" ||
@@ -131,15 +208,54 @@ export class ContainerTargetService {
 		) {
 			return;
 		}
-		const executor = this.deps.executors.get(device.provider);
 		const issueKey = device.issueKey;
+		const provider = device.provider;
+		const userId = device.userId;
+
+		const inFlight = this.inFlightBoots.get(issueKey);
+		if (inFlight) {
+			// Already booting this issue's container elsewhere — join it
+			// rather than start a second ensureRunning/mintDeviceToken.
+			return inFlight;
+		}
+
+		const attempt = this.bootInner(
+			deviceId,
+			userId,
+			provider,
+			issueKey,
+			notify,
+		);
+		this.inFlightBoots.set(issueKey, attempt);
+		try {
+			await attempt;
+		} finally {
+			if (this.inFlightBoots.get(issueKey) === attempt) {
+				this.inFlightBoots.delete(issueKey);
+			}
+		}
+	}
+
+	/**
+	 * Actually boots one issue's container. Written so it never rejects:
+	 * every failure — a missing executor, an `ensureRunning` rejection, or
+	 * even a failure to post the resulting activity (e.g. a Linear 5xx) — is
+	 * caught and logged rather than thrown, since this always runs detached
+	 * from a caller that could otherwise catch it.
+	 */
+	private async bootInner(
+		deviceId: number,
+		userId: number,
+		provider: string,
+		issueKey: string,
+		notify: { workspaceId: string; sessionId: string },
+	): Promise<void> {
+		const executor = this.deps.executors.get(provider);
 		try {
 			if (!executor) {
-				throw new Error(
-					`no executor configured for provider '${device.provider}'`,
-				);
+				throw new Error(`no executor configured for provider '${provider}'`);
 			}
-			const env = this.buildEnv(device.userId, issueKey);
+			const env = this.buildEnv(userId, issueKey);
 			await executor.ensureRunning({
 				issueKey,
 				env,
@@ -153,14 +269,25 @@ export class ContainerTargetService {
 			);
 			if (!this.bootFailedNotified.has(issueKey)) {
 				this.bootFailedNotified.add(issueKey);
-				await this.deps.postActivity(
-					notify.workspaceId,
-					notify.sessionId,
-					containerBootFailedMessage(
-						issueKey,
-						err instanceof Error ? err.message : String(err),
-					),
-				);
+				try {
+					await this.deps.postActivity(
+						notify.workspaceId,
+						notify.sessionId,
+						containerBootFailedMessage(
+							issueKey,
+							err instanceof Error ? err.message : String(err),
+						),
+					);
+				} catch (postErr) {
+					// A Linear 5xx/network error here must not escape as a
+					// rejection (Finding 1) — the boot failure itself is
+					// already logged above; losing the user-facing notice is
+					// an acceptable degradation, an unhandled rejection
+					// crashing the router is not.
+					this.deps.logger.warn(
+						`failed to post boot-failure activity for ${issueKey}: ${String(postErr)}`,
+					);
+				}
 			}
 		}
 	}
