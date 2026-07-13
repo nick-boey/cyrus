@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { RouterStore, SecretStore, USER_SECRET_KEYS } from "cyrus-router";
@@ -271,6 +271,31 @@ describe("RouterCommand", () => {
 			return join(cyrusHome, "router", "user-secrets.json");
 		}
 
+		/**
+		 * Writes a minimal, schema-valid `router-config.json` to `cyrusHome`.
+		 * Pass `containers` to include an (also schema-valid) `containers` block,
+		 * optionally overriding `secretsPath`.
+		 */
+		function writeRouterConfig(containers?: { secretsPath?: string }): void {
+			const config: Record<string, unknown> = {
+				port: 8787,
+				workspaces: {},
+				webhook: { verificationMode: "direct", secret: "shh" },
+			};
+			if (containers) {
+				config.containers = {
+					image: "ghcr.io/example/cyrus-worker:latest",
+					routerUrlForContainers: "ws://host.docker.internal:8787",
+					repositories: [],
+					...containers,
+				};
+			}
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify(config, null, 2),
+			);
+		}
+
 		it("writes the secret to the router's secrets file without echoing the value", async () => {
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);
@@ -327,6 +352,55 @@ describe("RouterCommand", () => {
 			// exactly or secrets written here would never be seen by the router.
 			expect(secretsPath()).toBe(join(dirname(dbPath()), "user-secrets.json"));
 			expect(existsSync(secretsPath())).toBe(true);
+		});
+
+		it("honors containers.secretsPath from router-config.json instead of the default", async () => {
+			const overridePath = join(cyrusHome, "custom-secrets.json");
+			writeRouterConfig({ secretsPath: overridePath });
+
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await command.execute([
+				"secrets",
+				"set",
+				"maya@example.com",
+				"githubPat",
+				"ghp_overridevalue",
+			]);
+
+			// Written to the configured override, not the default path — this is
+			// the exact path RouterServer.buildContainerTargets will read from
+			// (`containers.secretsPath ?? <default>`), so the CLI and the running
+			// router must agree on it.
+			expect(existsSync(overridePath)).toBe(true);
+			expect(existsSync(secretsPath())).toBe(false);
+
+			const secretStore = new SecretStore(overridePath);
+			expect(secretStore.get("maya@example.com").githubPat).toBe(
+				"ghp_overridevalue",
+			);
+		});
+
+		it("falls back to the default secrets path when router-config.json has no containers block", async () => {
+			writeRouterConfig();
+
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await command.execute([
+				"secrets",
+				"set",
+				"noah@example.com",
+				"githubPat",
+				"ghp_defaultvalue",
+			]);
+
+			expect(existsSync(secretsPath())).toBe(true);
+			const secretStore = new SecretStore(secretsPath());
+			expect(secretStore.get("noah@example.com").githubPat).toBe(
+				"ghp_defaultvalue",
+			);
 		});
 
 		it("rejects an unknown secret key and lists the valid ones", async () => {
@@ -414,6 +488,39 @@ describe("RouterCommand", () => {
 			expect(printed).toContain("CYPACK-9");
 			expect(printed).toContain("docker");
 			expect(printed).toContain("jack@example.com");
+		});
+
+		it("aligns the header with each data column", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute(["users", "add", "mia@example.com"]);
+
+			const seedStore = new RouterStore(dbPath());
+			const user = seedStore.findUserForCreator({ email: "mia@example.com" });
+			seedStore.createContainerDevice(user!.userId, "CYPACK-11", "docker");
+			seedStore.close();
+			consoleLogSpy.mockClear();
+
+			await command.execute(["containers", "list"]);
+
+			const [header, row] = printedStdout().split("\n");
+			expect(header).toBeDefined();
+			expect(row).toBeDefined();
+
+			// Regression guard for the off-by-one header (task 9 finding 3): each
+			// header label must start at the exact same column as the data it
+			// labels, which only holds if the header and
+			// formatContainerDeviceRow() share the same column-width constants.
+			expect(header!.indexOf("PROVIDER")).toBe(row!.indexOf("docker"));
+			expect(header!.indexOf("USER")).toBe(row!.indexOf("mia@example.com"));
+
+			const lastRoutedCol = header!.indexOf("LAST ROUTED");
+			const lastSeenCol = header!.indexOf("LAST SEEN");
+			// Neither timestamp is set on a freshly-created device, so both
+			// render as "-"; asserting the character at each header's column
+			// offset confirms the row's field boundaries line up too.
+			expect(row!.charAt(lastRoutedCol)).toBe("-");
+			expect(row!.charAt(lastSeenCol)).toBe("-");
 		});
 	});
 

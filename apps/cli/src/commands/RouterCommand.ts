@@ -32,6 +32,19 @@ function isSecretKey(value: string): value is keyof UserSecretBundle {
 }
 
 /**
+ * Column widths for `containers list`'s table, shared between the header
+ * (see {@link RouterCommand.formatContainerDeviceHeader}) and each data row
+ * (see {@link RouterCommand.formatContainerDeviceRow}) so the two can never
+ * drift out of alignment the way the previous hand-written header string did.
+ */
+const CONTAINERS_TABLE_COLUMN_WIDTHS = {
+	issueKey: 21,
+	provider: 10,
+	email: 30,
+	lastRouted: 25,
+} as const;
+
+/**
  * JSON shape of `<cyrusHome>/router-config.json`: a {@link RouterServerConfig}
  * minus `dbPath` (always defaulted to `<cyrusHome>/router/router.db` — see
  * {@link RouterCommand.resolveDbPath}) and minus the runtime-only
@@ -148,15 +161,49 @@ export class RouterCommand extends BaseCommand {
 	}
 
 	/**
+	 * The secrets file the running router will actually read:
+	 * `router-config.json`'s `containers.secretsPath` when set, otherwise
 	 * `<dirname(dbPath)>/user-secrets.json` — MUST match
-	 * {@link RouterServer.buildContainerTargets}'s default `secretsPath`
-	 * exactly (`join(dirname(config.dbPath), "user-secrets.json")`, where
-	 * `config.dbPath` is this same {@link resolveDbPath} value passed in by
-	 * {@link start}). A mismatch here means secrets written via `router
-	 * secrets set` are silently invisible to the running router.
+	 * {@link RouterServer.buildContainerTargets}'s own resolution exactly
+	 * (`containers.secretsPath ?? join(dirname(config.dbPath),
+	 * "user-secrets.json")`, where `config.dbPath` is this same
+	 * {@link resolveDbPath} value passed in by {@link start}). A mismatch here
+	 * means secrets written via `router secrets set` are silently invisible to
+	 * the running router.
+	 *
+	 * The override value is used verbatim (not passed through
+	 * {@link resolvePath}) because {@link RouterServer} itself uses it
+	 * verbatim — resolving it here while the router doesn't would just trade
+	 * one mismatch for another. `resolvePath` IS used to locate
+	 * `router-config.json` itself under `cyrusHome`, mirroring
+	 * {@link resolveDbPath}, so a `~`-prefixed `--cyrus-home` still works.
 	 */
 	private resolveSecretsPath(): string {
-		return join(dirname(this.resolveDbPath()), "user-secrets.json");
+		const defaultPath = join(
+			dirname(this.resolveDbPath()),
+			"user-secrets.json",
+		);
+
+		const configPath = join(
+			resolvePath(this.app.cyrusHome),
+			"router-config.json",
+		);
+		if (!existsSync(configPath)) {
+			return defaultPath;
+		}
+
+		try {
+			const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+			const parsed = RouterConfigFileSchema.safeParse(raw);
+			return parsed.success && parsed.data.containers?.secretsPath
+				? parsed.data.containers.secretsPath
+				: defaultPath;
+		} catch {
+			// A missing/unparsable router-config.json shouldn't block `secrets
+			// set/unset` — they work fine (against the default path) before an
+			// operator has ever written a router config.
+			return defaultPath;
+		}
 	}
 
 	private openSecretStore(): SecretStore {
@@ -551,9 +598,7 @@ export class RouterCommand extends BaseCommand {
 				this.logger.info("No container devices.");
 				return;
 			}
-			this.logger.raw(
-				"ISSUE KEY            PROVIDER   USER                           LAST ROUTED               LAST SEEN",
-			);
+			this.logger.raw(this.formatContainerDeviceHeader());
 			for (const device of devices) {
 				this.logger.raw(this.formatContainerDeviceRow(store, device));
 			}
@@ -562,10 +607,21 @@ export class RouterCommand extends BaseCommand {
 		}
 	}
 
+	/**
+	 * Header row for `containers list`. Padded with the exact same
+	 * {@link CONTAINERS_TABLE_COLUMN_WIDTHS} as {@link formatContainerDeviceRow}
+	 * so column labels always line up with their data.
+	 */
+	private formatContainerDeviceHeader(): string {
+		const w = CONTAINERS_TABLE_COLUMN_WIDTHS;
+		return `${"ISSUE KEY".padEnd(w.issueKey)} ${"PROVIDER".padEnd(w.provider)} ${"USER".padEnd(w.email)} ${"LAST ROUTED".padEnd(w.lastRouted)} LAST SEEN`;
+	}
+
 	private formatContainerDeviceRow(
 		store: RouterStore,
 		device: ContainerDeviceInfo,
 	): string {
+		const w = CONTAINERS_TABLE_COLUMN_WIDTHS;
 		const email = store.getUserEmail(device.userId) ?? "(unknown)";
 		const lastRouted = device.lastRoutedMs
 			? new Date(device.lastRoutedMs).toISOString()
@@ -573,7 +629,7 @@ export class RouterCommand extends BaseCommand {
 		const lastSeen = device.lastSeenMs
 			? new Date(device.lastSeenMs).toISOString()
 			: "-";
-		return `${device.issueKey.padEnd(21)} ${device.provider.padEnd(10)} ${email.padEnd(30)} ${lastRouted.padEnd(25)} ${lastSeen}`;
+		return `${device.issueKey.padEnd(w.issueKey)} ${device.provider.padEnd(w.provider)} ${email.padEnd(w.email)} ${lastRouted.padEnd(w.lastRouted)} ${lastSeen}`;
 	}
 
 	/**
