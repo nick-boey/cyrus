@@ -259,10 +259,7 @@ describe("RouterStore", () => {
 		// Re-add the user and mint fresh devices at the same issue keys/locks;
 		// none of them should be blocked by a stranded row left behind by a
 		// device this fix now purges.
-		store.addUser({ email: "multi@example.com" });
-		const { userId: userId2 } = {
-			userId: store.findUserForCreator({ email: "multi@example.com" })!.userId,
-		};
+		const { userId: userId2 } = store.addUser({ email: "multi@example.com" });
 		const freshContainer1 = store.createContainerDevice(
 			userId2,
 			"CYPACK-1",
