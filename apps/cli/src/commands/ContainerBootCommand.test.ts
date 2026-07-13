@@ -1,4 +1,5 @@
 import {
+	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -15,8 +16,10 @@ import { EdgeConfigSchema, RepositoryConfigSchema } from "cyrus-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	ContainerBootCommand,
+	defaultExec,
 	type ExecFn,
 	findMissingEnvVars,
+	isValidIssueKey,
 	parseReposJson,
 	REQUIRED_ENV_VARS,
 	type SpawnedChild,
@@ -101,6 +104,27 @@ describe("findMissingEnvVars", () => {
 	});
 });
 
+describe("isValidIssueKey", () => {
+	it("accepts typical Linear-style issue keys", () => {
+		expect(isValidIssueKey("CYPACK-11")).toBe(true);
+		expect(isValidIssueKey("a")).toBe(true);
+		expect(isValidIssueKey("A0")).toBe(true);
+	});
+
+	it("rejects empty strings, path separators, and other unsafe characters", () => {
+		expect(isValidIssueKey("")).toBe(false);
+		expect(isValidIssueKey("../../etc")).toBe(false);
+		expect(isValidIssueKey("has space")).toBe(false);
+		expect(isValidIssueKey("has/slash")).toBe(false);
+		expect(isValidIssueKey("-leading-dash")).toBe(false);
+	});
+
+	it("rejects keys longer than 64 characters", () => {
+		expect(isValidIssueKey("a".repeat(64))).toBe(true);
+		expect(isValidIssueKey("a".repeat(65))).toBe(false);
+	});
+});
+
 describe("parseReposJson", () => {
 	it("parses a valid array", () => {
 		const repos = parseReposJson(
@@ -131,6 +155,22 @@ describe("parseReposJson", () => {
 	});
 });
 
+describe("defaultExec", () => {
+	it("folds the underlying spawn error's message into stderr when the binary itself is missing (ENOENT)", async () => {
+		const result = await defaultExec(
+			"cyrus-definitely-not-a-real-binary-xyz",
+			[],
+		);
+
+		expect(result.exitCode).not.toBe(0);
+		// Node's stderr for a spawn-level ENOENT is empty; without folding in
+		// err.message, callers (e.g. cloneRepos) are left with no cause at
+		// all — just "git clone failed for repo1: " and nothing after it.
+		expect(result.stderr.length).toBeGreaterThan(0);
+		expect(result.stderr).toMatch(/ENOENT|not found|no such file/i);
+	});
+});
+
 describe("ContainerBootCommand.execute — env validation", () => {
 	it("exits 1 naming every missing required env var, without touching the fs", async () => {
 		const logger = silentLogger();
@@ -156,6 +196,19 @@ describe("ContainerBootCommand.execute — env validation", () => {
 		await expect(cmd.execute([])).rejects.toThrow(/process.exit called with 1/);
 		expect(logger.error).toHaveBeenCalledWith(
 			expect.stringContaining("CYRUS_REPOS_JSON"),
+		);
+	});
+
+	it("exits 1 when CYRUS_ISSUE_KEY doesn't match the required pattern", async () => {
+		const logger = silentLogger();
+		const cmd = new ContainerBootCommand({
+			env: baseEnv({ CYRUS_ISSUE_KEY: "not a valid key!" }),
+			logger,
+		});
+
+		await expect(cmd.execute([])).rejects.toThrow(/process.exit called with 1/);
+		expect(logger.error).toHaveBeenCalledWith(
+			expect.stringContaining("CYRUS_ISSUE_KEY"),
 		);
 	});
 });
@@ -316,8 +369,8 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 		});
 	});
 
-	describe("cloneRepos (step 3)", () => {
-		it("clones with the token embedded in the URL and --reference-if-able", async () => {
+	describe("cloneRepos (step 4)", () => {
+		it("clones from the clean (tokenless) URL and heals remote.origin.url after — never embeds GIT_TOKEN, even when it's set", async () => {
 			const { exec, calls } = makeFakeExec();
 			const cmd = newCommand({ exec });
 
@@ -330,6 +383,8 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 				gitToken: "tok-xyz",
 			});
 
+			// Deep-equality on every exec call: this is the exec-seam guarantee
+			// that no git invocation is ever passed a token-bearing URL/argument.
 			expect(calls).toEqual([
 				{
 					cmd: "git",
@@ -337,14 +392,30 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 						"clone",
 						"--reference-if-able",
 						join(repoCacheDir, "repo1.git"),
-						"https://x-access-token:tok-xyz@github.com/org/repo1.git",
+						"https://github.com/org/repo1.git",
 						join(workspacesDir, "repos", "repo1"),
 					],
 				},
+				{
+					cmd: "git",
+					args: [
+						"-C",
+						join(workspacesDir, "repos", "repo1"),
+						"remote",
+						"set-url",
+						"origin",
+						"https://github.com/org/repo1.git",
+					],
+				},
 			]);
+			for (const call of calls) {
+				for (const arg of call.args) {
+					expect(arg).not.toContain("tok-xyz");
+				}
+			}
 		});
 
-		it("clones anonymously when GIT_TOKEN is absent", async () => {
+		it("clones the same clean URL when GIT_TOKEN is absent", async () => {
 			const { exec, calls } = makeFakeExec();
 			const cmd = newCommand({ exec });
 
@@ -359,11 +430,13 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 			expect(calls[0]?.args).toContain("https://github.com/org/repo1.git");
 		});
 
-		it("is idempotent: skips a repo that already has a .git dir", async () => {
+		it("is idempotent: skips a repo whose existing clone has a resolvable HEAD, but still heals its remote URL", async () => {
 			mkdirSync(join(workspacesDir, "repos", "repo1", ".git"), {
 				recursive: true,
 			});
-			const { exec, calls } = makeFakeExec();
+			const { exec, calls } = makeFakeExec((_cmd, args) =>
+				args.includes("rev-parse") ? { exitCode: 0 } : undefined,
+			);
 			const cmd = newCommand({ exec });
 
 			await cmd.cloneRepos({
@@ -375,7 +448,55 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 				gitToken: "tok-xyz",
 			});
 
-			expect(calls).toEqual([]);
+			expect(calls.some((c) => c.args[0] === "clone")).toBe(false);
+			expect(calls).toContainEqual({
+				cmd: "git",
+				args: [
+					"-C",
+					join(workspacesDir, "repos", "repo1"),
+					"remote",
+					"set-url",
+					"origin",
+					"https://github.com/org/repo1.git",
+				],
+			});
+		});
+
+		it("re-clones when an existing .git dir has no resolvable HEAD (an interrupted/partial clone)", async () => {
+			const repoDir = join(workspacesDir, "repos", "repo1");
+			mkdirSync(join(repoDir, ".git"), { recursive: true });
+			writeFileSync(
+				join(repoDir, "leftover.txt"),
+				"debris from an interrupted clone",
+			);
+
+			const { exec, calls } = makeFakeExec((_cmd, args) => {
+				if (args.includes("rev-parse")) {
+					return {
+						exitCode: 128,
+						stderr: "fatal: not a valid object name HEAD",
+					};
+				}
+				if (args[0] === "clone") {
+					// A real `git clone` would recreate the directory cleanly;
+					// simulate that so we can assert the debris is gone.
+					rmSync(repoDir, { recursive: true, force: true });
+					mkdirSync(join(repoDir, ".git"), { recursive: true });
+				}
+				return undefined;
+			});
+			const cmd = newCommand({ exec });
+
+			await cmd.cloneRepos({
+				workspacesDir,
+				repoCacheDir,
+				repos: [
+					{ name: "repo1", githubSlug: "org/repo1", linearWorkspaceId: "ws-1" },
+				],
+			});
+
+			expect(calls.some((c) => c.args[0] === "clone")).toBe(true);
+			expect(existsSync(join(repoDir, "leftover.txt"))).toBe(false);
 		});
 
 		it("never leaks GIT_TOKEN into a thrown error message on clone failure", async () => {
@@ -421,7 +542,7 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 		});
 	});
 
-	describe("writeConfig (step 4)", () => {
+	describe("writeConfig (step 5)", () => {
 		const repos = [
 			{ name: "repo1", githubSlug: "org/repo1", linearWorkspaceId: "ws-1" },
 			{
@@ -518,7 +639,7 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 		});
 	});
 
-	describe("configureGit (step 5)", () => {
+	describe("configureGit (step 3)", () => {
 		it("sets git user.name/user.email (defaults)", async () => {
 			const { exec, calls } = makeFakeExec();
 			const cmd = newCommand({ exec });
@@ -670,6 +791,26 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 				expect.stringContaining("applyDotfiles failed"),
 			);
 		});
+
+		it("redacts a PAT embedded in DOTFILES_REPO from the warning log on clone failure", async () => {
+			const { exec } = makeFakeExec(() => ({
+				exitCode: 128,
+				stderr:
+					"fatal: unable to access 'https://ghp_secretpat123@github.com/me/dotfiles/': The requested URL returned error: 403",
+			}));
+			const logger = silentLogger();
+			const cmd = newCommand({ exec, logger });
+
+			await cmd.applyDotfiles({
+				dotfilesRepo: "https://ghp_secretpat123@github.com/me/dotfiles",
+			});
+
+			expect(logger.warn).toHaveBeenCalledTimes(1);
+			const warnedMessage = (logger.warn as ReturnType<typeof vi.fn>).mock
+				.calls[0]?.[0] as string;
+			expect(warnedMessage).not.toContain("ghp_secretpat123");
+			expect(warnedMessage).toContain("***");
+		});
 	});
 });
 
@@ -797,24 +938,38 @@ describe("ContainerBootCommand.execute — full fresh-start orchestration", () =
 		// Step 2
 		expect(downloadBundleFn).toHaveBeenCalled();
 		expect(restoreBundleFn).not.toHaveBeenCalled();
-		// Step 3
+		// Step 3 (configureGit) runs before step 4 (cloneRepos): the
+		// credential helper is what authenticates the clone.
+		const credentialHelperIndex = calls.findIndex(
+			(c) => c.cmd === "git" && c.args.includes("credential.helper"),
+		);
+		const cloneIndex = calls.findIndex(
+			(c) => c.cmd === "git" && c.args[0] === "clone",
+		);
+		expect(credentialHelperIndex).toBeGreaterThanOrEqual(0);
+		expect(cloneIndex).toBeGreaterThan(credentialHelperIndex);
+		expect(readFileSync(join(homeDir, ".git-credentials"), "utf-8")).toContain(
+			"tok-xyz",
+		);
+		// Step 4: the clone itself is never passed a token-bearing URL — the
+		// clean URL is used, and GIT_TOKEN never appears in any exec call
+		// (the exec-seam guarantee that it never reaches `.git/config`).
 		expect(
 			calls.some(
 				(c) =>
 					c.cmd === "git" &&
-					c.args.includes(
-						"https://x-access-token:tok-xyz@github.com/org/repo1.git",
-					),
+					c.args.includes("https://github.com/org/repo1.git"),
 			),
 		).toBe(true);
-		// Step 4
+		for (const call of calls) {
+			for (const arg of call.args) {
+				expect(arg).not.toContain("tok-xyz");
+			}
+		}
+		// Step 5
 		const configPath = join(workspacesDir, ".cyrus", "config.json");
 		const written = JSON.parse(readFileSync(configPath, "utf-8"));
 		expect(EdgeConfigSchema.safeParse(written).success).toBe(true);
-		// Step 5
-		expect(readFileSync(join(homeDir, ".git-credentials"), "utf-8")).toContain(
-			"tok-xyz",
-		);
 		// Step 7
 		expect(spawnFn).toHaveBeenCalledWith(
 			process.execPath,

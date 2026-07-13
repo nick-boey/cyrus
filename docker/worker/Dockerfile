@@ -36,5 +36,8 @@ COPY --from=build /out /app
 COPY docker/worker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 USER cyrus
-VOLUME /workspaces
+# No `VOLUME /workspaces` here: LocalDockerProvider always mounts a named
+# volume at this path itself, and a `VOLUME` directive would additionally
+# cause an anonymous volume to be created on any hand-run `docker run`
+# without `-v` — never what we want.
 ENTRYPOINT ["/entrypoint.sh"]

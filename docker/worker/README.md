@@ -57,7 +57,7 @@ happens when a container restarts after being stopped mid-session.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GIT_TOKEN` | (none — anonymous clone) | GitHub token embedded in the clone URL and written to `~/.git-credentials` for push/PR access. Public repos work without it. |
+| `GIT_TOKEN` | (none — anonymous clone) | GitHub token written to `~/.git-credentials` (mode 0600) and used via `credential.helper store` for cloning, pushing, and PR access. Never embedded in a clone URL, so it never lands in `.git/config`. Public repos work without it. |
 | `GIT_USER_NAME` | `Cyrus` | `git config --global user.name`. |
 | `GIT_USER_EMAIL` | `cyrus@localhost` | `git config --global user.email`. |
 | `DOTFILES_REPO` | (none) | Git URL cloned to `~/dotfiles`; its `install.sh` is run if present. Failures are logged and do not block boot. |

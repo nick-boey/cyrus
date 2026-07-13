@@ -43,6 +43,22 @@ export function findMissingEnvVars(env: NodeJS.ProcessEnv): string[] {
 	return REQUIRED_ENV_VARS.filter((key) => !env[key]);
 }
 
+/**
+ * `CYRUS_ISSUE_KEY` crosses an env-var boundary here and is then interpolated
+ * unencoded into filesystem paths and the artifact URL
+ * (`${httpBase}/artifacts/issues/${issueKey}/bundle`). Mirrors the router's
+ * own gate (`ISSUE_KEY_RE` in `packages/router/src/artifacts.ts` and
+ * `ContainerTargets.ts`) so a malformed key is rejected here, at the one
+ * place it enters the container, instead of failing deep inside a later
+ * fetch with a 400 from the router.
+ */
+export const ISSUE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+/** Validates `CYRUS_ISSUE_KEY` against {@link ISSUE_KEY_PATTERN}. */
+export function isValidIssueKey(key: string): boolean {
+	return ISSUE_KEY_PATTERN.test(key);
+}
+
 const RepoSpecSchema = z.object({
 	name: z.string().min(1),
 	githubSlug: z.string().min(1),
@@ -75,17 +91,32 @@ export type ExecFn = (
 	args: string[],
 ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
 
-const defaultExec: ExecFn = (cmd, args) =>
+export const defaultExec: ExecFn = (cmd, args) =>
 	new Promise((resolve) => {
 		execFile(
 			cmd,
 			args,
 			{ maxBuffer: 8 * 1024 * 1024 },
 			(err, stdout, stderr) => {
+				let stderrStr = stderr?.toString() ?? "";
+				// A spawn-level failure (e.g. ENOENT when the binary itself is
+				// missing from the image) never touches the child's stderr, so
+				// `stderrStr` is empty and the caller's thrown error loses the
+				// cause entirely. Fold the underlying error's own message in so
+				// a broken image is diagnosable instead of producing e.g.
+				// "git clone failed for repo1: " with nothing after the colon.
+				if (err && !stderrStr) {
+					stderrStr = err.message;
+				}
+				const exitCode = err
+					? typeof (err as { code?: unknown }).code === "number"
+						? ((err as { code: number }).code as number)
+						: 1
+					: 0;
 				resolve({
 					stdout: stdout?.toString() ?? "",
-					stderr: stderr?.toString() ?? "",
-					exitCode: err ? ((err as { code?: number }).code ?? 1) : 0,
+					stderr: stderrStr,
+					exitCode,
 				});
 			},
 		);
@@ -182,13 +213,21 @@ export class ContainerBootCommand implements ICommand {
 			return;
 		}
 
+		const issueKey = this.env.CYRUS_ISSUE_KEY as string;
+		if (!isValidIssueKey(issueKey)) {
+			this.logger.error(
+				`CYRUS_ISSUE_KEY is invalid: ${JSON.stringify(issueKey)} does not match ${ISSUE_KEY_PATTERN}`,
+			);
+			process.exit(1);
+			return;
+		}
+
 		const workspacesDir =
 			this.env.CYRUS_WORKSPACES_DIR ?? DEFAULT_WORKSPACES_DIR;
 		const repoCacheDir =
 			this.env.CYRUS_REPO_CACHE_DIR ?? DEFAULT_REPO_CACHE_DIR;
 		const routerUrl = this.env.CYRUS_ROUTER_URL as string;
 		const deviceToken = this.env.CYRUS_DEVICE_TOKEN as string;
-		const issueKey = this.env.CYRUS_ISSUE_KEY as string;
 		const gitToken = this.env.GIT_TOKEN;
 
 		let repos: RepoSpec[];
@@ -209,13 +248,19 @@ export class ContainerBootCommand implements ICommand {
 			deviceToken,
 			issueKey,
 		});
-		await this.cloneRepos({ workspacesDir, repoCacheDir, repos, gitToken });
-		this.writeConfig({ workspacesDir, routerUrl, deviceToken, repos });
+		// configureGit MUST run before cloneRepos: it installs the credential
+		// helper that authenticates the clone, so the clone URL itself never
+		// needs (and never gets) GIT_TOKEN embedded in it. That keeps the
+		// token out of `.git/config` on the durable volume, where it would
+		// otherwise resurface in `git fetch` failures and any `git remote -v`
+		// Claude runs inside the worktree (both logged/posted to Linear).
 		await this.configureGit({
 			gitUserName: this.env.GIT_USER_NAME ?? "Cyrus",
 			gitUserEmail: this.env.GIT_USER_EMAIL ?? "cyrus@localhost",
 			gitToken,
 		});
+		await this.cloneRepos({ workspacesDir, repoCacheDir, repos, gitToken });
+		this.writeConfig({ workspacesDir, routerUrl, deviceToken, repos });
 		await this.applyDotfiles({ dotfilesRepo: this.env.DOTFILES_REPO });
 		this.launch({ cyrusHome: this.cyrusHomeFor(workspacesDir) });
 	}
@@ -320,14 +365,32 @@ export class ContainerBootCommand implements ICommand {
 	}
 
 	/**
-	 * Step 3: clone every configured repo, skipping any that already have a
-	 * `.git` dir (idempotent on a warm volume). Uses `--reference-if-able`
-	 * against a local cache dir to speed up repeat clones across containers;
-	 * git silently ignores that flag when the cache doesn't exist/isn't
-	 * usable, so it's always safe to pass. With `GIT_TOKEN` set, the token is
-	 * embedded in the clone URL (`x-access-token:<token>@github.com`) and
-	 * never otherwise logged; without it, the clone is anonymous (public
-	 * repos only).
+	 * Step 4: clone every configured repo. Never embeds `GIT_TOKEN` in the
+	 * clone URL — `configureGit()` has already run (see `execute()`) and
+	 * installed a credential helper, which is sufficient to authenticate the
+	 * clone on its own. This matters because git stores the clone URL
+	 * *verbatim* as `remote.origin.url` in `.git/config` on the durable
+	 * volume: an embedded token there would resurface in `git fetch`
+	 * failures and in any `git remote -v` Claude runs inside the worktree
+	 * (both end up logged / posted to Linear as activity).
+	 *
+	 * A repo is skipped as "already cloned" only when it's actually usable
+	 * (`.git` exists AND `git rev-parse --verify HEAD` succeeds) — not
+	 * merely when `.git` exists. `git clone` creates `.git` at the *start*
+	 * of the transfer, so a container killed mid-clone (the longest step of
+	 * a cold boot) leaves a `.git` dir with no HEAD/worktree behind. Gating
+	 * on `.git` alone would make that state permanent: every future boot
+	 * would see `.git`, skip the clone, and hand `GitService` a broken repo
+	 * forever. A repo present but unusable is removed and re-cloned instead.
+	 *
+	 * Regardless of which path was taken, `remote.origin.url` is healed back
+	 * to the clean (tokenless) URL afterward — belt and braces for a warm
+	 * volume that was cloned by an older version of this code with the
+	 * token embedded.
+	 *
+	 * Uses `--reference-if-able` against a local cache dir to speed up
+	 * repeat clones across containers; git silently ignores that flag when
+	 * the cache doesn't exist/isn't usable, so it's always safe to pass.
 	 */
 	async cloneRepos(opts: {
 		workspacesDir: string;
@@ -337,14 +400,21 @@ export class ContainerBootCommand implements ICommand {
 	}): Promise<void> {
 		for (const repo of opts.repos) {
 			const repoDir = join(opts.workspacesDir, "repos", repo.name);
-			if (existsSync(join(repoDir, ".git"))) {
+			const cloneUrl = `https://github.com/${repo.githubSlug}.git`;
+
+			if (await this.isUsableClone(repoDir)) {
 				this.logger.info(`${repo.name}: already cloned, skipping.`);
+				await this.healRemoteUrl(repoDir, cloneUrl, opts.gitToken);
 				continue;
 			}
 
-			const cloneUrl = opts.gitToken
-				? `https://x-access-token:${opts.gitToken}@github.com/${repo.githubSlug}.git`
-				: `https://github.com/${repo.githubSlug}.git`;
+			if (existsSync(repoDir)) {
+				this.logger.warn(
+					`${repo.name}: existing clone at ${repoDir} has no usable HEAD (likely an interrupted clone) — removing and re-cloning.`,
+				);
+				rmSync(repoDir, { recursive: true, force: true });
+			}
+
 			const cacheDir = join(opts.repoCacheDir, `${repo.name}.git`);
 
 			const { exitCode, stderr } = await this.exec("git", [
@@ -360,6 +430,46 @@ export class ContainerBootCommand implements ICommand {
 				);
 			}
 			this.logger.info(`${repo.name}: cloned.`);
+			await this.healRemoteUrl(repoDir, cloneUrl, opts.gitToken);
+		}
+	}
+
+	/** True iff `repoDir` is a git repo with a resolvable HEAD — i.e. a complete clone, not one interrupted mid-transfer. */
+	private async isUsableClone(repoDir: string): Promise<boolean> {
+		if (!existsSync(join(repoDir, ".git"))) return false;
+		const { exitCode } = await this.exec("git", [
+			"-C",
+			repoDir,
+			"rev-parse",
+			"--verify",
+			"HEAD",
+		]);
+		return exitCode === 0;
+	}
+
+	/**
+	 * Forces `remote.origin.url` back to the clean (tokenless) URL. Belt and
+	 * braces for warm volumes cloned by an older version of this code that
+	 * embedded `GIT_TOKEN` in the clone URL — self-heals on the next boot
+	 * without requiring the volume to be destroyed.
+	 */
+	private async healRemoteUrl(
+		repoDir: string,
+		cleanUrl: string,
+		gitToken?: string,
+	): Promise<void> {
+		const { exitCode, stderr } = await this.exec("git", [
+			"-C",
+			repoDir,
+			"remote",
+			"set-url",
+			"origin",
+			cleanUrl,
+		]);
+		if (exitCode !== 0) {
+			this.logger.warn(
+				`${repoDir}: failed to heal remote.origin.url: ${this.redact(stderr, gitToken)}`,
+			);
 		}
 	}
 
@@ -383,7 +493,7 @@ export class ContainerBootCommand implements ICommand {
 	}
 
 	/**
-	 * Step 4: writes `<cyrusHome>/config.json`, validated against the real
+	 * Step 5: writes `<cyrusHome>/config.json`, validated against the real
 	 * `EdgeConfigSchema`/`RepositoryConfigSchema` (not just the brief's example
 	 * shape) so a malformed `CYRUS_REPOS_JSON` entry fails loudly here rather
 	 * than producing a config the edge worker silently can't load. Written
@@ -427,11 +537,13 @@ export class ContainerBootCommand implements ICommand {
 	}
 
 	/**
-	 * Step 5: global git identity + (when `GIT_TOKEN` is set) a credential
-	 * helper so subsequent git operations (push, PR creation) authenticate
-	 * without re-embedding the token. `~/.git-credentials` holds a live
-	 * bearer credential, so it is written at mode 0600 and re-chmod'd on
-	 * every boot in case an image/volume default umask is looser.
+	 * Step 3: global git identity + (when `GIT_TOKEN` is set) a credential
+	 * helper so subsequent git operations (clone, push, PR creation)
+	 * authenticate without ever embedding the token in a URL.
+	 * `~/.git-credentials` holds a live bearer credential, so it is written
+	 * at mode 0600 and re-chmod'd on every boot in case an image/volume
+	 * default umask is looser. Runs *before* `cloneRepos()` — see the note
+	 * there for why that ordering is load-bearing.
 	 */
 	async configureGit(opts: {
 		gitUserName: string;
@@ -472,9 +584,18 @@ export class ContainerBootCommand implements ICommand {
 	 * Step 6: best-effort dotfiles application. Any failure (clone or
 	 * install.sh) is logged as a warning and swallowed — a broken dotfiles
 	 * repo must never prevent the container from booting.
+	 *
+	 * `DOTFILES_REPO` commonly takes the form
+	 * `https://<pat>@github.com/me/dotfiles` — a PAT embedded directly in the
+	 * URL, distinct from `GIT_TOKEN`. A failed clone's stderr echoes that URL
+	 * back verbatim (git's `fatal: unable to access '<url>'`), so the
+	 * credential is extracted from the URL and redacted before it can reach
+	 * the warning log.
 	 */
 	async applyDotfiles(opts: { dotfilesRepo?: string }): Promise<void> {
 		if (!opts.dotfilesRepo) return;
+
+		const embeddedCredential = this.extractUrlCredential(opts.dotfilesRepo);
 
 		try {
 			const dotfilesDir = join(this.homeDir, "dotfiles");
@@ -485,7 +606,9 @@ export class ContainerBootCommand implements ICommand {
 					dotfilesDir,
 				]);
 				if (exitCode !== 0) {
-					throw new Error(`git clone failed: ${stderr}`);
+					throw new Error(
+						`git clone failed: ${this.redact(stderr, embeddedCredential)}`,
+					);
 				}
 			}
 
@@ -493,7 +616,9 @@ export class ContainerBootCommand implements ICommand {
 			if (existsSync(installScript)) {
 				const { exitCode, stderr } = await this.exec("sh", [installScript]);
 				if (exitCode !== 0) {
-					throw new Error(`install.sh exited ${exitCode}: ${stderr}`);
+					throw new Error(
+						`install.sh exited ${exitCode}: ${this.redact(stderr, embeddedCredential)}`,
+					);
 				}
 			}
 		} catch (error) {
@@ -501,6 +626,17 @@ export class ContainerBootCommand implements ICommand {
 				`applyDotfiles failed, continuing without it: ${(error as Error).message}`,
 			);
 		}
+	}
+
+	/**
+	 * Extracts a `user[:pass]`-style credential embedded in a URL's authority
+	 * component (e.g. the `<pat>` in `https://<pat>@github.com/...`), so it
+	 * can be passed to {@link redact}. Returns `undefined` when the URL has
+	 * no embedded credential or isn't a URL at all.
+	 */
+	private extractUrlCredential(url: string): string | undefined {
+		const match = url.match(/^[a-zA-Z][a-zA-Z\d+.-]*:\/\/([^@/]+)@/);
+		return match?.[1];
 	}
 
 	/**
