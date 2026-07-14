@@ -3,6 +3,8 @@ import {
 	type AgentSessionCreatedWebhook,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
+	isIssueDeletedWebhook,
+	isIssueStateChangeWebhook,
 	type Webhook,
 } from "cyrus-core";
 import type { SessionStateFrame } from "cyrus-router-protocol";
@@ -128,8 +130,80 @@ export class EventRouter {
 			await this.routeCreated(webhook);
 			return;
 		}
+		// Terminal-state webhooks carry no agent session, so they route on issue
+		// affinity rather than through resolveTarget(). The device needs them to
+		// run its own terminal-state cleanup (stop sessions, cyrus-teardown.sh,
+		// remove worktrees) — without this forwarding a node's worktrees are
+		// never reclaimed, since the node has no other way to learn an issue
+		// closed. See EdgeWorker.handleIssueStateChangeMessage.
+		if (isIssueStateChangeWebhook(webhook)) {
+			this.routeIssueTerminal(webhook, webhook.notification?.issue);
+			return;
+		}
+		if (isIssueDeletedWebhook(webhook)) {
+			this.routeIssueTerminal(webhook, webhook.data);
+			return;
+		}
 		this.logger.info(
 			`EventRouter ignoring non-agent-session webhook ${webhook.type}/${webhook.action}`,
+		);
+	}
+
+	/**
+	 * Forwards a terminal-state webhook (issue completed/canceled, or issue
+	 * deleted) to the device that owns the issue, so it can reclaim the
+	 * worktree.
+	 *
+	 * Routes on `issue_affinity` — the only mapping that survives the session
+	 * ending. Session affinity and the issue lock are both torn down the moment
+	 * a session reports a terminal `session_state`, which for a typical issue
+	 * happens well BEFORE the human moves it to Done. Issue affinity is only
+	 * purged when the device itself is removed, so it still points at the right
+	 * machine days later — which is exactly the window this cleanup lives in.
+	 *
+	 * No Linear activity is posted on the failure paths: a status change is not
+	 * an agent session, so there is no thread to post to.
+	 */
+	private routeIssueTerminal(
+		webhook: Webhook,
+		issue: { id?: string; identifier?: string } | null | undefined,
+	): void {
+		const label = `${webhook.type}/${webhook.action}`;
+		const issueId = issue?.id;
+		if (!issueId) {
+			this.logger.warn(
+				`Terminal webhook ${label} carries no issue id; cannot route cleanup`,
+			);
+			return;
+		}
+		const issueRef = issue?.identifier ?? issueId;
+
+		const deviceId = this.store.getIssueAffinity(issueId);
+		if (deviceId === undefined) {
+			// No device ever ran a session for this issue, so no device holds a
+			// worktree for it. Nothing to clean up — not an error.
+			this.logger.info(
+				`Terminal webhook ${label} for issue ${issueRef}: no device affinity, nothing to clean up`,
+			);
+			return;
+		}
+
+		// Enqueue unconditionally rather than only when online: the worktree
+		// still needs reclaiming when the device comes back, and pendingEvents
+		// replays anything unacked on reconnect. Cleanup is idempotent on the
+		// node (deleteWorktree no-ops when the directory is already gone), so a
+		// duplicate delivery is harmless.
+		this.store.enqueueEvent(
+			deviceId,
+			JSON.stringify(webhook),
+			this.now(),
+			this.config.eventTtlMs,
+		);
+		if (this.gateway.isOnline(deviceId)) {
+			this.gateway.deliverPending(deviceId);
+		}
+		this.logger.info(
+			`Forwarded terminal webhook ${label} for issue ${issueRef} to device ${deviceId} for worktree cleanup`,
 		);
 	}
 

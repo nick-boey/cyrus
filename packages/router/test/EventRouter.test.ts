@@ -72,6 +72,48 @@ function promptedEvent(opts: {
 	} as unknown as AgentEvent;
 }
 
+/**
+ * Minimal object that satisfies isIssueStateChangeWebhook. Linear sends this
+ * (as an AppUserNotification) when an issue reaches a terminal state; the node
+ * turns it into the IssueStateChangeMessage that drives worktree cleanup.
+ */
+function issueStatusChangedEvent(opts: {
+	issueId: string;
+	identifier?: string;
+	organizationId?: string;
+}): AgentEvent {
+	return {
+		type: "AppUserNotification",
+		action: "issueStatusChanged",
+		organizationId: opts.organizationId ?? "ws-1",
+		createdAt: new Date(ROUTE_NOW).toISOString(),
+		notification: {
+			issue: {
+				id: opts.issueId,
+				identifier: opts.identifier ?? "TEST-1",
+			},
+		},
+	} as unknown as AgentEvent;
+}
+
+/** Minimal object that satisfies isIssueDeletedWebhook (a deleted issue is terminal too). */
+function issueDeletedEvent(opts: {
+	issueId: string;
+	identifier?: string;
+	organizationId?: string;
+}): AgentEvent {
+	return {
+		type: "Issue",
+		action: "remove",
+		organizationId: opts.organizationId ?? "ws-1",
+		createdAt: new Date(ROUTE_NOW).toISOString(),
+		data: {
+			id: opts.issueId,
+			identifier: opts.identifier ?? "TEST-1",
+		},
+	} as unknown as AgentEvent;
+}
+
 function enroll(
 	store: RouterStore,
 	email: string,
@@ -625,5 +667,177 @@ describe("EventRouter issue promotion to a started state", () => {
 		await router.route(createdEvent({ sessionId: "sess-1", creator: ALICE }));
 
 		expect(moveIssueToStartedState).not.toHaveBeenCalled();
+	});
+
+	describe("terminal-state webhooks (worktree cleanup)", () => {
+		it("forwards an issueStatusChanged webhook to the device holding the issue", async () => {
+			const deviceId = enroll(store, "alice@example.com", {
+				linearId: ALICE.id,
+			});
+			const { router, gateway } = makeRouter(store, {
+				gateway: {
+					isOnline: () => true,
+					deliverPending: vi.fn<(deviceId: number) => void>(),
+				},
+			});
+
+			// Establish issue affinity the same way real traffic does.
+			await router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "issue-1",
+					creator: ALICE,
+				}),
+			);
+			const queuedBefore = store.pendingEvents(deviceId, 0, ROUTE_NOW).length;
+
+			await router.route(issueStatusChangedEvent({ issueId: "issue-1" }));
+
+			const pending = store.pendingEvents(deviceId, 0, ROUTE_NOW);
+			expect(pending).toHaveLength(queuedBefore + 1);
+			const forwarded = JSON.parse(
+				pending[pending.length - 1].payloadJson,
+			) as Record<string, unknown>;
+			expect(forwarded.type).toBe("AppUserNotification");
+			expect(forwarded.action).toBe("issueStatusChanged");
+			expect(gateway.deliverPending).toHaveBeenCalledWith(deviceId);
+		});
+
+		it("forwards an Issue/remove webhook to the device holding the issue", async () => {
+			const deviceId = enroll(store, "alice@example.com", {
+				linearId: ALICE.id,
+			});
+			const { router } = makeRouter(store);
+
+			await router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "issue-1",
+					creator: ALICE,
+				}),
+			);
+			const queuedBefore = store.pendingEvents(deviceId, 0, ROUTE_NOW).length;
+
+			await router.route(issueDeletedEvent({ issueId: "issue-1" }));
+
+			const pending = store.pendingEvents(deviceId, 0, ROUTE_NOW);
+			expect(pending).toHaveLength(queuedBefore + 1);
+			const forwarded = JSON.parse(
+				pending[pending.length - 1].payloadJson,
+			) as Record<string, unknown>;
+			expect(forwarded.type).toBe("Issue");
+			expect(forwarded.action).toBe("remove");
+		});
+
+		it("still forwards after the session ended, when only issue affinity remains", async () => {
+			// The real-world case: a session completes (releasing its lock and
+			// session affinity) hours before a human moves the issue to Done.
+			// Only issue_affinity survives that gap — cleanup must route on it.
+			const deviceId = enroll(store, "alice@example.com", {
+				linearId: ALICE.id,
+			});
+			const { router } = makeRouter(store);
+
+			await router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "issue-1",
+					creator: ALICE,
+				}),
+			);
+			router.handleSessionState(deviceId, {
+				type: "session_state",
+				sessionId: "sess-1",
+				state: "complete",
+			} as never);
+			expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+			const queuedBefore = store.pendingEvents(deviceId, 0, ROUTE_NOW).length;
+
+			await router.route(issueStatusChangedEvent({ issueId: "issue-1" }));
+
+			expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(
+				queuedBefore + 1,
+			);
+		});
+
+		it("queues the cleanup for an offline device instead of dropping it", async () => {
+			const deviceId = enroll(store, "alice@example.com", {
+				linearId: ALICE.id,
+			});
+			const { router, gateway } = makeRouter(store); // isOnline: () => false
+
+			await router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "issue-1",
+					creator: ALICE,
+				}),
+			);
+			const queuedBefore = store.pendingEvents(deviceId, 0, ROUTE_NOW).length;
+
+			await router.route(issueStatusChangedEvent({ issueId: "issue-1" }));
+
+			// Queued for replay on reconnect; no delivery attempted while offline.
+			expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(
+				queuedBefore + 1,
+			);
+			expect(gateway.deliverPending).not.toHaveBeenCalled();
+		});
+
+		it("does not post a Linear activity for terminal webhooks (no session thread to post to)", async () => {
+			enroll(store, "alice@example.com", { linearId: ALICE.id });
+			const { router, postActivity } = makeRouter(store);
+
+			await router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "issue-1",
+					creator: ALICE,
+				}),
+			);
+			postActivity.mockClear();
+
+			await router.route(issueStatusChangedEvent({ issueId: "issue-1" }));
+
+			expect(postActivity).not.toHaveBeenCalled();
+		});
+
+		it("drops a terminal webhook for an issue no device ever worked", async () => {
+			const deviceId = enroll(store, "alice@example.com", {
+				linearId: ALICE.id,
+			});
+			const { router } = makeRouter(store);
+
+			await router.route(issueStatusChangedEvent({ issueId: "issue-unknown" }));
+
+			expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(0);
+		});
+
+		it("drops a terminal webhook carrying no issue id", async () => {
+			const deviceId = enroll(store, "alice@example.com", {
+				linearId: ALICE.id,
+			});
+			const { router } = makeRouter(store);
+
+			await router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "issue-1",
+					creator: ALICE,
+				}),
+			);
+			const queuedBefore = store.pendingEvents(deviceId, 0, ROUTE_NOW).length;
+
+			await router.route({
+				type: "AppUserNotification",
+				action: "issueStatusChanged",
+				organizationId: "ws-1",
+				notification: {},
+			} as unknown as AgentEvent);
+
+			expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(
+				queuedBefore,
+			);
+		});
 	});
 });
