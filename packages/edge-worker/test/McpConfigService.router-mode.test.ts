@@ -3,11 +3,15 @@ import { describe, expect, it } from "vitest";
 import { McpConfigService } from "../src/McpConfigService.js";
 
 /**
- * Task 12 / Codex finding 6 — in router mode the device has no Linear token,
- * so `getLinearTokenForWorkspace` returns null. cyrus-tools must still be
- * exposed (backed by the tracker interface), while the token-authenticated
- * official Linear MCP server must NOT be emitted (users install the Linear MCP
- * locally with their own OAuth — the "two planes" split).
+ * Task 12 / Codex finding 6 — by default in router mode the device holds no
+ * Linear token, so `getLinearTokenForWorkspace` returns null. cyrus-tools must
+ * still be exposed (backed by the tracker interface), while the
+ * token-authenticated official Linear MCP server must NOT be emitted (users
+ * install the Linear MCP locally with their own OAuth — the "two planes"
+ * split). UNLESS an operator provisions a static per-user Linear token
+ * (LINEAR_API_TOKEN → linearWorkspaces) for a container, in which case
+ * `getLinearTokenForWorkspace` returns it and the Linear MCP server IS
+ * emitted — see the positive test below.
  */
 
 function makeTracker(metadata: Record<string, unknown>): IIssueTrackerService {
