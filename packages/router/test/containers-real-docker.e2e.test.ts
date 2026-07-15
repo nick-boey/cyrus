@@ -168,5 +168,77 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 			);
 			expect(vols).toContain(containerName);
 		}, 120_000);
+
+		it("stale-destroy removes the container AND its volume", async () => {
+			// Reuses the container booted in the previous test (or re-boots one).
+			// Scoped provider — this sweep()'s orphan GC must not reach beyond our key.
+			const lifecycle = new ContainerLifecycle({
+				store: server.store,
+				executors: new Map([
+					[
+						"docker",
+						scopedProvider(
+							new LocalDockerProvider({ image: IMAGE }),
+							new Set([issueKey]),
+						),
+					],
+				]),
+				idleStopMs: IDLE_STOP_MS,
+				staleDestroyMs: STALE_DESTROY_MS,
+				logger: { info: () => {}, warn: () => {} },
+				now: () => Date.now() + STALE_DESTROY_MS + 5_000,
+			});
+			await lifecycle.sweep();
+			await vi.waitFor(
+				() => expect(containerState(containerName)).toBe("absent"),
+				{ timeout: 40_000 },
+			);
+			const vols = execFileSync(
+				"docker",
+				["volume", "ls", "-q", "-f", `name=${containerName}`],
+				{ encoding: "utf-8" },
+			);
+			expect(vols.trim()).toBe("");
+		}, 120_000);
+
+		it.skipIf(!dedicatedDaemonOptIn())(
+			"orphan GC destroys a labelled container with no device row (DEDICATED DAEMON ONLY)",
+			async () => {
+				// Create a container carrying the cyrus.issue label but NO store device row.
+				const orphanKey = runScopedIssueKey("CYORPH");
+				const orphanName = `cyrus-issue-${orphanKey}`;
+				execFileSync("docker", [
+					"run",
+					"-d",
+					"--name",
+					orphanName,
+					"--label",
+					`cyrus.issue=${orphanKey}`,
+					IMAGE,
+					"sleep",
+					"600",
+				]);
+				try {
+					const lifecycle = new ContainerLifecycle({
+						store: server.store,
+						executors: new Map([
+							["docker", new LocalDockerProvider({ image: IMAGE })],
+						]),
+						idleStopMs: IDLE_STOP_MS,
+						staleDestroyMs: STALE_DESTROY_MS,
+						logger: { info: () => {}, warn: () => {} },
+						now: () => Date.now(),
+					});
+					await lifecycle.sweep();
+					await vi.waitFor(
+						() => expect(containerState(orphanName)).toBe("absent"),
+						{ timeout: 40_000 },
+					);
+				} finally {
+					removeContainerAndVolume(orphanName);
+				}
+			},
+			120_000,
+		);
 	},
 );
