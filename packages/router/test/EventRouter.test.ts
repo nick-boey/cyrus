@@ -1,9 +1,18 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentEvent } from "cyrus-core";
+import type {
+	ContainerExecutor,
+	IssueExecutionContext,
+} from "cyrus-router-executors";
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import { ContainerTargetService } from "../src/ContainerTargets.js";
 import { EventRouter } from "../src/EventRouter.js";
 import {
 	expiredMessage,
 	fillTemplate,
+	INVALID_ISSUE_KEY_MESSAGE,
 	ISSUE_LOCKED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
@@ -12,6 +21,7 @@ import {
 	UNENROLLED_CREATOR_MESSAGE,
 } from "../src/messages.js";
 import { RouterStore } from "../src/RouterStore.js";
+import { SecretStore } from "../src/SecretStore.js";
 
 const ROUTE_NOW = 1_000_000;
 const TTL_MS = 60_000;
@@ -26,6 +36,8 @@ interface Creator {
 function createdEvent(opts: {
 	sessionId: string;
 	issueId?: string;
+	/** The issue's human-readable key, e.g. "CYPACK-1" (drives container issueKey resolution). */
+	identifier?: string;
 	creator?: Creator;
 	organizationId?: string;
 	parentIssueId?: string;
@@ -40,11 +52,58 @@ function createdEvent(opts: {
 			organizationId: org,
 			issueId: opts.issueId,
 			issue: opts.issueId
-				? { id: opts.issueId, parentId: opts.parentIssueId }
+				? {
+						id: opts.issueId,
+						identifier: opts.identifier,
+						parentId: opts.parentIssueId,
+					}
 				: undefined,
 			creator: opts.creator,
 		},
 	} as unknown as AgentEvent;
+}
+
+/** Minimal fake ContainerExecutor whose ensureRunning is an inspectable mock. */
+function fakeExecutor(
+	provider: string,
+	overrides?: { ensureRunning?: Mock },
+): ContainerExecutor & { ensureRunning: Mock } {
+	return {
+		provider,
+		ensureRunning:
+			overrides?.ensureRunning ??
+			vi.fn<(ctx: IssueExecutionContext) => Promise<void>>(async () => {}),
+		destroy: vi.fn(async () => {}),
+		stop: vi.fn(async () => {}),
+		status: vi.fn(async () => "running" as const),
+		listManaged: vi.fn(async () => []),
+	};
+}
+
+/** A real ContainerTargetService over the same store, backed by a fake executor. */
+function makeContainerTargets(
+	store: RouterStore,
+	overrides?: { executor?: ReturnType<typeof fakeExecutor> },
+) {
+	const secrets = new SecretStore(
+		join(mkdtempSync(join(tmpdir(), "event-router-secrets-")), "secrets.json"),
+	);
+	const postActivity = vi.fn<
+		(workspaceId: string, agentSessionId: string, body: string) => Promise<void>
+	>(async () => {});
+	const executor = overrides?.executor ?? fakeExecutor("docker");
+	const containerTargets = new ContainerTargetService({
+		store,
+		secrets,
+		executors: new Map([["docker", executor]]),
+		containersConfig: {
+			routerUrlForContainers: "wss://router.example.com",
+			repositories: [],
+		},
+		postActivity,
+		logger: { info: () => {}, warn: () => {} },
+	});
+	return { containerTargets, executor, secrets, postActivity };
 }
 
 /** Minimal object that satisfies isAgentSessionPromptedWebhook + fields we read. */
@@ -53,6 +112,14 @@ function promptedEvent(opts: {
 	actorUserId?: string;
 	creator?: Creator;
 	issueId?: string;
+	/**
+	 * The issue's human-readable key, e.g. "CYPACK-1" (drives container
+	 * issueKey resolution). Omit to model a webhook whose `agentSession.issue`
+	 * carries no `identifier` at all (`issue` itself is `Maybe<...>` on the
+	 * real Linear payload type, so this is a real, not merely theoretical,
+	 * shape) — see the "fails closed" tests below.
+	 */
+	identifier?: string;
 	organizationId?: string;
 }): AgentEvent {
 	const org = opts.organizationId ?? "ws-1";
@@ -67,6 +134,9 @@ function promptedEvent(opts: {
 			id: opts.sessionId,
 			organizationId: org,
 			issueId: opts.issueId,
+			issue: opts.issueId
+				? { id: opts.issueId, identifier: opts.identifier }
+				: undefined,
 			creator: opts.creator,
 		},
 	} as unknown as AgentEvent;
@@ -93,6 +163,7 @@ function makeRouter(
 	store: RouterStore,
 	overrides?: {
 		gateway?: Gateway;
+		containerTargets?: ContainerTargetService;
 		config?: Partial<{
 			eventTtlMs: number;
 			issueLock: boolean;
@@ -116,6 +187,7 @@ function makeRouter(
 		gateway,
 		postActivity,
 		moveIssueToStartedState,
+		containerTargets: overrides?.containerTargets,
 		config: {
 			eventTtlMs: TTL_MS,
 			issueLock: true,
@@ -514,6 +586,245 @@ describe("EventRouter", () => {
 	});
 });
 
+describe("EventRouter container routing", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	const DAVE: Creator = {
+		id: "lin-dave",
+		email: "dave@example.com",
+		name: "Dave",
+	};
+
+	it("(h) routes a created event for a container-executor user to the issue's container device and skips the offline notice", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets, executor, secrets } = makeContainerTargets(store);
+		// A genuine claudeOauthToken so boot() actually reaches ensureRunning
+		// (a boot-failure notice is a separate, already-covered concern).
+		secrets.set("dave@example.com", "claudeOauthToken", "tok-1");
+		const bootSpy = vi.spyOn(containerTargets, "boot");
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await router.route(
+			createdEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				identifier: "CYPACK-1",
+				creator: DAVE,
+			}),
+		);
+
+		const device = store.getContainerDeviceForIssue("CYPACK-1");
+		expect(device).toMatchObject({ provider: "docker" });
+		expect(
+			store.pendingEvents(device?.deviceId ?? -1, 0, ROUTE_NOW),
+		).toHaveLength(1);
+		expect(bootSpy).toHaveBeenCalledWith(device?.deviceId, {
+			workspaceId: "ws-1",
+			sessionId: "sess-1",
+		});
+		// A cold boot is expected, not an outage: the offline notice must never fire.
+		expect(postActivity).not.toHaveBeenCalled();
+
+		await vi.waitFor(() =>
+			expect(executor.ensureRunning).toHaveBeenCalledTimes(1),
+		);
+	});
+
+	it("(i) falls through and heals when session affinity points at a deleted container device", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets, secrets } = makeContainerTargets(store);
+		secrets.set("dave@example.com", "claudeOauthToken", "tok-1");
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		// Session affinity points at a device id that was never created (as if
+		// its container had since been destroyed and the row removed).
+		store.setSessionAffinity("sess-1", 999_999);
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				identifier: "ISS-1",
+				actorUserId: "lin-dave",
+				creator: DAVE,
+			}),
+		);
+
+		// Re-resolved via the creator chain into a fresh container device, not
+		// left pointing at the deleted id — and the caller is told nothing was
+		// unroutable.
+		const device = store.getContainerDeviceForIssue("ISS-1");
+		expect(device).toBeDefined();
+		expect(store.getSessionAffinity("sess-1")).toBe(device?.deviceId);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
+	});
+
+	it("(j) keeps physical-device routing unchanged when containerTargets is not configured", async () => {
+		const deviceId = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		// executor_json exists and says "device" — with no containerTargets
+		// wired up at all, the container codepath must never even be
+		// consulted, and routing must be byte-identical to today.
+		store.setUserExecutor("alice@example.com", '{"type":"device"}');
+		const { router, postActivity } = makeRouter(store);
+
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(1);
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			offlineWaitingMessage("alice@example.com"),
+		);
+	});
+
+	it("(k) refuses to route a malformed issue key into the store instead of crashing or creating a broken container", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets } = makeContainerTargets(store);
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await expect(
+			router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "ISS-1",
+					identifier: "bad issue/key!",
+					creator: DAVE,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		// The gate refused: nothing was created in the store...
+		expect(store.listContainerDevices()).toHaveLength(0);
+		// ...and the router posts a message about the issue's identifier, NOT
+		// the unenrolled-creator message — Dave IS enrolled with a container
+		// executor, it's this issue's key that's the problem (Finding 4).
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: "bad issue/key!" }),
+		);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(UNENROLLED_CREATOR_MESSAGE, { userName: "Dave" }),
+		);
+	});
+
+	it("(l) posts the same invalid-issue-key message for a prompted event with a malformed identifier, not the generic unroutable message", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets } = makeContainerTargets(store);
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await expect(
+			router.route(
+				promptedEvent({
+					sessionId: "sess-1",
+					issueId: "ISS-1",
+					identifier: "bad issue/key!",
+					actorUserId: "lin-dave",
+					creator: DAVE,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(store.listContainerDevices()).toHaveLength(0);
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: "bad issue/key!" }),
+		);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
+	});
+
+	it("(m) fails closed for a created event whose webhook carries no issue identifier at all, instead of minting a container keyed by the UUID issueId", async () => {
+		// Regression test: extractIssueKey() used to fall back to `issueId` (or
+		// `sessionId`) when the webhook's `agentSession.issue.identifier` was
+		// missing. Both are Linear-internal UUIDs that pass ISSUE_KEY_RE fine,
+		// so the old code would silently create a container device keyed by a
+		// UUID the in-container edge worker's floor uploads (keyed by the
+		// human-readable `session.issue.identifier`) can never match — every
+		// floor upload for that container's life would 403, silently. The fix
+		// treats a missing identifier as an invalid issue key up front.
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets } = makeContainerTargets(store);
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await expect(
+			router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "11111111-2222-3333-4444-555555555555",
+					// identifier deliberately omitted.
+					creator: DAVE,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(store.listContainerDevices()).toHaveLength(0);
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, {
+				issueKey: "11111111-2222-3333-4444-555555555555",
+			}),
+		);
+	});
+
+	it("(n) fails closed for a prompted event whose webhook carries no issue identifier at all", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets } = makeContainerTargets(store);
+		const { router, postActivity } = makeRouter(store, { containerTargets });
+
+		await expect(
+			router.route(
+				promptedEvent({
+					sessionId: "sess-1",
+					issueId: "11111111-2222-3333-4444-555555555555",
+					// identifier deliberately omitted.
+					actorUserId: "lin-dave",
+					creator: DAVE,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(store.listContainerDevices()).toHaveLength(0);
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(INVALID_ISSUE_KEY_MESSAGE, {
+				issueKey: "11111111-2222-3333-4444-555555555555",
+			}),
+		);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
+	});
+});
+
 describe("EventRouter issue promotion to a started state", () => {
 	let store: RouterStore;
 
@@ -625,5 +936,99 @@ describe("EventRouter issue promotion to a started state", () => {
 		await router.route(createdEvent({ sessionId: "sess-1", creator: ALICE }));
 
 		expect(moveIssueToStartedState).not.toHaveBeenCalled();
+	});
+});
+
+describe("EventRouter dangling issue/parent affinity healing", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	it("heals a dangling issue-affinity row instead of routing into the void", async () => {
+		// No session affinity, no user enrolled that matches the creator, but a
+		// stale issue_affinity row pointing at a device_id that was never
+		// created — as if `revokeDevice` deleted the devices row (it does not
+		// purge issue_affinity; see RouterStore.revokeDevice).
+		store.setIssueAffinity("ISS-1", 999_999);
+		const { router, postActivity } = makeRouter(store);
+
+		// Before the fix this would resolve to { deviceId: 999_999, kind:
+		// "device" } and enqueueEvent() would throw "Unknown device: 999999",
+		// rejecting out of route() with no .catch() upstream (RouterServer) —
+		// an unhandled rejection that takes the whole router process down.
+		await expect(
+			router.route(
+				promptedEvent({
+					sessionId: "sess-1",
+					issueId: "ISS-1",
+					actorUserId: "lin-bob",
+					creator: BOB,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
+		// The stale row was cleared, not left dangling for the next event.
+		expect(store.getIssueAffinity("ISS-1")).toBeUndefined();
+	});
+
+	it("heals a dangling parent-issue-affinity row instead of routing into the void", async () => {
+		store.setIssueAffinity("ISS-parent", 999_999);
+		const { router, postActivity } = makeRouter(store);
+		const creator: Creator = {
+			id: "lin-x",
+			email: "x@example.com",
+			name: "X",
+		};
+
+		await expect(
+			router.route(
+				createdEvent({
+					sessionId: "sess-1",
+					issueId: "ISS-child",
+					parentIssueId: "ISS-parent",
+					creator,
+				}),
+			),
+		).resolves.toBeUndefined();
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			fillTemplate(UNENROLLED_CREATOR_MESSAGE, { userName: "X" }),
+		);
+		expect(store.getIssueAffinity("ISS-parent")).toBeUndefined();
+	});
+
+	it("re-resolves through a healthy issue-affinity row once it points at a live device (regression guard)", async () => {
+		// A live issue-affinity row must still work exactly as before — the
+		// healing branch must only fire when getDeviceInfo() is undefined.
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		store.setIssueAffinity("ISS-1", aliceDevice);
+		const { router, postActivity } = makeRouter(store);
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-new",
+				issueId: "ISS-1",
+				actorUserId: "lin-charlie",
+				creator: { id: "lin-charlie", email: "charlie@example.com", name: "C" },
+			}),
+		);
+
+		expect(store.pendingEvents(aliceDevice, 0, ROUTE_NOW)).toHaveLength(1);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-new",
+			PROMPT_UNROUTABLE_MESSAGE,
+		);
 	});
 });

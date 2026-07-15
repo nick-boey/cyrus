@@ -1,4 +1,4 @@
-import { execSync, spawn } from "node:child_process";
+import { execFile, execSync, spawn } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve as pathResolve } from "node:path";
+import { promisify } from "node:util";
 
 import type {
 	BaseBranchResolution,
@@ -88,6 +89,59 @@ interface NodeExecError {
 
 function isNodeExecError(value: unknown): value is NodeExecError {
 	return typeof value === "object" && value !== null;
+}
+
+/**
+ * Promisified `execFile` for the WIP-push path ({@link GitService.pushWipIfDirty}).
+ * Deliberately NOT `execSync`: that hot path now runs on every persistence-floor
+ * timer tick (every 5 minutes, per issue, per repo) while the agent may be
+ * concurrently running its own git commands in the same worktree — an
+ * `execSync` call blocks the entire Node event loop (webhook handling,
+ * activity streaming, the router WebSocket heartbeat, `WorkspaceSyncService`'s
+ * own shutdown timeout) for as long as the subprocess takes, which for a
+ * hanging `git push` against a slow/unreachable remote can be minutes.
+ * `execFile` spawns without blocking the JS thread, so a caller like
+ * `WorkspaceSyncService.stop()`'s `Promise.race` shutdown cap can actually
+ * preempt it.
+ */
+const execFileAsync = promisify(execFile);
+
+interface GitExecError extends Error {
+	stdout?: string;
+	stderr?: string;
+	code?: number | string | null;
+	signal?: string | null;
+}
+
+/**
+ * True when a git invocation failed because `.git/index.lock` (or the
+ * worktree-specific equivalent) is already held by another git process —
+ * i.e. genuine contention with a concurrently-running `git` command (the
+ * agent's own tooling, or another sync cycle that hasn't finished), not a
+ * real error. Detected from git's own stderr message rather than by
+ * computing the lock path ourselves, since the exact location varies between
+ * a plain repo and a linked worktree.
+ */
+function isIndexLockError(error: unknown): boolean {
+	const stderr = (error as GitExecError | undefined)?.stderr;
+	return typeof stderr === "string" && /index\.lock/.test(stderr);
+}
+
+/**
+ * True when a `git rev-list`/`rev-parse`-style invocation failed because the
+ * revision it referenced (typically a remote-tracking ref like
+ * `origin/<branch>`) doesn't exist locally, as opposed to some other git
+ * failure. Used by {@link GitService.pushWipIfDirty}'s unpushed-commit
+ * check: a branch that has never been pushed (no `origin/<branch>` ref
+ * fetched/created locally yet) has everything unpushed, by definition,
+ * rather than nothing to retry.
+ */
+function isUnknownRevisionError(error: unknown): boolean {
+	const stderr = (error as GitExecError | undefined)?.stderr;
+	return (
+		typeof stderr === "string" &&
+		/unknown revision|bad revision|ambiguous argument/i.test(stderr)
+	);
 }
 
 function escapeRegExp(value: string): string {
@@ -270,28 +324,135 @@ export class GitService {
 
 	/**
 	 * Commit-and-push dirty worktree state so another device can resume this
-	 * issue via {@link remoteBranchExists}. Returns true when a WIP commit was
-	 * created and pushed; false when the tree was already clean (no-op).
+	 * issue via {@link remoteBranchExists}. Returns true when a WIP commit
+	 * and/or push actually happened; false when there was nothing to do
+	 * (clean tree, nothing unpushed), or when the commit had to be skipped
+	 * because another git process holds the index lock.
+	 *
+	 * This runs on every session end AND every persistence-floor timer tick
+	 * (`WorkspaceSyncService`, every 5 minutes) — concurrently with whatever
+	 * git commands the agent itself is running in the same worktree. Several
+	 * things follow from that:
+	 *
+	 *  - Every step uses `execFile` (async, non-blocking), not `execSync`: an
+	 *    unbounded synchronous call here would stall the whole edge worker's
+	 *    event loop for as long as git takes, and would make the outer
+	 *    shutdown cap in `WorkspaceSyncService.stop()` inert (it races via
+	 *    `setTimeout`, which can't fire while the loop is blocked). See
+	 *    {@link execFileAsync}.
+	 *  - Both the commit AND the push use `--no-verify`: this is a
+	 *    safety-net operation, not a real one, and must never run the
+	 *    repository's pre-commit/pre-push hooks (which would otherwise fire
+	 *    ~12x/hour inside the user's own worktree and can get SIGTERM'd by
+	 *    this method's own timeout). The floor must be invisible.
+	 *  - If `.git/index.lock` is already held (the agent's own git command is
+	 *    mid-flight), this backs off rather than racing or forcing past it:
+	 *    the lock file is never deleted or overridden, and the failure is
+	 *    logged at debug (expected contention, not an error) so it doesn't
+	 *    spam warnings every tick. The next periodic tick tries again.
+	 *  - A **clean** working tree is NOT sufficient grounds to skip: a prior
+	 *    cycle may have committed successfully and then failed to push
+	 *    (network blip, router/GitHub unreachable, auth hiccup) —
+	 *    `pushWipSafely` in `WorkspaceSyncService` swallows that error and
+	 *    logs it, so without a further check the commit would sit
+	 *    local-only forever, silently lost the moment the container is
+	 *    destroyed. So when the tree is clean, this still checks whether
+	 *    `HEAD` has commits `origin/<branchName>` doesn't (via
+	 *    {@link hasUnpushedCommits}) and retries the push alone if so.
+	 *
+	 * WIP commits always land on the issue's own branch (`branchName`), the
+	 * same branch the `git-gh` subroutine's own commit lands on — so even if
+	 * this pre-empts that subroutine's commit (it finds a clean tree and
+	 * commits nothing further), no work is lost either way.
 	 */
 	async pushWipIfDirty(
 		worktreePath: string,
 		branchName: string,
 	): Promise<boolean> {
-		const status = execSync("git status --porcelain", {
-			cwd: worktreePath,
-			encoding: "utf-8",
-		});
-		if (status.trim().length === 0) return false;
-		execSync("git add -A", { cwd: worktreePath });
-		execSync(
-			'git -c user.email=cyrus@localhost -c user.name="Cyrus WIP" commit -m "wip: auto-saved by cyrus before session end"',
-			{ cwd: worktreePath },
-		);
-		execSync(`git push origin HEAD:${JSON.stringify(branchName)}`, {
-			cwd: worktreePath,
-			timeout: 60_000,
-		});
+		const git = (args: string[], timeoutMs: number) =>
+			execFileAsync("git", args, {
+				cwd: worktreePath,
+				encoding: "utf-8",
+				timeout: timeoutMs,
+			});
+
+		let status: { stdout: string };
+		try {
+			status = await git(["status", "--porcelain"], 30_000);
+		} catch (error) {
+			if (isIndexLockError(error)) {
+				this.logger.debug(
+					`pushWipIfDirty: index is locked in ${worktreePath} (another git process is running); skipping this sync cycle`,
+				);
+				return false;
+			}
+			throw error;
+		}
+
+		if (status.stdout.trim().length === 0) {
+			// Clean tree — but that alone doesn't mean there's nothing to do.
+			// See the "clean working tree is NOT sufficient" doc note above.
+			const hasUnpushedCommits = await this.hasUnpushedCommits(git, branchName);
+			if (!hasUnpushedCommits) return false;
+			await git(
+				["push", "--no-verify", "origin", `HEAD:${branchName}`],
+				60_000,
+			);
+			return true;
+		}
+
+		try {
+			await git(["add", "-A"], 30_000);
+			await git(
+				[
+					"-c",
+					"user.email=cyrus@localhost",
+					"-c",
+					"user.name=Cyrus WIP",
+					"commit",
+					"--no-verify",
+					"-m",
+					"wip: auto-saved by cyrus before session end",
+				],
+				30_000,
+			);
+		} catch (error) {
+			if (isIndexLockError(error)) {
+				this.logger.debug(
+					`pushWipIfDirty: index is locked in ${worktreePath} (another git process is running); skipping this sync cycle`,
+				);
+				return false;
+			}
+			throw error;
+		}
+
+		await git(["push", "--no-verify", "origin", `HEAD:${branchName}`], 60_000);
 		return true;
+	}
+
+	/**
+	 * True when `HEAD` has commits that `origin/<branchName>` does not — the
+	 * clean-tree counterpart to a dirty-tree check, so
+	 * {@link pushWipIfDirty} can retry a push that failed after its commit
+	 * already succeeded (see that method's doc). When `origin/<branchName>`
+	 * doesn't exist as a local remote-tracking ref (branch never pushed, or
+	 * this worktree has never fetched/pushed it), there's no known basis for
+	 * "already pushed" — the whole local branch counts as unpushed.
+	 */
+	private async hasUnpushedCommits(
+		git: (args: string[], timeoutMs: number) => Promise<{ stdout: string }>,
+		branchName: string,
+	): Promise<boolean> {
+		try {
+			const result = await git(
+				["rev-list", "--count", `origin/${branchName}..HEAD`],
+				30_000,
+			);
+			return Number.parseInt(result.stdout.trim(), 10) > 0;
+		} catch (error) {
+			if (isUnknownRevisionError(error)) return true;
+			throw error;
+		}
 	}
 
 	/**
@@ -1248,6 +1409,57 @@ export class GitService {
 		}
 
 		return worktrees;
+	}
+
+	/**
+	 * True iff `workspace` is currently usable on disk: a plain (non-git)
+	 * workspace only needs its `path` to exist, while a git-worktree
+	 * workspace — single- or multi-repo — needs every worktree path it
+	 * claims (`repoPaths` values, or `path` itself for the single-repo
+	 * layout) to actually resolve to a real git worktree, not merely an
+	 * empty directory.
+	 *
+	 * This is the check that closes the restore-ladder gap where a
+	 * destroyed-and-recreated container (or a manually deleted worktree on
+	 * a physical device) left `workspace.path` pointing at nothing: without
+	 * it, the runner's own `mkdirSync(cwd, { recursive: true })` would
+	 * silently manufacture an empty placeholder directory and resume the
+	 * Claude transcript there, with no repo, no `.git`, and no visibility of
+	 * any WIP commits the persistence floor had already pushed to origin.
+	 */
+	public isWorkspaceValid(workspace: Workspace): boolean {
+		if (!workspace.isGitWorktree) {
+			// `resolvedBaseBranches` is only ever populated when at least one
+			// repository was configured for this workspace (see
+			// `createGitWorktree`/`createSingleRepoWorktree`) — a genuinely
+			// plain (0-repo) workspace never sets it. So its presence here
+			// means `isGitWorktree: false` did NOT come from the 0-repo path,
+			// but from `createSingleRepoWorktree`'s catch-block fallback: a
+			// worktree creation attempt was made and failed (e.g. a transient
+			// `git fetch` failure during first boot), falling back to a plain
+			// `mkdirSync`. Don't short-circuit true for that case — it would
+			// let a failed-creation session resume into an empty directory
+			// forever, on every future resume, with no way to repair it.
+			// Instead fall through to the same on-disk check a real worktree
+			// gets, so a later resume's `ensureSessionWorkspaceExists` can
+			// detect the gap and recreate the worktree properly.
+			const hasConfiguredRepositories =
+				workspace.resolvedBaseBranches !== undefined &&
+				Object.keys(workspace.resolvedBaseBranches).length > 0;
+			if (!hasConfiguredRepositories) {
+				// Genuinely non-git (0-repo) workspace: existence alone is
+				// sufficient, and a missing one is already handled correctly
+				// by a plain `mkdir`.
+				return true;
+			}
+			return this.isGitWorktree(workspace.path);
+		}
+		if (workspace.repoPaths && Object.keys(workspace.repoPaths).length > 0) {
+			return Object.values(workspace.repoPaths).every((p) =>
+				this.isGitWorktree(p),
+			);
+		}
+		return this.isGitWorktree(workspace.path);
 	}
 
 	/**

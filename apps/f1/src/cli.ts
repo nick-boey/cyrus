@@ -19,6 +19,10 @@ import { createListChatThreadsCommand } from "./commands/listChatThreads.js";
 import { createPingCommand } from "./commands/ping.js";
 import { createPromptChatThreadCommand } from "./commands/promptChatThread.js";
 import { createPromptSessionCommand } from "./commands/promptSession.js";
+import { createRouterArtifactCommand } from "./commands/router/artifact.js";
+import { createRouterEnrollCommand } from "./commands/router/enroll.js";
+import { createRouterInjectCommand } from "./commands/router/inject.js";
+import { createRouterSeedUserCommand } from "./commands/router/seedUser.js";
 import { createStartChatSessionCommand } from "./commands/startChatSession.js";
 import { createStartSessionCommand } from "./commands/startSession.js";
 import { createStatusCommand } from "./commands/status.js";
@@ -75,6 +79,10 @@ program.addCommand(createPromptSessionCommand());
 program.addCommand(createStopSessionCommand());
 program.addCommand(createTerminateIssueCommand());
 program.addCommand(createInitTestRepoCommand());
+program.addCommand(createRouterEnrollCommand());
+program.addCommand(createRouterInjectCommand());
+program.addCommand(createRouterSeedUserCommand());
+program.addCommand(createRouterArtifactCommand());
 
 // Parse arguments
 program.parse();

@@ -8,15 +8,20 @@ CREATE TABLE IF NOT EXISTS users (
   user_id INTEGER PRIMARY KEY AUTOINCREMENT,
   email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   name TEXT,
-  linear_id TEXT
+  linear_id TEXT,
+  executor_json TEXT
 );
 CREATE TABLE IF NOT EXISTS devices (
   device_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL UNIQUE REFERENCES users(user_id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  kind TEXT NOT NULL DEFAULT 'device',
+  issue_key TEXT,
+  provider TEXT,
   token_hash TEXT NOT NULL UNIQUE,
   created_ms INTEGER NOT NULL,
   next_seq INTEGER NOT NULL DEFAULT 1,
-  last_seen_ms INTEGER
+  last_seen_ms INTEGER,
+  last_routed_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS enrollment_codes (
   code_hash TEXT PRIMARY KEY,
@@ -49,6 +54,16 @@ CREATE TABLE IF NOT EXISTS issue_locks (
 );
 `;
 
+// A user may have at most one physical device row, and an issue may have at
+// most one container device row — but a container row and a physical row can
+// coexist for the same user, and multiple container rows can coexist for the
+// same user across different issues. Inline UNIQUE constraints can't express
+// "unique among rows matching a condition", hence these partial indexes.
+const INDEXES = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_physical_user ON devices(user_id) WHERE kind = 'device';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_container_issue ON devices(issue_key) WHERE kind = 'container';
+`;
+
 function sha256Hex(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
@@ -62,15 +77,52 @@ interface UserRow {
 	email: string;
 	name: string | null;
 	linear_id: string | null;
+	executor_json: string | null;
 }
 
 interface DeviceRow {
 	device_id: number;
 	user_id: number;
+	kind: string;
+	issue_key: string | null;
+	provider: string | null;
 	token_hash: string;
 	created_ms: number;
 	next_seq: number;
 	last_seen_ms: number | null;
+	last_routed_ms: number | null;
+}
+
+interface ContainerDeviceRow {
+	device_id: number;
+	user_id: number;
+	issue_key: string;
+	provider: string;
+	created_ms: number;
+	last_seen_ms: number | null;
+	last_routed_ms: number | null;
+}
+
+export interface ContainerDeviceInfo {
+	deviceId: number;
+	userId: number;
+	issueKey: string;
+	provider: string;
+	createdMs: number;
+	lastSeenMs?: number;
+	lastRoutedMs?: number;
+}
+
+function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
+	return {
+		deviceId: row.device_id,
+		userId: row.user_id,
+		issueKey: row.issue_key,
+		provider: row.provider,
+		createdMs: row.created_ms,
+		lastSeenMs: row.last_seen_ms ?? undefined,
+		lastRoutedMs: row.last_routed_ms ?? undefined,
+	};
 }
 
 interface EnrollmentCodeRow {
@@ -114,6 +166,63 @@ export class RouterStore {
 		// default in SQLite) so removing a user/device cleans up dependent rows.
 		this.db.pragma("foreign_keys = ON");
 		this.db.exec(SCHEMA);
+		this.migrate();
+		this.db.exec(INDEXES);
+	}
+
+	/**
+	 * Upgrades a v1 database (pre schema-v2, no `kind`/`executor_json`
+	 * columns) in place. SCHEMA above already creates the v2 shape for fresh
+	 * databases via CREATE TABLE IF NOT EXISTS, so this only does work when
+	 * opening a pre-existing v1 router.db.
+	 */
+	private migrate(): void {
+		const deviceCols = this.db
+			.prepare("PRAGMA table_info(devices)")
+			.all() as Array<{ name: string }>;
+		if (deviceCols.length > 0 && !deviceCols.some((c) => c.name === "kind")) {
+			// v1 -> v2 rebuild. FK enforcement must be OFF for the duration:
+			// with it ON, DROP TABLE devices performs an implicit DELETE that
+			// would cascade away every queued event.
+			this.db.pragma("foreign_keys = OFF");
+			const txn = this.db.transaction(() => {
+				this.db.exec(`
+					CREATE TABLE devices_v2 (
+						device_id INTEGER PRIMARY KEY AUTOINCREMENT,
+						user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+						kind TEXT NOT NULL DEFAULT 'device',
+						issue_key TEXT,
+						provider TEXT,
+						token_hash TEXT NOT NULL UNIQUE,
+						created_ms INTEGER NOT NULL,
+						next_seq INTEGER NOT NULL DEFAULT 1,
+						last_seen_ms INTEGER,
+						last_routed_ms INTEGER
+					);
+					INSERT INTO devices_v2 (device_id, user_id, kind, token_hash, created_ms, next_seq, last_seen_ms)
+						SELECT device_id, user_id, 'device', token_hash, created_ms, next_seq, last_seen_ms FROM devices;
+					DROP TABLE devices;
+					ALTER TABLE devices_v2 RENAME TO devices;
+					INSERT OR REPLACE INTO sqlite_sequence (name, seq)
+						SELECT 'devices', COALESCE(MAX(device_id), 0) FROM devices;
+				`);
+			});
+			try {
+				txn();
+			} finally {
+				this.db.pragma("foreign_keys = ON");
+			}
+		}
+
+		const userCols = this.db
+			.prepare("PRAGMA table_info(users)")
+			.all() as Array<{ name: string }>;
+		if (
+			userCols.length > 0 &&
+			!userCols.some((c) => c.name === "executor_json")
+		) {
+			this.db.exec("ALTER TABLE users ADD COLUMN executor_json TEXT");
+		}
 	}
 
 	addUser(input: { email: string; name?: string; linearId?: string }): {
@@ -148,19 +257,48 @@ export class RouterStore {
 		}));
 	}
 
+	/**
+	 * Removes a user entirely — a deliberate, total operation, unlike
+	 * {@link revokeDevice} (which only detaches a physical device, e.g. a
+	 * laptop swap, and must never touch that user's containers — see its own
+	 * doc comment). A user can own MULTIPLE device rows at once: at most one
+	 * physical `kind = 'device'` row, plus any number of per-issue `kind =
+	 * 'container'` rows. All of them cascade away via `devices.user_id ON
+	 * DELETE CASCADE` when the `users` row below is deleted — that part was
+	 * already correct. What was NOT correct: only the FIRST device row
+	 * (`.get()`, not `.all()`) had its scoped rows purged, so a second/third
+	 * device (typically a container) would cascade its `devices` row away
+	 * while stranding its `issue_locks`/`session_affinity`/`issue_affinity`/
+	 * `rpc_mutations` rows pointed at a now-nonexistent device_id — those
+	 * tables have no FK back to `devices`. Loop over every device row so none
+	 * of them strand anything, matching the single-device guarantee
+	 * {@link redeemEnrollmentCode} already gives.
+	 *
+	 * Note this does NOT call into any {@link ExecutorRegistry} to
+	 * `destroy()` a removed user's live containers — `RouterStore` is a pure
+	 * DB layer with no executor wiring. Their container/volume are reaped the
+	 * same deliberate way `cyrus router containers destroy <issueKey>`
+	 * already reaps one: `ContainerLifecycle`'s orphan-GC sweep destroys any
+	 * provider-managed container whose device row is gone, on its next tick.
+	 * That is an accepted, documented latency (see `ContainerLifecycle`'s
+	 * class doc comment), not an oversight — removing a user is exactly the
+	 * case where reaping their containers IS the intended outcome, unlike the
+	 * `revokeDevice` bug this fix-pass also closes.
+	 */
 	removeUser(email: string): boolean {
 		const txn = this.db.transaction(() => {
 			const user = this.db
 				.prepare("SELECT user_id FROM users WHERE email = ? COLLATE NOCASE")
 				.get(email) as Pick<UserRow, "user_id"> | undefined;
 			if (!user) return false;
-			const deviceRow = this.db
+			const deviceRows = this.db
 				.prepare("SELECT device_id FROM devices WHERE user_id = ?")
-				.get(user.user_id) as Pick<DeviceRow, "device_id"> | undefined;
+				.all(user.user_id) as Array<Pick<DeviceRow, "device_id">>;
 			// The devices/events rows cascade away via ON DELETE CASCADE, but
 			// session_affinity/issue_affinity/issue_locks/rpc_mutations have no
-			// FK — purge them explicitly so they don't strand a dead device_id.
-			if (deviceRow) {
+			// FK — purge them explicitly, for EVERY device row, so none of them
+			// strand a dead device_id.
+			for (const deviceRow of deviceRows) {
 				this.purgeDeviceScopedRows(deviceRow.device_id);
 			}
 			const result = this.db
@@ -299,21 +437,157 @@ export class RouterStore {
 
 	getDeviceForUser(userId: number): { deviceId: number } | undefined {
 		const row = this.db
-			.prepare("SELECT device_id FROM devices WHERE user_id = ?")
+			.prepare(
+				"SELECT device_id FROM devices WHERE user_id = ? AND kind = 'device'",
+			)
 			.get(userId) as Pick<DeviceRow, "device_id"> | undefined;
 		if (!row) return undefined;
 		return { deviceId: row.device_id };
 	}
 
+	/**
+	 * Revokes a user's PHYSICAL device only (e.g. they got a new laptop) —
+	 * scoped to `kind = 'device'`, matching {@link getDeviceForUser}. Must
+	 * NEVER delete a user's `kind = 'container'` rows: those back live,
+	 * possibly mid-session ephemeral containers, and this call has no
+	 * `active session affinity` guard the way {@link ContainerLifecycle}'s
+	 * idle/stale sweep does. Before this scoping, revoking a teammate's
+	 * laptop deleted every device row for that user_id — physical AND
+	 * container — and `ContainerLifecycle`'s orphan-GC pass would then
+	 * `destroy()` (container AND volume) every one of their running
+	 * containers within one sweep tick, unconditionally killing in-flight
+	 * sessions. Removing a user ENTIRELY (rather than just their physical
+	 * device) is a separate, deliberate operation — see {@link removeUser}.
+	 */
 	revokeDevice(email: string): boolean {
 		const user = this.db
 			.prepare("SELECT user_id FROM users WHERE email = ? COLLATE NOCASE")
 			.get(email) as Pick<UserRow, "user_id"> | undefined;
 		if (!user) return false;
 		const result = this.db
-			.prepare("DELETE FROM devices WHERE user_id = ?")
+			.prepare("DELETE FROM devices WHERE user_id = ? AND kind = 'device'")
 			.run(user.user_id);
 		return result.changes > 0;
+	}
+
+	createContainerDevice(
+		userId: number,
+		issueKey: string,
+		provider: string,
+	): { deviceId: number; deviceToken: string } {
+		const token = generateTokenHex();
+		const result = this.db
+			.prepare(
+				`INSERT INTO devices (user_id, kind, issue_key, provider, token_hash, created_ms, next_seq)
+				 VALUES (?, 'container', ?, ?, ?, ?, 1)`,
+			)
+			.run(userId, issueKey, provider, sha256Hex(token), Date.now());
+		return { deviceId: Number(result.lastInsertRowid), deviceToken: token };
+	}
+
+	getContainerDeviceForIssue(
+		issueKey: string,
+	): ContainerDeviceInfo | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms
+				 FROM devices WHERE kind = 'container' AND issue_key = ?`,
+			)
+			.get(issueKey) as ContainerDeviceRow | undefined;
+		return row ? toContainerDeviceInfo(row) : undefined;
+	}
+
+	getDeviceInfo(deviceId: number):
+		| {
+				kind: "device" | "container";
+				userId: number;
+				issueKey?: string;
+				provider?: string;
+		  }
+		| undefined {
+		const row = this.db
+			.prepare(
+				"SELECT kind, user_id, issue_key, provider FROM devices WHERE device_id = ?",
+			)
+			.get(deviceId) as
+			| {
+					kind: string;
+					user_id: number;
+					issue_key: string | null;
+					provider: string | null;
+			  }
+			| undefined;
+		if (!row) return undefined;
+		return {
+			kind: row.kind as "device" | "container",
+			userId: row.user_id,
+			issueKey: row.issue_key ?? undefined,
+			provider: row.provider ?? undefined,
+		};
+	}
+
+	rotateContainerDeviceToken(deviceId: number): string {
+		const token = generateTokenHex();
+		const result = this.db
+			.prepare(
+				"UPDATE devices SET token_hash = ? WHERE device_id = ? AND kind = 'container'",
+			)
+			.run(sha256Hex(token), deviceId);
+		if (result.changes === 0)
+			throw new Error(`Unknown container device: ${deviceId}`);
+		return token;
+	}
+
+	deleteContainerDevice(deviceId: number): void {
+		const txn = this.db.transaction(() => {
+			this.purgeDeviceScopedRows(deviceId);
+			this.db
+				.prepare(
+					"DELETE FROM devices WHERE device_id = ? AND kind = 'container'",
+				)
+				.run(deviceId);
+		});
+		txn();
+	}
+
+	listContainerDevices(): ContainerDeviceInfo[] {
+		const rows = this.db
+			.prepare(
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms
+				 FROM devices WHERE kind = 'container'`,
+			)
+			.all() as ContainerDeviceRow[];
+		return rows.map(toContainerDeviceInfo);
+	}
+
+	countSessionAffinityForDevice(deviceId: number): number {
+		const row = this.db
+			.prepare("SELECT COUNT(*) AS n FROM session_affinity WHERE device_id = ?")
+			.get(deviceId) as { n: number };
+		return row.n;
+	}
+
+	setUserExecutor(email: string, executorJson: string | null): boolean {
+		const result = this.db
+			.prepare(
+				"UPDATE users SET executor_json = ? WHERE email = ? COLLATE NOCASE",
+			)
+			.run(executorJson, email);
+		return result.changes > 0;
+	}
+
+	getUserExecutor(userId: number): string | undefined {
+		const row = this.db
+			.prepare("SELECT executor_json FROM users WHERE user_id = ?")
+			.get(userId) as { executor_json: string | null } | undefined;
+		return row?.executor_json ?? undefined;
+	}
+
+	getUserEmail(userId: number): string | undefined {
+		const row = this.db
+			.prepare("SELECT email FROM users WHERE user_id = ?")
+			.get(userId) as { email: string } | undefined;
+		return row?.email;
 	}
 
 	enqueueEvent(
@@ -339,6 +613,11 @@ export class RouterStore {
 					 VALUES (?, ?, ?, ?, ?)`,
 				)
 				.run(deviceId, seq, payloadJson, nowMs, nowMs + ttlMs);
+			// Drives the container idle-stop policy (Task 8); harmless for
+			// physical devices, which ignore last_routed_ms.
+			this.db
+				.prepare("UPDATE devices SET last_routed_ms = ? WHERE device_id = ?")
+				.run(nowMs, deviceId);
 			return seq;
 		});
 		return txn();
@@ -498,6 +777,19 @@ export class RouterStore {
 			.prepare("SELECT device_id FROM issue_affinity WHERE issue_id = ?")
 			.get(issueId) as Pick<IssueAffinityRow, "device_id"> | undefined;
 		return row?.device_id;
+	}
+
+	/**
+	 * Deletes a single issue's affinity row. Used by {@link EventRouter} to
+	 * heal a dangling row that points at a device that no longer exists (e.g.
+	 * `revokeDevice` deletes the `devices` row without purging
+	 * `issue_affinity`, and `issue_affinity.device_id` has no FK cascade) —
+	 * without this, a live row can keep pointing at nothing forever.
+	 */
+	clearIssueAffinity(issueId: string): void {
+		this.db
+			.prepare("DELETE FROM issue_affinity WHERE issue_id = ?")
+			.run(issueId);
 	}
 
 	acquireIssueLock(

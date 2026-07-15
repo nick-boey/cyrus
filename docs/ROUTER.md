@@ -229,6 +229,16 @@ token and writes it — `chmod 0600` — into your `config.json` as
 `platform: "router"` with `router: { url, deviceToken }`. The enrollment code is
 burned after one use.
 
+`cyrus connect` does **not** enable the persistence-floor sync
+(`WorkspaceSyncService`) on your device — `router.floorSync` defaults to off
+and is left unset. That's deliberate: without it, every session end and a
+5-minute timer would start pushing `wip: auto-saved by cyrus…` commits onto
+your issue branches (including open PRs) whether you wanted that or not. If
+you want your device's in-progress work backed up to the router the same way
+an ephemeral container's is — for example so a session can later be migrated
+from your laptop onto a container — add `"floorSync": true` to the `router`
+block in your `config.json` by hand.
+
 ### 2. Install and OAuth the official Linear MCP locally
 
 In router-client mode Cyrus does **not** configure the app-token Linear MCP —

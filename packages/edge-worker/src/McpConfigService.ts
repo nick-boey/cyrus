@@ -126,9 +126,12 @@ export class McpConfigService {
 
 		// Workspace-level MCP servers — configured once regardless of repo count.
 		// The token-authenticated official Linear MCP server (https://linear.app/docs/mcp)
-		// is only emitted when we actually hold a Linear token; router-mode
-		// devices have none (users install the Linear MCP locally with their own
-		// OAuth), so it is omitted there.
+		// is emitted only when we actually hold a Linear token. Router-mode
+		// devices usually have none (users install the Linear MCP locally with
+		// their own OAuth), so it is omitted — UNLESS an operator provisions a
+		// static per-user Linear token (LINEAR_API_TOKEN → linearWorkspaces) for
+		// a container, in which case getLinearTokenForWorkspace returns it and
+		// the server IS emitted here.
 		const mcpConfig: Record<string, McpServerConfig> = {
 			...(linearToken
 				? {

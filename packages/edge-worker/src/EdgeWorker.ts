@@ -186,6 +186,7 @@ import { LinearActivitySink } from "./sinks/LinearActivitySink.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
 import type { AgentSessionData, EdgeWorkerEvents } from "./types.js";
 import { UserAccessControl } from "./UserAccessControl.js";
+import { WorkspaceSyncService } from "./WorkspaceSyncService.js";
 
 export declare interface EdgeWorker {
 	on<K extends keyof EdgeWorkerEvents>(
@@ -228,6 +229,7 @@ export class EdgeWorker extends EventEmitter {
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
 	private routerConnection?: RouterConnection; // Shared device-side WebSocket connection to the Cyrus Router (router platform mode)
+	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, opt-in via floorSync === true)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
 	private persistenceManager: PersistenceManager;
 	private sharedApplicationServer: SharedApplicationServer;
@@ -520,6 +522,26 @@ export class EdgeWorker extends EventEmitter {
 						error,
 					);
 				}
+
+				// Persistence floor: WIP-push + bundle-upload this issue now that a
+				// session on it just ended. syncIssueOnTermination() is independent
+				// of the sendSessionState try/catch above — a router-lock signalling
+				// failure must not skip the floor sync, and vice versa. It removes
+				// this session from the issue's live-session refcount immediately,
+				// then stops protecting the issue (removes it from the touched set)
+				// once BOTH that refcount is empty (no other session on the same
+				// issue is still running) AND a sync actually succeeds — a failed
+				// sync, or another still-live session on the issue, leaves it
+				// touched so a later periodic tick retries/re-evaluates it instead
+				// of dropping protection forever.
+				const session = this.agentSessionManager.getSession(sessionId);
+				const identifier = session?.issue?.identifier;
+				if (identifier) {
+					void this.workspaceSync?.syncIssueOnTermination(
+						identifier,
+						sessionId,
+					);
+				}
 			},
 		);
 
@@ -546,8 +568,12 @@ export class EdgeWorker extends EventEmitter {
 		}
 
 		// Router mode: create ONE shared device-side connection to the router.
-		// The device holds no Linear tokens — every issue-tracker operation is
-		// forwarded to the router over this connection.
+		// The device holds no Linear tokens for issue-tracker operations — those
+		// are forwarded to the router over this connection. (An operator MAY
+		// still provision a static per-user Linear token via config.linearWorkspaces
+		// — from LINEAR_API_TOKEN — purely to authenticate the hosted Linear MCP
+		// inside the container's Claude session; that path does not go through the
+		// router connection.)
 		if (this.config.platform === "router") {
 			if (!config.router) {
 				throw new Error(
@@ -559,6 +585,33 @@ export class EdgeWorker extends EventEmitter {
 				deviceToken: config.router.deviceToken,
 				stateDir: join(this.cyrusHome, "router-client"),
 			});
+
+			// Persistence floor: WIP-push + bundle-upload sync so container death
+			// (idle-stop, crash, host loss, executor switch) never loses work.
+			// Opt-IN via `router.floorSync: true` — defaults OFF so this is a
+			// no-op for every router-platform device that hasn't asked for it.
+			// Before this feature, a WIP push only ran on worktree teardown; this
+			// service additionally runs on every session end and on a 5-minute
+			// timer, which would otherwise push `wip: auto-saved by cyrus…`
+			// commits onto a teammate's issue branches (including open PRs)
+			// roughly 12x/hour with no opt-in on their part — a real behavior
+			// change for existing router+physical-device deployments, which the
+			// container-executors design explicitly promised would be
+			// unaffected. `ContainerBootCommand.writeConfig` sets `floorSync:
+			// true` for every container it boots (that's what makes the
+			// container restore ladder work); a physical-device user who wants
+			// the floor too (e.g. to enable device -> container migration) opts
+			// in the same way, by setting `floorSync: true` themselves.
+			if (config.router.floorSync === true) {
+				this.workspaceSync = new WorkspaceSyncService({
+					cyrusHome: this.cyrusHome,
+					routerUrl: config.router.url,
+					deviceToken: config.router.deviceToken,
+					gitService: this.gitService,
+					logger: this.logger,
+				});
+				this.workspaceSync.start();
+			}
 		}
 
 		// Router mode has no linearWorkspaces block (the device holds no Linear
@@ -2801,6 +2854,15 @@ ${taskSection}`;
 
 		// Stop shared application server (this also stops Cloudflare tunnel if running)
 		await this.sharedApplicationServer.stop();
+
+		// Persistence floor: this is the last chance to WIP-push + upload
+		// session bundles before the process (and possibly the container it
+		// runs in) is gone. Deliberately LAST — runner kill, egress-proxy
+		// stop, and server stop must not wait behind a potentially slow git
+		// push / router upload. `stop()` never throws (every per-issue sync
+		// swallows and logs its own errors) and is internally time-capped, so
+		// it can't block process exit indefinitely either.
+		await this.workspaceSync?.stop();
 	}
 
 	/**
@@ -4380,6 +4442,7 @@ ${taskSection}`;
 			branchName: issueMinimal.branchName,
 			baseBranchName:
 				workspace.resolvedBaseBranches?.[repo.id]?.branch ?? repo.baseBranch,
+			baseBranchSource: workspace.resolvedBaseBranches?.[repo.id]?.source,
 		}));
 
 		agentSessionManager.createCyrusAgentSession(
@@ -4679,6 +4742,17 @@ ${taskSection}`;
 			this.logger.warn("Cannot initialize Claude runner without issue");
 			return;
 		}
+
+		// Persistence floor: this issue is about to get a runner that may work
+		// for a long time before its session ever reaches a terminal state.
+		// touch() here (rather than only at session end) is what lets the
+		// periodic timer keep re-syncing it on every tick while it runs, and
+		// registers `sessionId` as a live session on the issue (a refcount —
+		// see WorkspaceSyncService's class doc — so a sibling session on the
+		// same issue can't be un-protected by this one's eventual termination).
+		// A no-op on non-router platforms — `workspaceSync` is only
+		// constructed when `platform === "router"`.
+		this.workspaceSync?.touch(issue.identifier, sessionId);
 
 		const primaryRepo = repositories[0]!;
 
@@ -7419,6 +7493,117 @@ ${input.userComment}
 	}
 
 	/**
+	 * Restore-ladder gap-closer: re-creates a session's git-worktree workspace
+	 * if it no longer exists (or was reduced to an empty/invalid directory)
+	 * before a resume attempts to use it as the runner's cwd.
+	 *
+	 * This is the single choke point for every resume path — new-comment
+	 * continuation (`handleNormalPromptedActivity`), parent-resume-from-child,
+	 * and feedback-to-child all funnel through `resumeAgentSession`, which
+	 * calls this before `buildAgentRunnerConfig` sets `cwd = session.workspace.path`.
+	 * Without it, a destroyed-and-recreated container (or a worktree deleted by
+	 * hand on a physical device) would resume the Claude transcript into a
+	 * directory `ClaudeRunner`'s own `mkdirSync(cwd, { recursive: true })`
+	 * silently manufactures empty — no repo, no `.git`, and no visibility of
+	 * any WIP commits the persistence floor already pushed to origin.
+	 *
+	 * A no-op on the happy path: `GitService.isWorkspaceValid` is a cheap
+	 * filesystem check, and plain (non-git) workspaces always report valid
+	 * (a missing one is already handled correctly by a plain `mkdir`).
+	 *
+	 * Reuses the exact same workspace-creation path `createCyrusAgentSession`
+	 * uses for brand-new sessions — the custom `handlers.createWorkspace`
+	 * override when configured (the path production takes), else
+	 * `GitService.createGitWorktree` directly. Both already implement
+	 * "worktree continuity": when the issue's branch already exists on
+	 * origin (which it will, since the floor pushes WIP there), the new
+	 * worktree is checked out from `origin/<branch>` instead of branching
+	 * fresh from the base branch — so re-creation here never loses
+	 * committed-but-unmerged work.
+	 */
+	private async ensureSessionWorkspaceExists(
+		session: CyrusAgentSession,
+		repository: RepositoryConfig,
+		fullIssue: Issue,
+		sessionId: string,
+		linearWorkspaceId: string,
+	): Promise<void> {
+		if (this.gitService.isWorkspaceValid(session.workspace)) {
+			return;
+		}
+
+		this.logger.warn(
+			`Workspace missing/invalid for session ${sessionId} (issue ${fullIssue.identifier}) at ${session.workspace.path} — recreating the worktree from the issue branch before resuming. Likely cause: destroyed/recreated container or a manually removed worktree.`,
+		);
+
+		const repositoriesForSession = session.repositories
+			.map((ctx) => this.repositories.get(ctx.repositoryId))
+			.filter((r): r is RepositoryConfig => Boolean(r));
+		const resolvedRepositories =
+			repositoriesForSession.length > 0 ? repositoriesForSession : [repository];
+
+		// Recreation must land the worktree on the same EXPLICIT base branch
+		// the session originally resolved to (e.g. a `[repo=name#branch]`
+		// description selector), not whatever `determineBaseBranch` would
+		// re-derive today. The session's own persisted
+		// `RepositoryContext.baseBranchName` already carries that resolved
+		// branch per repo (set once in `createCyrusAgentSession`), so reuse
+		// it here as a `baseBranchOverrides` map — the same mechanism
+		// `createCyrusAgentSession` itself passes through — instead of
+		// re-deriving from scratch.
+		//
+		// Only repos whose `baseBranchSource === "commit-ish"` are pinned
+		// this way. Passing an override unconditionally would also disable
+		// worktree continuity (`createSingleRepoWorktree`'s check for an
+		// already-pushed `origin/<issueBranch>`, which only runs when NO
+		// override is given) for the common case where `baseBranchName` is
+		// just an ordinary "default"/graphite/parent-issue resolution rather
+		// than a real user-specified override — silently discarding any WIP
+		// already pushed to the issue's own branch by the persistence floor
+		// and rebranching fresh from the base instead. Leaving those repos
+		// out of the map lets `determineBaseBranch` recompute exactly as it
+		// would for a brand-new session, so continuity keeps working.
+		const baseBranchOverrides = new Map<string, string>();
+		for (const ctx of session.repositories) {
+			if (ctx.baseBranchName && ctx.baseBranchSource === "commit-ish") {
+				baseBranchOverrides.set(ctx.repositoryId, ctx.baseBranchName);
+			}
+		}
+
+		const workspace = this.config.handlers?.createWorkspace
+			? await this.config.handlers.createWorkspace(
+					fullIssue,
+					resolvedRepositories,
+					{
+						baseBranchOverrides:
+							baseBranchOverrides.size > 0 ? baseBranchOverrides : undefined,
+						onRepoSetupHookEvent: (activity) =>
+							this.activityPoster.postRepoSetupHookActivity(
+								sessionId,
+								linearWorkspaceId,
+								activity,
+							),
+					},
+				)
+			: await this.gitService.createGitWorktree(
+					fullIssue,
+					resolvedRepositories,
+					{
+						baseBranchOverrides:
+							baseBranchOverrides.size > 0 ? baseBranchOverrides : undefined,
+						onRepoSetupHookEvent: (activity) =>
+							this.activityPoster.postRepoSetupHookActivity(
+								sessionId,
+								linearWorkspaceId,
+								activity,
+							),
+					},
+				);
+
+		session.workspace = workspace;
+	}
+
+	/**
 	 * Resume or create an Agent session with the given prompt
 	 * This is the core logic for handling prompted agent activities
 	 * @param session The Cyrus agent session
@@ -7444,6 +7629,17 @@ ${input.userComment}
 		commentTimestamp?: string,
 	): Promise<void> {
 		const log = this.logger.withContext({ sessionId });
+
+		// Persistence floor: this turn (new or resumed) may run for a long time
+		// before the session next reaches a terminal state. Touching here —
+		// not only at session end — is what lets the periodic timer keep
+		// re-syncing this issue on every tick while the runner is active, and
+		// (re-)registers this sessionId as live on the issue (idempotent — see
+		// WorkspaceSyncService's refcount). A no-op on non-router platforms
+		// (`workspaceSync` is only constructed when `platform === "router"`).
+		if (session.issue?.identifier) {
+			this.workspaceSync?.touch(session.issue.identifier, sessionId);
+		}
 
 		// A prompt is an explicit instruction to continue, so drop any stop request
 		// left over from a previous turn. Without this, a stop delivered while the
@@ -7505,6 +7701,17 @@ ${input.userComment}
 				`Failed to fetch full issue details for ${issueIdForResume}`,
 			);
 		}
+
+		// Restore-ladder gap-closer: re-create the workspace if it no longer
+		// exists (or was reduced to an empty/invalid directory) before it's
+		// used as the runner's cwd below. See ensureSessionWorkspaceExists.
+		await this.ensureSessionWorkspaceExists(
+			session,
+			repository,
+			fullIssue,
+			sessionId,
+			resolvedWorkspaceId,
+		);
 
 		// Fetch issue labels early to determine runner type
 		const labels = await this.fetchIssueLabels(fullIssue);

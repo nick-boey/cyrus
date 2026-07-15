@@ -982,6 +982,9 @@
 					"items": {
 						"type": "string"
 					}
+				},
+				"floorSync": {
+					"type": "boolean"
 				}
 			},
 			"required": ["url", "deviceToken"],

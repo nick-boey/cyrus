@@ -1,9 +1,46 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentEvent } from "cyrus-core";
 import { CLIIssueTrackerService } from "cyrus-core";
 import type { LinearOAuthConfig } from "cyrus-linear-event-transport";
+import type {
+	ContainerExecutor,
+	ExecutorRegistry,
+	IssueExecutionContext,
+} from "cyrus-router-executors";
 import { PROTOCOL_VERSION } from "cyrus-router-protocol";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
-import { RouterServer, type RouterServerConfig } from "../src/RouterServer.js";
+import {
+	type RouterContainersConfig,
+	RouterServer,
+	type RouterServerConfig,
+} from "../src/RouterServer.js";
+import { SecretStore } from "../src/SecretStore.js";
+
+/**
+ * Minimal fake ContainerExecutor whose ensureRunning is an inspectable mock
+ * that never shells out. Injected via `executorRegistryFactory` — the
+ * composition-root seam — so the container tests below can never reach a
+ * real Docker daemon, regardless of whether the developer's machine has
+ * Docker installed. See ContainerTargets.test.ts's `fakeExecutor` for the
+ * same pattern used one layer down.
+ */
+function fakeExecutor(provider: string): ContainerExecutor & {
+	ensureRunning: ReturnType<typeof vi.fn>;
+} {
+	return {
+		provider,
+		ensureRunning: vi.fn<(ctx: IssueExecutionContext) => Promise<void>>(
+			async () => {},
+		),
+		stop: vi.fn(async () => {}),
+		destroy: vi.fn(async () => {}),
+		status: vi.fn(async () => "running" as const),
+		listManaged: vi.fn(async () => []),
+	};
+}
 
 function makeServer(): RouterServer {
 	return new RouterServer({
@@ -372,5 +409,141 @@ describe("RouterServer Linear token refresh wiring", () => {
 		expect(persisted).toEqual([
 			["ws-1", { accessToken: "token-2", refreshToken: "refresh-2" }],
 		]);
+	});
+});
+
+describe("RouterServer containers wiring", () => {
+	let server: RouterServer | undefined;
+
+	afterEach(async () => {
+		if (server) {
+			await server.stop();
+			server = undefined;
+		}
+	});
+
+	const CONTAINERS_CONFIG: RouterContainersConfig = {
+		image: "ghcr.io/example/cyrus-worker:0.0.0-test",
+		routerUrlForContainers: "ws://host.docker.internal:3456",
+		repositories: [
+			{
+				name: "cyrus",
+				githubSlug: "ceedaragents/cyrus",
+				linearWorkspaceId: "ws-1",
+			},
+		],
+	};
+
+	/** Minimal object that satisfies isAgentSessionCreatedWebhook + the fields EventRouter reads. */
+	function createdEvent(opts: {
+		sessionId: string;
+		issueId: string;
+		identifier: string;
+		creatorEmail: string;
+	}): AgentEvent {
+		return {
+			type: "AgentSessionEvent",
+			action: "created",
+			organizationId: "ws-1",
+			agentSession: {
+				id: opts.sessionId,
+				organizationId: "ws-1",
+				issueId: opts.issueId,
+				issue: { id: opts.issueId, identifier: opts.identifier },
+				creator: { email: opts.creatorEmail },
+			},
+		} as unknown as AgentEvent;
+	}
+
+	it("leaves containerLifecycle unset when `containers` is absent from config (today's behavior, unchanged)", () => {
+		server = makeServer();
+
+		expect(server.containerLifecycle).toBeUndefined();
+	});
+
+	it("constructs containerLifecycle and routes a docker-executor user's session to a per-issue container device when `containers` is configured", async () => {
+		const executors: ExecutorRegistry = new Map([
+			["docker", fakeExecutor("docker")],
+		]);
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			containers: CONTAINERS_CONFIG,
+			executorRegistryFactory: () => executors,
+		});
+		expect(server.containerLifecycle).toBeDefined();
+
+		server.store.addUser({ email: "docker-user@example.com" });
+		server.store.setUserExecutor(
+			"docker-user@example.com",
+			'{"type":"docker"}',
+		);
+
+		await server.eventRouter.route(
+			createdEvent({
+				sessionId: "sess-container-1",
+				issueId: "issue-1",
+				identifier: "CYPACK-1",
+				creatorEmail: "docker-user@example.com",
+			}),
+		);
+
+		expect(server.store.getContainerDeviceForIssue("CYPACK-1")).toMatchObject({
+			provider: "docker",
+		});
+	});
+
+	it("forwards containers.requiredSecretKeys to the boot gate", async () => {
+		const docker = fakeExecutor("docker");
+		const executors: ExecutorRegistry = new Map([["docker", docker]]);
+		const secretsPath = join(
+			mkdtempSync(join(tmpdir(), "rs-secrets-")),
+			"s.json",
+		);
+		const logger = { info: vi.fn(), warn: vi.fn() };
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { "ws-1": { linearToken: "t" } },
+			webhook: { verificationMode: "direct", secret: "s" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			containers: {
+				...CONTAINERS_CONFIG,
+				secretsPath,
+				requiredSecretKeys: ["GIT_TOKEN"],
+			},
+			executorRegistryFactory: () => executors,
+			logger,
+		});
+		server.store.addUser({ email: "docker-user@example.com" });
+		server.store.setUserExecutor(
+			"docker-user@example.com",
+			'{"type":"docker"}',
+		);
+		// Only the Claude token — passes the default gate, fails the GIT_TOKEN gate.
+		new SecretStore(secretsPath).set(
+			"docker-user@example.com",
+			"CLAUDE_CODE_OAUTH_TOKEN",
+			"claude-tok",
+		);
+
+		await server.eventRouter.route(
+			createdEvent({
+				sessionId: "sess-1",
+				issueId: "issue-1",
+				identifier: "CYPACK-1",
+				creatorEmail: "docker-user@example.com",
+			}),
+		);
+
+		await vi.waitFor(() =>
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("is not fully authenticated"),
+			),
+		);
+		expect(docker.ensureRunning).not.toHaveBeenCalled();
 	});
 });

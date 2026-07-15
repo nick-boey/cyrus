@@ -13,6 +13,7 @@
 		"start": "bun run dist/src/cli.js",
 		"server": "bun run server.ts",
 		"server:dev": "bun --watch server.ts",
+		"router-server": "node --env-file-if-exists=.env dist/router-server.js",
 		"dev": "tsc --watch",
 		"test": "vitest",
 		"test:run": "vitest run --passWithNoTests",
@@ -24,6 +25,7 @@
 		"dist",
 		"f1",
 		"server.ts",
+		"router-server.ts",
 		"README.md",
 		"CLAUDE.md"
 	],
@@ -35,7 +37,10 @@
 		"cyrus-claude-runner": "workspace:*",
 		"cyrus-core": "workspace:*",
 		"cyrus-edge-worker": "workspace:*",
-		"cyrus-slack-event-transport": "workspace:*"
+		"cyrus-router": "workspace:*",
+		"cyrus-router-executors": "workspace:*",
+		"cyrus-slack-event-transport": "workspace:*",
+		"fastify": "^5.8.5"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
