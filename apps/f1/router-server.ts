@@ -93,7 +93,9 @@ if (import.meta.main) {
 		fakeExecutor: process.env.CYRUS_ROUTER_FAKE_EXECUTOR === "1",
 	});
 	console.log(bold(green("  🚦 F1 Router-Mode Server")));
-	console.log(`  ${cyan("Router WS:")}   ws://127.0.0.1:${handle.rig.port}`);
+	console.log(
+		`  ${cyan("Router WS:")}   ws://0.0.0.0:${handle.rig.port} (binds all interfaces; containers reach it via host.docker.internal:${handle.rig.port})`,
+	);
 	console.log(
 		`  ${cyan("Control:")}     ${handle.control.url}  ${success(`(token: ${controlToken})`)}`,
 	);

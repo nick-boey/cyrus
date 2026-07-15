@@ -1,5 +1,5 @@
 // apps/f1/test/router/router-server.smoke.test.ts
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -29,5 +29,21 @@ describe("router-server smoke (fake executor)", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ present: false });
+	});
+
+	it("resolves artifacts from the same artifactsDir the rig was configured with", async () => {
+		const bundleDir = join(dir, "artifacts", "CYFLOOR-9");
+		mkdirSync(bundleDir, { recursive: true });
+		const bundleBytes = Buffer.from("f1-router-server-smoke-test-bundle");
+		writeFileSync(join(bundleDir, "bundle.tar.gz"), bundleBytes);
+
+		const res = await fetch(`${handle.control.url}/router/artifact/CYFLOOR-9`, {
+			headers: { authorization: "Bearer t" },
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			present: true,
+			bytes: bundleBytes.length,
+		});
 	});
 });

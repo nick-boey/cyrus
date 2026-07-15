@@ -25,6 +25,7 @@
 		"dist",
 		"f1",
 		"server.ts",
+		"router-server.ts",
 		"README.md",
 		"CLAUDE.md"
 	],
