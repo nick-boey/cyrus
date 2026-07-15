@@ -141,7 +141,8 @@ them out unless you have a specific reason to relocate those paths:
 | Field | Default | Meaning |
 |---|---|---|
 | `artifactsDir` | `<cyrusHome>/router/artifacts` (e.g. `~/.cyrus/router/artifacts`) | Where the router stores per-issue floor bundles (git branch + Claude transcripts) uploaded by containers. **Leave this unset** — only set it if you deliberately want the bundles stored somewhere other than the default. Setting it to a Linux path like `/home/cyrus/...` will fail on macOS, where `/home` is an unwritable autofs mount. |
-| `secretsPath` | `<cyrusHome>/router/user-secrets.json` (e.g. `~/.cyrus/router/user-secrets.json`) | Where per-user container secrets (Claude token, git identity, GitHub PAT) are stored. `cyrus router secrets set` writes here. **Leave this unset** for the same reason as `artifactsDir` above. |
+| `secretsPath` | `<cyrusHome>/router/user-secrets.json` (e.g. `~/.cyrus/router/user-secrets.json`) | Where per-user container secrets are stored — an arbitrary set of environment-variable-named credentials per user (Claude token, git identity, GitHub token, and anything else a session needs; see [Per-user tool credentials and secrets management](#per-user-tool-credentials-and-secrets-management)). `cyrus router secrets set` writes here. **Leave this unset** for the same reason as `artifactsDir` above. |
+| `requiredSecretKeys` | `[]` (only the Claude OAuth token is required) | Extra secret keys a user must have stored before their containers are allowed to boot, on top of the always-required `CLAUDE_CODE_OAUTH_TOKEN` — e.g. `["GIT_TOKEN", "LINEAR_API_TOKEN"]`. See [Per-user tool credentials and secrets management](#per-user-tool-credentials-and-secrets-management). |
 | `idleStopMs` | `900000` (15 min) | A running container with no active session is `stop()`ped after this long — parked, volume retained, cheap to resume. |
 | `staleDestroyMs` | `1209600000` (14 days) | A container untouched this long is fully destroyed (container **and** volume). Safe because the floor (git branch + artifact bundle) survives — a later prompt rebuilds the workspace from scratch via the restore ladder. |
 | `docker.memoryLimit` | (none — host default) | Passed as `docker run --memory <value>`, e.g. `"2g"`. Strongly recommended if you're running several containers on one host — this is the fix for the small-VM OOM problem the design doc mentions. |
@@ -196,22 +197,31 @@ cyrus router users set-executor alice@example.com docker
 # Required: a Claude Code OAuth token, generated on ANY machine with the
 # Claude CLI installed (does not need to be the router host).
 claude setup-token
-cyrus router secrets set alice@example.com claudeOauthToken <token from claude setup-token>
+cyrus router secrets set alice@example.com CLAUDE_CODE_OAUTH_TOKEN <token from claude setup-token>
 
 # Recommended: git identity, so commits inside the container are attributed
 # to Alice rather than the image's baked-in default ("Cyrus" / "cyrus@localhost").
-cyrus router secrets set alice@example.com gitUserName "Alice Example"
-cyrus router secrets set alice@example.com gitUserEmail alice@example.com
+cyrus router secrets set alice@example.com GIT_USER_NAME "Alice Example"
+cyrus router secrets set alice@example.com GIT_USER_EMAIL alice@example.com
 
-# Optional: a GitHub PAT, if you want Alice's own PR/commit attribution
+# Optional: a GitHub token, if you want Alice's own PR/commit attribution
 # instead of the repo's shared GitHub App installation token, or if a
 # repository is private and the GitHub App path isn't configured.
-cyrus router secrets set alice@example.com githubPat <github-personal-access-token>
+cyrus router secrets set alice@example.com GIT_TOKEN <github-personal-access-token>
 
 # Optional: a dotfiles repo cloned to ~/dotfiles at boot (its install.sh, if
 # present, is run — failures are logged and never block boot).
-cyrus router secrets set alice@example.com dotfilesRepo https://github.com/alice/dotfiles.git
+cyrus router secrets set alice@example.com DOTFILES_REPO https://github.com/alice/dotfiles.git
 ```
+
+Any of these — and any other tool credential a session needs — can be stored
+this way: `cyrus router secrets set <email> <ENV_VAR_NAME> <value>` accepts
+**any valid environment-variable name** that isn't one of the container's
+own [reserved keys](#per-user-tool-credentials-and-secrets-management)
+(`CYRUS_ROUTER_URL`, `CYRUS_DEVICE_TOKEN`, etc. — see that section for the
+full list and for `containers.requiredSecretKeys`, `secrets list`, secret
+rotation, and the hosted Linear MCP). The five names above are just the ones
+this walkthrough happens to set up first.
 
 `alice@example.com` must already be an enrolled router user (`cyrus router
 users add alice@example.com` if not — see
@@ -340,6 +350,130 @@ session resumed straight into an empty, freshly-`mkdir`'d directory with no
 repo and no history. If you're on a build predating that fix, you will not
 see the behavior described above — update first.
 
+## Adding tools to the worker container
+
+The base image only bakes in `git`, `gh`, `curl`, `jq`, and `ca-certificates`
+(see [step 1](#1-build-the-worker-image)). If a session needs another CLI —
+say, a language-specific package manager, a linter, or another agent CLI —
+there are three ways to get it there, in order of preference:
+
+1. **Overlay image (recommended).** Build a thin image on top of the one you
+   built in step 1, install whatever you need as root, then drop back to the
+   non-root `cyrus` user the base image runs as (`useradd --uid 1001 cyrus`
+   + `USER cyrus`, see `docker/worker/Dockerfile`):
+
+   ```dockerfile
+   FROM cyrus-worker:dev
+   USER root
+   RUN npm install -g @openai/codex   # example: add the Codex CLI
+   USER cyrus
+   ```
+
+   Build it, push it to whatever registry you use (see step 1's note on
+   pushing `cyrus-worker:dev` — replace the `FROM` line with your own pushed
+   tag, e.g. `ghcr.io/<your-org>/cyrus-worker:<tag>`, once you have one),
+   point `containers.image` in `router-config.json` at the new tag, and
+   restart the router. No application rebuild required — this only touches
+   the image.
+
+2. **`cyrus-setup.sh` and a dotfiles repo.** Two existing per-worktree /
+   per-user hooks also run inside the container, without needing a new
+   image:
+   - **`cyrus-setup.sh`** at the repository root (see the top-level
+     [CLAUDE.md](../../CLAUDE.md) "Git Worktrees" note) runs whenever the
+     git worktree is (re)created — the container's first boot for a fresh
+     issue, and again if the worktree has to be rebuilt after a volume-loss
+     restore (see [step 5](#5-verify-persistence-stop-mid-session-and-re-prompt)
+     above) — but not on an ordinary warm restart where the worktree already
+     exists on the volume. It does **not** run with sudo; keep it to
+     repo-local setup only (installing packages that need root is not
+     possible this way — use the overlay image instead).
+   - **`DOTFILES_REPO`** (a per-user secret, see below) is cloned to
+     `~/dotfiles` and its `install.sh`, if present, is run — on **every**
+     `cyrus container-boot` invocation (every container start, not just the
+     first; the clone itself is skipped once `~/dotfiles/.git` already
+     exists, but `install.sh` always re-runs). It also runs as the
+     non-root `cyrus` user, and a failure is logged and never blocks boot.
+
+3. **Per-user tool credentials.** If the "tool" is really just an API key or
+   token a session needs (for example, Linear's own hosted MCP), store it as
+   a per-user secret instead of touching the image at all:
+
+   ```bash
+   cyrus router secrets set alice@example.com LINEAR_API_TOKEN lin_api_xxx
+   cyrus router secrets list alice@example.com   # keys masked; shows missing required
+   ```
+
+   See [Per-user tool credentials and secrets management](#per-user-tool-credentials-and-secrets-management)
+   below for the full picture: how these values reach the container, the
+   reserved keys you can't use, how to make a credential mandatory before a
+   user's containers boot, and how to apply a changed secret to an
+   already-running container.
+
+## Per-user tool credentials and secrets management
+
+`cyrus router secrets set <email> <ENV_VAR_NAME> <value>` (see
+[step 3](#3-point-a-user-at-the-docker-executor-and-set-their-secrets) above)
+accepts **any valid environment-variable name** that isn't reserved (below)
+— not just the five names that walkthrough happens to set up. Whatever you
+store is passed straight into the container's environment for that user's
+sessions, so any tool that authenticates via an env var works without a code
+change.
+
+- **The value appears verbatim in the container's environment.**
+  Interactive OAuth flows are **not possible inside a container** — there is
+  no browser to complete them in — so for anything that would normally
+  prompt an OAuth consent screen, use a long-lived credential instead: a
+  personal API key, or an access token obtained ahead of time on a machine
+  that *can* do the interactive flow. `LINEAR_API_TOKEN` is the concrete
+  example above: set it to a Linear Personal API Key (or a pre-obtained
+  OAuth access token) and, in addition to being visible to Claude as an
+  ordinary env var, it also authenticates the **hosted Linear MCP** for that
+  user's sessions (the same MCP server device-mode sessions get) — see the
+  `LINEAR_API_TOKEN` handling in `ContainerBootCommand.writeConfig()`.
+
+- **Required set.** `CLAUDE_CODE_OAUTH_TOKEN` is always required — a
+  container refuses to boot without it. Operators can require additional
+  credentials on top of that with `containers.requiredSecretKeys` in
+  `router-config.json`:
+
+  ```json
+  {
+    "containers": {
+      "requiredSecretKeys": ["GIT_TOKEN", "LINEAR_API_TOKEN"]
+    }
+  }
+  ```
+
+  A user missing any key in the effective required set (the Claude token
+  plus whatever `requiredSecretKeys` adds) is blocked from booting, with a
+  Linear boot-failure activity naming the missing keys — see
+  [Troubleshooting](#troubleshooting) below for what that activity looks
+  like. Check what a given user currently has and still needs with `cyrus
+  router secrets list <email>`.
+
+- **Reserved keys** (rejected by `secrets set`, and by `requiredSecretKeys`
+  in `router-config.json`): `CYRUS_ROUTER_URL`, `CYRUS_DEVICE_TOKEN`,
+  `CYRUS_ISSUE_KEY`, `CYRUS_REPOS_JSON`, `CYRUS_WORKSPACES_DIR`,
+  `CYRUS_REPO_CACHE_DIR`, `PATH`, `HOME`, `NODE_OPTIONS` — these are the
+  container's own wiring and can't be overridden per-user. Stored keys must
+  also be valid environment-variable names.
+
+- **Rotation limitation.** Changing or adding a secret takes effect the next
+  time that issue's container gets a **fresh** boot — an already-running
+  container keeps the environment it started with. To apply a changed
+  secret to an in-flight issue immediately, destroy its container first:
+
+  ```bash
+  cyrus router containers destroy <issueKey>
+  ```
+
+  The router recreates the container on the next routed event (a new
+  prompt, a Linear webhook), with the updated environment. This only drops
+  the router's bookkeeping row for the issue — see the "Dropping a stuck
+  container device" note in [Troubleshooting](#troubleshooting) below for
+  what it does and doesn't clean up immediately.
+
 ## Troubleshooting
 
 **A boot failure in Linear** looks like an activity on the session reading
@@ -385,7 +519,7 @@ for a boot failure looks like `container boot failed for <issueKey>: <error>`.
   than returning an immediate "connection refused".
 - No Claude OAuth token stored for the user — the error detail will read `no
   Claude OAuth token stored for <email>`. Run `cyrus router secrets set
-  <email> claudeOauthToken <token>`.
+  <email> CLAUDE_CODE_OAUTH_TOKEN <token>`.
 - Docker itself isn't reachable from the router process (wrong host, daemon
   not running, permission denied on the Docker socket) — the error detail
   surfaces whatever the `docker` CLI printed to stderr.
