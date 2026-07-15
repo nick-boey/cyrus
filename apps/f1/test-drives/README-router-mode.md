@@ -36,7 +36,7 @@ runbook is that check. It complements, not replaces, the CI suite — run both.
 - Docker installed and reachable (`docker info` succeeds).
 - A real Claude Code OAuth token: `claude setup-token`.
 - Repo built at least once: `pnpm install && pnpm build` from the repo root.
-- `apps/f1` uses [Bun](https://bun.sh) to run TypeScript directly (`router-server.ts`, `./f1`).
+- `apps/f1` uses [Bun](https://bun.sh) for the `./f1` client (auto-loads `.env`). The **`router-server` runs under Node**, not Bun, because `RouterStore` uses the native `better-sqlite3` module Bun can't load — see step 2.
 
 ## Steps
 
@@ -58,11 +58,16 @@ From `apps/f1`:
 
 ```bash
 cd apps/f1
-F1_ROUTER_CONTROL_TOKEN=<pick-a-token> F1_ROUTER_CONTROL_PORT=3601 bun run router-server.ts
+# IMPORTANT: router-server must run under NODE, not Bun. RouterStore uses the native
+# better-sqlite3 module, which Bun cannot load (ERR_DLOPEN_FAILED). Build the entrypoint,
+# then run the compiled JS under Node with --env-file (Node does not auto-load .env like Bun):
+pnpm --filter cyrus-f1 build   # if dist/ is stale
+node --env-file=.env dist/router-server.js
 ```
 
-(equivalently: `pnpm run router-server`, wired to the same script — see `apps/f1/package.json`'s
-`"router-server": "bun run router-server.ts"`).
+(The env vars can also be passed inline, e.g. `F1_ROUTER_CONTROL_TOKEN=<tok> F1_ROUTER_CONTROL_PORT=3601 node dist/router-server.js`.
+Note: `apps/f1/package.json`'s `"router-server": "bun run router-server.ts"` is currently broken for
+this reason — prefer the Node command above until that script is switched to Node.)
 
 Env vars the entrypoint reads (`apps/f1/router-server.ts:87-93`):
 
@@ -281,8 +286,8 @@ boot — `docker/worker/entrypoint.sh:2`, `exec node /app/dist/src/app.js contai
 ## Verification checklist
 
 - [ ] `docker build -f docker/worker/Dockerfile -t cyrus-worker:test .` succeeds
-- [ ] `bun run router-server.ts` (no `CYRUS_ROUTER_FAKE_EXECUTOR`) starts and prints the router WS
-      and control-plane URLs
+- [ ] `node --env-file-if-exists=.env dist/router-server.js` (a.k.a. `pnpm run router-server`; no
+      `CYRUS_ROUTER_FAKE_EXECUTOR`) starts and prints the router WS and control-plane URLs
 - [ ] `router:seed-user` returns success
 - [ ] `create-issue` + `router:inject --kind created` results in `docker ps` showing a new
       `cyrus-issue-<KEY>` container within a couple of minutes
@@ -317,7 +322,9 @@ There is also a scripted, credential-free real-Docker suite that covers containe
 skipped by default:
 
 ```bash
-CYRUS_E2E_DEDICATED_DOCKER=1 pnpm --filter cyrus-router vitest run test/containers-real-docker.e2e.test.ts
+# Note the `exec`: cyrus-router's test script is `test:run`, not `vitest`, so a
+# bare `pnpm --filter cyrus-router vitest ...` errors with ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT.
+CYRUS_E2E_DEDICATED_DOCKER=1 pnpm --filter cyrus-router exec vitest run test/containers-real-docker.e2e.test.ts
 ```
 
 `CYRUS_E2E_DEDICATED_DOCKER` verified in `packages/router/test/helpers/dockerDaemon.ts:10-12`
