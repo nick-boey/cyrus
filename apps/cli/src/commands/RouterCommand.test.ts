@@ -457,6 +457,11 @@ describe("RouterCommand", () => {
 					"NODE_OPTIONS",
 				]),
 			).rejects.toThrow(/process\.exit called with 1/);
+			const msg = String(
+				(app.logger.error as ReturnType<typeof vi.fn>).mock.calls[0]?.[0],
+			);
+			expect(msg).toContain("reserved env var");
+			expect(msg).toContain("NODE_OPTIONS");
 		});
 	});
 
