@@ -451,3 +451,176 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 		}, 180_000);
 	},
 );
+
+// Task 11 finding (A4 worktree-reachability, recorded 2026-07-15,
+// see .superpowers/sdd/vh-task-11-report.md):
+//
+// Code trace of packages/edge-worker/src/EdgeWorker.ts confirms
+// createGitWorktree (called at L4419, inside createCyrusAgentSession,
+// which is awaited at L4797) fully resolves and returns BEFORE the
+// runner is constructed/started (createRunnerForType at L4918;
+// runner.startStreaming/runner.start at L4954/L4958) — all within the
+// single linear control flow of initializeAgentRunner(). X < Y holds
+// structurally: there is no path through this handler that starts the
+// runner without first having created the worktree.
+//
+// Trace of the router-mode prerequisites (EdgeWorker.ts +
+// packages/router-client/src/RouterIssueTrackerService.ts) shows
+// reaching createGitWorktree needs only:
+//   (a) repository routing to resolve to "selected" (not
+//       needs_selection/pendingSelection) — deterministic for a
+//       single, unconfigured (catch-all) repo, as configured here; and
+//   (b) a successful device->router fetchIssue RPC — the ROUTER holds
+//       the real Linear OAuth tokens, not the device, so a
+//       CLI-tracker-backed router serving seeded data (seedSession /
+//       createdFixture, as used below) satisfies this with no real
+//       Linear credentials.
+// Neither depends on Claude Code OAuth token validity: the Claude
+// runner is only touched at L4918/L4954-4958, strictly AFTER
+// createGitWorktree returns, and ContainerBootCommand
+// (apps/cli/src/commands/ContainerBootCommand.ts) only checks that
+// CLAUDE_CODE_OAUTH_TOKEN is *present*, never that it's valid, before
+// spawning `cyrus start`.
+//
+// However, per Task 11's brief, "assertion as written" requires BOTH
+// this code trace AND an empirical container boot (with an invalid
+// Claude token) to confirm reachability. The empirical boot was
+// explicitly NOT run during Task 11 (no docker on that machine).
+// Conservatively treating reachability as code-trace-confirmed but
+// NOT empirically confirmed: this `it` is `it.skip`'d, and the
+// /workspaces/<KEY> real-directory invariant (item 4) is instead
+// validated by the manual real-Claude drive (Task 13). Once a
+// developer runs the Step-3 boot check on a dedicated Docker daemon
+// and confirms /workspaces/<KEY> appears, remove this skip.
+//
+// A SEPARATE describe block, deliberately: this block's closure locals
+// (`server`, `tracker`, `dir`, `port`) are private to its own
+// `beforeAll`/`it` closure and are NOT visible to, or shared with, the
+// suites above. It stands up its own `RouterServer` (own tmp dir, own
+// fixed port distinct from the suites above's 3456/3457) so it can run
+// independently of, and without interference from, those suites.
+describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
+	"/workspaces/<ISSUE-KEY> invariant",
+	() => {
+		let server: RouterServer;
+		let tracker: CLIIssueTrackerService;
+		let dir: string;
+		let port: number;
+		const issueKey = runScopedIssueKey("CYDIR");
+		const containerName = `cyrus-issue-${issueKey}`;
+
+		beforeAll(async () => {
+			// Build the worker image (cached; same pattern as the suites above).
+			execFileSync(
+				"docker",
+				["build", "-f", "docker/worker/Dockerfile", "-t", IMAGE, "."],
+				{
+					cwd: join(__dirname, "..", "..", ".."),
+					stdio: "inherit",
+				},
+			);
+
+			tracker = new CLIIssueTrackerService();
+			tracker.seedDefaultData();
+			dir = mkdtempSync(join(tmpdir(), "router-workspaces-dir-"));
+			const secrets = new SecretStore(join(dir, "secrets.json"));
+			port = 3458; // fixed; distinct from the lifecycle suite's 3456 and the floor-upload suite's 3457
+
+			const containers = {
+				image: IMAGE,
+				routerUrlForContainers: `ws://host.docker.internal:${port}`,
+				repositories: [
+					{
+						name: "hello",
+						githubSlug: "octocat/Hello-World",
+						linearWorkspaceId: WORKSPACE,
+						baseBranch: "master",
+					},
+				],
+				secretsPath: join(dir, "secrets.json"),
+				artifactsDir: join(dir, "artifacts"),
+				idleStopMs: IDLE_STOP_MS,
+				staleDestroyMs: STALE_DESTROY_MS,
+			};
+			server = new RouterServer({
+				port,
+				host: "0.0.0.0", // container-facing: reachable from host.docker.internal
+				dbPath: ":memory:",
+				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
+				webhook: { verificationMode: "direct", secret: "s" },
+				trackerFactory: () => tracker,
+				logger: { info: () => {}, warn: () => {} },
+				containers,
+				// Scoped so BOTH the container-targets executor AND RouterServer's
+				// own internal periodic sweep are bounded to this run's container —
+				// see the identical rationale on the suites above.
+				executorRegistryFactory: () =>
+					new Map([
+						[
+							"docker",
+							scopedProvider(
+								new LocalDockerProvider({ image: IMAGE }),
+								new Set([issueKey]),
+							),
+						],
+					]),
+			});
+			await server.start();
+			server.store.addUser({ email: "e2e@example.com", linearId: "lin-e2e" });
+			server.store.setUserExecutor(
+				"e2e@example.com",
+				JSON.stringify({ type: "docker" }),
+			);
+			secrets.set(
+				"e2e@example.com",
+				"claudeOauthToken",
+				"fake-oauth-not-used-for-boot",
+			);
+		}, 300_000);
+
+		afterAll(async () => {
+			removeContainerAndVolume(containerName);
+			await server?.stop();
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		it.skip("is a real directory, not a symlink, and realpath-stable", async () => {
+			seedSession(tracker, "sess-dir", "issue-dir");
+			await server.eventRouter.route(
+				createdFixture({
+					sessionId: "sess-dir",
+					issue: { id: "issue-dir", identifier: issueKey, title: "dir" },
+					creator: { id: "lin-e2e", email: "e2e@example.com", name: "E2E" },
+				}),
+			);
+			// Wait until the worktree exists inside the container.
+			await vi.waitFor(
+				() => {
+					const r = execFileSync(
+						"docker",
+						["exec", containerName, "test", "-d", `/workspaces/${issueKey}`],
+						{ stdio: "ignore" },
+					);
+					return r;
+				},
+				{ timeout: 90_000 },
+			);
+			// Assert: directory, NOT a symlink, realpath resolves to itself.
+			execFileSync("docker", [
+				"exec",
+				containerName,
+				"test",
+				"!",
+				"-L",
+				`/workspaces/${issueKey}`,
+			]);
+			const real = execFileSync(
+				"docker",
+				["exec", containerName, "realpath", `/workspaces/${issueKey}`],
+				{ encoding: "utf-8" },
+			).trim();
+			expect(real).toBe(`/workspaces/${issueKey}`);
+			removeContainerAndVolume(containerName);
+		}, 180_000);
+	},
+);
