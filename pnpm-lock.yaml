@@ -151,6 +151,12 @@ importers:
       cyrus-edge-worker:
         specifier: workspace:*
         version: link:../../packages/edge-worker
+      cyrus-router:
+        specifier: workspace:*
+        version: link:../../packages/router
+      cyrus-router-executors:
+        specifier: workspace:*
+        version: link:../../packages/router-executors
       cyrus-slack-event-transport:
         specifier: workspace:*
         version: link:../../packages/slack-event-transport
