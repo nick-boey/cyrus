@@ -2,6 +2,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SecretStore } from "cyrus-router";
 import type {
 	ContainerExecutor,
 	ContainerStatus,
@@ -35,13 +36,15 @@ describe("control server", () => {
 	let rig: RouterRig;
 	let control: ControlServer;
 	let dir: string;
+	let secretsPath: string;
 	const exec = new RecordingExecutor();
 
 	beforeAll(async () => {
 		dir = mkdtempSync(join(tmpdir(), "f1-control-"));
+		secretsPath = join(dir, "secrets.json");
 		rig = await createRouterRig({
 			dbPath: ":memory:",
-			secretsPath: join(dir, "secrets.json"),
+			secretsPath,
 			artifactsDir: join(dir, "artifacts"),
 			executors: new Map([["docker", exec]]),
 			logger: { info: () => {}, warn: () => {} },
@@ -97,6 +100,28 @@ describe("control server", () => {
 		});
 		expect(inject.status).toBe(200);
 		await vi.waitFor(() => expect(exec.calls).toContain("CYPACK-1"));
+	});
+
+	it("forwards env vars from /router/seed-user into the secret store", async () => {
+		const seed = await fetch(`${control.url}/router/seed-user`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer secret-token",
+			},
+			body: JSON.stringify({
+				email: "envy@example.com",
+				linearId: "lin-envy",
+				provider: "docker",
+				claudeOauthToken: "claude-tok",
+				env: { LINEAR_API_TOKEN: "lin_api_1" },
+			}),
+		});
+		expect(seed.status).toBe(200);
+
+		const stored = new SecretStore(secretsPath).get("envy@example.com");
+		expect(stored.CLAUDE_CODE_OAUTH_TOKEN).toBe("claude-tok");
+		expect(stored.LINEAR_API_TOKEN).toBe("lin_api_1");
 	});
 
 	it("rejects /router/enroll without the bearer token", async () => {

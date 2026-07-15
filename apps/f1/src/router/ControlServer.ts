@@ -60,6 +60,7 @@ export async function startControlServer(opts: {
 			linearId: string;
 			provider: string;
 			claudeOauthToken: string;
+			env?: Record<string, string>;
 		};
 		opts.rig.seedUser(b);
 		reply.send({ ok: true });

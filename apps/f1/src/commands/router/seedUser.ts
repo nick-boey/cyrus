@@ -11,6 +11,26 @@ interface RouterSeedUserOptions {
 	linearId: string;
 	provider: string;
 	claudeToken: string;
+	env: string[];
+}
+
+function collect(value: string, previous: string[]): string[] {
+	return previous.concat([value]);
+}
+
+/** Parses KEY=VALUE pairs. Never includes a VALUE in an error (it may be a secret). */
+export function parseEnvPairs(pairs: string[]): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const pair of pairs) {
+		const eq = pair.indexOf("=");
+		if (eq <= 0) {
+			throw new Error(
+				"--env expects KEY=VALUE with a non-empty key (value omitted from this error)",
+			);
+		}
+		out[pair.slice(0, eq)] = pair.slice(eq + 1);
+	}
+	return out;
 }
 
 export function createRouterSeedUserCommand(): Command {
@@ -24,12 +44,19 @@ export function createRouterSeedUserCommand(): Command {
 			"--claude-token <token>",
 			"CLAUDE_CODE_OAUTH_TOKEN for the container",
 		)
+		.option(
+			"--env <KEY=VALUE>",
+			"Extra container env var (repeatable)",
+			collect,
+			[],
+		)
 		.action(async (o: RouterSeedUserOptions) => {
 			await controlPost("/router/seed-user", {
 				email: o.email,
 				linearId: o.linearId,
 				provider: o.provider,
 				claudeOauthToken: o.claudeToken,
+				env: parseEnvPairs(o.env),
 			});
 			console.log(success(`Seeded user ${o.email} (${o.provider})`));
 		});

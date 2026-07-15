@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 import { createRouterArtifactCommand } from "../../src/commands/router/artifact.js";
 import { createRouterEnrollCommand } from "../../src/commands/router/enroll.js";
 import { createRouterInjectCommand } from "../../src/commands/router/inject.js";
-import { createRouterSeedUserCommand } from "../../src/commands/router/seedUser.js";
+import {
+	createRouterSeedUserCommand,
+	parseEnvPairs,
+} from "../../src/commands/router/seedUser.js";
 
 describe("router:* commands", () => {
 	it("expose the expected command names and required options", () => {
@@ -18,5 +21,15 @@ describe("router:* commands", () => {
 		const enroll = createRouterEnrollCommand();
 		const enrollNames = enroll.options.map((o) => o.long);
 		expect(enrollNames).toContain("--email");
+	});
+});
+
+describe("parseEnvPairs", () => {
+	it("parses repeatable KEY=VALUE pairs, splitting on the first '='", () => {
+		expect(parseEnvPairs(["A=1", "B=x=y"])).toEqual({ A: "1", B: "x=y" });
+	});
+
+	it("throws a leak-safe error (never includes the value) for a malformed pair", () => {
+		expect(() => parseEnvPairs(["SECRETVALUE_NO_EQ"])).toThrow(/value omitted/);
 	});
 });

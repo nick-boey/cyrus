@@ -2,6 +2,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SecretStore } from "cyrus-router";
 import type {
 	ContainerExecutor,
 	ContainerStatus,
@@ -32,13 +33,15 @@ class RecordingExecutor implements ContainerExecutor {
 describe("createRouterRig (fake executor, no Docker)", () => {
 	let rig: RouterRig;
 	let dir: string;
+	let secretsPath: string;
 	const exec = new RecordingExecutor();
 
 	beforeAll(async () => {
 		dir = mkdtempSync(join(tmpdir(), "f1-router-rig-"));
+		secretsPath = join(dir, "secrets.json");
 		rig = await createRouterRig({
 			dbPath: ":memory:",
-			secretsPath: join(dir, "secrets.json"),
+			secretsPath,
 			artifactsDir: join(dir, "artifacts"),
 			executors: new Map([["docker", exec]]),
 			logger: { info: () => {}, warn: () => {} },
@@ -67,5 +70,18 @@ describe("createRouterRig (fake executor, no Docker)", () => {
 		);
 		await vi.waitFor(() => expect(exec.calls).toContain("CYPACK-1"));
 		expect(rig.port).toBeGreaterThan(0);
+	});
+
+	it("seeds the Claude token under CLAUDE_CODE_OAUTH_TOKEN and stores extra env under raw keys", () => {
+		rig.seedUser({
+			email: "drive@example.com",
+			linearId: "lin-1",
+			provider: "docker",
+			claudeOauthToken: "claude-tok",
+			env: { LINEAR_API_TOKEN: "lin_api_1" },
+		});
+		const stored = new SecretStore(secretsPath).get("drive@example.com");
+		expect(stored.CLAUDE_CODE_OAUTH_TOKEN).toBe("claude-tok");
+		expect(stored.LINEAR_API_TOKEN).toBe("lin_api_1");
 	});
 });

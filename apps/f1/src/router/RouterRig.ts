@@ -14,6 +14,7 @@ export interface RouterRig {
 		linearId: string;
 		provider: string;
 		claudeOauthToken: string;
+		env?: Record<string, string>;
 	}): void;
 	stop(): Promise<void>;
 }
@@ -76,10 +77,13 @@ export async function createRouterRig(
 		server,
 		tracker,
 		port,
-		seedUser({ email, linearId, provider, claudeOauthToken }) {
+		seedUser({ email, linearId, provider, claudeOauthToken, env }) {
 			server.store.addUser({ email, linearId });
 			server.store.setUserExecutor(email, JSON.stringify({ type: provider }));
-			secrets.set(email, "claudeOauthToken", claudeOauthToken);
+			secrets.set(email, "CLAUDE_CODE_OAUTH_TOKEN", claudeOauthToken);
+			for (const [key, value] of Object.entries(env ?? {})) {
+				secrets.set(email, key, value);
+			}
 		},
 		async stop() {
 			await server.stop();
