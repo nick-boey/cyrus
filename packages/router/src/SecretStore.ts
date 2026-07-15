@@ -73,7 +73,9 @@ function migrateBundle(raw: Record<string, string>): UserSecretBundle {
 		if (!Object.hasOwn(LEGACY_SECRET_KEY_MAP, key)) out[key] = value;
 	}
 	for (const [key, value] of Object.entries(raw)) {
-		const envName = LEGACY_SECRET_KEY_MAP[key];
+		const envName = Object.hasOwn(LEGACY_SECRET_KEY_MAP, key)
+			? LEGACY_SECRET_KEY_MAP[key]
+			: undefined;
 		if (envName && !Object.hasOwn(out, envName)) out[envName] = value;
 	}
 	return out;
@@ -100,7 +102,10 @@ export class SecretStore {
 	 * Rejects reserved keys and non-env-var-name keys.
 	 */
 	set(email: string, key: string, value: string | undefined): void {
-		const normalizedKey = LEGACY_SECRET_KEY_MAP[key] ?? key;
+		const legacyTarget = Object.hasOwn(LEGACY_SECRET_KEY_MAP, key)
+			? LEGACY_SECRET_KEY_MAP[key]
+			: undefined;
+		const normalizedKey = legacyTarget ?? key;
 		if (isReservedEnvKey(normalizedKey)) {
 			throw new Error(
 				`"${normalizedKey}" is a reserved env var and cannot be stored as a per-user secret. Reserved: ${RESERVED_ENV_KEYS.join(", ")}`,
@@ -143,7 +148,9 @@ export class SecretStore {
 		requiredKeys: readonly string[],
 	): { ok: boolean; missing: string[] } {
 		const bundle = this.get(email);
-		const missing = requiredKeys.filter((key) => !bundle[key]);
+		const missing = requiredKeys.filter(
+			(key) => !(Object.hasOwn(bundle, key) && bundle[key]),
+		);
 		return { ok: missing.length === 0, missing };
 	}
 

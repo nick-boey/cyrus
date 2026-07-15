@@ -223,6 +223,10 @@ export class RouterCommand extends BaseCommand {
 	 * Claude token plus `containers.requiredSecretKeys` from router-config.json.
 	 * Read the same way `resolveSecretsPath` reads the config so `secrets list`
 	 * matches what actually blocks boot.
+	 *
+	 * Caveat: if the on-disk config is currently unparseable, this reports the
+	 * DEFAULT-only required set, which can under-report vs. a still-running
+	 * router that started from a previously-valid config (restart re-validates).
 	 */
 	private resolveRequiredSecretKeys(): string[] {
 		const configPath = join(

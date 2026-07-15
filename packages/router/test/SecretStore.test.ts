@@ -175,6 +175,20 @@ describe("SecretStore", () => {
 		).toEqual({ ok: false, missing: ["GIT_TOKEN", "LINEAR_API_TOKEN"] });
 	});
 
+	it("stores and round-trips a key that is an Object.prototype member name, without throwing or coercing to a function", () => {
+		const path = freshPath();
+		const store = new SecretStore(path);
+		store.set("a@example.com", "toString", "x");
+		expect(store.get("a@example.com")).toEqual({ toString: "x" });
+	});
+
+	it("treats an Object.prototype member name as MISSING when required, not satisfied via prototype lookup", () => {
+		const store = new SecretStore(freshPath());
+		expect(
+			store.isFullyAuthenticated("a@example.com", ["hasOwnProperty"]),
+		).toEqual({ ok: false, missing: ["hasOwnProperty"] });
+	});
+
 	it.each([
 		["a JSON array", "[]"],
 		["a non-object user entry", `${JSON.stringify({ "a@x.com": 42 })}`],
