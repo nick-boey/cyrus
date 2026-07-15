@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -9,6 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import {
 	AgentSessionStatus,
 	AgentSessionType,
@@ -39,6 +40,11 @@ import { createdFixture, seedSession, WORKSPACE } from "./helpers/fixtures.js";
 // ESM has no `__dirname`; derive it the same way the rest of the monorepo
 // does (see e.g. packages/core/test/json-schema-export.test.ts).
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// Async child-process runner: the floor round-trip boots a container that
+// downloads its bundle from the SAME in-process RouterServer, so the boot MUST
+// NOT block the event loop (a synchronous execFileSync would deadlock — the
+// router could never serve the container's download while the call blocks).
+const execFileAsync = promisify(execFile);
 
 const IMAGE = "cyrus-worker:test";
 const IDLE_STOP_MS = 60_000;
@@ -421,7 +427,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 			//    `container-boot --restore-only` runs the restore ladder and returns
 			//    without launching `cyrus start`, so its stdout is exactly the
 			//    restore log line we assert on.
-			const logs = execFileSync(
+			const { stdout: logs } = await execFileAsync(
 				"docker",
 				[
 					"run",
