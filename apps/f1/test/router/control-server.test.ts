@@ -98,4 +98,43 @@ describe("control server", () => {
 		expect(inject.status).toBe(200);
 		await vi.waitFor(() => expect(exec.calls).toContain("CYPACK-1"));
 	});
+
+	it("rejects /router/enroll without the bearer token", async () => {
+		const res = await fetch(`${control.url}/router/enroll`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ email: "enroll@example.com" }),
+		});
+		expect(res.status).toBe(401);
+	});
+
+	it("mints and redeems an enrollment code for a seeded user", async () => {
+		const seed = await fetch(`${control.url}/router/seed-user`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer secret-token",
+			},
+			body: JSON.stringify({
+				email: "enroll@example.com",
+				linearId: "lin-enroll",
+				provider: "docker",
+				claudeOauthToken: "tok",
+			}),
+		});
+		expect(seed.status).toBe(200);
+
+		const enroll = await fetch(`${control.url}/router/enroll`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer secret-token",
+			},
+			body: JSON.stringify({ email: "enroll@example.com" }),
+		});
+		expect(enroll.status).toBe(200);
+		const body = (await enroll.json()) as { deviceToken: string };
+		expect(typeof body.deviceToken).toBe("string");
+		expect(body.deviceToken.length).toBeGreaterThan(0);
+	});
 });
