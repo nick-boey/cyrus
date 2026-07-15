@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { resolvePath } from "cyrus-core";
 import {
 	type ContainerDeviceInfo,
+	isStorableSecretKey,
 	RouterServer,
 	type RouterServerConfig,
 	RouterStore,
@@ -91,6 +92,14 @@ const RouterConfigFileSchema = z.object({
 			secretsPath: z.string().optional(),
 			idleStopMs: z.number().optional(),
 			staleDestroyMs: z.number().optional(),
+			requiredSecretKeys: z
+				.array(
+					z.string().refine(isStorableSecretKey, {
+						error: (issue) =>
+							`"${String(issue.input)}" is not a valid, non-reserved env-var name`,
+					}),
+				)
+				.optional(),
 			docker: z
 				.object({
 					memoryLimit: z.string().optional(),

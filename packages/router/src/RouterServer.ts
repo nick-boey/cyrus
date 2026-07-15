@@ -74,6 +74,13 @@ export interface RouterContainersConfig {
 	idleStopMs?: number;
 	/** Default 1_209_600_000 (14 days). */
 	staleDestroyMs?: number;
+	/**
+	 * Extra env-var names a user must have stored before any container boots
+	 * for them, on top of the always-required Claude token. Each entry must be
+	 * a valid, non-reserved env-var name (validated at config load). e.g.
+	 * ["GIT_TOKEN", "LINEAR_API_TOKEN"].
+	 */
+	requiredSecretKeys?: string[];
 	docker?: { memoryLimit?: string; network?: string };
 }
 
@@ -400,6 +407,7 @@ export class RouterServer {
 			containersConfig: {
 				routerUrlForContainers: containers.routerUrlForContainers,
 				repositories: containers.repositories,
+				requiredSecretKeys: containers.requiredSecretKeys,
 			},
 			postActivity: (workspaceId, agentSessionId, body) =>
 				this.executor.postActivity(workspaceId, agentSessionId, body),

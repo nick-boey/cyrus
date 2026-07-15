@@ -1,3 +1,6 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentEvent } from "cyrus-core";
 import { CLIIssueTrackerService } from "cyrus-core";
 import type { LinearOAuthConfig } from "cyrus-linear-event-transport";
@@ -14,6 +17,7 @@ import {
 	RouterServer,
 	type RouterServerConfig,
 } from "../src/RouterServer.js";
+import { SecretStore } from "../src/SecretStore.js";
 
 /**
  * Minimal fake ContainerExecutor whose ensureRunning is an inspectable mock
@@ -490,5 +494,56 @@ describe("RouterServer containers wiring", () => {
 		expect(server.store.getContainerDeviceForIssue("CYPACK-1")).toMatchObject({
 			provider: "docker",
 		});
+	});
+
+	it("forwards containers.requiredSecretKeys to the boot gate", async () => {
+		const docker = fakeExecutor("docker");
+		const executors: ExecutorRegistry = new Map([["docker", docker]]);
+		const secretsPath = join(
+			mkdtempSync(join(tmpdir(), "rs-secrets-")),
+			"s.json",
+		);
+		const logger = { info: vi.fn(), warn: vi.fn() };
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { "ws-1": { linearToken: "t" } },
+			webhook: { verificationMode: "direct", secret: "s" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			containers: {
+				...CONTAINERS_CONFIG,
+				secretsPath,
+				requiredSecretKeys: ["GIT_TOKEN"],
+			},
+			executorRegistryFactory: () => executors,
+			logger,
+		});
+		server.store.addUser({ email: "docker-user@example.com" });
+		server.store.setUserExecutor(
+			"docker-user@example.com",
+			'{"type":"docker"}',
+		);
+		// Only the Claude token — passes the default gate, fails the GIT_TOKEN gate.
+		new SecretStore(secretsPath).set(
+			"docker-user@example.com",
+			"CLAUDE_CODE_OAUTH_TOKEN",
+			"claude-tok",
+		);
+
+		await server.eventRouter.route(
+			createdEvent({
+				sessionId: "sess-1",
+				issueId: "issue-1",
+				identifier: "CYPACK-1",
+				creatorEmail: "docker-user@example.com",
+			}),
+		);
+
+		await vi.waitFor(() =>
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("is not fully authenticated"),
+			),
+		);
+		expect(docker.ensureRunning).not.toHaveBeenCalled();
 	});
 });
