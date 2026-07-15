@@ -160,6 +160,9 @@ importers:
       cyrus-slack-event-transport:
         specifier: workspace:*
         version: link:../../packages/slack-event-transport
+      fastify:
+        specifier: ^5.8.5
+        version: 5.8.5
     devDependencies:
       '@types/node':
         specifier: ^20.0.0

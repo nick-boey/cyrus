@@ -37,7 +37,8 @@
 		"cyrus-edge-worker": "workspace:*",
 		"cyrus-router": "workspace:*",
 		"cyrus-router-executors": "workspace:*",
-		"cyrus-slack-event-transport": "workspace:*"
+		"cyrus-slack-event-transport": "workspace:*",
+		"fastify": "^5.8.5"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
