@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -56,6 +56,7 @@ const CONTAINERS_CONFIG: ContainerRoutingDeps["containersConfig"] = {
 describe("ContainerTargetService", () => {
 	let store: RouterStore;
 	let secrets: SecretStore;
+	let secretsFile: string;
 	let postActivity: Mock<
 		(workspaceId: string, sessionId: string, body: string) => Promise<void>
 	>;
@@ -63,7 +64,8 @@ describe("ContainerTargetService", () => {
 
 	beforeEach(() => {
 		store = new RouterStore(":memory:");
-		secrets = new SecretStore(freshSecretsPath());
+		secretsFile = freshSecretsPath();
+		secrets = new SecretStore(secretsFile);
 		postActivity = vi.fn(async () => {});
 		logger = { info: vi.fn(), warn: vi.fn() };
 	});
@@ -136,9 +138,10 @@ describe("ContainerTargetService", () => {
 	it("boot passes env built from secrets and repo config, minus the device token", async () => {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');
-		secrets.set("a@example.com", "claudeOauthToken", "claude-tok");
-		secrets.set("a@example.com", "githubPat", "gh-pat");
-		secrets.set("a@example.com", "gitUserName", "A Example");
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+		secrets.set("a@example.com", "GIT_TOKEN", "gh-pat");
+		secrets.set("a@example.com", "GIT_USER_NAME", "A Example");
+		secrets.set("a@example.com", "LINEAR_API_TOKEN", "lin_api_1");
 		const docker = fakeExecutor("docker");
 		const service = makeService(new Map([["docker", docker]]));
 		const { deviceId } = service.ensureDevice(
@@ -160,6 +163,7 @@ describe("ContainerTargetService", () => {
 			CLAUDE_CODE_OAUTH_TOKEN: "claude-tok",
 			GIT_TOKEN: "gh-pat",
 			GIT_USER_NAME: "A Example",
+			LINEAR_API_TOKEN: "lin_api_1",
 		});
 		expect(ctx.env.CYRUS_DEVICE_TOKEN).toBeUndefined();
 
@@ -170,7 +174,7 @@ describe("ContainerTargetService", () => {
 	it("posts a boot-failure activity once when ensureRunning rejects", async () => {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');
-		secrets.set("a@example.com", "claudeOauthToken", "claude-tok");
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
 		const ensureRunning = vi.fn(async () => {
 			throw new Error("docker daemon unreachable");
 		});
@@ -198,7 +202,7 @@ describe("ContainerTargetService", () => {
 	it("no Claude token means immediate failure without calling the executor", async () => {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');
-		// Deliberately no secrets.set(...) — claudeOauthToken is absent.
+		// Deliberately no secrets.set(...) — CLAUDE_CODE_OAUTH_TOKEN is absent.
 		const docker = fakeExecutor("docker");
 		const service = makeService(new Map([["docker", docker]]));
 		const { deviceId } = service.ensureDevice(
@@ -211,7 +215,7 @@ describe("ContainerTargetService", () => {
 		await vi.waitFor(() => expect(postActivity).toHaveBeenCalledTimes(1));
 		expect(docker.ensureRunning).not.toHaveBeenCalled();
 		expect(postActivity.mock.calls[0]?.[2]).toContain(
-			"no Claude OAuth token stored",
+			"is not fully authenticated for containers: missing CLAUDE_CODE_OAUTH_TOKEN",
 		);
 	});
 
@@ -257,7 +261,7 @@ describe("ContainerTargetService", () => {
 	it("serializes concurrent boots for the same issue: a second boot() while the first is still cold-booting joins it instead of racing ensureRunning/mintDeviceToken", async () => {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');
-		secrets.set("a@example.com", "claudeOauthToken", "claude-tok");
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
 
 		let resolveFirst: () => void = () => {};
 		const firstAttempt = new Promise<void>((resolve) => {
@@ -301,7 +305,7 @@ describe("ContainerTargetService", () => {
 	it("resets the boot-failed latch on success, so a later failure posts a fresh notice", async () => {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');
-		secrets.set("a@example.com", "claudeOauthToken", "claude-tok");
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
 		let shouldFail = true;
 		const ensureRunning = vi.fn(async () => {
 			if (shouldFail) throw new Error("docker daemon unreachable");
@@ -408,5 +412,87 @@ describe("ContainerTargetService", () => {
 		expect(service.executorFor(deviceUser)).toBeUndefined();
 		expect(service.executorFor(corruptUser)).toBeUndefined();
 		expect(service.executorFor(unsetUser)).toBeUndefined();
+	});
+
+	it("skips reserved env keys found in stored secrets, with a warning", async () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+		const raw = JSON.parse(readFileSync(secretsFile, "utf-8"));
+		raw["a@example.com"].CYRUS_ROUTER_URL = "http://evil";
+		writeFileSync(secretsFile, JSON.stringify(raw));
+
+		const docker = fakeExecutor("docker");
+		const service = makeService(new Map([["docker", docker]]));
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		await vi.waitFor(() =>
+			expect(docker.ensureRunning).toHaveBeenCalledTimes(1),
+		);
+		const ctx = docker.ensureRunning.mock
+			.calls[0]?.[0] as IssueExecutionContext;
+		expect(ctx.env.CYRUS_ROUTER_URL).toBe("wss://router.example.com");
+		expect(logger.warn).toHaveBeenCalledWith(
+			expect.stringContaining('skipping reserved env key "CYRUS_ROUTER_URL"'),
+		);
+	});
+
+	it("always requires the Claude token even when requiredSecretKeys omits it", async () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "GIT_TOKEN", "gh"); // no Claude token
+		const docker = fakeExecutor("docker");
+		const service = new ContainerTargetService({
+			store,
+			secrets,
+			executors: new Map([["docker", docker]]),
+			containersConfig: {
+				...CONTAINERS_CONFIG,
+				requiredSecretKeys: ["GIT_TOKEN"],
+			},
+			postActivity,
+			logger,
+		});
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		await vi.waitFor(() => expect(postActivity).toHaveBeenCalledTimes(1));
+		expect(docker.ensureRunning).not.toHaveBeenCalled();
+		expect(postActivity.mock.calls[0]?.[2]).toContain(
+			"missing CLAUDE_CODE_OAUTH_TOKEN",
+		);
+	});
+
+	it("blocks boot naming every missing required key", async () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+		const docker = fakeExecutor("docker");
+		const service = new ContainerTargetService({
+			store,
+			secrets,
+			executors: new Map([["docker", docker]]),
+			containersConfig: {
+				...CONTAINERS_CONFIG,
+				requiredSecretKeys: ["GIT_TOKEN", "LINEAR_API_TOKEN"],
+			},
+			postActivity,
+			logger,
+		});
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		await vi.waitFor(() => expect(postActivity).toHaveBeenCalledTimes(1));
+		expect(docker.ensureRunning).not.toHaveBeenCalled();
+		expect(postActivity.mock.calls[0]?.[2]).toContain(
+			"missing GIT_TOKEN, LINEAR_API_TOKEN",
+		);
 	});
 });

@@ -1,7 +1,11 @@
 import type { ExecutorRegistry } from "cyrus-router-executors";
 import { containerBootFailedMessage } from "./messages.js";
 import type { RouterStore } from "./RouterStore.js";
-import type { SecretStore } from "./SecretStore.js";
+import {
+	DEFAULT_REQUIRED_SECRET_KEYS,
+	isReservedEnvKey,
+	type SecretStore,
+} from "./SecretStore.js";
 
 /**
  * A device/webhook-supplied issue key flows into filesystem paths, Docker
@@ -42,6 +46,12 @@ export interface ContainerRoutingDeps {
 			linearWorkspaceId: string;
 			baseBranch?: string;
 		}>;
+		/**
+		 * Extra env-var names a user MUST have stored before any container
+		 * boots for them. The Claude token is always required on top of these
+		 * (see buildEnv). Defaults to none when omitted.
+		 */
+		requiredSecretKeys?: string[];
 	};
 	postActivity: (
 		workspaceId: string,
@@ -306,22 +316,40 @@ export class ContainerTargetService {
 
 	private buildEnv(userId: number, issueKey: string): Record<string, string> {
 		const email = this.emailFor(userId);
-		const secrets = this.deps.secrets.get(email);
-		if (!secrets.claudeOauthToken) {
+		// Additive: the container hard-requires the Claude token, so it is
+		// always required regardless of config; requiredSecretKeys adds to it.
+		const requiredKeys = [
+			...new Set([
+				...DEFAULT_REQUIRED_SECRET_KEYS,
+				...(this.deps.containersConfig.requiredSecretKeys ?? []),
+			]),
+		];
+		const { ok, missing } = this.deps.secrets.isFullyAuthenticated(
+			email,
+			requiredKeys,
+		);
+		if (!ok) {
 			throw new Error(
-				`no Claude OAuth token stored for ${email} (cyrus router secrets set ${email} claudeOauthToken <token>)`,
+				`${email} is not fully authenticated for containers: missing ${missing.join(", ")}. Set them with: cyrus router secrets set ${email} <KEY> <value>`,
 			);
 		}
+
 		const env: Record<string, string> = {
 			CYRUS_ROUTER_URL: this.deps.containersConfig.routerUrlForContainers,
 			CYRUS_ISSUE_KEY: issueKey,
 			CYRUS_REPOS_JSON: JSON.stringify(this.deps.containersConfig.repositories),
-			CLAUDE_CODE_OAUTH_TOKEN: secrets.claudeOauthToken,
 		};
-		if (secrets.githubPat) env.GIT_TOKEN = secrets.githubPat;
-		if (secrets.gitUserName) env.GIT_USER_NAME = secrets.gitUserName;
-		if (secrets.gitUserEmail) env.GIT_USER_EMAIL = secrets.gitUserEmail;
-		if (secrets.dotfilesRepo) env.DOTFILES_REPO = secrets.dotfilesRepo;
+		// Spread the user's map, skipping reserved keys. `set` already rejects
+		// them; this is belt-and-braces against a hand-edited secrets file.
+		for (const [key, value] of Object.entries(this.deps.secrets.get(email))) {
+			if (isReservedEnvKey(key)) {
+				this.deps.logger.warn(
+					`skipping reserved env key "${key}" found in ${email}'s stored secrets`,
+				);
+				continue;
+			}
+			env[key] = value;
+		}
 		return env;
 	}
 

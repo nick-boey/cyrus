@@ -18,8 +18,14 @@ export {
 } from "./RouterServer.js";
 export { type ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
 export {
+	DEFAULT_REQUIRED_SECRET_KEYS,
+	isReservedEnvKey,
+	isStorableSecretKey,
+	LEGACY_SECRET_KEY_MAP,
+	RESERVED_ENV_KEYS,
 	SecretStore,
 	USER_SECRET_KEYS,
 	type UserSecretBundle,
+	VALID_ENV_NAME_RE,
 } from "./SecretStore.js";
 export { registerWorkspacesRoute } from "./workspaces.js";
