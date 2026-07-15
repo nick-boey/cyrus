@@ -132,6 +132,12 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		expect(containerBootExecute).toHaveBeenCalledWith([]);
 	});
 
+	it("registers `container-boot --restore-only`", async () => {
+		await run(["container-boot", "--restore-only"]);
+
+		expect(containerBootExecute).toHaveBeenCalledWith(["--restore-only"]);
+	});
+
 	it("still rejects a genuinely unregistered router subcommand", async () => {
 		// Sanity check for the five tests above: confirms Commander actually
 		// errors on a command that was never registered, so the passing tests

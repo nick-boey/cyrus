@@ -1139,3 +1139,67 @@ describe("ContainerBootCommand.execute — full fresh-start orchestration", () =
 		onSpy.mockRestore();
 	});
 });
+
+describe("ContainerBootCommand.execute — --restore-only", () => {
+	let workspacesDir: string;
+	let homeDir: string;
+	let repoCacheDir: string;
+
+	beforeEach(() => {
+		workspacesDir = mkdtempSync(join(tmpdir(), "cyrus-boot-restore-only-ws-"));
+		homeDir = mkdtempSync(join(tmpdir(), "cyrus-boot-restore-only-home-"));
+		repoCacheDir = mkdtempSync(
+			join(tmpdir(), "cyrus-boot-restore-only-cache-"),
+		);
+	});
+
+	afterEach(() => {
+		rmSync(workspacesDir, { recursive: true, force: true });
+		rmSync(homeDir, { recursive: true, force: true });
+		rmSync(repoCacheDir, { recursive: true, force: true });
+	});
+
+	it("runs linkClaudeProjects + restoreState, then returns WITHOUT configureGit/cloneRepos/writeConfig/applyDotfiles/launch", async () => {
+		const { exec, calls } = makeFakeExec();
+		const downloadBundleFn = vi.fn().mockResolvedValue(false);
+		const restoreBundleFn = vi.fn();
+		const fakeChild: SpawnedChild = { on: vi.fn(), kill: vi.fn() };
+		const spawnFn = vi.fn().mockReturnValue(fakeChild);
+		const onSpy = vi.spyOn(process, "on").mockImplementation(() => process);
+
+		const cmd = new ContainerBootCommand({
+			env: baseEnv({
+				CYRUS_WORKSPACES_DIR: workspacesDir,
+				CYRUS_REPO_CACHE_DIR: repoCacheDir,
+				GIT_TOKEN: "tok-xyz",
+			}),
+			exec,
+			spawnFn,
+			homeDir,
+			downloadBundleFn,
+			restoreBundleFn,
+			appPath: "/app/dist/src/app.js",
+			logger: silentLogger(),
+		});
+
+		await cmd.execute(["--restore-only"]);
+
+		// linkClaudeProjects (step 1) still ran.
+		expect(
+			lstatSync(join(homeDir, ".claude", "projects")).isSymbolicLink(),
+		).toBe(true);
+		// restoreState (step 2) still ran.
+		expect(downloadBundleFn).toHaveBeenCalled();
+
+		// Nothing past restoreState ran: no git config/clone calls at all.
+		expect(calls).toEqual([]);
+		// writeConfig (step 5) never wrote config.json.
+		expect(existsSync(join(workspacesDir, ".cyrus", "config.json"))).toBe(
+			false,
+		);
+		// launch (step 7) never spawned `cyrus start`.
+		expect(spawnFn).not.toHaveBeenCalled();
+
+		onSpy.mockRestore();
+	});
+});

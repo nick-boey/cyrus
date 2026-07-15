@@ -317,8 +317,14 @@ export function buildProgram(
 		.description(
 			"Internal: boots an ephemeral worker container (restore ladder + launch `cyrus start`). Used as the worker image's ENTRYPOINT.",
 		)
-		.action(async () => {
-			await new ContainerBootCommand().execute([]);
+		.option(
+			"--restore-only",
+			"Run only the restore ladder (through restoreState) and exit, without launching `cyrus start`",
+		)
+		.action(async (opts: { restoreOnly?: boolean }) => {
+			await new ContainerBootCommand().execute(
+				opts.restoreOnly ? ["--restore-only"] : [],
+			);
 		});
 
 	// Connect command - enroll this device with a running Cyrus Router server

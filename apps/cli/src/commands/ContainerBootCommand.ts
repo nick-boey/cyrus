@@ -252,6 +252,17 @@ export class ContainerBootCommand implements ICommand {
 			deviceToken,
 			issueKey,
 		});
+
+		// `--restore-only`: run only the restore ladder (env validation,
+		// linkClaudeProjects, restoreState — everything above this point) and
+		// stop. Used by tests/tooling that need to assert restore behavior
+		// deterministically without booting a full `cyrus start` session.
+		// Everything below this point (configureGit/cloneRepos/writeConfig/
+		// applyDotfiles/launch) is skipped.
+		if (_args.includes("--restore-only")) {
+			return;
+		}
+
 		// configureGit MUST run before cloneRepos: it installs the credential
 		// helper that authenticates the clone, so the clone URL itself never
 		// needs (and never gets) GIT_TOKEN embedded in it. That keeps the
