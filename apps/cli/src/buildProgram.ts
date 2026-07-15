@@ -288,6 +288,11 @@ export function buildProgram(
 		.description("Remove a per-user container secret")
 		.action(makeRouterAction("secrets", "unset"));
 
+	routerSecretsCommand
+		.command("list <email>")
+		.description("List a user's stored secret keys (values masked)")
+		.action(makeRouterAction("secrets", "list"));
+
 	const routerContainersCommand = routerCommand
 		.command("containers")
 		.description("Manage ephemeral container devices");

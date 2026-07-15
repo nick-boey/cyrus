@@ -110,6 +110,16 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		]);
 	});
 
+	it("registers `router secrets list <email>`", async () => {
+		await run(["router", "secrets", "list", "alice@example.com"]);
+
+		expect(routerExecute).toHaveBeenCalledWith([
+			"secrets",
+			"list",
+			"alice@example.com",
+		]);
+	});
+
 	it("registers `router containers list`", async () => {
 		await run(["router", "containers", "list"]);
 
