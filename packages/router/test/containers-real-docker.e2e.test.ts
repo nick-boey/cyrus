@@ -82,8 +82,22 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				trackerFactory: () => tracker,
 				logger: { info: () => {}, warn: () => {} },
 				containers,
+				// Scoped so BOTH the container-targets executor AND RouterServer's own
+				// internal periodic sweep (the `setInterval` in `start()` that calls
+				// `this.containerLifecycle?.sweep()` every 60s) are bounded to this
+				// run's container. An unscoped provider here would let that internal
+				// sweep's host-wide orphan GC destroy foreign `cyrus.issue`-labelled
+				// containers on a shared/dedicated daemon while the server is alive.
 				executorRegistryFactory: () =>
-					new Map([["docker", new LocalDockerProvider({ image: IMAGE })]]),
+					new Map([
+						[
+							"docker",
+							scopedProvider(
+								new LocalDockerProvider({ image: IMAGE }),
+								new Set([issueKey]),
+							),
+						],
+					]),
 			});
 			await server.start();
 			server.store.addUser({ email: "e2e@example.com", linearId: "lin-e2e" });
@@ -117,6 +131,13 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				() => expect(containerState(containerName)).toBe("running"),
 				{ timeout: 60_000 },
 			);
+
+			// In a real run the container clears this via a terminal session_state
+			// frame; clear it deterministically here so the injected-clock sweep
+			// reaches the idle-stop branch (sweep() skips rows whose session
+			// affinity is still active, and affinity is still active here — the
+			// container only just reported "running").
+			server.store.clearSessionAffinity("sess-e2e");
 
 			// Idle-stop via a second lifecycle sharing the store, with an injected clock.
 			// Scope the provider so this sweep()'s orphan GC can only see OUR container.
