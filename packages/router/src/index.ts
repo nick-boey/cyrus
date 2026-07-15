@@ -24,7 +24,6 @@ export {
 	LEGACY_SECRET_KEY_MAP,
 	RESERVED_ENV_KEYS,
 	SecretStore,
-	USER_SECRET_KEYS,
 	type UserSecretBundle,
 	VALID_ENV_NAME_RE,
 } from "./SecretStore.js";

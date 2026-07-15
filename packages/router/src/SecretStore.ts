@@ -11,19 +11,6 @@ import { dirname } from "node:path";
 /** Per-user container secrets: an env-var-name → value map. */
 export type UserSecretBundle = Record<string, string>;
 
-/**
- * @deprecated Legacy fixed key names. Retained only so migration and the
- * transitional CLI guard can reference them; removed in Task 3 once the CLI
- * stops importing it. New code uses env-var names.
- */
-export const USER_SECRET_KEYS = [
-	"claudeOauthToken",
-	"githubPat",
-	"gitUserName",
-	"gitUserEmail",
-	"dotfilesRepo",
-] as const;
-
 /** Legacy named secret keys → the container env-var names they map to. */
 export const LEGACY_SECRET_KEY_MAP: Record<string, string> = {
 	claudeOauthToken: "CLAUDE_CODE_OAUTH_TOKEN",

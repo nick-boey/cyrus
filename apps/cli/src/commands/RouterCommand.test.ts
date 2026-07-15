@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { RouterStore, SecretStore, USER_SECRET_KEYS } from "cyrus-router";
+import { RouterStore, SecretStore } from "cyrus-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RouterCommand } from "./RouterCommand.js";
 
@@ -304,12 +304,12 @@ describe("RouterCommand", () => {
 				"secrets",
 				"set",
 				"henry@example.com",
-				"githubPat",
+				"GIT_TOKEN",
 				"ghp_supersecretvalue",
 			]);
 
 			expect(app.logger.success).toHaveBeenCalledWith(
-				expect.stringContaining("githubPat"),
+				expect.stringContaining("GIT_TOKEN"),
 			);
 
 			const successCalls = (app.logger.success as ReturnType<typeof vi.fn>).mock
@@ -329,7 +329,7 @@ describe("RouterCommand", () => {
 			}
 
 			const secretStore = new SecretStore(secretsPath());
-			expect(secretStore.get("henry@example.com").githubPat).toBe(
+			expect(secretStore.get("henry@example.com").GIT_TOKEN).toBe(
 				"ghp_supersecretvalue",
 			);
 		});
@@ -342,7 +342,7 @@ describe("RouterCommand", () => {
 				"secrets",
 				"set",
 				"liam@example.com",
-				"gitUserName",
+				"GIT_USER_NAME",
 				"Liam",
 			]);
 
@@ -365,7 +365,7 @@ describe("RouterCommand", () => {
 				"secrets",
 				"set",
 				"maya@example.com",
-				"githubPat",
+				"GIT_TOKEN",
 				"ghp_overridevalue",
 			]);
 
@@ -377,7 +377,7 @@ describe("RouterCommand", () => {
 			expect(existsSync(secretsPath())).toBe(false);
 
 			const secretStore = new SecretStore(overridePath);
-			expect(secretStore.get("maya@example.com").githubPat).toBe(
+			expect(secretStore.get("maya@example.com").GIT_TOKEN).toBe(
 				"ghp_overridevalue",
 			);
 		});
@@ -392,37 +392,33 @@ describe("RouterCommand", () => {
 				"secrets",
 				"set",
 				"noah@example.com",
-				"githubPat",
+				"GIT_TOKEN",
 				"ghp_defaultvalue",
 			]);
 
 			expect(existsSync(secretsPath())).toBe(true);
 			const secretStore = new SecretStore(secretsPath());
-			expect(secretStore.get("noah@example.com").githubPat).toBe(
+			expect(secretStore.get("noah@example.com").GIT_TOKEN).toBe(
 				"ghp_defaultvalue",
 			);
 		});
 
-		it("rejects an unknown secret key and lists the valid ones", async () => {
+		it("rejects a reserved env key on set", async () => {
 			const app = createMockApp(cyrusHome);
-			const command = new RouterCommand(app as any);
-
 			await expect(
-				command.execute([
+				new RouterCommand(app as any).execute([
 					"secrets",
 					"set",
 					"henry@example.com",
-					"sudoPassword",
-					"x",
+					"CYRUS_ROUTER_URL",
+					"http://evil",
 				]),
 			).rejects.toThrow(/process\.exit called with 1/);
-
-			const errorMessage = String(
+			const msg = String(
 				(app.logger.error as ReturnType<typeof vi.fn>).mock.calls[0]?.[0],
 			);
-			for (const key of USER_SECRET_KEYS) {
-				expect(errorMessage).toContain(key);
-			}
+			expect(msg).toContain("reserved env var");
+			expect(msg).toContain("CYRUS_ROUTER_URL");
 		});
 	});
 
@@ -434,7 +430,7 @@ describe("RouterCommand", () => {
 				"secrets",
 				"set",
 				"ivy@example.com",
-				"dotfilesRepo",
+				"DOTFILES_REPO",
 				"git@github.com:ivy/dotfiles.git",
 			]);
 
@@ -442,22 +438,86 @@ describe("RouterCommand", () => {
 				"secrets",
 				"unset",
 				"ivy@example.com",
-				"dotfilesRepo",
+				"DOTFILES_REPO",
 			]);
 
 			const secretStore = new SecretStore(
 				join(cyrusHome, "router", "user-secrets.json"),
 			);
-			expect(secretStore.get("ivy@example.com").dotfilesRepo).toBeUndefined();
+			expect(secretStore.get("ivy@example.com").DOTFILES_REPO).toBeUndefined();
 		});
 
-		it("rejects an unknown secret key", async () => {
+		it("rejects a reserved env key on unset", async () => {
 			const app = createMockApp(cyrusHome);
-			const command = new RouterCommand(app as any);
-
 			await expect(
-				command.execute(["secrets", "unset", "ivy@example.com", "sshKey"]),
+				new RouterCommand(app as any).execute([
+					"secrets",
+					"unset",
+					"ivy@example.com",
+					"NODE_OPTIONS",
+				]),
 			).rejects.toThrow(/process\.exit called with 1/);
+		});
+	});
+
+	describe("secrets list", () => {
+		it("lists stored keys masked and reports fully authenticated (default set)", async () => {
+			const app = createMockApp(cyrusHome);
+			await new RouterCommand(app as any).execute([
+				"secrets",
+				"set",
+				"ivy@example.com",
+				"CLAUDE_CODE_OAUTH_TOKEN",
+				"claude-secret-value",
+			]);
+			const app2 = createMockApp(cyrusHome);
+			await new RouterCommand(app2 as any).execute([
+				"secrets",
+				"list",
+				"ivy@example.com",
+			]);
+			const raw = (app2.logger.raw as ReturnType<typeof vi.fn>).mock.calls
+				.map((c) => String(c[0]))
+				.join("\n");
+			expect(raw).toContain("CLAUDE_CODE_OAUTH_TOKEN = ****");
+			expect(raw).not.toContain("claude-secret-value");
+			expect(app2.logger.success).toHaveBeenCalledWith(
+				expect.stringContaining("fully authenticated"),
+			);
+		});
+
+		it("flags a required key missing per containers.requiredSecretKeys", async () => {
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "ghcr.io/example/cyrus-worker:latest",
+						routerUrlForContainers: "ws://host.docker.internal:8787",
+						repositories: [],
+						requiredSecretKeys: ["GIT_TOKEN"],
+					},
+				}),
+			);
+			const app = createMockApp(cyrusHome);
+			await new RouterCommand(app as any).execute([
+				"secrets",
+				"set",
+				"kai@example.com",
+				"CLAUDE_CODE_OAUTH_TOKEN",
+				"claude-tok",
+			]);
+			const app2 = createMockApp(cyrusHome);
+			await new RouterCommand(app2 as any).execute([
+				"secrets",
+				"list",
+				"kai@example.com",
+			]);
+			expect(app2.logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("missing GIT_TOKEN"),
+			);
 		});
 	});
 

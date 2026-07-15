@@ -9,13 +9,14 @@ import { dirname, join } from "node:path";
 import { resolvePath } from "cyrus-core";
 import {
 	type ContainerDeviceInfo,
+	DEFAULT_REQUIRED_SECRET_KEYS,
+	isReservedEnvKey,
 	isStorableSecretKey,
+	RESERVED_ENV_KEYS,
 	RouterServer,
 	type RouterServerConfig,
 	RouterStore,
 	SecretStore,
-	USER_SECRET_KEYS,
-	type UserSecretBundle,
 } from "cyrus-router";
 import { z } from "zod";
 import { BaseCommand } from "./ICommand.js";
@@ -26,10 +27,6 @@ type ExecutorType = (typeof EXECUTOR_TYPES)[number];
 
 function isExecutorType(value: string): value is ExecutorType {
 	return (EXECUTOR_TYPES as readonly string[]).includes(value);
-}
-
-function isSecretKey(value: string): value is keyof UserSecretBundle {
-	return (USER_SECRET_KEYS as readonly string[]).includes(value);
 }
 
 /**
@@ -120,9 +117,11 @@ const RouterConfigFileSchema = z.object({
  *   cyrus router users set-executor <email> <device|docker|fly|codespaces>
  *                                                # choose where a user's sessions run
  *   cyrus router devices revoke <email>         # revoke a user's enrolled device
- *   cyrus router secrets set <email> <key> <value>
+ *   cyrus router secrets set <email> <ENV_VAR_NAME> <value>
  *                                                # store a per-user container secret
- *   cyrus router secrets unset <email> <key>    # remove a per-user container secret
+ *   cyrus router secrets unset <email> <ENV_VAR_NAME>
+ *                                                # remove a per-user container secret
+ *   cyrus router secrets list <email>           # list stored secret keys (masked) + missing required
  *   cyrus router containers list                # list running ephemeral container devices
  *   cyrus router containers destroy <issueKey>  # drop a container device's row
  *   cyrus router unlock <issueId>               # release a stuck issue lock
@@ -150,7 +149,7 @@ export class RouterCommand extends BaseCommand {
 				return this.unlock(rest[0]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces>|devices revoke <email>|secrets set <email> <key> <value>|secrets unset <email> <key>|containers list|containers destroy <issueKey>|unlock <issueId>>",
+					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces>|devices revoke <email>|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email>|containers list|containers destroy <issueKey>|unlock <issueId>>",
 				);
 		}
 	}
@@ -217,6 +216,32 @@ export class RouterCommand extends BaseCommand {
 
 	private openSecretStore(): SecretStore {
 		return new SecretStore(this.resolveSecretsPath());
+	}
+
+	/**
+	 * The EFFECTIVE required set the running router enforces: the always-on
+	 * Claude token plus `containers.requiredSecretKeys` from router-config.json.
+	 * Read the same way `resolveSecretsPath` reads the config so `secrets list`
+	 * matches what actually blocks boot.
+	 */
+	private resolveRequiredSecretKeys(): string[] {
+		const configPath = join(
+			resolvePath(this.app.cyrusHome),
+			"router-config.json",
+		);
+		let configured: string[] = [];
+		if (existsSync(configPath)) {
+			try {
+				const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+				const parsed = RouterConfigFileSchema.safeParse(raw);
+				if (parsed.success && parsed.data.containers?.requiredSecretKeys) {
+					configured = parsed.data.containers.requiredSecretKeys;
+				}
+			} catch {
+				// fall through to default-only
+			}
+		}
+		return [...new Set([...DEFAULT_REQUIRED_SECRET_KEYS, ...configured])];
 	}
 
 	private async start(): Promise<void> {
@@ -549,9 +574,11 @@ export class RouterCommand extends BaseCommand {
 				return this.secretsSet(secretRest[0], secretRest[1], secretRest[2]);
 			case "unset":
 				return this.secretsUnset(secretRest[0], secretRest[1]);
+			case "list":
+				return this.secretsList(secretRest[0]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router secrets <set <email> <key> <value>|unset <email> <key>>",
+					"Usage: cyrus router secrets <set <email> <ENV_VAR_NAME> <value>|unset <email> <ENV_VAR_NAME>|list <email>>",
 				);
 		}
 	}
@@ -568,13 +595,17 @@ export class RouterCommand extends BaseCommand {
 	): void {
 		if (!email || !key || value === undefined) {
 			this.exitWithError(
-				"Usage: cyrus router secrets set <email> <key> <value>",
+				"Usage: cyrus router secrets set <email> <ENV_VAR_NAME> <value>",
 			);
 		}
-		if (!isSecretKey(key)) {
+		if (isReservedEnvKey(key)) {
 			this.exitWithError(
-				`Unknown secret key "${key}". Valid keys: ${USER_SECRET_KEYS.join(", ")}`,
+				`"${key}" is a reserved env var and cannot be set. Reserved: ${RESERVED_ENV_KEYS.join(", ")}`,
 			);
+		}
+		if (!isStorableSecretKey(key)) {
+			// Reserved was handled above, so this is specifically an invalid name.
+			this.exitWithError(`"${key}" is not a valid environment variable name.`);
 		}
 		this.openSecretStore().set(email, key, value);
 		this.logSuccess(`Set ${key} for ${email}.`);
@@ -585,15 +616,41 @@ export class RouterCommand extends BaseCommand {
 		key: string | undefined,
 	): void {
 		if (!email || !key) {
-			this.exitWithError("Usage: cyrus router secrets unset <email> <key>");
-		}
-		if (!isSecretKey(key)) {
 			this.exitWithError(
-				`Unknown secret key "${key}". Valid keys: ${USER_SECRET_KEYS.join(", ")}`,
+				"Usage: cyrus router secrets unset <email> <ENV_VAR_NAME>",
+			);
+		}
+		if (isReservedEnvKey(key)) {
+			this.exitWithError(
+				`"${key}" is a reserved env var. Reserved: ${RESERVED_ENV_KEYS.join(", ")}`,
 			);
 		}
 		this.openSecretStore().set(email, key, undefined);
 		this.logSuccess(`Unset ${key} for ${email}.`);
+	}
+
+	private secretsList(email: string | undefined): void {
+		if (!email) {
+			this.exitWithError("Usage: cyrus router secrets list <email>");
+		}
+		const store = this.openSecretStore();
+		const bundle = store.get(email);
+		const keys = Object.keys(bundle).sort();
+		if (keys.length === 0) {
+			this.logger.info(`No secrets stored for ${email}.`);
+		} else {
+			this.logger.raw(`Stored secrets for ${email}:`);
+			for (const key of keys) this.logger.raw(`  ${key} = ****`);
+		}
+		const requiredKeys = this.resolveRequiredSecretKeys();
+		const { ok, missing } = store.isFullyAuthenticated(email, requiredKeys);
+		if (ok) {
+			this.logSuccess(`${email} is fully authenticated for containers.`);
+		} else {
+			this.logger.warn(
+				`${email} is NOT fully authenticated: missing ${missing.join(", ")}. Set them with: cyrus router secrets set ${email} <KEY> <value>`,
+			);
+		}
 	}
 
 	private async containers(rest: string[]): Promise<void> {
