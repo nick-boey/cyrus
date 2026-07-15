@@ -1,7 +1,7 @@
 # Design: Container-executor validation harness + "no final response" anomaly
 
 **Date**: 2026-07-15
-**Status**: Approved; revised after Codex (GPT-5.6-Sol) design review — all six findings verified against source and incorporated
+**Status**: Approved; revised after two Codex (GPT-5.6-Sol) reviews — the spec review (six findings) and the plan review (three structural findings, two confirmed against source: router bind interface, suite-wide sweep isolation). All verified before incorporation.
 **Branch**: `cyrus-containers`
 **Source**: `TODO.md` — follow-ups from `apps/f1/test-drives/2026-07-14-container-executors-phase1-validation.md`
 
@@ -146,6 +146,13 @@ CLI mode stays intact as its own regression surface).
 - Bind `RouterServer` to a **fixed, pre-allocated port** (grab a free port, close it, pass it
   as `port`), so `routerUrlForContainers: ws://host.docker.internal:<port>` is known before
   construction and containers can dial back.
+- **Bind the router itself to `0.0.0.0`, not `127.0.0.1`** (plan-review correction). A container
+  reaching the host via `host.docker.internal` lands on the host's bridge/gateway interface
+  (on Linux, the docker0 gateway) — a router bound to loopback is **unreachable** from the
+  container, so it could never connect back. Only the **F1 control plane** below stays on
+  loopback; the container-facing `RouterServer` must bind all interfaces. (Trade-off: on a dev
+  laptop this exposes `/device` / `/enroll` / `/artifacts` to the LAN; acceptable for a local
+  test rig, and those routes require a device token.)
 - Expose the human/agent control surface as a **separate Fastify on `127.0.0.1`, guarded by a
   bearer token** (its own port, owned by the F1 harness), with routes to: enroll+print a device
   token, inject `created`/`prompted`, seed user+executor+secret, inspect the artifact store,
@@ -193,8 +200,16 @@ Mandatory mitigations:
 
 - Run the suite against a **dedicated, disposable daemon** — a separate Docker context or an
   explicit `DOCKER_HOST` the suite requires (throwaway colima/DinD), never the developer's
-  default daemon. The **orphan-GC scenario must not run against a shared daemon at all**, since
-  orphan GC is host-global by construction.
+  default daemon. **The gate applies to the WHOLE suite, not just the orphan-GC test**
+  (plan-review correction): `ContainerLifecycle.sweep()` **always** runs orphan GC over the
+  live daemon (`packages/router/src/ContainerLifecycle.ts:114-141`) — so the idle-stop and
+  stale-destroy tests, which call `sweep()`, would also enumerate and destroy a developer's
+  real containers. Any test that calls `sweep()` requires the dedicated-daemon opt-in.
+- **Defense-in-depth for the non-orphan tests:** wrap the real `LocalDockerProvider` in a
+  scoped adapter whose `listManaged()` returns only the test run's own issue keys, so a
+  `sweep()` in the idle-stop / stale-destroy tests can never GC anything outside the run. The
+  genuine orphan-GC test uses the unscoped provider (it must see the planted orphan) and stays
+  behind the dedicated-daemon opt-in.
 - Use **run-scoped, collision-proof issue keys** (per-run random suffix) so created resources
   are identifiable.
 - Scope teardown to the **exact** container/volume names the run created — never a
@@ -241,10 +256,15 @@ cwd.
 `:960-962`), then `docker exec` to assert `/workspaces/<KEY>` exists, is a directory, is
 **not** a symlink (`test ! -L`), and `realpath` resolves to itself.
 
-**To confirm in the plan:** that worktree creation precedes the runner stream, so this holds
-even with no valid Claude token (a session that starts and stalls still creates the worktree).
+**To confirm in the plan (blocking):** that a router-mode session actually *reaches* worktree
+creation in CI — i.e. that `GitService.createGitWorktree` precedes the runner stream AND that
+the CLI-tracker-backed router returns enough issue detail for it to run, with no valid Claude
+token. The plan-review flagged this as unproven: if worktree creation is not reachable in CI
+router mode, the CI assertion is **dropped** and item 4 is validated **only** via the manual
+real-Claude drive below. This is a hard fork resolved by a verification step, not an assumption.
 
-**Manual drive:** observe the same directory type live during a real running session.
+**Manual drive (guaranteed path):** observe the same directory type live during a real running
+session — this is the primary validation for item 4 if the CI assertion proves unreachable.
 
 ## Track B — "No final `response`" anomaly (item 5)
 
