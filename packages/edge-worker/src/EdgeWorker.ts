@@ -568,8 +568,12 @@ export class EdgeWorker extends EventEmitter {
 		}
 
 		// Router mode: create ONE shared device-side connection to the router.
-		// The device holds no Linear tokens — every issue-tracker operation is
-		// forwarded to the router over this connection.
+		// The device holds no Linear tokens for issue-tracker operations — those
+		// are forwarded to the router over this connection. (An operator MAY
+		// still provision a static per-user Linear token via config.linearWorkspaces
+		// — from LINEAR_API_TOKEN — purely to authenticate the hosted Linear MCP
+		// inside the container's Claude session; that path does not go through the
+		// router connection.)
 		if (this.config.platform === "router") {
 			if (!config.router) {
 				throw new Error(
