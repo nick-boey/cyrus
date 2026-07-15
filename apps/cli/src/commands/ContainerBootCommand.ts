@@ -699,6 +699,23 @@ export class ContainerBootCommand implements ICommand {
 			return repoConfig;
 		});
 
+		// LINEAR_API_TOKEN is an ordinary passthrough env. Its only special
+		// handling: when present, populate linearWorkspaces so the existing
+		// device-mode Linear MCP wiring (getLinearTokenForWorkspace ->
+		// McpConfigService) authenticates the hosted Linear MCP with it. A
+		// container cannot do interactive OAuth. One user holds one Linear
+		// token, so it is applied to every configured workspace id.
+		const linearApiToken = this.env.LINEAR_API_TOKEN;
+		const linearWorkspaces = linearApiToken
+			? opts.repos.reduce<Record<string, { linearToken: string }>>(
+					(acc, repo) => {
+						acc[repo.linearWorkspaceId] = { linearToken: linearApiToken };
+						return acc;
+					},
+					{},
+				)
+			: undefined;
+
 		const config = EdgeConfigSchema.parse({
 			platform: "router" as const,
 			router: {
@@ -707,6 +724,7 @@ export class ContainerBootCommand implements ICommand {
 				floorSync: true,
 			},
 			repositories,
+			...(linearWorkspaces ? { linearWorkspaces } : {}),
 		});
 
 		const cyrusHome = this.cyrusHomeFor(opts.workspacesDir);

@@ -791,6 +791,44 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 
 			expect(second).toBe(first);
 		});
+
+		it("populates linearWorkspaces from LINEAR_API_TOKEN and validates against EdgeConfigSchema", () => {
+			const cmd = newCommand({
+				env: baseEnv({ LINEAR_API_TOKEN: "lin_api_tok" }),
+			});
+
+			cmd.writeConfig({
+				workspacesDir,
+				routerUrl: "https://router.example.com",
+				deviceToken: "device-tok",
+				repos,
+			});
+
+			const configPath = join(workspacesDir, ".cyrus", "config.json");
+			const written = JSON.parse(readFileSync(configPath, "utf-8"));
+
+			expect(EdgeConfigSchema.safeParse(written).success).toBe(true);
+			expect(written.linearWorkspaces).toEqual({
+				"ws-1": { linearToken: "lin_api_tok" },
+				"ws-2": { linearToken: "lin_api_tok" },
+			});
+		});
+
+		it("omits linearWorkspaces when LINEAR_API_TOKEN is absent", () => {
+			const cmd = newCommand();
+
+			cmd.writeConfig({
+				workspacesDir,
+				routerUrl: "https://router.example.com",
+				deviceToken: "device-tok",
+				repos,
+			});
+
+			const configPath = join(workspacesDir, ".cyrus", "config.json");
+			const written = JSON.parse(readFileSync(configPath, "utf-8"));
+
+			expect(written.linearWorkspaces).toBeUndefined();
+		});
 	});
 
 	describe("configureGit (step 3)", () => {
