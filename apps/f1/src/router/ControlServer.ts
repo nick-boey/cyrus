@@ -83,6 +83,22 @@ export async function startControlServer(opts: {
 		reply.send({ ok: true });
 	});
 
+	fastify.post("/router/enroll", async (request, reply) => {
+		const b = request.body as { email: string };
+		const code = opts.rig.server.store.mintEnrollmentCode(b.email, Date.now());
+		const redeemed = opts.rig.server.store.redeemEnrollmentCode(
+			code,
+			Date.now(),
+		);
+		if (!redeemed) {
+			reply
+				.code(500)
+				.send({ ok: false, error: "enrollment redemption failed" });
+			return;
+		}
+		reply.send({ deviceToken: redeemed.deviceToken });
+	});
+
 	fastify.get("/router/artifact/:issueKey", async (request, reply) => {
 		const { issueKey } = request.params as { issueKey: string };
 		const dir = opts.artifactsDir;
