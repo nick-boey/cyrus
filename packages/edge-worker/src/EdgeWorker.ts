@@ -558,6 +558,12 @@ export class EdgeWorker extends EventEmitter {
 				url: config.router.url,
 				deviceToken: config.router.deviceToken,
 				stateDir: join(this.cyrusHome, "router-client"),
+				// Declare the sessions we're still responsible for terminal-
+				// signalling on every (re)connect, so the router can reclaim issue
+				// locks for the rest — sessions we lost (e.g. a corrupt state file
+				// wiped them) or that completed but whose terminal signal died with
+				// a previous process. See AgentSessionManager.getLiveSessionIds.
+				getActiveSessions: () => this.agentSessionManager.getLiveSessionIds(),
 			});
 		}
 

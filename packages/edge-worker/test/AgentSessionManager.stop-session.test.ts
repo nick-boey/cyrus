@@ -566,3 +566,75 @@ describe("AgentSessionManager.reconcileInterruptedSessions", () => {
 		expect(terminal).toHaveBeenCalledWith("crashed", "error");
 	});
 });
+
+describe("AgentSessionManager.getLiveSessionIds", () => {
+	let manager: AgentSessionManager;
+
+	function newSession(id: string) {
+		manager.createCyrusAgentSession(
+			id,
+			`issue-${id}`,
+			{
+				id: `issue-${id}`,
+				identifier: "TEST-LIVE",
+				title: "Live Test",
+				description: "test",
+				branchName: "test-live",
+			},
+			{ path: "/tmp/workspace", isGitWorktree: false },
+		);
+	}
+
+	beforeEach(() => {
+		manager = new AgentSessionManager();
+	});
+
+	it("declares active and pending sessions", () => {
+		newSession("active");
+		newSession("pending");
+		const pending = manager.getSession("pending");
+		if (pending) pending.status = AgentSessionStatus.Pending;
+
+		expect(manager.getLiveSessionIds().sort()).toEqual(["active", "pending"]);
+	});
+
+	it("omits a terminal session with no runner (deferred-terminal signal died on restart)", () => {
+		// The leak shape: completeSession set status=complete, then deferred the
+		// terminal signal for pending work; a restart killed the wakeup, so the
+		// lock will never be released by this device. It must NOT be declared, so
+		// the router reclaims the stranded lock.
+		newSession("done");
+		const done = manager.getSession("done");
+		if (done) done.status = AgentSessionStatus.Complete;
+
+		expect(manager.getLiveSessionIds()).toEqual([]);
+	});
+
+	it("omits an errored session with no runner", () => {
+		newSession("failed");
+		const failed = manager.getSession("failed");
+		if (failed) failed.status = AgentSessionStatus.Error;
+
+		expect(manager.getLiveSessionIds()).toEqual([]);
+	});
+
+	it("still declares a terminal-status session that has a live runner (deferred-terminal window)", () => {
+		// completeSession flips status to complete BEFORE deferring the terminal
+		// signal while the runner has pending work. A reconnect mid-deferral must
+		// not let the router reclaim this still-working session's lock.
+		newSession("deferring");
+		const deferring = manager.getSession("deferring");
+		if (deferring) deferring.status = AgentSessionStatus.Complete;
+		manager.addAgentRunner("deferring", { isRunning: () => true } as never);
+
+		expect(manager.getLiveSessionIds()).toEqual(["deferring"]);
+	});
+
+	it("declares an awaitingInput session (paused, still the device's responsibility)", () => {
+		newSession("asking");
+		const asking = manager.getSession("asking");
+		if (asking) asking.status = AgentSessionStatus.AwaitingInput;
+
+		expect(manager.getLiveSessionIds()).toEqual(["asking"]);
+	});
+});

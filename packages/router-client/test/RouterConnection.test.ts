@@ -132,6 +132,7 @@ afterEach(async () => {
 function makeConn(overrides?: {
 	url?: string;
 	reconnectBaseMs?: number;
+	getActiveSessions?: () => string[];
 }): RouterConnection {
 	return new RouterConnection({
 		url: overrides?.url ?? router.url,
@@ -139,6 +140,7 @@ function makeConn(overrides?: {
 		stateDir,
 		reconnectBaseMs: overrides?.reconnectBaseMs ?? 10,
 		rpcTimeoutMs: 1000,
+		getActiveSessions: overrides?.getActiveSessions,
 	});
 }
 
@@ -160,6 +162,31 @@ describe("RouterConnection", () => {
 			protocolVersion: PROTOCOL_VERSION,
 			lastAckedSeq: 7,
 		});
+		conn.close();
+	});
+
+	it("(a2) includes freshly-evaluated activeSessions in hello when a provider is set", async () => {
+		let sessions = ["sess-a", "sess-b"];
+		const conn = makeConn({ getActiveSessions: () => sessions });
+		conn.connect();
+		await once(conn, "connected");
+		expect(router.hellos.at(-1)).toMatchObject({
+			activeSessions: ["sess-a", "sess-b"],
+		});
+
+		// Provider is re-evaluated on each connect, not captured once.
+		sessions = ["sess-c"];
+		router.lastSocket.close();
+		await once(conn, "connected");
+		expect(router.hellos.at(-1)).toMatchObject({ activeSessions: ["sess-c"] });
+		conn.close();
+	});
+
+	it("(a3) omits activeSessions entirely when no provider is set", async () => {
+		const conn = makeConn();
+		conn.connect();
+		await once(conn, "connected");
+		expect(router.hellos.at(-1)).not.toHaveProperty("activeSessions");
 		conn.close();
 	});
 
