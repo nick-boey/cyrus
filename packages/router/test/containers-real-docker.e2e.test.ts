@@ -35,7 +35,12 @@ import {
 	scopedProvider,
 } from "./helpers/dockerDaemon.js";
 // Local fixtures — same shape as apps/f1/src/router/fixtures.ts.
-import { createdFixture, seedSession, WORKSPACE } from "./helpers/fixtures.js";
+import {
+	createdFixture,
+	seedIssue,
+	seedSession,
+	WORKSPACE,
+} from "./helpers/fixtures.js";
 
 // ESM has no `__dirname`; derive it the same way the rest of the monorepo
 // does (see e.g. packages/core/test/json-schema-export.test.ts).
@@ -489,15 +494,16 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 // spawning `cyrus start`.
 //
 // However, per Task 11's brief, "assertion as written" requires BOTH
-// this code trace AND an empirical container boot (with an invalid
-// Claude token) to confirm reachability. The empirical boot was
-// explicitly NOT run during Task 11 (no docker on that machine).
-// Conservatively treating reachability as code-trace-confirmed but
-// NOT empirically confirmed: this `it` is `it.skip`'d, and the
-// /workspaces/<KEY> real-directory invariant (item 4) is instead
-// validated by the manual real-Claude drive (Task 13). Once a
-// developer runs the Step-3 boot check on a dedicated Docker daemon
-// and confirms /workspaces/<KEY> appears, remove this skip.
+// this code trace AND an empirical container boot to confirm
+// reachability. The empirical boot was explicitly NOT run during
+// Task 11 (no docker on that machine), so this `it` was conservatively
+// `it.skip`'d at the time. That empirical confirmation has since
+// happened: the 2026-07-17 manual real-Claude router-mode drive
+// (apps/f1/test-drives/2026-07-17-router-mode-container-drive.md)
+// observed a live cyrus-issue-DEF-1 container where
+// `test ! -L /workspaces/DEF-1` exited 0, `realpath` resolved to
+// itself, and `stat` reported a plain directory — so the skip was
+// removed per the Task 11/12 recommendation.
 //
 // A SEPARATE describe block, deliberately: this block's closure locals
 // (`server`, `tracker`, `dir`, `port`) are private to its own
@@ -590,8 +596,16 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 			rmSync(dir, { recursive: true, force: true });
 		});
 
-		it.skip("is a real directory, not a symlink, and realpath-stable", async () => {
+		it("is a real directory, not a symlink, and realpath-stable", async () => {
 			seedSession(tracker, "sess-dir", "issue-dir");
+			// The in-container EdgeWorker fetches the full issue before creating
+			// the worktree — without this the webhook 404s and /workspaces/<KEY>
+			// never appears (see seedIssue's doc comment).
+			seedIssue(tracker, {
+				id: "issue-dir",
+				identifier: issueKey,
+				title: "dir",
+			});
 			await server.eventRouter.route(
 				createdFixture({
 					sessionId: "sess-dir",

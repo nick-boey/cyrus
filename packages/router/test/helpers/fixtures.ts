@@ -68,4 +68,42 @@ export function seedSession(
 	});
 }
 
+/**
+ * Seed an issue directly, mirroring the stored shape of
+ * `CLIIssueTrackerService.createIssue` but with a CALLER-CHOSEN id and
+ * identifier (createIssue always auto-generates `issue-<n>` / `<TEAM>-<n>`,
+ * which can never match a run-scoped key like `CYDIR-xxxx`).
+ *
+ * `seedSession` alone is NOT enough for a suite that boots a REAL container:
+ * the container-side EdgeWorker fetches the full issue over router RPC while
+ * processing the created webhook (`EdgeWorker.createCyrusAgentSession`) and
+ * aborts BEFORE creating the worktree when that fetch 404s — first observed
+ * as the 2026-07-17 drive's `RouterRpcError: Issue issue-dir not found`.
+ * Requires `tracker.seedDefaultData()` (for `team-default`) to have run.
+ */
+export function seedIssue(
+	tracker: CLIIssueTrackerService,
+	issue: { id: string; identifier: string; title: string },
+): void {
+	tracker.getState().issues.set(issue.id, {
+		id: issue.id,
+		identifier: issue.identifier,
+		title: issue.title,
+		number: 1,
+		url: `https://linear.app/test/issue/${issue.identifier}`,
+		branchName: issue.identifier.toLowerCase(),
+		priority: 0,
+		priorityLabel: "No priority",
+		boardOrder: 0,
+		sortOrder: 0,
+		prioritySortOrder: 0,
+		labelIds: [],
+		previousIdentifiers: [],
+		customerTicketCount: 0,
+		createdAt: new Date(),
+		updatedAt: new Date(),
+		teamId: "team-default",
+	});
+}
+
 export { WORKSPACE };
