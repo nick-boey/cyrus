@@ -3,6 +3,8 @@ import {
 	type AgentSessionCreatedWebhook,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
+	isIssueDeletedWebhook,
+	isIssueStateChangeWebhook,
 	type Webhook,
 } from "cyrus-core";
 import type { SessionStateFrame } from "cyrus-router-protocol";
@@ -11,6 +13,7 @@ import {
 	expiredMessage,
 	fillTemplate,
 	ISSUE_LOCKED_MESSAGE,
+	ORPHANED_LOCK_RECLAIMED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
@@ -128,8 +131,80 @@ export class EventRouter {
 			await this.routeCreated(webhook);
 			return;
 		}
+		// Terminal-state webhooks carry no agent session, so they route on issue
+		// affinity rather than through resolveTarget(). The device needs them to
+		// run its own terminal-state cleanup (stop sessions, cyrus-teardown.sh,
+		// remove worktrees) — without this forwarding a node's worktrees are
+		// never reclaimed, since the node has no other way to learn an issue
+		// closed. See EdgeWorker.handleIssueStateChangeMessage.
+		if (isIssueStateChangeWebhook(webhook)) {
+			this.routeIssueTerminal(webhook, webhook.notification?.issue);
+			return;
+		}
+		if (isIssueDeletedWebhook(webhook)) {
+			this.routeIssueTerminal(webhook, webhook.data);
+			return;
+		}
 		this.logger.info(
 			`EventRouter ignoring non-agent-session webhook ${webhook.type}/${webhook.action}`,
+		);
+	}
+
+	/**
+	 * Forwards a terminal-state webhook (issue completed/canceled, or issue
+	 * deleted) to the device that owns the issue, so it can reclaim the
+	 * worktree.
+	 *
+	 * Routes on `issue_affinity` — the only mapping that survives the session
+	 * ending. Session affinity and the issue lock are both torn down the moment
+	 * a session reports a terminal `session_state`, which for a typical issue
+	 * happens well BEFORE the human moves it to Done. Issue affinity is only
+	 * purged when the device itself is removed, so it still points at the right
+	 * machine days later — which is exactly the window this cleanup lives in.
+	 *
+	 * No Linear activity is posted on the failure paths: a status change is not
+	 * an agent session, so there is no thread to post to.
+	 */
+	private routeIssueTerminal(
+		webhook: Webhook,
+		issue: { id?: string; identifier?: string } | null | undefined,
+	): void {
+		const label = `${webhook.type}/${webhook.action}`;
+		const issueId = issue?.id;
+		if (!issueId) {
+			this.logger.warn(
+				`Terminal webhook ${label} carries no issue id; cannot route cleanup`,
+			);
+			return;
+		}
+		const issueRef = issue?.identifier ?? issueId;
+
+		const deviceId = this.store.getIssueAffinity(issueId);
+		if (deviceId === undefined) {
+			// No device ever ran a session for this issue, so no device holds a
+			// worktree for it. Nothing to clean up — not an error.
+			this.logger.info(
+				`Terminal webhook ${label} for issue ${issueRef}: no device affinity, nothing to clean up`,
+			);
+			return;
+		}
+
+		// Enqueue unconditionally rather than only when online: the worktree
+		// still needs reclaiming when the device comes back, and pendingEvents
+		// replays anything unacked on reconnect. Cleanup is idempotent on the
+		// node (deleteWorktree no-ops when the directory is already gone), so a
+		// duplicate delivery is harmless.
+		this.store.enqueueEvent(
+			deviceId,
+			JSON.stringify(webhook),
+			this.now(),
+			this.config.eventTtlMs,
+		);
+		if (this.gateway.isOnline(deviceId)) {
+			this.gateway.deliverPending(deviceId);
+		}
+		this.logger.info(
+			`Forwarded terminal webhook ${label} for issue ${issueRef} to device ${deviceId} for worktree cleanup`,
 		);
 	}
 
@@ -146,6 +221,81 @@ export class EventRouter {
 		this.logger.info(
 			`Session ${frame.sessionId} reached terminal state '${frame.state}' on device ${deviceId}; released lock and affinity`,
 		);
+	}
+
+	/**
+	 * Reclaims issue locks a reconnecting device no longer backs with a live
+	 * session. A device declares its currently-tracked session IDs in the hello
+	 * frame; any lock we hold for that device whose session is not in the
+	 * declared set belongs to a session the device has lost — classically to a
+	 * corrupted state file after an ENOSPC restart — and can therefore never be
+	 * released by a terminal frame. Without this the issue stays locked forever
+	 * and every re-delegation is rejected.
+	 *
+	 * Fires on "deviceConnected". Safe to call for every reconnect; it only acts
+	 * on locks the device didn't claim.
+	 *
+	 * Guards:
+	 * - `declaredSessions === undefined` → an older client that doesn't report
+	 *   active sessions. Reclaiming would wrongly release every lock, so skip
+	 *   entirely and keep pre-reconcile behavior.
+	 * - The device still has undelivered events → it isn't caught up. A queued
+	 *   `created` event will make it start tracking a session it can't declare
+	 *   yet, so its list isn't authoritative; defer to a later reconnect. (Acked
+	 *   events are deleted, so this only trips while delivery is genuinely
+	 *   behind.)
+	 */
+	async reconcileDeviceLocks(
+		deviceId: number,
+		declaredSessions: string[] | undefined,
+	): Promise<void> {
+		if (!this.config.issueLock) return;
+		if (declaredSessions === undefined) return;
+
+		if (this.store.hasPendingEvents(deviceId, this.now())) {
+			this.logger.info(
+				`Skipping lock reconciliation for device ${deviceId}: it has undelivered events, so its active-session list is not yet authoritative`,
+			);
+			return;
+		}
+
+		const declared = new Set(declaredSessions);
+		const locks = this.store.getIssueLocksForDevice(deviceId);
+
+		// Two passes on purpose. Do every DB release synchronously first, before
+		// any `await`, so a `session_state` frame the device replays right after
+		// this same hello can't interleave mid-loop and race a release. Only then
+		// do the (awaiting) courtesy posts.
+		const reclaimed: Array<{
+			issueId: string;
+			sessionId: string;
+			workspaceId: string | undefined;
+		}> = [];
+		for (const { issueId, sessionId } of locks) {
+			if (declared.has(sessionId)) continue;
+			this.store.releaseIssueLockForSession(sessionId);
+			this.store.clearSessionAffinity(sessionId);
+			const workspaceId = this.sessionWorkspace.get(sessionId);
+			this.notifiedSessions.delete(sessionId);
+			this.sessionWorkspace.delete(sessionId);
+			reclaimed.push({ issueId, sessionId, workspaceId });
+		}
+
+		for (const { issueId, sessionId, workspaceId } of reclaimed) {
+			// Best-effort courtesy post. The workspace hint is in-memory only, so
+			// after a router restart we usually can't address the Linear thread —
+			// the lock release (the part that unblocks re-delegation) still stands.
+			if (workspaceId) {
+				await this.postActivity(
+					workspaceId,
+					sessionId,
+					ORPHANED_LOCK_RECLAIMED_MESSAGE,
+				);
+			}
+			this.logger.info(
+				`Reclaimed orphaned lock for issue ${issueId}: device ${deviceId} reconnected without tracking session ${sessionId}`,
+			);
+		}
 	}
 
 	async sweepExpired(): Promise<void> {
