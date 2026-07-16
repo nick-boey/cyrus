@@ -1496,6 +1496,44 @@ export class AgentSessionManager extends EventEmitter {
 	}
 
 	/**
+	 * Session IDs the device is still responsible for terminal-signalling, sent
+	 * to the router in the hello frame so it can reclaim issue locks for every
+	 * session NOT in this set.
+	 *
+	 * A session qualifies if it either has a live runner OR is not yet in a
+	 * terminal status (complete/error). The two clauses cover two distinct
+	 * leak-prone cases:
+	 *
+	 * - **Runner attached, status already terminal.** `completeSession` flips
+	 *   the status to complete/error *before* deferring the terminal signal when
+	 *   the runner still has pending work (a scheduled wakeup / background task).
+	 *   The lock must stay held through that deferral, so a session with a live
+	 *   runner is always declared even though its status reads terminal — else a
+	 *   mere reconnect mid-deferral would wrongly reclaim a still-working
+	 *   session's lock.
+	 *
+	 * - **Non-terminal, no runner.** A session interrupted by a host restart
+	 *   restores as active/pending with no runner (runners are never
+	 *   serialized); `reconcileInterruptedSessions` will drive it terminal and
+	 *   release the lock, so keep declaring it until then.
+	 *
+	 * Everything else — a terminal session with no runner — is a session the
+	 * device will never send a terminal frame for: either it already did (lock
+	 * long gone, so declaring it is moot) or its deferred wakeup died with a
+	 * previous process (the lock leaked). Omitting it lets the router reclaim
+	 * that stranded lock. Sessions the device lost entirely (e.g. a corrupt
+	 * state file) are absent here too, which is likewise correct to reclaim.
+	 */
+	getLiveSessionIds(): string[] {
+		const isTerminal = (status: CyrusAgentSession["status"]): boolean =>
+			status === AgentSessionStatus.Complete ||
+			status === AgentSessionStatus.Error;
+		return Array.from(this.sessions.entries())
+			.filter(([, s]) => s.agentRunner || !isTerminal(s.status))
+			.map(([id]) => id);
+	}
+
+	/**
 	 * Reports sessions that a host crash interrupted, so they stop looking alive.
 	 *
 	 * A SIGKILL (OOM kill, `pm2 delete`, power loss) gives no in-process handler a

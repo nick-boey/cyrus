@@ -15,6 +15,14 @@ const helloFrame = z.object({
 	deviceToken: z.string().min(1),
 	protocolVersion: z.number().int(),
 	lastAckedSeq: z.number().int().nonnegative(),
+	// Session IDs the device is currently tracking. Lets the router reclaim
+	// issue locks it holds for this device whose session the device no longer
+	// knows about — e.g. after the device lost its persisted state and can
+	// never send those sessions' terminal frames. Optional and additive: it
+	// does NOT bump PROTOCOL_VERSION. An older client omits it, which the
+	// router reads as "unknown" and skips reclamation for — preserving
+	// pre-reconcile behavior rather than wrongly releasing every lock.
+	activeSessions: z.array(z.string()).optional(),
 });
 const eventAckFrame = z.object({
 	type: z.literal("event_ack"),

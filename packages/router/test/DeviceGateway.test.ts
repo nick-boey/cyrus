@@ -101,6 +101,65 @@ describe("DeviceGateway", () => {
 		httpServer.close();
 	});
 
+	it("emits deviceConnected with the hello's activeSessions payload", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		const connected: Array<[number, string[] | undefined]> = [];
+		gateway.on("deviceConnected", (id: number, activeSessions?: string[]) => {
+			connected.push([id, activeSessions]);
+		});
+
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+				activeSessions: ["sess-1", "sess-2"],
+			}),
+		);
+		const helloAck = JSON.parse(await nextMessage());
+		expect(helloAck.type).toBe("hello_ack");
+		// deviceConnected is emitted synchronously inside handleHello; a tick is
+		// plenty for our listener to observe it.
+		await new Promise((r) => setTimeout(r, 20));
+
+		expect(connected).toEqual([[device.deviceId, ["sess-1", "sess-2"]]]);
+
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("emits deviceConnected with undefined when hello omits activeSessions (older client)", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		const connected: Array<[number, string[] | undefined]> = [];
+		gateway.on("deviceConnected", (id: number, activeSessions?: string[]) => {
+			connected.push([id, activeSessions]);
+		});
+
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+		const helloAck = JSON.parse(await nextMessage());
+		expect(helloAck.type).toBe("hello_ack");
+		await new Promise((r) => setTimeout(r, 20));
+
+		expect(connected).toEqual([[device.deviceId, undefined]]);
+
+		gateway.close();
+		httpServer.close();
+	});
+
 	it("delivers queued events in order after hello and removes them on ack", async () => {
 		const { store, gateway, device, port, httpServer } = await setup();
 		// Anchor to real time: the gateway now enforces TTL at delivery using

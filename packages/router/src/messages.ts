@@ -58,6 +58,15 @@ export function offlineReleaseMessage(email: string): string {
 }
 
 /**
+ * Posted when a device reconnects and no longer tracks a session whose issue
+ * lock it still held — i.e. the device lost the session (typically to a
+ * corrupted state file) and can never report it terminal. Releasing the lock
+ * lets the issue be re-delegated.
+ */
+export const ORPHANED_LOCK_RECLAIMED_MESSAGE =
+	"Released this issue's lock: the agent's device no longer has this session (its state was lost on restart). Re-delegate the issue to start a fresh session.";
+
+/**
  * Replaces `{{key}}` placeholders in `template` with the matching value from
  * `vars`. Unknown placeholders are left intact.
  */

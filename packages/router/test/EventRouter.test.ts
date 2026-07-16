@@ -5,6 +5,7 @@ import {
 	expiredMessage,
 	fillTemplate,
 	ISSUE_LOCKED_MESSAGE,
+	ORPHANED_LOCK_RECLAIMED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
@@ -839,5 +840,149 @@ describe("EventRouter issue promotion to a started state", () => {
 				queuedBefore,
 			);
 		});
+	});
+});
+
+describe("EventRouter reconcileDeviceLocks", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	/**
+	 * Locks a device via a routed created event, then simulates the device
+	 * having received (acked) the queued event so it is "caught up" and its
+	 * declared session list is authoritative.
+	 */
+	async function lockAndDeliver(
+		router: EventRouter,
+		deviceId: number,
+		opts: { sessionId: string; issueId: string },
+	): Promise<void> {
+		await router.route(
+			createdEvent({
+				sessionId: opts.sessionId,
+				issueId: opts.issueId,
+				creator: ALICE,
+			}),
+		);
+		// The created event was queued at seq 1; acking it deletes it, mirroring
+		// a device that has processed everything the router sent.
+		store.ackEvent(deviceId, 1);
+	}
+
+	it("reclaims a lock the reconnecting device no longer tracks", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, postActivity } = makeRouter(store);
+		await lockAndDeliver(router, aliceDevice, {
+			sessionId: "sess-1",
+			issueId: "ISS-1",
+		});
+
+		// Device reconnects declaring it no longer has sess-1 (state was lost).
+		await router.reconcileDeviceLocks(aliceDevice, []);
+
+		expect(store.getIssueLock("ISS-1")).toBeUndefined();
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(true);
+		// Workspace hint is still in memory, so the courtesy post goes out.
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			ORPHANED_LOCK_RECLAIMED_MESSAGE,
+		);
+	});
+
+	it("keeps a lock the device still declares", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, postActivity } = makeRouter(store);
+		await lockAndDeliver(router, aliceDevice, {
+			sessionId: "sess-1",
+			issueId: "ISS-1",
+		});
+		postActivity.mockClear();
+
+		await router.reconcileDeviceLocks(aliceDevice, ["sess-1"]);
+
+		// Still locked: a different session cannot take it.
+		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(false);
+		expect(postActivity).not.toHaveBeenCalled();
+	});
+
+	it("defers when the device still has undelivered events", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router } = makeRouter(store);
+		// Route but do NOT ack: the created event is still queued, so the device
+		// isn't caught up and its (empty) declared set is not yet authoritative.
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		await router.reconcileDeviceLocks(aliceDevice, []);
+
+		// Lock preserved — reconciliation must not race the pending created event.
+		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(false);
+	});
+
+	it("is a no-op for an older client that declares no list (undefined)", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, postActivity } = makeRouter(store);
+		await lockAndDeliver(router, aliceDevice, {
+			sessionId: "sess-1",
+			issueId: "ISS-1",
+		});
+		postActivity.mockClear();
+
+		await router.reconcileDeviceLocks(aliceDevice, undefined);
+
+		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(false);
+		expect(postActivity).not.toHaveBeenCalled();
+	});
+
+	it("still releases the lock after a router restart even though it cannot post", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		// Router A acquires the lock, then the device acks the event.
+		const { router: routerA } = makeRouter(store);
+		await lockAndDeliver(routerA, aliceDevice, {
+			sessionId: "sess-1",
+			issueId: "ISS-1",
+		});
+
+		// Router B is a fresh process sharing the same store: its in-memory
+		// sessionWorkspace map is empty (the PAR-110 scenario). It can't address
+		// the Linear thread, but must still free the lock.
+		const { router: routerB, postActivity: postB } = makeRouter(store);
+		await routerB.reconcileDeviceLocks(aliceDevice, []);
+
+		expect(store.getIssueLock("ISS-1")).toBeUndefined();
+		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(true);
+		expect(postB).not.toHaveBeenCalled();
+	});
+
+	it("does nothing when issue locking is disabled", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router } = makeRouter(store, { config: { issueLock: false } });
+		// No lock is taken when issueLock is off; reconcile must simply return.
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+		store.ackEvent(aliceDevice, 1);
+
+		await expect(
+			router.reconcileDeviceLocks(aliceDevice, []),
+		).resolves.toBeUndefined();
 	});
 });

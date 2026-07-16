@@ -13,6 +13,7 @@ import {
 	expiredMessage,
 	fillTemplate,
 	ISSUE_LOCKED_MESSAGE,
+	ORPHANED_LOCK_RECLAIMED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
@@ -220,6 +221,81 @@ export class EventRouter {
 		this.logger.info(
 			`Session ${frame.sessionId} reached terminal state '${frame.state}' on device ${deviceId}; released lock and affinity`,
 		);
+	}
+
+	/**
+	 * Reclaims issue locks a reconnecting device no longer backs with a live
+	 * session. A device declares its currently-tracked session IDs in the hello
+	 * frame; any lock we hold for that device whose session is not in the
+	 * declared set belongs to a session the device has lost — classically to a
+	 * corrupted state file after an ENOSPC restart — and can therefore never be
+	 * released by a terminal frame. Without this the issue stays locked forever
+	 * and every re-delegation is rejected.
+	 *
+	 * Fires on "deviceConnected". Safe to call for every reconnect; it only acts
+	 * on locks the device didn't claim.
+	 *
+	 * Guards:
+	 * - `declaredSessions === undefined` → an older client that doesn't report
+	 *   active sessions. Reclaiming would wrongly release every lock, so skip
+	 *   entirely and keep pre-reconcile behavior.
+	 * - The device still has undelivered events → it isn't caught up. A queued
+	 *   `created` event will make it start tracking a session it can't declare
+	 *   yet, so its list isn't authoritative; defer to a later reconnect. (Acked
+	 *   events are deleted, so this only trips while delivery is genuinely
+	 *   behind.)
+	 */
+	async reconcileDeviceLocks(
+		deviceId: number,
+		declaredSessions: string[] | undefined,
+	): Promise<void> {
+		if (!this.config.issueLock) return;
+		if (declaredSessions === undefined) return;
+
+		if (this.store.hasPendingEvents(deviceId, this.now())) {
+			this.logger.info(
+				`Skipping lock reconciliation for device ${deviceId}: it has undelivered events, so its active-session list is not yet authoritative`,
+			);
+			return;
+		}
+
+		const declared = new Set(declaredSessions);
+		const locks = this.store.getIssueLocksForDevice(deviceId);
+
+		// Two passes on purpose. Do every DB release synchronously first, before
+		// any `await`, so a `session_state` frame the device replays right after
+		// this same hello can't interleave mid-loop and race a release. Only then
+		// do the (awaiting) courtesy posts.
+		const reclaimed: Array<{
+			issueId: string;
+			sessionId: string;
+			workspaceId: string | undefined;
+		}> = [];
+		for (const { issueId, sessionId } of locks) {
+			if (declared.has(sessionId)) continue;
+			this.store.releaseIssueLockForSession(sessionId);
+			this.store.clearSessionAffinity(sessionId);
+			const workspaceId = this.sessionWorkspace.get(sessionId);
+			this.notifiedSessions.delete(sessionId);
+			this.sessionWorkspace.delete(sessionId);
+			reclaimed.push({ issueId, sessionId, workspaceId });
+		}
+
+		for (const { issueId, sessionId, workspaceId } of reclaimed) {
+			// Best-effort courtesy post. The workspace hint is in-memory only, so
+			// after a router restart we usually can't address the Linear thread —
+			// the lock release (the part that unblocks re-delegation) still stands.
+			if (workspaceId) {
+				await this.postActivity(
+					workspaceId,
+					sessionId,
+					ORPHANED_LOCK_RECLAIMED_MESSAGE,
+				);
+			}
+			this.logger.info(
+				`Reclaimed orphaned lock for issue ${issueId}: device ${deviceId} reconnected without tracking session ${sessionId}`,
+			);
+		}
 	}
 
 	async sweepExpired(): Promise<void> {
