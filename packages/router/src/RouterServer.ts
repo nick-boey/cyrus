@@ -199,6 +199,25 @@ export class RouterServer {
 		// (right after emitting "deviceConnected"), so adding it here would deliver
 		// every queued event twice on reconnect. The gateway owns hello-time
 		// delivery — do not re-add.
+		//
+		// We DO use deviceConnected to reconcile stale issue locks: a device
+		// that reconnects without a session it once held (e.g. lost state to a
+		// corrupt file) can never send that session's terminal frame, so the
+		// router reclaims the lock here. Fire-and-forget, mirroring the other
+		// gateway handlers; reconcileDeviceLocks never rejects on its own but
+		// guard anyway so a post failure can't crash the process.
+		this.gateway.on(
+			"deviceConnected",
+			(deviceId: number, activeSessions?: string[]) => {
+				void this.eventRouter
+					.reconcileDeviceLocks(deviceId, activeSessions)
+					.catch((err: unknown) => {
+						this.logger.warn(
+							`reconcileDeviceLocks failed for device ${deviceId}: ${String(err)}`,
+						);
+					});
+			},
+		);
 	}
 
 	/**

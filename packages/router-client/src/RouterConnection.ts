@@ -37,6 +37,14 @@ export interface RouterConnectionOptions {
 	reconnectBaseMs?: number;
 	/** Default 30_000ms. */
 	rpcTimeoutMs?: number;
+	/**
+	 * Returns the session IDs the device is currently tracking, sent in every
+	 * hello so the router can reclaim issue locks for sessions the device has
+	 * lost (e.g. after a corrupt-state restart). Evaluated fresh on each
+	 * (re)connect. Omitting it sends no list, which the router reads as
+	 * "unknown" and skips reconciliation for.
+	 */
+	getActiveSessions?: () => string[];
 }
 
 /**
@@ -135,6 +143,7 @@ export class RouterConnection extends EventEmitter {
 	private readonly deviceToken: string;
 	private readonly reconnectBaseMs: number;
 	private readonly rpcTimeoutMs: number;
+	private readonly getActiveSessions: (() => string[]) | undefined;
 
 	private readonly stateFile: string;
 	private readonly outboundFile: string;
@@ -160,6 +169,7 @@ export class RouterConnection extends EventEmitter {
 		this.deviceToken = opts.deviceToken;
 		this.reconnectBaseMs = opts.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS;
 		this.rpcTimeoutMs = opts.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+		this.getActiveSessions = opts.getActiveSessions;
 
 		mkdirSync(opts.stateDir, { recursive: true });
 		this.stateFile = join(opts.stateDir, "router-connection.json");
@@ -334,6 +344,13 @@ export class RouterConnection extends EventEmitter {
 			deviceToken: this.deviceToken,
 			protocolVersion: PROTOCOL_VERSION,
 			lastAckedSeq: this.lastAckedSeq,
+			// Evaluated fresh each (re)connect so the router reconciles against
+			// the device's current sessions. Omit the field entirely when no
+			// provider is wired — the router distinguishes "no list" (skip) from
+			// an empty list (device tracks nothing; reclaim all its locks).
+			...(this.getActiveSessions
+				? { activeSessions: this.getActiveSessions() }
+				: {}),
 		};
 		ws.send(JSON.stringify(frame));
 	}

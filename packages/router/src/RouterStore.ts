@@ -417,6 +417,22 @@ export class RouterStore {
 		}));
 	}
 
+	/**
+	 * Whether the device has any queued event it hasn't acked yet (acked events
+	 * are deleted, so an undelivered event is simply a surviving, non-expired
+	 * row). Used to gate lock reconciliation: while a `created` event the device
+	 * hasn't processed is still queued, the device can't yet declare the session
+	 * it's about to start — so its active-session list isn't authoritative.
+	 */
+	hasPendingEvents(deviceId: number, nowMs: number): boolean {
+		const row = this.db
+			.prepare(
+				"SELECT 1 FROM events WHERE device_id = ? AND expires_ms > ? LIMIT 1",
+			)
+			.get(deviceId, nowMs);
+		return row !== undefined;
+	}
+
 	ackEvent(deviceId: number, seq: number): void {
 		// Cumulative ack: deletes every queued event with seq <= the given
 		// seq (not just the exact seq), since a client acking N implicitly
@@ -544,6 +560,24 @@ export class RouterStore {
 		this.db
 			.prepare("DELETE FROM issue_locks WHERE session_id = ?")
 			.run(sessionId);
+	}
+
+	/**
+	 * Every issue lock currently held on behalf of a device. Used by hello-time
+	 * reconciliation to find locks whose session the device no longer tracks.
+	 */
+	getIssueLocksForDevice(
+		deviceId: number,
+	): Array<{ issueId: string; sessionId: string }> {
+		const rows = this.db
+			.prepare(
+				"SELECT issue_id, session_id FROM issue_locks WHERE device_id = ?",
+			)
+			.all(deviceId) as Array<Pick<IssueLockRow, "issue_id" | "session_id">>;
+		return rows.map((row) => ({
+			issueId: row.issue_id,
+			sessionId: row.session_id,
+		}));
 	}
 
 	releaseLocksAndAffinityForDevice(
