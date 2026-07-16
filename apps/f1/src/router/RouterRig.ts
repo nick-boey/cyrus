@@ -28,6 +28,12 @@ export interface RouterRigOptions {
 	executors?: Map<string, ContainerExecutor>;
 	idleStopMs?: number;
 	staleDestroyMs?: number;
+	/**
+	 * Extra env-var names a user must have seeded before their containers
+	 * boot, on top of the always-required Claude token (forwarded to
+	 * `containers.requiredSecretKeys` on the RouterServer).
+	 */
+	requiredSecretKeys?: string[];
 	logger?: { info(m: string): void; warn(m: string): void };
 }
 
@@ -68,6 +74,7 @@ export async function createRouterRig(
 			artifactsDir: opts.artifactsDir,
 			idleStopMs: opts.idleStopMs,
 			staleDestroyMs: opts.staleDestroyMs,
+			requiredSecretKeys: opts.requiredSecretKeys,
 		},
 		...(executors ? { executorRegistryFactory: () => executors } : {}),
 	});
@@ -78,7 +85,15 @@ export async function createRouterRig(
 		tracker,
 		port,
 		seedUser({ email, linearId, provider, claudeOauthToken, env }) {
-			server.store.addUser({ email, linearId });
+			// Idempotent: re-seeding an existing user updates their executor and
+			// secrets (the natural "blocked on a missing key → seed it → re-route"
+			// drive flow) instead of crashing on the users.email UNIQUE constraint.
+			const exists = server.store
+				.listUsers()
+				.some((u) => u.email.toLowerCase() === email.toLowerCase());
+			if (!exists) {
+				server.store.addUser({ email, linearId });
+			}
 			server.store.setUserExecutor(email, JSON.stringify({ type: provider }));
 			secrets.set(email, "CLAUDE_CODE_OAUTH_TOKEN", claudeOauthToken);
 			for (const [key, value] of Object.entries(env ?? {})) {

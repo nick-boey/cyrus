@@ -1,5 +1,6 @@
 **/.env.*
 !.env.example
+!.env.user.example
 dist
 .cp-edge-config.json
 node_modules

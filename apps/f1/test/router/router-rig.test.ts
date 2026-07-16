@@ -85,3 +85,69 @@ describe("createRouterRig (fake executor, no Docker)", () => {
 		expect(stored.LINEAR_API_TOKEN).toBe("lin_api_1");
 	});
 });
+
+describe("createRouterRig requiredSecretKeys gate (fake executor, no Docker)", () => {
+	let rig: RouterRig;
+	let dir: string;
+	const exec = new RecordingExecutor();
+	const logger = { info: vi.fn(), warn: vi.fn() };
+
+	beforeAll(async () => {
+		dir = mkdtempSync(join(tmpdir(), "f1-router-rig-gate-"));
+		rig = await createRouterRig({
+			dbPath: ":memory:",
+			secretsPath: join(dir, "secrets.json"),
+			artifactsDir: join(dir, "artifacts"),
+			executors: new Map([["docker", exec]]),
+			requiredSecretKeys: ["LINEAR_API_TOKEN"],
+			logger,
+		});
+	});
+
+	afterAll(async () => {
+		await rig.stop();
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("blocks boot for a user missing a configured required key, naming it", async () => {
+		rig.seedUser({
+			email: "gated@example.com",
+			linearId: "lin-gated",
+			provider: "docker",
+			claudeOauthToken: "tok", // no LINEAR_API_TOKEN
+		});
+		seedSession(rig.tracker, "sess-gate-1", "issue-gate-1");
+		await rig.server.eventRouter.route(
+			createdFixture({
+				sessionId: "sess-gate-1",
+				issue: { id: "issue-gate-1", identifier: "CYGATE-1", title: "Gated" },
+				creator: { id: "lin-gated", email: "gated@example.com", name: "G" },
+			}),
+		);
+		await vi.waitFor(() =>
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("missing LINEAR_API_TOKEN"),
+			),
+		);
+		expect(exec.calls).not.toContain("CYGATE-1");
+	});
+
+	it("re-seeding the same user adds the missing key and unblocks boot", async () => {
+		rig.seedUser({
+			email: "gated@example.com",
+			linearId: "lin-gated",
+			provider: "docker",
+			claudeOauthToken: "tok",
+			env: { LINEAR_API_TOKEN: "lin_api_1" },
+		});
+		seedSession(rig.tracker, "sess-gate-2", "issue-gate-2");
+		await rig.server.eventRouter.route(
+			createdFixture({
+				sessionId: "sess-gate-2",
+				issue: { id: "issue-gate-2", identifier: "CYGATE-2", title: "Ok" },
+				creator: { id: "lin-gated", email: "gated@example.com", name: "G" },
+			}),
+		);
+		await vi.waitFor(() => expect(exec.calls).toContain("CYGATE-2"));
+	});
+});

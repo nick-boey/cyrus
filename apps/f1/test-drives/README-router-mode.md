@@ -76,6 +76,7 @@ Env vars the entrypoint reads (`apps/f1/router-server.ts:87-93`):
 | `F1_ROUTER_CONTROL_TOKEN` | Bearer token guarding the `/router/*` control-plane endpoints. Defaults to `"f1-router"` if unset — set your own for anything beyond a throwaway local run. |
 | `F1_ROUTER_CONTROL_PORT` | Port the control server binds. If unset, an ephemeral port is allocated (`allocatePort()`, `apps/f1/src/router/allocatePort.ts`) and only shown in the startup log — **set this explicitly to `3601`** so it matches the `./f1 router:*` CLI's default (`F1_ROUTER_CONTROL_URL` defaults to `http://127.0.0.1:3601`, `apps/f1/src/commands/router/controlClient.ts:12`) and you don't have to export `F1_ROUTER_CONTROL_URL` separately. |
 | `CYRUS_ROUTER_FAKE_EXECUTOR` | **Do NOT set this for a real drive.** Setting it to `1` swaps in `NoopFakeExecutor` (`router-server.ts:31-44`) — a no-Docker stub that never actually boots a container. This is the selector between the fake path (control-plane-only smoke tests) and the real `LocalDockerProvider` path this drive needs. |
+| `F1_ROUTER_REQUIRED_SECRET_KEYS` | Optional, comma-separated. Extra env-var names every user must have seeded before their containers boot (e.g. `LINEAR_API_TOKEN,GIT_TOKEN`). Additive: `CLAUDE_CODE_OAUTH_TOKEN` is always required regardless. A user missing a listed key is blocked at boot with a `[router]` warning in the server console naming the missing keys; re-run `router:seed-user` with the missing `--env` pair (re-seeding is idempotent) and re-inject to unblock. |
 
 The router's own WebSocket port (separate from the control-plane port above) is always allocated
 automatically (`RouterRig.ts` calls `allocatePort()` unconditionally — no env var controls it) and
@@ -114,14 +115,23 @@ default beyond an empty string, so it must always be exported to match the serve
 
 ### 3. Seed a user
 
+Per-user credentials live in `.env.user` (template: `apps/f1/.env.user.example` — copy it and
+fill in your values). Router/control config stays in `.env`. Source both so the shell can expand
+the values on the command line:
+
 ```bash
+set -a && source .env && source .env.user && set +a
 ./f1 router:seed-user \
   --email you@example.com \
   --linear-id lin-you \
-  --claude-token <CLAUDE_CODE_OAUTH_TOKEN-from-`claude setup-token`>
+  --claude-token "$CLAUDE_CODE_OAUTH_TOKEN" \
+  --env LINEAR_API_TOKEN="$LINEAR_API_TOKEN" \
+  --env GIT_TOKEN="$GIT_TOKEN" \
+  --env GIT_USER_NAME="$GIT_USER_NAME" \
+  --env GIT_USER_EMAIL="$GIT_USER_EMAIL"
 ```
 
-Flags verified against `apps/f1/src/commands/router/seedUser.ts:16-37`:
+Flags verified against `apps/f1/src/commands/router/seedUser.ts`:
 
 | Flag | Required | Default | Meaning |
 |---|---|---|---|
@@ -129,6 +139,7 @@ Flags verified against `apps/f1/src/commands/router/seedUser.ts:16-37`:
 | `-l, --linear-id <id>` | yes | — | User's Linear id — this is the value you'll pass as `--creator-id` to `router:inject` in step 4; they must match, or the router won't route the event to this user. |
 | `-p, --provider <provider>` | no | `"docker"` | Executor provider. Leave as `docker` for this drive. |
 | `--claude-token <token>` | yes | — | The `CLAUDE_CODE_OAUTH_TOKEN` value the container will use to run the real Claude session. |
+| `--env <KEY=VALUE>` | no | `[]` | Repeatable. Extra per-user container env vars (e.g. `LINEAR_API_TOKEN`, which also enables the hosted Linear MCP inside the container's Claude session). Reserved keys (`CYRUS_*` routing/bootstrap vars, `PATH`, `HOME`, `NODE_OPTIONS`) are rejected. |
 
 Under the hood this calls `POST /router/seed-user` (`ControlServer.ts:57-66`), which registers the
 user, sets their executor to `docker`, and stores the Claude token via `SecretStore`.

@@ -26,7 +26,7 @@ import {
 	startControlServer,
 } from "./src/router/ControlServer.js";
 import { createRouterRig, type RouterRig } from "./src/router/RouterRig.js";
-import { bold, cyan, green, success } from "./src/utils/colors.js";
+import { bold, cyan, green, success, yellow } from "./src/utils/colors.js";
 
 class NoopFakeExecutor implements ContainerExecutor {
 	readonly provider = "docker";
@@ -43,11 +43,27 @@ class NoopFakeExecutor implements ContainerExecutor {
 	}
 }
 
+/**
+ * Parses a comma-separated env-var-name list (F1_ROUTER_REQUIRED_SECRET_KEYS)
+ * into the rig's `requiredSecretKeys`; undefined when unset or blank.
+ */
+export function parseRequiredSecretKeys(
+	raw: string | undefined,
+): string[] | undefined {
+	const keys = (raw ?? "")
+		.split(",")
+		.map((key) => key.trim())
+		.filter(Boolean);
+	return keys.length > 0 ? keys : undefined;
+}
+
 export async function startRouterServer(opts: {
 	home?: string;
 	controlToken?: string;
 	controlPort?: number;
 	fakeExecutor?: boolean;
+	requiredSecretKeys?: string[];
+	logger?: { info(m: string): void; warn(m: string): void };
 }): Promise<{ rig: RouterRig; control: ControlServer; stop(): Promise<void> }> {
 	const home = opts.home ?? join(tmpdir(), `cyrus-f1-router-${Date.now()}`);
 	for (const d of [home, join(home, "artifacts"), join(home, "state")]) {
@@ -58,6 +74,8 @@ export async function startRouterServer(opts: {
 		dbPath: join(home, "router.db"),
 		secretsPath: join(home, "secrets.json"),
 		artifactsDir,
+		requiredSecretKeys: opts.requiredSecretKeys,
+		logger: opts.logger,
 		...(opts.fakeExecutor
 			? {
 					executors: new Map<string, ContainerExecutor>([
@@ -85,12 +103,23 @@ export async function startRouterServer(opts: {
 // CLI entrypoint (only when run directly).
 if (import.meta.main) {
 	const controlToken = process.env.F1_ROUTER_CONTROL_TOKEN ?? "f1-router";
+	const requiredSecretKeys = parseRequiredSecretKeys(
+		process.env.F1_ROUTER_REQUIRED_SECRET_KEYS,
+	);
 	const handle = await startRouterServer({
 		controlToken,
 		controlPort: process.env.F1_ROUTER_CONTROL_PORT
 			? Number(process.env.F1_ROUTER_CONTROL_PORT)
 			: undefined,
 		fakeExecutor: process.env.CYRUS_ROUTER_FAKE_EXECUTOR === "1",
+		requiredSecretKeys,
+		// Console-backed so drive operators SEE router warnings — above all the
+		// boot gate's "<email> is not fully authenticated: missing <KEYS>" —
+		// instead of the rig's silent default logger swallowing them.
+		logger: {
+			info: (m) => console.log(`  ${cyan("[router]")} ${m}`),
+			warn: (m) => console.warn(`  ${yellow("[router]")} ${m}`),
+		},
 	});
 	console.log(bold(green("  🚦 F1 Router-Mode Server")));
 	console.log(
@@ -98,6 +127,9 @@ if (import.meta.main) {
 	);
 	console.log(
 		`  ${cyan("Control:")}     ${handle.control.url}  ${success(`(token: ${controlToken})`)}`,
+	);
+	console.log(
+		`  ${cyan("Boot gate:")}   ${["CLAUDE_CODE_OAUTH_TOKEN", ...(requiredSecretKeys ?? [])].join(", ")} required per user`,
 	);
 	const shutdown = async () => {
 		await handle.stop();
