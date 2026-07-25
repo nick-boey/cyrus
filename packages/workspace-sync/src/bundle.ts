@@ -34,6 +34,34 @@ export async function buildBundle(opts: {
 	const ids = Object.keys(sessions);
 	if (ids.length === 0) return false;
 
+	// The issue -> repo[] cache is what `EdgeWorker.restoreMappings` uses to
+	// register each restored session's activity sink. Without it the restored
+	// session has no sink and every work/result activity is silently dropped
+	// (the timeline freezes after the prompt acknowledgment, which posts by a
+	// different path). Persist the entries for the bundled sessions' issues so a
+	// fresh host can rebuild the sink. Matches restoreMappings' own key lookup
+	// (`issueContext?.issueId ?? issueId`), with `issue.id` as a fallback.
+	const bundledIssueIds = new Set<string>();
+	for (const s of Object.values(sessions)) {
+		const sess = s as {
+			issueId?: string;
+			issueContext?: { issueId?: string };
+			issue?: { id?: string };
+		};
+		for (const cand of [
+			sess.issueContext?.issueId,
+			sess.issueId,
+			sess.issue?.id,
+		]) {
+			if (cand) bundledIssueIds.add(cand);
+		}
+	}
+	const issueRepositoryCache = Object.fromEntries(
+		Object.entries(opts.state.issueRepositoryCache ?? {}).filter(([issueId]) =>
+			bundledIssueIds.has(issueId),
+		),
+	);
+
 	const staging = await mkdtemp(join(tmpdir(), "cyrus-bundle-"));
 	try {
 		const workspacePaths = [
@@ -72,7 +100,11 @@ export async function buildBundle(opts: {
 		await writeFile(
 			join(staging, "state", "sessions.json"),
 			JSON.stringify(
-				{ agentSessions: sessions, agentSessionEntries: entries },
+				{
+					agentSessions: sessions,
+					agentSessionEntries: entries,
+					issueRepositoryCache,
+				},
 				null,
 				2,
 			),
@@ -121,6 +153,7 @@ export async function restoreBundle(opts: {
 		) as {
 			agentSessions: Record<string, Record<string, unknown>>;
 			agentSessionEntries: Record<string, unknown[]>;
+			issueRepositoryCache?: Record<string, string[]>;
 		};
 
 		let existing: {
@@ -165,6 +198,18 @@ export async function restoreBundle(opts: {
 			] ?? []) as never;
 			restored++;
 		}
+		// Merge the issue -> repo[] cache so restoreMappings can re-register the
+		// restored sessions' activity sinks. Local state wins, mirroring the
+		// per-session merge above.
+		if (bundled.issueRepositoryCache) {
+			existing.state.issueRepositoryCache ??= {};
+			for (const [issueId, repoIds] of Object.entries(
+				bundled.issueRepositoryCache,
+			)) {
+				existing.state.issueRepositoryCache[issueId] ??= repoIds;
+			}
+		}
+
 		existing.savedAt = new Date().toISOString();
 		mkdirSync(dirname(opts.stateFile), { recursive: true });
 		const tmp = `${opts.stateFile}.tmp`;

@@ -145,6 +145,42 @@ describe("buildBundle/restoreBundle round trip", () => {
 		).toBeUndefined();
 	});
 
+	it("persists and restores issueRepositoryCache so the restored session's activity sink can be rebuilt", async () => {
+		const src = mkdtempSync(join(tmpdir(), "sync-src-"));
+		const dst = mkdtempSync(join(tmpdir(), "sync-dst-"));
+		const bundleFile = join(src, "bundle.tar.gz");
+		// makeState's session carries issue.id === "uuid-1"; restoreMappings keys
+		// the sink registration off that issue id, so the cache entry for it must
+		// survive the round trip. An unrelated issue's entry must NOT leak into
+		// this per-issue bundle.
+		const state = {
+			...(makeState("CYPACK-9", "/workspaces/CYPACK-9", {
+				claudeSessionId: "x",
+			}) as Record<string, unknown>),
+			issueRepositoryCache: {
+				"uuid-1": ["repo-A"],
+				"unrelated-uuid": ["repo-B"],
+			},
+		} as never;
+		await buildBundle({
+			issueKey: "CYPACK-9",
+			state,
+			claudeProjectsDir: join(src, "projects"),
+			outFile: bundleFile,
+		});
+		const stateFile = join(dst, "state", "edge-worker-state.json");
+		await restoreBundle({
+			bundleFile,
+			claudeProjectsDir: join(dst, "projects"),
+			stateFile,
+		});
+		const restored = JSON.parse(readFileSync(stateFile, "utf-8"));
+		expect(restored.state.issueRepositoryCache["uuid-1"]).toEqual(["repo-A"]);
+		expect(
+			restored.state.issueRepositoryCache["unrelated-uuid"],
+		).toBeUndefined();
+	});
+
 	it("returns false and writes nothing when no sessions match the issue", async () => {
 		const src = mkdtempSync(join(tmpdir(), "sync-src-"));
 		const outFile = join(src, "bundle.tar.gz");
