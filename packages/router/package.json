@@ -17,21 +17,21 @@
 	},
 	"dependencies": {
 		"@linear/sdk": "^64.0.0",
-		"better-sqlite3": "^12.4.1",
-		"cyrus-router-protocol": "workspace:*",
+		"better-sqlite3": "^12.11.1",
 		"cyrus-core": "workspace:*",
 		"cyrus-linear-event-transport": "workspace:*",
-		"fastify": "^5.8.5",
-		"ws": "^8.18.0",
+		"cyrus-router-protocol": "workspace:*",
+		"fastify": "^5.10.0",
+		"ws": "^8.21.1",
 		"zod": "4.3.6"
 	},
 	"devDependencies": {
-		"@types/better-sqlite3": "^7.6.11",
-		"@types/ws": "^8.5.12",
-		"@types/node": "^20.0.0",
+		"@types/better-sqlite3": "^7.6.13",
+		"@types/node": "^20.19.43",
+		"@types/ws": "^8.18.1",
 		"cyrus-router-client": "workspace:*",
-		"typescript": "^5.3.3",
-		"vitest": "^4.1.0"
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.10"
 	},
 	"publishConfig": {
 		"access": "public"
