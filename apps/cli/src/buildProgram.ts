@@ -268,11 +268,27 @@ export function buildProgram(
 		.description("Manage enrolled devices");
 
 	routerDevicesCommand
+		.command("list")
+		.description("List enrolled devices and the users they belong to")
+		.action(makeRouterAction("devices", "list"));
+
+	routerDevicesCommand
 		.command("revoke <email>")
 		.description(
 			"Revoke a user's enrolled device, releasing any issue locks it held",
 		)
 		.action(makeRouterAction("devices", "revoke"));
+
+	const routerSessionsCommand = routerCommand
+		.command("sessions")
+		.description("Inspect running and locked sessions");
+
+	routerSessionsCommand
+		.command("list")
+		.description(
+			"List running and locked sessions with their Linear issue id and session GUID",
+		)
+		.action(makeRouterAction("sessions", "list"));
 
 	const routerSecretsCommand = routerCommand
 		.command("secrets")

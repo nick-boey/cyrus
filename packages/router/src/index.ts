@@ -16,7 +16,12 @@ export {
 	type RouterServerConfig,
 	type RouterWorkspaceConfig,
 } from "./RouterServer.js";
-export { type ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
+export {
+	type ContainerDeviceInfo,
+	type DeviceInfo,
+	RouterStore,
+	type SessionInfo,
+} from "./RouterStore.js";
 export {
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	isReservedEnvKey,

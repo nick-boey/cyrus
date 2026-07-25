@@ -224,6 +224,80 @@ describe("RouterStore", () => {
 		expect(store.getMutation(device2.deviceId, "m-1")).toBeUndefined();
 	});
 
+	it("listDevices returns physical and container devices joined to their user's email", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const code = store.mintEnrollmentCode("alice@example.com", NOW);
+		const physical = store.redeemEnrollmentCode(code, NOW);
+		if (!physical) throw new Error("redeem failed");
+		const container = store.createContainerDevice(userId, "CYPACK-1", "docker");
+
+		const devices = store.listDevices();
+		expect(devices).toHaveLength(2);
+
+		const physicalRow = devices.find((d) => d.deviceId === physical.deviceId);
+		expect(physicalRow).toMatchObject({
+			email: "alice@example.com",
+			kind: "device",
+			issueKey: undefined,
+			provider: undefined,
+		});
+
+		const containerRow = devices.find((d) => d.deviceId === container.deviceId);
+		expect(containerRow).toMatchObject({
+			email: "alice@example.com",
+			kind: "container",
+			issueKey: "CYPACK-1",
+			provider: "docker",
+		});
+	});
+
+	it("listSessions reports running, locked, and stranded sessions with issue + session ids", () => {
+		const { store, device } = storeWithDevice();
+
+		// A running session that also holds an issue lock.
+		store.setSessionAffinity(
+			"sess-locked",
+			device.deviceId,
+			JSON.stringify({ email: "alice@example.com", name: "Alice" }),
+		);
+		store.acquireIssueLock("issue-guid-1", "sess-locked", device.deviceId);
+
+		// A running session with no lock.
+		store.setSessionAffinity("sess-running", device.deviceId);
+
+		// A stranded lock: an issue_locks row whose session has no affinity row,
+		// the leaked-lock case an operator hunts for when unlocking.
+		store.acquireIssueLock("issue-guid-2", "sess-stranded", device.deviceId);
+
+		const sessions = store.listSessions();
+		expect(sessions).toHaveLength(3);
+
+		const locked = sessions.find((s) => s.sessionId === "sess-locked");
+		expect(locked).toMatchObject({
+			issueId: "issue-guid-1",
+			locked: true,
+			hasAffinity: true,
+			email: "alice@example.com",
+			creatorEmail: "alice@example.com",
+			creatorName: "Alice",
+		});
+
+		const running = sessions.find((s) => s.sessionId === "sess-running");
+		expect(running).toMatchObject({
+			issueId: undefined,
+			locked: false,
+			hasAffinity: true,
+		});
+
+		const stranded = sessions.find((s) => s.sessionId === "sess-stranded");
+		expect(stranded).toMatchObject({
+			issueId: "issue-guid-2",
+			locked: true,
+			hasAffinity: false,
+		});
+	});
+
 	it("removeUser purges scoped rows for EVERY device the user owned, not just the first", () => {
 		// Regression test: removeUser used to purge only the first device row
 		// returned by `.get()`. A user with a physical device AND container

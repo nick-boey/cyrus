@@ -120,6 +120,18 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		]);
 	});
 
+	it("registers `router devices list`", async () => {
+		await run(["router", "devices", "list"]);
+
+		expect(routerExecute).toHaveBeenCalledWith(["devices", "list"]);
+	});
+
+	it("registers `router sessions list`", async () => {
+		await run(["router", "sessions", "list"]);
+
+		expect(routerExecute).toHaveBeenCalledWith(["sessions", "list"]);
+	});
+
 	it("registers `router containers list`", async () => {
 		await run(["router", "containers", "list"]);
 

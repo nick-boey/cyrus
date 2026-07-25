@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - Sessions can now run in ephemeral Docker containers managed by the router: assign a user to the `docker` executor and their issues each get an isolated, auto-stopping container, with work persisted across restarts. See `docker/worker/README.md` for the setup runbook.
 - Router operators can store arbitrary per-user environment variables for containers with `cyrus router secrets set <email> <ENV_VAR> <value>`, so any tool that authenticates via env vars works without code changes.
 - `cyrus router secrets list <email>` shows a user's stored secret keys (values masked) and which required credentials are still missing.
+- New router status commands: `cyrus router devices list` shows every enrolled device and its owner, and `cyrus router sessions list` shows all running and locked sessions with both their Linear issue id and session GUID — so you can find which issue a stuck session holds and release it with `cyrus router unlock <issueId>`. `cyrus router users list` now also shows each user's running and locked session counts.
 - Containers run the full hosted Linear MCP in their Claude session when a `LINEAR_API_TOKEN` secret is set for the user.
 - Operators can require extra credentials before a user's containers boot via `containers.requiredSecretKeys` in the router config (the Claude OAuth token is always required).
 

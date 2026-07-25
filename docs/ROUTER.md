@@ -114,11 +114,18 @@ Admin management commands (all operate directly on the SQLite db, safe to run
 alongside a live `router start`):
 
 ```bash
-cyrus router users list                 # show users + whether a device is enrolled
+cyrus router users list                 # show users + device + running/locked session counts
 cyrus router users remove <email>       # remove a user (and their device)
+cyrus router devices list               # show enrolled devices and who owns them
 cyrus router devices revoke <email>     # revoke a user's device token
+cyrus router sessions list              # show running + locked sessions (Linear issue id + session GUID)
 cyrus router unlock <issueId>           # release a stuck issue lock
 ```
+
+To release a stuck lock, run `cyrus router sessions list` to find the locked
+issue's id (the `ISSUE ID` column — a Linear issue GUID), then pass it to
+`cyrus router unlock <issueId>`. Sessions shown as `stranded` are leaked locks
+with no live session behind them and are the usual unlock candidates.
 
 Re-running `users add` for someone who is already enrolled mints a fresh code;
 redeeming it **replaces** their device and immediately invalidates the old
@@ -429,9 +436,11 @@ handoff mechanism.
 |---------|-------|---------|
 | `cyrus router start` | host | Start the router server (reads `~/.cyrus/router-config.json`). |
 | `cyrus router users add <email> [--name <name>]` | host | Register a user + mint a 15-minute enrollment code. |
-| `cyrus router users list` | host | List users and whether each has an enrolled device. |
+| `cyrus router users list` | host | List users with device status and running/locked session counts. |
 | `cyrus router users remove <email>` | host | Remove a user and their device. |
+| `cyrus router devices list` | host | List enrolled devices (physical + container) and their owners. |
 | `cyrus router devices revoke <email>` | host | Revoke a user's device token. |
+| `cyrus router sessions list` | host | List running + locked sessions with their Linear issue id and session GUID. |
 | `cyrus router unlock <issueId>` | host | Release a stuck issue lock. |
 | `cyrus connect <url> --code <code>` | device | Enroll this device with the router. |
 | `cyrus start` | device | Begin receiving and running your routed sessions. |

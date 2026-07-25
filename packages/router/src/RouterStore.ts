@@ -72,6 +72,28 @@ function generateTokenHex(): string {
 	return randomBytes(32).toString("hex");
 }
 
+/**
+ * Best-effort read of the `creator_json` stored on a `session_affinity` row
+ * (the Linear webhook's `agentSession.creator`). Only `email`/`name` are pulled
+ * out, for display in `sessions list`; a null or unparseable blob yields an
+ * empty object rather than throwing, since this is diagnostic output.
+ */
+function parseCreator(creatorJson: string | null): {
+	email?: string;
+	name?: string;
+} {
+	if (!creatorJson) return {};
+	try {
+		const parsed = JSON.parse(creatorJson) as {
+			email?: string;
+			name?: string;
+		};
+		return { email: parsed.email, name: parsed.name };
+	} catch {
+		return {};
+	}
+}
+
 interface UserRow {
 	user_id: number;
 	email: string;
@@ -111,6 +133,46 @@ export interface ContainerDeviceInfo {
 	createdMs: number;
 	lastSeenMs?: number;
 	lastRoutedMs?: number;
+}
+
+/**
+ * A device row (physical or container) joined to its owning user's email, for
+ * `cyrus router devices list`. `email` can be undefined only in the pathological
+ * case of a device row whose user was deleted without cascading — normal
+ * deletes purge devices, so this is a diagnostic, not an expected state.
+ */
+export interface DeviceInfo {
+	deviceId: number;
+	userId: number;
+	email?: string;
+	kind: "device" | "container";
+	issueKey?: string;
+	provider?: string;
+	createdMs: number;
+	lastSeenMs?: number;
+	lastRoutedMs?: number;
+}
+
+/**
+ * A router-tracked session for `cyrus router sessions list`, joining
+ * `session_affinity` (running sessions) with `issue_locks` (locked issues) by
+ * `sessionId`. `locked` sessions carry the `issueId` — the Linear issue GUID
+ * that `cyrus router unlock <issueId>` takes. A session with `locked: false`
+ * and no `issueId` is running but holds no issue lock. A row can also originate
+ * purely from `issue_locks` with no matching affinity (`hasAffinity: false`) —
+ * a leaked/stranded lock, exactly the case an operator hunts for when unlocking.
+ */
+export interface SessionInfo {
+	sessionId: string;
+	issueId?: string;
+	locked: boolean;
+	hasAffinity: boolean;
+	deviceId: number;
+	email?: string;
+	kind?: "device" | "container";
+	issueKey?: string;
+	creatorEmail?: string;
+	creatorName?: string;
 }
 
 function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
@@ -558,6 +620,115 @@ export class RouterStore {
 			)
 			.all() as ContainerDeviceRow[];
 		return rows.map(toContainerDeviceInfo);
+	}
+
+	/**
+	 * Every device row (physical and container) joined to its owning user's
+	 * email, for `cyrus router devices list`. Ordered by user then kind so a
+	 * user's physical device sorts ahead of their container devices.
+	 */
+	listDevices(): DeviceInfo[] {
+		const rows = this.db
+			.prepare(
+				`SELECT d.device_id, d.user_id, d.kind, d.issue_key, d.provider,
+					d.created_ms, d.last_seen_ms, d.last_routed_ms, u.email
+				 FROM devices d
+				 LEFT JOIN users u ON u.user_id = d.user_id
+				 ORDER BY d.user_id, d.kind, d.issue_key`,
+			)
+			.all() as Array<DeviceRow & { email: string | null }>;
+		return rows.map((row) => ({
+			deviceId: row.device_id,
+			userId: row.user_id,
+			email: row.email ?? undefined,
+			kind: row.kind as "device" | "container",
+			issueKey: row.issue_key ?? undefined,
+			provider: row.provider ?? undefined,
+			createdMs: row.created_ms,
+			lastSeenMs: row.last_seen_ms ?? undefined,
+			lastRoutedMs: row.last_routed_ms ?? undefined,
+		}));
+	}
+
+	/**
+	 * Every router-tracked session — running (from `session_affinity`) and any
+	 * stranded issue lock with no matching affinity (from `issue_locks`) — joined
+	 * to the owning device/user and, when locked, the Linear issue GUID. Powers
+	 * `cyrus router sessions list`, whose primary job is letting an operator find
+	 * the `issueId` a stuck session holds so they can `cyrus router unlock` it.
+	 */
+	listSessions(): SessionInfo[] {
+		const affinityRows = this.db
+			.prepare(
+				`SELECT sa.session_id, sa.device_id, sa.creator_json,
+					il.issue_id AS locked_issue_id,
+					d.kind, d.issue_key, u.email
+				 FROM session_affinity sa
+				 LEFT JOIN issue_locks il ON il.session_id = sa.session_id
+				 LEFT JOIN devices d ON d.device_id = sa.device_id
+				 LEFT JOIN users u ON u.user_id = d.user_id`,
+			)
+			.all() as Array<{
+			session_id: string;
+			device_id: number;
+			creator_json: string | null;
+			locked_issue_id: string | null;
+			kind: string | null;
+			issue_key: string | null;
+			email: string | null;
+		}>;
+
+		// Locks whose session has NO affinity row — leaked/stranded. These are the
+		// most important rows for an operator hunting a stuck issue to unlock, so
+		// surface them even though there is no running session behind them.
+		const orphanLockRows = this.db
+			.prepare(
+				`SELECT il.session_id, il.issue_id, il.device_id,
+					d.kind, d.issue_key, u.email
+				 FROM issue_locks il
+				 LEFT JOIN devices d ON d.device_id = il.device_id
+				 LEFT JOIN users u ON u.user_id = d.user_id
+				 WHERE il.session_id NOT IN (SELECT session_id FROM session_affinity)`,
+			)
+			.all() as Array<{
+			session_id: string;
+			issue_id: string;
+			device_id: number;
+			kind: string | null;
+			issue_key: string | null;
+			email: string | null;
+		}>;
+
+		const sessions: SessionInfo[] = affinityRows.map((row) => {
+			const creator = parseCreator(row.creator_json);
+			return {
+				sessionId: row.session_id,
+				issueId: row.locked_issue_id ?? undefined,
+				locked: row.locked_issue_id !== null,
+				hasAffinity: true,
+				deviceId: row.device_id,
+				email: row.email ?? undefined,
+				kind: (row.kind as "device" | "container" | null) ?? undefined,
+				issueKey: row.issue_key ?? undefined,
+				creatorEmail: creator.email,
+				creatorName: creator.name,
+			};
+		});
+
+		for (const row of orphanLockRows) {
+			sessions.push({
+				sessionId: row.session_id,
+				issueId: row.issue_id,
+				locked: true,
+				hasAffinity: false,
+				deviceId: row.device_id,
+				email: row.email ?? undefined,
+				kind: (row.kind as "device" | "container" | null) ?? undefined,
+				issueKey: row.issue_key ?? undefined,
+			});
+		}
+
+		return sessions;
 	}
 
 	countSessionAffinityForDevice(deviceId: number): number {

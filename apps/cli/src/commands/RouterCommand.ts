@@ -10,6 +10,7 @@ import { resolvePath } from "cyrus-core";
 import {
 	type ContainerDeviceInfo,
 	DEFAULT_REQUIRED_SECRET_KEYS,
+	type DeviceInfo,
 	isReservedEnvKey,
 	isStorableSecretKey,
 	RESERVED_ENV_KEYS,
@@ -17,6 +18,7 @@ import {
 	type RouterServerConfig,
 	RouterStore,
 	SecretStore,
+	type SessionInfo,
 } from "cyrus-router";
 import { z } from "zod";
 import { BaseCommand } from "./ICommand.js";
@@ -40,6 +42,30 @@ const CONTAINERS_TABLE_COLUMN_WIDTHS = {
 	provider: 10,
 	email: 30,
 	lastRouted: 25,
+} as const;
+
+/**
+ * Column widths for `devices list`'s table, shared between its header and data
+ * rows so they can't drift apart. Mirrors {@link CONTAINERS_TABLE_COLUMN_WIDTHS}.
+ */
+const DEVICES_TABLE_COLUMN_WIDTHS = {
+	email: 30,
+	kind: 10,
+	issueKey: 15,
+	provider: 10,
+	lastSeen: 25,
+} as const;
+
+/**
+ * Column widths for `sessions list`'s table. The two GUID columns (session id
+ * and the Linear issue id) are wide because those are the values an operator
+ * copies into `cyrus router unlock <issueId>`.
+ */
+const SESSIONS_TABLE_COLUMN_WIDTHS = {
+	sessionId: 38,
+	issueId: 38,
+	state: 8,
+	email: 28,
 } as const;
 
 /**
@@ -112,11 +138,13 @@ const RouterConfigFileSchema = z.object({
  *
  *   cyrus router start                          # start the router server
  *   cyrus router users add <email> [--name x]   # register a user + mint an enrollment code
- *   cyrus router users list                     # list registered users
+ *   cyrus router users list                     # list registered users + their running session counts
  *   cyrus router users remove <email>           # remove a user
  *   cyrus router users set-executor <email> <device|docker|fly|codespaces>
  *                                                # choose where a user's sessions run
+ *   cyrus router devices list                   # list enrolled devices + who owns them
  *   cyrus router devices revoke <email>         # revoke a user's enrolled device
+ *   cyrus router sessions list                  # list running + locked sessions (issue id + session GUID)
  *   cyrus router secrets set <email> <ENV_VAR_NAME> <value>
  *                                                # store a per-user container secret
  *   cyrus router secrets unset <email> <ENV_VAR_NAME>
@@ -141,6 +169,8 @@ export class RouterCommand extends BaseCommand {
 				return this.users(rest);
 			case "devices":
 				return this.devices(rest);
+			case "sessions":
+				return this.sessions(rest);
 			case "secrets":
 				return this.secrets(rest);
 			case "containers":
@@ -149,7 +179,7 @@ export class RouterCommand extends BaseCommand {
 				return this.unlock(rest[0]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces>|devices revoke <email>|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email>|containers list|containers destroy <issueKey>|unlock <issueId>>",
+					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email>|containers list|containers destroy <issueKey>|unlock <issueId>>",
 				);
 		}
 	}
@@ -425,12 +455,31 @@ export class RouterCommand extends BaseCommand {
 				this.logger.info("No users registered.");
 				return;
 			}
+			// Running/locked session counts per user, so `users list` answers "who
+			// has work in flight" at a glance; `sessions list` has the per-session
+			// detail. Keyed by lower-cased email since RouterStore emails are
+			// case-insensitive (COLLATE NOCASE) and a session's owning email comes
+			// from the same users table.
+			const sessions = store.listSessions();
+			const runningByEmail = new Map<string, number>();
+			const lockedByEmail = new Map<string, number>();
+			for (const session of sessions) {
+				if (!session.email) continue;
+				const key = session.email.toLowerCase();
+				if (session.hasAffinity) {
+					runningByEmail.set(key, (runningByEmail.get(key) ?? 0) + 1);
+				}
+				if (session.locked) {
+					lockedByEmail.set(key, (lockedByEmail.get(key) ?? 0) + 1);
+				}
+			}
 			this.logger.raw(
-				"EMAIL                          NAME                 DEVICE ENROLLED",
+				`${"EMAIL".padEnd(30)} ${"NAME".padEnd(20)} ${"DEVICE".padEnd(6)} ${"RUNNING".padEnd(7)} LOCKED`,
 			);
 			for (const user of users) {
+				const key = user.email.toLowerCase();
 				this.logger.raw(
-					`${user.email.padEnd(30)} ${(user.name ?? "").padEnd(20)} ${user.deviceEnrolled ? "yes" : "no"}`,
+					`${user.email.padEnd(30)} ${(user.name ?? "").padEnd(20)} ${(user.deviceEnrolled ? "yes" : "no").padEnd(6)} ${String(runningByEmail.get(key) ?? 0).padEnd(7)} ${lockedByEmail.get(key) ?? 0}`,
 				);
 			}
 		} finally {
@@ -508,11 +557,107 @@ export class RouterCommand extends BaseCommand {
 	private async devices(rest: string[]): Promise<void> {
 		const [action, ...deviceRest] = rest;
 		switch (action) {
+			case "list":
+				return this.devicesList();
 			case "revoke":
 				return this.devicesRevoke(deviceRest[0]);
 			default:
-				this.exitWithError("Usage: cyrus router devices revoke <email>");
+				this.exitWithError("Usage: cyrus router devices <list|revoke <email>>");
 		}
+	}
+
+	private devicesList(): void {
+		const store = this.openStore();
+		try {
+			const devices = store.listDevices();
+			if (devices.length === 0) {
+				this.logger.info("No devices enrolled.");
+				return;
+			}
+			this.logger.raw(this.formatDeviceHeader());
+			for (const device of devices) {
+				this.logger.raw(this.formatDeviceRow(device));
+			}
+		} finally {
+			store.close();
+		}
+	}
+
+	private formatDeviceHeader(): string {
+		const w = DEVICES_TABLE_COLUMN_WIDTHS;
+		return `${"USER".padEnd(w.email)} ${"KIND".padEnd(w.kind)} ${"ISSUE KEY".padEnd(w.issueKey)} ${"PROVIDER".padEnd(w.provider)} ${"LAST SEEN".padEnd(w.lastSeen)} DEVICE ID`;
+	}
+
+	private formatDeviceRow(device: DeviceInfo): string {
+		const w = DEVICES_TABLE_COLUMN_WIDTHS;
+		const email = device.email ?? "(unknown)";
+		const issueKey = device.issueKey ?? "-";
+		const provider = device.provider ?? "-";
+		const lastSeen = device.lastSeenMs
+			? new Date(device.lastSeenMs).toISOString()
+			: "-";
+		return `${email.padEnd(w.email)} ${device.kind.padEnd(w.kind)} ${issueKey.padEnd(w.issueKey)} ${provider.padEnd(w.provider)} ${lastSeen.padEnd(w.lastSeen)} ${device.deviceId}`;
+	}
+
+	private async sessions(rest: string[]): Promise<void> {
+		const [action] = rest;
+		switch (action) {
+			case "list":
+				return this.sessionsList();
+			default:
+				this.exitWithError("Usage: cyrus router sessions list");
+		}
+	}
+
+	/**
+	 * Lists every router-tracked session with both the Linear issue GUID (for
+	 * locked sessions) and the session GUID, so an operator can find the
+	 * `issueId` a stuck session holds and pass it to `cyrus router unlock`.
+	 * Sorted locked-first so the rows most likely to need unlocking lead.
+	 */
+	private sessionsList(): void {
+		const store = this.openStore();
+		try {
+			const sessions = store.listSessions();
+			if (sessions.length === 0) {
+				this.logger.info("No active or locked sessions.");
+				return;
+			}
+			sessions.sort((a, b) => {
+				if (a.locked !== b.locked) return a.locked ? -1 : 1;
+				return a.sessionId.localeCompare(b.sessionId);
+			});
+			this.logger.raw(this.formatSessionHeader());
+			for (const session of sessions) {
+				this.logger.raw(this.formatSessionRow(session));
+			}
+			this.logger.raw("");
+			this.logger.raw("Release a lock with: cyrus router unlock <ISSUE ID>");
+		} finally {
+			store.close();
+		}
+	}
+
+	private formatSessionHeader(): string {
+		const w = SESSIONS_TABLE_COLUMN_WIDTHS;
+		return `${"SESSION ID".padEnd(w.sessionId)} ${"ISSUE ID".padEnd(w.issueId)} ${"STATE".padEnd(w.state)} USER`;
+	}
+
+	/**
+	 * `STATE` is one of `locked` (holds an issue lock, running), `running` (has
+	 * device affinity, no lock), or `stranded` (an issue lock with no live
+	 * session behind it — a leaked lock, the prime unlock candidate).
+	 */
+	private formatSessionRow(session: SessionInfo): string {
+		const w = SESSIONS_TABLE_COLUMN_WIDTHS;
+		const issueId = session.issueId ?? "-";
+		const state = !session.hasAffinity
+			? "stranded"
+			: session.locked
+				? "locked"
+				: "running";
+		const user = session.email ?? session.creatorEmail ?? "(unknown)";
+		return `${session.sessionId.padEnd(w.sessionId)} ${issueId.padEnd(w.issueId)} ${state.padEnd(w.state)} ${user}`;
 	}
 
 	private devicesRevoke(email: string | undefined): void {

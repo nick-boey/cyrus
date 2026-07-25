@@ -90,6 +90,41 @@ describe("RouterCommand", () => {
 			expect(printedStdout()).toContain("bob@example.com");
 		});
 
+		it("shows per-user running and locked session counts", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute(["users", "add", "bob@example.com"]);
+
+			const seedStore = new RouterStore(dbPath());
+			const code = seedStore.mintEnrollmentCode("bob@example.com", Date.now());
+			const redeemed = seedStore.redeemEnrollmentCode(code, Date.now());
+			expect(redeemed).toBeDefined();
+			const deviceId = redeemed!.deviceId;
+			seedStore.setSessionAffinity(
+				"bob-session-1",
+				deviceId,
+				JSON.stringify({ email: "bob@example.com" }),
+			);
+			seedStore.setSessionAffinity("bob-session-2", deviceId);
+			seedStore.acquireIssueLock("bob-issue-1", "bob-session-1", deviceId);
+			seedStore.close();
+
+			consoleLogSpy.mockClear();
+			await command.execute(["users", "list"]);
+
+			const printed = printedStdout();
+			expect(printed).toContain("RUNNING");
+			expect(printed).toContain("LOCKED");
+			// bob has 2 running sessions and 1 lock — assert the data row.
+			const dataRow = printed
+				.split("\n")
+				.find((line) => line.includes("bob@example.com"));
+			expect(dataRow).toBeDefined();
+			expect(dataRow).toMatch(/\byes\b/);
+			// ...RUNNING(2)  LOCKED(1) at the end of the row.
+			expect(dataRow?.trimEnd()).toMatch(/\s2\s+1$/);
+		});
+
 		it("reports when no users are registered", async () => {
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);
@@ -145,6 +180,108 @@ describe("RouterCommand", () => {
 			} finally {
 				verifyStore.close();
 			}
+		});
+	});
+
+	describe("devices list", () => {
+		it("reports when no devices are enrolled", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute(["users", "add", "frank@example.com"]);
+			consoleLogSpy.mockClear();
+
+			await command.execute(["devices", "list"]);
+
+			expect(app.logger.info).toHaveBeenCalledWith("No devices enrolled.");
+		});
+
+		it("lists enrolled physical and container devices with their owner", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute(["users", "add", "grace@example.com"]);
+
+			const seedStore = new RouterStore(dbPath());
+			const code = seedStore.mintEnrollmentCode(
+				"grace@example.com",
+				Date.now(),
+			);
+			const redeemed = seedStore.redeemEnrollmentCode(code, Date.now());
+			expect(redeemed).toBeDefined();
+			const user = seedStore
+				.listUsers()
+				.find((u) => u.email === "grace@example.com");
+			seedStore.createContainerDevice(user!.userId, "GRACE-1", "docker");
+			seedStore.close();
+
+			consoleLogSpy.mockClear();
+			await command.execute(["devices", "list"]);
+
+			const printed = printedStdout();
+			expect(printed).toContain("grace@example.com");
+			expect(printed).toContain("device");
+			expect(printed).toContain("container");
+			expect(printed).toContain("GRACE-1");
+			expect(printed).toContain("docker");
+		});
+	});
+
+	describe("sessions list", () => {
+		it("reports when there are no sessions", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await command.execute(["sessions", "list"]);
+
+			expect(app.logger.info).toHaveBeenCalledWith(
+				"No active or locked sessions.",
+			);
+		});
+
+		it("lists locked, running, and stranded sessions with issue + session ids", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute(["users", "add", "heidi@example.com"]);
+
+			const seedStore = new RouterStore(dbPath());
+			const code = seedStore.mintEnrollmentCode(
+				"heidi@example.com",
+				Date.now(),
+			);
+			const redeemed = seedStore.redeemEnrollmentCode(code, Date.now());
+			expect(redeemed).toBeDefined();
+			const deviceId = redeemed!.deviceId;
+			// Locked + running session.
+			seedStore.setSessionAffinity(
+				"session-locked-guid",
+				deviceId,
+				JSON.stringify({ email: "heidi@example.com" }),
+			);
+			seedStore.acquireIssueLock(
+				"issue-locked-guid",
+				"session-locked-guid",
+				deviceId,
+			);
+			// Stranded lock: no matching affinity row.
+			seedStore.acquireIssueLock(
+				"issue-stranded-guid",
+				"session-stranded-guid",
+				deviceId,
+			);
+			seedStore.close();
+
+			consoleLogSpy.mockClear();
+			await command.execute(["sessions", "list"]);
+
+			const printed = printedStdout();
+			expect(printed).toContain("session-locked-guid");
+			expect(printed).toContain("issue-locked-guid");
+			expect(printed).toContain("locked");
+			expect(printed).toContain("session-stranded-guid");
+			expect(printed).toContain("issue-stranded-guid");
+			expect(printed).toContain("stranded");
+			expect(printed).toContain("heidi@example.com");
+			// The unlock hint uses the issue id, the value operators copy.
+			expect(printed).toContain("cyrus router unlock");
 		});
 	});
 
