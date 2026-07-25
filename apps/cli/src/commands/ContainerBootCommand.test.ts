@@ -913,6 +913,68 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 				false,
 			);
 		});
+
+		it("registers gh as git's credential helper when GH_TOKEN is set, writing no credential file", async () => {
+			const { exec, calls } = makeFakeExec();
+			const cmd = newCommand({ exec });
+
+			await cmd.configureGit({
+				gitUserName: "Cyrus",
+				gitUserEmail: "cyrus@localhost",
+				ghToken: "gho_tok",
+			});
+
+			expect(calls).toEqual(
+				expect.arrayContaining([
+					{
+						cmd: "gh",
+						args: ["auth", "setup-git", "--hostname", "github.com"],
+					},
+				]),
+			);
+			// gh holds the token — nothing written to disk, no manual store helper.
+			expect(() => statSync(join(homeDir, ".git-credentials"))).toThrow();
+			expect(calls.some((c) => c.args.includes("credential.helper"))).toBe(
+				false,
+			);
+		});
+
+		it("prefers GH_TOKEN over GIT_TOKEN (gh helper, no credential file)", async () => {
+			const { exec, calls } = makeFakeExec();
+			const cmd = newCommand({ exec });
+
+			await cmd.configureGit({
+				gitUserName: "Cyrus",
+				gitUserEmail: "cyrus@localhost",
+				ghToken: "gho_tok",
+				gitToken: "tok-xyz",
+			});
+
+			expect(
+				calls.some((c) => c.cmd === "gh" && c.args.includes("setup-git")),
+			).toBe(true);
+			expect(() => statSync(join(homeDir, ".git-credentials"))).toThrow();
+		});
+
+		it("warns but does not throw when gh auth setup-git fails", async () => {
+			const logger = silentLogger();
+			const { exec } = makeFakeExec((c) =>
+				c === "gh" ? { exitCode: 1, stderr: "not logged in" } : undefined,
+			);
+			const cmd = newCommand({ exec, logger });
+
+			await expect(
+				cmd.configureGit({
+					gitUserName: "Cyrus",
+					gitUserEmail: "cyrus@localhost",
+					ghToken: "gho_tok",
+				}),
+			).resolves.toBeUndefined();
+
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("gh auth setup-git failed"),
+			);
+		});
 	});
 
 	describe("applyDotfiles (step 6)", () => {

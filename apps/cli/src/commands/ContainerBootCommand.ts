@@ -232,6 +232,11 @@ export class ContainerBootCommand implements ICommand {
 			this.env.CYRUS_REPO_CACHE_DIR ?? DEFAULT_REPO_CACHE_DIR;
 		const routerUrl = this.env.CYRUS_ROUTER_URL as string;
 		const deviceToken = this.env.CYRUS_DEVICE_TOKEN as string;
+		// GH_TOKEN is the canonical GitHub credential: `gh` reads it natively and
+		// git rides on `gh` as its credential helper (see configureGit), so one
+		// secret authenticates both. GIT_TOKEN is the legacy fallback (manual
+		// credential store; authenticates git only).
+		const ghToken = this.env.GH_TOKEN;
 		const gitToken = this.env.GIT_TOKEN;
 
 		let repos: RepoSpec[];
@@ -272,6 +277,7 @@ export class ContainerBootCommand implements ICommand {
 		await this.configureGit({
 			gitUserName: this.env.GIT_USER_NAME ?? "Cyrus",
 			gitUserEmail: this.env.GIT_USER_EMAIL ?? "cyrus@localhost",
+			ghToken,
 			gitToken,
 		});
 		await this.cloneRepos({ workspacesDir, repoCacheDir, repos, gitToken });
@@ -740,17 +746,26 @@ export class ContainerBootCommand implements ICommand {
 	}
 
 	/**
-	 * Step 3: global git identity + (when `GIT_TOKEN` is set) a credential
-	 * helper so subsequent git operations (clone, push, PR creation)
-	 * authenticate without ever embedding the token in a URL.
-	 * `~/.git-credentials` holds a live bearer credential, so it is written
-	 * at mode 0600 and re-chmod'd on every boot in case an image/volume
-	 * default umask is looser. Runs *before* `cloneRepos()` — see the note
-	 * there for why that ordering is load-bearing.
+	 * Step 3: global git identity + a credential helper so subsequent git
+	 * operations (clone, push, PR creation) authenticate without ever embedding
+	 * a token in a URL. Two mutually exclusive paths:
+	 *
+	 * - `ghToken` (canonical): register the `gh` CLI as git's credential helper
+	 *   (`gh auth setup-git`). `gh` reads GH_TOKEN from the process env, so one
+	 *   secret authenticates BOTH git (via the helper) and `gh` itself (natively,
+	 *   e.g. `gh pr create`). No token touches the filesystem — `gh` holds it.
+	 * - `gitToken` (legacy): the manual credential-store helper. `~/.git-credentials`
+	 *   holds a live bearer credential, so it is written at mode 0600 and
+	 *   re-chmod'd on every boot in case an image/volume default umask is looser.
+	 *   Authenticates git only — not `gh`.
+	 *
+	 * GH_TOKEN wins when both are present. Runs *before* `cloneRepos()` — see the
+	 * note there for why that ordering is load-bearing.
 	 */
 	async configureGit(opts: {
 		gitUserName: string;
 		gitUserEmail: string;
+		ghToken?: string;
 		gitToken?: string;
 	}): Promise<void> {
 		await this.exec("git", [
@@ -766,7 +781,22 @@ export class ContainerBootCommand implements ICommand {
 			opts.gitUserEmail,
 		]);
 
-		if (opts.gitToken) {
+		if (opts.ghToken) {
+			// `gh` already has the token from GH_TOKEN in the env; make git ride
+			// on gh's credential helper for github.com. `--hostname github.com`
+			// keeps it scoped rather than clobbering unrelated hosts.
+			const { exitCode, stderr } = await this.exec("gh", [
+				"auth",
+				"setup-git",
+				"--hostname",
+				"github.com",
+			]);
+			if (exitCode !== 0) {
+				this.logger.warn(
+					`gh auth setup-git failed — git may be unauthenticated: ${stderr.trim()}`,
+				);
+			}
+		} else if (opts.gitToken) {
 			const credentialsPath = join(this.homeDir, ".git-credentials");
 			writeFileSync(
 				credentialsPath,

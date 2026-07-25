@@ -27,6 +27,20 @@ RUN apt-get update \
 		git \
 		jq \
 	&& rm -rf /var/lib/apt/lists/*
+# .NET SDK: repos targeting .NET (e.g. net10.0/net8.0 solutions) need `dotnet`
+# for Claude sessions to build, test, restore, and run local tools. Installed
+# from Microsoft's package feed, which auto-resolves the native runtime deps
+# (libicu, libssl, …) that node:22-slim does not ship. Pinned to the base
+# image's Debian release (12/bookworm) — update the feed URL if the base moves.
+RUN curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -o /tmp/packages-microsoft-prod.deb \
+	&& dpkg -i /tmp/packages-microsoft-prod.deb \
+	&& rm /tmp/packages-microsoft-prod.deb \
+	&& apt-get update \
+	&& apt-get install -y --no-install-recommends dotnet-sdk-10.0 \
+	&& rm -rf /var/lib/apt/lists/*
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+	DOTNET_NOLOGO=1 \
+	DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 RUN useradd --create-home --uid 1001 cyrus \
 	&& mkdir -p /workspaces /var/cache/repos \
 	&& chown -R cyrus:cyrus /workspaces /var/cache/repos \
