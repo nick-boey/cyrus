@@ -6,6 +6,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { LinearClient } from "@linear/sdk";
 import { resolvePath } from "cyrus-core";
 import {
 	type ContainerDeviceInfo,
@@ -22,6 +23,16 @@ import {
 } from "cyrus-router";
 import { z } from "zod";
 import { BaseCommand } from "./ICommand.js";
+
+/**
+ * A Linear human issue identifier: a team key (letters/digits, starting with a
+ * letter) then a hyphen then a number — e.g. `PAR-169`, `ENG-12`. Deliberately
+ * NOT matched by issue GUIDs: a UUID's first hyphen is followed by more hex and
+ * hyphens (`aaaa-1111-...`), so `-\d+$` (digits only to the end) fails. Used by
+ * `unlock` to decide whether a value needs Linear resolution or is already a
+ * GUID it can look up directly.
+ */
+const ISSUE_IDENTIFIER_RE = /^[A-Za-z][A-Za-z0-9]*-\d+$/;
 
 /** Valid values for `cyrus router users set-executor <email> <type>`. */
 const EXECUTOR_TYPES = ["device", "docker", "fly", "codespaces"] as const;
@@ -152,7 +163,7 @@ const RouterConfigFileSchema = z.object({
  *   cyrus router secrets list <email>           # list stored secret keys (masked) + missing required
  *   cyrus router containers list                # list running ephemeral container devices
  *   cyrus router containers destroy <issueKey>  # drop a container device's row
- *   cyrus router unlock <issueId>               # release a stuck issue lock
+ *   cyrus router unlock <issueId|PAR-123>       # release a stuck issue lock (GUID or Linear identifier)
  *
  * Every subcommand except `start` opens a {@link RouterStore} directly on the
  * db file (rather than talking to a running server over HTTP). Task 6's WAL
@@ -696,24 +707,107 @@ export class RouterCommand extends BaseCommand {
 		}
 	}
 
-	private unlock(issueId: string | undefined): void {
-		if (!issueId) {
-			this.exitWithError("Usage: cyrus router unlock <issueId>");
+	/**
+	 * Releases a stuck issue lock. Accepts either the Linear issue GUID (the raw
+	 * `issue_locks.issue_id`) or a human identifier like `PAR-169`.
+	 *
+	 * Locks are keyed by GUID, so a human identifier is resolved to its GUID via
+	 * Linear (`resolveIssueGuid`) before the lookup. The direct GUID path runs
+	 * first and needs no network, so passing a GUID still works with no Linear
+	 * token configured — only the identifier path requires one.
+	 */
+	private async unlock(issue: string | undefined): Promise<void> {
+		if (!issue) {
+			this.exitWithError("Usage: cyrus router unlock <issueId|PAR-123>");
 		}
 		const store = this.openStore();
 		try {
-			const lock = store.getIssueLock(issueId);
+			// 1. Direct: the value is already the locked issue's GUID.
+			let lock = store.getIssueLock(issue);
+			let resolvedGuid = issue;
+			let resolvedIdentifier: string | undefined;
+
+			// 2. Not directly locked, and it looks like a human identifier (e.g.
+			//    "PAR-169") rather than a GUID — resolve it against Linear and
+			//    retry the lookup with the resolved GUID.
+			if (!lock && ISSUE_IDENTIFIER_RE.test(issue)) {
+				const resolved = await this.resolveIssueGuid(issue);
+				if (!resolved) {
+					this.exitWithError(
+						`Could not resolve Linear issue "${issue}" to an id. Check the identifier and that router-config.json has a Linear token for its workspace, or pass the issue GUID directly (find it with: cyrus router sessions list).`,
+					);
+				}
+				resolvedGuid = resolved.id;
+				resolvedIdentifier = resolved.identifier;
+				lock = store.getIssueLock(resolvedGuid);
+			}
+
 			if (!lock) {
-				this.logger.info(`No lock found for issue ${issueId}.`);
+				const where = resolvedIdentifier
+					? `${issue} (resolved to ${resolvedGuid})`
+					: issue;
+				this.logger.info(`No lock found for issue ${where}.`);
 				return;
 			}
 			store.releaseIssueLockForSession(lock.sessionId);
+			const released = resolvedIdentifier
+				? `${resolvedIdentifier} → ${resolvedGuid}`
+				: resolvedGuid;
 			this.logSuccess(
-				`Released lock on ${issueId} (session ${lock.sessionId}).`,
+				`Released lock on ${released} (session ${lock.sessionId}).`,
 			);
 		} finally {
 			store.close();
 		}
+	}
+
+	/**
+	 * Linear access tokens for every workspace in `router-config.json`, used to
+	 * resolve a human issue identifier to its GUID. An identifier belongs to one
+	 * workspace, so {@link resolveIssueGuid} tries each token until one resolves.
+	 * Read the same defensive way as {@link resolveRequiredSecretKeys}: a
+	 * missing/unparseable config yields an empty list rather than throwing.
+	 */
+	private resolveLinearTokens(): string[] {
+		const configPath = join(
+			resolvePath(this.app.cyrusHome),
+			"router-config.json",
+		);
+		if (!existsSync(configPath)) return [];
+		try {
+			const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+			const parsed = RouterConfigFileSchema.safeParse(raw);
+			if (!parsed.success) return [];
+			return Object.values(parsed.data.workspaces).map((w) => w.linearToken);
+		} catch {
+			return [];
+		}
+	}
+
+	/**
+	 * Resolves a human issue identifier (e.g. `PAR-169`) to its Linear issue
+	 * GUID by trying each workspace token until one resolves it. `undefined`
+	 * when no token can (wrong org, expired token, or none configured). Split
+	 * into its own `protected` method so tests can override it without a live
+	 * Linear call. Linear's `issue(id:)` accepts both the identifier and the
+	 * GUID, so this is also a harmless no-op if handed a GUID.
+	 */
+	protected async resolveIssueGuid(
+		identifier: string,
+	): Promise<{ id: string; identifier: string } | undefined> {
+		for (const token of this.resolveLinearTokens()) {
+			try {
+				const issue = await new LinearClient({ accessToken: token }).issue(
+					identifier,
+				);
+				if (issue?.id) {
+					return { id: issue.id, identifier: issue.identifier ?? identifier };
+				}
+			} catch {
+				// Wrong workspace for this token, or an expired token — try the next.
+			}
+		}
+		return undefined;
 	}
 
 	private async secrets(rest: string[]): Promise<void> {

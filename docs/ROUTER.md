@@ -119,12 +119,16 @@ cyrus router users remove <email>       # remove a user (and their device)
 cyrus router devices list               # show enrolled devices and who owns them
 cyrus router devices revoke <email>     # revoke a user's device token
 cyrus router sessions list              # show running + locked sessions (Linear issue id + session GUID)
-cyrus router unlock <issueId>           # release a stuck issue lock
+cyrus router unlock <issueId|PAR-123>   # release a stuck issue lock (GUID or Linear identifier)
 ```
 
-To release a stuck lock, run `cyrus router sessions list` to find the locked
-issue's id (the `ISSUE ID` column — a Linear issue GUID), then pass it to
-`cyrus router unlock <issueId>`. Sessions shown as `stranded` are leaked locks
+To release a stuck lock, the simplest path is the human identifier straight from
+Linear: `cyrus router unlock PAR-169`. The router resolves the identifier to the
+issue's GUID via Linear (using a workspace token from `router-config.json`) and
+releases the matching lock. You can still pass the raw GUID — run
+`cyrus router sessions list` and copy the `ISSUE ID` column — which needs no
+Linear token and works even when identifier resolution can't (e.g. an expired
+token). Sessions shown as `stranded` are leaked locks
 with no live session behind them and are the usual unlock candidates.
 
 Re-running `users add` for someone who is already enrolled mints a fresh code;
@@ -441,6 +445,6 @@ handoff mechanism.
 | `cyrus router devices list` | host | List enrolled devices (physical + container) and their owners. |
 | `cyrus router devices revoke <email>` | host | Revoke a user's device token. |
 | `cyrus router sessions list` | host | List running + locked sessions with their Linear issue id and session GUID. |
-| `cyrus router unlock <issueId>` | host | Release a stuck issue lock. |
+| `cyrus router unlock <issueId\|PAR-123>` | host | Release a stuck issue lock, by GUID or Linear identifier. |
 | `cyrus connect <url> --code <code>` | device | Enroll this device with the router. |
 | `cyrus start` | device | Begin receiving and running your routed sessions. |

@@ -326,8 +326,10 @@ export function buildProgram(
 		.action(makeRouterAction("containers", "destroy"));
 
 	routerCommand
-		.command("unlock <issueId>")
-		.description("Release a stuck issue lock")
+		.command("unlock <issue>")
+		.description(
+			"Release a stuck issue lock, by Linear issue GUID or human identifier (e.g. PAR-169)",
+		)
 		.action(makeRouterAction("unlock"));
 
 	// Container-boot command - entrypoint for ephemeral worker containers (see

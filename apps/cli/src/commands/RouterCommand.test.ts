@@ -12,6 +12,23 @@ vi.spyOn(process, "exit").mockImplementation((code?: number) => {
 	throw new Error(`process.exit called with ${code}`);
 });
 
+/**
+ * RouterCommand with `resolveIssueGuid` stubbed so `unlock <identifier>` tests
+ * never make a live Linear call. Set `resolveResult` to the mapping the stub
+ * should return (or leave undefined to simulate an unresolvable identifier);
+ * `resolveCalledWith` records whether — and with what — resolution ran.
+ */
+class StubResolveRouterCommand extends RouterCommand {
+	public resolveResult: { id: string; identifier: string } | undefined;
+	public resolveCalledWith: string | undefined;
+	protected async resolveIssueGuid(
+		identifier: string,
+	): Promise<{ id: string; identifier: string } | undefined> {
+		this.resolveCalledWith = identifier;
+		return this.resolveResult;
+	}
+}
+
 function createMockApp(cyrusHome: string) {
 	return {
 		cyrusHome,
@@ -305,6 +322,89 @@ describe("RouterCommand", () => {
 			} finally {
 				verifyStore.close();
 			}
+		});
+
+		it("uses a GUID directly without any Linear resolution when the lock exists", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new StubResolveRouterCommand(app as any);
+			await command.execute(["users", "add", "ivan@example.com"]);
+
+			const guid = "aaaaaaaa-1111-4222-8333-444444444444";
+			const seedStore = new RouterStore(dbPath());
+			const code = seedStore.mintEnrollmentCode("ivan@example.com", Date.now());
+			const redeemed = seedStore.redeemEnrollmentCode(code, Date.now());
+			seedStore.acquireIssueLock(guid, "session-ivan", redeemed!.deviceId);
+			seedStore.close();
+
+			// If resolution were (wrongly) attempted, this would send it down a
+			// no-result path; asserting resolveCalledWith stays undefined proves the
+			// direct GUID path short-circuited before any network call.
+			await command.execute(["unlock", guid]);
+
+			expect(command.resolveCalledWith).toBeUndefined();
+			const verifyStore = new RouterStore(dbPath());
+			try {
+				expect(verifyStore.getIssueLock(guid)).toBeUndefined();
+			} finally {
+				verifyStore.close();
+			}
+		});
+
+		it("resolves a Linear identifier to its GUID and releases that lock", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new StubResolveRouterCommand(app as any);
+			await command.execute(["users", "add", "judy@example.com"]);
+
+			const guid = "bbbbbbbb-5555-4666-8777-888888888888";
+			const seedStore = new RouterStore(dbPath());
+			const code = seedStore.mintEnrollmentCode("judy@example.com", Date.now());
+			const redeemed = seedStore.redeemEnrollmentCode(code, Date.now());
+			seedStore.acquireIssueLock(guid, "session-judy", redeemed!.deviceId);
+			seedStore.close();
+
+			command.resolveResult = { id: guid, identifier: "PAR-169" };
+			await command.execute(["unlock", "PAR-169"]);
+
+			expect(command.resolveCalledWith).toBe("PAR-169");
+			const verifyStore = new RouterStore(dbPath());
+			try {
+				expect(verifyStore.getIssueLock(guid)).toBeUndefined();
+			} finally {
+				verifyStore.close();
+			}
+			expect(app.logger.success).toHaveBeenCalledWith(
+				expect.stringContaining(
+					"PAR-169 → bbbbbbbb-5555-4666-8777-888888888888",
+				),
+			);
+		});
+
+		it("reports no lock when the identifier resolves but nothing is locked", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new StubResolveRouterCommand(app as any);
+
+			command.resolveResult = {
+				id: "cccccccc-9999-4000-8111-222222222222",
+				identifier: "PAR-404",
+			};
+			await command.execute(["unlock", "PAR-404"]);
+
+			expect(app.logger.info).toHaveBeenCalledWith(
+				"No lock found for issue PAR-404 (resolved to cccccccc-9999-4000-8111-222222222222).",
+			);
+		});
+
+		it("errors clearly when a Linear identifier cannot be resolved", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new StubResolveRouterCommand(app as any);
+
+			command.resolveResult = undefined;
+			// exitWithError calls process.exit, mocked at the top to throw.
+			await expect(command.execute(["unlock", "PAR-999"])).rejects.toThrow();
+
+			expect(app.logger.error).toHaveBeenCalledWith(
+				expect.stringContaining('Could not resolve Linear issue "PAR-999"'),
+			);
 		});
 	});
 
