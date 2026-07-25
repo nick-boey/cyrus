@@ -46,6 +46,8 @@ function createBetaMessage(
 			cache_read_input_tokens: 0,
 			output_tokens_details: null,
 			cache_creation: null,
+			// Anthropic-only billing field; Gemini never performs a fallback-credit reprice.
+			fallback_credit: null,
 			inference_geo: null,
 			iterations: null,
 			server_tool_use: null,
@@ -231,6 +233,10 @@ export function geminiEventToSDKMessage(
 							ephemeral_1h_input_tokens: 0,
 							ephemeral_5m_input_tokens: 0,
 						},
+						// Anthropic-only billing field; Gemini never performs a fallback-credit reprice.
+						fallback_credit: {
+							status: { type: "not_applied", reason: "not_enabled" },
+						},
 						inference_geo: "unknown",
 						iterations: [],
 						output_tokens_details: { thinking_tokens: 0 },
@@ -267,6 +273,10 @@ export function geminiEventToSDKMessage(
 						cache_creation: {
 							ephemeral_1h_input_tokens: 0,
 							ephemeral_5m_input_tokens: 0,
+						},
+						// Anthropic-only billing field; Gemini never performs a fallback-credit reprice.
+						fallback_credit: {
+							status: { type: "not_applied", reason: "not_enabled" },
 						},
 						inference_geo: "unknown",
 						iterations: [],
@@ -307,6 +317,10 @@ export function geminiEventToSDKMessage(
 					cache_creation: {
 						ephemeral_1h_input_tokens: 0,
 						ephemeral_5m_input_tokens: 0,
+					},
+					// Anthropic-only billing field; Gemini never performs a fallback-credit reprice.
+					fallback_credit: {
+						status: { type: "not_applied", reason: "not_enabled" },
 					},
 					inference_geo: "unknown",
 					iterations: [],

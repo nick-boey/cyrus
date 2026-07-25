@@ -462,6 +462,10 @@ export class GeminiRunner extends EventEmitter implements IAgentRunner {
 						ephemeral_1h_input_tokens: 0,
 						ephemeral_5m_input_tokens: 0,
 					},
+					// Anthropic-only billing field; Gemini never performs a fallback-credit reprice.
+					fallback_credit: {
+						status: { type: "not_applied", reason: "not_enabled" },
+					},
 					inference_geo: "unknown",
 					iterations: [],
 					output_tokens_details: { thinking_tokens: 0 },
