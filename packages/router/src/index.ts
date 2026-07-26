@@ -15,7 +15,6 @@ export {
 	type EntraTokenVerifier,
 	registerEnrollmentRoute,
 } from "./enrollment.js";
-export { webhookIdempotencyKey } from "./idempotency.js";
 export {
 	buildGitHubTokenScopeReport,
 	diagnoseGitHubTokenScopes,
@@ -31,6 +30,7 @@ export {
 	REDACTED,
 	redactToken,
 } from "./GitHubTokenScopes.js";
+export { webhookIdempotencyKey } from "./idempotency.js";
 export {
 	createKeyVaultTokenProvider,
 	KeyVaultSecretStore,
