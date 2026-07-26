@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { chmodSync } from "node:fs";
 import type { EdgeConfig } from "cyrus-core";
+import type { Application } from "../Application.js";
 import { BaseCommand } from "./ICommand.js";
 
 /**
@@ -36,8 +38,24 @@ export function deriveWebSocketUrl(httpUrl: string): string | undefined {
  * credential.
  */
 export class ConnectCommand extends BaseCommand {
+	constructor(
+		app: Application,
+		private readonly runCommand: (
+			file: string,
+			args: string[],
+		) => Promise<{ stdout: string }> = (file, args) =>
+			new Promise((resolve, reject) => {
+				execFile(file, args, { encoding: "utf8" }, (error, stdout) => {
+					if (error) reject(error);
+					else resolve({ stdout });
+				});
+			}),
+	) {
+		super(app);
+	}
+
 	async execute(args: string[]): Promise<void> {
-		const { url, code } = this.parseArgs(args);
+		const { url, code, entraAudience } = this.parseArgs(args);
 		if (!url) {
 			this.exitWithError("Usage: cyrus connect <url> --code <code>");
 		}
@@ -55,9 +73,16 @@ export class ConnectCommand extends BaseCommand {
 			);
 		}
 
+		const headers: Record<string, string> = {
+			"content-type": "application/json",
+		};
+		if (entraAudience) {
+			headers.authorization = `Bearer ${await this.getEntraToken(entraAudience)}`;
+		}
+
 		const response = await fetch(`${httpUrl}/enroll`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers,
 			body: JSON.stringify({ code }),
 		}).catch((error: unknown) => {
 			this.exitWithError(
@@ -93,8 +118,13 @@ export class ConnectCommand extends BaseCommand {
 		this.logger.raw("Next: run `cyrus start` to begin processing issues.");
 	}
 
-	private parseArgs(args: string[]): { url?: string; code?: string } {
+	private parseArgs(args: string[]): {
+		url?: string;
+		code?: string;
+		entraAudience?: string;
+	} {
 		let code: string | undefined;
+		let entraAudience: string | undefined;
 		const positional: string[] = [];
 		for (let i = 0; i < args.length; i++) {
 			const arg = args[i];
@@ -102,11 +132,37 @@ export class ConnectCommand extends BaseCommand {
 			if (arg === "--code" && args[i + 1]) {
 				code = args[i + 1];
 				i++;
+			} else if (arg === "--entra" && args[i + 1]) {
+				entraAudience = args[i + 1];
+				i++;
 			} else {
 				positional.push(arg);
 			}
 		}
-		return { url: positional[0], code };
+		return { url: positional[0], code, entraAudience };
+	}
+
+	private async getEntraToken(audience: string): Promise<string> {
+		const scope = `${audience.replace(/\/+$/, "")}/.default`;
+		try {
+			const { stdout } = await this.runCommand("az", [
+				"account",
+				"get-access-token",
+				"--scope",
+				scope,
+				"--query",
+				"accessToken",
+				"--output",
+				"tsv",
+			]);
+			const token = stdout.trim();
+			if (!token) throw new Error("Azure CLI returned an empty access token");
+			return token;
+		} catch {
+			this.exitWithError(
+				`Failed to obtain an Entra token for ${audience}. Run \`az login\` and verify access to the router app registration.`,
+			);
+		}
 	}
 
 	/**

@@ -16,12 +16,16 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
+		"@azure/identity": "^4.11.1",
 		"@linear/sdk": "^64.0.0",
 		"better-sqlite3": "^12.11.1",
 		"cyrus-core": "workspace:*",
 		"cyrus-linear-event-transport": "workspace:*",
+		"cyrus-router-executors": "workspace:*",
 		"cyrus-router-protocol": "workspace:*",
+		"cyrus-workspace-sync": "workspace:*",
 		"fastify": "^5.10.0",
+		"jose": "^6.2.3",
 		"ws": "^8.21.1",
 		"zod": "4.3.6"
 	},

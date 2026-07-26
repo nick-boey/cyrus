@@ -205,4 +205,62 @@ describe("AgentSessionManager terminal signal ordering", () => {
 			events.indexOf("terminal:complete"),
 		);
 	});
+
+	// Container/floor restore: a session that was mid-run when its host was
+	// destroyed is reconciled to `error` (terminal one-shot spent, router lock
+	// released) at startup, then the same queued prompt re-attaches a runner and
+	// resumes it. Without reviving the session, the resumed run's completion
+	// cannot emit a fresh terminal — the re-acquired router issue lock leaks —
+	// and its status stays `error`. Re-attaching a runner must re-arm both.
+	it("resuming a reconciled session re-arms its terminal signal and status", async () => {
+		events = [];
+		sink = {
+			id: "test-workspace",
+			postActivity: vi.fn().mockImplementation(async () => {
+				events.push("activity");
+				return { activityId: "activity-1" };
+			}),
+			createAgentSession: vi.fn().mockResolvedValue("ext-session-1"),
+		};
+		manager = new AgentSessionManager();
+		manager.createCyrusAgentSession(
+			sessionId,
+			issueId,
+			{
+				id: issueId,
+				identifier: "PAR-98",
+				title: "Reconcile then resume",
+				description: "",
+				branchName: "test-branch",
+			},
+			{ path: "/tmp/workspace", isGitWorktree: false },
+		);
+		manager.setActivitySink(sessionId, sink);
+		manager.on("sessionTerminal", (_id: string, state: string) => {
+			events.push(`terminal:${state}`);
+		});
+
+		// Restart with the session active but runner-less -> reconcile marks it
+		// error and emits terminal:error (releasing the router lock).
+		const reconciled = await manager.reconcileInterruptedSessions();
+		expect(reconciled).toContain(sessionId);
+		expect(events).toContain("terminal:error");
+		expect(manager.getSession(sessionId)?.status).toBe("error");
+
+		// The queued prompt re-attaches a runner: the session is live again.
+		const runnerStub = {
+			getFormatter: () => new ClaudeMessageFormatter(),
+			constructor: { name: "ClaudeRunner" },
+		} as unknown as Parameters<typeof manager.addAgentRunner>[1];
+		manager.addAgentRunner(sessionId, runnerStub);
+		expect(manager.getSession(sessionId)?.status).toBe("active");
+
+		// The resumed run completes: its final result posts AND a fresh terminal
+		// fires (the reconcile-era one no longer covers the re-acquired lock).
+		events.length = 0;
+		await manager.completeSession(sessionId, result());
+		expect(events).toContain("activity");
+		expect(events).toContain("terminal:complete");
+		expect(manager.getSession(sessionId)?.status).toBe("complete");
+	});
 });

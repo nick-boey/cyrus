@@ -124,6 +124,56 @@ describe("worktree continuity", () => {
 		const svc = new GitService(undefined, console as never);
 		expect(await svc.pushWipIfDirty(clone, "main")).toBe(false);
 	});
+
+	/**
+	 * Task 10 fix pass 3 — Finding 1 regression guard.
+	 *
+	 * Reproduces the exact failure sequence from the finding: a sync cycle's
+	 * `add`+`commit` succeed (leaving the tree clean) but its `push` fails
+	 * (here: a broken remote URL standing in for a network blip / router or
+	 * GitHub unreachable). Before this fix, `pushWipIfDirty` early-returned
+	 * `false` on ANY clean tree without checking whether the commit it just
+	 * made had actually reached the remote — so the very next call (also a
+	 * clean tree, since nothing new happened) skipped the retry forever,
+	 * stranding the commit local-only. A container destroyed at that point
+	 * loses the work even though the "sync" reported no error.
+	 *
+	 * This test drives the real (non-mocked) `pushWipIfDirty` against a real
+	 * git remote, so it fails against the pre-fix clean-tree early-return
+	 * and passes once the clean-tree path also checks for unpushed commits.
+	 */
+	it("retries the push on a later call after a commit succeeded but the push failed (clean tree must not skip the retry)", async () => {
+		const { origin, clone } = makeOriginAndClone();
+		execSync(`git -C ${clone} checkout -b ISS-2`);
+		execSync(`echo wip > ${join(clone, "file.txt")}`);
+
+		// Break the remote so this call's commit succeeds but its push fails —
+		// standing in for "network blip / router / GitHub unreachable" without
+		// needing real network flakiness. A bogus local path fails fast (no
+		// hang) rather than timing out.
+		const brokenUrl = join(tmpdir(), `no-such-remote-${Date.now()}`);
+		execSync(`git -C ${clone} remote set-url origin ${brokenUrl}`);
+
+		const svc = new GitService(undefined, console as never);
+		await expect(svc.pushWipIfDirty(clone, "ISS-2")).rejects.toThrow();
+
+		// The commit landed locally even though the push failed — the tree is
+		// now clean, exactly the state that used to cause the early return.
+		const statusAfterFailedPush = execSync(
+			`git -C ${clone} status --porcelain`,
+		).toString();
+		expect(statusAfterFailedPush.trim()).toBe("");
+
+		// The remote recovers (router/GitHub reachable again on the next tick).
+		execSync(`git -C ${clone} remote set-url origin ${origin}`);
+
+		// A later call, now with a clean tree, must still retry the push
+		// instead of silently no-op'ing — this is exactly the regression
+		// Finding 1 guards against.
+		expect(await svc.pushWipIfDirty(clone, "ISS-2")).toBe(true);
+		const remoteBranches = execSync(`git -C ${origin} branch`).toString();
+		expect(remoteBranches).toContain("ISS-2");
+	});
 });
 
 describe("worktree continuity — createSingleRepoWorktree wiring", () => {

@@ -74,12 +74,32 @@ function buildWorkspaces(env) {
 	return undefined;
 }
 
+function parseObject(name, value) {
+	let parsed;
+	try {
+		parsed = JSON.parse(value);
+	} catch (error) {
+		fail(`${name} is not valid JSON: ${error.message}`);
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		fail(`${name} must be a JSON object`);
+	}
+	return parsed;
+}
+
 function generateConfig(env) {
 	const anyProvided = Boolean(
 		env.CYRUS_ROUTER_WORKSPACES_JSON ||
 			env.LINEAR_WORKSPACE_ID ||
 			env.LINEAR_WORKSPACE_TOKEN ||
-			env.LINEAR_WEBHOOK_SECRET,
+			env.LINEAR_WEBHOOK_SECRET ||
+			env.CYRUS_ROUTER_CONTAINERS_JSON ||
+			env.CYRUS_ROUTER_BACKUP_BLOB_URL ||
+			env.CYRUS_ROUTER_ENTRA_TENANT_ID ||
+			env.CYRUS_ROUTER_ENTRA_AUDIENCE ||
+			env.CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN ||
+			env.CYRUS_ROUTER_ENTRA_JWKS_URL ||
+			env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID,
 	);
 
 	if (!anyProvided) {
@@ -127,16 +147,78 @@ function generateConfig(env) {
 		);
 	}
 	if (env.CYRUS_ROUTER_ISSUE_LOCK) {
-		config.issueLock = toBoolean("CYRUS_ROUTER_ISSUE_LOCK", env.CYRUS_ROUTER_ISSUE_LOCK);
+		config.issueLock = toBoolean(
+			"CYRUS_ROUTER_ISSUE_LOCK",
+			env.CYRUS_ROUTER_ISSUE_LOCK,
+		);
 	}
 	if (env.CYRUS_ROUTER_CREATOR_ONLY_PROMPTING) {
-		config.creatorOnlyPrompting = toBoolean("CYRUS_ROUTER_CREATOR_ONLY_PROMPTING", env.CYRUS_ROUTER_CREATOR_ONLY_PROMPTING);
+		config.creatorOnlyPrompting = toBoolean(
+			"CYRUS_ROUTER_CREATOR_ONLY_PROMPTING",
+			env.CYRUS_ROUTER_CREATOR_ONLY_PROMPTING,
+		);
 	}
 	if (env.CYRUS_ROUTER_HEARTBEAT_MS) {
 		config.heartbeatMs = toNumber(
 			"CYRUS_ROUTER_HEARTBEAT_MS",
 			env.CYRUS_ROUTER_HEARTBEAT_MS,
 		);
+	}
+	if (env.CYRUS_ROUTER_CONTAINERS_JSON) {
+		config.containers = parseObject(
+			"CYRUS_ROUTER_CONTAINERS_JSON",
+			env.CYRUS_ROUTER_CONTAINERS_JSON,
+		);
+	}
+	if (env.CYRUS_ROUTER_BACKUP_BLOB_URL) {
+		config.backup = {
+			blobContainerUrl: env.CYRUS_ROUTER_BACKUP_BLOB_URL,
+		};
+	}
+	const anyCanonicalEntra = Boolean(
+		env.CYRUS_ROUTER_ENTRA_TENANT_ID ||
+			env.CYRUS_ROUTER_ENTRA_AUDIENCE ||
+			env.CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN,
+	);
+	const anyLegacyEntra = Boolean(
+		env.CYRUS_ROUTER_ENTRA_JWKS_URL || env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID,
+	);
+	if (anyCanonicalEntra || anyLegacyEntra) {
+		const missingEntra = [];
+		if (!env.CYRUS_ROUTER_ENTRA_TENANT_ID) {
+			missingEntra.push("CYRUS_ROUTER_ENTRA_TENANT_ID");
+		}
+		if (!env.CYRUS_ROUTER_ENTRA_AUDIENCE) {
+			missingEntra.push("CYRUS_ROUTER_ENTRA_AUDIENCE");
+		}
+		if (anyLegacyEntra && !env.CYRUS_ROUTER_ENTRA_JWKS_URL) {
+			missingEntra.push("CYRUS_ROUTER_ENTRA_JWKS_URL");
+		}
+		if (anyLegacyEntra && !env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID) {
+			missingEntra.push("CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID");
+		}
+		if (missingEntra.length > 0) {
+			fail(
+				`missing required environment variables: ${missingEntra.join(", ")}`,
+			);
+		}
+		config.entra = {
+			...(anyCanonicalEntra
+				? {
+						tenantId: env.CYRUS_ROUTER_ENTRA_TENANT_ID,
+						audience: env.CYRUS_ROUTER_ENTRA_AUDIENCE,
+						...(env.CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN
+							? { allowedDomain: env.CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN }
+							: {}),
+					}
+				: {}),
+			...(anyLegacyEntra
+				? {
+						jwksUrl: env.CYRUS_ROUTER_ENTRA_JWKS_URL,
+						certificateIssuerId: env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID,
+					}
+				: {}),
+		};
 	}
 
 	mkdirSync(DATA_DIR, { recursive: true });

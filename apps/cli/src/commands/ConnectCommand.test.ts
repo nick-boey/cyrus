@@ -87,6 +87,60 @@ describe("ConnectCommand", () => {
 		expect(mode).toBe(0o600);
 	});
 
+	it("gets an Entra token with az and sends it only as the enrollment bearer token", async () => {
+		const fetchMock = stubFetch({ deviceToken: "tok" });
+		const runCommand = vi.fn().mockResolvedValue({ stdout: "entra-token\n" });
+		const app = createApp();
+		const command = new ConnectCommand(app as any, runCommand);
+
+		await command.execute([
+			"https://x",
+			"--code",
+			"the-code",
+			"--entra",
+			"api://router-app",
+		]);
+
+		expect(runCommand).toHaveBeenCalledWith("az", [
+			"account",
+			"get-access-token",
+			"--scope",
+			"api://router-app/.default",
+			"--query",
+			"accessToken",
+			"--output",
+			"tsv",
+		]);
+		expect(fetchMock).toHaveBeenNthCalledWith(
+			1,
+			"https://x/enroll",
+			expect.objectContaining({
+				headers: {
+					"content-type": "application/json",
+					authorization: "Bearer entra-token",
+				},
+			}),
+		);
+	});
+
+	it("reports Azure CLI token acquisition failures without contacting the router", async () => {
+		const fetchMock = stubFetch({ deviceToken: "unused" });
+		const runCommand = vi.fn().mockRejectedValue(new Error("az failed"));
+		const app = createApp();
+		const command = new ConnectCommand(app as any, runCommand);
+
+		await expect(
+			command.execute([
+				"https://x",
+				"--code",
+				"the-code",
+				"--entra",
+				"api://router-app",
+			]),
+		).rejects.toThrow(/process.exit called/);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
 	it("derives wss:// for the config's router.url while POSTing to the https origin", async () => {
 		stubFetch({ deviceToken: "tok2" });
 		const app = createApp();

@@ -456,6 +456,15 @@ The agent automatically moves issues to the "started" state when assigned. Linea
 
    Symptom of forgetting this: self-host sessions crash with `ENOENT: no such file or directory, open '~/.cyrus/...'` while cloud sessions (which get absolute paths from cyrus-hosted) work fine. This bit us with the three platform MCP config arrays added in CYHOST-967 / v0.2.53 — they were the only path-bearing fields on `EdgeWorkerConfig` that bypassed normalization, and crashed every self-host session that had a connected platform MCP integration.
 
+12. **ACA executor and Azure router invariants**:
+   - ACA sandboxes use server-assigned GUIDs; issue identity is labels-only (`cyrus.issue`, `cyrus.device-id`, `cyrus.disk`). The ARM sandbox-group body is `properties: {}` and has no `maxSandboxCount` or default CPU/memory/disk fields. Per-sandbox create config is the source of truth.
+   - ACA `Running` is infrastructure state, not worker-process liveness: an exited entrypoint can leave `tini` and the sandbox Running. Reconciliation must include router device/WSS heartbeat state.
+   - Suspend delivers no SIGTERM. Keep ACA auto-suspend disabled and let the affinity-aware router idle sweep stop workers. Explicit snapshots preserve env/device tokens, require lineage checks, and are never garbage-collected by Azure.
+   - Azure router hosting must remain one replica. SQLite stays on ephemeral local storage and is periodically backed up to Blob; Azure Files is for artifact bundles, not SQLite WAL. Blob restores are at-least-once within the backup interval, and overlapping revision uploads can be out of order.
+   - `containers.keyVaultUrl` selects the Key Vault secret backend. Rotated per-user values reach only create-from-image; destroy and re-prompt existing issues to apply them. Entra enrollment uses one app registration/audience per router deployment.
+   - Terminal teardown order is force floor flush, WIP/teardown/worktree removal, authenticated callback, provider destroy (including snapshots), then device-row deletion; only deleted issues lose their floor bundle. Self-actored closes and Linear's `duplicate` state miss `issueStatusChanged` and rely on stale GC/manual cleanup.
+   - Before Azure stack deletion, destroy managed sandboxes and sweep snapshots before destroying the sandbox group. Keep the operator Blob role for corrupt-backup break glass. See `infra/azure/README.md` and `docs/ROUTER.md`.
+
 ## Dependency Security Policy (MANDATE)
 
 > **Config location (pnpm ≥10):** The root `package.json` `pnpm` field
