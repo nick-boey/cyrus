@@ -615,6 +615,9 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 		expect(
 			brokenExec.ensureRunningCalls.filter((c) => c.issueKey === "CYPACK-300"),
 		).toHaveLength(1);
+		// Secret backends are async; let bootInner's in-flight cleanup settle after
+		// the activity post that satisfied the wait above.
+		await new Promise((resolve) => setTimeout(resolve, 0));
 
 		// A second event for the SAME still-failing issue must not post a second
 		// notice — the once-per-issue-until-success latch in

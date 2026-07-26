@@ -434,15 +434,25 @@ export class RouterStore {
 	redeemEnrollmentCode(
 		code: string,
 		nowMs: number,
+		expectedEmail?: string,
 	): { deviceId: number; deviceToken: string } | undefined {
 		const codeHash = sha256Hex(code);
 		const txn = this.db.transaction(() => {
 			const codeRow = this.db
 				.prepare(
-					"SELECT code_hash, user_id, expires_ms FROM enrollment_codes WHERE code_hash = ?",
+					`SELECT ec.code_hash, ec.user_id, ec.expires_ms, u.email
+					 FROM enrollment_codes ec
+					 JOIN users u ON u.user_id = ec.user_id
+					 WHERE ec.code_hash = ?`,
 				)
-				.get(codeHash) as EnrollmentCodeRow | undefined;
+				.get(codeHash) as (EnrollmentCodeRow & { email: string }) | undefined;
 			if (!codeRow) return undefined;
+			if (
+				expectedEmail !== undefined &&
+				codeRow.email.toLowerCase() !== expectedEmail.toLowerCase()
+			) {
+				return undefined;
+			}
 
 			// Burn the code regardless of expiry (one-time use).
 			this.db
@@ -462,22 +472,24 @@ export class RouterStore {
 			// by the dead device_id (e.g. an issue lock the new device could
 			// never acquire). Purge them first, atomically, in this txn.
 			const oldDeviceRow = this.db
-				.prepare("SELECT device_id FROM devices WHERE user_id = ?")
+				.prepare(
+					"SELECT device_id FROM devices WHERE user_id = ? AND kind = 'device'",
+				)
 				.get(codeRow.user_id) as Pick<DeviceRow, "device_id"> | undefined;
 			if (oldDeviceRow) {
 				this.purgeDeviceScopedRows(oldDeviceRow.device_id);
 			}
-			// INSERT OR REPLACE: UNIQUE(user_id) means any existing device row
-			// for this user is deleted and a fresh row is inserted (getting a
-			// new AUTOINCREMENT device_id, never reused, and — with
+			// INSERT OR REPLACE: the partial unique physical-device index means an
+			// existing physical row for this user is deleted and a fresh row is
+			// inserted (getting a new AUTOINCREMENT device_id, never reused, and — with
 			// foreign_keys=ON — cascading away any leftover queued events tied
 			// to the old device_id). This is what "replaces any existing
 			// device for that user" means: a clean device identity, not an
 			// in-place field update.
 			const result = this.db
 				.prepare(
-					`INSERT OR REPLACE INTO devices (user_id, token_hash, created_ms, next_seq, last_seen_ms)
-					 VALUES (?, ?, ?, 1, NULL)`,
+					`INSERT OR REPLACE INTO devices (user_id, kind, token_hash, created_ms, next_seq, last_seen_ms)
+					 VALUES (?, 'device', ?, ?, 1, NULL)`,
 				)
 				.run(codeRow.user_id, tokenHash, nowMs);
 

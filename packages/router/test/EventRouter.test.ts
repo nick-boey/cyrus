@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent } from "cyrus-core";
@@ -23,6 +23,7 @@ import {
 } from "../src/messages.js";
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
+import { TerminalTeardown } from "../src/TerminalTeardown.js";
 
 const ROUTE_NOW = 1_000_000;
 const TTL_MS = 60_000;
@@ -207,6 +208,7 @@ function makeRouter(
 	overrides?: {
 		gateway?: Gateway;
 		containerTargets?: ContainerTargetService;
+		terminalTeardown?: TerminalTeardown;
 		config?: Partial<{
 			eventTtlMs: number;
 			issueLock: boolean;
@@ -231,6 +233,7 @@ function makeRouter(
 		postActivity,
 		moveIssueToStartedState,
 		containerTargets: overrides?.containerTargets,
+		terminalTeardown: overrides?.terminalTeardown,
 		config: {
 			eventTtlMs: TTL_MS,
 			issueLock: true,
@@ -982,6 +985,126 @@ describe("EventRouter issue promotion to a started state", () => {
 	});
 
 	describe("terminal-state webhooks (worktree cleanup)", () => {
+		it("classifies container terminal actions, dedupes wakeups, and keeps relaying raw events", async () => {
+			const { userId } = store.addUser({
+				email: "alice@example.com",
+				linearId: ALICE.id,
+			});
+			const { deviceId } = store.createContainerDevice(
+				userId,
+				"TEST-1",
+				"docker",
+			);
+			store.setIssueAffinity("issue-1", deviceId);
+			const targets = makeContainerTargets(store).containerTargets;
+			const wake = vi
+				.spyOn(targets, "bootForTeardown")
+				.mockImplementation(() => {});
+			const register = vi
+				.fn()
+				.mockReturnValueOnce(true)
+				.mockReturnValueOnce(false)
+				.mockReturnValueOnce(true);
+			const teardown = { register } as unknown as TerminalTeardown;
+			const { router } = makeRouter(store, {
+				containerTargets: targets,
+				terminalTeardown: teardown,
+			});
+
+			await router.route(
+				issueStatusChangedEvent({ issueId: "issue-1", identifier: "TEST-1" }),
+			);
+			await router.route(
+				issueStatusChangedEvent({ issueId: "issue-1", identifier: "TEST-1" }),
+			);
+			await router.route(
+				issueDeletedEvent({ issueId: "issue-1", identifier: "TEST-1" }),
+			);
+
+			expect(register.mock.calls).toEqual([
+				[{ issueKey: "TEST-1", deviceId, action: "closed" }],
+				[{ issueKey: "TEST-1", deviceId, action: "closed" }],
+				[{ issueKey: "TEST-1", deviceId, action: "deleted" }],
+			]);
+			expect(wake).toHaveBeenCalledTimes(2);
+			expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(3);
+		});
+
+		it("only relays to physical devices without pending teardown or wake semantics", async () => {
+			const deviceId = enroll(store, "alice@example.com", {
+				linearId: ALICE.id,
+			});
+			store.setIssueAffinity("issue-1", deviceId);
+			const targets = makeContainerTargets(store).containerTargets;
+			const wake = vi.spyOn(targets, "bootForTeardown");
+			const register = vi.fn(() => true);
+			const { router } = makeRouter(store, {
+				containerTargets: targets,
+				terminalTeardown: { register } as unknown as TerminalTeardown,
+			});
+
+			await router.route(issueStatusChangedEvent({ issueId: "issue-1" }));
+			expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(1);
+			expect(register).not.toHaveBeenCalled();
+			expect(wake).not.toHaveBeenCalled();
+		});
+
+		it("removes only the retained issue bundle when delete arrives after close teardown", async () => {
+			const { userId } = store.addUser({ email: "alice@example.com" });
+			const { deviceId } = store.createContainerDevice(
+				userId,
+				"TEST-1",
+				"docker",
+			);
+			store.setIssueAffinity("issue-1", deviceId);
+			const artifactsDir = mkdtempSync(join(tmpdir(), "router-delete-bundle-"));
+			const bundle = join(artifactsDir, "TEST-1", "bundle.tar.gz");
+			mkdirSync(join(artifactsDir, "TEST-1"));
+			writeFileSync(bundle, "retained");
+			const destroy = vi.fn(async () => {});
+			const teardown = new TerminalTeardown({
+				store,
+				executors: new Map([
+					[
+						"docker",
+						{
+							provider: "docker",
+							ensureRunning: vi.fn(async () => {}),
+							stop: vi.fn(async () => {}),
+							destroy,
+							status: vi.fn(async () => "running" as const),
+							listManaged: vi.fn(async () => []),
+						},
+					],
+				]),
+				artifactsDir,
+				graceMs: 60_000,
+				logger: { info: () => {}, warn: () => {} },
+				setTimeout: () => 1,
+				clearTimeout: () => {},
+			});
+			const targets = makeContainerTargets(store).containerTargets;
+			vi.spyOn(targets, "bootForTeardown").mockImplementation(() => {});
+			const { router } = makeRouter(store, {
+				containerTargets: targets,
+				terminalTeardown: teardown,
+			});
+
+			await router.route(
+				issueStatusChangedEvent({ issueId: "issue-1", identifier: "TEST-1" }),
+			);
+			await teardown.handleCallback("TEST-1", deviceId);
+			expect(existsSync(bundle)).toBe(true);
+			expect(store.getIssueAffinity("issue-1")).toBeUndefined();
+
+			await router.route(
+				issueDeletedEvent({ issueId: "issue-1", identifier: "TEST-1" }),
+			);
+
+			expect(existsSync(bundle)).toBe(false);
+			expect(destroy).toHaveBeenCalledTimes(1);
+			expect(store.getContainerDeviceForIssue("TEST-1")).toBeUndefined();
+		});
 		it("forwards an issueStatusChanged webhook to the device holding the issue", async () => {
 			const deviceId = enroll(store, "alice@example.com", {
 				linearId: ALICE.id,

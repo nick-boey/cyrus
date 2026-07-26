@@ -5,6 +5,10 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- Azure Container Apps Sandboxes support: typed preview data-plane client, labels-only and device-lineage-aware provider, deny-by-default egress, memory suspend/resume, explicit snapshot retention/GC, and router/CLI configuration wiring.
+- Azure router readiness: single-replica Terraform stack plus Bicep parity reference, managed identity/RBAC, Key Vault `SecretStore` backend, atomic Blob backup/restore service, and optional Entra-gated device enrollment.
+- Terminal container teardown: router relay for `issueStatusChanged` and `Issue/remove`, forced floor flush and worker callback, provider destroy/device-row cleanup, deleted-bundle removal, and stale/grace backstops.
+- F1 fake-ACA router lifecycle drive covering delegation, prompt routing, idle stop, resume, synthetic terminal webhooks, wake, callback destruction, device cleanup, and deleted-bundle cleanup. See `apps/f1/test-drives/2026-07-26-router-mode-fake-aca-lifecycle.md`.
 - **F1 router-mode credentialed drive support** (used by the 2026-07-17 per-user-secrets drive, `apps/f1/test-drives/2026-07-17-router-mode-container-drive.md`):
   - Split env templates: `apps/f1/.env.example` is now router/control-plane-only; new `apps/f1/.env.user.example` documents per-user container secrets (`CLAUDE_CODE_OAUTH_TOKEN`, `LINEAR_API_TOKEN`, `GIT_TOKEN`, `GIT_USER_NAME`/`GIT_USER_EMAIL`, `DOTFILES_REPO`) seeded via `./f1 router:seed-user --env`, with quoting/rotation/reserved-key guidance. `apps/f1/.gitignore` unignores the new template.
   - `F1_ROUTER_REQUIRED_SECRET_KEYS` (comma-separated) → `startRouterServer`/`RouterRigOptions.requiredSecretKeys` → `containers.requiredSecretKeys`, so F1 drives can exercise the additive boot gate; the effective gate is printed in the startup banner. Exported `parseRequiredSecretKeys` helper.

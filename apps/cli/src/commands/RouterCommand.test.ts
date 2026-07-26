@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { RouterStore, SecretStore } from "cyrus-router";
+import { KeyVaultSecretStore, RouterStore, SecretStore } from "cyrus-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RouterCommand } from "./RouterCommand.js";
 
@@ -26,6 +26,30 @@ class StubResolveRouterCommand extends RouterCommand {
 	): Promise<{ id: string; identifier: string } | undefined> {
 		this.resolveCalledWith = identifier;
 		return this.resolveResult;
+	}
+}
+
+class StubSnapshotGcRouterCommand extends RouterCommand {
+	public containersConfig: any;
+	public readonly plan = vi.fn(async (_activeIssueKeys: string[]) => [
+		{
+			id: "snap-orphan",
+			issueKey: "OLD-1",
+			deviceId: "device-old",
+			createdAtUtc: "2026-01-01T00:00:00Z",
+		},
+	]);
+	public readonly gc = vi.fn(
+		async (_activeIssueKeys: string[], _plan?: unknown[]) => [
+			{ id: "snap-orphan", issueKey: "OLD-1", deviceId: "device-old" },
+		],
+	);
+	protected createAcaSnapshotGcProvider(containers: unknown) {
+		this.containersConfig = containers;
+		return {
+			planOrphanSnapshots: this.plan,
+			gcOrphanSnapshots: this.gc,
+		};
 	}
 }
 
@@ -63,6 +87,29 @@ describe("RouterCommand", () => {
 
 	function printedStdout(): string {
 		return consoleLogSpy.mock.calls.map((call) => String(call[0])).join("\n");
+	}
+
+	function writeAcaRouterConfig(): void {
+		writeFileSync(
+			join(cyrusHome, "router-config.json"),
+			JSON.stringify({
+				port: 8787,
+				workspaces: { workspace: { linearToken: "token" } },
+				webhook: { verificationMode: "direct", secret: "secret" },
+				containers: {
+					image: "worker:latest",
+					routerUrlForContainers: "wss://router.example.com",
+					repositories: [],
+					aca: {
+						subscriptionId: "subscription",
+						resourceGroup: "resource-group",
+						sandboxGroup: "sandbox-group",
+						region: "australiaeast",
+						disk: "worker-disk",
+					},
+				},
+			}),
+		);
 	}
 
 	describe("users add", () => {
@@ -513,7 +560,10 @@ describe("RouterCommand", () => {
 		 * Pass `containers` to include an (also schema-valid) `containers` block,
 		 * optionally overriding `secretsPath`.
 		 */
-		function writeRouterConfig(containers?: { secretsPath?: string }): void {
+		function writeRouterConfig(containers?: {
+			secretsPath?: string;
+			keyVaultUrl?: string;
+		}): void {
 			const config: Record<string, unknown> = {
 				port: 8787,
 				workspaces: {},
@@ -617,6 +667,91 @@ describe("RouterCommand", () => {
 			expect(secretStore.get("maya@example.com").GIT_TOKEN).toBe(
 				"ghp_overridevalue",
 			);
+		});
+
+		it("selects the Key Vault backend when containers.keyVaultUrl is configured", () => {
+			writeRouterConfig({ keyVaultUrl: "https://example.vault.azure.net" });
+			const command = new RouterCommand(createMockApp(cyrusHome) as any);
+			const store = (command as any).openSecretStore();
+			expect(store).toBeInstanceOf(KeyVaultSecretStore);
+		});
+
+		it("fails instead of falling back to a local success for malformed router config", async () => {
+			writeFileSync(join(cyrusHome, "router-config.json"), "{ invalid azure");
+			const app = createMockApp(cyrusHome);
+
+			await expect(
+				new RouterCommand(app as any).execute([
+					"secrets",
+					"set",
+					"azure@example.com",
+					"GIT_TOKEN",
+					"must-not-be-local",
+				]),
+			).rejects.toThrow("Failed to parse");
+			expect(existsSync(secretsPath())).toBe(false);
+			expect(app.logger.success).not.toHaveBeenCalled();
+		});
+
+		it("fails all secret operations for schema-invalid router config", async () => {
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({ containers: { keyVaultUrl: "https://vault" } }),
+			);
+			for (const args of [
+				["secrets", "set", "a@example.com", "GIT_TOKEN", "x"],
+				["secrets", "unset", "a@example.com", "GIT_TOKEN"],
+				["secrets", "list", "a@example.com"],
+			]) {
+				await expect(
+					new RouterCommand(createMockApp(cyrusHome) as any).execute(args),
+				).rejects.toThrow("Invalid router config");
+			}
+		});
+
+		it.each([
+			["autoSuspendSeconds", -1],
+			["keepSnapshots", -1],
+			["keepSnapshots", 1.5],
+			["disconnectedRecreateMs", -1],
+			[
+				"egress",
+				{
+					defaultAction: "Deny",
+					trafficInspection: "Full",
+					hostRules: [{ pattern: " ", action: "Allow" }],
+				},
+			],
+		])("rejects invalid ACA config %s=%s", async (field, value) => {
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "worker:latest",
+						routerUrlForContainers: "wss://router.example.com",
+						repositories: [],
+						aca: {
+							subscriptionId: "sub",
+							resourceGroup: "rg",
+							sandboxGroup: "sg",
+							region: "eastus",
+							disk: "disk",
+							[field]: value,
+						},
+					},
+				}),
+			);
+
+			await expect(
+				new RouterCommand(createMockApp(cyrusHome) as any).execute([
+					"secrets",
+					"list",
+					"a@example.com",
+				]),
+			).rejects.toThrow("Invalid router config");
 		});
 
 		it("falls back to the default secrets path when router-config.json has no containers block", async () => {
@@ -863,6 +998,52 @@ describe("RouterCommand", () => {
 
 			expect(app.logger.error).toHaveBeenCalledWith(
 				expect.stringContaining("NOPE-1"),
+			);
+		});
+	});
+
+	describe("containers gc-snapshots", () => {
+		it("prints the full plan and remains a dry run without --yes", async () => {
+			writeAcaRouterConfig();
+			const app = createMockApp(cyrusHome);
+			const command = new StubSnapshotGcRouterCommand(app as any);
+
+			await command.execute(["containers", "gc-snapshots"]);
+
+			expect(printedStdout()).toContain(
+				"snap-orphan issue=OLD-1 device=device-old created=2026-01-01T00:00:00Z",
+			);
+			expect(printedStdout()).toContain("Re-run with --yes");
+			expect(command.gc).not.toHaveBeenCalled();
+			expect(command.containersConfig.aca.disconnectedRecreateMs).toBe(120_000);
+		});
+
+		it("passes active ACA device rows and executes only with --yes", async () => {
+			writeAcaRouterConfig();
+			const app = createMockApp(cyrusHome);
+			await new RouterCommand(app as any).execute([
+				"users",
+				"add",
+				"aca@example.com",
+			]);
+			const store = new RouterStore(dbPath());
+			const user = store.findUserForCreator({ email: "aca@example.com" })!;
+			store.createContainerDevice(user.userId, "LIVE-ACA", "aca");
+			store.createContainerDevice(user.userId, "LIVE-DOCKER", "docker");
+			store.close();
+			const command = new StubSnapshotGcRouterCommand(app as any);
+
+			await command.execute(["containers", "gc-snapshots", "--yes"]);
+
+			expect(command.plan).toHaveBeenCalledWith(["LIVE-ACA"]);
+			expect(command.gc).toHaveBeenCalledWith(
+				["LIVE-ACA"],
+				expect.arrayContaining([
+					expect.objectContaining({ id: "snap-orphan" }),
+				]),
+			);
+			expect(app.logger.success).toHaveBeenCalledWith(
+				"Deleted 1 orphan ACA snapshot(s).",
 			);
 		});
 	});

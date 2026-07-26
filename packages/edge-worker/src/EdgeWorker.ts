@@ -145,6 +145,7 @@ import {
 	SlackEventTransport,
 	type SlackWebhookEvent,
 } from "cyrus-slack-event-transport";
+import { postTeardownComplete, toHttpBase } from "cyrus-workspace-sync";
 import { Sessions, streamableHttp } from "fastify-mcp";
 import { ActivityPoster } from "./ActivityPoster.js";
 import { AgentSessionManager } from "./AgentSessionManager.js";
@@ -3642,6 +3643,14 @@ ${taskSection}`;
 			session.agentRunner?.stop();
 		}
 
+		// Capture the terminal sessions and their worktrees before removeSession
+		// erases them from persisted state or deleteWorktree marks the workspace
+		// gone. A forced call waits out any periodic sync and then performs a
+		// fresh pass rather than coalescing with stale in-flight work.
+		await this.workspaceSync?.syncIssue(message.workItemIdentifier, {
+			force: true,
+		});
+
 		// Post a response activity to each stopped session's Linear thread,
 		// then remove the session so subsequent prompts don't find stale state.
 		for (const session of sessions) {
@@ -3723,6 +3732,23 @@ ${taskSection}`;
 		await this.gitService.deleteWorktree(message.workItemIdentifier, {
 			repositories: teardownRepositories,
 		});
+
+		// Last by design: provider destruction is only safe after all in-container
+		// cleanup, including worktree deletion, has completed. Callback failure is
+		// non-fatal because the router's grace deadline runs the same destroy path.
+		if (this.config.platform === "router" && this.config.router) {
+			try {
+				await postTeardownComplete(
+					toHttpBase(this.config.router.url),
+					this.config.router.deviceToken,
+					message.workItemIdentifier,
+				);
+			} catch (error) {
+				this.logger.warn(
+					`Failed to report teardown completion for ${message.workItemIdentifier}; router grace expiry will retry destruction: ${String(error)}`,
+				);
+			}
+		}
 
 		this.logger.info(
 			`Completed cleanup for ${message.workItemIdentifier}: stopped ${sessions.length} session(s)`,

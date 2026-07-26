@@ -6,7 +6,7 @@ export interface ContainerLifecycleOptions {
 	executors: ExecutorRegistry;
 	/** A running, affinity-free container idle past this many ms is stopped (Task 8 default: 15 minutes). */
 	idleStopMs: number;
-	/** A container untouched past this many ms is destroyed and its device row deleted (Task 8 default: 14 days). */
+	/** Backstop: a container untouched past this many ms is destroyed and its device row deleted (default: 14 days). */
 	staleDestroyMs: number;
 	logger: { info(msg: string): void; warn(msg: string): void };
 	/** Injectable clock (default `Date.now`) so time-based policy is deterministic in tests. */
@@ -19,11 +19,14 @@ export interface ContainerLifecycleOptions {
  *  - Idle-stop: a container with no active session affinity, untouched for
  *    `idleStopMs`, gets `stop()`ed — parked, volume retained, cheap to
  *    resume.
- *  - Stale-destroy: a container untouched for `staleDestroyMs` gets
+ *  - Stale-destroy backstop: terminal webhooks normally destroy containers
+ *    immediately. A container untouched for `staleDestroyMs` still gets
  *    `destroy()`ed (container AND volume) and its device row deleted. Safe
  *    only because of the persistence floor: the git branch and the artifact
  *    bundle survive, so a later prompt rebuilds the workspace from the
  *    restore ladder.
+ *    This also bounds terminal-webhook blind spots: Linear emits no
+ *    issueStatusChanged notification for self-actored closes or Duplicate.
  *  - Orphan GC: any container a provider still owns with no matching device
  *    row gets `destroy()`ed — reclaims containers left behind when a
  *    container device row is deleted without touching the provider itself:

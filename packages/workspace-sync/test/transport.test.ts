@@ -2,7 +2,11 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { downloadBundle, uploadBundle } from "../src/transport.js";
+import {
+	downloadBundle,
+	postTeardownComplete,
+	uploadBundle,
+} from "../src/transport.js";
 
 const HTTP_BASE = "https://router.example.com";
 const TOKEN = "device-token-123";
@@ -107,5 +111,34 @@ describe("downloadBundle", () => {
 			downloadBundle(HTTP_BASE, TOKEN, ISSUE_KEY, destFile),
 		).rejects.toThrow(/bundle download failed: HTTP 503/);
 		expect(existsSync(destFile)).toBe(false);
+	});
+});
+
+describe("postTeardownComplete", () => {
+	it("POSTs with bearer auth and a 30 second deadline", async () => {
+		const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		await postTeardownComplete(HTTP_BASE, TOKEN, ISSUE_KEY);
+
+		const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe(
+			`${HTTP_BASE}/containers/issues/${ISSUE_KEY}/teardown-complete`,
+		);
+		expect(init.method).toBe("POST");
+		expect(jsonHeaders(init.headers)).toMatchObject({
+			authorization: `Bearer ${TOKEN}`,
+		});
+		expect(init.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	it("throws on a non-2xx response", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(null, { status: 401 })),
+		);
+		await expect(
+			postTeardownComplete(HTTP_BASE, TOKEN, ISSUE_KEY),
+		).rejects.toThrow("teardown-complete callback failed: HTTP 401");
 	});
 });

@@ -135,6 +135,49 @@ Re-running `users add` for someone who is already enrolled mints a fresh code;
 redeeming it **replaces** their device and immediately invalidates the old
 token.
 
+### Optional Entra-gated enrollment
+
+Entra authentication can protect `POST /enroll` in addition to the one-time
+code. Create **one app registration per router deployment** so a token issued
+for one router cannot be replayed against another router in the same tenant:
+
+1. In Microsoft Entra admin center, create a single-tenant app registration for
+   the router deployment.
+2. Under **Expose an API**, accept or set its Application ID URI (normally
+   `api://<client-id>`). This URI is the router audience.
+3. Confirm the exact URI with:
+
+   ```bash
+   az ad app show --id <client-id> --query identifierUris
+   ```
+
+4. Add the following block to `router-config.json` (or set the corresponding
+   `CYRUS_ROUTER_ENTRA_TENANT_ID`, `CYRUS_ROUTER_ENTRA_AUDIENCE`, and optional
+   `CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN` container environment variables):
+
+   ```json
+   {
+     "entra": {
+       "tenantId": "<tenant-guid>",
+       "audience": "api://<client-id>",
+       "allowedDomain": "example.com"
+     }
+   }
+   ```
+
+Users first run `az login`, then pass the same Application ID URI when
+connecting:
+
+```bash
+cyrus connect https://router.example.com --code <code> --entra api://<client-id>
+```
+
+The CLI non-interactively requests `<audience>/.default` with
+`az account get-access-token`. The router verifies the token signature, expiry,
+exact audience, and tenant issuer, binds the code to the token's email, and, if
+configured, compares the exact lowercased email domain. With no `entra` block,
+enrollment remains code-only.
+
 ---
 
 ## Running the router in Docker
@@ -179,6 +222,9 @@ runs — branch and `sha-*` tags (amd64 + arm64).
 | `CYRUS_ROUTER_CREATOR_ONLY_PROMPTING` | no | `true` | `creatorOnlyPrompting` |
 | `CYRUS_ROUTER_HEARTBEAT_MS` | no | `30000` | `heartbeatMs` |
 | `CYRUS_ROUTER_WORKSPACES_JSON` | no | — | full `workspaces` map (supersedes the ID/token pair) |
+| `CYRUS_ROUTER_ENTRA_TENANT_ID` | no | — | `entra.tenantId` (requires audience) |
+| `CYRUS_ROUTER_ENTRA_AUDIENCE` | no | — | `entra.audience` Application ID URI (requires tenant) |
+| `CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN` | no | — | `entra.allowedDomain` exact email domain |
 
 On every start, if the required variables are set the entrypoint regenerates
 `/data/router-config.json` from them (env is the source of truth). With no
@@ -214,6 +260,162 @@ docker compose exec cyrus-router cyrus router unlock <issueId>
   `wss://` and Linear can reach `https://…/linear-webhook`.
 - **Backups:** the `cyrus-router-data` volume is the only state; snapshot it
   (or `sqlite3 /data/router/router.db ".backup …"`) to back up the router.
+
+---
+
+## Azure hosting and ACA Sandboxes
+
+The maintained Azure deployment in [`infra/azure/`](../infra/azure/README.md)
+runs the router as one Azure Container App replica and gives selected users one
+Azure Container Apps (ACA) Sandbox per issue. Set the executor with:
+
+```bash
+cyrus router users set-executor alice@example.com aca
+```
+
+The Terraform stack produces the complete `containers` configuration. Its ACA
+provider needs a pre-registered worker disk image and these provider fields:
+
+```json
+{
+  "containers": {
+    "image": "ghcr.io/your-org/cyrus-worker:tag",
+    "routerUrlForContainers": "wss://<router-fqdn>",
+    "repositories": [{
+      "name": "repo",
+      "githubSlug": "org/repo",
+      "linearWorkspaceId": "<workspace-id>",
+      "baseBranch": "main"
+    }],
+    "keyVaultUrl": "https://<vault>.vault.azure.net",
+    "aca": {
+      "subscriptionId": "<subscription-guid>",
+      "resourceGroup": "<resource-group>",
+      "sandboxGroup": "<sandbox-group>",
+      "region": "australiaeast",
+      "disk": "cyrus-worker",
+      "cpu": "4000m",
+      "memory": "8192Mi",
+      "autoSuspendSeconds": 0,
+	  "keepSnapshots": 2,
+	  "disconnectedRecreateMs": 120000
+    }
+  },
+  "backup": {
+    "blobContainerUrl": "https://<account>.blob.core.windows.net/router-backups",
+    "intervalMs": 300000
+  }
+}
+```
+
+### Observed ACA behavior
+
+- Sandboxes have server-assigned GUIDs, not operator-selected names. Cyrus maps
+  issues exclusively through labels (`cyrus.managed`, `cyrus.issue`,
+  `cyrus.disk`, and `cyrus.device-id`); label values are limited to 63
+  characters. The sandbox-group ARM resource is `properties: {}`. It has no
+  `maxSandboxCount`, `defaultCpu`, `defaultMemory`, or `defaultDisk` properties;
+  resource sizing and lifecycle policy are applied to each sandbox.
+- Memory-mode resume measured **0.52 seconds** in the 2026-07-26 spike. Suspend
+  took 6.47 seconds and delivered **no SIGTERM**: processes freeze in place, so
+  there is no Docker-style shutdown grace in which to force a final flush.
+  Cyrus therefore keeps periodic/session-end floor sync enabled and tolerates a
+  frozen upload until the next retry.
+- ACA's `Running` state describes infrastructure, not worker health. An
+  entrypoint can exit while `tini` leaves the sandbox `Running`; Cyrus also
+  checks router WSS state and recreates workers disconnected longer than
+  `disconnectedRecreateMs` (default 120 seconds). The grace tolerates startup
+  and transient disconnects, and connected workers are never replaced.
+- `autoSuspendSeconds` defaults to `0`. ACA auto-suspend has no Cyrus session
+  affinity gate, and snapshot restore otherwise resets it to ACA's 300-second
+  default. The provider reapplies the disabled policy on every create path;
+  `idleStopMs` remains the recommended, affinity-aware controller.
+- Egress defaults to **Deny** with `Full` inspection and an HTTP/WSS allowlist
+  for the router, GitHub, Anthropic API and OAuth refresh, Linear, and supported
+  package registries. The spike confirmed WSS works. Blocked HTTP hosts return
+  403. `Full` inspection blocks non-HTTP TCP/UDP, including SSH on port 22, so
+  `git@...` and `git+ssh://` remotes/submodules are unsupported; use HTTPS.
+- Explicit snapshots preserve memory, disk, and environment, including the
+  device token. Cyrus restores one only when its `cyrus.device-id` lineage
+  matches the current row. Azure does not garbage-collect explicit snapshots;
+  `keepSnapshots` prunes per issue and `cyrus router containers gc-snapshots`
+  plans orphan cleanup (`--yes` applies it). Published pricing does not identify
+  a snapshot-storage meter, so snapshot cost after preview is unquantified, not
+  proven to be free or equivalent to ordinary Blob pricing.
+
+### Key Vault and Entra operations
+
+Setting `containers.keyVaultUrl` selects the Key Vault per-user secret backend.
+The router's managed identity needs data-plane secret access. Because the
+router is remote, do not expect a laptop command pointed at its local
+`router-config.json` to mutate the hosted store. Use either path:
+
+```bash
+# Preferred: run the normal Cyrus command under the replica's managed identity.
+az containerapp exec --name <router-app> --resource-group <rg> \
+  --command "cyrus router secrets set alice@example.com CLAUDE_CODE_OAUTH_TOKEN <value>"
+
+# Or use az keyvault secret set with the hashed name/tag convention below;
+# preserve both email and key tags.
+```
+
+The Key Vault name is `u<first-20-hex-of-sha256(lowercase-email)>-<first-10-hex-of-sha256(key)>`;
+set tags `email=<lowercase-email>` and `key=<ENV_VAR_NAME>`. The tags are what
+make `secrets list` reversible; the hashed name alone is intentionally opaque.
+
+Secret reads are cached briefly. A rotation affects the next
+**create-from-image** only; a running, suspended, or snapshot-restored sandbox
+keeps its baked environment. Apply a rotation immediately with `cyrus router
+containers destroy <issueKey>` followed by a new prompt.
+
+Optional Entra-gated enrollment is described in
+[Optional Entra-gated enrollment](#optional-entra-gated-enrollment). Use one app
+registration per router deployment, set its Application ID URI as the exact
+audience, and have operators/users authenticate with `az login`. Entra protects
+enrollment; sandbox data-plane calls separately use the router managed identity
+and the `https://dynamicsessions.io/.default` audience.
+
+### Router state and recovery
+
+Azure hosting is deliberately **single replica** (`minReplicas = maxReplicas =
+1`) because SQLite and live WebSockets are not multi-writer state. `router.db`
+lives on local ephemeral storage; `StateBackup` restores it from Blob when the
+file is absent, then uploads a SQLite backup every five minutes by default and
+once on graceful shutdown. A single-request `PutBlob` is atomic, so an
+interrupted upload retains the previous blob. During a Container Apps revision
+rollout, however, old and new replicas can overlap and upload out of order. The
+accepted recovery window is `intervalMs`; restored queue events are
+at-least-once and may be delivered again.
+
+If restore fails on a corrupt blob, startup fails loudly rather than silently
+discarding state. Break glass: use the operator's **Storage Blob Data
+Contributor** grant to delete `router.db` from the backup container, then
+restart/redeploy the single replica. This starts an empty router registry; users
+and devices must be re-enrolled.
+
+### Terminal teardown and known gaps
+
+For a human-acted completed/canceled notification or an `Issue/remove` webhook,
+the router queues the raw webhook, wakes a suspended worker, and the worker stops
+sessions, force-flushes the persistence floor, pushes WIP, runs
+`cyrus-teardown.sh`, and removes the worktree. Its authenticated
+`teardown-complete` callback then destroys the sandbox and all issue snapshots
+before deleting the device row. Completed/canceled issues retain the bundle for
+reopen; deleted issues also remove it. A missed callback falls back to the
+10-minute grace timer, and stale/orphan sweeps remain backstops.
+
+Linear has two verified notification blind spots: it sends no
+`issueStatusChanged` notification for a close performed by the Cyrus app's own
+OAuth identity, and sends none for the `duplicate` state. Those cases wait for
+the 14-day stale-destroy backstop unless an operator destroys the container.
+Router restart during the in-memory teardown grace also loses that immediate
+callback registration; idle-stop and stale GC still bound it.
+
+Before deleting Azure infrastructure, follow the ordered sweep in
+[`infra/azure/README.md`](../infra/azure/README.md#teardown-m5): destroy all
+router-managed containers, delete leftover data-plane snapshots (and optional
+disk images), then run `terraform destroy`. Terraform does not own those
+data-plane children.
 
 ---
 
@@ -446,5 +648,5 @@ handoff mechanism.
 | `cyrus router devices revoke <email>` | host | Revoke a user's device token. |
 | `cyrus router sessions list` | host | List running + locked sessions with their Linear issue id and session GUID. |
 | `cyrus router unlock <issueId\|PAR-123>` | host | Release a stuck issue lock, by GUID or Linear identifier. |
-| `cyrus connect <url> --code <code>` | device | Enroll this device with the router. |
+| `cyrus connect <url> --code <code> [--entra <audience>]` | device | Enroll this device, optionally using an Azure CLI Entra token. |
 | `cyrus start` | device | Begin receiving and running your routed sessions. |

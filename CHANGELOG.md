@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Azure Container Apps Sandboxes executor: selected router users can run each issue in an isolated cloud worker that suspends when idle, resumes from memory, and uses deny-by-default network egress.
+- The router can now run as a single-replica Azure Container App with managed identity, Key Vault-backed per-user secrets, Blob-backed router state, optional Entra-gated enrollment, and Terraform deployment assets.
 - Router mode: run `cyrus router start` on an always-on host and `cyrus connect` on each team member's machine — sessions run on the creator's own device with its native credentials (az, gh, SSH, Claude subscription). Includes offline queueing, per-issue locks, and creator-only prompting. See `docs/ROUTER.md`.
 - Guided setup (`/cyrus-setup`) now starts by asking which deployment mode you want — **standalone** (single-host), **router host**, or **client device** — and walks you through only the steps that mode needs. Router-host and client-device setup are first-class guided flows instead of a manual appendix.
 - Worktrees now resume from the issue's pushed branch when one exists, and uncommitted work is auto-pushed as WIP before a worktree is removed.
@@ -20,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Operators can require extra credentials before a user's containers boot via `containers.requiredSecretKeys` in the router config (the Claude OAuth token is always required).
 
 ### Fixed
+- Ephemeral containers are now destroyed automatically when their Linear issue is completed, canceled, or deleted, after saving in-progress work and running worktree teardown. Deleted issues also remove their saved bundle; stale cleanup remains the fallback for missed Linear notifications.
 - Ephemeral containers: resuming a session after its container was destroyed and recreated no longer drops the repository. The session's git worktree is now re-created from the issue's branch (including any in-progress work already pushed) before work resumes, instead of silently continuing in an empty folder with no code and no history. A session moved from a teammate's device onto a container now also keeps its Claude conversation history where possible, instead of always starting a fresh one.
 - Ephemeral containers: revoking a teammate's physical device (for example after they get a new laptop, via `cyrus router devices revoke`) no longer destroys their running per-issue containers along with it. Only the physical device is detached now; in-progress container sessions, and the work inside them, are left alone.
 - Ephemeral containers: the automatic backup of in-progress work (WIP commits pushed to the issue branch) now only happens inside containers, where it's required so work survives a restart. Router setups where everyone works from their own device are unaffected — nobody's laptop starts auto-committing to their issue branches, including open pull requests, as a side effect of this feature.

@@ -32,6 +32,7 @@ const DEFAULT_UPLOAD_TIMEOUT_MS = 2 * 60_000;
  * param when they know more about expected bundle size / link speed.
  */
 const DEFAULT_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_TEARDOWN_TIMEOUT_MS = 30_000;
 
 export async function uploadBundle(
 	httpBase: string,
@@ -69,4 +70,23 @@ export async function downloadBundle(
 	mkdirSync(dirname(destFile), { recursive: true });
 	await writeFile(destFile, Buffer.from(await res.arrayBuffer()));
 	return true;
+}
+
+export async function postTeardownComplete(
+	httpBase: string,
+	deviceToken: string,
+	issueKey: string,
+	timeoutMs: number = DEFAULT_TEARDOWN_TIMEOUT_MS,
+): Promise<void> {
+	const res = await fetch(
+		`${httpBase}/containers/issues/${issueKey}/teardown-complete`,
+		{
+			method: "POST",
+			headers: { authorization: `Bearer ${deviceToken}` },
+			signal: AbortSignal.timeout(timeoutMs),
+		},
+	);
+	if (!res.ok) {
+		throw new Error(`teardown-complete callback failed: HTTP ${res.status}`);
+	}
 }

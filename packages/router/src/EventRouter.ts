@@ -26,6 +26,10 @@ import {
 	UNENROLLED_CREATOR_MESSAGE,
 } from "./messages.js";
 import type { RouterStore } from "./RouterStore.js";
+import type {
+	TerminalTeardown,
+	TerminalTeardownAction,
+} from "./TerminalTeardown.js";
 
 /**
  * `agentSessionCreated` and `agentSessionPrompted` webhooks are the same
@@ -81,6 +85,7 @@ export interface EventRouterOptions {
 	 * keeps every user on the physical-device path (today's behavior).
 	 */
 	containerTargets?: ContainerTargetService;
+	terminalTeardown?: TerminalTeardown;
 	config: {
 		eventTtlMs: number;
 		issueLock: boolean;
@@ -113,6 +118,7 @@ export class EventRouter {
 		| ((workspaceId: string, issueId: string) => Promise<string | undefined>)
 		| undefined;
 	private readonly containerTargets: ContainerTargetService | undefined;
+	private readonly terminalTeardown: TerminalTeardown | undefined;
 	private readonly config: {
 		eventTtlMs: number;
 		issueLock: boolean;
@@ -137,6 +143,7 @@ export class EventRouter {
 		this.postActivity = opts.postActivity;
 		this.moveIssueToStartedState = opts.moveIssueToStartedState;
 		this.containerTargets = opts.containerTargets;
+		this.terminalTeardown = opts.terminalTeardown;
 		this.config = opts.config;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
@@ -159,11 +166,15 @@ export class EventRouter {
 		// never reclaimed, since the node has no other way to learn an issue
 		// closed. See EdgeWorker.handleIssueStateChangeMessage.
 		if (isIssueStateChangeWebhook(webhook)) {
-			this.routeIssueTerminal(webhook, webhook.notification?.issue);
+			await this.routeIssueTerminal(
+				webhook,
+				webhook.notification?.issue,
+				"closed",
+			);
 			return;
 		}
 		if (isIssueDeletedWebhook(webhook)) {
-			this.routeIssueTerminal(webhook, webhook.data);
+			await this.routeIssueTerminal(webhook, webhook.data, "deleted");
 			return;
 		}
 		this.logger.info(
@@ -186,10 +197,11 @@ export class EventRouter {
 	 * No Linear activity is posted on the failure paths: a status change is not
 	 * an agent session, so there is no thread to post to.
 	 */
-	private routeIssueTerminal(
+	private async routeIssueTerminal(
 		webhook: Webhook,
 		issue: { id?: string; identifier?: string } | null | undefined,
-	): void {
+		action: TerminalTeardownAction,
+	): Promise<void> {
 		const label = `${webhook.type}/${webhook.action}`;
 		const issueId = issue?.id;
 		if (!issueId) {
@@ -202,6 +214,18 @@ export class EventRouter {
 
 		const deviceId = this.store.getIssueAffinity(issueId);
 		if (deviceId === undefined) {
+			if (action === "deleted" && this.terminalTeardown && issue?.identifier) {
+				try {
+					await this.terminalTeardown.deleteRetainedBundle(issue.identifier);
+					this.logger.info(
+						`Removed retained artifact bundle for deleted issue ${issueRef}`,
+					);
+				} catch (error) {
+					this.logger.warn(
+						`Could not remove retained artifact bundle for deleted issue ${issueRef}: ${String(error)}`,
+					);
+				}
+			}
 			// No device ever ran a session for this issue, so no device holds a
 			// worktree for it. Nothing to clean up — not an error.
 			this.logger.info(
@@ -227,6 +251,22 @@ export class EventRouter {
 		this.logger.info(
 			`Forwarded terminal webhook ${label} for issue ${issueRef} to device ${deviceId} for worktree cleanup`,
 		);
+
+		if (
+			this.containerTargets?.isContainerDevice(deviceId) &&
+			this.terminalTeardown
+		) {
+			const issueKey = this.store.getDeviceInfo(deviceId)?.issueKey;
+			if (!issueKey) {
+				this.logger.warn(
+					`Container device ${deviceId} has no issue key; cannot register terminal teardown`,
+				);
+				return;
+			}
+			if (this.terminalTeardown.register({ issueKey, deviceId, action })) {
+				this.containerTargets.bootForTeardown(deviceId);
+			}
+		}
 	}
 
 	/**

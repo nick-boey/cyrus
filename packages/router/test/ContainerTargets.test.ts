@@ -199,6 +199,31 @@ describe("ContainerTargetService", () => {
 		expect(postActivity).toHaveBeenCalledTimes(1);
 	});
 
+	it("bootForTeardown uses normal env/token booting but only logs failures", async () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+		const ensureRunning = vi.fn(async () => {
+			throw new Error("wake failed");
+		});
+		const service = makeService(
+			new Map([["docker", fakeExecutor("docker", { ensureRunning })]]),
+		);
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+
+		service.bootForTeardown(deviceId);
+		await vi.waitFor(() =>
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("wake failed"),
+			),
+		);
+		expect(ensureRunning).toHaveBeenCalledTimes(1);
+		expect(postActivity).not.toHaveBeenCalled();
+	});
+
 	it("no Claude token means immediate failure without calling the executor", async () => {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');
@@ -287,7 +312,7 @@ describe("ContainerTargetService", () => {
 		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
 		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-2" });
 
-		expect(ensureRunning).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(1));
 		expect(rotateSpy).toHaveBeenCalledTimes(1);
 
 		resolveFirst();

@@ -367,6 +367,39 @@ describe("WorkspaceSyncService concurrency", () => {
 		await Promise.all([p1, p2]);
 		expect(pushWipIfDirty).toHaveBeenCalledTimes(2);
 	});
+
+	it("a forced sync waits for an in-flight sync and then performs a fresh pass", async () => {
+		const cyrusHome = mkCyrusHome();
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+		let releaseFirst: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const pushWipIfDirty = vi.fn(async () => {
+			if (pushWipIfDirty.mock.calls.length === 1) await gate;
+			return true;
+		});
+		const fetchMock = stubFetchOk();
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService: {
+				pushWipIfDirty,
+				deriveWorktreeBranchName: vi.fn(() => "branch"),
+			},
+			logger: makeLogger(),
+		});
+
+		const ordinary = service.syncIssue("CYPACK-9");
+		await vi.waitFor(() => expect(pushWipIfDirty).toHaveBeenCalledTimes(1));
+		const forced = service.syncIssue("CYPACK-9", { force: true });
+		expect(fetchMock).not.toHaveBeenCalled();
+		releaseFirst?.();
+		await Promise.all([ordinary, forced]);
+
+		expect(pushWipIfDirty).toHaveBeenCalledTimes(2);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
 });
 
 describe("WorkspaceSyncService.stop", () => {
