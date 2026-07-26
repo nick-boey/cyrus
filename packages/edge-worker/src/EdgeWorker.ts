@@ -230,6 +230,13 @@ export class EdgeWorker extends EventEmitter {
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
 	private routerConnection?: RouterConnection; // Shared device-side WebSocket connection to the Cyrus Router (router platform mode)
+	/**
+	 * A fully-wired router connection whose dial loop has not started yet.
+	 * `initializeComponents` attaches the event listeners and parks the connection
+	 * here; `start()` dials it only after interrupted-session reconciliation has
+	 * finished, so no queued prompt can race a terminal signal.
+	 */
+	private pendingRouterDial?: RouterConnection;
 	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, opt-in via floorSync === true)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
 	private persistenceManager: PersistenceManager;
@@ -501,7 +508,33 @@ export class EdgeWorker extends EventEmitter {
 					childSessionId,
 				);
 			},
+			undefined, // logger
+			// The terminal path flushes state to disk before it signals, so both
+			// the router's affinity release and the persistence floor's bundle see
+			// a session that reads terminal and carries its final response entry.
+			() => this.savePersistedState(),
 		);
+
+		// Router mode: a session that just picked up a new runner has advanced past
+		// whatever terminal state it last reported, so any still-unacked terminal
+		// frame for it is stale. Drop it rather than let the next reconnect replay
+		// it: the router applies terminal frames unconditionally, so a replay
+		// lands mid-turn, clears the session affinity this turn's activities post
+		// under, and the turn's final response is rejected with "session not owned
+		// by this device". The session emits a fresh terminal frame when it
+		// genuinely finishes (addAgentRunner re-arms the one-shot), so nothing is
+		// lost by dropping the old one.
+		this.agentSessionManager.on("sessionResumed", (sessionId: string) => {
+			if (this.config.platform !== "router") return;
+			try {
+				this.routerConnection?.discardBufferedSessionState(sessionId);
+			} catch (error) {
+				this.logger.error(
+					`Failed to discard the buffered terminal frame for session ${sessionId}`,
+					error,
+				);
+			}
+		});
 
 		// Router mode: when a session reaches a terminal state, tell the router
 		// so it can release the issue lock + session affinity. Guarded by
@@ -842,13 +875,23 @@ export class EdgeWorker extends EventEmitter {
 			});
 		}
 
-		// Start shared application server (this also starts Cloudflare tunnel if CLOUDFLARE_TOKEN is set)
-		await this.sharedApplicationServer.start();
-
 		// Report any session the previous process was running when it died. Runs
 		// after initializeComponents() so the activity sinks and issue trackers
-		// exist, and before any webhook can create a new runner. Non-fatal: a
-		// worker that cannot reconcile must still come up and serve new work.
+		// exist, and — critically — before the HTTP server accepts a webhook or the
+		// router dial can deliver a queued prompt. Reconciliation drives a session
+		// to `error` and emits a terminal signal that releases the router's issue
+		// lock and session affinity; if a prompt for that same session is already
+		// being resumed when it fires, it strips the affinity mid-turn and every
+		// activity that turn posts — including its final response — is rejected
+		// with "session not owned by this device". Ordering it ahead of all inbound
+		// work is what makes that unreachable: `addAgentRunner` then always
+		// observes the reconciled state and re-arms the session cleanly.
+		//
+		// Safe to run while offline: both the activity post and the terminal signal
+		// are durable across a router disconnect.
+		//
+		// Non-fatal: a worker that cannot reconcile must still come up and serve
+		// new work.
 		try {
 			const interrupted =
 				await this.agentSessionManager.reconcileInterruptedSessions();
@@ -859,6 +902,18 @@ export class EdgeWorker extends EventEmitter {
 			}
 		} catch (error) {
 			this.logger.error("Failed to reconcile interrupted sessions:", error);
+		}
+
+		// Start shared application server (this also starts Cloudflare tunnel if CLOUDFLARE_TOKEN is set)
+		await this.sharedApplicationServer.start();
+
+		// Router mode: begin the dial loop. Deferred from initializeComponents() to
+		// here so reconciliation above has already settled every restored session
+		// before the router can deliver a queued prompt for one of them.
+		if (this.pendingRouterDial) {
+			const routerConnection = this.pendingRouterDial;
+			this.pendingRouterDial = undefined;
+			routerConnection.connect();
 		}
 	}
 
@@ -997,9 +1052,11 @@ export class EdgeWorker extends EventEmitter {
 				// call it to honor the IAgentEventTransport contract.
 				routerEventTransport.register();
 
-				// Begin the dial loop AFTER listeners are attached so no replayed or
-				// live event is emitted with zero "event" consumers.
-				routerConnection.connect();
+				// The dial loop is deliberately NOT started here. Listeners are
+				// attached now (so no replayed or live event can be emitted with zero
+				// "event" consumers), but dialing waits until start() has reconciled
+				// interrupted sessions — see the note there.
+				this.pendingRouterDial = routerConnection;
 
 				this.logger.info("✅ Router event transport registered");
 				this.logger.info(`   Connecting to router: ${this.config.router?.url}`);
@@ -5068,19 +5125,25 @@ ${taskSection}`;
 						: `Stopped session ${agentSessionId} (interrupt not supported)`,
 				);
 			}
-			// The kill tears the query down before it can yield a result, so
-			// completeSession() — and with it the "sessionTerminal" emit — never
-			// runs. Signal the terminal state explicitly, or router mode holds this
-			// issue's lock until an admin runs `cyrus router unlock`. The interrupt
-			// branch below needs no such call: the query still returns a result.
-			this.agentSessionManager.abortSession(agentSessionId);
-			this.lastStopTimeBySession.delete(agentSessionId);
+			// Post the closing response BEFORE going terminal, for the same reason
+			// completeSession does: the router drops this device's ownership of the
+			// session the instant it sees the terminal state and rejects anything
+			// posted afterwards with "session not owned by this device". Posting
+			// after the abort cost this path its final response, leaving the thread
+			// with no record that the stop ever landed.
 			await this.agentSessionManager.createResponseActivity(
 				agentSessionId,
 				isDoubleStop
 					? `I've fully stopped working on ${issueTitle}.\n\n**Stop Signal:** Received from ${senderName} (second stop)\n**Action Taken:** Session terminated`
 					: `I've stopped working on ${issueTitle}.\n\n**Stop Signal:** Received from ${senderName}\n**Action Taken:** Session terminated`,
 			);
+			// The kill tears the query down before it can yield a result, so
+			// completeSession() — and with it the "sessionTerminal" emit — never
+			// runs. Signal the terminal state explicitly, or router mode holds this
+			// issue's lock until an admin runs `cyrus router unlock`. The interrupt
+			// branch below needs no such call: the query still returns a result.
+			await this.agentSessionManager.abortSession(agentSessionId);
+			this.lastStopTimeBySession.delete(agentSessionId);
 		} else {
 			// First stop on a warm session — interrupt current turn, keep session warm
 			await existingRunner!.interrupt!();
