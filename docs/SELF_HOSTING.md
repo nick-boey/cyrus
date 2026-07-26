@@ -302,20 +302,44 @@ After=network.target
 [Service]
 Type=simple
 User=your-user
-EnvironmentFile=/home/your-user/.cyrus/.env
-ExecStart=/usr/local/bin/cyrus
+# your-user's REAL home directory — not necessarily /home/your-user.
+# For root it is /root. Resolve it with: getent passwd your-user | cut -d: -f6
+EnvironmentFile=-/home/your-user/.cyrus/.env
+ExecStart=/usr/local/bin/cyrus start
 Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+Replace `your-user` with the account Cyrus runs as, and both paths with real
+values for that account:
+
+- **`EnvironmentFile`** — use the user's actual home directory, which is not
+  always `/home/<user>`. For `root` it is `/root`. Resolve it with
+  `getent passwd your-user | cut -d: -f6`. systemd does not expand `$HOME` here,
+  so the path must be literal. The leading `-` makes the file optional so the
+  service still starts before `.cyrus/.env` exists.
+- **`ExecStart`** — name the `start` subcommand explicitly. Bare
+  `ExecStart=/usr/local/bin/cyrus` works only because `start` is the CLI's
+  default command; being explicit keeps the unit correct if that changes. Use
+  `which cyrus` to confirm the binary path — a globally linked dev build will
+  resolve somewhere other than `/usr/local/bin`.
+
+For a router host, use `ExecStart=/usr/local/bin/cyrus router start` and name the
+unit `cyrus-router.service`.
+
 Then:
 
 ```bash
+sudo systemctl daemon-reload
 sudo systemctl enable cyrus
 sudo systemctl start cyrus
 ```
+
+Stop any existing Cyrus process (foreground, backgrounded, or pm2) before
+starting the unit, and only cut over when no sessions are in flight.
 
 ---
 
