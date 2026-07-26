@@ -165,6 +165,8 @@ function emptyUsageBlock(): SDKAssistantMessage["message"]["usage"] {
 		cache_read_input_tokens: 0,
 		output_tokens_details: null,
 		cache_creation: null,
+		// Anthropic-only billing field; Codex never performs a fallback-credit reprice.
+		fallback_credit: null,
 		inference_geo: null,
 		iterations: null,
 		server_tool_use: null,
@@ -251,6 +253,8 @@ function createResultUsage(parsed: NormalizedUsage): SDKResultMessage["usage"] {
 			ephemeral_1h_input_tokens: 0,
 			ephemeral_5m_input_tokens: 0,
 		},
+		// Anthropic-only billing field; Codex never performs a fallback-credit reprice.
+		fallback_credit: { status: { type: "not_applied", reason: "not_enabled" } },
 		inference_geo: "unknown",
 		iterations: [],
 		server_tool_use: { web_fetch_requests: 0, web_search_requests: 0 },
