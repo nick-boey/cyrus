@@ -79,7 +79,7 @@ Optional fields (with defaults):
 | `eventTtlMs` | `172800000` (48h) | How long a queued event lives before it expires and the user is asked to re-delegate. |
 | `issueLock` | `true` | Reject a second session on an issue already being worked (see [Issue lock](#issue-lock)). |
 | `creatorOnlyPrompting` | `true` | Only the session's creator may send it new prompts (see [Creator-only prompting](#creator-only-prompting)). |
-| `heartbeatMs` | `30000` | WebSocket keepalive interval. |
+| `heartbeatMs` | `30000` | WebSocket keepalive interval. The router terminates a socket that misses two consecutive pings, and advertises this value in `hello_ack` so each device's watchdog gives up at the same point (see [Device liveness watchdog](#device-liveness-watchdog)). |
 | `host` | `127.0.0.1` | Bind address. Put the router behind a TLS-terminating reverse proxy for `wss://`. |
 
 - `verificationMode: "direct"` verifies Linear's webhook signature with `secret`.
@@ -326,6 +326,14 @@ provider needs a pre-registered worker disk image and these provider fields:
   checks router WSS state and recreates workers disconnected longer than
   `disconnectedRecreateMs` (default 120 seconds). The grace tolerates startup
   and transient disconnects, and connected workers are never replaced.
+- The same rule applies to a **resume**. `resumeSandbox` returning is only an
+  infrastructure signal, so after resuming the provider polls the router's device
+  connectivity every `resumeConnectPollMs` (default 2 seconds) for up to
+  `resumeConnectTimeoutMs` (default 90 seconds — comfortably longer than the two
+  heartbeats the device's own watchdog needs to notice its frozen socket). A
+  worker that rejoins is kept; one that never does is replaced immediately rather
+  than leaving queued work stranded. Set `resumeConnectTimeoutMs: 0` to skip the
+  check and trust ACA's state alone.
 - `autoSuspendSeconds` defaults to `0`. ACA auto-suspend has no Cyrus session
   affinity gate, and snapshot restore otherwise resets it to ACA's 300-second
   default. The provider reapplies the disabled policy on every create path;
@@ -403,6 +411,26 @@ sessions, force-flushes the persistence floor, pushes WIP, runs
 before deleting the device row. Completed/canceled issues retain the bundle for
 reopen; deleted issues also remove it. A missed callback falls back to the
 10-minute grace timer, and stale/orphan sweeps remain backstops.
+
+The callback is durable on both sides, because falling back to grace expiry means
+paying for a sandbox that has already finished its work:
+
+- The worker records the callback (with an idempotency key) to
+  `~/.cyrus/router-client/teardown-callbacks.jsonl` **before** it starts any
+  cleanup, and retries that same key with backoff until the router accepts it. A
+  worker killed anywhere in the sequence — including between the floor flush and
+  the callback — replays it once it reconnects.
+- The router mirrors each registered teardown into its SQLite `container_teardowns`
+  table, so `cyrus router containers list` shows a `TEARDOWN` column:
+  `callback-pending(<action>, grace <N>s)` while it is still waiting on the
+  worker, or `destroying(<action>, callbacks <N>)` once a callback has arrived and
+  only the provider destroy is retrying. A re-delivered callback is logged as
+  `callback retry`, distinct from the `grace expired` warning that means no worker
+  ever reported in.
+
+The mirror is observability plus retry accounting, not a restart journal: the
+rows are cleared when the router builds its teardown coordinator, matching that
+coordinator's empty in-memory starting state.
 
 Linear has two verified notification blind spots: it sends no
 `issueStatusChanged` notification for a close performed by the Cyrus app's own
@@ -560,6 +588,24 @@ so a crash between ack and processing replays it rather than dropping it.
 - **Reconnect:** the client reconnects with exponential backoff and replays any
   activity posts it buffered while offline (idempotently, so no duplicate
   timeline entries).
+
+### Device liveness watchdog
+
+A TCP connection can stay half-open on the device long after the router has
+terminated its end, in which case the device believes it is connected, sends no
+new `hello`, and the router's queued events are never delivered. The device
+therefore runs its own watchdog: it timestamps every inbound signal from the
+router (ping, pong, or any frame) and terminates its socket once that timestamp
+is older than two `heartbeatMs` intervals — the same point at which the router
+gives up on a device that stops answering pings. Termination feeds the ordinary
+reconnect path, so a fresh authenticated `hello` drains the backlog.
+
+The comparison uses **wall-clock** time, not elapsed timer ticks. An ACA
+memory-mode suspend freezes every JavaScript timer in the sandbox, so after a
+resume the watchdog's own interval fires late; only a wall-clock check reveals
+the gap. This is what makes a resumed sandbox rejoin on its own instead of
+waiting for a later prompt to cross `disconnectedRecreateMs` and force a cold
+replacement.
 
 ---
 

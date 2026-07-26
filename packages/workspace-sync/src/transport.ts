@@ -72,21 +72,74 @@ export async function downloadBundle(
 	return true;
 }
 
+/** Header carrying the callback's stable idempotency key. */
+export const TEARDOWN_IDEMPOTENCY_HEADER = "x-cyrus-teardown-id";
+
+/**
+ * A `teardown-complete` callback the router did not accept.
+ *
+ * `retryable` splits the two cases a caller must treat differently:
+ *  - `true`  — the router is unreachable, overloaded, or its destroy failed
+ *              (5xx). Replaying the SAME idempotency key later is safe and is
+ *              the whole point of the device-side durable queue.
+ *  - `false` — the router positively rejected this callback (bad/revoked token,
+ *              wrong issue, malformed key). No amount of retrying changes that,
+ *              so the caller should stop and let the router's grace deadline
+ *              run the destroy instead.
+ */
+export class TeardownCallbackError extends Error {
+	readonly status: number | undefined;
+	readonly retryable: boolean;
+
+	constructor(message: string, status: number | undefined, retryable: boolean) {
+		super(message);
+		this.name = "TeardownCallbackError";
+		this.status = status;
+		this.retryable = retryable;
+	}
+}
+
+/** 4xx statuses that mean "the router will never accept this callback". */
+const FATAL_TEARDOWN_STATUSES = new Set([400, 401, 403, 404]);
+
 export async function postTeardownComplete(
 	httpBase: string,
 	deviceToken: string,
 	issueKey: string,
-	timeoutMs: number = DEFAULT_TEARDOWN_TIMEOUT_MS,
+	opts: { idempotencyKey?: string; timeoutMs?: number } = {},
 ): Promise<void> {
-	const res = await fetch(
-		`${httpBase}/containers/issues/${issueKey}/teardown-complete`,
-		{
-			method: "POST",
-			headers: { authorization: `Bearer ${deviceToken}` },
-			signal: AbortSignal.timeout(timeoutMs),
-		},
-	);
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_TEARDOWN_TIMEOUT_MS;
+	let res: Response;
+	try {
+		res = await fetch(
+			`${httpBase}/containers/issues/${issueKey}/teardown-complete`,
+			{
+				method: "POST",
+				headers: {
+					authorization: `Bearer ${deviceToken}`,
+					// Stable across replays so the router can tell a retry of the
+					// same logical callback from a fresh one, and log it as such.
+					...(opts.idempotencyKey
+						? { [TEARDOWN_IDEMPOTENCY_HEADER]: opts.idempotencyKey }
+						: {}),
+				},
+				signal: AbortSignal.timeout(timeoutMs),
+			},
+		);
+	} catch (error) {
+		// Network failure / timeout: the router may well have processed the
+		// request, but we can't know, so this is retryable by the same key.
+		throw new TeardownCallbackError(
+			`teardown-complete callback failed: ${String(error)}`,
+			undefined,
+			true,
+		);
+	}
 	if (!res.ok) {
-		throw new Error(`teardown-complete callback failed: HTTP ${res.status}`);
+		throw new TeardownCallbackError(
+			`teardown-complete callback failed: HTTP ${res.status}`,
+			res.status,
+			!FATAL_TEARDOWN_STATUSES.has(res.status),
+		);
 	}
 }

@@ -623,4 +623,114 @@ describe("container devices (schema v2)", () => {
 
 		store.close();
 	});
+	describe("container teardown bookkeeping", () => {
+		function seedContainer(store: RouterStore, issueKey = "CYPACK-1") {
+			const { userId } = store.addUser({ email: `${issueKey}@example.com` });
+			return store.createContainerDevice(userId, issueKey, "aca");
+		}
+
+		it("upserts, reads, and lists pending teardowns", () => {
+			const store = new RouterStore(":memory:");
+			const { deviceId } = seedContainer(store);
+
+			expect(store.getPendingTeardown("CYPACK-1")).toBeUndefined();
+			store.upsertPendingTeardown({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "closed",
+				registeredMs: 10,
+				deadlineMs: 610,
+			});
+			expect(store.getPendingTeardown("CYPACK-1")).toEqual({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "closed",
+				registeredMs: 10,
+				deadlineMs: 610,
+				callbackId: undefined,
+				callbackReceivedMs: undefined,
+				callbackAttempts: 0,
+			});
+			expect(store.listPendingTeardowns()).toHaveLength(1);
+
+			// An upgrade to `deleted` overwrites in place rather than duplicating.
+			store.upsertPendingTeardown({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "deleted",
+				registeredMs: 20,
+				deadlineMs: 620,
+			});
+			expect(store.listPendingTeardowns()).toHaveLength(1);
+			expect(store.getPendingTeardown("CYPACK-1")?.action).toBe("deleted");
+
+			store.deletePendingTeardown("CYPACK-1");
+			expect(store.listPendingTeardowns()).toEqual([]);
+			store.close();
+		});
+
+		it("counts callback deliveries and flags a repeat of the same key as a retry", () => {
+			const store = new RouterStore(":memory:");
+			const { deviceId } = seedContainer(store);
+			store.upsertPendingTeardown({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "closed",
+				registeredMs: 10,
+				deadlineMs: 610,
+			});
+
+			const first = store.recordTeardownCallback("CYPACK-1", "cb-1", 100);
+			expect(first?.retry).toBe(false);
+			expect(first?.info).toMatchObject({
+				callbackId: "cb-1",
+				callbackReceivedMs: 100,
+				callbackAttempts: 1,
+			});
+
+			// The device replays the SAME key until we accept it; the first
+			// received-at timestamp is preserved so it stays the source of truth.
+			const second = store.recordTeardownCallback("CYPACK-1", "cb-1", 200);
+			expect(second?.retry).toBe(true);
+			expect(second?.info).toMatchObject({
+				callbackId: "cb-1",
+				callbackReceivedMs: 100,
+				callbackAttempts: 2,
+			});
+
+			// No pending row -> nothing to record.
+			expect(
+				store.recordTeardownCallback("CYPACK-404", "cb-9", 300),
+			).toBeUndefined();
+			store.close();
+		});
+
+		it("clears every row, and drops a row when its container device is deleted", () => {
+			const store = new RouterStore(":memory:");
+			const a = seedContainer(store, "CYPACK-1");
+			const b = seedContainer(store, "CYPACK-2");
+			for (const [issueKey, deviceId] of [
+				["CYPACK-1", a.deviceId],
+				["CYPACK-2", b.deviceId],
+			] as const) {
+				store.upsertPendingTeardown({
+					issueKey,
+					deviceId,
+					action: "closed",
+					registeredMs: 1,
+					deadlineMs: 2,
+				});
+			}
+
+			store.deleteContainerDevice(a.deviceId);
+			expect(store.listPendingTeardowns().map((r) => r.issueKey)).toEqual([
+				"CYPACK-2",
+			]);
+
+			expect(store.clearPendingTeardowns()).toBe(1);
+			expect(store.listPendingTeardowns()).toEqual([]);
+			expect(store.clearPendingTeardowns()).toBe(0);
+			store.close();
+		});
+	});
 });

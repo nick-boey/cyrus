@@ -184,6 +184,7 @@ import {
 import { SlackChatAdapter } from "./SlackChatAdapter.js";
 import type { IActivitySink } from "./sinks/IActivitySink.js";
 import { LinearActivitySink } from "./sinks/LinearActivitySink.js";
+import { TeardownCallbackQueue } from "./TeardownCallbackQueue.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
 import type { AgentSessionData, EdgeWorkerEvents } from "./types.js";
 import { UserAccessControl } from "./UserAccessControl.js";
@@ -231,6 +232,7 @@ export class EdgeWorker extends EventEmitter {
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
 	private routerConnection?: RouterConnection; // Shared device-side WebSocket connection to the Cyrus Router (router platform mode)
 	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, opt-in via floorSync === true)
+	private teardownCallbacks?: TeardownCallbackQueue; // Durable, retrying "terminal cleanup is done" callback to the router (router platform mode)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
 	private persistenceManager: PersistenceManager;
 	private sharedApplicationServer: SharedApplicationServer;
@@ -591,6 +593,24 @@ export class EdgeWorker extends EventEmitter {
 				// wiped them) or that completed but whose terminal signal died with
 				// a previous process. See AgentSessionManager.getLiveSessionIds.
 				getActiveSessions: () => this.agentSessionManager.getLiveSessionIds(),
+			});
+
+			// Durable record of "I owe the router a teardown callback". Written
+			// before terminal cleanup starts and retried until the router accepts
+			// it, so an idle-stopped-then-woken worker gets its sandbox destroyed
+			// promptly instead of waiting out the router's 10-minute grace.
+			const routerHttpBase = toHttpBase(config.router.url);
+			const routerDeviceToken = config.router.deviceToken;
+			this.teardownCallbacks = new TeardownCallbackQueue({
+				stateDir: join(this.cyrusHome, "router-client"),
+				post: (issueKey, idempotencyKey) =>
+					postTeardownComplete(routerHttpBase, routerDeviceToken, issueKey, {
+						idempotencyKey,
+					}),
+				logger: {
+					info: (msg) => this.logger.info(msg),
+					warn: (msg) => this.logger.warn(msg),
+				},
 			});
 
 			// Persistence floor: WIP-push + bundle-upload sync so container death
@@ -961,6 +981,17 @@ export class EdgeWorker extends EventEmitter {
 				// letting them go unhandled. Attach BEFORE connect().
 				routerConnection.on("error", (error: Error) => {
 					this.handleError(error);
+				});
+
+				// Replay any teardown callback a previous process recorded but never
+				// delivered — deliberately gated on "connected" rather than fired at
+				// startup. The callback rides the router's HTTP surface, and a
+				// reconnect (including the liveness watchdog's post-ACA-resume
+				// redial) is the first point at which we know the router is
+				// reachable at all. Runs on every reconnect; a no-op when the queue
+				// is empty, which is the normal case.
+				routerConnection.on("connected", () => {
+					void this.teardownCallbacks?.resume();
 				});
 
 				// SYNCHRONOUS-CONSUMER CONTRACT: RouterConnection marks its durable
@@ -2870,6 +2901,11 @@ ${taskSection}`;
 		// swallows and logs its own errors) and is internally time-capped, so
 		// it can't block process exit indefinitely either.
 		await this.workspaceSync?.stop();
+
+		// Abandon in-flight callback retries rather than holding the process
+		// open on backoff sleeps. Anything still queued is on disk and replays
+		// on the next start (and the router's grace deadline covers the gap).
+		this.teardownCallbacks?.stop();
 	}
 
 	/**
@@ -3627,8 +3663,22 @@ ${taskSection}`;
 	private async handleIssueStateChangeMessage(
 		message: IssueStateChangeMessage,
 	): Promise<void> {
+		// FIRST, and synchronously — before this method's first `await`, so the
+		// write lands inside the window where RouterConnection's inbox entry for
+		// this webhook is still unprocessed. From here on, a kill at ANY point
+		// (mid floor flush, mid worktree removal, or in the gap before the
+		// callback) leaves the intent on disk to be replayed on the next start.
+		const teardownCallbackKey =
+			this.config.platform === "router"
+				? this.teardownCallbacks?.record(message.workItemIdentifier)
+				: undefined;
+
 		this.logger.info(
-			`[MessageBus] Issue reached terminal state: ${message.workItemIdentifier}`,
+			`[MessageBus] Issue reached terminal state: ${message.workItemIdentifier}${
+				teardownCallbackKey
+					? ` (teardown callback ${teardownCallbackKey} recorded)`
+					: ""
+			}`,
 		);
 
 		const issueId = message.workItemId;
@@ -3734,20 +3784,12 @@ ${taskSection}`;
 		});
 
 		// Last by design: provider destruction is only safe after all in-container
-		// cleanup, including worktree deletion, has completed. Callback failure is
-		// non-fatal because the router's grace deadline runs the same destroy path.
-		if (this.config.platform === "router" && this.config.router) {
-			try {
-				await postTeardownComplete(
-					toHttpBase(this.config.router.url),
-					this.config.router.deviceToken,
-					message.workItemIdentifier,
-				);
-			} catch (error) {
-				this.logger.warn(
-					`Failed to report teardown completion for ${message.workItemIdentifier}; router grace expiry will retry destruction: ${String(error)}`,
-				);
-			}
+		// cleanup, including worktree deletion, has completed. The queue retries
+		// the recorded callback (same idempotency key) until the router accepts
+		// it, and never rejects — the router's grace deadline runs the same
+		// destroy path if delivery ultimately fails.
+		if (teardownCallbackKey) {
+			await this.teardownCallbacks?.flush();
 		}
 
 		this.logger.info(
