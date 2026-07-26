@@ -611,4 +611,92 @@ describe("RouterConnection", () => {
 		expect(readJsonl(bufferPath())).toHaveLength(1);
 		conn.close();
 	});
+
+	// ── session_state monotonicity ─────────────────────────────────────────
+	// Durability cuts both ways. The router applies a terminal frame
+	// unconditionally, so replaying a frame whose session has already moved on
+	// releases the issue lock and session affinity out from under a live turn —
+	// and every activity that turn posts afterwards, including its final
+	// response, is rejected with "session not owned by this device".
+
+	it("(l) discards an unacked terminal frame once its session resumes", async () => {
+		const conn = makeConn(); // offline: the frame is buffered, never delivered
+		conn.sendSessionState("sess-1", "complete");
+		expect(readJsonl(bufferPath())).toHaveLength(1);
+
+		// A queued prompt attaches a new runner: the session has advanced.
+		conn.discardBufferedSessionState("sess-1");
+		expect(readJsonl(bufferPath())).toHaveLength(0);
+
+		// Connecting must not replay it over the resumed turn.
+		router.onFrame = ackAll;
+		conn.connect();
+		await once(conn, "connected");
+		await new Promise((r) => setTimeout(r, 50));
+		expect(sessionStates()).toHaveLength(0);
+		conn.close();
+	});
+
+	it("(l2) a discard survives a restart rather than replaying from disk", async () => {
+		const conn1 = makeConn();
+		conn1.sendSessionState("sess-1", "error");
+		conn1.discardBufferedSessionState("sess-1");
+		conn1.close();
+
+		// A replacement process reading the same stateDir must find nothing to send.
+		router.onFrame = ackAll;
+		const conn2 = makeConn();
+		conn2.connect();
+		await once(conn2, "connected");
+		await new Promise((r) => setTimeout(r, 50));
+		expect(sessionStates()).toHaveLength(0);
+		conn2.close();
+	});
+
+	it("(m) discarding one session's frame leaves other sessions' frames intact", async () => {
+		const conn = makeConn();
+		conn.sendSessionState("sess-1", "complete");
+		conn.sendSessionState("sess-2", "error");
+
+		conn.discardBufferedSessionState("sess-1");
+
+		const buffered = readJsonl(bufferPath()) as Array<{ sessionId: string }>;
+		expect(buffered.map((e) => e.sessionId)).toEqual(["sess-2"]);
+		conn.close();
+	});
+
+	it("(n) a newer terminal frame supersedes an older unacked one for the same session", async () => {
+		const conn = makeConn();
+		conn.sendSessionState("sess-1", "error");
+		conn.sendSessionState("sess-1", "complete");
+
+		// Only the latest state per session is retained, so a reconnect cannot
+		// deliver the superseded one.
+		const buffered = readJsonl(bufferPath()) as Array<{
+			sessionId: string;
+			state: string;
+		}>;
+		expect(buffered).toHaveLength(1);
+		expect(buffered[0]).toMatchObject({
+			sessionId: "sess-1",
+			state: "complete",
+		});
+
+		router.onFrame = ackAll;
+		conn.connect();
+		await once(conn, "connected");
+		await vi.waitFor(() => expect(sessionStates()).toHaveLength(1));
+		await new Promise((r) => setTimeout(r, 50));
+		expect(sessionStates()).toHaveLength(1);
+		expect(sessionStates()[0]).toMatchObject({ state: "complete" });
+		conn.close();
+	});
+
+	it("(o) discarding a session with no buffered frame is a no-op", async () => {
+		const conn = makeConn();
+		conn.sendSessionState("sess-1", "complete");
+		conn.discardBufferedSessionState("sess-unknown");
+		expect(readJsonl(bufferPath())).toHaveLength(1);
+		conn.close();
+	});
 });

@@ -100,6 +100,20 @@ export interface CyrusAgentSession {
 	externalSessionId?: string;
 	type: AgentSessionType.CommentThread;
 	status: AgentSessionStatus;
+	/**
+	 * The terminal state this session has already signalled to its terminal-state
+	 * observers (the router's issue-lock/affinity release, the persistence floor).
+	 * Set — and persisted — at the moment the signal is emitted, and cleared when a
+	 * new runner re-attaches and the session advances to another turn.
+	 *
+	 * This is the durable half of the one-shot terminal signal, and exists so a
+	 * cold restore can tell "this session finished and already reported it" from
+	 * "this session was mid-run when its host died". Without it, a session that
+	 * completed cleanly *after* the last state flush restores looking active and
+	 * runner-less — indistinguishable from an interrupted one — and gets a bogus
+	 * `error` activity plus a stale terminal frame replayed over the top of it.
+	 */
+	terminalState?: "complete" | "error" | "stopped";
 	context: AgentSessionType.CommentThread;
 	createdAt: number; // e.g. Date.now()
 	updatedAt: number; // e.g. Date.now()
