@@ -74,6 +74,7 @@ import {
 	isStopSignalMessage,
 	isUnassignMessage,
 	isUserPromptMessage,
+	McpHealthRegistry,
 	PersistenceManager,
 	requireLinearWorkspaceId,
 	resolvePath,
@@ -159,6 +160,7 @@ import { EgressProxy } from "./EgressProxy.js";
 import { GitService } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
 import { McpConfigService } from "./McpConfigService.js";
+import { McpHealthMonitor } from "./McpHealthMonitor.js";
 import { PromptBuilder } from "./PromptBuilder.js";
 import type {
 	IssueContextResult,
@@ -251,6 +253,13 @@ export class EdgeWorker extends EventEmitter {
 	private runnerSelectionService: RunnerSelectionService;
 	private toolPermissionResolver: ToolPermissionResolver;
 	private mcpConfigService: McpConfigService;
+	/**
+	 * Single view of MCP connection health, shared by `McpConfigService` (which
+	 * declares configured servers and records headless skips) and
+	 * `McpHealthMonitor` (which probes and folds in per-session SDK statuses).
+	 */
+	private readonly mcpHealthRegistry = new McpHealthRegistry();
+	private mcpHealthMonitor: McpHealthMonitor;
 	private runnerConfigBuilder: RunnerConfigBuilder;
 	private activityPoster: ActivityPoster;
 	private configManager: ConfigManager;
@@ -716,6 +725,11 @@ export class EdgeWorker extends EventEmitter {
 			getCyrusToolsMcpUrl: () => this.getCyrusToolsMcpUrl(),
 			createCyrusToolsOptions: (parentSessionId) =>
 				this.createCyrusToolsOptions(parentSessionId),
+			healthRegistry: this.mcpHealthRegistry,
+		});
+		this.mcpHealthMonitor = new McpHealthMonitor({
+			registry: this.mcpHealthRegistry,
+			logger: this.logger,
 		});
 		this.runnerConfigBuilder = new RunnerConfigBuilder(
 			this.toolPermissionResolver,
@@ -844,6 +858,14 @@ export class EdgeWorker extends EventEmitter {
 
 		// Start shared application server (this also starts Cloudflare tunnel if CLOUDFLARE_TOKEN is set)
 		await this.sharedApplicationServer.start();
+
+		// Probe MCP connectivity now that the cyrus-tools endpoint is listening.
+		// Deliberately NOT awaited: a slow or unreachable MCP server must never
+		// delay accepting webhooks. Results land in `mcpHealthRegistry` and are
+		// rendered by `getMcpHealthDiagnostics()` in the startup banner.
+		this.probeMcpHealth().catch((error) => {
+			this.logger.warn("MCP health probe failed (non-fatal):", error);
+		});
 
 		// Report any session the previous process was running when it died. Runs
 		// after initializeComponents() so the activity sinks and issue trackers
@@ -5612,9 +5634,59 @@ ${taskSection}`;
 	private async handleClaudeMessage(
 		sessionId: string,
 		message: SDKMessage,
-		_repositoryId: string,
+		repositoryId: string,
 	): Promise<void> {
+		this.recordMcpSessionInit(sessionId, message, repositoryId);
 		await this.agentSessionManager.handleClaudeMessage(sessionId, message);
+	}
+
+	/**
+	 * Fold the SDK's per-session MCP connection report into the health registry.
+	 *
+	 * The `system`/`init` message is the only place the SDK reports per-server
+	 * connection state, and with `MCP_CONNECTION_NONBLOCKING=true` a server that
+	 * never connected does not fail the session — so this is the hook that turns
+	 * "the agent mentioned MCP was reconnecting" into an operator-visible
+	 * diagnostic plus a bounded re-probe of anything that failed transiently.
+	 *
+	 * Never throws: MCP diagnostics must not be able to break message handling.
+	 */
+	private recordMcpSessionInit(
+		sessionId: string,
+		message: SDKMessage,
+		repositoryId: string,
+	): void {
+		if (message.type !== "system" || message.subtype !== "init") return;
+		const servers = message.mcp_servers;
+		if (!servers || servers.length === 0) return;
+
+		try {
+			// Re-derive the configs so a transient failure can be re-probed. Safe
+			// and side-effect-free (no context is registered).
+			let configs: Record<string, McpServerConfig> | undefined;
+			const repo = this.repositories.get(repositoryId);
+			if (repo) {
+				try {
+					configs = this.mcpConfigService.describeMcpServers(
+						repo.id,
+						requireLinearWorkspaceId(repo),
+					);
+					// `cyrus-tools` cannot be probed without a live session context —
+					// see the exemption in probeMcpHealth().
+					delete configs["cyrus-tools"];
+				} catch {
+					configs = undefined;
+				}
+			}
+
+			this.mcpHealthMonitor.recordSessionInit({
+				sessionId,
+				servers,
+				...(configs ? { configs } : {}),
+			});
+		} catch (error) {
+			this.logger.warn("Failed to record MCP session init statuses:", error);
+		}
 	}
 
 	/**
@@ -7074,6 +7146,72 @@ ${input.userComment}
 		}
 		// For "silent" behavior, we don't post any activity.
 		// The session will remain in "Working" state until manually stopped or timed out.
+	}
+
+	/**
+	 * Diagnostic lines describing MCP connection health — which servers
+	 * connected, which are retrying/degraded/failed, and which were deliberately
+	 * skipped (e.g. `cyrus-docs` in a headless container).
+	 *
+	 * Consumed by the CLI's startup banner alongside the port / repository lines,
+	 * so an operator sees MCP state in the same place as everything else. Returns
+	 * `[]` before the first probe or config build, so callers can splice it in
+	 * unconditionally.
+	 */
+	getMcpHealthDiagnostics(): string[] {
+		return this.mcpHealthMonitor.diagnosticLines();
+	}
+
+	/**
+	 * Probe every remote MCP server Cyrus would configure, once, at startup.
+	 *
+	 * Builds the MCP config for each configured repository (the same call the
+	 * live session path makes, minus a parent session id) and hands the deduped
+	 * union to `McpHealthMonitor`, which handshakes each remote server with
+	 * bounded exponential backoff. Servers dropped for headless mode are already
+	 * recorded as `skipped` by `McpConfigService` and are not probed.
+	 *
+	 * Never throws — an unreachable MCP server is a diagnostic, not a boot
+	 * failure.
+	 */
+	private async probeMcpHealth(): Promise<void> {
+		const servers: Record<string, McpServerConfig> = {};
+		for (const repo of this.repositories.values()) {
+			try {
+				const workspaceId = requireLinearWorkspaceId(repo);
+				Object.assign(
+					servers,
+					this.mcpConfigService.describeMcpServers(repo.id, workspaceId),
+				);
+			} catch (error) {
+				this.logger.debug(
+					`Skipping MCP health probe for repository ${repo.id}:`,
+					error,
+				);
+			}
+		}
+
+		if (Object.keys(servers).length === 0) return;
+
+		if (this.mcpConfigService.isHeadless()) {
+			this.logger.info(
+				"🔌 MCP: headless container mode — servers requiring interactive OAuth are omitted",
+			);
+		}
+
+		await this.mcpHealthMonitor.probeAll(servers, {
+			// `cyrus-tools` is served by THIS process and only answers a request
+			// carrying a live `x-cyrus-mcp-context-id` (see
+			// registerCyrusToolsMcpEndpoint). A context-free probe would get a 500
+			// and be recorded as a false failure, so its health comes from the SDK's
+			// per-session `system`/`init` report instead — which is now blocking for
+			// this server (`alwaysLoad: true`), so a genuine failure shows up on the
+			// very first turn.
+			skip: ["cyrus-tools"],
+		});
+		for (const line of this.getMcpHealthDiagnostics()) {
+			this.logger.info(line);
+		}
 	}
 
 	/**

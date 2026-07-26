@@ -44,6 +44,19 @@ export class WorkerService {
 	}
 
 	/**
+	 * MCP connection-health lines for the startup banner — which MCP servers
+	 * connected, which are retrying/degraded/failed, and which were skipped
+	 * (e.g. `cyrus-docs` inside a headless container, where its interactive
+	 * OAuth flow can never complete).
+	 *
+	 * Empty until the EdgeWorker's background probe has recorded something, so
+	 * banner callers can splice it in unconditionally.
+	 */
+	getMcpHealthDiagnostics(): string[] {
+		return this.edgeWorker?.getMcpHealthDiagnostics() ?? [];
+	}
+
+	/**
 	 * Start setup waiting mode - server infrastructure only, no EdgeWorker
 	 * Used after initial authentication while waiting for server configuration
 	 */

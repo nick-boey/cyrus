@@ -85,6 +85,20 @@ export interface ClaudeRunnerConfig {
 	onError?: (error: Error) => void | Promise<void>;
 	onComplete?: (messages: SDKMessage[]) => void | Promise<void>;
 	/**
+	 * Called once per session with the MCP connection statuses the SDK reports in
+	 * its `system`/`init` message.
+	 *
+	 * This is the ONLY place the SDK tells us whether an MCP server actually
+	 * connected. Cyrus runs every session with `MCP_CONNECTION_NONBLOCKING=true`
+	 * (see `CYRUS_SESSION_ENV` in `session-env.ts`), so servers connect in the
+	 * background and a failed connect never fails the session — without this hook
+	 * a degraded `linear` or `cyrus-tools` server is completely invisible.
+	 */
+	onMcpServerStatus?: (
+		servers: readonly McpServerStatusReport[],
+		sessionId: string,
+	) => void | Promise<void>;
+	/**
 	 * Pre-warmed session from startup() — when set, the first streaming query uses
 	 * this warm instance instead of spawning a cold process (~20x faster first turn).
 	 */
@@ -110,6 +124,17 @@ export interface ClaudeSessionInfo {
 	isRunning: boolean;
 }
 
+/**
+ * One entry of the SDK `system`/`init` message's `mcp_servers` array.
+ * `status` is a free-form string from Claude Code (`connected`, `pending`,
+ * `failed`, `needs-auth`, …) — classified by `classifyMcpFailure` in
+ * `cyrus-core`, never string-matched at call sites.
+ */
+export interface McpServerStatusReport {
+	name: string;
+	status: string;
+}
+
 export interface ClaudeRunnerEvents {
 	message: (message: SDKMessage) => void;
 	assistant: (content: string) => void;
@@ -118,6 +143,11 @@ export interface ClaudeRunnerEvents {
 	"end-turn": (lastText: string) => void;
 	error: (error: Error) => void | Promise<void>;
 	complete: (messages: SDKMessage[]) => void | Promise<void>;
+	/** Per-session MCP connection statuses from the SDK's `system`/`init`. */
+	"mcp-server-status": (
+		servers: readonly McpServerStatusReport[],
+		sessionId: string,
+	) => void;
 }
 
 // Re-export SDK types for convenience
