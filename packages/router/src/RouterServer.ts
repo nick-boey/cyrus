@@ -127,6 +127,10 @@ export interface RouterContainersConfig {
 		keepSnapshots?: number;
 		/** Default 120_000 — grace before replacing Running but WSS-disconnected ACA workers. */
 		disconnectedRecreateMs?: number;
+		/** Default 90_000 — how long a resumed sandbox may take to rejoin the router's WSS before it is replaced. */
+		resumeConnectTimeoutMs?: number;
+		/** Default 2_000 — poll cadence while confirming a resumed worker reconnected. */
+		resumeConnectPollMs?: number;
 		/** Override the pinned `2026-02-01-preview` data-plane api-version. */
 		apiVersion?: string;
 		/** Override the per-region `management.{region}.azuredevcompute.io` base. */

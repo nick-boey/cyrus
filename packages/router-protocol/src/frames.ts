@@ -10,6 +10,41 @@ import { z } from "zod";
  */
 export const PROTOCOL_VERSION = 2;
 
+/**
+ * Router → device ping cadence, in milliseconds. `DeviceGateway` pings every
+ * registered socket on this interval; a socket that misses
+ * {@link MAX_MISSED_HEARTBEATS} consecutive cycles is terminated.
+ *
+ * Shared here because BOTH sides derive liveness deadlines from it: the
+ * router's own sweep, and the device's inbound-activity watchdog in
+ * `RouterConnection`. Keeping one constant is what makes
+ * {@link DEVICE_LIVENESS_TIMEOUT_MS} a real relationship rather than two
+ * numbers that silently drift apart.
+ */
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/**
+ * "Misses two heartbeats" — two consecutive ping cycles pass with no pong
+ * before the router terminates the socket, and (symmetrically) two cycles with
+ * no inbound server activity before the device gives up on its socket.
+ */
+export const MAX_MISSED_HEARTBEATS = 2;
+
+/**
+ * How long a device tolerates total silence from the router before deciding
+ * its socket is dead. Derived from the router's own heartbeat policy, so the
+ * device gives up at the same point the router does rather than at some
+ * unrelated hardcoded number.
+ *
+ * The device must measure this against WALL-CLOCK time (`Date.now()`), never
+ * by counting timer ticks: an Azure Container Apps sandbox suspended in
+ * `Memory` mode freezes every JavaScript timer, so on resume the ticks simply
+ * fire late and a tick-counting watchdog observes no gap at all — while the
+ * router has long since terminated its side of the socket.
+ */
+export const DEVICE_LIVENESS_TIMEOUT_MS =
+	HEARTBEAT_INTERVAL_MS * MAX_MISSED_HEARTBEATS;
+
 const helloFrame = z.object({
 	type: z.literal("hello"),
 	deviceToken: z.string().min(1),
@@ -58,6 +93,12 @@ const helloAckFrame = z.object({
 		name: z.string().optional(),
 	}),
 	serverVersion: z.string(),
+	// The router's actual ping cadence, so the device's liveness watchdog can
+	// derive its deadline from the server it is really talking to rather than
+	// from a compiled-in default. Optional and additive: it does NOT bump
+	// PROTOCOL_VERSION. An older router omits it and the device falls back to
+	// HEARTBEAT_INTERVAL_MS.
+	heartbeatMs: z.number().int().positive().optional(),
 });
 const helloErrorFrame = z.object({
 	type: z.literal("hello_error"),

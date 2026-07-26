@@ -2,7 +2,9 @@ import { EventEmitter } from "node:events";
 import type { Server as HttpServer } from "node:http";
 import {
 	type DeviceFrame,
+	HEARTBEAT_INTERVAL_MS,
 	type HelloFrame,
+	MAX_MISSED_HEARTBEATS,
 	PROTOCOL_VERSION,
 	parseDeviceFrame,
 	type RpcResponseFrame,
@@ -11,9 +13,6 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { RouterStore } from "./RouterStore.js";
 
 const HELLO_TIMEOUT_MS = 10_000;
-// "misses two heartbeats" => two consecutive ping cycles pass with no pong
-// before the socket is terminated.
-const MAX_MISSED_HEARTBEATS = 2;
 
 interface SocketState {
 	deviceId?: number;
@@ -44,7 +43,7 @@ export class DeviceGateway extends EventEmitter {
 	constructor(store: RouterStore, opts?: { heartbeatMs?: number }) {
 		super();
 		this.store = store;
-		this.heartbeatMs = opts?.heartbeatMs ?? 30_000;
+		this.heartbeatMs = opts?.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
 	}
 
 	attach(httpServer: HttpServer, path: string): void {
@@ -252,6 +251,10 @@ export class DeviceGateway extends EventEmitter {
 				type: "hello_ack",
 				user: { id: String(userId) },
 				serverVersion: "1",
+				// Advertise our real ping cadence so the device's liveness
+				// watchdog terminates its socket at the same point we terminate
+				// ours, even when this router runs a non-default heartbeatMs.
+				heartbeatMs: this.heartbeatMs,
 			}),
 		);
 
