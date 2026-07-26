@@ -153,12 +153,19 @@ function issueStatusChangedEvent(opts: {
 	issueId: string;
 	identifier?: string;
 	organizationId?: string;
+	/**
+	 * The payload's own `createdAt`, which is part of the webhook idempotency
+	 * key. Two genuinely separate terminal notifications for one issue (Done →
+	 * reopen → Done) carry different payload timestamps; reusing one timestamp
+	 * models a REDELIVERY of a single notification, which `route()` now drops.
+	 */
+	createdAtMs?: number;
 }): AgentEvent {
 	return {
 		type: "AppUserNotification",
 		action: "issueStatusChanged",
 		organizationId: opts.organizationId ?? "ws-1",
-		createdAt: new Date(ROUTE_NOW).toISOString(),
+		createdAt: new Date(opts.createdAtMs ?? ROUTE_NOW).toISOString(),
 		notification: {
 			issue: {
 				id: opts.issueId,
@@ -1011,11 +1018,18 @@ describe("EventRouter issue promotion to a started state", () => {
 				terminalTeardown: teardown,
 			});
 
+			// Two DISTINCT closed notifications (Done → reopen → Done), hence two
+			// payload timestamps: this test is about TerminalTeardown.register's
+			// own wakeup dedupe, not the webhook-redelivery gate in route().
 			await router.route(
 				issueStatusChangedEvent({ issueId: "issue-1", identifier: "TEST-1" }),
 			);
 			await router.route(
-				issueStatusChangedEvent({ issueId: "issue-1", identifier: "TEST-1" }),
+				issueStatusChangedEvent({
+					issueId: "issue-1",
+					identifier: "TEST-1",
+					createdAtMs: ROUTE_NOW + 1_000,
+				}),
 			);
 			await router.route(
 				issueDeletedEvent({ issueId: "issue-1", identifier: "TEST-1" }),
