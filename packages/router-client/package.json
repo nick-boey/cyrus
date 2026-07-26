@@ -16,16 +16,16 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"cyrus-router-protocol": "workspace:*",
 		"cyrus-core": "workspace:*",
 		"cyrus-linear-event-transport": "workspace:*",
-		"ws": "^8.18.0"
+		"cyrus-router-protocol": "workspace:*",
+		"ws": "^8.21.1"
 	},
 	"devDependencies": {
-		"@types/ws": "^8.5.12",
-		"@types/node": "^20.0.0",
-		"typescript": "^5.3.3",
-		"vitest": "^4.1.0"
+		"@types/node": "^20.19.43",
+		"@types/ws": "^8.18.1",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.10"
 	},
 	"publishConfig": {
 		"access": "public"
