@@ -27,7 +27,7 @@ interface SocketState {
  * order, receives acks, and emits ingress events (rpc / session_state).
  *
  * Emits:
- *  - "deviceConnected"(deviceId: number)
+ *  - "deviceConnected"(deviceId: number, activeSessions?: string[])
  *  - "deviceDisconnected"(deviceId: number)
  *  - "rpc"(deviceId: number, frame: RpcRequestFrame)
  *  - "sessionState"(deviceId: number, frame: SessionStateFrame)
@@ -270,7 +270,11 @@ export class DeviceGateway extends EventEmitter {
 			this.store.ackEvent(deviceId, e.seq);
 		}
 
-		this.emit("deviceConnected", deviceId);
+		// Carry the device's declared active sessions so a listener can
+		// reconcile stale issue locks. Emitted after the lastAckedSeq purge
+		// above and before deliverPending, so a reconcile handler sees the true
+		// set of still-undelivered events (via store.hasPendingEvents).
+		this.emit("deviceConnected", deviceId, frame.activeSessions);
 
 		this.deliverPending(deviceId);
 	}
