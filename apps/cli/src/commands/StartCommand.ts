@@ -40,6 +40,18 @@ export class StartCommand extends BaseCommand {
 				this.logger.info("\n⏸️  No repositories configured");
 				this.logger.info("   Add one with: cyrus self-add-repo <git-url>");
 			}
+
+			// MCP connection health. EdgeWorker.start() kicks the probe off in the
+			// background (it must not delay accepting webhooks), so on a fast boot
+			// this shows the configured inventory and the probe re-logs the settled
+			// connected/degraded/skipped picture moments later.
+			const mcpHealth = this.app.worker.getMcpHealthDiagnostics();
+			if (mcpHealth.length > 0) {
+				this.logger.info("");
+				for (const line of mcpHealth) {
+					this.logger.info(line);
+				}
+			}
 			this.logger.divider(70);
 
 			// Setup signal handlers for graceful shutdown

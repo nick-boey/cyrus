@@ -41,6 +41,7 @@ import type {
 	ClaudeRunnerConfig,
 	ClaudeRunnerEvents,
 	ClaudeSessionInfo,
+	McpServerStatusReport,
 } from "./types.js";
 
 // AbortError is no longer exported in v1.0.95, so we define it locally
@@ -1168,7 +1169,15 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 				break;
 
 			case "system":
-				// System messages are for initialization
+				// The `init` system message is the ONLY report the SDK gives us of
+				// per-server MCP connection state. Surface it instead of dropping
+				// it: with MCP_CONNECTION_NONBLOCKING=true a server that never
+				// connected (or is retrying) otherwise fails silently, which is
+				// exactly how the live ACA drive lost visibility into `linear` and
+				// `cyrus-tools` reconnecting mid-session.
+				if (message.subtype === "init") {
+					this.reportMcpServerStatuses(message.mcp_servers);
+				}
 				break;
 
 			case "rate_limit_event":
@@ -1182,6 +1191,40 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 
 			default:
 				this.logger.debug(`Unhandled message type: ${(message as any).type}`);
+		}
+	}
+
+	/**
+	 * Log the SDK's per-session MCP connection statuses and forward them to the
+	 * `onMcpServerStatus` callback / `mcp-server-status` event so the EdgeWorker
+	 * can fold them into MCP health diagnostics and start a bounded re-probe of
+	 * anything that failed transiently.
+	 *
+	 * Never throws: an MCP diagnostic must not be able to abort a live session.
+	 */
+	private reportMcpServerStatuses(
+		servers: readonly McpServerStatusReport[] | undefined,
+	): void {
+		if (!servers || servers.length === 0) return;
+
+		const sessionId = this.sessionInfo?.sessionId ?? "unknown";
+		const rendered = servers
+			.map((server) => `${server.name}=${server.status}`)
+			.join(", ");
+		const unhealthy = servers.filter(
+			(server) => server.status?.toLowerCase() !== "connected",
+		);
+		if (unhealthy.length > 0) {
+			this.logger.warn(`MCP servers for session ${sessionId}: ${rendered}`);
+		} else {
+			this.logger.info(`MCP servers for session ${sessionId}: ${rendered}`);
+		}
+
+		this.emit("mcp-server-status", servers, sessionId);
+		try {
+			void this.config.onMcpServerStatus?.(servers, sessionId);
+		} catch (error) {
+			this.logger.warn("onMcpServerStatus callback threw:", error);
 		}
 	}
 

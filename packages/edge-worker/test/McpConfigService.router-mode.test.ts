@@ -71,6 +71,8 @@ describe("McpConfigService router mode", () => {
 			type: "http",
 			url: "https://mcp.linear.app/mcp",
 			headers: { Authorization: "Bearer lin_api_static" },
+			// Bounded tool-call timeout — see McpConfigService.headless.test.ts.
+			timeout: 60_000,
 		});
 	});
 });
