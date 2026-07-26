@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -12,6 +12,15 @@ import { createLogger, type ILogger } from "./logging/index.js";
 
 /** Current persistence format version */
 export const PERSISTENCE_VERSION = "4.0";
+
+/**
+ * Monotonic counter making each save's temp-file name unique within this
+ * process. Saves can overlap — {@link PersistenceManager.saveEdgeWorkerState}
+ * is fired from an un-awaited `onStateChange` callback as well as several
+ * awaited call sites — so two writes must never share a temp path or they
+ * would clobber each other mid-write.
+ */
+let tempFileCounter = 0;
 
 // Serialized versions with Date fields as strings
 export type SerializedCyrusAgentSession = CyrusAgentSession;
@@ -107,19 +116,36 @@ export class PersistenceManager {
 	}
 
 	/**
-	 * Save EdgeWorker state to disk (single file for all repositories)
+	 * Save EdgeWorker state to disk (single file for all repositories).
+	 *
+	 * Writes to a unique temp file and atomically renames it over the real
+	 * file. A partial write — the common case being ENOSPC when the disk fills
+	 * — then damages only the throwaway temp file, never the last good state.
+	 * This matters because {@link loadEdgeWorkerState} treats an unparseable
+	 * file as "no state", so an in-place write truncated mid-JSON silently
+	 * discards every session on the next restart. In router mode that strands
+	 * the issue lock and affinity for every interrupted session forever, since
+	 * the device no longer knows the session exists to report it terminal.
 	 */
 	async saveEdgeWorkerState(state: SerializableEdgeWorkerState): Promise<void> {
+		const stateFile = this.getEdgeWorkerStateFilePath();
+		// Unique per write (pid + counter): overlapping saves must not share a
+		// temp path. Same directory as the target so the rename stays on one
+		// filesystem and is therefore atomic.
+		const tempFile = `${stateFile}.${process.pid}.${tempFileCounter++}.tmp`;
 		try {
 			await this.ensurePersistenceDirectory();
-			const stateFile = this.getEdgeWorkerStateFilePath();
 			const stateData = {
 				version: PERSISTENCE_VERSION,
 				savedAt: new Date().toISOString(),
 				state,
 			};
-			await writeFile(stateFile, JSON.stringify(stateData, null, 2), "utf8");
+			await writeFile(tempFile, JSON.stringify(stateData, null, 2), "utf8");
+			await rename(tempFile, stateFile);
 		} catch (error) {
+			// Best-effort cleanup: a failed write (e.g. ENOSPC) may leave the
+			// temp file behind. Don't let its removal mask the original error.
+			await unlink(tempFile).catch(() => {});
 			this.logger.error("Failed to save EdgeWorker state:", error);
 			throw error;
 		}
@@ -136,7 +162,28 @@ export class PersistenceManager {
 				return null;
 			}
 
-			const stateData = JSON.parse(await readFile(stateFile, "utf8"));
+			const raw = await readFile(stateFile, "utf8");
+			// `state` is an opaque blob whose real shape depends on `version`; the
+			// migration branches below narrow it with explicit casts.
+			let stateData: { version?: string; state?: unknown };
+			try {
+				stateData = JSON.parse(raw);
+			} catch (parseError) {
+				// A corrupt file (historically: an in-place write truncated by
+				// ENOSPC) must not be silently treated as "no state" — that
+				// discards every session and, in router mode, strands their
+				// locks. Preserve it for diagnosis instead of overwriting it on
+				// the next save, and surface the loss loudly.
+				await this.preserveCorruptStateFile(stateFile);
+				this.logger.error(
+					"EdgeWorker state file is corrupt and could not be parsed; " +
+						"preserved a copy alongside it. Starting with empty state.",
+					parseError instanceof Error
+						? parseError
+						: new Error(String(parseError)),
+				);
+				return null;
+			}
 
 			// Validate state structure exists
 			if (!stateData.state) {
@@ -147,7 +194,9 @@ export class PersistenceManager {
 			// Handle version migration
 			if (stateData.version === "2.0") {
 				this.logger.info("Migrating state from v2.0 to v3.0 to v4.0");
-				const v3State = this.migrateV2ToV3(stateData.state);
+				const v3State = this.migrateV2ToV3(
+					stateData.state as V3SerializableEdgeWorkerState,
+				);
 				const migratedState = this.migrateV3ToV4(v3State);
 				await this.saveEdgeWorkerState(migratedState);
 				this.logger.info(
@@ -175,10 +224,28 @@ export class PersistenceManager {
 				return null;
 			}
 
-			return stateData.state;
+			return stateData.state as SerializableEdgeWorkerState;
 		} catch (error) {
 			this.logger.error("Failed to load EdgeWorker state:", error);
 			return null;
+		}
+	}
+
+	/**
+	 * Move a corrupt state file aside so the next save doesn't overwrite the
+	 * evidence and an operator can inspect what was lost. Best-effort: if the
+	 * rename fails the caller still proceeds with empty state.
+	 */
+	private async preserveCorruptStateFile(stateFile: string): Promise<void> {
+		const backup = `${stateFile}.corrupt-${Date.now()}`;
+		try {
+			await rename(stateFile, backup);
+			this.logger.warn(`Preserved corrupt state file as ${backup}`);
+		} catch (error) {
+			this.logger.error(
+				"Failed to preserve corrupt state file:",
+				error instanceof Error ? error : new Error(String(error)),
+			);
 		}
 	}
 
