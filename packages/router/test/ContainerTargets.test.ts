@@ -70,7 +70,10 @@ describe("ContainerTargetService", () => {
 		logger = { info: vi.fn(), warn: vi.fn() };
 	});
 
-	function makeService(executors: ExecutorRegistry): ContainerTargetService {
+	function makeService(
+		executors: ExecutorRegistry,
+		now?: () => number,
+	): ContainerTargetService {
 		return new ContainerTargetService({
 			store,
 			secrets,
@@ -78,6 +81,7 @@ describe("ContainerTargetService", () => {
 			containersConfig: CONTAINERS_CONFIG,
 			postActivity,
 			logger,
+			...(now ? { now } : {}),
 		});
 	}
 
@@ -519,5 +523,128 @@ describe("ContainerTargetService", () => {
 		expect(postActivity.mock.calls[0]?.[2]).toContain(
 			"missing GIT_TOKEN, LINEAR_API_TOKEN",
 		);
+	});
+	/**
+	 * Joining an in-flight boot is a dedup of concurrent work, never proof that
+	 * the container ended up running. These pin the two ways that assumption
+	 * broke a terminal-teardown wake on the live drive: the joined attempt
+	 * finished with the container stopped, and the joined attempt never
+	 * finished at all.
+	 */
+	describe("joining an in-flight boot", () => {
+		function seed(ensureRunning: Mock, status: Mock, now?: () => number) {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker", { ensureRunning });
+			docker.status = status;
+			const service = makeService(new Map([["docker", docker]]), now);
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"CYPACK-1",
+			);
+			return { service, deviceId, docker };
+		}
+
+		it("still boots when the joined attempt left the container stopped", async () => {
+			// The exact live shape: a resume is in flight when the idle sweep parks
+			// the container, so the boot settles having achieved nothing. A
+			// terminal-teardown wake arriving in that window must NOT conclude the
+			// container is up - otherwise nothing ever starts it and only the grace
+			// deadline reclaims it.
+			let releaseFirst!: () => void;
+			const firstBoot = new Promise<void>((r) => {
+				releaseFirst = r;
+			});
+			const ensureRunning = vi
+				.fn<() => Promise<void>>()
+				.mockReturnValueOnce(firstBoot)
+				.mockResolvedValue(undefined);
+			const status = vi.fn(async () => "stopped" as const);
+			const { service, deviceId } = seed(ensureRunning, status);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(1));
+
+			// The teardown wake lands while the first boot is still in flight.
+			service.bootForTeardown(deviceId);
+			releaseFirst();
+
+			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(2));
+			expect(status).toHaveBeenCalledWith("CYPACK-1");
+		});
+
+		it("does not re-boot when the joined attempt did leave it running", async () => {
+			// The dedup this join exists for: two webhooks seconds apart must not
+			// drive two ensureRunning calls (the second would re-mint the device
+			// token and orphan the container the first just started).
+			let releaseFirst!: () => void;
+			const firstBoot = new Promise<void>((r) => {
+				releaseFirst = r;
+			});
+			const ensureRunning = vi
+				.fn<() => Promise<void>>()
+				.mockReturnValueOnce(firstBoot)
+				.mockResolvedValue(undefined);
+			const status = vi.fn(async () => "running" as const);
+			const { service, deviceId } = seed(ensureRunning, status);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(1));
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-2" });
+			releaseFirst();
+
+			await vi.waitFor(() => expect(status).toHaveBeenCalled());
+			expect(ensureRunning).toHaveBeenCalledTimes(1);
+		});
+
+		it("abandons a boot that has hung past the join window and starts a fresh one", async () => {
+			// A provider call that never settles must not disable booting for the
+			// device forever - the teardown wake has to be able to get through.
+			const ensureRunning = vi
+				.fn<() => Promise<void>>()
+				.mockReturnValueOnce(new Promise<void>(() => {})) // never settles
+				.mockResolvedValue(undefined);
+			const status = vi.fn(async () => "stopped" as const);
+			let clock = 0;
+			const { service, deviceId } = seed(ensureRunning, status, () => clock);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(1));
+
+			// Past the 10-minute join window.
+			clock = 11 * 60_000;
+			service.bootForTeardown(deviceId);
+
+			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(2));
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("abandoning the join"),
+			);
+		});
+
+		it("boots for real when the provider cannot report status after a join", async () => {
+			let releaseFirst!: () => void;
+			const firstBoot = new Promise<void>((r) => {
+				releaseFirst = r;
+			});
+			const ensureRunning = vi
+				.fn<() => Promise<void>>()
+				.mockReturnValueOnce(firstBoot)
+				.mockResolvedValue(undefined);
+			const status = vi.fn(async () => {
+				throw new Error("provider unreachable");
+			});
+			const { service, deviceId } = seed(ensureRunning, status);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(1));
+			service.bootForTeardown(deviceId);
+			releaseFirst();
+
+			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(2));
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("could not read container status"),
+			);
+		});
 	});
 });

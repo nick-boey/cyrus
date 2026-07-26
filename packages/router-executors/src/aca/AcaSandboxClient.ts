@@ -157,6 +157,24 @@ const RBAC_403_RETRY_MAX = 20;
 const RBAC_403_RETRY_DELAY_MS = 5_000;
 
 /**
+ * Per-request deadline for every ACA data-plane call.
+ *
+ * Node's `fetch` has no overall request timeout — only undici's 300s headers
+ * timeout — so a blackholed data plane (an NSG change, an egress policy that
+ * silently drops rather than rejects) leaves a request pending for minutes or
+ * indefinitely. That matters far beyond this client: `ensureRunning` awaits
+ * these calls while holding the provider's per-issue mutex, and
+ * `ContainerTargets` in turn awaits `ensureRunning` while holding the device's
+ * in-flight boot slot. A single hung request therefore blocks every later boot
+ * for that issue — including the wake that a terminal teardown needs — so the
+ * container is only ever reclaimed by the grace deadline.
+ *
+ * Bounding it here means every call settles, one way or the other. Generous
+ * enough not to fire on a legitimately slow control-plane operation.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+
+/**
  * Create is synchronous (200 with `state: "Running"`) per the spike; this
  * loop is a defensive fallback the spike never exercised. Bounded tight.
  */
@@ -184,6 +202,7 @@ export class AcaSandboxClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
 	private readonly sleepFn: SleepFn;
+	private readonly requestTimeoutMs: number;
 
 	constructor(opts: {
 		subscriptionId: string;
@@ -199,6 +218,8 @@ export class AcaSandboxClient {
 		baseUrl?: string;
 		/** Injectable for tests; default uses `setTimeout`. */
 		sleepFn?: SleepFn;
+		/** Per-request deadline; default 120s. `0` disables it (tests). */
+		requestTimeoutMs?: number;
 	}) {
 		this.subscriptionId = opts.subscriptionId;
 		this.resourceGroup = opts.resourceGroup;
@@ -212,6 +233,20 @@ export class AcaSandboxClient {
 		this.sleepFn =
 			opts.sleepFn ??
 			((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+		this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+	}
+
+	/**
+	 * Per-attempt abort signal. Applied to each attempt rather than to the whole
+	 * `request()` call so the RBAC-403 retry loop still gets its full budget —
+	 * the point is that no SINGLE fetch can hang, not that the retry sequence is
+	 * capped. Omitted entirely when the timeout is disabled, so an injected
+	 * `fetchFn` in tests never sees a signal it didn't ask for.
+	 */
+	private timeoutSignal(): AbortSignal | undefined {
+		return this.requestTimeoutMs > 0
+			? AbortSignal.timeout(this.requestTimeoutMs)
+			: undefined;
 	}
 
 	private get root(): string {
@@ -248,7 +283,8 @@ export class AcaSandboxClient {
 		let lastStatus = 0;
 		let lastBody: any;
 		for (let attempt = 0; attempt <= RBAC_403_RETRY_MAX; attempt++) {
-			const r = await this.fetchFn(url, init);
+			const signal = this.timeoutSignal();
+			const r = await this.fetchFn(url, signal ? { ...init, signal } : init);
 			lastStatus = r.status;
 			const text = await r.text();
 			let parsed: unknown;
@@ -385,7 +421,8 @@ export class AcaSandboxClient {
 		};
 
 		for (let attempt = 0; attempt <= RBAC_403_RETRY_MAX; attempt++) {
-			const r = await this.fetchFn(url, init);
+			const signal = this.timeoutSignal();
+			const r = await this.fetchFn(url, signal ? { ...init, signal } : init);
 			if (r.status === 403 && attempt < RBAC_403_RETRY_MAX) {
 				await this.sleepFn(RBAC_403_RETRY_DELAY_MS);
 				continue;
