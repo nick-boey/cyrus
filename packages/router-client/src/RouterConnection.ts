@@ -10,9 +10,11 @@ import {
 import { join } from "node:path";
 import {
 	type EventFrame,
+	HEARTBEAT_INTERVAL_MS,
 	type HelloAckFrame,
 	type HelloErrorFrame,
 	type HelloFrame,
+	MAX_MISSED_HEARTBEATS,
 	PROTOCOL_VERSION,
 	parseServerFrame,
 	type RpcRequestFrame,
@@ -27,6 +29,16 @@ const BACKOFF_CAP_MS = 60_000;
 const DEFAULT_RECONNECT_BASE_MS = 1_000;
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 
+/**
+ * The watchdog samples the wall clock this often, as a fraction of the router's
+ * heartbeat interval. Half a heartbeat bounds detection latency to ~15s on the
+ * default 30s cadence without adding a meaningful timer to the event loop.
+ * Floored at 1s so a pathologically small configured heartbeat can't turn this
+ * into a busy loop.
+ */
+const LIVENESS_CHECK_DIVISOR = 2;
+const LIVENESS_CHECK_FLOOR_MS = 1_000;
+
 export interface RouterConnectionOptions {
 	/** Base router URL; the `/device` path is appended automatically. */
 	url: string;
@@ -37,6 +49,20 @@ export interface RouterConnectionOptions {
 	reconnectBaseMs?: number;
 	/** Default 30_000ms. */
 	rpcTimeoutMs?: number;
+	/**
+	 * Assumed router ping cadence before the first `hello_ack` (which carries
+	 * the router's real value and overrides this). Defaults to the shared
+	 * protocol constant. The liveness watchdog gives up on a silent socket
+	 * after `heartbeat * MAX_MISSED_HEARTBEATS` of wall-clock silence, so this
+	 * is the only knob tests need to compress the watchdog's timescale.
+	 */
+	serverHeartbeatMs?: number;
+	/**
+	 * Injectable wall clock for the liveness watchdog (tests). Defaults to
+	 * `Date.now`. MUST be a wall clock, not a monotonic tick counter — see the
+	 * watchdog notes on {@link RouterConnection}.
+	 */
+	now?: () => number;
 	/**
 	 * Returns the session IDs the device is currently tracking, sent in every
 	 * hello so the router can reclaim issue locks for sessions the device has
@@ -121,6 +147,33 @@ interface PersistedState {
  *    mid-call router outage rejects an in-flight RPC retryably — to a durable
  *    JSONL file, replaying them FIFO with a stable `mutationId` so the router
  *    dedupes idempotent replays (finding 4).
+ *  - Runs a WALL-CLOCK liveness watchdog over inbound server activity, so a
+ *    socket the router has already given up on is torn down and redialed
+ *    instead of being held forever (see below).
+ *
+ * ── LIVENESS WATCHDOG (why wall clock, not tick counting) ──
+ * `ws` does not surface "the peer stopped answering" on its own: the router
+ * pings, we auto-pong, and if the router terminates its end the TCP connection
+ * can stay half-open on ours indefinitely. That is exactly what an Azure
+ * Container Apps `Memory`-mode suspend produces — the sandbox freezes, the
+ * router misses two heartbeats and terminates its socket, and on resume the
+ * worker still believes it is connected. Observed live: ACA resumed a sandbox
+ * to `Running` in 1.25s and the worker never reconnected, so the router's
+ * safely-queued prompt sat undelivered until a *later* prompt crossed the
+ * 120s disconnected threshold and forced a cold sandbox replacement.
+ *
+ * So we timestamp every inbound signal from the router (`ping`, `pong`, and any
+ * message frame) with `Date.now()` and, on a periodic sample, terminate the
+ * socket once that timestamp is older than `MAX_MISSED_HEARTBEATS` router
+ * heartbeat intervals. `terminate()` synthesises the `close` the half-open
+ * socket never delivered, which feeds the ordinary `handleDisconnect` →
+ * `scheduleReconnect` → `dial` path, so a fresh authenticated `hello` (carrying
+ * `lastAckedSeq`) drains the queued events.
+ *
+ * Comparing wall clocks is load-bearing, not a stylistic choice: JavaScript
+ * timers are frozen for the whole suspend, so a watchdog that counted
+ * `setInterval` ticks would see its ticks arrive late and conclude nothing had
+ * happened. Only `Date.now()` reveals the gap.
  *
  * ── CONSUMER CONTRACT for the "event" listener (read before wiring this up) ──
  * The `"event"` listener MUST be attached synchronously, before/around
@@ -144,6 +197,7 @@ export class RouterConnection extends EventEmitter {
 	private readonly reconnectBaseMs: number;
 	private readonly rpcTimeoutMs: number;
 	private readonly getActiveSessions: (() => string[]) | undefined;
+	private readonly now: () => number;
 
 	private readonly stateFile: string;
 	private readonly outboundFile: string;
@@ -156,6 +210,12 @@ export class RouterConnection extends EventEmitter {
 	private _connected = false;
 	private reconnectAttempts = 0;
 	private reconnectTimer: NodeJS.Timeout | undefined;
+
+	/** Router ping cadence; replaced by the value `hello_ack` advertises. */
+	private serverHeartbeatMs: number;
+	/** Wall-clock stamp of the most recent inbound signal from the router. */
+	private lastServerActivityMs = 0;
+	private livenessTimer: NodeJS.Timeout | undefined;
 
 	private lastAckedSeq: number;
 	private outboundEntries: OutboundEntry[];
@@ -170,6 +230,11 @@ export class RouterConnection extends EventEmitter {
 		this.reconnectBaseMs = opts.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS;
 		this.rpcTimeoutMs = opts.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
 		this.getActiveSessions = opts.getActiveSessions;
+		// Read the global lazily rather than capturing `Date.now` itself, so a
+		// test (or anything else) that installs a mock clock after construction
+		// still drives the watchdog.
+		this.now = opts.now ?? (() => Date.now());
+		this.serverHeartbeatMs = opts.serverHeartbeatMs ?? HEARTBEAT_INTERVAL_MS;
 
 		mkdirSync(opts.stateDir, { recursive: true });
 		this.stateFile = join(opts.stateDir, "router-connection.json");
@@ -208,6 +273,7 @@ export class RouterConnection extends EventEmitter {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = undefined;
 		}
+		this.stopLivenessWatchdog();
 		this._connected = false;
 		this.teardownSocket();
 	}
@@ -322,6 +388,11 @@ export class RouterConnection extends EventEmitter {
 		};
 		ws.on("open", () => this.sendHello(ws));
 		ws.on("message", (raw) => this.handleMessage(raw.toString()));
+		// Every inbound signal counts as proof of life, including the protocol
+		// frames the router sends purely to keep the socket warm. `ws` answers a
+		// server ping with a pong automatically; we only observe it.
+		ws.on("ping", () => this.noteServerActivity());
+		ws.on("pong", () => this.noteServerActivity());
 		ws.on("close", onDown);
 		ws.on("error", onDown);
 	}
@@ -358,6 +429,7 @@ export class RouterConnection extends EventEmitter {
 	private handleDisconnect(): void {
 		const wasConnected = this._connected;
 		this._connected = false;
+		this.stopLivenessWatchdog();
 		this.rejectAllPending(new RouterRpcError("connection lost", true));
 		if (wasConnected) this.emit("disconnected");
 		if (!this.stopped) this.scheduleReconnect();
@@ -376,9 +448,68 @@ export class RouterConnection extends EventEmitter {
 		}, delay);
 	}
 
+	// ── Liveness watchdog ──────────────────────────────────────────────────
+
+	/** Wall-clock deadline: silence longer than this means the socket is dead. */
+	private get livenessTimeoutMs(): number {
+		return this.serverHeartbeatMs * MAX_MISSED_HEARTBEATS;
+	}
+
+	private noteServerActivity(): void {
+		this.lastServerActivityMs = this.now();
+	}
+
+	private startLivenessWatchdog(): void {
+		this.stopLivenessWatchdog();
+		this.noteServerActivity();
+		const tickMs = Math.max(
+			LIVENESS_CHECK_FLOOR_MS,
+			Math.floor(this.serverHeartbeatMs / LIVENESS_CHECK_DIVISOR),
+		);
+		this.livenessTimer = setInterval(() => this.checkLiveness(), tickMs);
+		// Never hold the process open on the watchdog alone; the socket itself is
+		// the handle that keeps a live worker running.
+		this.livenessTimer.unref?.();
+	}
+
+	private stopLivenessWatchdog(): void {
+		if (!this.livenessTimer) return;
+		clearInterval(this.livenessTimer);
+		this.livenessTimer = undefined;
+	}
+
+	/**
+	 * One wall-clock sample. This tick may itself arrive arbitrarily late (an
+	 * ACA memory suspend freezes it for the whole suspend), which is precisely
+	 * why the decision is made from `now() - lastServerActivityMs` and never
+	 * from how many ticks have elapsed.
+	 */
+	private checkLiveness(): void {
+		if (this.stopped || !this._connected) return;
+		const silentMs = this.now() - this.lastServerActivityMs;
+		if (silentMs <= this.livenessTimeoutMs) return;
+		console.warn(
+			`[RouterConnection] no router activity for ${silentMs}ms (> ${this.livenessTimeoutMs}ms, ${MAX_MISSED_HEARTBEATS} heartbeats); terminating the stale socket and reconnecting`,
+		);
+		this.stopLivenessWatchdog();
+		const ws = this.ws;
+		if (ws) {
+			// `terminate()` (not `close()`) — a half-open socket will never
+			// complete a closing handshake. This synthesises the "close" event
+			// dial() is already listening for, which runs the normal
+			// handleDisconnect → scheduleReconnect → dial path.
+			ws.terminate();
+		} else {
+			this.handleDisconnect();
+		}
+	}
+
 	// ── Frame handling ─────────────────────────────────────────────────────
 
 	private handleMessage(raw: string): void {
+		// Stamped before parsing: even a frame we don't understand proves the
+		// router is still on the other end of this socket.
+		this.noteServerActivity();
 		let frame: ServerFrame;
 		try {
 			frame = parseServerFrame(raw);
@@ -407,6 +538,12 @@ export class RouterConnection extends EventEmitter {
 	private onHelloAck(frame: HelloAckFrame): void {
 		this._connected = true;
 		this.reconnectAttempts = 0;
+		// Prefer the router's advertised cadence over our compiled-in default, so
+		// the watchdog's deadline tracks the server that is actually pinging us.
+		if (frame.heartbeatMs !== undefined && frame.heartbeatMs > 0) {
+			this.serverHeartbeatMs = frame.heartbeatMs;
+		}
+		this.startLivenessWatchdog();
 		// Resend any terminal frames the router never acked. Done before the
 		// outbound replay so a stranded issue lock is released as early as
 		// possible; both are independent of each other.
@@ -423,6 +560,7 @@ export class RouterConnection extends EventEmitter {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = undefined;
 		}
+		this.stopLivenessWatchdog();
 		this._connected = false;
 		this.teardownSocket();
 		const error = new Error(`hello rejected: ${frame.reason}`);
