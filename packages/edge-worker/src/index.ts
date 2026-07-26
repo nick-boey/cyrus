@@ -33,6 +33,11 @@ export type { SerializedGlobalRegistryState } from "./GlobalSessionRegistry.js";
 export { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
 export type { McpConfigServiceDeps } from "./McpConfigService.js";
 export { McpConfigService } from "./McpConfigService.js";
+export type {
+	McpHealthMonitorDeps,
+	McpProbeFetch,
+} from "./McpHealthMonitor.js";
+export { McpHealthMonitor } from "./McpHealthMonitor.js";
 export { RepositoryRouter } from "./RepositoryRouter.js";
 export type {
 	ChatRunnerConfigInput,

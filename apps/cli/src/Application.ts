@@ -308,6 +308,15 @@ export class Application {
 			repositories.forEach((repo) => {
 				this.logger.info(`   • ${repo.name} (${repo.repositoryPath})`);
 			});
+
+			// MCP connection health — see the equivalent block in StartCommand.
+			const mcpHealth = this.worker.getMcpHealthDiagnostics();
+			if (mcpHealth.length > 0) {
+				this.logger.info("");
+				for (const line of mcpHealth) {
+					this.logger.info(line);
+				}
+			}
 			this.logger.divider(70);
 		} catch (error) {
 			this.logger.error(`❌ Failed to transition to normal mode: ${error}`);
