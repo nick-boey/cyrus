@@ -13,6 +13,7 @@ import {
 	InvalidIssueKeyError,
 } from "./ContainerTargets.js";
 import type { DeviceGateway } from "./DeviceGateway.js";
+import { webhookIdempotencyKey } from "./idempotency.js";
 import {
 	expiredMessage,
 	fillTemplate,
@@ -90,6 +91,12 @@ export interface EventRouterOptions {
 		eventTtlMs: number;
 		issueLock: boolean;
 		creatorOnlyPrompting: boolean;
+		/**
+		 * How long a claimed webhook idempotency key is remembered before
+		 * {@link EventRouter.sweepExpired} discards it. Defaults to
+		 * {@link DEFAULT_WEBHOOK_CLAIM_RETENTION_MS}.
+		 */
+		webhookClaimRetentionMs?: number;
 	};
 	logger: { info(msg: string): void; warn(msg: string): void };
 	/** Injectable clock (default `Date.now`) so TTL behavior is deterministic in tests. */
@@ -97,6 +104,17 @@ export interface EventRouterOptions {
 }
 
 const DEFAULT_EMAIL = "the delegating user";
+
+/**
+ * 7 days — how long a claimed webhook idempotency key is kept.
+ *
+ * The bound only has to outlive every window in which the SAME delivery can
+ * come back: Linear's own webhook redelivery window, a rolling deployment's
+ * old/new revision overlap, and the 48h default `eventTtlMs` a claimed event
+ * can sit queued for. A week clears all three with room to spare, and at
+ * router-scale webhook volumes the table stays tiny.
+ */
+export const DEFAULT_WEBHOOK_CLAIM_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Routes Linear agent-session webhooks to the creator's enrolled device.
@@ -124,6 +142,7 @@ export class EventRouter {
 		issueLock: boolean;
 		creatorOnlyPrompting: boolean;
 	};
+	private readonly webhookClaimRetentionMs: number;
 	private readonly logger: { info(msg: string): void; warn(msg: string): void };
 	private readonly now: () => number;
 
@@ -145,12 +164,23 @@ export class EventRouter {
 		this.containerTargets = opts.containerTargets;
 		this.terminalTeardown = opts.terminalTeardown;
 		this.config = opts.config;
+		this.webhookClaimRetentionMs =
+			opts.config.webhookClaimRetentionMs ?? DEFAULT_WEBHOOK_CLAIM_RETENTION_MS;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
 	}
 
 	async route(event: AgentEvent): Promise<void> {
 		const webhook = event as unknown as Webhook;
+		// Duplicate-delivery gate, BEFORE any routing work. A rolling deployment
+		// overlaps the outgoing and incoming router revision, so the same webhook
+		// (a Linear retry, or the same durable work replayed after a restart) can
+		// reach the router twice; the 2026-07-26 emergency rollout did exactly
+		// that and produced doubled Linear activity and two `linear-mcp-ok`
+		// comments for one surviving worker. Claim first so no side effect —
+		// queue row, issue lock, Linear activity, container boot, MCP mutation —
+		// can happen twice for one delivery.
+		if (!this.claimWebhook(webhook)) return;
 		if (isAgentSessionPromptedWebhook(webhook)) {
 			await this.routePrompted(webhook);
 			return;
@@ -180,6 +210,52 @@ export class EventRouter {
 		this.logger.info(
 			`EventRouter ignoring non-agent-session webhook ${webhook.type}/${webhook.action}`,
 		);
+	}
+
+	/**
+	 * Claims this delivery's idempotency key in SQLite, returning whether the
+	 * caller may go on to route it. The claim is transactional and arbitrated by
+	 * a UNIQUE constraint (see {@link RouterStore.claimWebhookEvent}), so two
+	 * router replicas sharing one database resolve to exactly one winner.
+	 *
+	 * Fails OPEN in two cases, both of which route the event unprotected rather
+	 * than drop it:
+	 * - The payload yields no key material at all (no `createdAt` — see
+	 *   {@link webhookIdempotencyKey}). Collapsing two distinct events onto a
+	 *   degenerate shared key would silently discard real work. No real Linear
+	 *   webhook takes this path.
+	 * - The store itself throws. A DB error is not evidence of a duplicate, and
+	 *   letting it escape would reject out of `route()` — which RouterServer
+	 *   invokes as `void route(event)` with no catch, so an unhandled rejection
+	 *   would take the whole router process down for every teammate. If the
+	 *   database really is unusable, `enqueueEvent` fails loudly a moment later
+	 *   for this one event instead.
+	 */
+	private claimWebhook(webhook: Webhook): boolean {
+		const label = `${webhook.type}/${webhook.action}`;
+		const key = webhookIdempotencyKey(webhook);
+		if (key === undefined) {
+			this.logger.warn(
+				`Webhook ${label} carries no idempotency key material; routing it without duplicate protection`,
+			);
+			return true;
+		}
+		let claimed: boolean;
+		try {
+			claimed = this.store.claimWebhookEvent(key, this.now());
+		} catch (err) {
+			this.logger.warn(
+				`Could not claim idempotency key ${key} for webhook ${label}; routing it without duplicate protection: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			);
+			return true;
+		}
+		if (claimed) return true;
+		this.logger.info(
+			`Dropping duplicate webhook ${label}: idempotency key ${key} was already claimed`,
+		);
+		return false;
 	}
 
 	/**
@@ -409,6 +485,18 @@ export class EventRouter {
 					`Released stale lock for session ${sessionId}; device ${device.deviceId} offline past TTL`,
 				);
 			}
+		}
+
+		// 3. Bounded retention for webhook idempotency claims. Nothing else ever
+		//    deletes from that table, so this pass is what keeps it from growing
+		//    for the life of the deployment.
+		const claimsSwept = this.store.sweepWebhookClaims(
+			now - this.webhookClaimRetentionMs,
+		);
+		if (claimsSwept > 0) {
+			this.logger.info(
+				`Swept ${claimsSwept} webhook idempotency claim(s) older than ${this.webhookClaimRetentionMs}ms`,
+			);
 		}
 	}
 
