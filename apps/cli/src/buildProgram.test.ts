@@ -120,6 +120,23 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		]);
 	});
 
+	it("forwards `router secrets list --check-scopes` as a string arg", async () => {
+		await run([
+			"router",
+			"secrets",
+			"list",
+			"alice@example.com",
+			"--check-scopes",
+		]);
+
+		expect(routerExecute).toHaveBeenCalledWith([
+			"secrets",
+			"list",
+			"alice@example.com",
+			"--check-scopes",
+		]);
+	});
+
 	it("registers `router devices list`", async () => {
 		await run(["router", "devices", "list"]);
 

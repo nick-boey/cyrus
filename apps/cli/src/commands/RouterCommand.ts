@@ -9,13 +9,16 @@ import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import { resolvePath } from "cyrus-core";
 import {
+	buildGitHubTokenScopeReport,
 	type ContainerDeviceInfo,
 	createAcaSandboxesProvider,
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	type DeviceInfo,
+	GITHUB_TOKEN_SECRET_KEYS,
 	isReservedEnvKey,
 	isStorableSecretKey,
 	KeyVaultSecretStore,
+	probeGitHubTokenScopes,
 	RESERVED_ENV_KEYS,
 	RouterServer,
 	type RouterServerConfig,
@@ -237,7 +240,10 @@ const RouterConfigFileSchema = z.object({
  *                                                # store a per-user container secret
  *   cyrus router secrets unset <email> <ENV_VAR_NAME>
  *                                                # remove a per-user container secret
- *   cyrus router secrets list <email>           # list stored secret keys (masked) + missing required
+ *   cyrus router secrets list <email> [--check-scopes]
+ *                                                # list stored secret keys (masked) + missing required;
+ *                                                # --check-scopes additionally reports the stored GitHub
+ *                                                # token's OAuth scopes (advisory, never rejects)
  *   cyrus router containers list                # list running ephemeral container devices
  *   cyrus router containers destroy <issueKey>  # drop a container device's row
  *   cyrus router containers gc-snapshots [--yes] # plan/delete orphan ACA snapshots
@@ -268,7 +274,7 @@ export class RouterCommand extends BaseCommand {
 				return this.unlock(rest[0]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces|aca>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email>|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|unlock <issueId>>",
+					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces|aca>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email> [--check-scopes]|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|unlock <issueId>>",
 				);
 		}
 	}
@@ -890,10 +896,13 @@ export class RouterCommand extends BaseCommand {
 			case "unset":
 				return this.secretsUnset(secretRest[0], secretRest[1]);
 			case "list":
-				return this.secretsList(secretRest[0]);
+				return this.secretsList(
+					secretRest[0],
+					secretRest.includes("--check-scopes"),
+				);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router secrets <set <email> <ENV_VAR_NAME> <value>|unset <email> <ENV_VAR_NAME>|list <email>>",
+					"Usage: cyrus router secrets <set <email> <ENV_VAR_NAME> <value>|unset <email> <ENV_VAR_NAME>|list <email> [--check-scopes]>",
 				);
 		}
 	}
@@ -944,9 +953,14 @@ export class RouterCommand extends BaseCommand {
 		this.logSuccess(`Unset ${key} for ${email}.`);
 	}
 
-	private async secretsList(email: string | undefined): Promise<void> {
+	private async secretsList(
+		email: string | undefined,
+		checkScopes = false,
+	): Promise<void> {
 		if (!email) {
-			this.exitWithError("Usage: cyrus router secrets list <email>");
+			this.exitWithError(
+				"Usage: cyrus router secrets list <email> [--check-scopes]",
+			);
 		}
 		const store = this.openSecretStore();
 		const bundle = await store.get(email);
@@ -956,6 +970,9 @@ export class RouterCommand extends BaseCommand {
 		} else {
 			this.logger.raw(`Stored secrets for ${email}:`);
 			for (const key of keys) this.logger.raw(`  ${key} = ****`);
+		}
+		if (checkScopes) {
+			await this.reportGitHubTokenScopes(bundle);
 		}
 		const requiredKeys = this.resolveRequiredSecretKeys();
 		const { ok, missing } = await store.isFullyAuthenticated(
@@ -968,6 +985,35 @@ export class RouterCommand extends BaseCommand {
 			this.logger.warn(
 				`${email} is NOT fully authenticated: missing ${missing.join(", ")}. Set them with: cyrus router secrets set ${email} <KEY> <value>`,
 			);
+		}
+	}
+
+	/**
+	 * `--check-scopes` diagnostics for a user's stored GitHub credential.
+	 *
+	 * Strictly informational: this makes one authenticated `GET
+	 * https://api.github.com/` per GitHub secret to read its `X-OAuth-Scopes`
+	 * header, then prints what the token has and what it lacks. It never fails
+	 * the command and never changes the "fully authenticated" verdict — a token
+	 * missing `read:org` (or one whose scopes cannot be introspected at all,
+	 * like a fine-grained PAT) still works for clone/commit/push/query. Token
+	 * values are never printed; only the env-var name is echoed.
+	 */
+	private async reportGitHubTokenScopes(
+		bundle: Record<string, string>,
+	): Promise<void> {
+		const present = GITHUB_TOKEN_SECRET_KEYS.filter((key) => bundle[key]);
+		if (present.length === 0) {
+			this.logger.info(
+				`No GitHub token stored (looked for ${GITHUB_TOKEN_SECRET_KEYS.join(", ")}); skipping scope check.`,
+			);
+			return;
+		}
+		for (const key of present) {
+			const probe = await probeGitHubTokenScopes(bundle[key] as string);
+			const report = buildGitHubTokenScopeReport(key, probe);
+			for (const line of report.info) this.logger.raw(`  ${line}`);
+			for (const warning of report.warnings) this.logger.warn(warning);
 		}
 	}
 
