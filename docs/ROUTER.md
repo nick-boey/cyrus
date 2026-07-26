@@ -273,6 +273,15 @@ Azure Container Apps (ACA) Sandbox per issue. Set the executor with:
 cyrus router users set-executor alice@example.com aca
 ```
 
+Both the router and worker image refs must be pinned to an **immutable**
+reference — a digest, a release tag (`v1.2.3`), or a git-SHA tag
+(`sha-a1b2c3d`). Terraform rejects mutable tags such as `:latest` or `:deploy`:
+a floating tag leaves the tag string in state unchanged while the registry
+re-points it, so a later unrelated `terraform apply` can silently roll the router
+backwards onto an older build. See
+[Router image tag policy](../infra/azure/README.md#router-image-tag-policy) for
+the build/push/pin runbook and for reconciling a hand-patched Container App.
+
 The Terraform stack produces the complete `containers` configuration. Its ACA
 provider needs a pre-registered worker disk image and these provider fields:
 
@@ -648,5 +657,8 @@ handoff mechanism.
 | `cyrus router devices revoke <email>` | host | Revoke a user's device token. |
 | `cyrus router sessions list` | host | List running + locked sessions with their Linear issue id and session GUID. |
 | `cyrus router unlock <issueId\|PAR-123>` | host | Release a stuck issue lock, by GUID or Linear identifier. |
+| `cyrus router secrets set <email> <ENV_VAR_NAME> <value>` | host | Store a per-user container secret. Never echoes the value. |
+| `cyrus router secrets unset <email> <ENV_VAR_NAME>` | host | Remove a per-user container secret. |
+| `cyrus router secrets list <email> [--check-scopes]` | host | List stored secret keys (values masked) + any missing required keys. `--check-scopes` additionally reports the stored `GH_TOKEN`/`GIT_TOKEN` OAuth scopes — advisory only, never rejects a usable token, never prints values. |
 | `cyrus connect <url> --code <code> [--entra <audience>]` | device | Enroll this device, optionally using an Azure CLI Entra token. |
 | `cyrus start` | device | Begin receiving and running your routed sessions. |

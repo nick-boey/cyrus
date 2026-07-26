@@ -7,6 +7,16 @@ output "router_fqdn" {
   value       = azurerm_container_app.router.ingress[0].fqdn
 }
 
+output "router_app_name" {
+  description = "Name of the router Container App (e.g. 'app-cyrus-dev-router'). Needed by the image-tag reconciliation runbook to read the image the live revision is actually serving (`az containerapp show … --query 'properties.template.containers[0].image'`) and to compare it against `var.router_image`. See README → 'Router image tag policy'."
+  value       = azurerm_container_app.router.name
+}
+
+output "router_image" {
+  description = "The router image reference this stack is pinned to (echo of `var.router_image`). Surfaced so an operator can diff the declared pin against the image the live revision serves without opening tfvars — a mismatch means someone hand-patched the Container App and the next apply will revert it."
+  value       = var.router_image
+}
+
 output "router_wss_url" {
   description = "Canonical WSS URL for containers to dial back to the router (`wss://<router_fqdn>`). Embedded into CYRUS_ROUTER_CONTAINERS_JSON."
   value       = "wss://${azurerm_container_app.router.ingress[0].fqdn}"

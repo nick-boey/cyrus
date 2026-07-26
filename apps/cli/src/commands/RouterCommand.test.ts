@@ -898,6 +898,189 @@ describe("RouterCommand", () => {
 		});
 	});
 
+	describe("secrets list --check-scopes", () => {
+		const GH_SECRET = "ghp_tokenvalue_must_never_be_printed";
+
+		/** Stubs global fetch (what probeGitHubTokenScopes falls back to). */
+		const stubGitHubScopes = (scopes: string | null) =>
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => ({
+					ok: true,
+					status: 200,
+					headers: new Headers(
+						scopes === null ? {} : { "x-oauth-scopes": scopes },
+					),
+				})),
+			);
+
+		const seedGhToken = async (email: string) => {
+			const app = createMockApp(cyrusHome);
+			await new RouterCommand(app as any).execute([
+				"secrets",
+				"set",
+				email,
+				"GH_TOKEN",
+				GH_SECRET,
+			]);
+		};
+
+		afterEach(() => {
+			vi.unstubAllGlobals();
+		});
+
+		it("accepts a token missing only read:org: warns, still fully authenticated", async () => {
+			stubGitHubScopes("repo");
+			await seedGhToken("nia@example.com");
+			const app = createMockApp(cyrusHome);
+			await new RouterCommand(app as any).execute([
+				"secrets",
+				"set",
+				"nia@example.com",
+				"CLAUDE_CODE_OAUTH_TOKEN",
+				"claude-tok",
+			]);
+
+			const app2 = createMockApp(cyrusHome);
+			await new RouterCommand(app2 as any).execute([
+				"secrets",
+				"list",
+				"nia@example.com",
+				"--check-scopes",
+			]);
+
+			const warnings = (app2.logger.warn as ReturnType<typeof vi.fn>).mock.calls
+				.map((c) => String(c[0]))
+				.join("\n");
+			expect(warnings).toContain("read:org");
+			// Missing read:org must NOT change the authentication verdict.
+			expect(app2.logger.success).toHaveBeenCalledWith(
+				expect.stringContaining("fully authenticated"),
+			);
+		});
+
+		it("accepts a token with no scopes at all: warns without failing", async () => {
+			stubGitHubScopes("");
+			await seedGhToken("omar@example.com");
+			const app = createMockApp(cyrusHome);
+			await new RouterCommand(app as any).execute([
+				"secrets",
+				"set",
+				"omar@example.com",
+				"CLAUDE_CODE_OAUTH_TOKEN",
+				"claude-tok",
+			]);
+
+			const app2 = createMockApp(cyrusHome);
+			await new RouterCommand(app2 as any).execute([
+				"secrets",
+				"list",
+				"omar@example.com",
+				"--check-scopes",
+			]);
+
+			const warnings = (app2.logger.warn as ReturnType<typeof vi.fn>).mock.calls
+				.map((c) => String(c[0]))
+				.join("\n");
+			expect(warnings).toContain('missing "repo"');
+			expect(app2.logger.error).not.toHaveBeenCalled();
+			expect(app2.logger.success).toHaveBeenCalledWith(
+				expect.stringContaining("fully authenticated"),
+			);
+		});
+
+		it("never prints the token value in any diagnostic output", async () => {
+			stubGitHubScopes("repo, read:org");
+			await seedGhToken("pia@example.com");
+
+			const app2 = createMockApp(cyrusHome);
+			await new RouterCommand(app2 as any).execute([
+				"secrets",
+				"list",
+				"pia@example.com",
+				"--check-scopes",
+			]);
+
+			const everything = (
+				["raw", "info", "warn", "success", "error"] as const
+			).flatMap((channel) =>
+				(app2.logger[channel] as ReturnType<typeof vi.fn>).mock.calls.map((c) =>
+					String(c[0]),
+				),
+			);
+			const output = everything.join("\n");
+			expect(output).not.toContain(GH_SECRET);
+			expect(output).toContain("GH_TOKEN = ****");
+			expect(output).toContain("scopes = repo, read:org");
+		});
+
+		it("skips the probe (no network call) when no GitHub token is stored", async () => {
+			const fetchSpy = vi.fn();
+			vi.stubGlobal("fetch", fetchSpy);
+			const app = createMockApp(cyrusHome);
+			await new RouterCommand(app as any).execute([
+				"secrets",
+				"set",
+				"quinn@example.com",
+				"CLAUDE_CODE_OAUTH_TOKEN",
+				"claude-tok",
+			]);
+
+			const app2 = createMockApp(cyrusHome);
+			await new RouterCommand(app2 as any).execute([
+				"secrets",
+				"list",
+				"quinn@example.com",
+				"--check-scopes",
+			]);
+
+			expect(fetchSpy).not.toHaveBeenCalled();
+			expect(app2.logger.info).toHaveBeenCalledWith(
+				expect.stringContaining("No GitHub token stored"),
+			);
+		});
+
+		it("does not probe at all without the flag", async () => {
+			const fetchSpy = vi.fn();
+			vi.stubGlobal("fetch", fetchSpy);
+			await seedGhToken("ravi@example.com");
+
+			const app2 = createMockApp(cyrusHome);
+			await new RouterCommand(app2 as any).execute([
+				"secrets",
+				"list",
+				"ravi@example.com",
+			]);
+
+			expect(fetchSpy).not.toHaveBeenCalled();
+		});
+
+		it("still completes when the GitHub probe fails outright", async () => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => {
+					throw new Error(`ECONNREFUSED ${GH_SECRET}`);
+				}),
+			);
+			await seedGhToken("sana@example.com");
+
+			const app2 = createMockApp(cyrusHome);
+			await new RouterCommand(app2 as any).execute([
+				"secrets",
+				"list",
+				"sana@example.com",
+				"--check-scopes",
+			]);
+
+			const warnings = (app2.logger.warn as ReturnType<typeof vi.fn>).mock.calls
+				.map((c) => String(c[0]))
+				.join("\n");
+			expect(warnings).toContain("could not verify scopes");
+			expect(warnings).not.toContain(GH_SECRET);
+			expect(app2.logger.error).not.toHaveBeenCalled();
+		});
+	});
+
 	describe("containers list", () => {
 		it("reports when there are no container devices", async () => {
 			const app = createMockApp(cyrusHome);

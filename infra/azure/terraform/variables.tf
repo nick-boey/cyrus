@@ -37,11 +37,42 @@ variable "location" {
 
 ################################################################################
 # Container images
+#
+# DURABLE-ENVIRONMENT RULE: both image inputs below must be pinned to an
+# IMMUTABLE reference — a digest (`@sha256:<64 hex>`), a release tag (`v1.2.3`),
+# or a git-SHA tag (`sha-a1b2c3d`). A mutable/floating tag (`:latest`,
+# `:deploy`, a branch name, or an ad-hoc hotfix tag such as
+# `:deploy-aca-disk-fix`) does NOT identify a build: the registry can re-point it
+# at any time, so the next `terraform apply` can silently roll a running router
+# BACKWARDS onto an older image while Terraform reports no change (the tag string
+# in state is identical). That is exactly how the private-disk fix nearly got
+# lost — the live Container App ran `:deploy-aca-disk-fix` while dev.tfvars said
+# `:deploy`.
+#
+# `.github/workflows/docker-router.yml` publishes `sha-<short-sha>` on every
+# push and `v<semver>` on every release tag precisely so there is always an
+# immutable ref to pin. See README → "Router image tag policy".
 ################################################################################
 
 variable "router_image" {
-  description = "Fully-qualified container image for the router (e.g. 'ghcr.io/ceedaragents/cyrus-router:latest'). Pullable anonymously or, for private registries, via the group's managed identity after `enable_acr = true`."
+  description = "Fully-qualified container image for the router, pinned to an IMMUTABLE reference — a digest ('ghcr.io/ceedaragents/cyrus-router@sha256:<64 hex>'), a release tag ('…/cyrus-router:v1.2.3'), or a git-SHA tag ('…/cyrus-router:sha-a1b2c3d'). Mutable tags (':latest', ':deploy', any branch or ad-hoc hotfix tag) are REJECTED, because the next apply would silently redeploy whatever that tag points at then — set `allow_mutable_image_tags = true` to override in a throwaway stack. Pullable anonymously or, for private registries, via the router's user-assigned identity after `enable_acr = true`."
   type        = string
+
+  validation {
+    condition = (
+      var.allow_mutable_image_tags ||
+      can(regex("@sha256:[0-9a-f]{64}$", var.router_image)) ||
+      can(regex(":v?[0-9]+[.][0-9]+[.][0-9]+([-+.][0-9A-Za-z.-]+)?$", var.router_image)) ||
+      can(regex(":(sha-)?[0-9a-f]{7,40}$", var.router_image))
+    )
+    error_message = "router_image must be pinned to an immutable reference: a digest ('repo@sha256:<64 hex>'), a release tag ('repo:v1.2.3'), or a git-SHA tag ('repo:sha-a1b2c3d' / 'repo:a1b2c3d'). Mutable tags such as ':latest', ':deploy', or a branch/hotfix tag let the next apply silently change the deployed build. Build and push an immutable tag first (README step 4), or set allow_mutable_image_tags = true for a throwaway stack."
+  }
+}
+
+variable "allow_mutable_image_tags" {
+  description = "ESCAPE HATCH — leave false. When true, `router_image` and `worker_image` may carry mutable tags (':latest', ':deploy', a branch or ad-hoc hotfix tag). Only set this in a throwaway/scratch stack you are willing to have silently rolled backwards, because a floating tag means the next apply deploys whatever the registry points it at THEN, not the build you tested. It must stay false in any durable environment; the non-default value is deliberately visible in the tfvars diff."
+  type        = bool
+  default     = false
 }
 
 variable "router_url_for_containers" {
@@ -51,8 +82,18 @@ variable "router_url_for_containers" {
 }
 
 variable "worker_image" {
-  description = "Fully-qualified OCI image for the Cyrus worker. This image is NOT pulled by the router — it is registered as a group-scoped ACA disk image OUT OF BAND (`aca sandboxgroup disk create --image <worker_image>`). The disk image *name* that the group knows it by is `var.aca_disk_name`. Pass the raw image ref here purely so the router can embed it in `CYRUS_ROUTER_CONTAINERS_JSON` for display/diagnostic purposes."
+  description = "Fully-qualified OCI image for the Cyrus worker, pinned to an IMMUTABLE reference (digest, 'v1.2.3', or 'sha-a1b2c3d') for the same reason as `router_image`. This image is NOT pulled by the router — it is registered as a group-scoped ACA disk image OUT OF BAND (`aca sandboxgroup disk create --image <worker_image>`). The disk image *name* that the group knows it by is `var.aca_disk_name`. Pass the raw image ref here purely so the router can embed it in `CYRUS_ROUTER_CONTAINERS_JSON` for display/diagnostic purposes. Because the disk image is registered out of band, a floating tag here also makes it impossible to tell which build a registered disk was cut from."
   type        = string
+
+  validation {
+    condition = (
+      var.allow_mutable_image_tags ||
+      can(regex("@sha256:[0-9a-f]{64}$", var.worker_image)) ||
+      can(regex(":v?[0-9]+[.][0-9]+[.][0-9]+([-+.][0-9A-Za-z.-]+)?$", var.worker_image)) ||
+      can(regex(":(sha-)?[0-9a-f]{7,40}$", var.worker_image))
+    )
+    error_message = "worker_image must be pinned to an immutable reference: a digest ('repo@sha256:<64 hex>'), a release tag ('repo:v1.2.3'), or a git-SHA tag ('repo:sha-a1b2c3d' / 'repo:a1b2c3d'). Mutable tags such as ':latest', ':deploy', or a branch/hotfix tag make the registered ACA disk image untraceable to a build. Build and push an immutable tag first (README step 4), or set allow_mutable_image_tags = true for a throwaway stack."
+  }
 }
 
 variable "aca_disk_name" {

@@ -17,10 +17,22 @@ tags = {
 location = "australiaeast"
 
 # ---- Container images --------------------------------------------------------
+# BOTH image refs MUST be immutable: a digest (`@sha256:<64 hex>`), a release tag
+# (`v1.2.3`), or a git-SHA tag (`sha-a1b2c3d`). Terraform REJECTS mutable tags
+# (`:latest`, `:deploy`, branch or ad-hoc hotfix tags) — a floating tag means the
+# next `terraform apply` can silently redeploy a DIFFERENT (possibly older) build
+# while reporting no change, because the tag string in state never moved. See
+# README → "Router image tag policy" for the build/push/pin runbook.
+#
+# Both placeholders below are deliberately SHAPE-VALID but fake, so the step-3
+# bootstrap apply (which targets only Key Vault / identities / ACR / sandbox
+# group, and creates no Container App) passes variable validation. Replace them
+# with real refs in step 4, BEFORE the step-5 full apply.
+#
 # router_image: pulled by the Container App directly. Public GHCR works
 # anonymously. Private registries require `enable_acr = true` AND `az acr
-# import` of the image into the ACR (see README).
-router_image = "ghcr.io/ceedaragents/cyrus-router:latest"
+# import` (or a direct `buildx --push`) of the image into the ACR (see README).
+router_image = "ghcr.io/ceedaragents/cyrus-router:sha-0000000"
 
 # router_url_for_containers: WSS URL containers dial back to. The router's real
 # FQDN is only known AFTER first apply (can't be embedded in the router's own
@@ -34,7 +46,14 @@ router_url_for_containers = null
 # OUT OF BAND after first apply:
 #   aca sandboxgroup disk create --image <worker_image> --name <aca_disk_name> \
 #     --resource-group <rg> --sandbox-group <sandbox_group_name>
-worker_image = "ghcr.io/ceedaragents/cyrus-worker:latest"
+# Immutable here too — the disk image is registered out of band, so a floating
+# tag leaves no way to tell which build a registered disk was cut from.
+worker_image = "ghcr.io/ceedaragents/cyrus-worker:sha-0000000"
+
+# allow_mutable_image_tags: ESCAPE HATCH, leave false. Setting it true re-permits
+# `:latest`/`:deploy`/branch tags above and forfeits the guarantee that an apply
+# redeploys the build you tested. Throwaway stacks only.
+allow_mutable_image_tags = false
 
 # aca_disk_name: the disk image NAME the group knows the worker image by. Must
 # match the `--name` you passed to `aca sandboxgroup disk create` above.
