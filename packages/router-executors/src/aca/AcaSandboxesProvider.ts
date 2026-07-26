@@ -4,6 +4,7 @@ import type {
 	IssueExecutionContext,
 } from "../types.js";
 import type {
+	AcaDiskImage,
 	AcaEgressPolicy,
 	AcaLifecyclePolicy,
 	AcaSandbox,
@@ -340,13 +341,13 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 			// No re-mint: env/token inherited (spike S3b), AND the device-id
 			// label matches the live row (lineage filter above).
 		} else {
-			await this.ensureDisk();
+			const disk = await this.ensureDisk();
 			// Token rotation invalidates every prior memory snapshot, including
 			// same-device snapshots. Remove them durably before minting.
 			await this.deleteIssueSnapshots(ctx.issueKey);
 			const deviceToken = ctx.mintDeviceToken();
 			await this.client.createSandbox({
-				diskImageName: this.disk,
+				...(disk.id ? { diskImageId: disk.id } : { diskImageName: this.disk }),
 				environment: { ...ctx.env, CYRUS_DEVICE_TOKEN: deviceToken },
 				resources: this.resources(),
 				lifecycle: this.lifecyclePolicy(),
@@ -714,16 +715,28 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 	 * Operators SHOULD pre-register the disk image (S1); this is a
 	 * failsafe for first-boot in dev.
 	 */
-	private async ensureDisk(): Promise<void> {
+	private async ensureDisk(): Promise<AcaDiskImage> {
 		const existing = await this.client.listDiskImages();
-		if (existing.some((d) => d.name === this.disk)) return;
+		const registered = existing.find(
+			(d) => d.name === this.disk || d.labels?.name === this.disk,
+		);
+		if (registered) return registered;
 		try {
-			await this.client.createDiskImage(this.disk, this.image);
+			return await this.client.createDiskImage(this.disk, this.image);
 		} catch (err: unknown) {
-			// Concurrent registration by another boot — log and continue.
-			this.logger.warn(
-				`ensureDisk: createDiskImage(${this.disk}) failed (continuing if it exists): ${String(err)}`,
+			// A concurrent caller may have won the registration race. Confirm that
+			// before continuing; otherwise preserve the real registry/auth failure.
+			const afterFailure = await this.client.listDiskImages();
+			const concurrent = afterFailure.find(
+				(d) => d.name === this.disk || d.labels?.name === this.disk,
 			);
+			if (concurrent) {
+				this.logger.warn(
+					`ensureDisk: createDiskImage(${this.disk}) failed, but the disk now exists: ${String(err)}`,
+				);
+				return concurrent;
+			}
+			throw err;
 		}
 	}
 }

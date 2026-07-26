@@ -7,6 +7,7 @@
 # ---- Project / naming -------------------------------------------------------
 project     = "cyrus"
 environment = "dev"
+# resource_group_name = "rg-cyrus" # Optional exact override.
 tags = {
   owner       = "platform"
   cost-center = "research"
@@ -64,10 +65,12 @@ aca_egress_host_rules = null
 aca_keep_snapshots = 2
 
 # ---- Linear secrets (seeded into Key Vault; rotate after first deploy) ------
-linear_workspace_id = "<workspace>"
+# Real organization UUID from `cyrus self-auth-linear`; do not use the slug.
+linear_workspace_id = "00000000-0000-0000-0000-000000000000"
 
-# All four below are SENSITIVE — pull from your password manager, NOT from git.
-linear_workspace_token  = "<linear-workspace-api-token>"
+# All five below are SENSITIVE — pull from your password manager, NOT from git.
+linear_workspace_token         = "<linear-workspace-api-token>"
+linear_workspace_refresh_token = "<linear-workspace-refresh-token>"
 # HMAC secret — generate with `openssl rand -hex 32` and paste the SAME value
 # into Linear's webhook subscription UI (see README → Linear webhook cutover).
 linear_webhook_secret  = "<openssl-rand-hex-32>"
@@ -90,7 +93,7 @@ cyrus_repositories = [
   {
     name                = "cyrus-containers"
     github_slug         = "ceedaragents/cyrus-containers"
-    linear_workspace_id = "<workspace>"
+    linear_workspace_id = "00000000-0000-0000-0000-000000000000"
     base_branch         = "main"
   },
 ]

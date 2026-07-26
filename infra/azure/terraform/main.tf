@@ -7,7 +7,7 @@ locals {
     "project"       = var.project
   }, var.tags)
 
-  resource_group_name = "rg-${local.name_prefix}"
+  resource_group_name = var.resource_group_name != null ? var.resource_group_name : "rg-${local.name_prefix}"
 }
 
 ################################################################################
@@ -41,9 +41,9 @@ resource "azurerm_key_vault" "this" {
   name                       = "kv-${local.name_prefix}"
   resource_group_name        = azurerm_resource_group.this.name
   location                   = azurerm_resource_group.this.location
-  tenant_id                   = data.azurerm_client_config.current.tenant_id
+  tenant_id                  = data.azurerm_client_config.current.tenant_id
   sku_name                   = "standard"
-  enable_rbac_authorization  = true
+  rbac_authorization_enabled = true
   purge_protection_enabled   = false
   soft_delete_retention_days = 7
   # Open network for dev. The spike created the vault with default_action=Allow.
@@ -83,14 +83,14 @@ resource "azurerm_storage_account" "this" {
 }
 
 resource "azurerm_storage_share" "artifacts" {
-  name                 = "artifacts"
-  storage_account_name = azurerm_storage_account.this.name
-  quota_gb             = 50
+  name               = "artifacts"
+  storage_account_id = azurerm_storage_account.this.id
+  quota              = 50
 }
 
 resource "azurerm_storage_container" "router_backups" {
   name                  = "router-backups"
-  storage_account_name  = azurerm_storage_account.this.name
+  storage_account_id    = azurerm_storage_account.this.id
   container_access_type = "private"
 }
 
@@ -127,7 +127,7 @@ data "azurerm_role_definition" "sandboxgroup_data_owner" {
 }
 
 locals {
-  sandboxgroup_data_owner_role_id = var.sandboxgroup_data_owner_role_id != null ? var.sandboxgroup_data_owner_role_id : data.azurerm_role_definition.sandboxgroup_data_owner.id
+  sandboxgroup_data_owner_role_id = var.sandboxgroup_data_owner_role_id
 }
 
 ################################################################################
@@ -151,7 +151,7 @@ resource "azurerm_role_assignment" "router_kv_secrets_officer" {
 ################################################################################
 
 resource "azurerm_role_assignment" "router_backups_blob_contributor" {
-  scope                = azurerm_storage_container.router_backups.resource_manager_id
+  scope                = azurerm_storage_container.router_backups.id
   role_definition_name = "Storage Blob Data Contributor"
   principal_id         = azurerm_user_assigned_identity.router.principal_id
 }
@@ -164,7 +164,7 @@ resource "azurerm_role_assignment" "router_backups_blob_contributor" {
 
 resource "azurerm_role_assignment" "operator_backups_breakglass" {
   count                = var.operator_principal_id != null ? 1 : 0
-  scope                = azurerm_storage_container.router_backups.resource_manager_id
+  scope                = azurerm_storage_container.router_backups.id
   role_definition_name = "Storage Blob Data Contributor"
   principal_id         = var.operator_principal_id
 }
@@ -181,6 +181,18 @@ resource "azurerm_key_vault_secret" "linear_workspace_token" {
   # rotation). Setting expiration_date=timeadd(timestamp(),...) here would
   # cause perpetual plan diff noise (timestamp() re-evaluates every plan).
   tags = local.default_tags
+}
+
+resource "azurerm_key_vault_secret" "linear_workspaces_json" {
+  name = "linear-workspaces-json"
+  value = jsonencode({
+    (var.linear_workspace_id) = {
+      linearToken        = var.linear_workspace_token
+      linearRefreshToken = var.linear_workspace_refresh_token
+    }
+  })
+  key_vault_id = azurerm_key_vault.this.id
+  tags         = local.default_tags
 }
 
 resource "azurerm_key_vault_secret" "linear_webhook_secret" {

@@ -56,9 +56,10 @@ resource "azapi_resource" "sandbox_group" {
 ################################################################################
 
 resource "azurerm_role_assignment" "router_sandboxgroup_data_owner" {
-  scope              = azapi_resource.sandbox_group.id
-  role_definition_id = local.sandboxgroup_data_owner_role_id
-  principal_id       = azurerm_user_assigned_identity.router.principal_id
+  scope                = azapi_resource.sandbox_group.id
+  role_definition_id   = local.sandboxgroup_data_owner_role_id
+  role_definition_name = local.sandboxgroup_data_owner_role_id == null ? data.azurerm_role_definition.sandboxgroup_data_owner.name : null
+  principal_id         = azurerm_user_assigned_identity.router.principal_id
 }
 
 ################################################################################

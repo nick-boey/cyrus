@@ -50,6 +50,14 @@ CLAUDE.local.md
 
 docker/router/.env
 
+# Terraform local state and sensitive variable files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+tfplan
+
 # Claude worktrees
 .claude/worktrees
 .superpowers/
