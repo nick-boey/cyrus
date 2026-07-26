@@ -150,9 +150,12 @@ cp env/dev.tfvars.example dev.tfvars
 chmod 600 dev.tfvars
 ```
 
-Fill every placeholder. For a private registry set `enable_acr = true`, choose
-an immutable image tag, and point `router_image`/`worker_image` at the ACR login
-server that the naming convention will create. Set:
+Fill every placeholder. For a private registry set `enable_acr = true` and point
+`router_image`/`worker_image` at the ACR login server that the naming convention
+will create. Both image refs must be immutable — Terraform rejects `:latest`,
+`:deploy`, and other floating tags; see
+[Router image tag policy](#router-image-tag-policy). You fill in the real refs in
+step 4, once there is a build to pin. Set:
 
 - `linear_workspace_id` to the organization UUID from step 1.
 - `linear_workspace_token` and `linear_workspace_refresh_token` to the OAuth
@@ -201,10 +204,16 @@ Allow several minutes for fresh RBAC assignments to propagate.
 
 ### 4. Build and push immutable images
 
+Derive the tag from the commit you are deploying so the tag names exactly one
+build. Never push `:latest`, `:deploy`, a branch name, or an ad-hoc hotfix tag
+into a durable environment — Terraform rejects those refs (see
+[Router image tag policy](#router-image-tag-policy)).
+
 ```bash
 cd "$REPO_ROOT"
 az acr login --name <acr-name>
-TAG=<git-sha-or-release>
+# Same shape as the `sha-<short-sha>` tag docker-router.yml publishes to GHCR.
+TAG="sha-$(git rev-parse --short=7 HEAD)"   # or a release tag: TAG=v1.2.3
 
 docker buildx build --platform linux/amd64 \
   --file docker/router/Dockerfile \
@@ -214,7 +223,17 @@ docker buildx build --platform linux/amd64 \
   --tag <acr-name>.azurecr.io/cyrus-worker:$TAG --push .
 ```
 
-Update `router_image` and `worker_image` in `dev.tfvars` to those exact tags.
+Set `router_image` and `worker_image` in `dev.tfvars` to those exact refs. For
+the strongest pin, resolve the pushed digest and use that instead of the tag:
+
+```bash
+az acr manifest show-metadata <acr-name>.azurecr.io/cyrus-router:$TAG \
+  --query digest -o tsv
+# → router_image = "<acr-name>.azurecr.io/cyrus-router@sha256:<64 hex>"
+```
+
+Confirm the build actually contains the commit you intend to deploy before you
+pin it — a tag is only as trustworthy as the commit it was cut from.
 
 ### 5. Apply the complete stack
 
@@ -342,12 +361,24 @@ cyrus router secrets set alice@example.com GIT_USER_NAME "Alice Example"
 cyrus router secrets set alice@example.com GIT_USER_EMAIL alice@example.com
 
 cyrus router secrets list alice@example.com
+
+# Optional: also report the stored GitHub token's OAuth scopes (advisory only —
+# never rejects a usable token, never prints token values).
+cyrus router secrets list alice@example.com --check-scopes
+
 cyrus router users list
 ```
 
 `CLAUDE_CODE_OAUTH_TOKEN` is the only unconditional boot requirement. For a
-private repository, `GH_TOKEN` needs repository read/write access; add `read:org`
-only when organization-level queries are required. `LINEAR_API_TOKEN` is a
+private repository, a classic-PAT `GH_TOKEN` needs the `repo` scope — that is the
+functional minimum and covers clone, commit, push, and issue/PR access. Add
+`read:org` **only** when organization-level queries are required; `gh auth
+status` warns about its absence even for tokens that work correctly, so that
+warning is not a failure. Fine-grained PATs use per-resource permissions instead
+of scopes (grant Contents read/write at minimum) and report no scope list, so
+`--check-scopes` reports them as un-introspectable rather than deficient. Full
+breakdown: [docs/GIT_GITHUB.md](../../docs/GIT_GITHUB.md#token-scopes).
+`LINEAR_API_TOKEN` is a
 personal key used by the hosted Linear MCP, separate from the router app's
 workspace OAuth token. ACA users do not redeem the printed enrollment code and
 do not run `cyrus connect`; their per-issue sandbox is their device.
@@ -463,6 +494,83 @@ cyrus.managed=true` then `aca sandbox delete --id <id>` per row — spike S2
 confirmed server-side label filtering works with `cyrus.managed=true`.)
 
 ## Ops runbook
+
+### Router image tag policy
+
+`router_image` and `worker_image` must be pinned to an **immutable** reference:
+
+| Form | Example | Use |
+| --- | --- | --- |
+| Digest | `…/cyrus-router@sha256:<64 hex>` | Strongest pin. Preferred. |
+| Release tag | `…/cyrus-router:v1.2.3` | Published by `docker-router.yml` on `v*` tags. |
+| Git-SHA tag | `…/cyrus-router:sha-a1b2c3d` | Published by `docker-router.yml` on every push to `main`. |
+
+Terraform **rejects** anything else (`:latest`, `:deploy`, a branch name, an
+ad-hoc hotfix tag, or an untagged ref). The escape hatch
+`allow_mutable_image_tags = true` exists for throwaway stacks only and must stay
+`false` in a durable environment.
+
+Why: a mutable tag does not identify a build. The tag string recorded in
+Terraform state never changes, so Terraform reports **no diff** while the
+registry quietly re-points the tag at different bits. The next unrelated
+`terraform apply` then pulls whatever that tag means at that moment — which can
+roll the router **backwards** onto an older image, silently reverting a fix, with
+nothing in the plan output to warn you.
+
+#### Reconciling a hand-patched (emergency) router image
+
+This is the situation to look for: someone hotfixed the live Container App with
+`az containerapp update --image …:deploy-aca-disk-fix` while `dev.tfvars` still
+said `:deploy`. The running revision and the Terraform input now disagree, and
+the next apply reverts the hotfix. Reconcile **before** the next apply:
+
+1. Diff what is actually running against what Terraform declares. If these two
+   differ, an apply right now would change the running image:
+
+   ```bash
+   RG=$(terraform output -raw resource_group_name)
+   APP=$(terraform output -raw router_app_name)
+
+   echo "live:     $(az containerapp show -g "$RG" -n "$APP" \
+     --query 'properties.template.containers[0].image' -o tsv)"
+   echo "declared: $(terraform output -raw router_image)"
+   ```
+
+2. Identify the commit that image was built from. If it is not obvious, inspect
+   the image's revision/source labels, or rebuild from the commit you know
+   carries the fix (here: the private-disk fix) and diff behaviour.
+
+3. Build and push an **immutable** tag from that commit — step 4 above. Do not
+   reuse the hotfix tag; cut `sha-<short-sha>` (or a release tag) from the exact
+   commit.
+
+4. Pin it in `dev.tfvars`:
+
+   ```hcl
+   router_image = "<acr-name>.azurecr.io/cyrus-router:sha-<short-sha>"
+   ```
+
+5. Plan and read the diff **before** applying. Expect either no image change
+   (if the immutable tag resolves to the same bits already running) or a single
+   deliberate image change. A plan that reverts the image to an older ref means
+   you pinned the wrong commit — stop and go back to step 2.
+
+   ```bash
+   terraform plan -var-file=dev.tfvars -out=tfplan
+   terraform apply tfplan
+   ```
+
+6. Verify the new revision is serving and healthy before closing out:
+
+   ```bash
+   az containerapp revision list -g "$RG" -n "$APP" \
+     --query '[].{name:name,active:properties.active,image:properties.template.containers[0].image}' -o table
+   ```
+
+Rolling back is then just re-pinning the previous immutable ref and applying —
+which is the whole point of the policy. Note the router runs a single replica by
+design, so an apply that changes the image is a brief interruption, not a
+zero-downtime rollout; drain or expect in-flight sessions to reconnect.
 
 ### Break-glass: corrupt `router.db`
 

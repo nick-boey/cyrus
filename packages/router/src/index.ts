@@ -12,6 +12,21 @@ export {
 	registerEnrollmentRoute,
 } from "./enrollment.js";
 export {
+	buildGitHubTokenScopeReport,
+	diagnoseGitHubTokenScopes,
+	GITHUB_ORG_SCOPE,
+	GITHUB_REQUIRED_SCOPE,
+	GITHUB_TOKEN_SECRET_KEYS,
+	type GitHubTokenKind,
+	type GitHubTokenScopeDiagnostic,
+	type GitHubTokenScopeProbe,
+	type GitHubTokenScopeReport,
+	parseOAuthScopeHeader,
+	probeGitHubTokenScopes,
+	REDACTED,
+	redactToken,
+} from "./GitHubTokenScopes.js";
+export {
 	createKeyVaultTokenProvider,
 	KeyVaultSecretStore,
 	type KeyVaultSecretStoreOptions,
