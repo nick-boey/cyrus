@@ -52,6 +52,16 @@ CREATE TABLE IF NOT EXISTS issue_affinity (
 CREATE TABLE IF NOT EXISTS issue_locks (
   issue_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, device_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS container_teardowns (
+  issue_key TEXT PRIMARY KEY,
+  device_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  registered_ms INTEGER NOT NULL,
+  deadline_ms INTEGER NOT NULL,
+  callback_id TEXT,
+  callback_received_ms INTEGER,
+  callback_attempts INTEGER NOT NULL DEFAULT 0
+);
 `;
 
 // A user may have at most one physical device row, and an issue may have at
@@ -133,6 +143,55 @@ export interface ContainerDeviceInfo {
 	createdMs: number;
 	lastSeenMs?: number;
 	lastRoutedMs?: number;
+}
+
+interface ContainerTeardownRow {
+	issue_key: string;
+	device_id: number;
+	action: string;
+	registered_ms: number;
+	deadline_ms: number;
+	callback_id: string | null;
+	callback_received_ms: number | null;
+	callback_attempts: number;
+}
+
+/**
+ * A terminal teardown the router has registered for a container issue but not
+ * yet completed. Written so `cyrus router containers list` — a SEPARATE process
+ * from the running router, which therefore cannot read `TerminalTeardown`'s
+ * in-memory map — can show an operator which containers are waiting on their
+ * worker's authenticated teardown callback versus which have already reported in
+ * and are stuck retrying the provider destroy.
+ *
+ * `callbackReceivedMs === undefined` is the "callback pending" state: the worker
+ * has been asked to clean up and has not (yet) called back, so the grace
+ * deadline in `deadlineMs` is what will eventually force destruction.
+ */
+export interface PendingTeardownInfo {
+	issueKey: string;
+	deviceId: number;
+	action: "closed" | "deleted";
+	registeredMs: number;
+	deadlineMs: number;
+	/** Idempotency key of the first callback received for this teardown. */
+	callbackId?: string;
+	callbackReceivedMs?: number;
+	/** How many callbacks (including retries) have arrived for this teardown. */
+	callbackAttempts: number;
+}
+
+function toPendingTeardownInfo(row: ContainerTeardownRow): PendingTeardownInfo {
+	return {
+		issueKey: row.issue_key,
+		deviceId: row.device_id,
+		action: row.action === "deleted" ? "deleted" : "closed",
+		registeredMs: row.registered_ms,
+		deadlineMs: row.deadline_ms,
+		callbackId: row.callback_id ?? undefined,
+		callbackReceivedMs: row.callback_received_ms ?? undefined,
+		callbackAttempts: row.callback_attempts,
+	};
 }
 
 /**
@@ -615,6 +674,13 @@ export class RouterStore {
 	deleteContainerDevice(deviceId: number): void {
 		const txn = this.db.transaction(() => {
 			this.purgeDeviceScopedRows(deviceId);
+			// The teardown row is keyed by issue, not device, so it has no FK to
+			// cascade from — drop it explicitly. Once the container row is gone
+			// there is nothing left to tear down, whether we got here from a
+			// completed teardown, `containers destroy`, or a user removal.
+			this.db
+				.prepare("DELETE FROM container_teardowns WHERE device_id = ?")
+				.run(deviceId);
 			this.db
 				.prepare(
 					"DELETE FROM devices WHERE device_id = ? AND kind = 'container'",
@@ -632,6 +698,113 @@ export class RouterStore {
 			)
 			.all() as ContainerDeviceRow[];
 		return rows.map(toContainerDeviceInfo);
+	}
+
+	// ── Terminal teardown bookkeeping ──────────────────────────────────────
+	// Owned by TerminalTeardown; persisted (rather than kept purely in that
+	// object's map) so the out-of-process `containers list` CLI can report
+	// callback-pending state, and so a repeated callback can be recognised as a
+	// retry of the same logical delivery.
+
+	/**
+	 * Record a registered terminal teardown. An existing row for the issue is
+	 * overwritten, which is what upgrades a `closed` teardown to `deleted`
+	 * without losing any callback already received for it.
+	 */
+	upsertPendingTeardown(input: {
+		issueKey: string;
+		deviceId: number;
+		action: "closed" | "deleted";
+		registeredMs: number;
+		deadlineMs: number;
+	}): void {
+		this.db
+			.prepare(
+				`INSERT INTO container_teardowns
+					(issue_key, device_id, action, registered_ms, deadline_ms)
+				 VALUES (?, ?, ?, ?, ?)
+				 ON CONFLICT(issue_key) DO UPDATE SET
+					device_id = excluded.device_id,
+					action = excluded.action,
+					deadline_ms = excluded.deadline_ms`,
+			)
+			.run(
+				input.issueKey,
+				input.deviceId,
+				input.action,
+				input.registeredMs,
+				input.deadlineMs,
+			);
+	}
+
+	/**
+	 * Note that a worker's teardown callback arrived. Returns the row as it
+	 * stands AFTER the update, plus whether this was a retry — i.e. a callback
+	 * carrying an id we had already recorded, which the caller logs distinctly
+	 * from a first delivery and from grace expiry.
+	 */
+	recordTeardownCallback(
+		issueKey: string,
+		callbackId: string | undefined,
+		nowMs: number,
+	): { info: PendingTeardownInfo; retry: boolean } | undefined {
+		const existing = this.getPendingTeardown(issueKey);
+		if (!existing) return undefined;
+		const retry =
+			existing.callbackReceivedMs !== undefined &&
+			(callbackId === undefined || existing.callbackId === callbackId);
+		this.db
+			.prepare(
+				`UPDATE container_teardowns
+				 SET callback_id = COALESCE(callback_id, ?),
+					callback_received_ms = COALESCE(callback_received_ms, ?),
+					callback_attempts = callback_attempts + 1
+				 WHERE issue_key = ?`,
+			)
+			.run(callbackId ?? null, nowMs, issueKey);
+		const info = this.getPendingTeardown(issueKey);
+		return info ? { info, retry } : undefined;
+	}
+
+	getPendingTeardown(issueKey: string): PendingTeardownInfo | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT issue_key, device_id, action, registered_ms, deadline_ms,
+					callback_id, callback_received_ms, callback_attempts
+				 FROM container_teardowns WHERE issue_key = ?`,
+			)
+			.get(issueKey) as ContainerTeardownRow | undefined;
+		return row ? toPendingTeardownInfo(row) : undefined;
+	}
+
+	listPendingTeardowns(): PendingTeardownInfo[] {
+		const rows = this.db
+			.prepare(
+				`SELECT issue_key, device_id, action, registered_ms, deadline_ms,
+					callback_id, callback_received_ms, callback_attempts
+				 FROM container_teardowns ORDER BY issue_key`,
+			)
+			.all() as ContainerTeardownRow[];
+		return rows.map(toPendingTeardownInfo);
+	}
+
+	deletePendingTeardown(issueKey: string): void {
+		this.db
+			.prepare("DELETE FROM container_teardowns WHERE issue_key = ?")
+			.run(issueKey);
+	}
+
+	/**
+	 * Drop every teardown row. Called once when the router builds its
+	 * `TerminalTeardown`: that coordinator starts with an empty in-memory map
+	 * and no re-armed grace timers, so any surviving row is a ghost from the
+	 * previous process that would otherwise make `containers list` claim a
+	 * callback is pending forever. Destruction of those containers falls to the
+	 * lifecycle sweep's stale-destroy backstop, exactly as it did before this
+	 * table existed.
+	 */
+	clearPendingTeardowns(): number {
+		return this.db.prepare("DELETE FROM container_teardowns").run().changes;
 	}
 
 	/**

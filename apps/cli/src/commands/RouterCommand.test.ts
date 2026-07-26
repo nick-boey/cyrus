@@ -958,6 +958,59 @@ describe("RouterCommand", () => {
 			// offset confirms the row's field boundaries line up too.
 			expect(row!.charAt(lastRoutedCol)).toBe("-");
 			expect(row!.charAt(lastSeenCol)).toBe("-");
+			expect(row!.charAt(header!.indexOf("TEARDOWN"))).toBe("-");
+		});
+
+		/**
+		 * The router process holds its pending teardowns in memory, so this CLI —
+		 * a separate process — reads the mirrored `container_teardowns` rows. An
+		 * operator uses this column to tell "the worker never called back, we're
+		 * burning the grace window" apart from "the callback landed and the
+		 * provider destroy is retrying".
+		 */
+		it("shows callback-pending teardown state and the received-callback state", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute(["users", "add", "nina@example.com"]);
+
+			const seedStore = new RouterStore(dbPath());
+			const user = seedStore.findUserForCreator({ email: "nina@example.com" });
+			const pendingDevice = seedStore.createContainerDevice(
+				user!.userId,
+				"CYPACK-20",
+				"aca",
+			);
+			const reportedDevice = seedStore.createContainerDevice(
+				user!.userId,
+				"CYPACK-21",
+				"aca",
+			);
+			seedStore.upsertPendingTeardown({
+				issueKey: "CYPACK-20",
+				deviceId: pendingDevice.deviceId,
+				action: "closed",
+				registeredMs: Date.now(),
+				deadlineMs: Date.now() + 600_000,
+			});
+			seedStore.upsertPendingTeardown({
+				issueKey: "CYPACK-21",
+				deviceId: reportedDevice.deviceId,
+				action: "deleted",
+				registeredMs: Date.now(),
+				deadlineMs: Date.now() + 600_000,
+			});
+			seedStore.recordTeardownCallback("CYPACK-21", "cb-1", Date.now());
+			seedStore.close();
+			consoleLogSpy.mockClear();
+
+			await command.execute(["containers", "list"]);
+
+			const printed = printedStdout();
+			expect(printed).toContain("TEARDOWN");
+			expect(printed).toMatch(
+				/CYPACK-20.*callback-pending\(closed, grace \d+s\)/,
+			);
+			expect(printed).toMatch(/CYPACK-21.*destroying\(deleted, callbacks 1\)/);
 		});
 	});
 

@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	downloadBundle,
 	postTeardownComplete,
+	TEARDOWN_IDEMPOTENCY_HEADER,
+	TeardownCallbackError,
 	uploadBundle,
 } from "../src/transport.js";
 
@@ -132,6 +134,21 @@ describe("postTeardownComplete", () => {
 		expect(init.signal).toBeInstanceOf(AbortSignal);
 	});
 
+	it("sends the idempotency key so the router can recognise a replay", async () => {
+		const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		await postTeardownComplete(HTTP_BASE, TOKEN, ISSUE_KEY, {
+			idempotencyKey: "cb-42",
+		});
+
+		const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+		expect(jsonHeaders(init.headers)).toMatchObject({
+			authorization: `Bearer ${TOKEN}`,
+			[TEARDOWN_IDEMPOTENCY_HEADER]: "cb-42",
+		});
+	});
+
 	it("throws on a non-2xx response", async () => {
 		vi.stubGlobal(
 			"fetch",
@@ -140,5 +157,48 @@ describe("postTeardownComplete", () => {
 		await expect(
 			postTeardownComplete(HTTP_BASE, TOKEN, ISSUE_KEY),
 		).rejects.toThrow("teardown-complete callback failed: HTTP 401");
+	});
+
+	// The device queue keys its retry decision off `retryable`: a router the
+	// worker cannot reach must be retried with the same key, while a positive
+	// rejection must be dropped so it isn't replayed forever.
+	it("marks a 5xx as retryable and an auth/scope rejection as fatal", async () => {
+		for (const [status, retryable] of [
+			[503, true],
+			[500, true],
+			[429, true],
+			[400, false],
+			[401, false],
+			[403, false],
+			[404, false],
+		] as const) {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => new Response(null, { status })),
+			);
+			const error = await postTeardownComplete(
+				HTTP_BASE,
+				TOKEN,
+				ISSUE_KEY,
+			).catch((err: unknown) => err);
+			expect(error).toBeInstanceOf(TeardownCallbackError);
+			expect((error as TeardownCallbackError).status).toBe(status);
+			expect((error as TeardownCallbackError).retryable).toBe(retryable);
+		}
+	});
+
+	it("treats a network failure as retryable", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("ECONNREFUSED");
+			}),
+		);
+		const error = await postTeardownComplete(HTTP_BASE, TOKEN, ISSUE_KEY).catch(
+			(err: unknown) => err,
+		);
+		expect(error).toBeInstanceOf(TeardownCallbackError);
+		expect((error as TeardownCallbackError).retryable).toBe(true);
+		expect((error as TeardownCallbackError).status).toBeUndefined();
 	});
 });
