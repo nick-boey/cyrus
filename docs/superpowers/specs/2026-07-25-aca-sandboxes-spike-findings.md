@@ -12,7 +12,7 @@
 
 | Spike | Verdict | Impact on plan |
 |---|---|---|
-| S0 — Linear webhook delivery | **NOT RUN — not an Azure spike** | Task 6 still gated. See "S0" below. |
+| S0 — Linear webhook delivery | **PASS — with two blind spots** | Task 6 **unblocked**. Both webhook kinds delivered; see **F3**. |
 | S1 — Worker image boot | **PASS (mechanism), PARTIAL (real image)** | Custom OCI registration + env + entrypoint proven with a stand-in image. **New risk found — see F1.** |
 | S2 — Data-plane shapes | **PASS — with 6 corrections** | Client interface in Task 4 needs rework. |
 | S3 — Suspend semantics | **PASS** | Resume measured **0.52 s**. No SIGTERM. |
@@ -24,7 +24,12 @@
 
 **Bottom line: no blocker was found.** Every load-bearing assumption in the plan either held or
 was replaced by something better. The corrections below are mostly mechanical (wire shapes),
-with two genuine design consequences (**F1** and **F2**).
+with three genuine design consequences (**F1**, **F2** and **F3**).
+
+> **S0 addendum, 2026-07-26 (operator operator).** S0 was run separately from the Azure spikes
+> against the live Linear workspace `<workspace>` and the pm2-hosted `cyrus-router` on this
+> host (ngrok tunnel `tunnel.example.dev` → `localhost:8787`). It involves no
+> Azure resources. Task 6 is no longer gated.
 
 ---
 
@@ -68,15 +73,159 @@ This independently confirms **N5** and makes it stronger: the provider must set 
 policy **explicitly on every create path**, including create-from-snapshot. Passing it in the
 create body works; a follow-up `POST /lifecycle` also works.
 
+### F3 — Terminal-destroy has two blind spots: self-actored closes, and the `duplicate` state
+
+`issueStatusChanged` is an `AppUserNotification`, and notifications inherit two Linear behaviours
+the plan does not account for. Both were found by live test, not inference (S0).
+
+1. **Linear does not notify you about your own actions.** All 29 notifications in the corpus had a
+   *human* actor (`actorId` = Test Operator) and the Cyrus app user as recipient. When the same state
+   change was driven **using the Cyrus app's own OAuth token**, `Issue/update` fired normally but
+   `issueStatusChanged` **did not fire at all**. So any terminal transition performed by the app
+   user itself — a Cyrus session closing its own issue, or any automation sharing that OAuth
+   app — produces no terminal-destroy trigger.
+2. **The `duplicate` state type fires no notification.** Moving the test issue (human actor,
+   subscribed) to a `type: "duplicate"` state produced only `Issue/update`; no notification arrived
+   in the following 26 s, whereas the `canceled` notification had arrived in the *same second* as
+   its `Issue/update`. Linear treats Duplicate as a closed state in the UI, so a user will
+   reasonably expect cleanup.
+
+Neither case is a correctness bug — both fall through to the 14-day `staleDestroyMs` backstop — but
+each is a container burning storage (and, if it is `Running` rather than suspended, compute) for two
+weeks. **Recommended plan change (Task 6):** treat these as known, documented gaps in the D9 GC
+table rather than silently relying on the backstop. If either matters in practice, the fallback is
+the same one S0 was written to avoid — subscribe to entity `Issue` update webhooks and resolve
+`updatedFrom.stateId` against the tracker's state types (`completed` / `canceled` / `duplicate`),
+which *are* delivered in all four cases including self-actored ones. That is strictly more work than
+the notification path and should only be taken on if the blind spots prove real.
+
 ---
 
-## S0 — Linear webhook delivery — NOT RUN
+## S0 — Linear webhook delivery — PASS (with two blind spots)
 
-S0 is a **Linear** spike (does the router-mode OAuth app receive `AppUserNotification` /
-`issueStatusChanged` and `Issue` remove?). It involves no Azure resources and cannot be run with
-`az`. It was therefore out of scope for this session.
+**This was the gate on Task 6. It passes: both webhook kinds are delivered to the router-mode
+OAuth app's subscription, and the existing cyrus-core type guards match the delivered shapes
+unmodified.**
 
-**Task 6 remains gated on S0.** Nothing in this document unblocks it.
+### Method
+
+Two independent sources, so the result does not rest on a single triggered event:
+
+- **Passive corpus** — the ngrok inspector (`http://127.0.0.1:4040/api/requests/http`) retains full
+  request bodies for the live router's tunnel. **908 real webhook deliveries** were recovered,
+  spanning **2026-07-14T02:39Z → 2026-07-25T09:47Z** (11 days of ordinary production traffic).
+- **Active tests** — a throwaway issue (`BGL-24`, team Beagle) with the Cyrus app user as
+  subscriber, driven through `Todo → In Progress → Canceled → Duplicate → deleted`. Transitions
+  needing a human actor were performed by the operator in the Linear UI; the rest via the app token.
+  The issue was deleted as the final test step, so nothing was left in the workspace.
+
+### Delivery — both kinds confirmed
+
+| Webhook | Evidence | Verdict |
+|---|---|---|
+| `AppUserNotification` / `issueStatusChanged` | 29 deliveries in the corpus + 1 live (`canceled`, 04:02:51Z) | **delivered** ✓ |
+| `Issue` / `remove` | 1 live (04:05:44Z) + 1 historical (2026-07-14T01:31Z) | **delivered** ✓ |
+
+Deliveries carry `Linear-Event`, `Linear-Delivery`, `Linear-Timestamp` and `Linear-Signature`
+headers and pass the router's existing HMAC verification (they reach `EventRouter.route()`, which
+logs them as ignored — see prior art below).
+
+### "Terminal-by-construction" holds — 100% precision
+
+The plan's load-bearing claim is that `issueStatusChanged` needs **no tracker fetch** because it
+only fires on terminal transitions. Cross-referencing every notification against the `Issue/update`
+webhook for the same issue within ±10 s:
+
+| Target state type | Transitions in corpus | Fired a notification |
+|---|---|---|
+| `backlog` / `unstarted` / `started` | 129 | **0** |
+| `completed` | 45 | 29 |
+| `canceled` | 0 in corpus — **confirmed by live test** | 1/1 |
+| `duplicate` | 0 in corpus — **live test fired none** (F3) | 0/1 |
+
+**Zero false positives across 129 non-terminal transitions.** A container can never be destroyed
+because someone moved an issue to In Progress. The claim stands.
+
+### Recall is bounded by Cyrus's own subscription — which is exactly the right population
+
+The 16 `completed` transitions that fired no notification look alarming until correlated: the
+predicate is a **perfect** match for "did Cyrus ever have an agent session on this issue".
+
+- 29/29 issues **with** a prior `AgentSessionEvent` → notification fired.
+- 16/16 issues **without** one → no notification.
+
+Issues Cyrus never touched have no container to reclaim, so the misses are irrelevant. Delegation
+subscribes the app user (`issueSubscribed` notifications are observed for these issues), and
+subscription is what drives the notification — which is why a subscribed-but-never-delegated test
+issue was sufficient to prove the `canceled` case.
+
+### Payload shape — and one thing it does *not* contain
+
+The notification carries `notification.issue` with `id`, `identifier`, `title`, `teamId`, `team`
+and `url`, plus `actorId` / `actor`. It carries **no state field whatsoever** — no `stateId`, no
+state name, no state type. Consequently:
+
+- `completed` vs `canceled` is **not** derivable from the notification. This is fine for the plan:
+  `translateIssueStateChange` sets `isTerminal: true` unconditionally, and Task 6 step 1 only needs
+  `closed` vs `deleted`, which is derivable from the **webhook type** alone.
+- It is also *why* F3's fallback would require the entity-webhook path — that is the only one of
+  the two that carries `updatedFrom.stateId`.
+
+### Type guards verified against real payloads
+
+Run against the captured bodies using the built `cyrus-core` / `cyrus-linear-event-transport`:
+
+- `isIssueStateChangeWebhook` + `LinearMessageTranslator.translate` → **29/29 pass**, each producing
+  `isTerminal: true` with the correct `workItemId` / `workItemIdentifier`; plus the live `canceled`
+  payload.
+- `isIssueDeletedWebhook` + translate → passes on the live `Issue/remove` payload
+  (`isTerminal: true`, `workItemIdentifier: "BGL-24"`; the `remove` body also carries `description`).
+- Negative controls hold: `isIssueStateChangeWebhook` is `false` for `Issue/update` and for the
+  `remove` payload; `isIssueDeletedWebhook` is `false` for a notification.
+
+**No `LinearMessageTranslator` or type-guard changes are needed** — as the plan predicted.
+
+### Two Task 6 assumptions verified in code, not just on the wire
+
+- **`RouterEventTransport` does not type-filter.** `handleConnectionEvent` emits `"event"`
+  unconditionally and runs `messageTranslator.translate()` on whatever the router forwards. The
+  plan's "extend only if type-filtered" item resolves to **no work**.
+- **Entity webhooks are not actor-filtered**, unlike notifications. `Issue/create`, `Issue/update`
+  and `Issue/remove` all fired for app-token-driven changes during the test. This asymmetry is the
+  whole of F3.
+
+### Prior art — the relay half of Task 6 already exists and has run in production
+
+Commit **`2aa0c24a`** ("fix(router): forward issue terminal-state webhooks so nodes reclaim
+worktrees") on branch **`fix/router-forward-terminal-state`** already implements Task 6 steps 1–2:
+it handles both `isIssueStateChangeWebhook` and `isIssueDeletedWebhook` in `EventRouter.route()`,
+enqueues the **raw webhook** on the durable per-device queue, and ships 214 lines of tests plus
+`scripts/reclaim-stale-worktrees.sh`. This host's router logs show it working on 2026-07-24
+(`Forwarded terminal webhook AppUserNotification/issueStatusChanged for issue PAR-178 to device 3
+for worktree cleanup`).
+
+It is **not merged** into `main`, `cyrus-containers` or `deploy` — the currently-running build logs
+`EventRouter ignoring non-agent-session webhook` again. **Task 6 should build on this commit rather
+than re-derive it**, and it answers a question the plan leaves open: the target device is resolved
+via **`issue_affinity`**, because session affinity and the issue lock are both torn down when the
+session reports terminal `session_state` — typically well before a human moves the issue to Done.
+Issue affinity survives until the device is removed, so it still resolves days later.
+
+### Reproduction
+
+```bash
+# passive corpus (full bodies, ~11 days retained by the ngrok inspector)
+curl -s "http://127.0.0.1:4040/api/requests/http?limit=1000" -o ngrok-requests.json
+# each entry: .requests[].request.raw is base64 of the full HTTP request
+
+# router-side view of what was delivered but dropped
+grep "ignoring non-agent-session webhook" /root/.pm2/logs/cyrus-router-out.log
+```
+
+Active tests used the workspace OAuth token from `~/.cyrus/router-config.json`
+(`issueCreate` with `subscriberIds: [<app user id>]`, then `issueUpdate` / `issueDelete`).
+**Note:** state changes driven with that token are self-actored and therefore fire **no**
+notification (F3) — terminal-notification tests must be driven by a human actor in the UI.
 
 ---
 
