@@ -195,6 +195,29 @@ resource "azurerm_container_app" "router" {
         name = "artifacts"
         path = "/data/artifacts"
       }
+
+      # Rolling-update health gate. `revision_mode = "Single"` plus
+      # min/max_replicas = 1 (above) keep exactly one router replica serving in
+      # steady state, but they do NOT remove the rolling-overlap window: ACA
+      # starts the new revision's replica while the old one is still serving.
+      # Without a readiness probe ACA treats a merely-started container as
+      # ready, so ingress can shift (and the old revision be deactivated)
+      # before the router has opened its SQLite database and registered the
+      # webhook route — which is how the 2026-07-26 emergency rollout ended up
+      # with both revisions accepting the same work. This probe makes ACA hold
+      # traffic on the previous revision until /healthz answers on the new one,
+      # shortening (but never eliminating) that window. Correctness across it
+      # comes from the router's own webhook idempotency claim — see
+      # RouterStore.claimWebhookEvent — not from this probe.
+      readiness_probe {
+        transport               = "HTTP"
+        port                    = 8787
+        path                    = "/healthz"
+        interval_seconds        = 5
+        timeout                 = 3
+        failure_count_threshold = 6
+        success_count_threshold = 1
+      }
     }
 
     # Azure Files share bound to /data/artifacts — read/write; stores artifact

@@ -13,6 +13,15 @@ export interface Creator {
 
 const WORKSPACE = "ws-1";
 
+/**
+ * Makes each synthesized AgentActivity id unique, the way Linear's are. The
+ * router claims a webhook idempotency key derived from the payload's entity id
+ * and `createdAt` before routing it (see `webhookIdempotencyKey`), so two prompt
+ * fixtures that shared an activity id AND landed in the same millisecond would
+ * be treated as one redelivered prompt and the second silently dropped.
+ */
+let activitySeq = 0;
+
 export function createdFixture(opts: {
 	sessionId: string;
 	issue: { id: string; identifier: string; title: string };
@@ -55,7 +64,7 @@ export function promptedFixture(opts: {
 		organizationId: WORKSPACE,
 		createdAt: new Date().toISOString(),
 		agentActivity: {
-			id: `act-${opts.sessionId}-${opts.actorUserId}`,
+			id: `act-${opts.sessionId}-${opts.actorUserId}-${++activitySeq}`,
 			userId: opts.actorUserId,
 			content: { type: "prompt", body: opts.body },
 		},

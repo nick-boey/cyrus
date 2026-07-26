@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS issue_affinity (
 CREATE TABLE IF NOT EXISTS issue_locks (
   issue_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, device_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS webhook_claims (
+  idempotency_key TEXT PRIMARY KEY, claimed_ms INTEGER NOT NULL
+);
 `;
 
 // A user may have at most one physical device row, and an issue may have at
@@ -59,9 +62,15 @@ CREATE TABLE IF NOT EXISTS issue_locks (
 // coexist for the same user, and multiple container rows can coexist for the
 // same user across different issues. Inline UNIQUE constraints can't express
 // "unique among rows matching a condition", hence these partial indexes.
+//
+// `idx_webhook_claims_claimed_ms` is a plain index, not a constraint: it exists
+// so the bounded retention sweep (`sweepWebhookClaims`) deletes by age without
+// scanning the whole table. Uniqueness of the key itself comes from
+// `webhook_claims.idempotency_key`'s PRIMARY KEY.
 const INDEXES = `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_physical_user ON devices(user_id) WHERE kind = 'device';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_container_issue ON devices(issue_key) WHERE kind = 'container';
+CREATE INDEX IF NOT EXISTS idx_webhook_claims_claimed_ms ON webhook_claims(claimed_ms);
 `;
 
 function sha256Hex(value: string): string {
@@ -224,6 +233,13 @@ export class RouterStore {
 	constructor(dbPath: string) {
 		this.db = new Database(dbPath);
 		this.db.pragma("journal_mode = WAL");
+		// Two router processes can briefly share this file — a rolling deployment
+		// overlaps the outgoing and incoming revision, and an operator CLI opens
+		// the same db as the running server. WAL gives them one writer at a time;
+		// without a busy timeout the loser of a write-lock race throws
+		// SQLITE_BUSY immediately instead of waiting its turn, which for
+		// `claimWebhookEvent` would turn a serialized claim into a thrown webhook.
+		this.db.pragma("busy_timeout = 5000");
 		// Enforce the ON DELETE CASCADE clauses declared in SCHEMA (off by
 		// default in SQLite) so removing a user/device cleans up dependent rows.
 		this.db.pragma("foreign_keys = ON");
@@ -771,6 +787,61 @@ export class RouterStore {
 			.prepare("SELECT email FROM users WHERE user_id = ?")
 			.get(userId) as { email: string } | undefined;
 		return row?.email;
+	}
+
+	/**
+	 * Claims a webhook delivery's idempotency key, returning `true` only for the
+	 * caller that won the claim. Every later caller presenting the same key gets
+	 * `false` and must drop the delivery instead of routing it.
+	 *
+	 * This is the router's exactly-once-execution gate, so the claim MUST be a
+	 * write that the database itself arbitrates — never a read-then-write
+	 * ("does this key exist? no → insert"), which is racy the moment two router
+	 * processes share this file. Instead the single `INSERT OR IGNORE` leans on
+	 * `webhook_claims.idempotency_key`'s PRIMARY KEY: SQLite serializes the two
+	 * writers (WAL + the `busy_timeout` set in the constructor), the second one's
+	 * insert conflicts, and `changes === 0` reports the loss. `.immediate()` takes
+	 * the write lock when the transaction opens rather than upgrading a read lock
+	 * mid-transaction, so concurrent claimers queue instead of deadlocking.
+	 *
+	 * Callers claim BEFORE doing any routing work, which makes this at-most-once
+	 * execution: a crash between the claim and the routing loses that event
+	 * rather than duplicating it. That is the intended trade — a redelivery is
+	 * already the only reason this table exists, and the router replies 200 to
+	 * Linear before routing anyway, so a rejected claim is never retried.
+	 */
+	claimWebhookEvent(key: string, nowMs: number): boolean {
+		const txn = this.db.transaction(() => {
+			const result = this.db
+				.prepare(
+					"INSERT OR IGNORE INTO webhook_claims (idempotency_key, claimed_ms) VALUES (?, ?)",
+				)
+				.run(key, nowMs);
+			return result.changes === 1;
+		});
+		return txn.immediate();
+	}
+
+	/** Whether a key has already been claimed (diagnostics; the claim itself is {@link claimWebhookEvent}). */
+	hasWebhookClaim(key: string): boolean {
+		const row = this.db
+			.prepare("SELECT 1 FROM webhook_claims WHERE idempotency_key = ?")
+			.get(key);
+		return row !== undefined;
+	}
+
+	/**
+	 * Deletes webhook claims older than `cutoffMs`, returning how many went. The
+	 * table is append-only otherwise, so this bound is the only thing keeping it
+	 * from growing for the life of the deployment. Driven by
+	 * {@link EventRouter.sweepExpired}, alongside the event-TTL and stale-lock
+	 * passes.
+	 */
+	sweepWebhookClaims(cutoffMs: number): number {
+		const result = this.db
+			.prepare("DELETE FROM webhook_claims WHERE claimed_ms < ?")
+			.run(cutoffMs);
+		return result.changes;
 	}
 
 	enqueueEvent(
