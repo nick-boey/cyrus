@@ -307,7 +307,18 @@ export function buildProgram(
 	routerSecretsCommand
 		.command("list <email>")
 		.description("List a user's stored secret keys (values masked)")
-		.action(makeRouterAction("secrets", "list"));
+		.option(
+			"--check-scopes",
+			"Also query GitHub for the stored GH_TOKEN/GIT_TOKEN scopes and report what is missing. Informational only — never rejects a usable token, and never prints token values.",
+		)
+		.action(async (email: string, options: { checkScopes?: boolean }) => {
+			// makeRouterAction forwards only string args, so translate the
+			// boolean flag back into the string form RouterCommand parses.
+			await makeRouterAction("secrets", "list")(
+				email,
+				...(options.checkScopes ? ["--check-scopes"] : []),
+			);
+		});
 
 	const routerContainersCommand = routerCommand
 		.command("containers")
