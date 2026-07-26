@@ -124,7 +124,7 @@ export interface AcaSandboxesProviderOptions {
 	logger?: { info(msg: string): void; warn(msg: string): void };
 	/** Injectable clock for "newest snapshot" selection (tests). */
 	now?: () => number;
-	/** Optional sleep hook (unused in v1, kept for future retry paths). */
+	/** Injectable sleep, used to pace the post-resume connectivity poll (tests). */
 	sleepFn?: (ms: number) => Promise<void>;
 	/** Router WSS state for F1 worker-process liveness reconciliation. */
 	deviceConnectivity?: (deviceId: string) => {
@@ -133,6 +133,20 @@ export interface AcaSandboxesProviderOptions {
 	};
 	/** Recreate ACA Running sandboxes disconnected longer than this grace period. */
 	disconnectedRecreateMs?: number;
+	/**
+	 * How long a resumed sandbox is given to re-establish its router WSS session
+	 * before it is treated as a dead worker and replaced (default 90s).
+	 *
+	 * A memory resume takes ~1s of infrastructure time; the worker then has to
+	 * notice its frozen socket is stale (its wall-clock liveness watchdog fires
+	 * within two router heartbeats — 60s on the default cadence) and redial. The
+	 * default therefore sits just above that worst case. Set to `0` to skip
+	 * verification entirely and keep the older behavior of trusting ACA's
+	 * infrastructure state.
+	 */
+	resumeConnectTimeoutMs?: number;
+	/** Poll cadence while waiting for a resumed worker to reconnect (default 2s). */
+	resumeConnectPollMs?: number;
 }
 
 /**
@@ -158,6 +172,9 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 	private readonly now: () => number;
 	private readonly deviceConnectivity?: AcaSandboxesProviderOptions["deviceConnectivity"];
 	private readonly disconnectedRecreateMs: number;
+	private readonly resumeConnectTimeoutMs: number;
+	private readonly resumeConnectPollMs: number;
+	private readonly sleep: (ms: number) => Promise<void>;
 	/** Provider-internal per-issue mutex (M1). */
 	private readonly locks = new Map<string, Promise<void>>();
 
@@ -181,6 +198,14 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 		this.now = opts.now ?? (() => Date.now());
 		this.deviceConnectivity = opts.deviceConnectivity;
 		this.disconnectedRecreateMs = opts.disconnectedRecreateMs ?? 120_000;
+		this.resumeConnectTimeoutMs = opts.resumeConnectTimeoutMs ?? 90_000;
+		this.resumeConnectPollMs = opts.resumeConnectPollMs ?? 2_000;
+		this.sleep =
+			opts.sleepFn ??
+			((ms) =>
+				new Promise((resolve) => {
+					setTimeout(resolve, ms).unref?.();
+				}));
 	}
 
 	/**
@@ -285,7 +310,10 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 	 * ACA `Running` is infrastructure state only. When the router supplies
 	 * device connectivity, a worker that remains WSS-disconnected beyond the
 	 * configured grace is replaced; connected and transiently disconnected
-	 * workers are retained.
+	 * workers are retained. The same rule applies to a resume: `resumeSandbox`
+	 * returning is not evidence that the worker process rejoined the router, so
+	 * connectivity is confirmed before the resume is reported as success (see
+	 * {@link waitForWorkerConnectivity}).
 	 */
 	async ensureRunning(ctx: IssueExecutionContext): Promise<void> {
 		this.validateIssueContext(ctx.issueKey, ctx.deviceId);
@@ -301,7 +329,7 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 				(a, b) =>
 					this.sandboxRank(a) - this.sandboxRank(b) || a.id.localeCompare(b.id),
 			);
-		let retained = valid[0];
+		const retained = valid[0];
 		if (existing.length > 0) {
 			const replaceAll =
 				!retained ||
@@ -309,7 +337,6 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 					this.shouldRecreateDisconnected(deviceId));
 			if (replaceAll) {
 				await this.replaceSandboxes(ctx.issueKey, existing);
-				retained = undefined;
 			} else {
 				const current = retained;
 				if (!current) return;
@@ -319,15 +346,25 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 				);
 				if (this.isTransitional(current.state)) return;
 				if (current.state === "Running") return;
-				if (current.state === "Stopped" || current.state === "Suspended") {
-					// Memory-mode resume inherits env/token from the frozen state.
-					await this.client.resumeSandbox(current.id);
+				if (current.state !== "Stopped" && current.state !== "Suspended") {
 					return;
 				}
-				return;
+				// Memory-mode resume inherits env/token from the frozen state.
+				await this.client.resumeSandbox(current.id);
+				// A memory suspend freezes the worker's timers and leaves it
+				// holding a socket the router already terminated, so `Resumed`
+				// does not imply "back on the router". Confirm the device is
+				// actually online before reporting success; a worker that never
+				// rejoins is replaced HERE rather than leaving queued work
+				// stranded until a later prompt crosses disconnectedRecreateMs.
+				if (await this.waitForWorkerConnectivity(ctx.issueKey, deviceId)) {
+					return;
+				}
+				await this.replaceSandboxes(ctx.issueKey, [current]);
 			}
 		}
-		// Absent, or after a stale replacement. Lineage check (B5) first.
+		// Absent, or after a stale/unreachable replacement. Lineage check (B5)
+		// first.
 		const snap =
 			deviceId === undefined
 				? undefined
@@ -416,6 +453,45 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 				errors,
 				`failed to delete ACA sandboxes for ${issueKey}: ${errors.map(String).join("; ")}`,
 			);
+		}
+	}
+
+	/**
+	 * Poll the router's device/WSS state until the resumed worker is online, or
+	 * until {@link resumeConnectTimeoutMs} elapses.
+	 *
+	 * Returns `true` (i.e. "trust the resume") when there is nothing to verify
+	 * against — no router connectivity callback, no device id, or verification
+	 * explicitly disabled — so a provider constructed without the router seam
+	 * behaves exactly as before.
+	 */
+	private async waitForWorkerConnectivity(
+		issueKey: string,
+		deviceId: string | undefined,
+	): Promise<boolean> {
+		if (
+			!deviceId ||
+			!this.deviceConnectivity ||
+			this.resumeConnectTimeoutMs <= 0
+		) {
+			return true;
+		}
+		const startedMs = this.now();
+		const deadline = startedMs + this.resumeConnectTimeoutMs;
+		for (;;) {
+			if (this.deviceConnectivity(deviceId).connected) {
+				this.logger.info(
+					`Resumed ACA sandbox for ${issueKey} reconnected to the router after ${this.now() - startedMs}ms`,
+				);
+				return true;
+			}
+			if (this.now() >= deadline) {
+				this.logger.warn(
+					`Resumed ACA sandbox for ${issueKey} reached ACA Running but device ${deviceId} never reconnected to the router within ${this.resumeConnectTimeoutMs}ms; replacing the sandbox`,
+				);
+				return false;
+			}
+			await this.sleep(this.resumeConnectPollMs);
 		}
 	}
 

@@ -700,6 +700,130 @@ describe("AcaSandboxesProvider", () => {
 		});
 	});
 
+	/**
+	 * ACA `Running` is infrastructure state, not worker-process liveness — a
+	 * memory resume can report success while the worker inside is still holding
+	 * the dead socket it froze with. These cover the post-resume verification:
+	 * a resume counts as success only once the router says the device is back on
+	 * its WebSocket.
+	 */
+	describe("ensureRunning — post-resume connectivity verification", () => {
+		/**
+		 * Suspended sandbox plus an injected virtual clock that advances ONLY when
+		 * the provider sleeps, so the timeout is exercised deterministically with
+		 * no real waiting.
+		 */
+		function suspendedProviderFor(opts: {
+			connectedAfterMs?: number;
+			resumeConnectTimeoutMs?: number;
+		}) {
+			const sandboxByIssue = new Map<string, AcaSandbox>([
+				[
+					"CYPACK-1",
+					sb("CYPACK-1", {
+						state: "Suspended",
+						labels: { "cyrus.device-id": "dev-1" },
+					}),
+				],
+			]);
+			const fake = fakeClient({
+				sandboxByIssue,
+				diskImages: [{ name: "disk-v1" }],
+			});
+			let clock = 0;
+			const sleeps: number[] = [];
+			const connectivityChecks: string[] = [];
+			return {
+				...fake,
+				sleeps,
+				connectivityChecks,
+				provider: new AcaSandboxesProvider({
+					client: fake.client,
+					image: "img:1",
+					disk: "disk-v1",
+					now: () => clock,
+					sleepFn: async (ms) => {
+						sleeps.push(ms);
+						clock += ms;
+					},
+					resumeConnectPollMs: 1_000,
+					resumeConnectTimeoutMs: opts.resumeConnectTimeoutMs ?? 5_000,
+					deviceConnectivity: (deviceId) => {
+						connectivityChecks.push(deviceId);
+						return {
+							connected:
+								opts.connectedAfterMs !== undefined &&
+								clock >= opts.connectedAfterMs,
+							disconnectedSinceMs: 0,
+						};
+					},
+				}),
+			};
+		}
+
+		it("resumes and stops once the worker rejoins the router", async () => {
+			const { provider, calls, sleeps } = suspendedProviderFor({
+				connectedAfterMs: 2_000,
+			});
+			await provider.ensureRunning(ctx({ deviceId: "dev-1" }));
+			expect(calls.resumeSandbox).toEqual(["sb-CYPACK-1"]);
+			// Two polls of virtual time, then connected — no replacement.
+			expect(sleeps).toEqual([1_000, 1_000]);
+			expect(calls.deleteSandbox).toHaveLength(0);
+			expect(calls.createSandbox).toHaveLength(0);
+		});
+
+		it("replaces a sandbox that reaches Running but never rejoins the router", async () => {
+			const { provider, calls } = suspendedProviderFor({
+				resumeConnectTimeoutMs: 3_000,
+			});
+			await provider.ensureRunning(
+				ctx({ deviceId: "dev-1", mintDeviceToken: () => "fresh-token" }),
+			);
+			// The cheap resume is attempted first; then — because the worker never
+			// came back — the sandbox is replaced HERE, rather than leaving queued
+			// work stranded until a later prompt crosses disconnectedRecreateMs.
+			expect(calls.resumeSandbox).toEqual(["sb-CYPACK-1"]);
+			expect(calls.deleteSandbox).toEqual(["sb-CYPACK-1"]);
+			expect(calls.createSandbox).toHaveLength(1);
+			expect(calls.createSandbox[0]?.environment?.CYRUS_DEVICE_TOKEN).toBe(
+				"fresh-token",
+			);
+		});
+
+		it("trusts the resume when no router connectivity signal is wired", async () => {
+			const sandboxByIssue = new Map<string, AcaSandbox>([
+				["CYPACK-1", sb("CYPACK-1", { state: "Suspended" })],
+			]);
+			const { client, calls } = fakeClient({
+				sandboxByIssue,
+				diskImages: [{ name: "disk-v1" }],
+			});
+			const provider = new AcaSandboxesProvider({
+				client,
+				image: "img:1",
+				disk: "disk-v1",
+				sleepFn: async () => {
+					throw new Error("must not poll without a connectivity signal");
+				},
+			});
+			await provider.ensureRunning(ctx({ deviceId: "dev-1" }));
+			expect(calls.resumeSandbox).toEqual(["sb-CYPACK-1"]);
+			expect(calls.deleteSandbox).toHaveLength(0);
+			expect(calls.createSandbox).toHaveLength(0);
+		});
+
+		it("skips verification entirely when the timeout is zero", async () => {
+			const { provider, calls, sleeps, connectivityChecks } =
+				suspendedProviderFor({ resumeConnectTimeoutMs: 0 });
+			await provider.ensureRunning(ctx({ deviceId: "dev-1" }));
+			expect(calls.resumeSandbox).toEqual(["sb-CYPACK-1"]);
+			expect(sleeps).toEqual([]);
+			expect(connectivityChecks).toEqual([]);
+			expect(calls.deleteSandbox).toHaveLength(0);
+		});
+	});
+
 	describe("ensureRunning — lineage restore (B5)", () => {
 		it("creates from a matching labeled snapshot WITHOUT re-minting, and lifecycle stays disabled (F2)", async () => {
 			const snapshotsByLabels = [
