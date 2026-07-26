@@ -337,4 +337,161 @@ describe("TerminalTeardown", () => {
 		expect(clearTimeout).toHaveBeenCalledWith(60_000);
 		expect(teardown.has("CYPACK-1")).toBe(false);
 	});
+
+	/**
+	 * The pending-teardown mirror exists for the out-of-process
+	 * `cyrus router containers list`, which cannot see this object's in-memory
+	 * map, and for telling a re-delivered worker callback apart from grace
+	 * expiry in the router log.
+	 */
+	describe("persisted callback-pending state", () => {
+		it("exposes callback-pending state, then flips to callback-received", async () => {
+			const { deviceId, deviceToken } = container();
+			const timers = {
+				callbacks: [] as Array<() => void>,
+				delays: [] as number[],
+			};
+			const destroy = vi
+				.fn()
+				.mockRejectedValueOnce(new Error("azure unavailable"));
+			const teardown = coordinator(executor(destroy), timers);
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "closed" });
+
+			// Registered, worker has not reported in: the grace deadline is what
+			// will force destruction.
+			const registered = store.getPendingTeardown("CYPACK-1");
+			expect(registered).toMatchObject({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "closed",
+				deadlineMs: 601_000,
+				callbackAttempts: 0,
+			});
+			expect(registered?.callbackReceivedMs).toBeUndefined();
+			expect(store.listPendingTeardowns()).toHaveLength(1);
+
+			const app = Fastify();
+			registerTerminalTeardownRoute(app, store, teardown);
+			const first = await app.inject({
+				method: "POST",
+				url: "/containers/issues/CYPACK-1/teardown-complete",
+				headers: {
+					authorization: `Bearer ${deviceToken}`,
+					"x-cyrus-teardown-id": "cb-1",
+				},
+			});
+			// The destroy failed, so the router keeps retrying — but the callback
+			// itself was received and recorded.
+			expect(first.statusCode).toBe(503);
+			expect(store.getPendingTeardown("CYPACK-1")).toMatchObject({
+				callbackId: "cb-1",
+				callbackAttempts: 1,
+			});
+			expect(
+				store.getPendingTeardown("CYPACK-1")?.callbackReceivedMs,
+			).toBeDefined();
+			await app.close();
+		});
+
+		it("logs a re-delivered callback as a retry, distinctly from grace expiry", async () => {
+			const { deviceId } = container();
+			const timers = {
+				callbacks: [] as Array<() => void>,
+				delays: [] as number[],
+			};
+			const destroy = vi.fn(async () => {
+				throw new Error("azure unavailable");
+			});
+			const teardown = coordinator(executor(destroy), timers);
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "closed" });
+
+			await expect(
+				teardown.handleCallback("CYPACK-1", deviceId, "cb-1"),
+			).rejects.toThrow("azure unavailable");
+			await expect(
+				teardown.handleCallback("CYPACK-1", deviceId, "cb-1"),
+			).rejects.toThrow("azure unavailable");
+
+			expect(logger.info).toHaveBeenCalledWith(
+				expect.stringContaining("is a retry of callback cb-1 (delivery #2)"),
+			);
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("after callback retry"),
+			);
+			// Grace expiry says something different: no worker ever reported in.
+			expect(logger.warn).not.toHaveBeenCalledWith(
+				expect.stringContaining("Terminal teardown grace expired"),
+			);
+			expect(store.getPendingTeardown("CYPACK-1")?.callbackAttempts).toBe(2);
+		});
+
+		it("clears the mirrored row once teardown completes", async () => {
+			const { deviceId } = container();
+			const teardown = coordinator(executor());
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "closed" });
+			expect(store.getPendingTeardown("CYPACK-1")).toBeDefined();
+
+			await teardown.handleCallback("CYPACK-1", deviceId, "cb-1");
+
+			expect(store.getPendingTeardown("CYPACK-1")).toBeUndefined();
+			expect(store.listPendingTeardowns()).toEqual([]);
+		});
+
+		it("records an upgraded close→delete against the same row", () => {
+			const { deviceId } = container();
+			const teardown = coordinator(executor());
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "closed" });
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "deleted" });
+			expect(store.listPendingTeardowns()).toHaveLength(1);
+			expect(store.getPendingTeardown("CYPACK-1")?.action).toBe("deleted");
+		});
+
+		it("rejects a malformed idempotency key rather than logging it", async () => {
+			const { deviceId, deviceToken } = container();
+			const teardown = coordinator(executor());
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "closed" });
+			const app = Fastify();
+			registerTerminalTeardownRoute(app, store, teardown);
+
+			const response = await app.inject({
+				method: "POST",
+				url: "/containers/issues/CYPACK-1/teardown-complete",
+				headers: {
+					authorization: `Bearer ${deviceToken}`,
+					"x-cyrus-teardown-id": "not a key",
+				},
+			});
+			expect(response.statusCode).toBe(400);
+			expect(teardown.has("CYPACK-1")).toBe(true);
+			await app.close();
+		});
+
+		it("clears ghost rows from a previous router process on construction", () => {
+			const { deviceId } = container();
+			store.upsertPendingTeardown({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "closed",
+				registeredMs: 1,
+				deadlineMs: 2,
+			});
+			// A fresh coordinator starts with no in-memory entries and no armed
+			// grace timers, so a surviving row would misreport forever.
+			coordinator(executor());
+			expect(store.listPendingTeardowns()).toEqual([]);
+			expect(logger.info).toHaveBeenCalledWith(
+				expect.stringContaining(
+					"Cleared 1 terminal teardown row(s) left by a previous router process",
+				),
+			);
+		});
+
+		it("drops the mirrored row when the container device row is deleted", () => {
+			const { deviceId } = container();
+			const teardown = coordinator(executor());
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "closed" });
+			store.deleteContainerDevice(deviceId);
+			expect(store.getPendingTeardown("CYPACK-1")).toBeUndefined();
+		});
+	});
 });

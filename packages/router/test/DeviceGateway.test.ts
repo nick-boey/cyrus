@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { PROTOCOL_VERSION } from "cyrus-router-protocol";
+import { HEARTBEAT_INTERVAL_MS, PROTOCOL_VERSION } from "cyrus-router-protocol";
 import { describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { DeviceGateway } from "../src/DeviceGateway.js";
@@ -97,6 +97,57 @@ describe("DeviceGateway", () => {
 		await closed;
 		// A version-mismatched hello must never authenticate the device.
 		expect(gateway.isOnline(device.deviceId)).toBe(false);
+		gateway.close();
+		httpServer.close();
+	});
+
+	/**
+	 * The device's liveness watchdog gives up after two heartbeats of silence,
+	 * and must derive that from the router it is actually talking to — a router
+	 * configured with a non-default cadence would otherwise leave the device on
+	 * the compiled-in 30s default and terminating at the wrong time.
+	 */
+	it("advertises its heartbeat cadence in hello_ack", async () => {
+		const { gateway, device, port, httpServer } = await setup({
+			heartbeatMs: 5_000,
+		});
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+
+		const helloAck = JSON.parse(await nextMessage());
+		expect(helloAck.type).toBe("hello_ack");
+		expect(helloAck.heartbeatMs).toBe(5_000);
+
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("defaults its advertised heartbeat to the shared protocol constant", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+
+		const helloAck = JSON.parse(await nextMessage());
+		expect(helloAck.heartbeatMs).toBe(HEARTBEAT_INTERVAL_MS);
+
 		gateway.close();
 		httpServer.close();
 	});

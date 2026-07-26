@@ -34,6 +34,8 @@ export function createAcaSandboxesProvider(
 		egress: cfg.egress,
 		keepSnapshots: cfg.keepSnapshots,
 		disconnectedRecreateMs: cfg.disconnectedRecreateMs,
+		resumeConnectTimeoutMs: cfg.resumeConnectTimeoutMs,
+		resumeConnectPollMs: cfg.resumeConnectPollMs,
 		deviceConnectivity,
 		routerUrlForContainers: containers.routerUrlForContainers,
 		logger,

@@ -51,6 +51,7 @@ export {
 export {
 	type ContainerDeviceInfo,
 	type DeviceInfo,
+	type PendingTeardownInfo,
 	RouterStore,
 	type SessionInfo,
 } from "./RouterStore.js";

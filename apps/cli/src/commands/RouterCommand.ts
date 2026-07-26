@@ -18,6 +18,7 @@ import {
 	isReservedEnvKey,
 	isStorableSecretKey,
 	KeyVaultSecretStore,
+	type PendingTeardownInfo,
 	probeGitHubTokenScopes,
 	RESERVED_ENV_KEYS,
 	RouterServer,
@@ -65,6 +66,7 @@ const CONTAINERS_TABLE_COLUMN_WIDTHS = {
 	provider: 10,
 	email: 30,
 	lastRouted: 25,
+	lastSeen: 25,
 } as const;
 
 /**
@@ -216,6 +218,8 @@ const RouterConfigFileSchema = z.object({
 						.optional(),
 					keepSnapshots: z.number().int().nonnegative().optional(),
 					disconnectedRecreateMs: z.number().nonnegative().default(120_000),
+					resumeConnectTimeoutMs: z.number().nonnegative().default(90_000),
+					resumeConnectPollMs: z.number().positive().default(2_000),
 					apiVersion: z.string().optional(),
 					managementEndpoint: z.string().optional(),
 				})
@@ -1133,7 +1137,7 @@ export class RouterCommand extends BaseCommand {
 	 */
 	private formatContainerDeviceHeader(): string {
 		const w = CONTAINERS_TABLE_COLUMN_WIDTHS;
-		return `${"ISSUE KEY".padEnd(w.issueKey)} ${"PROVIDER".padEnd(w.provider)} ${"USER".padEnd(w.email)} ${"LAST ROUTED".padEnd(w.lastRouted)} LAST SEEN`;
+		return `${"ISSUE KEY".padEnd(w.issueKey)} ${"PROVIDER".padEnd(w.provider)} ${"USER".padEnd(w.email)} ${"LAST ROUTED".padEnd(w.lastRouted)} ${"LAST SEEN".padEnd(w.lastSeen)} TEARDOWN`;
 	}
 
 	private formatContainerDeviceRow(
@@ -1148,7 +1152,37 @@ export class RouterCommand extends BaseCommand {
 		const lastSeen = device.lastSeenMs
 			? new Date(device.lastSeenMs).toISOString()
 			: "-";
-		return `${device.issueKey.padEnd(w.issueKey)} ${device.provider.padEnd(w.provider)} ${email.padEnd(w.email)} ${lastRouted.padEnd(w.lastRouted)} ${lastSeen}`;
+		const teardown = this.formatTeardownState(
+			store.getPendingTeardown(device.issueKey),
+		);
+		return `${device.issueKey.padEnd(w.issueKey)} ${device.provider.padEnd(w.provider)} ${email.padEnd(w.email)} ${lastRouted.padEnd(w.lastRouted)} ${lastSeen.padEnd(w.lastSeen)} ${teardown}`;
+	}
+
+	/**
+	 * The TEARDOWN column. Distinguishes the three states an operator actually
+	 * needs to tell apart while a container is being reclaimed:
+	 *
+	 *  - `-` — no terminal teardown registered; a normally-running container.
+	 *  - `callback-pending(<action>, grace <Ns>)` — the worker was asked to clean
+	 *    up and has NOT called back yet. The grace countdown is what will
+	 *    eventually force destruction; if this sits here until it expires, the
+	 *    worker never came back.
+	 *  - `destroying(<action>, callbacks N)` — the worker DID report in (N
+	 *    deliveries, retries included), so any remaining delay is the provider
+	 *    destroy retrying, not a missing callback.
+	 */
+	protected formatTeardownState(
+		pending: PendingTeardownInfo | undefined,
+	): string {
+		if (!pending) return "-";
+		if (pending.callbackReceivedMs === undefined) {
+			const graceSeconds = Math.max(
+				0,
+				Math.round((pending.deadlineMs - Date.now()) / 1000),
+			);
+			return `callback-pending(${pending.action}, grace ${graceSeconds}s)`;
+		}
+		return `destroying(${pending.action}, callbacks ${pending.callbackAttempts})`;
 	}
 
 	/**
