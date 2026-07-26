@@ -23,9 +23,20 @@ through it automatically:
   the teammate who owns it (Linear + tunnel only; no Claude, no GitHub).
 - **Client device** — a teammate's own machine that runs *their* sessions locally
   with *their* native credentials, connected to a router.
+- **Azure-hosted router + ACA Sandboxes** — a single-replica router Container App
+  routes selected users to per-issue cloud sandboxes that suspend when idle.
 
 The router/client modes are documented in [ROUTER.md](./ROUTER.md). The rest of
 this guide covers **standalone**.
+
+For the Azure option, use the maintained Terraform stack and operator runbook in
+[`infra/azure/README.md`](../infra/azure/README.md), then read
+[Azure hosting and ACA Sandboxes](./ROUTER.md#azure-hosting-and-aca-sandboxes).
+It requires a published worker image registered as an ACA disk image, Azure
+credentials/RBAC, Key Vault, and a public `wss://` router URL. The router is
+single-replica by design; its ephemeral SQLite database is periodically backed
+up to Blob, while artifact bundles live on Azure Files. ACA egress is
+deny-by-default and supports HTTPS/WSS, not SSH remotes.
 
 ---
 

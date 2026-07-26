@@ -1,0 +1,108 @@
+################################################################################
+# dev.tfvars.example — copy to dev.tfvars and fill in. NEVER commit dev.tfvars.
+# Every variable is documented in variables.tf; this file lists each one with a
+# sample/placeholder so a fresh operator has a complete checklist.
+################################################################################
+
+# ---- Project / naming -------------------------------------------------------
+project     = "cyrus"
+environment = "dev"
+tags = {
+  owner       = "platform"
+  cost-center = "research"
+}
+
+# ---- Location (spike S7: 35 regions supported; australiaeast verified) ------
+location = "australiaeast"
+
+# ---- Container images --------------------------------------------------------
+# router_image: pulled by the Container App directly. Public GHCR works
+# anonymously. Private registries require `enable_acr = true` AND `az acr
+# import` of the image into the ACR (see README).
+router_image = "ghcr.io/ceedaragents/cyrus-router:latest"
+
+# router_url_for_containers: WSS URL containers dial back to. The router's real
+# FQDN is only known AFTER first apply (can't be embedded in the router's own
+# env without a Terraform dependency cycle). TWO-APPLY FLOW:
+#   1. Leave null on first apply (router boots; containers won't connect yet).
+#   2. `terraform output router_wss_url` → paste the value here.
+#   3. `terraform apply` again.
+router_url_for_containers = null
+
+# worker_image: NOT pulled by the router. Register it as a group disk image
+# OUT OF BAND after first apply:
+#   aca sandboxgroup disk create --image <worker_image> --name <aca_disk_name> \
+#     --resource-group <rg> --sandbox-group <sandbox_group_name>
+worker_image = "ghcr.io/ceedaragents/cyrus-worker:latest"
+
+# aca_disk_name: the disk image NAME the group knows the worker image by. Must
+# match the `--name` you passed to `aca sandboxgroup disk create` above.
+aca_disk_name = "cyrus-worker"
+
+# ---- ACA per-sandbox compute defaults ----------------------------------------
+# These are PASSED TO THE ROUTER CONFIG (CYRUS_ROUTER_CONTAINERS_JSON), NOT to
+# the ARM sandboxGroups resource — spike finding: the ARM resource accepts
+# `properties: {}` only. See README → "maxSandboxCount does not exist".
+aca_cpu    = "4000m" # XL tier; most expensive — set consciously.
+aca_memory = "8192Mi"
+
+# 0 = DISABLED (spike N5/F2: ACA-side suspend has no session-affinity gate and
+# can freeze a live session mid-task). The router's idleStopMs is the sole idle
+# controller. Leave this at 0.
+aca_auto_suspend_seconds = 0
+
+# Deny-by-default egress (D7). The router injects the full D7 allowlist on each
+# sandbox create. 'Allow' disables the wall for air-gap-free test sandboxes.
+aca_egress_default_action      = "Deny"
+aca_egress_traffic_inspection = "Full"
+# Leave null to retain the provider's complete built-in allowlist and append the
+# router WSS host. Setting a list replaces that default entirely.
+aca_egress_host_rules = null
+
+# Retention for explicit per-issue labeled snapshots the provider prunes on the
+# create path. Snapshots are NEVER GC'd by Azure — keep this modest.
+aca_keep_snapshots = 2
+
+# ---- Linear secrets (seeded into Key Vault; rotate after first deploy) ------
+linear_workspace_id = "northrop-digital"
+
+# All four below are SENSITIVE — pull from your password manager, NOT from git.
+linear_workspace_token  = "<linear-workspace-api-token>"
+# HMAC secret — generate with `openssl rand -hex 32` and paste the SAME value
+# into Linear's webhook subscription UI (see README → Linear webhook cutover).
+linear_webhook_secret  = "<openssl-rand-hex-32>"
+linear_client_id       = "<linear-oauth-client-id>"
+linear_client_secret  = "<linear-oauth-client-secret>"
+
+# ---- RBAC fallback -----------------------------------------------------------
+# Optional — when null, the stack resolves "Container Apps SandboxGroup Data
+# Owner" via a `data.azurerm_role_definition` lookup by name. Spike S6 verified
+# the documented GUID resolves in-tenant; set this only if the lookup fails.
+sandboxgroup_data_owner_role_id = null
+
+# Operator break-glass principal (Entra object id). Without this, an operator
+# cannot delete a corrupt router.db blob (M2). Set null in pure-CI envs.
+operator_principal_id = null
+
+# ---- Cyrus repositories ------------------------------------------------------
+# Routed by the router. Becomes `CYRUS_ROUTER_CONTAINERS_JSON.repositories`.
+cyrus_repositories = [
+  {
+    name                = "cyrus-containers"
+    github_slug         = "ceedaragents/cyrus-containers"
+    linear_workspace_id = "northrop-digital"
+    base_branch         = "main"
+  },
+]
+
+# ---- Optional feature flags --------------------------------------------------
+enable_acr         = false # see README for the `az acr import` recipe.
+enable_custom_domain = false
+custom_domain_name             = null
+custom_domain_certificate_zone_id = null
+
+# Set tenant + audience together to enable Entra-gated enrollment. The audience
+# is the app registration's exact Application ID URI (for example api://...).
+entra_tenant_id     = null
+entra_audience      = null
+entra_allowed_domain = null

@@ -1606,6 +1606,26 @@ export class AgentSessionManager extends EventEmitter {
 			return;
 		}
 
+		// Revive a session that already emitted its terminal signal. Two paths
+		// reach here with a spent one-shot: a floor-restored session, and one
+		// that {@link reconcileInterruptedSessions} marked `error` at startup
+		// before its queued prompt re-attached a runner. Attaching a live runner
+		// means the session is running again, so:
+		//   1. clear the one-shot — otherwise its next real completion's
+		//      `emitTerminalOnce` is a no-op and the router's issue lock +
+		//      affinity are never released (they leak until the event TTL sweep);
+		//   2. lift a terminal status back to `active` so its activities post and
+		//      Linear shows it working rather than stuck in the reconciled error.
+		if (this.terminalEmittedSessions.delete(sessionId)) {
+			if (
+				session.status === AgentSessionStatus.Complete ||
+				session.status === AgentSessionStatus.Error
+			) {
+				session.status = AgentSessionStatus.Active;
+			}
+			log.debug(`Revived terminal-emitted session on runner (re)attach`);
+		}
+
 		session.agentRunner = agentRunner;
 		session.updatedAt = Date.now();
 		log.debug(`Added agent runner`);

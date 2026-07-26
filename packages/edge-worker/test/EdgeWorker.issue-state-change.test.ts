@@ -2,7 +2,8 @@ import {
 	isIssueStateIdUpdateWebhook,
 	isIssueTitleOrDescriptionUpdateWebhook,
 } from "cyrus-core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { EdgeWorker } from "../src/EdgeWorker.js";
 
 describe("isIssueStateIdUpdateWebhook type guard", () => {
 	it("returns true for an Issue update webhook with stateId in updatedFrom", () => {
@@ -123,5 +124,73 @@ describe("isIssueStateIdUpdateWebhook type guard", () => {
 		// Should match state change but NOT title/description
 		expect(isIssueStateIdUpdateWebhook(webhook as any)).toBe(true);
 		expect(isIssueTitleOrDescriptionUpdateWebhook(webhook as any)).toBe(false);
+	});
+});
+
+describe("EdgeWorker terminal teardown ordering", () => {
+	it("forces floor sync before response/removal and posts callback after worktree deletion", async () => {
+		const order: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				order.push("callback");
+				return new Response(null, { status: 200 });
+			}),
+		);
+		const session = {
+			id: "sess-1",
+			agentRunner: { stop: () => order.push("runner-stop") },
+		};
+		const fakeWorker = {
+			logger: { info: vi.fn(), warn: vi.fn() },
+			agentSessionManager: {
+				getSessionsByIssueId: () => [session],
+				requestSessionStop: () => order.push("request-stop"),
+				createResponseActivity: async () => {
+					order.push("response");
+				},
+				removeSession: () => order.push("remove-session"),
+			},
+			workspaceSync: {
+				syncIssue: async (_key: string, options: unknown) => {
+					expect(options).toEqual({ force: true });
+					order.push("force-sync");
+				},
+			},
+			sessionRepositories: new Map(),
+			repositories: new Map(),
+			gitService: {
+				deleteWorktree: async () => {
+					order.push("delete-worktree");
+				},
+			},
+			config: {
+				platform: "router",
+				router: { url: "ws://router.example.com", deviceToken: "token" },
+			},
+		};
+		const handler = (
+			EdgeWorker.prototype as unknown as {
+				handleIssueStateChangeMessage(message: {
+					workItemId: string;
+					workItemIdentifier: string;
+				}): Promise<void>;
+			}
+		).handleIssueStateChangeMessage;
+		await handler.call(fakeWorker, {
+			workItemId: "issue-1",
+			workItemIdentifier: "CYPACK-1",
+		});
+
+		expect(order).toEqual([
+			"request-stop",
+			"runner-stop",
+			"force-sync",
+			"response",
+			"remove-session",
+			"delete-worktree",
+			"callback",
+		]);
+		vi.unstubAllGlobals();
 	});
 });

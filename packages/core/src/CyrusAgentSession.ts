@@ -65,6 +65,21 @@ export interface RepositoryContext {
 	branchName?: string;
 	/** The base branch for PRs (e.g., "main" or a Graphite parent branch) */
 	baseBranchName?: string;
+	/**
+	 * How `baseBranchName` was resolved when the workspace was created (see
+	 * {@link BaseBranchResolution.source}). Only `"commit-ish"` means the
+	 * session's issue explicitly requested this base branch (e.g. a
+	 * `[repo=name#branch]` description selector) — the other sources
+	 * (`"graphite-blocked-by"`, `"parent-issue"`, `"default"`) are ordinary
+	 * auto-resolutions that should be free to re-derive if the workspace is
+	 * ever recreated (e.g. a parent issue's branch may have changed since).
+	 * Used by `EdgeWorker.ensureSessionWorkspaceExists` to decide which
+	 * repos' base branches must be pinned via `baseBranchOverrides` on
+	 * worktree recreation, vs. left to `determineBaseBranch` to recompute
+	 * (which also preserves worktree-continuity resume-from-issue-branch
+	 * behavior for non-overridden repos).
+	 */
+	baseBranchSource?: BaseBranchResolution["source"];
 }
 
 /**
