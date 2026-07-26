@@ -50,6 +50,36 @@ Expected file format:
 
 Learn more about MCP: https://code.claude.com/docs/en/mcp
 
+#### MCP connection health
+
+Cyrus reports the state of every MCP server it configures in two places:
+
+- **At startup** — a `🔌 MCP servers: …` block in the `cyrus start` banner, listing
+  each server as connected, connecting, retrying, degraded, failed, or skipped.
+  Remote (`http`/`sse`) servers are handshaked in the background with bounded
+  exponential backoff, so an unreachable server never delays startup.
+- **Per session** — the same block is logged for each Claude session, built from
+  the connection statuses the Claude Agent SDK reports at session init.
+
+A *transient* failure (connection reset, timeout, 429/5xx) is retried with a
+capped delay and a capped attempt count. A *permanent* failure (401/403, a
+rejected token, a missing binary, a 404 endpoint, `needs-auth`) is reported and
+**not** retried — retrying cannot fix it.
+
+#### Headless containers and interactive OAuth
+
+MCP servers that authenticate through an interactive browser OAuth flow cannot
+connect inside an ephemeral worker container (Local Docker / Azure Container
+Apps) — there is no browser and no user. Cyrus detects container mode from the
+env vars every container provider already sets (`CYRUS_ISSUE_KEY` +
+`CYRUS_DEVICE_TOKEN`) and omits those servers, recording them as `skipped` with a
+reason in the health block.
+
+Today the only such server Cyrus ships is `cyrus-docs`. To keep it available in a
+container, provision a bearer token as `CYRUS_DOCS_MCP_TOKEN` — Cyrus then sends
+it as an `Authorization` header and no longer treats the server as needing an
+interactive flow.
+
 ### `teamKeys` (array of strings)
 
 Routes Linear issues from specific teams to this repository. When specified, only issues from matching teams trigger Cyrus.
