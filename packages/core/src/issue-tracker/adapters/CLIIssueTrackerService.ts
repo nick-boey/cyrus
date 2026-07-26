@@ -1255,10 +1255,13 @@ export class CLIIssueTrackerService
 			);
 		}
 
-		// Check if the session is stopped/completed
-		if (sessionData.status === AgentSessionStatus.Complete) {
-			throw new Error(`Cannot prompt completed session ${sessionId}`);
-		}
+		// A finished session is still promptable — that is Cyrus's whole follow-up
+		// model, and Linear allows it: a comment on a completed agent session emits
+		// `AgentSessionEvent prompted` and the session runs another turn (the
+		// EdgeWorker's `addAgentRunner` revives it). Rejecting it here would have
+		// made the follow-up and Done→reopen flows untestable now that a `response`
+		// activity actually derives `complete` (see
+		// {@link deriveSessionStatusFromActivity}).
 
 		// Create a comment on the issue
 		const comment = await this.createComment(sessionData.issueId, {
@@ -1267,6 +1270,7 @@ export class CLIIssueTrackerService
 
 		// Update session status to awaiting processing
 		sessionData.updatedAt = new Date();
+		sessionData.endedAt = undefined;
 
 		// Create an activity record for the prompt
 		await this.createAgentActivity({
@@ -1385,6 +1389,11 @@ export class CLIIssueTrackerService
 
 		this.state.agentActivities.set(activityId, activityData);
 
+		this.deriveSessionStatusFromActivity(
+			input.agentSessionId,
+			input.content.type,
+		);
+
 		// Emit state change event
 		this.emit("agentActivity:created", { input, activityId });
 
@@ -1395,6 +1404,60 @@ export class CLIIssueTrackerService
 			success: true,
 			lastSyncId: Date.now(),
 		} as AgentActivityPayload;
+	}
+
+	/**
+	 * Moves a session's status to whatever its newest activity implies, the way
+	 * Linear does server-side.
+	 *
+	 * Linear derives agent-session state from the last emitted activity — nothing
+	 * in Cyrus ever calls `updateAgentSessionStatus` for a session that finishes
+	 * normally, because on the real tracker it does not have to. This adapter used
+	 * to model only the activity log, leaving every session reading `active`
+	 * ("Working…") until an operator explicitly ran `stop-session`. A completed
+	 * F1 session was therefore indistinguishable from one still running, which is
+	 * exactly the false alarm recorded in
+	 * `apps/f1/test-drives/2026-07-14-container-executors-phase1-validation.md`:
+	 * the drive saw `status: active` after a successful run and concluded the final
+	 * response had gone missing, when the response activity had in fact been posted
+	 * (`activity-89`) and only the derived status was absent.
+	 *
+	 * A `response` ends the turn, an `error` ends it unsuccessfully, an
+	 * `elicitation` parks it on the user, and anything else (`thought`, `action`,
+	 * `prompt`) means work is in progress.
+	 */
+	private deriveSessionStatusFromActivity(
+		sessionId: string,
+		activityType: AgentActivityType,
+	): void {
+		const sessionData = this.state.agentSessions.get(sessionId);
+		if (!sessionData) return;
+
+		const derived =
+			activityType === AgentActivityType.Response
+				? AgentSessionStatus.Complete
+				: activityType === AgentActivityType.Error
+					? AgentSessionStatus.Error
+					: activityType === AgentActivityType.Elicitation
+						? AgentSessionStatus.AwaitingInput
+						: AgentSessionStatus.Active;
+
+		if (sessionData.status === derived) return;
+
+		sessionData.status = derived;
+		sessionData.updatedAt = new Date();
+		if (
+			derived === AgentSessionStatus.Complete ||
+			derived === AgentSessionStatus.Error
+		) {
+			sessionData.endedAt = new Date();
+		} else {
+			sessionData.endedAt = undefined;
+		}
+
+		this.emit("agentSession:updated", {
+			agentSession: createCLIAgentSession(sessionData),
+		});
 	}
 
 	/**
