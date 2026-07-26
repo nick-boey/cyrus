@@ -13,6 +13,12 @@ variable "environment" {
   default     = "dev"
 }
 
+variable "resource_group_name" {
+  description = "Optional exact resource group name. Defaults to rg-<project>-<environment>."
+  type        = string
+  default     = null
+}
+
 variable "tags" {
   description = "Azure resource tags applied to every resource. Merged with a `cyrus-managed=true` tag."
   type        = map(string)
@@ -153,32 +159,38 @@ variable "aca_disconnected_recreate_ms" {
 ################################################################################
 
 variable "linear_workspace_id" {
-  description = "Linear workspace identifier (the workspace subdomain, e.g. 'northrop-digital'). NOT secret — shipped as a plain env var to the router."
+  description = "Linear organization UUID returned by OAuth workspace discovery. Use the UUID, not the workspace slug. NOT secret; shipped as a plain env var to the router."
   type        = string
 }
 
 variable "linear_workspace_token" {
   description = "Linear workspace API token used by the router to read/mutate issues. Seeded into Key Vault secret 'linear-workspace-token'. Rotate via Key Vault after first deploy (see README → secret rotation)."
   type        = string
-  sensitive  = true
+  sensitive   = true
+}
+
+variable "linear_workspace_refresh_token" {
+  description = "Linear OAuth refresh token used to rotate the workspace access token. Seeded into the secret workspace configuration."
+  type        = string
+  sensitive   = true
 }
 
 variable "linear_webhook_secret" {
   description = "HMAC secret shared between Linear and the router for verifying webhook signatures. Seeded into Key Vault secret 'linear-webhook-secret'."
   type        = string
-  sensitive  = true
+  sensitive   = true
 }
 
 variable "linear_client_id" {
   description = "Linear OAuth client id (router-mode OAuth app). Seeded into Key Vault secret 'linear-client-id'."
   type        = string
-  sensitive  = true
+  sensitive   = true
 }
 
 variable "linear_client_secret" {
   description = "Linear OAuth client secret. Seeded into Key Vault secret 'linear-client-secret'."
   type        = string
-  sensitive  = true
+  sensitive   = true
 }
 
 ################################################################################

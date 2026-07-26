@@ -4,12 +4,12 @@
 
 output "router_fqdn" {
   description = "Public ingress FQDN of the router Container App (e.g. 'app-cyrus-dev-router.kindocean-<hash>.australiaeast.azurecontainerapps.io'). Use this verbatim in your Linear webhook URL and as the public WSS host."
-  value       = azurerm_container_app.router.latest_revision_fqdn
+  value       = azurerm_container_app.router.ingress[0].fqdn
 }
 
 output "router_wss_url" {
-  description = "Canonical WSS URL for containers to dial back to the router (`wss://<router_fqdn>`). Embedded into CYRUS_ROUTER_CONTAINERS_JSON."  
-  value       = "wss://${azurerm_container_app.router.latest_revision_fqdn}"
+  description = "Canonical WSS URL for containers to dial back to the router (`wss://<router_fqdn>`). Embedded into CYRUS_ROUTER_CONTAINERS_JSON."
+  value       = "wss://${azurerm_container_app.router.ingress[0].fqdn}"
 }
 
 output "key_vault_name" {

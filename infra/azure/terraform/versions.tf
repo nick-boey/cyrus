@@ -22,14 +22,7 @@ terraform {
 }
 
 provider "azurerm" {
-  features {
-    # The Key Vault in this stack is created WITHOUT purge protection for dev
-    # ergonomics (see README → prereqs). azurerm's `prevent_purging_on_delete`
-    # would otherwise leave hidden scheduled-purge blobs blocking re-deploys.
-    key_vault {
-      prevent_purging_on_delete = false
-    }
-  }
+  features {}
 }
 
 provider "azapi" {

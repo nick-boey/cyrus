@@ -20,23 +20,23 @@ locals {
         linearWorkspaceId = repository.linear_workspace_id
       }, repository.base_branch != null ? { baseBranch = repository.base_branch } : {})
     ]
-    keyVaultUrl            = azurerm_key_vault.this.vault_uri
-    artifactsDir           = "/data/artifacts"
+    keyVaultUrl  = azurerm_key_vault.this.vault_uri
+    artifactsDir = "/data/artifacts"
     aca = {
-      subscriptionId          = data.azurerm_client_config.current.subscription_id
-      resourceGroup           = azurerm_resource_group.this.name
-      sandboxGroup            = azapi_resource.sandbox_group.name
-      region                  = var.location
-      disk                    = var.aca_disk_name
-      cpu                     = var.aca_cpu
-      memory                  = var.aca_memory
-      autoSuspendSeconds      = var.aca_auto_suspend_seconds
+      subscriptionId     = data.azurerm_client_config.current.subscription_id
+      resourceGroup      = azurerm_resource_group.this.name
+      sandboxGroup       = azapi_resource.sandbox_group.name
+      region             = var.location
+      disk               = var.aca_disk_name
+      cpu                = var.aca_cpu
+      memory             = var.aca_memory
+      autoSuspendSeconds = var.aca_auto_suspend_seconds
       egress = merge({
         defaultAction     = var.aca_egress_default_action
         trafficInspection = var.aca_egress_traffic_inspection
       }, var.aca_egress_host_rules != null ? { hostRules = var.aca_egress_host_rules } : {})
-      keepSnapshots           = var.aca_keep_snapshots
-      disconnectedRecreateMs  = var.aca_disconnected_recreate_ms
+      keepSnapshots          = var.aca_keep_snapshots
+      disconnectedRecreateMs = var.aca_disconnected_recreate_ms
       # The authoritative data-plane host is the ARM-emitted
       # `properties.managementEndpoint`; the router config prefers this over
       # the client's region+baseUrl fallback. Output as `management_endpoint`.
@@ -51,7 +51,7 @@ locals {
     LINEAR_WORKSPACE_ID               = var.linear_workspace_id
     CYRUS_ROUTER_CONTAINERS_JSON      = jsonencode(local.router_containers_config)
     CYRUS_ROUTER_BACKUP_BLOB_URL      = local.router_containers_config.backupBlobUrl
-    CYRUS_ROUTER_ENTRA_TENANT_ID     = var.entra_tenant_id
+    CYRUS_ROUTER_ENTRA_TENANT_ID      = var.entra_tenant_id
     CYRUS_ROUTER_ENTRA_AUDIENCE       = var.entra_audience
     CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN = var.entra_allowed_domain
   }
@@ -101,6 +101,11 @@ resource "azurerm_container_app" "router" {
     key_vault_secret_id = azurerm_key_vault_secret.linear_workspace_token.versionless_id
   }
   secret {
+    name                = "linear-workspaces-json"
+    identity            = azurerm_user_assigned_identity.router.id
+    key_vault_secret_id = azurerm_key_vault_secret.linear_workspaces_json.versionless_id
+  }
+  secret {
     name                = "linear-webhook-secret"
     identity            = azurerm_user_assigned_identity.router.id
     key_vault_secret_id = azurerm_key_vault_secret.linear_webhook_secret.versionless_id
@@ -132,19 +137,23 @@ resource "azurerm_container_app" "router" {
       }
       env {
         name        = "LINEAR_WORKSPACE_TOKEN"
-        secret_ref = "linear-workspace-token"
+        secret_name = "linear-workspace-token"
+      }
+      env {
+        name        = "CYRUS_ROUTER_WORKSPACES_JSON"
+        secret_name = "linear-workspaces-json"
       }
       env {
         name        = "LINEAR_WEBHOOK_SECRET"
-        secret_ref = "linear-webhook-secret"
+        secret_name = "linear-webhook-secret"
       }
       env {
         name        = "LINEAR_CLIENT_ID"
-        secret_ref = "linear-client-id"
+        secret_name = "linear-client-id"
       }
       env {
         name        = "LINEAR_CLIENT_SECRET"
-        secret_ref = "linear-client-secret"
+        secret_name = "linear-client-secret"
       }
       env {
         name  = "CYRUS_ROUTER_CONTAINERS_JSON"
@@ -153,6 +162,10 @@ resource "azurerm_container_app" "router" {
       env {
         name  = "CYRUS_ROUTER_BACKUP_BLOB_URL"
         value = local.router_env_non_secret.CYRUS_ROUTER_BACKUP_BLOB_URL
+      }
+      env {
+        name  = "AZURE_CLIENT_ID"
+        value = azurerm_user_assigned_identity.router.client_id
       }
 
       # Entra env is optional and uses the canonical entrypoint/Zod names.
@@ -178,9 +191,9 @@ resource "azurerm_container_app" "router" {
         }
       }
 
-      volume_mount {
-        name       = "artifacts"
-        mount_path = "/data/artifacts"
+      volume_mounts {
+        name = "artifacts"
+        path = "/data/artifacts"
       }
     }
 

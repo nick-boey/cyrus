@@ -50,9 +50,11 @@ export interface AcaSnapshot {
 }
 
 export interface AcaDiskImage {
-	name: string;
-	image?: string;
-	status?: string;
+	id?: string;
+	name?: string;
+	labels?: Record<string, string>;
+	image?: string | { base?: string };
+	status?: string | { state?: string; errorMessage?: string };
 	sizeInMB?: number;
 	[x: string]: any;
 }
@@ -87,8 +89,9 @@ export interface AcaLifecyclePolicy {
 }
 
 export interface AcaSandboxCreateBody {
-	/** Exactly one of diskImageName / snapshotId. */
+	/** Exactly one of diskImageName / diskImageId / snapshotId. */
 	diskImageName?: string;
+	diskImageId?: string;
 	snapshotId?: string;
 	/** Create-from-image only. Write-only — never returned by GET. */
 	environment?: Record<string, string>;
@@ -340,14 +343,12 @@ export class AcaSandboxClient {
 	}
 
 	async createSandbox(b: AcaSandboxCreateBody): Promise<AcaSandbox> {
-		if (!b.diskImageName && !b.snapshotId) {
+		const sourceCount = [b.diskImageName, b.diskImageId, b.snapshotId].filter(
+			Boolean,
+		).length;
+		if (sourceCount !== 1) {
 			throw new Error(
-				"createSandbox requires exactly one of diskImageName or snapshotId",
-			);
-		}
-		if (b.diskImageName && b.snapshotId) {
-			throw new Error(
-				"createSandbox requires exactly one of diskImageName or snapshotId",
+				"createSandbox requires exactly one of diskImageName, diskImageId, or snapshotId",
 			);
 		}
 		const body: Record<string, unknown> = {};
@@ -356,6 +357,8 @@ export class AcaSandboxClient {
 			if (b.diskImageIsPublic !== undefined)
 				diskImage.isPublic = b.diskImageIsPublic;
 			body.sourcesRef = { diskImage };
+		} else if (b.diskImageId) {
+			body.sourcesRef = { diskImage: { id: b.diskImageId } };
 		} else if (b.snapshotId) {
 			body.sourcesRef = { snapshot: { id: b.snapshotId } };
 		}

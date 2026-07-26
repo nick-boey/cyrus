@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type {
+	AcaDiskImage,
 	AcaEgressPolicy,
 	AcaSandbox,
 	AcaSandboxClient,
@@ -16,6 +17,7 @@ type FakeClientCalls = {
 	listSandboxes: Array<Record<string, string> | undefined>;
 	createSandbox: Array<{
 		diskImageName?: string;
+		diskImageId?: string;
 		snapshotId?: string;
 		environment?: Record<string, string>;
 		resources?: Record<string, string>;
@@ -39,8 +41,9 @@ function fakeClient(script: {
 	sandboxByIssue?: Map<string, AcaSandbox>;
 	snapshotsByLabels?: AcaSnapshot[];
 	listSandboxesResult?: AcaSandbox[];
-	diskImages?: Array<{ name: string; image?: string }>;
+	diskImages?: AcaDiskImage[];
 	createDiskImageError?: unknown;
+	diskImagesAfterCreateError?: AcaDiskImage[];
 	failCreateSnapshot?: boolean;
 	beforeCreateSnapshot?: () => Promise<void>;
 	/** When this predicate returns true for a given id, deleteSandbox throws AFTER recording. */
@@ -174,7 +177,7 @@ function fakeClient(script: {
 				);
 			}
 		},
-		async listDiskImages(): Promise<Array<{ name: string; image?: string }>> {
+		async listDiskImages(): Promise<AcaDiskImage[]> {
 			calls.listDiskImages++;
 			return script.diskImages ?? [];
 		},
@@ -183,7 +186,10 @@ function fakeClient(script: {
 			image: string,
 		): Promise<{ name: string }> {
 			calls.createDiskImage.push({ name, image });
-			if (script.createDiskImageError) throw script.createDiskImageError;
+			if (script.createDiskImageError) {
+				script.diskImages = script.diskImagesAfterCreateError;
+				throw script.createDiskImageError;
+			}
 			if (!script.diskImages) script.diskImages = [];
 			script.diskImages.push({ name, image });
 			return { name };
@@ -342,10 +348,31 @@ describe("AcaSandboxesProvider", () => {
 			expect(calls.createSandbox[0]?.diskImageName).toBe("disk-v1");
 		});
 
+		it("uses the id of a registered private disk whose name is a label", async () => {
+			const { client, calls } = fakeClient({
+				diskImages: [
+					{
+						id: "private-disk-id",
+						labels: { name: "disk-v1" },
+						image: { base: "registry.example/worker:sha" },
+					},
+				],
+			});
+			const p = new AcaSandboxesProvider({
+				client,
+				image: "registry.example/worker:sha",
+				disk: "disk-v1",
+			});
+			await p.ensureRunning(ctx({ deviceId: "dev-1" }));
+			expect(calls.createDiskImage).toEqual([]);
+			expect(calls.createSandbox[0]?.diskImageId).toBe("private-disk-id");
+		});
+
 		it("tolerates a concurrent createDiskImage error (logs and continues)", async () => {
 			const { client, calls } = fakeClient({
 				diskImages: [],
 				createDiskImageError: new Error("already exists"),
+				diskImagesAfterCreateError: [{ name: "disk-v1" }],
 			});
 			const p = new AcaSandboxesProvider({
 				client,
@@ -356,6 +383,24 @@ describe("AcaSandboxesProvider", () => {
 				p.ensureRunning(ctx({ deviceId: "dev-1" })),
 			).resolves.toBeUndefined();
 			expect(calls.createSandbox).toHaveLength(1);
+		});
+
+		it("surfaces a disk registration failure when the disk still does not exist", async () => {
+			const { client, calls } = fakeClient({
+				diskImages: [],
+				createDiskImageError: new Error("registry auth failed"),
+				diskImagesAfterCreateError: [],
+			});
+			const p = new AcaSandboxesProvider({
+				client,
+				image: "img:1",
+				disk: "disk-v1",
+			});
+			await expect(p.ensureRunning(ctx({ deviceId: "dev-1" }))).rejects.toThrow(
+				"registry auth failed",
+			);
+			expect(calls.createSandbox).toHaveLength(0);
+			expect(calls.listDiskImages).toBe(2);
 		});
 	});
 
@@ -442,29 +487,27 @@ describe("AcaSandboxesProvider", () => {
 			expect(calls.createSandbox).toHaveLength(0);
 		});
 
-		it.each([
-			"Resuming",
-			"Stopping",
-			"Creating",
-			"Deleting",
-		] as const)("treats %s as transitional and no-ops (next sweep retries)", async (state) => {
-			const sandboxByIssue = new Map<string, AcaSandbox>([
-				["CYPACK-1", sb("CYPACK-1", { state })],
-			]);
-			const { client, calls } = fakeClient({
-				sandboxByIssue,
-				diskImages: [{ name: "disk-v1" }],
-			});
-			const p = new AcaSandboxesProvider({
-				client,
-				image: "img:1",
-				disk: "disk-v1",
-			});
-			await p.ensureRunning(ctx({ issueKey: "CYPACK-1", deviceId: "dev-1" }));
-			expect(calls.createSandbox).toHaveLength(0);
-			expect(calls.resumeSandbox).toHaveLength(0);
-			expect(calls.stopSandbox).toHaveLength(0);
-		});
+		it.each(["Resuming", "Stopping", "Creating", "Deleting"] as const)(
+			"treats %s as transitional and no-ops (next sweep retries)",
+			async (state) => {
+				const sandboxByIssue = new Map<string, AcaSandbox>([
+					["CYPACK-1", sb("CYPACK-1", { state })],
+				]);
+				const { client, calls } = fakeClient({
+					sandboxByIssue,
+					diskImages: [{ name: "disk-v1" }],
+				});
+				const p = new AcaSandboxesProvider({
+					client,
+					image: "img:1",
+					disk: "disk-v1",
+				});
+				await p.ensureRunning(ctx({ issueKey: "CYPACK-1", deviceId: "dev-1" }));
+				expect(calls.createSandbox).toHaveLength(0);
+				expect(calls.resumeSandbox).toHaveLength(0);
+				expect(calls.stopSandbox).toHaveLength(0);
+			},
+		);
 
 		it("retains one deterministic current sandbox and deletes every duplicate", async () => {
 			const { client, calls } = fakeClient({

@@ -1,5 +1,143 @@
 # TODO
 
+## ACA live-deployment follow-ups
+
+Follow-ups from the live Azure drive documented in
+`apps/f1/test-drives/2026-07-26-live-aca-nor-252.md`.
+
+### 1. Reconnect the worker WebSocket after ACA memory resume
+
+**Status:** open. **Priority:** critical.
+
+ACA resumed the sandbox to `Running` in 1.25 seconds, but the worker retained a
+stale WebSocket and never reconnected. The router safely queued the prompt, but
+work did not resume until another prompt crossed the 120-second disconnected
+threshold and forced a cold replacement.
+
+Implement a device-side liveness watchdog in `RouterConnection`. Track inbound
+server pings/messages using wall-clock time; if no server activity arrives for
+more than two router heartbeat intervals, terminate the local socket and use the
+existing reconnect path. Wall-clock comparison is important because JavaScript
+timers are frozen while an ACA sandbox is suspended and fire late after resume.
+Also make the ACA provider verify connectivity after `resumeSandbox` rather than
+returning solely because infrastructure state changed.
+
+Acceptance criteria:
+
+- Suspend a connected live sandbox for longer than two router heartbeats.
+- Resume it and observe a new authenticated device hello without a second prompt.
+- Deliver the already-queued prompt exactly once on the same sandbox ID.
+- Add fake-timer tests that model a long wall-clock jump while timers are frozen.
+
+### 2. Prevent duplicate webhook execution during router rollouts
+
+**Status:** open. **Priority:** critical.
+
+The emergency router image rollout briefly ran old and new revisions together.
+Both accepted/replayed the same durable work, producing doubled Linear activity
+and two `linear-mcp-ok` comments even though only one worker sandbox survived.
+Single revision mode does not eliminate the normal rolling-overlap window.
+
+Persist a webhook/event idempotency key in SQLite before routing. Prefer Linear's
+delivery/event identifier; otherwise derive a stable key from organization,
+session, action, and event timestamp. Reject an already-claimed key transactionally
+across replicas. Add a bounded retention sweep. Deployment should still keep
+`revision_mode = "Single"`, min/max replicas at one, and wait for the new revision
+to become healthy before deactivating the old revision.
+
+Acceptance criteria:
+
+- Run two router processes against the same durable store and submit one webhook.
+- Exactly one queue row, agent execution, activity stream, and MCP mutation occur.
+- Restart during the enqueue/ack window and confirm at-least-once delivery does not
+  become at-least-twice execution.
+
+### 3. Preserve clean session completion across cold restore and reopen
+
+**Status:** open. **Priority:** high.
+
+Disconnected replacement and completed-issue reopen restored the branch and
+worktree successfully, but both emitted terminal `error` before `complete` and
+omitted the requested final response. Git work survived; transcript/session
+continuity did not finish cleanly.
+
+Trace restored `EdgeWorker` state, Claude transcript relocation, active-session
+reconciliation, and buffered terminal frames. A completed session should either
+resume cleanly or deliberately start a new session while retaining prior context;
+it must not replay stale terminal error state. Persist the final response before
+releasing affinity and make terminal-frame replay monotonic by session state.
+
+Acceptance criteria:
+
+- Destroy a worker after a completed turn, then route a follow-up from its bundle.
+- Observe no transient `error`, one `complete`, and one final response activity.
+- Repeat after Done -> reopen and verify the same behavior.
+
+### 4. Make terminal teardown callback reliable after idle stop
+
+**Status:** open. **Priority:** high.
+
+The Done webhook woke the idle-stopped sandbox, but the authenticated teardown
+callback never arrived. The documented 10-minute grace fallback eventually
+deleted the sandbox and snapshots, so resources did not leak, but cleanup was
+slow and billed during the grace window.
+
+Fix this together with the resume WebSocket watchdog. Persist terminal cleanup
+intent in the worker inbox before acknowledging it, reconnect before processing,
+and retry the teardown callback with its idempotency key until acknowledged.
+Expose callback-pending state in `router containers list` and log callback retry
+attempts distinctly from grace expiry.
+
+Acceptance criteria:
+
+- Idle-stop a worker, mark its issue Done, and observe wake -> final floor flush ->
+  callback -> sandbox/snapshot deletion without waiting for grace expiry.
+- Kill the worker between flush and callback; restart and confirm callback replay.
+
+### 5. Stabilize MCP connections in long-lived and restored workers
+
+**Status:** open. **Priority:** medium.
+
+The live worker reported that the Linear and `cyrus-tools` MCP servers disconnected
+and were reconnecting. Linear MCP completed its mutation first, but long-running
+sessions need predictable reconnect behavior. The optional `cyrus-docs` MCP also
+required interactive OAuth, which is unsuitable inside a headless sandbox.
+
+Add MCP connection health to startup/session diagnostics, retry transient server
+disconnects with bounded backoff, and omit or preconfigure MCP servers that require
+interactive OAuth in ACA mode. Add a multi-turn container test that invokes Linear
+MCP before and after idle/reconnect.
+
+### 6. Document and optionally enforce GitHub token scopes
+
+**Status:** open. **Priority:** low.
+
+`GH_TOKEN` successfully cloned, committed, pushed, and queried the repository, but
+`gh auth status` warned that `read:org` was absent. Keep `repo` as the functional
+minimum for private repository work and document `read:org` as required only for
+organization-level queries. Optionally add scope diagnostics to `router secrets
+list` without rejecting otherwise usable tokens.
+
+### 7. Reconcile the emergency router image with Terraform
+
+**Status:** open. **Priority:** high before the next apply.
+
+The running Container App uses `cyrus-router:deploy-aca-disk-fix`, while the
+deployment tfvars used during initial provisioning referenced `:deploy`. Publish
+an immutable release or SHA tag containing the private-disk fix and update the
+deployment input before the next Terraform apply. Avoid mutable tags in durable
+environments.
+
+### Completed during the drive: private ACA disk IDs
+
+**Status:** fixed locally and deployed for validation.
+
+The ACA data plane rejects a registered private disk expressed as
+`sourcesRef.diskImage.name`; it requires `sourcesRef.diskImage.id`. Disk list
+responses also expose the operator name under `labels.name`. The typed client and
+provider now recognize that shape and create private-image sandboxes by ID. Keep
+the live-wire regression tests as a release gate.
+
 Follow-ups from the phase-1 container-executor test drive
 (`apps/f1/test-drives/2026-07-14-container-executors-phase1-validation.md`).
 

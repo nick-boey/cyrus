@@ -210,6 +210,16 @@ describe("AcaSandboxClient createSandbox body shape (C2/C3/C4/C5)", () => {
 		});
 	});
 
+	it("create-from-private-image: references the registered disk by id", async () => {
+		const { fetch, calls } = fakeFetch([res(200, runningSandbox)]);
+		const c = client({ fetchFn: fetch });
+		await c.createSandbox({ diskImageId: "disk-private-1" });
+		const body = JSON.parse(calls[0]?.init?.body as string);
+		expect(body.sourcesRef).toEqual({
+			diskImage: { id: "disk-private-1" },
+		});
+	});
+
 	it("create-from-snapshot: uses sourcesRef.snapshot.id and no environment", async () => {
 		const { fetch, calls } = fakeFetch([res(200, runningSandbox)]);
 		const c = client({ fetchFn: fetch });
