@@ -4,13 +4,18 @@ export {
 	ContainerTargetService,
 } from "./ContainerTargets.js";
 export { DeviceGateway } from "./DeviceGateway.js";
-export { EventRouter, type EventRouterOptions } from "./EventRouter.js";
+export {
+	DEFAULT_WEBHOOK_CLAIM_RETENTION_MS,
+	EventRouter,
+	type EventRouterOptions,
+} from "./EventRouter.js";
 export {
 	createEntraTokenVerifier,
 	type EntraEnrollmentConfig,
 	type EntraTokenVerifier,
 	registerEnrollmentRoute,
 } from "./enrollment.js";
+export { webhookIdempotencyKey } from "./idempotency.js";
 export {
 	createKeyVaultTokenProvider,
 	KeyVaultSecretStore,
