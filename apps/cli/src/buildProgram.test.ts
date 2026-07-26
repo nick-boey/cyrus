@@ -148,6 +148,16 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		]);
 	});
 
+	it("registers `router containers gc-snapshots --yes`", async () => {
+		await run(["router", "containers", "gc-snapshots", "--yes"]);
+
+		expect(routerExecute).toHaveBeenCalledWith([
+			"containers",
+			"gc-snapshots",
+			"--yes",
+		]);
+	});
+
 	it("registers `container-boot`", async () => {
 		await run(["container-boot"]);
 

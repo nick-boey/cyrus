@@ -1,4 +1,4 @@
-# Cyrus worker image — local Docker mode runbook
+# Cyrus worker image — Docker and ACA runbook
 
 This is the image a Cyrus Router boots **one per issue** when a user's
 executor is set to `docker` (`cyrus router users set-executor <email>
@@ -13,6 +13,10 @@ This doc is an **operator runbook**: it walks through building the image,
 configuring the router, delegating an issue, and verifying that everything
 actually works, start to finish. If you just want the image's environment
 variable reference, jump to [Environment variables](#environment-variables).
+
+The same image can run in Azure Container Apps Sandboxes. See
+[ACA Sandboxes](#aca-sandboxes) for the provider-specific setup and verified
+runtime differences.
 
 Prerequisites:
 
@@ -601,6 +605,50 @@ falls back to its own defaults shown above. `CYRUS_WORKSPACES_DIR` and
 run`'s env never includes them); the container always falls back to the
 defaults above for those two. You don't set any of these six by hand except
 in the manual smoke test above.
+
+## ACA Sandboxes
+
+Use [`infra/azure/README.md`](../../infra/azure/README.md) for the maintained
+deployment and [`docs/ROUTER.md`](../../docs/ROUTER.md#azure-hosting-and-aca-sandboxes)
+for operations. The short setup sequence is:
+
+1. Publish this worker image to a registry reachable by the sandbox group.
+   Private GHCR requires importing it to ACR and granting the group identity
+   `AcrPull`; the 2026-07-26 spike did not publish the actual worker image, so a
+   local-only tag is not sufficient.
+2. Register the OCI image as a group disk image with `aca sandboxgroup disk
+   create`, and set `containers.aca.disk` to that disk name.
+3. Set `containers.routerUrlForContainers` to the router's public `wss://` URL,
+   configure the ACA subscription/resource-group/group/region block, and set the
+   user with `cyrus router users set-executor <email> aca`.
+
+ACA maps issues by labels only because sandbox IDs are server-assigned GUIDs.
+Memory-mode resume measured **0.52 s** in the spike. Suspend sends no SIGTERM
+and provides no shutdown grace, unlike Docker's `docker stop -t 30`; periodic
+and session-end floor sync is therefore mandatory protection rather than a
+guaranteed suspend-time flush. Also, ACA can report `Running` after this image's
+entrypoint has exited, so confirm the router device is connected/fresh instead
+of treating infrastructure state as worker liveness.
+
+Leave `autoSuspendSeconds: 0`: the router's `idleStopMs` is affinity-aware,
+whereas ACA auto-suspend can freeze live work and snapshot restore otherwise
+resets the policy to 300 seconds. The default egress policy is Deny + Full
+inspection. HTTPS clones, package registries, Anthropic/Linear, and router WSS
+are allowlisted; SSH remotes/submodules are not supported.
+
+Explicit snapshots retain memory, disk, and env, including the device token.
+Restore is device-lineage checked. Azure does not collect explicit snapshots,
+so keep `keepSnapshots` small and schedule `cyrus router containers
+gc-snapshots --yes` after reviewing its plan. No official snapshot-specific
+price was published during the spike; do not budget from the stale claim that
+preview snapshots are free or later billed as ordinary Blob storage.
+
+Key Vault secret rotation reaches only a fresh create-from-image. Resume and
+snapshot restore retain the old env; run `cyrus router containers destroy
+<issueKey>` and re-prompt to force updated credentials. Closing/deleting an
+issue normally wakes the sandbox for a forced floor flush and teardown before
+destroying it; see the router runbook for Linear's self-acted/duplicate terminal
+notification blind spots and the 14-day GC backstop.
 
 ## Why the workspace path matters
 

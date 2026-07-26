@@ -295,9 +295,12 @@ export class WorkspaceSyncService {
 	 * `syncIssueOnTermination` go through this, so either path can complete
 	 * the removal.
 	 */
-	syncIssue(issueKey: string): Promise<boolean> {
+	syncIssue(issueKey: string, options?: { force?: boolean }): Promise<boolean> {
 		const existing = this.inFlight.get(issueKey);
-		if (existing) return existing;
+		if (existing) {
+			if (!options?.force) return existing;
+			return existing.then(() => this.syncIssue(issueKey, { force: true }));
+		}
 		const promise = this.doSyncIssue(issueKey)
 			.then(({ ok, workspaceGone }) => {
 				if (workspaceGone) {

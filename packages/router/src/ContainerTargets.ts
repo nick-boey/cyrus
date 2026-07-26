@@ -4,7 +4,7 @@ import type { RouterStore } from "./RouterStore.js";
 import {
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	isReservedEnvKey,
-	type SecretStore,
+	type SecretStoreBackend,
 } from "./SecretStore.js";
 
 /**
@@ -36,7 +36,7 @@ export class InvalidIssueKeyError extends Error {
 
 export interface ContainerRoutingDeps {
 	store: RouterStore;
-	secrets: SecretStore;
+	secrets: SecretStoreBackend;
 	executors: ExecutorRegistry; // Map<providerName, ContainerExecutor>
 	containersConfig: {
 		routerUrlForContainers: string;
@@ -202,6 +202,19 @@ export class ContainerTargetService {
 	}
 
 	/**
+	 * Wakes a container solely to process a terminal webhook. It shares the
+	 * normal device-scoped in-flight boot and env/token construction, but has no
+	 * agent session on which to post a Linear activity if booting fails.
+	 */
+	bootForTeardown(deviceId: number): void {
+		void this.bootStart(deviceId).catch((err: unknown) => {
+			this.deps.logger.warn(
+				`terminal-teardown boot for device ${deviceId} threw unexpectedly: ${String(err)}`,
+			);
+		});
+	}
+
+	/**
 	 * Resolves the device's issue key and either joins an in-flight boot for
 	 * that issue or starts a new one. Defensive: resolving the device is in
 	 * its own try/catch (not just the one inside {@link bootInner}) so a
@@ -211,7 +224,7 @@ export class ContainerTargetService {
 	 */
 	private async bootStart(
 		deviceId: number,
-		notify: { workspaceId: string; sessionId: string },
+		notify?: { workspaceId: string; sessionId: string },
 	): Promise<void> {
 		let device: ReturnType<RouterStore["getDeviceInfo"]>;
 		try {
@@ -270,26 +283,31 @@ export class ContainerTargetService {
 		userId: number,
 		provider: string,
 		issueKey: string,
-		notify: { workspaceId: string; sessionId: string },
+		notify?: { workspaceId: string; sessionId: string },
 	): Promise<void> {
 		const executor = this.deps.executors.get(provider);
 		try {
 			if (!executor) {
 				throw new Error(`no executor configured for provider '${provider}'`);
 			}
-			const env = this.buildEnv(userId, issueKey);
+			const env = await this.buildEnv(userId, issueKey);
 			await executor.ensureRunning({
 				issueKey,
 				env,
 				mintDeviceToken: () =>
 					this.deps.store.rotateContainerDeviceToken(deviceId),
+				// ACA provider's snapshot-lineage check (B5/D3): the live device
+				// row id guards against restoring an explicit snapshot whose
+				// baked-in device token no longer matches this row. Docker/Fly
+				// ignore this field.
+				deviceId: String(deviceId),
 			});
 			this.bootFailedNotified.delete(issueKey);
 		} catch (err) {
 			this.deps.logger.warn(
 				`container boot failed for ${issueKey}: ${String(err)}`,
 			);
-			if (!this.bootFailedNotified.has(issueKey)) {
+			if (notify && !this.bootFailedNotified.has(issueKey)) {
 				this.bootFailedNotified.add(issueKey);
 				try {
 					await this.deps.postActivity(
@@ -314,7 +332,10 @@ export class ContainerTargetService {
 		}
 	}
 
-	private buildEnv(userId: number, issueKey: string): Record<string, string> {
+	private async buildEnv(
+		userId: number,
+		issueKey: string,
+	): Promise<Record<string, string>> {
 		const email = this.emailFor(userId);
 		// Additive: the container hard-requires the Claude token, so it is
 		// always required regardless of config; requiredSecretKeys adds to it.
@@ -324,7 +345,7 @@ export class ContainerTargetService {
 				...(this.deps.containersConfig.requiredSecretKeys ?? []),
 			]),
 		];
-		const { ok, missing } = this.deps.secrets.isFullyAuthenticated(
+		const { ok, missing } = await this.deps.secrets.isFullyAuthenticated(
 			email,
 			requiredKeys,
 		);
@@ -341,7 +362,8 @@ export class ContainerTargetService {
 		};
 		// Spread the user's map, skipping reserved keys. `set` already rejects
 		// them; this is belt-and-braces against a hand-edited secrets file.
-		for (const [key, value] of Object.entries(this.deps.secrets.get(email))) {
+		const bundle = await this.deps.secrets.get(email);
+		for (const [key, value] of Object.entries(bundle)) {
 			if (isReservedEnvKey(key)) {
 				this.deps.logger.warn(
 					`skipping reserved env key "${key}" found in ${email}'s stored secrets`,

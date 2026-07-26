@@ -198,6 +198,57 @@ describe("RouterStore", () => {
 		expect(store.getIssueAffinity("ISS-1")).toBeUndefined();
 	});
 
+	it("re-enrollment purges only the physical device when containers and stranded rows coexist", () => {
+		const { store, device: physical } = storeWithDevice();
+		const user = store.findUserForCreator({ email: "alice@example.com" });
+		if (!user) throw new Error("user missing");
+		const container = store.createContainerDevice(
+			user.userId,
+			"CYPACK-1",
+			"docker",
+		);
+		store.setSessionAffinity("physical-session", physical.deviceId);
+		store.setIssueAffinity("physical-issue", physical.deviceId);
+		store.acquireIssueLock(
+			"physical-lock",
+			"physical-session",
+			physical.deviceId,
+		);
+		store.setSessionAffinity("container-session", container.deviceId);
+		store.setIssueAffinity("container-issue", container.deviceId);
+		store.acquireIssueLock(
+			"container-lock",
+			"container-session",
+			container.deviceId,
+		);
+		store.recordMutation(container.deviceId, "container-mutation", "ok", NOW);
+
+		const code = store.mintEnrollmentCode("alice@example.com", NOW);
+		const replacement = store.redeemEnrollmentCode(code, NOW);
+		expect(replacement).toBeDefined();
+
+		expect(store.getDeviceByToken(physical.deviceToken)).toBeUndefined();
+		expect(store.getSessionAffinity("physical-session")).toBeUndefined();
+		expect(store.getIssueAffinity("physical-issue")).toBeUndefined();
+		expect(store.getContainerDeviceForIssue("CYPACK-1")?.deviceId).toBe(
+			container.deviceId,
+		);
+		expect(store.getSessionAffinity("container-session")).toBe(
+			container.deviceId,
+		);
+		expect(store.getIssueAffinity("container-issue")).toBe(container.deviceId);
+		expect(store.getMutation(container.deviceId, "container-mutation")).toBe(
+			"ok",
+		);
+		expect(
+			store.acquireIssueLock(
+				"container-lock",
+				"other-session",
+				container.deviceId,
+			),
+		).toBe(false);
+	});
+
 	it("removeUser purges the device's locks and affinity", () => {
 		const { store, device } = storeWithDevice();
 		store.setSessionAffinity("sess-1", device.deviceId);

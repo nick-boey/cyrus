@@ -10,15 +10,18 @@ import { LinearClient } from "@linear/sdk";
 import { resolvePath } from "cyrus-core";
 import {
 	type ContainerDeviceInfo,
+	createAcaSandboxesProvider,
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	type DeviceInfo,
 	isReservedEnvKey,
 	isStorableSecretKey,
+	KeyVaultSecretStore,
 	RESERVED_ENV_KEYS,
 	RouterServer,
 	type RouterServerConfig,
 	RouterStore,
 	SecretStore,
+	type SecretStoreBackend,
 	type SessionInfo,
 } from "cyrus-router";
 import { z } from "zod";
@@ -35,7 +38,13 @@ import { BaseCommand } from "./ICommand.js";
 const ISSUE_IDENTIFIER_RE = /^[A-Za-z][A-Za-z0-9]*-\d+$/;
 
 /** Valid values for `cyrus router users set-executor <email> <type>`. */
-const EXECUTOR_TYPES = ["device", "docker", "fly", "codespaces"] as const;
+const EXECUTOR_TYPES = [
+	"device",
+	"docker",
+	"fly",
+	"codespaces",
+	"aca",
+] as const;
 type ExecutorType = (typeof EXECUTOR_TYPES)[number];
 
 function isExecutorType(value: string): value is ExecutorType {
@@ -79,6 +88,21 @@ const SESSIONS_TABLE_COLUMN_WIDTHS = {
 	email: 28,
 } as const;
 
+interface SnapshotGcItem {
+	id: string;
+	issueKey: string;
+	deviceId: string;
+	createdAtUtc?: string;
+}
+
+interface SnapshotGcProvider {
+	planOrphanSnapshots(activeIssueKeys: string[]): Promise<SnapshotGcItem[]>;
+	gcOrphanSnapshots(
+		activeIssueKeys: string[],
+		printedPlan?: SnapshotGcItem[],
+	): Promise<SnapshotGcItem[]>;
+}
+
 /**
  * JSON shape of `<cyrusHome>/router-config.json`: a {@link RouterServerConfig}
  * minus `dbPath` (always defaulted to `<cyrusHome>/router/router.db` — see
@@ -106,6 +130,21 @@ const RouterConfigFileSchema = z.object({
 	creatorOnlyPrompting: z.boolean().optional(),
 	heartbeatMs: z.number().optional(),
 	host: z.string().optional(),
+	backup: z
+		.object({
+			blobContainerUrl: z.string(),
+			intervalMs: z.number().optional(),
+		})
+		.optional(),
+	entra: z
+		.object({
+			tenantId: z.string().min(1),
+			audience: z.string().min(1),
+			allowedDomain: z.string().optional(),
+			jwksUrl: z.string().optional(),
+			certificateIssuerId: z.string().optional(),
+		})
+		.optional(),
 	// Opt-in ephemeral container executor settings — see
 	// RouterContainersConfig in cyrus-router. Omitting this field entirely (the
 	// default) leaves the router routing every user to their enrolled physical
@@ -124,8 +163,10 @@ const RouterConfigFileSchema = z.object({
 			),
 			artifactsDir: z.string().optional(),
 			secretsPath: z.string().optional(),
+			keyVaultUrl: z.string().optional(),
 			idleStopMs: z.number().optional(),
 			staleDestroyMs: z.number().optional(),
+			teardownGraceMs: z.number().optional(),
 			requiredSecretKeys: z
 				.array(
 					z.string().refine(isStorableSecretKey, {
@@ -140,6 +181,42 @@ const RouterConfigFileSchema = z.object({
 					network: z.string().optional(),
 				})
 				.optional(),
+			// Azure Container Apps (ACA) Sandboxes provider — opt-in, additive.
+			// When present, the router's default executor registry also builds
+			// an "aca" AcaSandboxesProvider alongside "docker". When absent,
+			// non-Azure deployments are byte-for-byte unchanged.
+			aca: z
+				.object({
+					subscriptionId: z.string(),
+					resourceGroup: z.string(),
+					sandboxGroup: z.string(),
+					region: z.string(),
+					disk: z.string(),
+					cpu: z.string().optional(),
+					memory: z.string().optional(),
+					autoSuspendSeconds: z.number().nonnegative().optional(),
+					egress: z
+						.object({
+							defaultAction: z.enum(["Allow", "Deny"]),
+							trafficInspection: z.enum(["Legacy", "Full", "Partial", "None"]),
+							hostRules: z
+								.array(
+									z.object({
+										pattern: z
+											.string()
+											.refine((value) => value.trim().length > 0),
+										action: z.enum(["Allow", "Deny"]),
+									}),
+								)
+								.optional(),
+						})
+						.optional(),
+					keepSnapshots: z.number().int().nonnegative().optional(),
+					disconnectedRecreateMs: z.number().nonnegative().default(120_000),
+					apiVersion: z.string().optional(),
+					managementEndpoint: z.string().optional(),
+				})
+				.optional(),
 		})
 		.optional(),
 });
@@ -151,7 +228,7 @@ const RouterConfigFileSchema = z.object({
  *   cyrus router users add <email> [--name x]   # register a user + mint an enrollment code
  *   cyrus router users list                     # list registered users + their running session counts
  *   cyrus router users remove <email>           # remove a user
- *   cyrus router users set-executor <email> <device|docker|fly|codespaces>
+ *   cyrus router users set-executor <email> <device|docker|fly|codespaces|aca>
  *                                                # choose where a user's sessions run
  *   cyrus router devices list                   # list enrolled devices + who owns them
  *   cyrus router devices revoke <email>         # revoke a user's enrolled device
@@ -163,6 +240,7 @@ const RouterConfigFileSchema = z.object({
  *   cyrus router secrets list <email>           # list stored secret keys (masked) + missing required
  *   cyrus router containers list                # list running ephemeral container devices
  *   cyrus router containers destroy <issueKey>  # drop a container device's row
+ *   cyrus router containers gc-snapshots [--yes] # plan/delete orphan ACA snapshots
  *   cyrus router unlock <issueId|PAR-123>       # release a stuck issue lock (GUID or Linear identifier)
  *
  * Every subcommand except `start` opens a {@link RouterStore} directly on the
@@ -190,7 +268,7 @@ export class RouterCommand extends BaseCommand {
 				return this.unlock(rest[0]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email>|containers list|containers destroy <issueKey>|unlock <issueId>>",
+					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces|aca>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email>|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|unlock <issueId>>",
 				);
 		}
 	}
@@ -233,30 +311,42 @@ export class RouterCommand extends BaseCommand {
 			"user-secrets.json",
 		);
 
+		return this.readRouterConfig()?.containers?.secretsPath ?? defaultPath;
+	}
+
+	private openSecretStore(): SecretStoreBackend {
+		const keyVaultUrl = this.readRouterConfig()?.containers?.keyVaultUrl;
+		if (keyVaultUrl)
+			return new KeyVaultSecretStore({
+				vaultUrl: keyVaultUrl,
+				logger: this.logger,
+			});
+		return new SecretStore(this.resolveSecretsPath());
+	}
+
+	private readRouterConfig():
+		| z.infer<typeof RouterConfigFileSchema>
+		| undefined {
 		const configPath = join(
 			resolvePath(this.app.cyrusHome),
 			"router-config.json",
 		);
-		if (!existsSync(configPath)) {
-			return defaultPath;
-		}
-
+		if (!existsSync(configPath)) return undefined;
+		let raw: unknown;
 		try {
-			const raw = JSON.parse(readFileSync(configPath, "utf-8"));
-			const parsed = RouterConfigFileSchema.safeParse(raw);
-			return parsed.success && parsed.data.containers?.secretsPath
-				? parsed.data.containers.secretsPath
-				: defaultPath;
-		} catch {
-			// A missing/unparsable router-config.json shouldn't block `secrets
-			// set/unset` — they work fine (against the default path) before an
-			// operator has ever written a router config.
-			return defaultPath;
+			raw = JSON.parse(readFileSync(configPath, "utf-8"));
+		} catch (error) {
+			throw new Error(
+				`Failed to parse ${configPath}: ${(error as Error).message}`,
+			);
 		}
-	}
-
-	private openSecretStore(): SecretStore {
-		return new SecretStore(this.resolveSecretsPath());
+		const parsed = RouterConfigFileSchema.safeParse(raw);
+		if (!parsed.success) {
+			throw new Error(
+				`Invalid router config at ${configPath}: ${parsed.error.message}`,
+			);
+		}
+		return parsed.data;
 	}
 
 	/**
@@ -264,28 +354,10 @@ export class RouterCommand extends BaseCommand {
 	 * Claude token plus `containers.requiredSecretKeys` from router-config.json.
 	 * Read the same way `resolveSecretsPath` reads the config so `secrets list`
 	 * matches what actually blocks boot.
-	 *
-	 * Caveat: if the on-disk config is currently unparseable, this reports the
-	 * DEFAULT-only required set, which can under-report vs. a still-running
-	 * router that started from a previously-valid config (restart re-validates).
 	 */
 	private resolveRequiredSecretKeys(): string[] {
-		const configPath = join(
-			resolvePath(this.app.cyrusHome),
-			"router-config.json",
-		);
-		let configured: string[] = [];
-		if (existsSync(configPath)) {
-			try {
-				const raw = JSON.parse(readFileSync(configPath, "utf-8"));
-				const parsed = RouterConfigFileSchema.safeParse(raw);
-				if (parsed.success && parsed.data.containers?.requiredSecretKeys) {
-					configured = parsed.data.containers.requiredSecretKeys;
-				}
-			} catch {
-				// fall through to default-only
-			}
-		}
+		const configured =
+			this.readRouterConfig()?.containers?.requiredSecretKeys ?? [];
 		return [...new Set([...DEFAULT_REQUIRED_SECRET_KEYS, ...configured])];
 	}
 
@@ -329,7 +401,7 @@ export class RouterCommand extends BaseCommand {
 			},
 		};
 
-		const server = new RouterServer(config);
+		const server = await RouterServer.create(config);
 		await server.start();
 		this.logSuccess(`Router server listening on port ${server.port}`);
 
@@ -420,7 +492,7 @@ export class RouterCommand extends BaseCommand {
 				return this.usersSetExecutor(userRest[0], userRest[1]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router users <add <email> [--name <name>]|list|remove <email>|set-executor <email> <device|docker|fly|codespaces>>",
+					"Usage: cyrus router users <add <email> [--name <name>]|list|remove <email>|set-executor <email> <device|docker|fly|codespaces|aca>>",
 				);
 		}
 	}
@@ -539,7 +611,7 @@ export class RouterCommand extends BaseCommand {
 	): void {
 		if (!email || !type) {
 			this.exitWithError(
-				"Usage: cyrus router users set-executor <email> <device|docker|fly|codespaces>",
+				"Usage: cyrus router users set-executor <email> <device|docker|fly|codespaces|aca>",
 			);
 		}
 		if (!isExecutorType(type)) {
@@ -831,11 +903,11 @@ export class RouterCommand extends BaseCommand {
 	 * must not be echoed back into stdout/logs. Only the key name is
 	 * confirmed.
 	 */
-	private secretsSet(
+	private async secretsSet(
 		email: string | undefined,
 		key: string | undefined,
 		value: string | undefined,
-	): void {
+	): Promise<void> {
 		if (!email || !key || value === undefined) {
 			this.exitWithError(
 				"Usage: cyrus router secrets set <email> <ENV_VAR_NAME> <value>",
@@ -850,14 +922,14 @@ export class RouterCommand extends BaseCommand {
 			// Reserved was handled above, so this is specifically an invalid name.
 			this.exitWithError(`"${key}" is not a valid environment variable name.`);
 		}
-		this.openSecretStore().set(email, key, value);
+		await this.openSecretStore().set(email, key, value);
 		this.logSuccess(`Set ${key} for ${email}.`);
 	}
 
-	private secretsUnset(
+	private async secretsUnset(
 		email: string | undefined,
 		key: string | undefined,
-	): void {
+	): Promise<void> {
 		if (!email || !key) {
 			this.exitWithError(
 				"Usage: cyrus router secrets unset <email> <ENV_VAR_NAME>",
@@ -868,16 +940,16 @@ export class RouterCommand extends BaseCommand {
 				`"${key}" is a reserved env var. Reserved: ${RESERVED_ENV_KEYS.join(", ")}`,
 			);
 		}
-		this.openSecretStore().set(email, key, undefined);
+		await this.openSecretStore().set(email, key, undefined);
 		this.logSuccess(`Unset ${key} for ${email}.`);
 	}
 
-	private secretsList(email: string | undefined): void {
+	private async secretsList(email: string | undefined): Promise<void> {
 		if (!email) {
 			this.exitWithError("Usage: cyrus router secrets list <email>");
 		}
 		const store = this.openSecretStore();
-		const bundle = store.get(email);
+		const bundle = await store.get(email);
 		const keys = Object.keys(bundle).sort();
 		if (keys.length === 0) {
 			this.logger.info(`No secrets stored for ${email}.`);
@@ -886,7 +958,10 @@ export class RouterCommand extends BaseCommand {
 			for (const key of keys) this.logger.raw(`  ${key} = ****`);
 		}
 		const requiredKeys = this.resolveRequiredSecretKeys();
-		const { ok, missing } = store.isFullyAuthenticated(email, requiredKeys);
+		const { ok, missing } = await store.isFullyAuthenticated(
+			email,
+			requiredKeys,
+		);
 		if (ok) {
 			this.logSuccess(`${email} is fully authenticated for containers.`);
 		} else {
@@ -903,9 +978,11 @@ export class RouterCommand extends BaseCommand {
 				return this.containersList();
 			case "destroy":
 				return this.containersDestroy(containerRest[0]);
+			case "gc-snapshots":
+				return this.containersGcSnapshots(containerRest.includes("--yes"));
 			default:
 				this.exitWithError(
-					"Usage: cyrus router containers <list|destroy <issueKey>>",
+					"Usage: cyrus router containers <list|destroy <issueKey>|gc-snapshots [--yes]>",
 				);
 		}
 	}
@@ -925,6 +1002,82 @@ export class RouterCommand extends BaseCommand {
 		} finally {
 			store.close();
 		}
+	}
+
+	protected createAcaSnapshotGcProvider(
+		containers: RouterServerConfig["containers"],
+	): SnapshotGcProvider | undefined {
+		return containers
+			? createAcaSandboxesProvider(containers, {
+					info: (msg) => this.logger.info(msg),
+					warn: (msg) => this.logger.warn(msg),
+				})
+			: undefined;
+	}
+
+	private async containersGcSnapshots(yes: boolean): Promise<void> {
+		const configPath = join(
+			resolvePath(this.app.cyrusHome),
+			"router-config.json",
+		);
+		if (!existsSync(configPath)) {
+			this.exitWithError(`No router config found at ${configPath}`);
+		}
+		let parsed: z.infer<typeof RouterConfigFileSchema>;
+		try {
+			const result = RouterConfigFileSchema.safeParse(
+				JSON.parse(readFileSync(configPath, "utf-8")),
+			);
+			if (!result.success) {
+				this.exitWithError(
+					`Invalid router config at ${configPath}: ${result.error.message}`,
+				);
+			}
+			parsed = result.data;
+		} catch (error) {
+			this.exitWithError(
+				`Failed to parse ${configPath}: ${(error as Error).message}`,
+			);
+		}
+
+		const provider = this.createAcaSnapshotGcProvider(parsed.containers);
+		if (!provider || typeof provider.gcOrphanSnapshots !== "function") {
+			this.exitWithError(
+				"Snapshot GC requires containers.aca in router-config.json.",
+			);
+		}
+
+		const store = this.openStore();
+		let activeIssueKeys: string[];
+		try {
+			activeIssueKeys = store
+				.listContainerDevices()
+				.filter((device) => device.provider === "aca")
+				.map((device) => device.issueKey);
+		} finally {
+			store.close();
+		}
+		const plan = await provider.planOrphanSnapshots(activeIssueKeys);
+		if (plan.length === 0) {
+			this.logger.info("No orphan ACA snapshots found.");
+			return;
+		}
+		this.logger.raw("Orphan ACA snapshots planned for deletion:");
+		for (const snapshot of plan) this.printSnapshotGcItem(snapshot);
+		if (!yes) {
+			this.logger.raw(
+				"Dry run only. Re-run with --yes to delete these snapshots.",
+			);
+			return;
+		}
+		const deleted = await provider.gcOrphanSnapshots(activeIssueKeys, plan);
+		this.logSuccess(`Deleted ${deleted.length} orphan ACA snapshot(s).`);
+	}
+
+	private printSnapshotGcItem(snapshot: SnapshotGcItem): void {
+		this.logger.raw(
+			`  ${snapshot.id} issue=${snapshot.issueKey} device=${snapshot.deviceId}${snapshot.createdAtUtc ? ` created=${snapshot.createdAtUtc}` : ""}`,
+		);
 	}
 
 	/**

@@ -11,6 +11,22 @@ import { dirname } from "node:path";
 /** Per-user container secrets: an env-var-name → value map. */
 export type UserSecretBundle = Record<string, string>;
 
+/** Async storage contract shared by the file and Azure Key Vault backends. */
+export interface SecretStoreBackend {
+	get(email: string): UserSecretBundle | Promise<UserSecretBundle>;
+	set(
+		email: string,
+		key: string,
+		value: string | undefined,
+	): void | Promise<void>;
+	isFullyAuthenticated(
+		email: string,
+		requiredKeys: readonly string[],
+	):
+		| { ok: boolean; missing: string[] }
+		| Promise<{ ok: boolean; missing: string[] }>;
+}
+
 /** Legacy named secret keys → the container env-var names they map to. */
 export const LEGACY_SECRET_KEY_MAP: Record<string, string> = {
 	claudeOauthToken: "CLAUDE_CODE_OAUTH_TOKEN",
@@ -58,6 +74,24 @@ export function isStorableSecretKey(key: string): boolean {
 	return VALID_ENV_NAME_RE.test(key) && !isReservedEnvKey(key);
 }
 
+/** Normalizes legacy names and applies the common backend validation rules. */
+export function normalizeSecretKey(key: string): string {
+	const normalizedKey = Object.hasOwn(LEGACY_SECRET_KEY_MAP, key)
+		? LEGACY_SECRET_KEY_MAP[key]!
+		: key;
+	if (isReservedEnvKey(normalizedKey)) {
+		throw new Error(
+			`"${normalizedKey}" is a reserved env var and cannot be stored as a per-user secret. Reserved: ${RESERVED_ENV_KEYS.join(", ")}`,
+		);
+	}
+	if (!VALID_ENV_NAME_RE.test(normalizedKey)) {
+		throw new Error(
+			`"${normalizedKey}" is not a valid environment variable name (expected ${VALID_ENV_NAME_RE}).`,
+		);
+	}
+	return normalizedKey;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -86,7 +120,7 @@ function migrateBundle(raw: Record<string, string>): UserSecretBundle {
  * file (keyed by lowercased email) next to router-config.json. Single-org
  * threat model: file perms (0600) are the protection boundary.
  */
-export class SecretStore {
+export class FileSecretStore implements SecretStoreBackend {
 	constructor(private readonly filePath: string) {}
 
 	/** Returns the user's bundle with legacy keys migrated to env-var names. */
@@ -102,20 +136,7 @@ export class SecretStore {
 	 * Rejects reserved keys and non-env-var-name keys.
 	 */
 	set(email: string, key: string, value: string | undefined): void {
-		const legacyTarget = Object.hasOwn(LEGACY_SECRET_KEY_MAP, key)
-			? LEGACY_SECRET_KEY_MAP[key]
-			: undefined;
-		const normalizedKey = legacyTarget ?? key;
-		if (isReservedEnvKey(normalizedKey)) {
-			throw new Error(
-				`"${normalizedKey}" is a reserved env var and cannot be stored as a per-user secret. Reserved: ${RESERVED_ENV_KEYS.join(", ")}`,
-			);
-		}
-		if (!VALID_ENV_NAME_RE.test(normalizedKey)) {
-			throw new Error(
-				`"${normalizedKey}" is not a valid environment variable name (expected ${VALID_ENV_NAME_RE}).`,
-			);
-		}
+		const normalizedKey = normalizeSecretKey(key);
 
 		const all = this.readAll();
 		const id = email.toLowerCase();
@@ -200,3 +221,6 @@ export class SecretStore {
 		return migrated;
 	}
 }
+
+/** Backward-compatible class export for the original file-backed store. */
+export { FileSecretStore as SecretStore };

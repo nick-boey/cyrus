@@ -325,6 +325,15 @@ export function buildProgram(
 		)
 		.action(makeRouterAction("containers", "destroy"));
 
+	routerContainersCommand
+		.command("gc-snapshots")
+		.description("Plan orphan ACA snapshot deletion; pass --yes to execute")
+		.option("--yes", "Delete the planned snapshots")
+		.action(async (options: { yes?: boolean }) => {
+			const action = makeRouterAction("containers", "gc-snapshots");
+			await action(...(options.yes ? ["--yes"] : []));
+		});
+
 	routerCommand
 		.command("unlock <issue>")
 		.description(
@@ -357,7 +366,11 @@ export function buildProgram(
 			"Enroll this device with a Cyrus Router server using a one-time code from `cyrus router users add`",
 		)
 		.requiredOption("--code <code>", "One-time enrollment code")
-		.action(async (url: string, cmdOpts: { code: string }) => {
+		.option(
+			"--entra <audience>",
+			"Authenticate enrollment with Azure CLI for the router Application ID URI",
+		)
+		.action(async (url: string, cmdOpts: { code: string; entra?: string }) => {
 			const opts = program.opts();
 			const app = new Application(
 				opts.cyrusHome,
@@ -366,7 +379,12 @@ export function buildProgram(
 				errorReporter,
 			);
 			try {
-				await new ConnectCommand(app).execute([url, "--code", cmdOpts.code]);
+				await new ConnectCommand(app).execute([
+					url,
+					"--code",
+					cmdOpts.code,
+					...(cmdOpts.entra ? ["--entra", cmdOpts.entra] : []),
+				]);
 			} finally {
 				app.disposeWatchers();
 			}
