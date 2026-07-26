@@ -658,8 +658,60 @@ export class RouterConnection extends EventEmitter {
 	}
 
 	private appendSessionStateEntry(entry: SessionStateEntry): void {
+		// Monotonic by session: a session only reaches a terminal state once per
+		// turn, so a newer frame supersedes any older unacked frame for the same
+		// session. Durability first — append, then best-effort compaction. If the
+		// rewrite fails both frames stay on disk and both replay, which the
+		// router's idempotent release handles.
+		const superseded = this.sessionStateEntries.filter(
+			(e) => e.sessionId === entry.sessionId,
+		);
 		this.sessionStateEntries.push(entry);
 		appendFileSync(this.sessionStateFile, `${JSON.stringify(entry)}\n`);
+		if (superseded.length === 0) return;
+		const supersededIds = new Set(superseded.map((e) => e.id));
+		this.sessionStateEntries = this.sessionStateEntries.filter(
+			(e) => !supersededIds.has(e.id),
+		);
+		try {
+			this.rewriteJsonl(this.sessionStateFile, this.sessionStateEntries);
+		} catch (err) {
+			console.error(
+				`[RouterConnection] failed to compact superseded session_state entries for session ${entry.sessionId}:`,
+				err,
+			);
+		}
+	}
+
+	/**
+	 * Drops every unacked terminal frame for a session that has since advanced
+	 * past it (a new runner attached, so it is running again).
+	 *
+	 * Terminal frames are durable precisely because losing one strands an issue
+	 * lock — but that durability cuts the other way once the session resumes. The
+	 * router applies a terminal frame unconditionally: replaying a stale one on a
+	 * later reconnect releases the lock and session affinity out from under a live
+	 * turn, and every subsequent activity post for that turn — including its final
+	 * response — is rejected with "session not owned by this device". Nothing
+	 * leaks by dropping the frame: the resumed session re-arms its terminal
+	 * one-shot and emits a fresh frame when it actually finishes.
+	 */
+	discardBufferedSessionState(sessionId: string): void {
+		const remaining = this.sessionStateEntries.filter(
+			(e) => e.sessionId !== sessionId,
+		);
+		if (remaining.length === this.sessionStateEntries.length) return;
+		this.sessionStateEntries = remaining;
+		try {
+			this.rewriteJsonl(this.sessionStateFile, this.sessionStateEntries);
+		} catch (err) {
+			// The entry survives on disk and will replay — stale, but idempotent on
+			// the router. Surface it rather than failing silently.
+			console.error(
+				`[RouterConnection] failed to drop the stale session_state entry for resumed session ${sessionId}:`,
+				err,
+			);
+		}
 	}
 
 	private removeSessionStateEntry(id: string): void {
