@@ -14,3 +14,13 @@ code
 .superpowers
 .husky
 .github
+# Test sources are never compiled into the image: every package/app tsconfig
+# builds `src/**` only and excludes `**/*.test.ts`, so nothing under these paths
+# can reach `/out`. Excluding them keeps a test-only edit from invalidating the
+# `COPY . .` layer and forcing a full ~8-minute rebuild — which is exactly what
+# blows the 300s `beforeAll` hook timeout in
+# packages/router/test/containers-real-docker.e2e.test.ts (that suite builds this
+# image itself). Recorded as a gotcha by the 2026-07-17 router-mode drive.
+packages/*/test
+apps/*/test
+**/*.test.ts
