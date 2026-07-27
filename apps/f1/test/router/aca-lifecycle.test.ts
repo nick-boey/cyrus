@@ -65,6 +65,16 @@ interface DeviceStack {
 	transport: RouterEventTransport;
 	rawEvents: AgentEvent[];
 	messages: InternalMessage[];
+	/**
+	 * Resolved by `stop()`/`destroy()` when this stack's connection is closed.
+	 *
+	 * `RouterConnection.close()` detaches its own socket listeners, so a
+	 * connection closed while it is still CONNECTING emits nothing at all —
+	 * not `connected`, not `disconnected`, not `error`. Anything awaiting
+	 * `once(connection, "connected")` would therefore wait forever. This gate
+	 * is how `connectDevice` learns the attempt is over.
+	 */
+	closed: { promise: Promise<void>; resolve(): void };
 }
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -114,15 +124,27 @@ class RecordingAcaExecutor implements ContainerExecutor {
 
 	async stop(issueKey: string): Promise<void> {
 		this.stopCalls.push(issueKey);
-		this.stacks.get(issueKey)?.connection.close();
+		this.closeStack(issueKey);
 		this.statuses.set(issueKey, "stopped");
 	}
 
 	async destroy(issueKey: string): Promise<void> {
 		this.destroyCalls.push(issueKey);
-		this.stacks.get(issueKey)?.connection.close();
+		this.closeStack(issueKey);
 		this.stacks.delete(issueKey);
 		this.statuses.delete(issueKey);
+	}
+
+	/**
+	 * Close a stack's connection and release anyone waiting on it. Resolving
+	 * the gate BEFORE `close()` keeps the ordering obvious: by the time the
+	 * connection is torn down, the waiter is already unblocked.
+	 */
+	private closeStack(issueKey: string): void {
+		const stack = this.stacks.get(issueKey);
+		if (!stack) return;
+		stack.closed.resolve();
+		stack.connection.close();
 	}
 
 	async status(issueKey: string): Promise<ContainerStatus> {
@@ -151,6 +173,7 @@ class RecordingAcaExecutor implements ContainerExecutor {
 			transport,
 			rawEvents: previous?.rawEvents ?? [],
 			messages: previous?.messages ?? [],
+			closed: deferred(),
 		};
 		transport.on("event", (event) => stack.rawEvents.push(event));
 		transport.on("message", (message) => {
@@ -160,9 +183,18 @@ class RecordingAcaExecutor implements ContainerExecutor {
 			}
 		});
 		this.stacks.set(issueKey, stack);
+		// Settle on EITHER outcome. A real executor's `ensureRunning` is always
+		// bounded — LocalDockerProvider's `execFile` has a timeout, and
+		// AcaSandboxesProvider polls router connectivity against a deadline — so
+		// modelling this as an unbounded `await once(connection, "connected")`
+		// would be harness infidelity: the idle sweep can legitimately park a
+		// container while it is still starting (`stop()` closes this very
+		// connection mid-handshake), and that must END the boot attempt, not hang
+		// it. Hanging here would leave the router's in-flight boot slot occupied
+		// and silently skip every later boot for the device.
 		const connected = once(connection, "connected");
 		connection.connect();
-		await connected;
+		await Promise.race([connected, stack.closed.promise]);
 	}
 
 	private startTerminalCleanup(
@@ -304,6 +336,16 @@ describe("F1 router-mode fake ACA lifecycle drive", () => {
 			}),
 		);
 		await vi.waitFor(() => expect(executor.resumeCalls).toContain("ACA-1"));
+		// `resumeCalls` is pushed the moment the executor decides to resume —
+		// before the device has reconnected, let alone drained its queue. Gating
+		// only on it would park the container again mid-handshake, so this prompt
+		// would never be delivered and the "resume after idle stop" leg would be
+		// asserting nothing. Wait for the resume to actually complete: the device
+		// back on the router, with the queued prompt delivered.
+		await vi.waitFor(() => {
+			expect(rig.server.isDeviceOnline(closedDevice!.deviceId)).toBe(true);
+			expect(executor.stacks.get("ACA-1")?.rawEvents).toHaveLength(3);
+		});
 
 		// Park it again so the terminal notification must wake it before teardown.
 		rig.server.eventRouter.handleSessionState(closedDevice!.deviceId, {

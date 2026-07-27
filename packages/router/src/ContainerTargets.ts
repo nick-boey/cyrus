@@ -18,6 +18,32 @@ import {
 const ISSUE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 /**
+ * How long a concurrent caller will join an already-running boot attempt before
+ * treating it as stale and starting its own.
+ *
+ * Sized well above a legitimate cold boot (a first `docker run` that has to
+ * pull the image can take minutes, and the ACA provider additionally waits up
+ * to `resumeConnectTimeoutMs` for a resumed worker to rejoin the router), so
+ * this never fires in normal operation — it exists purely so a provider call
+ * that hangs cannot permanently disable booting for a device.
+ */
+const BOOT_JOIN_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * How many times one `bootStart` will wait on someone else's attempt before
+ * insisting on its own. Two is enough to absorb the realistic case (join an
+ * attempt, find it left the container stopped, join the replacement someone
+ * else started in the meantime) while bounding the work.
+ */
+const MAX_BOOT_JOINS = 2;
+
+/** An in-progress `bootInner`, with the wall-clock time it started. */
+interface InFlightBoot {
+	promise: Promise<void>;
+	startedMs: number;
+}
+
+/**
  * Thrown by {@link ContainerTargetService.ensureDevice} specifically when
  * `issueKey` fails {@link ISSUE_KEY_RE}. Kept distinct from other
  * `ensureDevice` failures (e.g. a store error) so {@link EventRouter} can
@@ -59,6 +85,8 @@ export interface ContainerRoutingDeps {
 		body: string,
 	) => Promise<void>;
 	logger: { info(msg: string): void; warn(msg: string): void };
+	/** Injectable clock for the in-flight boot staleness window (tests). */
+	now?: () => number;
 }
 
 /**
@@ -72,6 +100,10 @@ export class ContainerTargetService {
 	private readonly bootFailedNotified = new Set<string>();
 
 	constructor(private readonly deps: ContainerRoutingDeps) {}
+
+	private now(): number {
+		return this.deps.now ? this.deps.now() : Date.now();
+	}
 
 	/** Provider name from users.executor_json, or undefined for physical-device users. */
 	executorFor(userId: number): string | undefined {
@@ -150,6 +182,29 @@ export class ContainerTargetService {
 	}
 
 	/**
+	 * Is the issue's container actually up right now? Used only on the
+	 * join-an-in-flight-boot path, to decide whether someone else's finished
+	 * attempt satisfied this caller. A provider that cannot answer is treated as
+	 * not-running: booting again is idempotent and self-logging, whereas
+	 * wrongly assuming "running" silently drops the boot.
+	 */
+	private async isRunning(
+		provider: string,
+		issueKey: string,
+	): Promise<boolean> {
+		const executor = this.deps.executors.get(provider);
+		if (!executor) return false;
+		try {
+			return (await executor.status(issueKey)) === "running";
+		} catch (err) {
+			this.deps.logger.warn(
+				`could not read container status for ${issueKey} after joining an in-flight boot: ${String(err)}`,
+			);
+			return false;
+		}
+	}
+
+	/**
 	 * In-flight boot attempts keyed by DEVICE ID (not issue key — see below).
 	 * Linear's `created` (delegation) and `prompted` (first user message)
 	 * webhooks for the same issue routinely arrive seconds apart, both while
@@ -175,8 +230,18 @@ export class ContainerTargetService {
 	 * start. Keying by device id keeps the same-device dedup (both webhooks
 	 * still resolve to the same device id when no switch happened) while
 	 * making an executor switch's new device id always start a fresh attempt.
+	 *
+	 * Entries carry the time the attempt started, because joining is only safe
+	 * while the attempt is plausibly still alive. `ensureRunning` is
+	 * provider-implemented network I/O, and one that never settles would
+	 * otherwise wedge this slot forever: every later `boot()` — and, worse,
+	 * every `bootForTeardown()` — would join a dead promise and return
+	 * immediately, so the container could never be woken again and only the
+	 * teardown grace deadline would reclaim it. Past
+	 * {@link BOOT_JOIN_TIMEOUT_MS} the entry is treated as stale and a fresh
+	 * attempt is started; see {@link bootStart}.
 	 */
-	private readonly inFlightBoots = new Map<number, Promise<void>>();
+	private readonly inFlightBoots = new Map<number, InFlightBoot>();
 
 	/**
 	 * Fire-and-forget boot, serialized per issue via {@link inFlightBoots}. On
@@ -235,23 +300,52 @@ export class ContainerTargetService {
 			);
 			return;
 		}
-		if (
-			!device ||
-			device.kind !== "container" ||
-			!device.issueKey ||
-			!device.provider
-		) {
+		if (device?.kind !== "container" || !device.issueKey || !device.provider) {
 			return;
 		}
 		const issueKey = device.issueKey;
 		const provider = device.provider;
 		const userId = device.userId;
 
-		const inFlight = this.inFlightBoots.get(deviceId);
-		if (inFlight) {
-			// Already booting this exact device elsewhere — join it rather
-			// than start a second ensureRunning/mintDeviceToken.
-			return inFlight;
+		// Join a concurrent attempt rather than driving a second
+		// ensureRunning/mintDeviceToken — but only as a dedup of overlapping
+		// work, never as evidence that the container ended up running. Bounded
+		// so a pathological interleaving of settle-and-restart can't spin.
+		for (let join = 0; join < MAX_BOOT_JOINS; join++) {
+			const inFlight = this.inFlightBoots.get(deviceId);
+			if (!inFlight) break;
+
+			if (this.now() - inFlight.startedMs >= BOOT_JOIN_TIMEOUT_MS) {
+				// The provider's `ensureRunning` has outlived any plausible cold
+				// boot and may never settle. Waiting on it would block this caller
+				// forever. Abandon the join; the orphaned promise still settles on
+				// its own eventually (bootInner logs its own outcome) and the
+				// identity check below stops it clobbering our slot.
+				this.deps.logger.warn(
+					`container boot for device ${deviceId} (${issueKey}) has been in flight for over ${BOOT_JOIN_TIMEOUT_MS}ms; abandoning the join and starting a fresh attempt`,
+				);
+				if (this.inFlightBoots.get(deviceId) === inFlight) {
+					this.inFlightBoots.delete(deviceId);
+				}
+				break;
+			}
+
+			// bootInner is written never to reject, but a detached rejection here
+			// would take out the whole router, so guard it anyway.
+			await inFlight.promise.catch(() => {});
+
+			// CRITICAL: the attempt we just joined began BEFORE we asked for a
+			// boot, so its completion says nothing about the state we care about.
+			// It may have failed, or — the case that bit us live — the idle sweep
+			// may have parked the container while that attempt was still starting
+			// it. Returning here on the strength of someone else's finished boot
+			// silently skips the boot this caller asked for. For a
+			// terminal-teardown wake that is fatal: nothing else will start the
+			// container, the queued terminal webhook is never delivered, and the
+			// grace deadline becomes the only thing that reclaims it. So confirm
+			// the container is actually running, and fall through to boot it for
+			// real if it isn't.
+			if (await this.isRunning(provider, issueKey)) return;
 		}
 
 		const attempt = this.bootInner(
@@ -261,11 +355,12 @@ export class ContainerTargetService {
 			issueKey,
 			notify,
 		);
-		this.inFlightBoots.set(deviceId, attempt);
+		const entry: InFlightBoot = { promise: attempt, startedMs: this.now() };
+		this.inFlightBoots.set(deviceId, entry);
 		try {
 			await attempt;
 		} finally {
-			if (this.inFlightBoots.get(deviceId) === attempt) {
+			if (this.inFlightBoots.get(deviceId) === entry) {
 				this.inFlightBoots.delete(deviceId);
 			}
 		}
