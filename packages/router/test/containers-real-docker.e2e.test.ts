@@ -1,9 +1,10 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,15 +29,18 @@ import { RouterServer } from "../src/RouterServer.js";
 import { SecretStore } from "../src/SecretStore.js";
 import {
 	containerState,
+	countingProvider,
 	dedicatedDaemonOptIn,
 	dockerAvailable,
 	removeContainerAndVolume,
+	routerHostForContainers,
 	runScopedIssueKey,
 	scopedProvider,
 } from "./helpers/dockerDaemon.js";
 // Local fixtures — same shape as apps/f1/src/router/fixtures.ts.
 import {
 	createdFixture,
+	promptedFixture,
 	seedIssue,
 	seedSession,
 	WORKSPACE,
@@ -52,6 +56,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const execFileAsync = promisify(execFile);
 
 const IMAGE = "cyrus-worker:test";
+// The host address a container uses to reach this process's RouterServer.
+// Daemon-dependent (`host.docker.internal` on Docker Desktop/colima, the bridge
+// gateway on plain Linux Engine), so it is resolved by each suite's `beforeAll`
+// once the image it probes with exists — see `routerHostForContainers`.
+let routerHost = "host.docker.internal";
 const IDLE_STOP_MS = 60_000;
 const STALE_DESTROY_MS = 14 * 24 * 60 * 60_000;
 
@@ -77,16 +86,17 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					stdio: "inherit",
 				},
 			);
+			routerHost = routerHostForContainers(IMAGE);
 
 			tracker = new CLIIssueTrackerService();
 			tracker.seedDefaultData();
 			dir = mkdtempSync(join(tmpdir(), "router-real-docker-"));
 			const secrets = new SecretStore(join(dir, "secrets.json"));
-			port = 3456; // fixed so host.docker.internal:3456 resolves from the container
+			port = 3456; // fixed so the container's router URL is stable across boots
 
 			const containers = {
 				image: IMAGE,
-				routerUrlForContainers: `ws://host.docker.internal:${port}`,
+				routerUrlForContainers: `ws://${routerHost}:${port}`,
 				repositories: [
 					{
 						name: "hello",
@@ -102,7 +112,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 			};
 			server = new RouterServer({
 				port,
-				host: "0.0.0.0", // container-facing: reachable from host.docker.internal
+				host: "0.0.0.0", // container-facing: loopback is unreachable from a container
 				dbPath: ":memory:",
 				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
 				webhook: { verificationMode: "direct", secret: "s" },
@@ -298,6 +308,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					stdio: "inherit",
 				},
 			);
+			routerHost = routerHostForContainers(IMAGE);
 
 			dir = mkdtempSync(join(tmpdir(), "router-floor-upload-"));
 			const secrets = new SecretStore(join(dir, "secrets.json"));
@@ -305,7 +316,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 
 			const containers = {
 				image: IMAGE,
-				routerUrlForContainers: `ws://host.docker.internal:${port}`,
+				routerUrlForContainers: `ws://${routerHost}:${port}`,
 				repositories: [
 					{
 						name: "hello",
@@ -321,7 +332,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 			};
 			server = new RouterServer({
 				port,
-				host: "0.0.0.0", // container-facing: reachable from host.docker.internal
+				host: "0.0.0.0", // container-facing: loopback is unreachable from a container
 				dbPath: ":memory:",
 				workspaces: {},
 				webhook: { verificationMode: "direct", secret: "s" },
@@ -440,7 +451,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					"--name",
 					containerName,
 					"-e",
-					`CYRUS_ROUTER_URL=http://host.docker.internal:${port}`,
+					`CYRUS_ROUTER_URL=http://${routerHost}:${port}`,
 					"-e",
 					`CYRUS_DEVICE_TOKEN=${deviceToken}`,
 					"-e",
@@ -531,6 +542,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					stdio: "inherit",
 				},
 			);
+			routerHost = routerHostForContainers(IMAGE);
 
 			tracker = new CLIIssueTrackerService();
 			tracker.seedDefaultData();
@@ -540,7 +552,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 
 			const containers = {
 				image: IMAGE,
-				routerUrlForContainers: `ws://host.docker.internal:${port}`,
+				routerUrlForContainers: `ws://${routerHost}:${port}`,
 				repositories: [
 					{
 						name: "hello",
@@ -556,7 +568,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 			};
 			server = new RouterServer({
 				port,
-				host: "0.0.0.0", // container-facing: reachable from host.docker.internal
+				host: "0.0.0.0", // container-facing: loopback is unreachable from a container
 				dbPath: ":memory:",
 				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
 				webhook: { verificationMode: "direct", secret: "s" },
@@ -634,6 +646,18 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				"-L",
 				`/workspaces/${issueKey}`,
 			]);
+			// `stat` uses lstat(2) by default (only `stat -L` dereferences), so
+			// this is the direct lstat assertion the invariant is stated in
+			// terms of: a symlink here would report "symbolic link", and the
+			// `test -d` above (which DOES follow links) would have passed
+			// anyway. Together with `test ! -L` that pins the file type at the
+			// path itself, not at whatever it might point to.
+			const fileType = execFileSync(
+				"docker",
+				["exec", containerName, "stat", "-c", "%F", `/workspaces/${issueKey}`],
+				{ encoding: "utf-8" },
+			).trim();
+			expect(fileType).toBe("directory");
 			const real = execFileSync(
 				"docker",
 				["exec", containerName, "realpath", `/workspaces/${issueKey}`],
@@ -641,6 +665,533 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 			).trim();
 			expect(real).toBe(`/workspaces/${issueKey}`);
 			removeContainerAndVolume(containerName);
+		}, 180_000);
+	},
+);
+
+/**
+ * A SEPARATE describe block, deliberately (same rationale as the blocks above:
+ * their closure locals are private to their own `beforeAll`/`it`). Own tmp dir,
+ * own fixed port distinct from 3456/3457/3458.
+ *
+ * Boot serialization / dedup — the fourth lifecycle behaviour spec A2 asks for,
+ * and the only one that had no real-daemon coverage: `containers-e2e.test.ts`
+ * scenario 5 proves it against a `FakeBootExecutor` whose `ensureRunning` parks
+ * on a hand-held gate. Against the real provider the "still cold-booting"
+ * window is a genuine `docker run`/`docker start` round-trip, so this also
+ * proves the window is real (not an artifact of the fake's gate) and that the
+ * dedup holds across the whole of it.
+ */
+describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
+	"real-Docker boot serialization",
+	() => {
+		let server: RouterServer;
+		let tracker: CLIIssueTrackerService;
+		let dir: string;
+		let port: number;
+		let docker: ReturnType<typeof countingProvider>;
+		const issueKey = runScopedIssueKey("CYSER");
+		const containerName = `cyrus-issue-${issueKey}`;
+
+		beforeAll(async () => {
+			// Build the worker image (cached; same pattern as the suites above).
+			execFileSync(
+				"docker",
+				["build", "-f", "docker/worker/Dockerfile", "-t", IMAGE, "."],
+				{
+					cwd: join(__dirname, "..", "..", ".."),
+					stdio: "inherit",
+				},
+			);
+			routerHost = routerHostForContainers(IMAGE);
+
+			tracker = new CLIIssueTrackerService();
+			tracker.seedDefaultData();
+			dir = mkdtempSync(join(tmpdir(), "router-boot-serialization-"));
+			const secrets = new SecretStore(join(dir, "secrets.json"));
+			port = 3459; // fixed; distinct from 3456 / 3457 / 3458 above
+
+			// Counting AND scoped: the count is the observable under test, the
+			// scope keeps this suite's `sweep()`s (RouterServer's own 60s
+			// interval included) from GC'ing anything outside this run — see the
+			// identical rationale on the suites above.
+			docker = countingProvider(
+				scopedProvider(
+					new LocalDockerProvider({ image: IMAGE }),
+					new Set([issueKey]),
+				),
+			);
+			server = new RouterServer({
+				port,
+				host: "0.0.0.0", // container-facing: loopback is unreachable from a container
+				dbPath: ":memory:",
+				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
+				webhook: { verificationMode: "direct", secret: "s" },
+				trackerFactory: () => tracker,
+				logger: { info: () => {}, warn: () => {} },
+				containers: {
+					image: IMAGE,
+					routerUrlForContainers: `ws://${routerHost}:${port}`,
+					repositories: [
+						{
+							name: "hello",
+							githubSlug: "octocat/Hello-World",
+							linearWorkspaceId: WORKSPACE,
+							baseBranch: "master",
+						},
+					],
+					secretsPath: join(dir, "secrets.json"),
+					artifactsDir: join(dir, "artifacts"),
+					idleStopMs: IDLE_STOP_MS,
+					staleDestroyMs: STALE_DESTROY_MS,
+				},
+				executorRegistryFactory: () => new Map([["docker", docker]]),
+			});
+			await server.start();
+			server.store.addUser({ email: "e2e@example.com", linearId: "lin-e2e" });
+			server.store.setUserExecutor(
+				"e2e@example.com",
+				JSON.stringify({ type: "docker" }),
+			);
+			secrets.set(
+				"e2e@example.com",
+				"claudeOauthToken",
+				"fake-oauth-not-used-for-boot",
+			);
+		}, 300_000);
+
+		afterAll(async () => {
+			removeContainerAndVolume(containerName);
+			await server?.stop();
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		it("created then prompted for the same still-cold-booting issue coalesce into one real docker run", async () => {
+			const creator = {
+				id: "lin-e2e",
+				email: "e2e@example.com",
+				name: "E2E",
+			};
+			const issue = { id: "issue-ser", identifier: issueKey, title: "ser" };
+			seedSession(tracker, "sess-ser", "issue-ser");
+			seedIssue(tracker, issue);
+
+			await server.eventRouter.route(
+				createdFixture({ sessionId: "sess-ser", issue, creator }),
+			);
+			// `ContainerTargetService.boot` never awaits `ensureRunning`, but its
+			// synchronous prefix (resolve device → check `inFlightBoots` → call
+			// `ensureRunning` down to the wrapper's push) runs inside `route()`'s
+			// own call stack. So the first boot is recorded, and genuinely still
+			// in flight (a real `docker run` against the daemon), by the time
+			// `route()` settles.
+			expect(docker.ensureRunningCalls).toEqual([issueKey]);
+			expect(docker.resolvedCount).toBe(0);
+
+			// The follow-up prompt Linear sends seconds after `created`, arriving
+			// while `docker run` is still going. Resolves via session affinity
+			// rather than ensureDevice, but hits the same `deliverOrNotify` choke
+			// point and calls `boot()` again for the SAME device id — the exact
+			// race `inFlightBoots` exists to dedupe.
+			await server.eventRouter.route(
+				promptedFixture({
+					sessionId: "sess-ser",
+					actorUserId: creator.id,
+					creator,
+					issue,
+					body: "already going?",
+				}),
+			);
+			expect(docker.ensureRunningCalls).toEqual([issueKey]);
+
+			// Let the single in-flight boot settle, then check the daemon: one
+			// container, and exactly one container device row (a broken dedup
+			// mints a second token and starts a second boot, orphaning the
+			// container that actually won).
+			await vi.waitFor(() => expect(docker.resolvedCount).toBe(1), {
+				timeout: 60_000,
+			});
+			await vi.waitFor(
+				() => expect(containerState(containerName)).toBe("running"),
+				{ timeout: 60_000 },
+			);
+			expect(docker.ensureRunningCalls).toEqual([issueKey]);
+			const names = execFileSync(
+				"docker",
+				[
+					"ps",
+					"-a",
+					"--filter",
+					`label=cyrus.issue=${issueKey}`,
+					"--format",
+					"{{.Names}}",
+				],
+				{ encoding: "utf-8" },
+			)
+				.split("\n")
+				.filter(Boolean);
+			expect(names).toEqual([containerName]);
+			expect(
+				server.store
+					.listContainerDevices()
+					.filter((d) => d.issueKey === issueKey),
+			).toHaveLength(1);
+		}, 180_000);
+	},
+);
+
+/**
+ * A SEPARATE describe block, deliberately (same rationale as the blocks above).
+ * Own tmp dir, own fixed port distinct from 3456/3457/3458/3459.
+ *
+ * The floor's UPLOAD half, fired by the container's OWN production trigger.
+ * The "floor upload round-trip" block above proves the transport and the
+ * artifact endpoint, but it builds and PUTs the bundle from the test process:
+ * nothing in it runs `WorkspaceSyncService` inside a container, so the
+ * trigger → `pushWipIfDirty` → `buildBundle` → `uploadBundle` chain is not what
+ * it exercises. Here the bundle that lands at `/artifacts` is produced by the
+ * in-container EdgeWorker's own floor, from a real worktree it created itself,
+ * and the fresh-container restore reads back that container-produced bundle.
+ *
+ * No Claude token is needed: `WorkspaceSyncService` is constructed and
+ * `touch()`ed at the top of `initializeAgentRunner` (EdgeWorker.ts) — i.e.
+ * before the runner is ever built — and the WIP push's failure (no GitHub
+ * credential for octocat/Hello-World) is swallowed and logged by design so the
+ * bundle upload still proceeds; see `pushWipSafely` in
+ * packages/edge-worker/src/WorkspaceSyncService.ts.
+ *
+ * WHICH trigger fires is deliberately not pinned, because with a deliberately
+ * invalid Claude token it is not ours to choose. Observed across repeated real
+ * runs, the Agent SDK either returns its 401 as an error *result* — the session
+ * reaches a terminal state within seconds and the floor's session-end hook
+ * (`syncIssueOnTermination`, wired at EdgeWorker.ts's terminal-state listener)
+ * uploads — or never produces a result at all, leaving the session live, the
+ * issue in the floor's touched set, and the upload to the periodic tick
+ * (`DEFAULT_INTERVAL_MS`, 5 minutes). Both are production triggers on the same
+ * `syncIssue` path, so the wait below spans both and the assertion is the union:
+ * a real bundle, built by a real in-container floor, lands at the artifact
+ * endpoint. The third trigger — the stop-time flush
+ * (`WorkspaceSyncService.stop()`) — cannot be forced from here (by the time the
+ * container can be stopped the floor has usually converged and deliberately
+ * stopped protecting the issue), so what this suite pins about idle-stop is the
+ * container-level precondition that flush depends on: SIGTERM is delivered and
+ * handled rather than the container being SIGKILLed. The flush itself is
+ * covered by packages/edge-worker/test/WorkspaceSyncService.test.ts ("flushes a
+ * live (un-ended) session's work on stop()").
+ */
+describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
+	"floor upload fired by a real in-container session",
+	() => {
+		let server: RouterServer;
+		let tracker: CLIIssueTrackerService;
+		let dir: string;
+		let port: number;
+		let userId: number;
+		/**
+		 * Set when the booted container stopped/vanished before its floor ever
+		 * flushed. That is an environment failure, not a floor failure (the
+		 * container never got the chance the assertion is about), so the tests
+		 * below skip on it rather than reporting a red that says nothing about
+		 * the code under test. A container that is still RUNNING and has not
+		 * uploaded is the opposite — a genuine floor regression — and fails.
+		 */
+		let containerDiedEarly: string | undefined;
+		const issueKey = runScopedIssueKey("CYFLIVE");
+		const containerName = `cyrus-issue-${issueKey}`;
+		const bundleFile = () => join(dir, "artifacts", issueKey, "bundle.tar.gz");
+		// Both streams, concatenated: the container's logger splits info to
+		// stdout and warn/error to stderr, and the lines asserted on below span
+		// both, so a stdout-only read would be a flaky oracle.
+		const containerLogs = (): string => {
+			const r = spawnSync("docker", ["logs", containerName], {
+				encoding: "utf-8",
+				maxBuffer: 64 * 1024 * 1024,
+			});
+			return `${r.stdout ?? ""}${r.stderr ?? ""}`;
+		};
+		/**
+		 * Polls for the session's worktree, bailing out (and recording why in
+		 * {@link containerDiedEarly}) the moment the container stops running.
+		 * Resolves `true` once `/workspaces/<KEY>` exists.
+		 */
+		const waitForWorktree = async (): Promise<boolean> => {
+			const deadline = Date.now() + 120_000;
+			while (Date.now() < deadline) {
+				const probe = spawnSync(
+					"docker",
+					["exec", containerName, "test", "-d", `/workspaces/${issueKey}`],
+					{ stdio: "ignore" },
+				);
+				if (probe.status === 0) return true;
+				const state = containerState(containerName);
+				if (state !== "running") {
+					containerDiedEarly = state;
+					return false;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1_000));
+			}
+			return false;
+		};
+
+		beforeAll(async () => {
+			// Build the worker image (cached; same pattern as the suites above).
+			execFileSync(
+				"docker",
+				["build", "-f", "docker/worker/Dockerfile", "-t", IMAGE, "."],
+				{
+					cwd: join(__dirname, "..", "..", ".."),
+					stdio: "inherit",
+				},
+			);
+			routerHost = routerHostForContainers(IMAGE);
+
+			tracker = new CLIIssueTrackerService();
+			tracker.seedDefaultData();
+			dir = mkdtempSync(join(tmpdir(), "router-floor-live-"));
+			const secrets = new SecretStore(join(dir, "secrets.json"));
+			port = 3460; // fixed; distinct from 3456 / 3457 / 3458 / 3459 above
+
+			server = new RouterServer({
+				port,
+				host: "0.0.0.0", // container-facing: loopback is unreachable from a container
+				dbPath: ":memory:",
+				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
+				webhook: { verificationMode: "direct", secret: "s" },
+				trackerFactory: () => tracker,
+				logger: { info: () => {}, warn: () => {} },
+				containers: {
+					image: IMAGE,
+					routerUrlForContainers: `ws://${routerHost}:${port}`,
+					repositories: [
+						{
+							name: "hello",
+							githubSlug: "octocat/Hello-World",
+							linearWorkspaceId: WORKSPACE,
+							baseBranch: "master",
+						},
+					],
+					secretsPath: join(dir, "secrets.json"),
+					artifactsDir: join(dir, "artifacts"),
+					// Deliberately huge: this suite drives idle-stop itself, with an
+					// injected clock, at the exact point it wants it. RouterServer's
+					// own 60s internal sweep must not idle-stop the container out
+					// from under the session mid-test.
+					idleStopMs: STALE_DESTROY_MS,
+					staleDestroyMs: STALE_DESTROY_MS,
+				},
+				// Scoped so BOTH the container-targets executor AND RouterServer's
+				// own internal periodic sweep are bounded to this run's container —
+				// see the identical rationale on the suites above.
+				executorRegistryFactory: () =>
+					new Map([
+						[
+							"docker",
+							scopedProvider(
+								new LocalDockerProvider({ image: IMAGE }),
+								new Set([issueKey]),
+							),
+						],
+					]),
+			});
+			await server.start();
+			const added = server.store.addUser({
+				email: "e2e@example.com",
+				linearId: "lin-e2e",
+			});
+			userId = added.userId;
+			server.store.setUserExecutor(
+				"e2e@example.com",
+				JSON.stringify({ type: "docker" }),
+			);
+			secrets.set(
+				"e2e@example.com",
+				"claudeOauthToken",
+				"fake-oauth-not-used-for-boot",
+			);
+		}, 300_000);
+
+		afterAll(async () => {
+			removeContainerAndVolume(containerName);
+			await server?.stop();
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		it("PUTs a bundle built by the container's own floor to the router artifact endpoint", async (ctx) => {
+			const issue = { id: "issue-live", identifier: issueKey, title: "live" };
+			seedSession(tracker, "sess-live", "issue-live");
+			// The in-container EdgeWorker fetches the full issue over router RPC
+			// before creating the worktree — without this the webhook 404s and no
+			// workspace (hence nothing for the floor to protect) ever exists.
+			seedIssue(tracker, issue);
+			await server.eventRouter.route(
+				createdFixture({
+					sessionId: "sess-live",
+					issue,
+					creator: { id: "lin-e2e", email: "e2e@example.com", name: "E2E" },
+				}),
+			);
+			await vi.waitFor(
+				() => expect(containerState(containerName)).toBe("running"),
+				{ timeout: 60_000 },
+			);
+			// Wait for the worktree the session created — the workspace path the
+			// floor will WIP-push and bundle. Same running-container guard as the
+			// bundle wait below: a container that has gone away can neither create
+			// a worktree nor flush, and calling that a floor failure would be a
+			// lie about what was observed.
+			if (!(await waitForWorktree())) {
+				// Still running but no worktree is a real failure (the session
+				// never reached GitService); gone is an environment failure.
+				if (!containerDiedEarly) {
+					throw new Error(
+						`container is still running but never created /workspaces/${issueKey}`,
+					);
+				}
+				ctx.skip(
+					`container went ${containerDiedEarly} before creating its worktree — nothing to assert about the upload path on this daemon`,
+				);
+				return;
+			}
+			// Dirty it, so the floor's WIP-push leg has real work to do (the push
+			// itself fails — no GitHub credential — which is logged and swallowed;
+			// the bundle upload proceeds regardless, which is the leg under test).
+			execFileSync("docker", [
+				"exec",
+				containerName,
+				"sh",
+				"-c",
+				`echo floor-upload-e2e > /workspaces/${issueKey}/FLOOR.txt`,
+			]);
+
+			// Wide enough to span both reachable triggers (see the block comment):
+			// session end lands in ~5s, the periodic tick at 5 minutes. Bails out
+			// early — rather than burning the whole window — the moment the
+			// container is no longer running, since a container that is gone can
+			// never flush and the distinction between "died" and "did not upload"
+			// is what makes the outcome meaningful.
+			const deadline = Date.now() + 6.5 * 60_000;
+			while (!existsSync(bundleFile()) && Date.now() < deadline) {
+				const state = containerState(containerName);
+				if (state !== "running") {
+					containerDiedEarly = state;
+					break;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1_000));
+			}
+			if (containerDiedEarly && !existsSync(bundleFile())) {
+				ctx.skip(
+					`container went ${containerDiedEarly} before its floor flushed — nothing to assert about the upload path on this daemon`,
+				);
+				return;
+			}
+
+			expect(existsSync(bundleFile())).toBe(true);
+			expect(statSync(bundleFile()).size).toBeGreaterThan(0);
+			// Attribute the bundle to the container's own floor rather than
+			// inferring it from the file's existence, and pin that the WIP-push
+			// leg ran over exactly the one workspace this session created.
+			expect(containerLogs()).toContain(
+				`WorkspaceSyncService: synced issue ${issueKey} (1 workspace(s), bundle uploaded)`,
+			);
+		}, 480_000);
+
+		it("idle-stop parks the container through its graceful shutdown path", async (ctx) => {
+			if (containerDiedEarly) {
+				ctx.skip(`container went ${containerDiedEarly} during the boot above`);
+				return;
+			}
+			// The container-level risk the floor's stop-time flush runs into is
+			// being SIGKILLed before it can finish; `docker stop -t 30` exists to
+			// buy it room (see DOCKER_STOP_TIMEOUT_SECONDS in LocalDockerProvider).
+			// So drive the REAL idle-stop path — sweep() with an injected clock past
+			// idleStopMs → provider.stop() → `docker stop -t 30` → SIGTERM →
+			// container-boot forwards it to `cyrus start` → EdgeWorker.stop() →
+			// WorkspaceSyncService.stop() — and assert the container reached its
+			// SIGTERM handler and parked, rather than dying on the grace timer.
+			// Affinity must be cleared first: sweep() never touches a device with a
+			// live session, and that safety invariant is what a terminal
+			// session_state frame releases in a real run.
+			server.store.clearSessionAffinity("sess-live");
+			const lifecycle = new ContainerLifecycle({
+				store: server.store,
+				executors: new Map([
+					[
+						"docker",
+						scopedProvider(
+							new LocalDockerProvider({ image: IMAGE }),
+							new Set([issueKey]),
+						),
+					],
+				]),
+				idleStopMs: IDLE_STOP_MS,
+				staleDestroyMs: STALE_DESTROY_MS,
+				logger: { info: () => {}, warn: () => {} },
+				now: () => Date.now() + IDLE_STOP_MS + 5_000,
+			});
+			await lifecycle.sweep();
+			await vi.waitFor(
+				() => expect(containerState(containerName)).toBe("stopped"),
+				{ timeout: 60_000 },
+			);
+			expect(containerLogs()).toContain("shutting down gracefully");
+			// The bundle the floor uploaded must survive the stop — it is the only
+			// copy of this session's state once the volume goes away below.
+			expect(existsSync(bundleFile())).toBe(true);
+		}, 120_000);
+
+		it("a fresh container restores from that container-produced bundle (rung 2)", async (ctx) => {
+			if (containerDiedEarly) {
+				ctx.skip(`container went ${containerDiedEarly} during the boot above`);
+				return;
+			}
+			expect(existsSync(bundleFile())).toBe(true);
+			// Destroy the container AND its volume: rung 2 (download + restore the
+			// bundle) is only reachable with no warm volume to resume from.
+			removeContainerAndVolume(containerName);
+
+			// `devices.issue_key` is UNIQUE for container rows, and the router
+			// already minted one for the container booted above — so drop it first,
+			// exactly as `router containers destroy <issueKey>` does, before minting
+			// the fresh device the replacement container authenticates with. (The
+			// synthetic "floor upload round-trip" suite never boots a
+			// router-managed container for its key, so it can mint straight away.)
+			const stale = server.store.getContainerDeviceForIssue(issueKey);
+			if (stale) server.store.deleteContainerDevice(stale.deviceId);
+			const { deviceToken } = server.store.createContainerDevice(
+				userId,
+				issueKey,
+				"docker",
+			);
+			// `container-boot --restore-only` runs the restore ladder and returns
+			// without launching `cyrus start`, so its stdout is exactly the restore
+			// log line asserted on.
+			const { stdout: logs } = await execFileAsync(
+				"docker",
+				[
+					"run",
+					"--rm",
+					"--name",
+					containerName,
+					"-e",
+					`CYRUS_ROUTER_URL=http://${routerHost}:${port}`,
+					"-e",
+					`CYRUS_DEVICE_TOKEN=${deviceToken}`,
+					"-e",
+					`CYRUS_ISSUE_KEY=${issueKey}`,
+					"-e",
+					"CYRUS_REPOS_JSON=[]",
+					"-e",
+					"CLAUDE_CODE_OAUTH_TOKEN=unused",
+					"--entrypoint",
+					"node",
+					IMAGE,
+					"/app/dist/src/app.js",
+					"container-boot",
+					"--restore-only",
+				],
+				{ encoding: "utf-8" },
+			);
+			expect(logs).toContain("Restored");
 		}, 180_000);
 	},
 );
