@@ -175,6 +175,39 @@ describe("ContainerTargetService", () => {
 		expect(store.getDeviceByToken(minted)).toEqual({ deviceId, userId });
 	});
 
+	/**
+	 * Regression guard for the 2026-07-27 PAR-166 investigation. Every logging
+	 * call in this file was `logger.warn` — the container lifecycle only ever
+	 * spoke up on failure. A boot that succeeded said nothing at all, so an ACA
+	 * sandbox that came up `Running` but whose worker never dialed back left no
+	 * router-side evidence that a boot had even been attempted.
+	 */
+	it("logs the start and the successful completion of a boot", async () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+		const docker = fakeExecutor("docker");
+		const service = makeService(new Map([["docker", docker]]));
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+
+		await vi.waitFor(() =>
+			expect(docker.ensureRunning).toHaveBeenCalledTimes(1),
+		);
+		await vi.waitFor(() => expect(logger.info).toHaveBeenCalled());
+
+		const logged = logger.info.mock.calls.map(([m]) => m).join("\n");
+		expect(logged).toContain("CYPACK-1");
+		// Both edges: a boot that starts and never completes must be
+		// distinguishable from one that never started.
+		expect(logged).toMatch(/booting|boot start/i);
+		expect(logged).toMatch(/running|completed|ready/i);
+	});
+
 	it("posts a boot-failure activity once when ensureRunning rejects", async () => {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');

@@ -216,6 +216,7 @@ function makeRouter(
 		gateway?: Gateway;
 		containerTargets?: ContainerTargetService;
 		terminalTeardown?: TerminalTeardown;
+		logger?: { info(msg: string): void; warn(msg: string): void };
 		config?: Partial<{
 			eventTtlMs: number;
 			issueLock: boolean;
@@ -247,7 +248,7 @@ function makeRouter(
 			creatorOnlyPrompting: false,
 			...overrides?.config,
 		},
-		logger: { info: () => {}, warn: () => {} },
+		logger: overrides?.logger ?? { info: () => {}, warn: () => {} },
 		now: () => clock.value,
 	});
 	return { router, postActivity, moveIssueToStartedState, gateway, clock };
@@ -686,6 +687,43 @@ describe("EventRouter container routing", () => {
 		await vi.waitFor(() =>
 			expect(executor.ensureRunning).toHaveBeenCalledTimes(1),
 		);
+	});
+
+	/**
+	 * Regression guard for the 2026-07-27 PAR-166 investigation. Routing a
+	 * created event to a container device wrote affinity rows, queued the event
+	 * and dispatched a boot — and logged NOTHING. Meanwhile every webhook the
+	 * router deliberately ignores logs a line. The console therefore showed only
+	 * the events Cyrus did not act on, which read as "Linear never sent the
+	 * agent-session event" when in fact it had been received and routed.
+	 * Accepting work must be at least as visible as ignoring it.
+	 */
+	it("(h2) logs acceptance and the container boot dispatch for a routed created event", async () => {
+		store.addUser({ email: "dave@example.com", linearId: "lin-dave" });
+		store.setUserExecutor("dave@example.com", '{"type":"docker"}');
+		const { containerTargets, secrets } = makeContainerTargets(store);
+		secrets.set("dave@example.com", "claudeOauthToken", "tok-1");
+		const info = vi.fn<(msg: string) => void>();
+		const { router } = makeRouter(store, {
+			containerTargets,
+			logger: { info, warn: () => {} },
+		});
+
+		await router.route(
+			createdEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				identifier: "CYPACK-1",
+				creator: DAVE,
+			}),
+		);
+
+		const logged = info.mock.calls.map(([msg]) => msg).join("\n");
+		// The session must be traceable to the device that took it.
+		expect(logged).toContain("sess-1");
+		// And the container boot must announce itself, so a worker that never
+		// connects is visibly a boot that started and did not finish.
+		expect(logged.toLowerCase()).toContain("boot");
 	});
 
 	it("(i) falls through and heals when session affinity points at a deleted container device", async () => {

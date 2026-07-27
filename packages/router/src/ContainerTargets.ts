@@ -386,6 +386,16 @@ export class ContainerTargetService {
 				throw new Error(`no executor configured for provider '${provider}'`);
 			}
 			const env = await this.buildEnv(userId, issueKey);
+			// Both edges of the boot are logged deliberately. `ensureRunning`
+			// can take minutes (image pull, sandbox create), and for ACA it
+			// returning successfully only means the INFRASTRUCTURE came up — the
+			// worker process still has to dial back over WSS. Without a start
+			// line and a completion line, "provider never got called",
+			// "provider is still working" and "provider finished but the worker
+			// never connected" all look identical from the router's console.
+			this.deps.logger.info(
+				`booting ${provider} container for ${issueKey} (device ${deviceId})`,
+			);
 			await executor.ensureRunning({
 				issueKey,
 				env,
@@ -397,6 +407,9 @@ export class ContainerTargetService {
 				// ignore this field.
 				deviceId: String(deviceId),
 			});
+			this.deps.logger.info(
+				`${provider} container for ${issueKey} (device ${deviceId}) reported running; waiting for the worker to connect`,
+			);
 			this.bootFailedNotified.delete(issueKey);
 		} catch (err) {
 			this.deps.logger.warn(
