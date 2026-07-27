@@ -268,18 +268,34 @@ class GatedBootExecutor implements ContainerExecutor {
 		this.releaseGate();
 	}
 
+	/** Set once a boot has actually completed; drives {@link status}. */
+	private running = false;
+
 	async ensureRunning(ctx: IssueExecutionContext): Promise<void> {
 		this.ensureRunningCalls.push(ctx);
 		await this.gate;
 		this.resolvedCount++;
+		this.running = true;
 	}
 
-	async stop(): Promise<void> {}
+	async stop(): Promise<void> {
+		this.running = false;
+	}
 
-	async destroy(): Promise<void> {}
+	async destroy(): Promise<void> {
+		this.running = false;
+	}
 
+	/**
+	 * Must reflect what `ensureRunning` actually achieved. A caller that joined
+	 * an in-flight boot re-checks this before trusting it (see
+	 * `ContainerTargets.bootStart`), because a joined attempt can legitimately
+	 * finish with the container still stopped — that is the bug which silently
+	 * swallowed terminal-teardown wakes. A fake reporting a constant `"absent"`
+	 * would make every completed boot look like a failure.
+	 */
 	async status(): Promise<ContainerStatus> {
-		return "absent";
+		return this.running ? "running" : "absent";
 	}
 
 	async listManaged(): Promise<string[]> {

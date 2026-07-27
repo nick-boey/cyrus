@@ -441,6 +441,25 @@ The mirror is observability plus retry accounting, not a restart journal: the
 rows are cleared when the router builds its teardown coordinator, matching that
 coordinator's empty in-memory starting state.
 
+Waking the container for teardown has its own hazard. `ContainerTargets` dedupes
+concurrent boots for a device by joining the in-flight attempt, which is
+necessary — two parallel `ensureRunning` calls would each mint a device token and
+orphan the container the other just started — but it is *only* a dedup, never
+evidence that the container ended up running. An attempt that began before the
+teardown webhook arrived can finish having achieved nothing, most realistically
+when the idle sweep parks the container while it is still starting. A teardown
+wake that joined such an attempt would return believing the container is up, so
+nothing would ever start it and the grace deadline would be the only thing that
+reclaimed it. After joining, the router therefore re-checks `executor.status()`
+and boots for real if the container is not running; and an attempt still in
+flight past ten minutes is abandoned rather than joined, so a provider call that
+hangs cannot permanently disable booting for that device.
+
+Relatedly, every ACA data-plane request carries a 120-second deadline
+(`requestTimeoutMs`). Node's `fetch` has no overall request timeout, and an
+unbounded call would block `ensureRunning`, the provider's per-issue mutex, and
+the device's boot slot behind it.
+
 Linear has two verified notification blind spots: it sends no
 `issueStatusChanged` notification for a close performed by the Cyrus app's own
 OAuth identity, and sends none for the `duplicate` state. Those cases wait for

@@ -490,3 +490,71 @@ describe("AcaSandboxClient snapshots + disk images", () => {
 		});
 	});
 });
+
+/**
+ * Node's `fetch` has no overall request timeout, so a blackholed data plane
+ * leaves a call pending indefinitely. That matters well beyond this client:
+ * `ensureRunning` awaits these calls while holding the provider's per-issue
+ * mutex, and the router awaits `ensureRunning` while holding the device's
+ * in-flight boot slot — so one hung request can block every later boot for an
+ * issue, including the wake a terminal teardown needs.
+ */
+describe("AcaSandboxClient request deadline", () => {
+	it("attaches an abort signal to every request", async () => {
+		const { fetch, calls } = fakeFetch([res(200, runningSandbox)]);
+		const c = client({ fetchFn: fetch });
+		await c.getSandbox(runningSandbox.id);
+		expect(calls[0]?.init?.signal).toBeInstanceOf(AbortSignal);
+		expect(calls[0]?.init?.signal?.aborted).toBe(false);
+	});
+
+	it("attaches one to the raw createSandbox PUT as well", async () => {
+		const { fetch, calls } = fakeFetch([res(200, runningSandbox)]);
+		const c = client({ fetchFn: fetch });
+		await c.createSandbox({ diskImageName: "disk-v1" });
+		expect(calls[0]?.init?.method).toBe("PUT");
+		expect(calls[0]?.init?.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	it("gives each RBAC-403 retry its own fresh deadline", async () => {
+		// Per-attempt rather than per-call, so the retry sequence keeps its full
+		// budget while no single fetch can hang.
+		const { fetch, calls } = fakeFetch([
+			res(403, { error: "propagating" }),
+			res(200, runningSandbox),
+		]);
+		const c = client({ fetchFn: fetch, sleepFn: async () => {} });
+		await c.getSandbox(runningSandbox.id);
+		expect(calls).toHaveLength(2);
+		const signals = calls.map((call) => call.init?.signal);
+		expect(signals[0]).toBeInstanceOf(AbortSignal);
+		expect(signals[1]).toBeInstanceOf(AbortSignal);
+		expect(signals[0]).not.toBe(signals[1]);
+	});
+
+	it("omits the signal entirely when the deadline is disabled", async () => {
+		const { fetch, calls } = fakeFetch([res(200, runningSandbox)]);
+		const c = client({ fetchFn: fetch, requestTimeoutMs: 0 });
+		await c.getSandbox(runningSandbox.id);
+		expect(calls[0]?.init?.signal).toBeUndefined();
+	});
+
+	it("aborts a request that outlives its deadline", async () => {
+		// A genuinely hung data plane: the fetch only settles because the signal
+		// fires, which is the whole point.
+		const hangingFetch = (async (
+			_url: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			return new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () =>
+					reject(new Error("aborted by signal")),
+				);
+			});
+		}) as typeof fetch;
+		const c = client({ fetchFn: hangingFetch, requestTimeoutMs: 5 });
+		await expect(c.getSandbox(runningSandbox.id)).rejects.toThrow(
+			"aborted by signal",
+		);
+	});
+});
