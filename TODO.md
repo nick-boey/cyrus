@@ -5,128 +5,152 @@
 Follow-ups from the live Azure drive documented in
 `apps/f1/test-drives/2026-07-26-live-aca-nor-252.md`.
 
+All seven items below are **implemented and merged to `deploy`**. Every acceptance
+criterion that could be met without live Azure is covered by automated tests; the
+criteria written as live-sandbox procedures are called out per item as still
+needing a real drive.
+
 ### 1. Reconnect the worker WebSocket after ACA memory resume
 
-**Status:** open. **Priority:** critical.
+**Status:** fixed. **Priority:** was critical.
 
-ACA resumed the sandbox to `Running` in 1.25 seconds, but the worker retained a
-stale WebSocket and never reconnected. The router safely queued the prompt, but
-work did not resume until another prompt crossed the 120-second disconnected
-threshold and forced a cold replacement.
+`RouterConnection` stamps every inbound router signal with wall-clock time and
+terminates the socket once the stamp is older than two router heartbeats, feeding
+the existing reconnect path. Wall clock rather than tick counting is the point:
+timers are frozen for the whole suspend and fire late on resume. The heartbeat
+interval moved into `cyrus-router-protocol` and `hello_ack` now advertises the
+gateway's configured `heartbeatMs`, so the threshold is derived rather than
+hardcoded. `AcaSandboxesProvider` polls device connectivity after `resumeSandbox`
+instead of trusting infrastructure state, and replaces a sandbox whose worker
+never rejoins.
 
-Implement a device-side liveness watchdog in `RouterConnection`. Track inbound
-server pings/messages using wall-clock time; if no server activity arrives for
-more than two router heartbeat intervals, terminate the local socket and use the
-existing reconnect path. Wall-clock comparison is important because JavaScript
-timers are frozen while an ACA sandbox is suspended and fire late after resume.
-Also make the ACA provider verify connectivity after `resumeSandbox` rather than
-returning solely because infrastructure state changed.
+Covered by fake-timer tests that jump the system clock past two heartbeats while
+no timer runs, then assert the socket closes and a second `hello` arrives after
+redial, plus a negative test proving pings keep it alive.
 
-Acceptance criteria:
-
-- Suspend a connected live sandbox for longer than two router heartbeats.
-- Resume it and observe a new authenticated device hello without a second prompt.
-- Deliver the already-queued prompt exactly once on the same sandbox ID.
-- Add fake-timer tests that model a long wall-clock jump while timers are frozen.
+**Still needs a live drive:** suspend/resume a real sandbox, observe a new
+authenticated hello without a second prompt, and confirm the queued prompt is
+delivered exactly once on the same sandbox ID. The 90s `resumeConnectTimeoutMs`
+default was chosen analytically and is unvalidated against real Azure latency.
 
 ### 2. Prevent duplicate webhook execution during router rollouts
 
-**Status:** open. **Priority:** critical.
+**Status:** fixed. **Priority:** was critical.
 
-The emergency router image rollout briefly ran old and new revisions together.
-Both accepted/replayed the same durable work, producing doubled Linear activity
-and two `linear-mcp-ok` comments even though only one worker sandbox survived.
-Single revision mode does not eliminate the normal rolling-overlap window.
+A `webhook_claims` table plus `RouterStore.claimWebhookEvent` — one
+`INSERT OR IGNORE` inside an immediate transaction, arbitrated by the PRIMARY KEY,
+never a read-then-write. `EventRouter.route()` claims before any dispatch, so no
+queue row, issue lock, activity, or MCP mutation can happen twice for one
+delivery. Bounded retention sweep rides the existing 60s tick. Terraform already
+had `revision_mode = "Single"` and one replica; a `/healthz` readiness probe was
+added so ingress cannot shift before the router has opened SQLite.
 
-Persist a webhook/event idempotency key in SQLite before routing. Prefer Linear's
-delivery/event identifier; otherwise derive a stable key from organization,
-session, action, and event timestamp. Reject an already-claimed key transactionally
-across replicas. Add a bounded retention sweep. Deployment should still keep
-`revision_mode = "Single"`, min/max replicas at one, and wait for the new revision
-to become healthy before deactivating the old revision.
+Linear's payload carries no delivery id — verified against the SDK's generated
+types, it lives in an HTTP header the transport never surfaces — so the key is
+`<type>/<action>:<organizationId>:<entityRef>:<createdAt>`. `createdAt` is a
+property of the payload, so a redelivery reproduces it exactly.
 
-Acceptance criteria:
-
-- Run two router processes against the same durable store and submit one webhook.
-- Exactly one queue row, agent execution, activity stream, and MCP mutation occur.
-- Restart during the enqueue/ack window and confirm at-least-once delivery does not
-  become at-least-twice execution.
+**Known limit, not closed:** each ACA router revision keeps `router.db` on
+ephemeral local storage, so during a rollout overlap the two revisions have
+*separate* databases. A duplicate whose original claim postdates the last Blob
+backup is not caught. Making that airtight needs a shared claim store (or a much
+shorter backup interval) and is deliberately out of scope here.
 
 ### 3. Preserve clean session completion across cold restore and reopen
 
-**Status:** open. **Priority:** high.
+**Status:** fixed. **Priority:** was high.
 
-Disconnected replacement and completed-issue reopen restored the branch and
-worktree successfully, but both emitted terminal `error` before `complete` and
-omitted the requested final response. Git work survived; transcript/session
-continuity did not finish cleanly.
+Root cause: `updateSessionStatus` mutated memory only. `savePersistedState()` ran
+at runner attach and in `stop()` but never on completion, so the last durable
+snapshot of a cleanly-finished session read `active` with no runner — byte-identical
+to a host that died mid-run. Reconciliation could not tell them apart and posted a
+bogus terminal `error`. The floor inherited the same lie, because the bundle is
+built by re-reading that file off disk.
 
-Trace restored `EdgeWorker` state, Claude transcript relocation, active-session
-reconciliation, and buffered terminal frames. A completed session should either
-resume cleanly or deliberately start a new session while retaining prior context;
-it must not replay stale terminal error state. Persist the final response before
-releasing affinity and make terminal-frame replay monotonic by session state.
+Terminal emission now flushes durable state before signalling, a `terminalState`
+marker makes reconciliation skip finished sessions, terminal-frame replay is
+monotonic by session state, and reconcile runs before the HTTP server accepts a
+webhook so no queued prompt can race a terminal signal.
 
-Acceptance criteria:
-
-- Destroy a worker after a completed turn, then route a follow-up from its bundle.
-- Observe no transient `error`, one `complete`, and one final response activity.
-- Repeat after Done -> reopen and verify the same behavior.
+**Still needs a live drive:** the router-side half — `EventRouter.handleSessionState`
+clearing affinity mid-turn and the resulting `LinearExecutor` "session not owned by
+this device" rejection — is read from the code, not observed.
 
 ### 4. Make terminal teardown callback reliable after idle stop
 
-**Status:** open. **Priority:** high.
+**Status:** fixed. **Priority:** was high.
 
-The Done webhook woke the idle-stopped sandbox, but the authenticated teardown
-callback never arrived. The documented 10-minute grace fallback eventually
-deleted the sandbox and snapshots, so resources did not leak, but cleanup was
-slow and billed during the grace window.
+Two defects, one durability and one correctness:
 
-Fix this together with the resume WebSocket watchdog. Persist terminal cleanup
-intent in the worker inbox before acknowledging it, reconnect before processing,
-and retry the teardown callback with its idempotency key until acknowledged.
-Expose callback-pending state in `router containers list` and log callback retry
-attempts distinctly from grace expiry.
+- The worker marked its inbox entry processed as soon as the event emit returned,
+  long before the async cleanup that emit started had finished, so anything still
+  owed to the router died with the process. Cleanup intent is now persisted with
+  its idempotency key before the first `await`, replayed on reconnect, and retried
+  until acknowledged. `router containers list` gained a `TEARDOWN` column and
+  callback retries log distinctly from grace expiry.
+- **The live symptom's actual cause:** joining an in-flight boot was treated as
+  proof the container was running. The joined attempt may have begun before the
+  event the joiner is reacting to and can finish having achieved nothing, so a
+  teardown wake returned believing the container was up — nothing started it, the
+  terminal webhook was never delivered, and only the grace deadline reclaimed it.
+  `bootStart` now re-checks `executor.status()` after joining. Boots are also
+  bounded so a hung `ensureRunning` cannot wedge a device permanently.
 
-Acceptance criteria:
-
-- Idle-stop a worker, mark its issue Done, and observe wake -> final floor flush ->
-  callback -> sandbox/snapshot deletion without waiting for grace expiry.
-- Kill the worker between flush and callback; restart and confirm callback replay.
+Covered end-to-end by the F1 fake-ACA lifecycle drive, which now exercises
+idle-stop → Done → wake → flush → callback → destroy without grace expiry.
 
 ### 5. Stabilize MCP connections in long-lived and restored workers
 
-**Status:** open. **Priority:** medium.
+**Status:** fixed. **Priority:** was medium.
 
-The live worker reported that the Linear and `cyrus-tools` MCP servers disconnected
-and were reconnecting. Linear MCP completed its mutation first, but long-running
-sessions need predictable reconnect behavior. The optional `cyrus-docs` MCP also
-required interactive OAuth, which is unsuitable inside a headless sandbox.
+The disconnects were invisible by construction: `ClaudeRunner`'s `case "system":`
+was a no-op, discarding the SDK's only per-server status report, while
+`MCP_CONNECTION_NONBLOCKING=true` meant a failing server never failed the session.
+Status is now surfaced in startup/session diagnostics, transient disconnects retry
+with bounded backoff behind an ordered transient/permanent classifier, and
+`cyrus-docs` (interactive OAuth, impossible in a container) is omitted in headless
+mode. A multi-turn container test invokes Linear MCP before and after an
+idle/reconnect cycle and runs in the default suite — no daemon or network needed.
 
-Add MCP connection health to startup/session diagnostics, retry transient server
-disconnects with bounded backoff, and omit or preconfigure MCP servers that require
-interactive OAuth in ACA mode. Add a multi-turn container test that invokes Linear
-MCP before and after idle/reconnect.
+**Not verified:** no live Azure or Linear credentials, so the exact failure status
+codes those services return are inferred from the classifier table, not observed.
+Whether `atcyrus.com/docs/mcp` accepts the `CYRUS_DOCS_MCP_TOKEN` bearer escape
+hatch is unconfirmed; if it does not, `cyrus-docs` is simply always omitted in
+containers, which is the safe failure mode.
 
 ### 6. Document and optionally enforce GitHub token scopes
 
-**Status:** open. **Priority:** low.
+**Status:** fixed. **Priority:** was low.
 
-`GH_TOKEN` successfully cloned, committed, pushed, and queried the repository, but
-`gh auth status` warned that `read:org` was absent. Keep `repo` as the functional
-minimum for private repository work and document `read:org` as required only for
-organization-level queries. Optionally add scope diagnostics to `router secrets
-list` without rejecting otherwise usable tokens.
+`repo` documented as the functional minimum, `read:org` as required only for
+organization-level queries, in `docs/GIT_GITHUB.md` and the `cyrus-setup-github`
+skill. Opt-in `cyrus router secrets list <email> --check-scopes` warns but never
+rejects, and distinguishes an absent `X-OAuth-Scopes` header (fine-grained PAT or
+App token, un-introspectable) from a present-but-empty one so it cannot report a
+false deficiency. Token values are never printed.
+
+Correction found while verifying against the code: `EdgeWorker.resolveGitHubToken()`
+reads `GITHUB_TOKEN` only. `GH_TOKEN` is exclusively a router/container credential
+consumed by `ContainerBootCommand`.
 
 ### 7. Reconcile the emergency router image with Terraform
 
-**Status:** open. **Priority:** high before the next apply.
+**Status:** fixed in config and docs; **the image publish remains a manual
+operator step.** **Priority:** was high before the next apply.
 
-The running Container App uses `cyrus-router:deploy-aca-disk-fix`, while the
-deployment tfvars used during initial provisioning referenced `:deploy`. Publish
-an immutable release or SHA tag containing the private-disk fix and update the
-deployment input before the next Terraform apply. Avoid mutable tags in durable
-environments.
+`router_image`/`worker_image` now validate as a digest, release tag, or git-SHA
+tag, with `allow_mutable_image_tags` as a deliberate escape hatch that shows up in
+the tfvars diff. A positive allowlist, not a blocklist — a blocklist would have
+missed `deploy-aca-disk-fix`. Terraform state records the tag *string*, so a
+re-pointed mutable tag produces no plan diff while the deployed bits change, which
+is exactly how `:deploy-aca-disk-fix` and `:deploy` diverged.
+
+**Before the next apply, an operator must:** build and push an immutable tag from
+the commit carrying the private-disk fix, then set `router_image` to it. Otherwise
+the next apply fails validation — which is the intended fail-loud. Identifying
+which commit `:deploy-aca-disk-fix` was built from needs access to the live
+environment. `terraform fmt -check` and `terraform validate` have not been run
+(no toolchain here) and still should be.
 
 ### Completed during the drive: private ACA disk IDs
 
