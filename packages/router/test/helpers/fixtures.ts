@@ -51,6 +51,42 @@ export function createdFixture(opts: {
 	} as unknown as AgentEvent;
 }
 
+/** A minimal but type-guard-valid agentSessionPrompted webhook fixture. */
+export function promptedFixture(opts: {
+	sessionId: string;
+	actorUserId: string;
+	creator: Creator;
+	issue: { id: string; identifier: string; title: string };
+	body: string;
+}): AgentEvent {
+	return {
+		type: "AgentSessionEvent",
+		action: "prompted",
+		organizationId: WORKSPACE,
+		createdAt: new Date().toISOString(),
+		agentActivity: {
+			id: `act-${opts.sessionId}-${opts.actorUserId}`,
+			userId: opts.actorUserId,
+			content: { type: "prompt", body: opts.body },
+		},
+		agentSession: {
+			id: opts.sessionId,
+			organizationId: WORKSPACE,
+			status: "active",
+			type: "issue",
+			creator: opts.creator,
+			issueId: opts.issue.id,
+			issue: {
+				id: opts.issue.id,
+				identifier: opts.issue.identifier,
+				title: opts.issue.title,
+				url: `linear://issue/${opts.issue.identifier}`,
+				team: { id: "team-1", key: "DEF", name: "Default" },
+			},
+		},
+	} as unknown as AgentEvent;
+}
+
 /** Seed a session directly so the CLI tracker's `createAgentActivity` (used by
  * the router to post offline/lock/boot-failure notices) finds it. */
 export function seedSession(
