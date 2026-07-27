@@ -9,14 +9,14 @@
 	},
 	"type": "module",
 	"scripts": {
-		"build": "pnpm -r --filter='!@cyrus/electron' build",
+		"build": "pnpm -r build",
 		"dev": "pnpm -r --parallel dev",
 		"test": "pnpm -r test",
 		"lint": "biome check",
 		"format": "biome check --write --unsafe",
-		"test:packages": "pnpm --filter './packages/*' test",
-		"test:packages:run": "pnpm --filter './packages/*' test:run",
-		"test:apps": "pnpm --filter './apps/*' test",
+		"test:packages": "pnpm --filter \"./packages/*\" test",
+		"test:packages:run": "pnpm --filter \"./packages/*\" test:run",
+		"test:apps": "pnpm --filter \"./apps/*\" test",
 		"typecheck": "pnpm -r typecheck",
 		"prepare": "husky"
 	},

@@ -100,8 +100,21 @@ export interface AcaSandboxCreateBody {
 	lifecycle?: AcaLifecyclePolicy;
 	labels?: Record<string, string>;
 	egressPolicy?: AcaEgressPolicy;
-	entrypoint?: string;
-	cmd?: string;
+	/**
+	 * Exec-form override arrays. The wire type is `IReadOnlyList<string>`, NOT
+	 * a single shell string — sending a bare string is rejected with
+	 * `400 "The JSON value could not be converted to
+	 * System.Collections.Generic.IReadOnlyList\`1[System.String]"`.
+	 *
+	 * Normally leave both unset: ACA honours the disk image's own OCI
+	 * ENTRYPOINT (verified live — a redis:alpine disk booted `redis-server`
+	 * with no override), so the worker image's `ENTRYPOINT ["/entrypoint.sh"]`
+	 * is what starts the worker. Note the entrypoint runs as a CHILD process;
+	 * PID 1 is always ACA's own `tini -- sleep infinity` keep-alive, so PID 1
+	 * is never evidence about whether the workload started.
+	 */
+	entrypoint?: string[];
+	cmd?: string[];
 	/** Forwarded to sourcesRef.diskImage.isPublic when booting a public image. */
 	diskImageIsPublic?: boolean;
 }

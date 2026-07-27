@@ -182,8 +182,8 @@ describe("AcaSandboxClient createSandbox body shape (C2/C3/C4/C5)", () => {
 					{ pattern: "api.anthropic.com", action: "Allow" },
 				],
 			},
-			entrypoint: "/container-boot",
-			cmd: "--serve",
+			entrypoint: ["/entrypoint.sh"],
+			cmd: ["--serve"],
 		});
 		const call = calls[0];
 		expect(call?.init?.method).toBe("PUT");
@@ -205,9 +205,30 @@ describe("AcaSandboxClient createSandbox body shape (C2/C3/C4/C5)", () => {
 					{ pattern: "api.anthropic.com", action: "Allow" },
 				],
 			},
-			entrypoint: "/container-boot",
-			cmd: "--serve",
+			entrypoint: ["/entrypoint.sh"],
+			cmd: ["--serve"],
 		});
+	});
+
+	// Verified against the live 2026-02-01-preview data plane: sending a bare
+	// string for `entrypoint` is rejected with
+	//   400 "The JSON value could not be converted to
+	//        System.Collections.Generic.IReadOnlyList`1[System.String]"
+	// so these must serialize as JSON arrays, exec-form style, never as a
+	// single shell string.
+	it("serializes entrypoint/cmd as string arrays (wire type is IReadOnlyList<string>)", async () => {
+		const { fetch, calls } = fakeFetch([res(200, runningSandbox)]);
+		const c = client({ fetchFn: fetch });
+		await c.createSandbox({
+			diskImageId: "disk-1",
+			entrypoint: ["/bin/sh", "-c", "exec /entrypoint.sh"],
+			cmd: ["--flag", "value"],
+		});
+		const body = JSON.parse(calls[0]?.init?.body as string);
+		expect(Array.isArray(body.entrypoint)).toBe(true);
+		expect(body.entrypoint).toEqual(["/bin/sh", "-c", "exec /entrypoint.sh"]);
+		expect(Array.isArray(body.cmd)).toBe(true);
+		expect(body.cmd).toEqual(["--flag", "value"]);
 	});
 
 	it("create-from-private-image: references the registered disk by id", async () => {

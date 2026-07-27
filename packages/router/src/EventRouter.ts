@@ -561,6 +561,17 @@ export class EventRouter {
 		}
 		this.sessionWorkspace.set(sessionId, workspaceId);
 
+		// Accepting an event must be at least as visible as ignoring one. Every
+		// rejection path above logs, and so does every webhook the router
+		// deliberately drops — but until this line the SUCCESS path was silent,
+		// so a console showing only "ignoring non-agent-session webhook" lines
+		// looked exactly like an agent-session event that never arrived.
+		this.logger.info(
+			`Routed session ${sessionId} (issue ${issueId ?? "unknown"}) to ${
+				target.kind
+			} device ${target.deviceId}`,
+		);
+
 		await this.deliverOrNotify(webhook, target, sessionId, workspaceId);
 
 		// Delivery first, promotion second: the device only needs the queued event
@@ -927,6 +938,14 @@ export class EventRouter {
 			// it is the expected path, so no offlineWaitingMessage. boot() posts
 			// its own (once-per-issue) failure notice only if ensureRunning
 			// actually rejects; the queue drains once the container connects.
+			//
+			// Logged because this is the last thing the router does for a cold
+			// start: everything after it happens inside the container. Without
+			// this line, a worker that boots but never dials back is
+			// indistinguishable from an event that was never dispatched.
+			this.logger.info(
+				`Queued session ${sessionId} for container device ${target.deviceId} and dispatched a boot; the queue drains when the worker connects`,
+			);
 			this.containerTargets?.boot(target.deviceId, { workspaceId, sessionId });
 			return;
 		}
