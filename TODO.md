@@ -162,83 +162,122 @@ responses also expose the operator name under `labels.name`. The typed client an
 provider now recognize that shape and create private-image sandboxes by ID. Keep
 the live-wire regression tests as a release gate.
 
+## Phase-1 container-executor follow-ups
+
 Follow-ups from the phase-1 container-executor test drive
 (`apps/f1/test-drives/2026-07-14-container-executors-phase1-validation.md`).
 
-The drive validated everything reachable without a live router: image build,
-the three restore-ladder rungs, git-token hygiene, device→container migration,
-and the container-only WIP-floor gate. The items below are what it could **not**
-reach, plus one anomaly it surfaced.
+**This section was substantially stale.** Items 1, 2 and 4 had already been built
+or largely built in the days after the drive; the section was never updated. All
+five are now closed. Verdicts below are backed by commit and file evidence, and by
+tests actually executed against a real Docker daemon.
 
-## 1. Router-mode F1 harness
+### 1. Router-mode F1 harness
 
-**Status:** open. **Priority:** high — blocks live validation of the whole feature.
+**Status:** done — was already built when this item was written.
 
-`apps/f1/server.ts` builds a `platform: "cli"` EdgeWorker only. It has no router
-mode, no executor selection, and no container support, so a stock F1 drive cannot
-boot a container or exercise anything router-driven. The 2026-07-09 router drive
-already flagged this gap and recommended the same rig; it is now blocking a second
-feature.
+Landed the day after the drive: `7eb87dca` (in-process router rig — a `RouterServer`
+with a CLI-tracker `trackerFactory`), `ba29c460` (token-guarded control server),
+`fe1fc736` (`./f1 router:*` subcommands), `c2c4608f` (`router-server.ts` entrypoint).
+See `apps/f1/src/router/RouterRig.ts`, `apps/f1/src/router/ControlServer.ts`,
+`apps/f1/router-server.ts`, `apps/f1/test/router/`. The `platform: "router"`
+EdgeWorker is the one `ContainerBootCommand.writeConfig` writes inside each booted
+container, and the whole path was driven with real credentials in
+`apps/f1/test-drives/2026-07-17-router-mode-container-drive.md`.
 
-Build a router-mode F1 rig — a `RouterServer` with a CLI-tracker `trackerFactory`
-plus a `platform: "router"` EdgeWorker enrolled as a device — so container boot,
-in-container sessions, and the floor's upload path can be driven end-to-end.
+Never built: the optional physical-device attach sub-mode (an in-process host
+EdgeWorker enrolled as a device), a documented fallback for machines without
+Docker. It was not blocking anything this item was blocking.
 
-## 2. Real-Docker coverage for the container lifecycle
+### 2. Real-Docker coverage for the container lifecycle
 
-**Status:** open. **Priority:** high.
+**Status:** done. Was 3 of 4 behaviours; the fourth is now covered.
 
-`packages/router/test/containers-e2e.test.ts` uses a `FakeBootExecutor` and never
-shells out to Docker; `packages/router-executors/test/LocalDockerProvider.test.ts`
-is mock-based. So **none** of the container lifecycle — boot serialization,
-idle-stop, stale-destroy, orphan GC — has run against a real daemon.
+`7226e3dc` / `022baa45` added cold boot, idle-stop, stale-destroy and orphan GC
+against a real daemon in `packages/router/test/containers-real-docker.e2e.test.ts`.
+**Boot serialization/dedup** — the fourth behaviour in spec A2 — had only a
+`FakeBootExecutor` test with a hand-held gate. Now covered against a real
+`LocalDockerProvider`: created-then-prompted mid-`docker run`, asserting one
+`ensureRunning` call, one labelled container, one container device row. Container
+count alone cannot detect a broken dedup, since a duplicate `docker run` just
+name-clashes — hence a counting provider.
 
-Add a real-Docker e2e (opt-in / skipped when no daemon) that exercises the
-lifecycle sweeps against actual containers and volumes.
+### 3. The floor's upload path
 
-## 3. The floor's upload path is unproven
+**Status:** done for the session-end trigger; two triggers remain unit-covered only.
 
-**Status:** open. **Priority:** high.
+The earlier round-trip test built and PUT the bundle *from the test process*, so
+the trigger → `pushWipIfDirty` → PUT chain was never exercised in CI. There is now
+a test where the bundle at the router artifact endpoint is attributed to the
+*container's own* `WorkspaceSyncService`, followed by a fresh container restoring
+from that bundle.
 
-The drive proved the **download/restore** half of the floor. The **upload** half —
-`pushWipIfDirty` plus the bundle `PUT` firing on session end / idle-stop / the
-periodic timer — never ran, because no session ran inside a container. Drive an
-in-container session (needs item 1) and assert a bundle actually lands at the
-router artifact endpoint, then that a fresh container restores from it.
+Not pinned: idle-stop's flush and the 5-minute periodic tick, as *in-container*
+observations. Both funnel through the same `syncIssue` and are unit-covered in
+`packages/edge-worker/test/WorkspaceSyncService.test.ts`, but neither could be
+forced in a container — by the time the container can be stopped the floor has
+usually converged and deliberately dropped the issue from its touched set. Making
+the interval configurable purely for the test was judged out of scope.
 
-## 4. `/workspaces/<ISSUE-KEY>` real-directory invariant, observed under a live session
+### 4. `/workspaces/<ISSUE-KEY>` real-directory invariant
 
-**Status:** open. **Priority:** medium.
+**Status:** done — and it was not actually running on Linux until now.
 
-The spec's hard requirement — `/workspaces/<ISSUE-KEY>` is a real directory, never
-a symlink, because the Agent SDK keys transcripts off the realpath-resolved cwd —
-is currently argued, not observed. The boot path never creates a symlink there and
-`realpath` resolves clean, but the worktree itself is only created by `GitService`
-at session start, which needs a live router. Once item 1 exists, assert the
-directory type directly during a running session.
+`f54562a5` added the docker-exec assertion, `90b04811` un-skipped it after the
+2026-07-17 drive observed it live. It now also asserts the explicit lstat form the
+spec is stated in (`stat -c %F` → `directory`, alongside `test ! -L` and
+`realpath`).
 
-## 5. Anomaly: a completed session posts no final `response` activity
+**Worth knowing:** every Docker e2e suite hardcoded `host.docker.internal`, which
+does not resolve on plain Linux Docker Engine — `LocalDockerProvider` passes no
+`--add-host`, and `getent hosts host.docker.internal` was confirmed to fail here.
+So on Linux this invariant test and the floor round-trip test could never have
+passed; they would have failed or flaked rather than validated anything. A
+`routerHostForContainers` helper now probes the name and falls back to the bridge
+gateway. `dockerAvailable()` was also hardened: a transient `spawnSync` failure
+used to silently skip the entire opt-in suite, indistinguishable in the reporter
+from "no daemon" — i.e. a green run that tested nothing.
 
-**Status:** open. **Priority:** medium — needs attribution before it's actionable.
+### 5. Anomaly: a completed session posts no final `response` activity
 
-In the CLI-mode drive the Claude session completed successfully on the server
-(`Session completed (subtype: success)`, 188 messages, `activity-89`) and committed
-its work, but the issue tracker stayed `status: active` with no final `response`
-activity until the session was explicitly stopped. The 2026-07-09 drive **did**
-record a final concise-summary response, so this is a regression against that run.
+**Status:** resolved — it was two separate bugs, and the headline symptom was a
+mis-observation.
 
-Evidence says it is **not** from this branch: `AgentSessionManager` (which owns
-activity posting) is untouched, the new floor code is gated behind
-`router.floorSync === true` and never executed in CLI mode (zero `WorkspaceSync`
-lines in the log). But that is a code-path argument, not an experiment — nobody
-A/B'd it against `origin/deploy`.
+Reproduced rather than argued. The response activity **was** posted: the drive's
+own log line `Result message emitted to Linear (activity activity-89)` is emitted
+only for a posted result, and a direct reproduction confirms
+`posted: [{"type":"response", ...}]`. The "no final `response`" half is not
+reproducible and is contradicted by the drive's own evidence.
 
-Next step: reproduce on `origin/deploy` to confirm it predates this branch, then
-open a standalone issue. A session that finishes its work but never reports a final
-response is a real product problem regardless of which change introduced it.
+What was real is `status: active`. `updateAgentSessionStatus` had exactly one
+caller in the repo (`CLIRPCServer.handleStopSession`), so the F1 CLI tracker never
+modelled Linear's derive-state-from-last-activity behaviour and every F1 session
+read `active` until an operator ran `stop-session`, regardless of what it had
+posted. Fixed via `deriveSessionStatusFromActivity`. That is harness infidelity,
+which is what made the drive misdiagnose a healthy run.
 
-Note the failure *shape* — "final result never posted, zero Response activities" —
-rhymes with the router-side `sessionTerminal`-ordering bug fixed earlier on this
-branch's lineage. Different trigger (that one needed router affinity loss; this
-reproduces in CLI mode with no router), but worth checking they aren't two faces of
-one completion-path gap.
+Separately, the genuine product defect in this area was ACA item 3's — session
+status transitions were never persisted — which is why a *restored* session
+reported a spurious terminal `error`. The two are unrelated despite the similar
+shape; the suspicion recorded here that they were "two faces of one completion-path
+gap" was wrong.
+
+**Left open deliberately, needs a ticket owner's call:** `addResultEntry` returns
+early when a successful result yields empty content — a turn ending on a tool call
+with no trailing prose and no SDK result text. No `response` activity is posted at
+all, and since Linear derives state from the last activity, such a session sits at
+"Working…" forever. This is the exact shape item 5 described, and it is a real
+product hole. It is currently pinned by `AgentSessionManager.pending-work.test.ts`
+under CYPACK-1177 / CYHOST-905 ("never post raw tool-input JSON"). A neutral
+synthesized body would satisfy both constraints, but overturning that decision
+belongs to that ticket's owner.
+
+## Environment note for future Docker drives
+
+Under load (concurrent `docker build`, polling watchers) a booted container was
+observed dying ~10s in, before its floor could flush. It was not attributable: the
+router logged no sweep destroy, `.Config.Image` matched so it was not
+`ensureRunning`'s image-mismatch path, and no terminal webhook was sent. It stopped
+happening once the machine was quiet (8 consecutive clean runs). The new tests skip
+loudly on that condition rather than reporting a false floor failure. Worth
+re-checking if it recurs on a dedicated daemon.
