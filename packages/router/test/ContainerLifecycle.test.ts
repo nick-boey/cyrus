@@ -94,6 +94,36 @@ describe("ContainerLifecycle", () => {
 		);
 	});
 
+	it("logs the inputs behind an idle-stop decision", async () => {
+		// PAR-166 (2026-07-27): a live session was parked mid-task and the only
+		// evidence left was `Idle-stopped container for PAR-166` — which records
+		// none of the values the decision was made from. Reconstructing it after
+		// the fact was impossible because the store had since been rewritten.
+		// Every stop must be self-explanatory from its own log line.
+		const { createdMs, deviceId } = makeContainerDevice("CYPACK-LOG", "docker");
+		const docker = fakeExecutor("docker", { status: "running" });
+		const idleStopMs = 900_000;
+		const now = createdMs + idleStopMs + 1;
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			logger,
+			now: () => now,
+		});
+
+		await lifecycle.sweep();
+
+		const line = String(logger.info.mock.calls.at(-1)?.[0]);
+		expect(line).toContain("CYPACK-LOG");
+		expect(line).toContain(`device=${deviceId}`);
+		expect(line).toContain("affinity=0");
+		expect(line).toContain(`idleForMs=${idleStopMs + 1}`);
+		expect(line).toContain(`idleStopMs=${idleStopMs}`);
+		expect(line).toContain("status=running");
+	});
+
 	it("never idle-stops a device with active session affinity, regardless of timestamps", async () => {
 		const { createdMs } = makeContainerDevice("CYPACK-1", "docker");
 		store.setSessionAffinity(

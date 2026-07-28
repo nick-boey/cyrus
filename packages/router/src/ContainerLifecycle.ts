@@ -85,9 +85,8 @@ export class ContainerLifecycle {
 			const executor = this.executors.get(row.provider);
 			if (!executor) continue;
 			try {
-				const active =
-					this.store.countSessionAffinityForDevice(row.deviceId) > 0;
-				if (active) continue;
+				const affinity = this.store.countSessionAffinityForDevice(row.deviceId);
+				if (affinity > 0) continue;
 				const lastTouch = Math.max(
 					row.lastRoutedMs ?? 0,
 					row.lastSeenMs ?? 0,
@@ -96,16 +95,37 @@ export class ContainerLifecycle {
 				if (now - lastTouch > this.staleDestroyMs) {
 					await executor.destroy(row.issueKey);
 					this.store.deleteContainerDevice(row.deviceId);
-					this.logger.info(`Destroyed stale container for ${row.issueKey}`);
+					this.logger.info(
+						`Destroyed stale container for ${row.issueKey} ` +
+							`(device=${row.deviceId} affinity=${affinity} ` +
+							`lastRoutedMs=${row.lastRoutedMs ?? "none"} ` +
+							`lastSeenMs=${row.lastSeenMs ?? "none"} ` +
+							`createdMs=${row.createdMs} ` +
+							`staleForMs=${now - lastTouch} staleDestroyMs=${this.staleDestroyMs})`,
+					);
 					continue;
 				}
 				const idleSince = row.lastRoutedMs ?? row.createdMs;
-				if (
-					now - idleSince > this.idleStopMs &&
-					(await executor.status(row.issueKey)) === "running"
-				) {
-					await executor.stop(row.issueKey);
-					this.logger.info(`Idle-stopped container for ${row.issueKey}`);
+				const idleForMs = now - idleSince;
+				if (idleForMs > this.idleStopMs) {
+					// `status` is read only once the clock already qualifies, so the
+					// logged value is the same one the decision used.
+					const status = await executor.status(row.issueKey);
+					if (status === "running") {
+						await executor.stop(row.issueKey);
+						// Every input behind the decision, so a stop that looks wrong
+						// (PAR-166: a live session parked mid-task) can be diagnosed
+						// from this line alone rather than reconstructed from a store
+						// that has since moved on.
+						this.logger.info(
+							`Idle-stopped container for ${row.issueKey} ` +
+								`(device=${row.deviceId} affinity=${affinity} ` +
+								`lastRoutedMs=${row.lastRoutedMs ?? "none"} ` +
+								`createdMs=${row.createdMs} ` +
+								`idleForMs=${idleForMs} idleStopMs=${this.idleStopMs} ` +
+								`status=${status})`,
+						);
+					}
 				}
 			} catch (err) {
 				this.logger.warn(
