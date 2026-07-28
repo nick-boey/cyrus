@@ -41,11 +41,53 @@ RUN curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsof
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
 	DOTNET_NOLOGO=1 \
 	DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+# Fleece CLI: installed to a shared --tool-path rather than `-g`. A global
+# install lands in $HOME/.dotnet/tools, and $HOME is /root at build time —
+# unreachable for the non-root `cyrus` user this image actually runs as.
+# Intentionally unpinned (tracks the latest published Fleece.Cli); pin the
+# version here if you need byte-identical rebuilds.
+ENV PATH="/usr/local/dotnet-tools:${PATH}"
+RUN dotnet tool install Fleece.Cli --tool-path /usr/local/dotnet-tools \
+	&& rm -rf /root/.nuget/packages /tmp/NuGetScratch
+# actionlint: GitHub Actions workflow linter. No Debian package exists, so we
+# pull the pinned release tarball and verify its published checksum. Arch is
+# derived from dpkg (amd64/arm64) because ACA builds --platform linux/amd64
+# while local dev builds native on Apple Silicon.
+ARG ACTIONLINT_VERSION=1.7.12
+RUN set -eu; \
+	arch="$(dpkg --print-architecture)"; \
+	base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"; \
+	tarball="actionlint_${ACTIONLINT_VERSION}_linux_${arch}.tar.gz"; \
+	cd /tmp; \
+	curl -fsSLO "${base}/${tarball}"; \
+	curl -fsSLO "${base}/actionlint_${ACTIONLINT_VERSION}_checksums.txt"; \
+	grep " ${tarball}\$" "actionlint_${ACTIONLINT_VERSION}_checksums.txt" | sha256sum -c -; \
+	tar -xzf "${tarball}" actionlint; \
+	install -m 0755 actionlint /usr/local/bin/actionlint; \
+	rm -f "${tarball}" "actionlint_${ACTIONLINT_VERSION}_checksums.txt" actionlint
 RUN useradd --create-home --uid 1001 cyrus \
 	&& mkdir -p /workspaces /var/cache/repos \
 	&& chown -R cyrus:cyrus /workspaces /var/cache/repos \
 	&& printf '#!/bin/sh\nexec node /app/dist/src/app.js "$@"\n' > /usr/local/bin/cyrus \
 	&& chmod +x /usr/local/bin/cyrus
+# Chromium for Playwright. Baked in rather than fetched on demand: ACA
+# sandboxes run a Deny-by-default egress policy whose allowlist
+# (DEFAULT_EGRESS_HOSTS in cyrus-router-executors) has no Playwright CDN
+# entry, so a session's own `playwright install` would hang there.
+# --with-deps is the part sessions genuinely cannot do themselves — it
+# apt-installs Chromium's shared libraries and fonts, which needs root, and
+# this image drops to `cyrus` below.
+# PLAYWRIGHT_BROWSERS_PATH puts the browsers at a shared path (instead of
+# ~/.cache/ms-playwright) so they survive regardless of which user or repo
+# invokes Playwright; it is chowned to `cyrus` so a session can still add a
+# browser build at runtime if its repo pins a Playwright whose Chromium
+# revision differs from the one baked here.
+ARG PLAYWRIGHT_VERSION=1.62.0
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN npm install -g "playwright@${PLAYWRIGHT_VERSION}" \
+	&& playwright install --with-deps chromium \
+	&& chown -R cyrus:cyrus /ms-playwright \
+	&& rm -rf /var/lib/apt/lists/* /root/.npm
 COPY --from=build /out /app
 COPY docker/worker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

@@ -40,9 +40,10 @@ docker build -f docker/worker/Dockerfile -t cyrus-worker:dev .
 ```
 
 This is a multi-stage build: it compiles `cyrus-ai` and its workspace
-dependencies from monorepo source, then produces a slim `node:22-slim` runtime
-image with `git`, `gh`, `curl`, `jq`, and `ca-certificates` installed (the
-restore ladder and Claude sessions themselves need all four). Tag it however
+dependencies from monorepo source, then produces a `node:22-slim` runtime
+image with a baked-in toolchain (see
+[What's in the image](#whats-in-the-image) for the full list and why each
+piece is there). Tag it however
 you like — `router-config.json`'s `containers.image` field (below) must match
 whatever tag you use. For a real deployment, push this to a registry (GHCR,
 ECR, etc.) and reference the pushed tag instead of a locally-built `:dev` tag,
@@ -354,11 +355,62 @@ session resumed straight into an empty, freshly-`mkdir`'d directory with no
 repo and no history. If you're on a build predating that fix, you will not
 see the behavior described above — update first.
 
+## What's in the image
+
+| Tool | Why it's baked in |
+|---|---|
+| `git`, `gh`, `curl`, `jq`, `ca-certificates` | The restore ladder (clone, credential helper) and sessions themselves (PR creation, fetching raw files). `ca-certificates` is what makes node's `fetch` able to reach the router at all — `node:22-slim` ships no root store. |
+| `dotnet` (SDK 10.0) | Repos targeting .NET need it to build/test/restore and to run repo-local `dotnet tool`s. |
+| `fleece` (Fleece.Cli) | Fleece issue tracking. Installed via `dotnet tool install --tool-path /usr/local/dotnet-tools` — **not** `-g`, which would put it under build-time `/root` where the non-root `cyrus` user cannot reach it. Unpinned: rebuilding the image picks up the latest published `Fleece.Cli`. |
+| `actionlint` | GitHub Actions workflow linting. Pinned by the `ACTIONLINT_VERSION` build arg, checksum-verified, arch-resolved from `dpkg` so the same Dockerfile produces a working `amd64` (ACA) and `arm64` (local Apple Silicon) image. |
+| `playwright` + Chromium | Browser automation. Pinned by the `PLAYWRIGHT_VERSION` build arg; the browser lives at `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, owned by `cyrus`. See the caveats below. |
+
+Override a pinned version at build time without editing the Dockerfile:
+
+```bash
+docker build -f docker/worker/Dockerfile \
+  --build-arg ACTIONLINT_VERSION=1.7.12 \
+  --build-arg PLAYWRIGHT_VERSION=1.62.0 \
+  -t cyrus-worker:dev .
+```
+
+### Playwright caveats
+
+- **The browser is baked in because it cannot be fetched later on ACA.** ACA
+  sandboxes run Deny-by-default egress and the built-in allowlist
+  (`DEFAULT_EGRESS_HOSTS` in `cyrus-router-executors`) has no Playwright CDN
+  entry, so a session running `playwright install` inside an ACA sandbox will
+  fail to download. Under the `docker` executor it would work (no egress
+  policy), which is exactly the kind of drift baking it in avoids.
+- **Version mismatch is possible.** Playwright refuses to run against a
+  Chromium revision it did not ship with. If a repo pins a Playwright far from
+  the image's `PLAYWRIGHT_VERSION`, its tests will ask for a
+  `playwright install`. `/ms-playwright` is writable by `cyrus` so that
+  install can succeed — but on ACA it will be blocked by egress (above). The
+  durable fix for a repo like that is an overlay image (option 1 below) that
+  installs the matching browser at build time.
+- **Only Chromium is installed.** Firefox and WebKit are not; a repo whose
+  Playwright config runs the full three-browser matrix will fail on the other
+  two. Add them in an overlay image if you need them.
+- `--with-deps` was used, so Chromium's shared libraries and fonts are present.
+  That part is genuinely un-fixable at runtime — it needs root, and sessions
+  run as `cyrus`.
+- **It costs about 1.3 GB of image size** — 984 MB of browsers
+  (`chromium` 641 MB + `chromium-headless-shell` 340 MB + ffmpeg), 37 MB for
+  the `playwright` npm package, and ~300 MB of apt dependencies (Mesa/LLVM and
+  X11 libraries) that `--with-deps` pulls in. That is in line with Microsoft's
+  own Playwright image, but it is a real cold-start cost on ACA, which pulls
+  the image when it creates a sandbox from the disk image. If your sessions
+  only ever drive headless Chromium, changing `playwright install` to
+  `playwright install --with-deps --only-shell chromium` drops the 641 MB full
+  browser and keeps the headless shell — at the cost of breaking any repo that
+  uses Playwright's default (non-`chromium-headless-shell`) channel or runs
+  headed.
+
 ## Adding tools to the worker container
 
-The base image only bakes in `git`, `gh`, `curl`, `jq`, and `ca-certificates`
-(see [step 1](#1-build-the-worker-image)). If a session needs another CLI —
-say, a language-specific package manager, a linter, or another agent CLI —
+If a session needs a CLI that isn't in the table above — say, a
+language-specific package manager, another linter, or another agent CLI —
 there are three ways to get it there, in order of preference:
 
 1. **Overlay image (recommended).** Build a thin image on top of the one you
