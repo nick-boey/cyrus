@@ -298,6 +298,31 @@ export class RouterCommand extends BaseCommand {
 	}
 
 	/**
+	 * Like {@link openStore}, but refuses to CREATE the database.
+	 *
+	 * Inspection subcommands must never conjure the state they exist to report
+	 * on. Run inside the ACA router container without `--cyrus-home /data`,
+	 * `containers list` used to create an empty db under the default home and
+	 * print "No container devices." while the live db sat at
+	 * `/data/router/router.db` — the opposite of the truth, produced by the very
+	 * tool an operator reaches for when a container looks stuck. Anything that
+	 * reads or mutates existing router state uses this; only `users add`
+	 * (first-run bootstrap) and `router start` may create the file.
+	 */
+	private openExistingStore(): RouterStore {
+		const dbPath = this.resolveDbPath();
+		if (!existsSync(dbPath)) {
+			this.exitWithError(
+				`No router database at ${dbPath}. ` +
+					`Pass --cyrus-home <path> pointing at the running router's home ` +
+					`(inside the ACA router container that is --cyrus-home /data), ` +
+					`or run 'cyrus router users add <email>' first if this is a new install.`,
+			);
+		}
+		return new RouterStore(dbPath);
+	}
+
+	/**
 	 * The secrets file the running router will actually read:
 	 * `router-config.json`'s `containers.secretsPath` when set, otherwise
 	 * `<dirname(dbPath)>/user-secrets.json` — MUST match
@@ -527,6 +552,8 @@ export class RouterCommand extends BaseCommand {
 			);
 		}
 
+		// `users add` is the first-run bootstrap: it is the one subcommand that
+		// may legitimately create the database.
 		const store = this.openStore();
 		try {
 			store.addUser({ email, name });
@@ -541,7 +568,7 @@ export class RouterCommand extends BaseCommand {
 	}
 
 	private usersList(): void {
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			const users = store.listUsers();
 			if (users.length === 0) {
@@ -584,7 +611,7 @@ export class RouterCommand extends BaseCommand {
 		if (!email) {
 			this.exitWithError("Usage: cyrus router users remove <email>");
 		}
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			const removed = store.removeUser(email);
 			if (removed) {
@@ -629,7 +656,7 @@ export class RouterCommand extends BaseCommand {
 				`Unknown executor type "${type}". Valid types: ${EXECUTOR_TYPES.join(", ")}`,
 			);
 		}
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			const updated = store.setUserExecutor(
 				email,
@@ -660,7 +687,7 @@ export class RouterCommand extends BaseCommand {
 	}
 
 	private devicesList(): void {
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			const devices = store.listDevices();
 			if (devices.length === 0) {
@@ -709,7 +736,7 @@ export class RouterCommand extends BaseCommand {
 	 * Sorted locked-first so the rows most likely to need unlocking lead.
 	 */
 	private sessionsList(): void {
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			const sessions = store.listSessions();
 			if (sessions.length === 0) {
@@ -757,7 +784,7 @@ export class RouterCommand extends BaseCommand {
 		if (!email) {
 			this.exitWithError("Usage: cyrus router devices revoke <email>");
 		}
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			// Resolve the device id BEFORE revoking: revokeDevice() only deletes
 			// the `devices` row, so the issue_locks/session_affinity rows tied to
@@ -802,7 +829,7 @@ export class RouterCommand extends BaseCommand {
 		if (!issue) {
 			this.exitWithError("Usage: cyrus router unlock <issueId|PAR-123>");
 		}
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			// 1. Direct: the value is already the locked issue's GUID.
 			let lock = store.getIssueLock(issue);
@@ -1038,7 +1065,7 @@ export class RouterCommand extends BaseCommand {
 	}
 
 	private containersList(): void {
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			const devices = store.listContainerDevices();
 			if (devices.length === 0) {
@@ -1097,7 +1124,7 @@ export class RouterCommand extends BaseCommand {
 			);
 		}
 
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		let activeIssueKeys: string[];
 		try {
 			activeIssueKeys = store
@@ -1196,7 +1223,7 @@ export class RouterCommand extends BaseCommand {
 		if (!issueKey) {
 			this.exitWithError("Usage: cyrus router containers destroy <issueKey>");
 		}
-		const store = this.openStore();
+		const store = this.openExistingStore();
 		try {
 			const device = store.getContainerDeviceForIssue(issueKey);
 			if (!device) {

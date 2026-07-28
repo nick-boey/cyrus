@@ -1,4 +1,10 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { KeyVaultSecretStore, RouterStore, SecretStore } from "cyrus-router";
@@ -83,6 +89,17 @@ describe("RouterCommand", () => {
 
 	function dbPath(): string {
 		return join(cyrusHome, "router", "router.db");
+	}
+
+	/**
+	 * Creates the router db with no rows. Inspection subcommands refuse to run
+	 * against a MISSING db (that silently-create-an-empty-db behaviour is what
+	 * made `containers list` lie about the live router), so tests covering
+	 * genuine empty-state output must bootstrap the file first.
+	 */
+	function seedEmptyDb(): void {
+		mkdirSync(dirname(dbPath()), { recursive: true });
+		new RouterStore(dbPath()).close();
 	}
 
 	function printedStdout(): string {
@@ -190,6 +207,7 @@ describe("RouterCommand", () => {
 		});
 
 		it("reports when no users are registered", async () => {
+			seedEmptyDb();
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);
 
@@ -291,6 +309,7 @@ describe("RouterCommand", () => {
 
 	describe("sessions list", () => {
 		it("reports when there are no sessions", async () => {
+			seedEmptyDb();
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);
 
@@ -427,6 +446,7 @@ describe("RouterCommand", () => {
 		});
 
 		it("reports no lock when the identifier resolves but nothing is locked", async () => {
+			seedEmptyDb();
 			const app = createMockApp(cyrusHome);
 			const command = new StubResolveRouterCommand(app as any);
 
@@ -442,6 +462,7 @@ describe("RouterCommand", () => {
 		});
 
 		it("errors clearly when a Linear identifier cannot be resolved", async () => {
+			seedEmptyDb();
 			const app = createMockApp(cyrusHome);
 			const command = new StubResolveRouterCommand(app as any);
 
@@ -513,6 +534,7 @@ describe("RouterCommand", () => {
 		});
 
 		it("errors clearly for an unknown user", async () => {
+			seedEmptyDb();
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);
 
@@ -1081,10 +1103,52 @@ describe("RouterCommand", () => {
 		});
 	});
 
-	describe("containers list", () => {
-		it("reports when there are no container devices", async () => {
+	describe("missing router database", () => {
+		it.each([
+			[["users", "list"]],
+			[["devices", "list"]],
+			[["sessions", "list"]],
+		])("errors without creating a db for %j", async (args) => {
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);
+
+			await expect(command.execute(args)).rejects.toThrow(/process\.exit/);
+
+			expect(app.logger.error).toHaveBeenCalledWith(
+				expect.stringContaining(dbPath()),
+			);
+			expect(existsSync(dbPath())).toBe(false);
+		});
+	});
+
+	describe("containers list", () => {
+		it("errors naming the expected path when the router db does not exist, instead of creating an empty one", async () => {
+			// Regression (PAR-166 investigation, 2026-07-27): run inside the ACA
+			// router container without `--cyrus-home /data`, `containers list`
+			// created a fresh db under the default home and reported "No container
+			// devices" — the exact opposite of the truth, while the live db sat at
+			// /data/router/router.db. An inspection command must never conjure the
+			// state it is meant to inspect.
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await expect(command.execute(["containers", "list"])).rejects.toThrow(
+				/process\.exit/,
+			);
+
+			expect(app.logger.error).toHaveBeenCalledWith(
+				expect.stringContaining(dbPath()),
+			);
+			expect(app.logger.info).not.toHaveBeenCalledWith("No container devices.");
+			// The failed inspection must not have created the db it looked for.
+			expect(existsSync(dbPath())).toBe(false);
+		});
+
+		it("reports when the router db exists but holds no container devices", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			// `users add` legitimately bootstraps the db on a fresh install.
+			await command.execute(["users", "add", "jack@example.com"]);
 
 			await command.execute(["containers", "list"]);
 
@@ -1225,6 +1289,7 @@ describe("RouterCommand", () => {
 		});
 
 		it("errors clearly when there is no container for the issue", async () => {
+			seedEmptyDb();
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);
 
@@ -1240,6 +1305,7 @@ describe("RouterCommand", () => {
 
 	describe("containers gc-snapshots", () => {
 		it("prints the full plan and remains a dry run without --yes", async () => {
+			seedEmptyDb();
 			writeAcaRouterConfig();
 			const app = createMockApp(cyrusHome);
 			const command = new StubSnapshotGcRouterCommand(app as any);
