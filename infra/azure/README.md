@@ -209,6 +209,19 @@ build. Never push `:latest`, `:deploy`, a branch name, or an ad-hoc hotfix tag
 into a durable environment — Terraform rejects those refs (see
 [Router image tag policy](#router-image-tag-policy)).
 
+For the **router** image, `scripts/deploy-router-image.sh` does all of this —
+build, digest resolution, repinning `router_image`, and `terraform plan` — in
+one step, and refuses to build from a dirty tree so the tag cannot misname the
+commit. Prefer it over the manual sequence below:
+
+```bash
+./scripts/deploy-router-image.sh          # then review the plan and apply
+```
+
+The manual steps below remain the reference for the **worker** image, which the
+script does not handle: the worker is registered out of band as an ACA disk
+(`aca sandboxgroup disk create`) and `aca_disk_name` must move with it.
+
 ```bash
 cd "$REPO_ROOT"
 az acr login --name <acr-name>
