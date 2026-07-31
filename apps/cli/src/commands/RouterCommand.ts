@@ -306,11 +306,13 @@ export class RouterCommand extends BaseCommand {
 				return this.secrets(rest);
 			case "containers":
 				return this.containers(rest);
+			case "linear":
+				return this.linear(rest);
 			case "unlock":
 				return this.unlock(rest[0]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces|aca>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email> [--check-scopes]|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|unlock <issueId>>",
+					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces|aca>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email> [--check-scopes]|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|linear status|unlock <issueId>>",
 				);
 		}
 	}
@@ -321,6 +323,14 @@ export class RouterCommand extends BaseCommand {
 	 */
 	private resolveDbPath(): string {
 		return join(resolvePath(this.app.cyrusHome), "router", "router.db");
+	}
+
+	/**
+	 * Single source for the router config path. `resolvePath` expands a
+	 * `~`-prefixed `--cyrus-home`, matching {@link resolveDbPath}.
+	 */
+	private resolveConfigPath(): string {
+		return join(resolvePath(this.app.cyrusHome), "router-config.json");
 	}
 
 	private openStore(): RouterStore {
@@ -394,10 +404,7 @@ export class RouterCommand extends BaseCommand {
 	private readRouterConfig():
 		| z.infer<typeof RouterConfigFileSchema>
 		| undefined {
-		const configPath = join(
-			resolvePath(this.app.cyrusHome),
-			"router-config.json",
-		);
+		const configPath = this.resolveConfigPath();
 		if (!existsSync(configPath)) return undefined;
 		let raw: unknown;
 		try {
@@ -429,10 +436,7 @@ export class RouterCommand extends BaseCommand {
 	}
 
 	private async start(): Promise<void> {
-		const configPath = join(
-			resolvePath(this.app.cyrusHome),
-			"router-config.json",
-		);
+		const configPath = this.resolveConfigPath();
 		if (!existsSync(configPath)) {
 			this.exitWithError(`No router config found at ${configPath}`);
 		}
@@ -1376,6 +1380,76 @@ export class RouterCommand extends BaseCommand {
 			);
 		} finally {
 			store.close();
+		}
+	}
+
+	private async linear(rest: string[]): Promise<void> {
+		const [action] = rest;
+		if (action !== "status") {
+			return this.exitWithError("Usage: cyrus router linear status");
+		}
+		return this.linearStatus();
+	}
+
+	/**
+	 * Reports each workspace's Linear auth health.
+	 *
+	 * Probes Linear with the resolved access token rather than reading mirrored
+	 * state: this command runs out of process and cannot see the running
+	 * router's in-memory rejection map. A `viewer` query is the cheapest
+	 * definitive answer, and it still works when auth is dead — that is exactly
+	 * the case it needs to report.
+	 */
+	private async linearStatus(): Promise<void> {
+		const configPath = this.resolveConfigPath();
+		if (!existsSync(configPath)) {
+			return this.exitWithError(`No router config found at ${configPath}`);
+		}
+		const parsed = RouterConfigFileSchema.safeParse(
+			JSON.parse(readFileSync(configPath, "utf-8")),
+		);
+		if (!parsed.success) {
+			return this.exitWithError(
+				`Invalid router config at ${configPath}: ${parsed.error.message}`,
+			);
+		}
+
+		if (parsed.data.linearTokenStore) {
+			this.linearTokenStore = new KeyVaultTokenStore({
+				vaultUrl: parsed.data.linearTokenStore.keyVaultUrl,
+			});
+		}
+		const resolved = await this.resolveWorkspaceTokens(parsed.data.workspaces);
+
+		console.log(
+			`${"WORKSPACE".padEnd(38)} ${"SOURCE".padEnd(9)} ${"LAST REFRESH".padEnd(25)} STATUS`,
+		);
+		for (const [workspaceId, ws] of Object.entries(resolved)) {
+			const source = this.linearTokenSources.get(workspaceId) ?? "config";
+			const updatedMs = this.linearTokenUpdatedMs.get(workspaceId);
+			const lastRefresh = updatedMs ? new Date(updatedMs).toISOString() : "—";
+			const status = await this.probeLinearToken(ws.linearToken);
+			console.log(
+				`${workspaceId.padEnd(38)} ${source.padEnd(9)} ${lastRefresh.padEnd(25)} ${status}`,
+			);
+		}
+	}
+
+	private async probeLinearToken(token: string): Promise<string> {
+		try {
+			const response = await fetch("https://api.linear.app/graphql", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: token,
+				},
+				body: JSON.stringify({ query: "{ viewer { id } }" }),
+			});
+			if (!response.ok) return `rejected (HTTP ${response.status})`;
+			const body = (await response.json()) as { errors?: unknown[] };
+			return body.errors?.length ? "rejected (auth error)" : "ok";
+		} catch (error) {
+			return `unknown (${(error as Error).message})`;
 		}
 	}
 }
