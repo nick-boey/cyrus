@@ -1482,4 +1482,83 @@ describe("RouterCommand", () => {
 			expect((command as any).linearTokenSources.get("ws-1")).toBe("config");
 		});
 	});
+
+	describe("router linear status", () => {
+		function makeRouterCommand(): RouterCommand {
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {
+						"ws-1": { linearToken: "at-1", linearRefreshToken: "rt-1" },
+					},
+					webhook: { verificationMode: "direct", secret: "shh" },
+				}),
+			);
+			return new RouterCommand(createMockApp(cyrusHome) as any);
+		}
+
+		function captureStatus(fetchImpl: () => Promise<Response>) {
+			const command = makeRouterCommand();
+			(command as any).linearTokenStore = undefined;
+			const lines: string[] = [];
+			vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
+			vi.stubGlobal("fetch", vi.fn(fetchImpl));
+			return { command, lines };
+		}
+
+		afterEach(() => {
+			vi.unstubAllGlobals();
+			vi.restoreAllMocks();
+		});
+
+		it("reports ok for a working token", async () => {
+			const { command, lines } = captureStatus(
+				async () =>
+					new Response(JSON.stringify({ data: { viewer: { id: "u1" } } }), {
+						status: 200,
+					}),
+			);
+
+			await (command as any).linear(["status"]);
+
+			expect(lines.join("\n")).toMatch(/ws-1/);
+			expect(lines.join("\n")).toMatch(/\bok\b/);
+		});
+
+		it("reports rejected when Linear returns an auth error", async () => {
+			const { command, lines } = captureStatus(
+				async () =>
+					new Response(
+						JSON.stringify({
+							errors: [{ message: "Authentication required" }],
+						}),
+						{ status: 200 },
+					),
+			);
+
+			await (command as any).linear(["status"]);
+
+			expect(lines.join("\n")).toMatch(/rejected \(auth error\)/);
+		});
+
+		it("reports rejected on a non-200 response", async () => {
+			const { command, lines } = captureStatus(
+				async () => new Response("nope", { status: 401 }),
+			);
+
+			await (command as any).linear(["status"]);
+
+			expect(lines.join("\n")).toMatch(/rejected \(HTTP 401\)/);
+		});
+
+		it("rejects an unknown subcommand", async () => {
+			const command = makeRouterCommand();
+			const exit = vi
+				.spyOn(command as any, "exitWithError")
+				.mockImplementation(() => {});
+			await (command as any).linear(["bogus"]);
+			expect(exit).toHaveBeenCalled();
+		});
+	});
 });
