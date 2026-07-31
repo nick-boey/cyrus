@@ -19,6 +19,7 @@ import {
 	isStorableSecretKey,
 	KeyVaultSecretStore,
 	KeyVaultTokenStore,
+	type LinearTokenEnvelope,
 	type PendingTeardownInfo,
 	probeGitHubTokenScopes,
 	RESERVED_ENV_KEYS,
@@ -279,6 +280,16 @@ export class RouterCommand extends BaseCommand {
 	 * operator has re-seeded the chain.
 	 */
 	private linearTokenSeeds = new Map<string, string>();
+	/**
+	 * Where each workspace's tokens came from after the last
+	 * {@link resolveWorkspaceTokens} call — `"keyvault"` when the stored
+	 * envelope was trusted, `"config"` when the config/env value won (no
+	 * store, no envelope, or a stale/mismatched one). Consumed by callers that
+	 * report startup diagnostics.
+	 */
+	private linearTokenSources = new Map<string, "keyvault" | "config">();
+	/** `updatedMs` of the Key Vault envelope actually adopted, per workspace. */
+	private linearTokenUpdatedMs = new Map<string, number>();
 
 	async execute(args: string[]): Promise<void> {
 		const [subcommand, ...rest] = args;
@@ -456,8 +467,13 @@ export class RouterCommand extends BaseCommand {
 			}
 		}
 
+		const resolvedWorkspaces = await this.resolveWorkspaceTokens(
+			parsed.data.workspaces,
+		);
+
 		const config: RouterServerConfig = {
 			...parsed.data,
+			workspaces: resolvedWorkspaces,
 			dbPath,
 			oauth: this.resolveOAuthCredentials(),
 			onTokenRefresh: (workspaceId, tokens) =>
@@ -482,6 +498,68 @@ export class RouterCommand extends BaseCommand {
 		};
 		process.on("SIGINT", () => void shutdown());
 		process.on("SIGTERM", () => void shutdown());
+	}
+
+	/**
+	 * Chooses each workspace's tokens between the config/env values and the
+	 * Key Vault envelope.
+	 *
+	 * The envelope wins only while its `seedRefreshToken` still equals the
+	 * config value. When an operator re-authorizes they update the config/env
+	 * seed, which no longer matches — and the stored chain, whose head is by
+	 * then a dead token, must be abandoned. Without this comparison a re-auth
+	 * would silently do nothing.
+	 *
+	 * Both tokens move together: the envelope is one unit, never merged
+	 * field-by-field with the config.
+	 */
+	private async resolveWorkspaceTokens(
+		workspaces: Record<
+			string,
+			{ linearToken: string; linearRefreshToken?: string }
+		>,
+	): Promise<
+		Record<string, { linearToken: string; linearRefreshToken?: string }>
+	> {
+		const resolved: Record<
+			string,
+			{ linearToken: string; linearRefreshToken?: string }
+		> = {};
+
+		for (const [workspaceId, cfg] of Object.entries(workspaces)) {
+			resolved[workspaceId] = { ...cfg };
+			this.linearTokenSources.set(workspaceId, "config");
+
+			if (!this.linearTokenStore || !cfg.linearRefreshToken) continue;
+
+			let envelope: LinearTokenEnvelope | undefined;
+			try {
+				envelope = await this.linearTokenStore.get(workspaceId);
+			} catch (error) {
+				// Booting with a possibly-stale token beats not booting at all.
+				this.logger.warn(
+					`Could not read the stored Linear token for workspace ${workspaceId} from Key Vault; using the configured value: ${(error as Error).message}`,
+				);
+				continue;
+			}
+
+			if (!envelope) continue;
+			if (envelope.seedRefreshToken !== cfg.linearRefreshToken) {
+				this.logger.info(
+					`Configured Linear refresh token for workspace ${workspaceId} differs from the stored chain's seed; treating it as a fresh re-authorization and discarding the stored token.`,
+				);
+				continue;
+			}
+
+			resolved[workspaceId] = {
+				linearToken: envelope.accessToken,
+				linearRefreshToken: envelope.refreshToken,
+			};
+			this.linearTokenSources.set(workspaceId, "keyvault");
+			this.linearTokenUpdatedMs.set(workspaceId, envelope.updatedMs);
+		}
+
+		return resolved;
 	}
 
 	/**

@@ -1415,4 +1415,71 @@ describe("RouterCommand", () => {
 			expect(written.workspaces["ws-1"].linearRefreshToken).toBe("rt-2");
 		});
 	});
+
+	describe("resolveWorkspaceTokens", () => {
+		const configWorkspaces = {
+			"ws-1": { linearToken: "at-cfg", linearRefreshToken: "rt-seed" },
+		};
+
+		function makeRouterCommand(): RouterCommand {
+			return new RouterCommand(createMockApp(cyrusHome) as any);
+		}
+
+		function commandWithStore(get: () => Promise<unknown>) {
+			const command = makeRouterCommand();
+			(command as any).linearTokenStore = { get };
+			(command as any).linearTokenSeeds = new Map([["ws-1", "rt-seed"]]);
+			return command;
+		}
+
+		it("uses the config value when no envelope is stored", async () => {
+			const command = commandWithStore(async () => undefined);
+			const out = await (command as any).resolveWorkspaceTokens(
+				configWorkspaces,
+			);
+			expect(out["ws-1"].linearRefreshToken).toBe("rt-seed");
+			expect((command as any).linearTokenSources.get("ws-1")).toBe("config");
+		});
+
+		it("prefers the stored envelope when the seed still matches", async () => {
+			const command = commandWithStore(async () => ({
+				refreshToken: "rt-9",
+				accessToken: "at-9",
+				seedRefreshToken: "rt-seed",
+				updatedMs: 123,
+			}));
+			const out = await (command as any).resolveWorkspaceTokens(
+				configWorkspaces,
+			);
+			expect(out["ws-1"].linearRefreshToken).toBe("rt-9");
+			expect(out["ws-1"].linearToken).toBe("at-9");
+			expect((command as any).linearTokenSources.get("ws-1")).toBe("keyvault");
+		});
+
+		it("abandons the stored chain when the operator seeded a new token", async () => {
+			const command = commandWithStore(async () => ({
+				refreshToken: "rt-9",
+				accessToken: "at-9",
+				seedRefreshToken: "rt-OLD-seed",
+				updatedMs: 123,
+			}));
+			const out = await (command as any).resolveWorkspaceTokens(
+				configWorkspaces,
+			);
+			expect(out["ws-1"].linearRefreshToken).toBe("rt-seed");
+			expect(out["ws-1"].linearToken).toBe("at-cfg");
+			expect((command as any).linearTokenSources.get("ws-1")).toBe("config");
+		});
+
+		it("falls back to config rather than failing to boot when Key Vault errors", async () => {
+			const command = commandWithStore(async () => {
+				throw new Error("kv unreachable");
+			});
+			const out = await (command as any).resolveWorkspaceTokens(
+				configWorkspaces,
+			);
+			expect(out["ws-1"].linearRefreshToken).toBe("rt-seed");
+			expect((command as any).linearTokenSources.get("ws-1")).toBe("config");
+		});
+	});
 });
