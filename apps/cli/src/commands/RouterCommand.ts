@@ -18,6 +18,7 @@ import {
 	isReservedEnvKey,
 	isStorableSecretKey,
 	KeyVaultSecretStore,
+	KeyVaultTokenStore,
 	type PendingTeardownInfo,
 	probeGitHubTokenScopes,
 	RESERVED_ENV_KEYS,
@@ -141,6 +142,18 @@ const RouterConfigFileSchema = z.object({
 			intervalMs: z.number().optional(),
 		})
 		.optional(),
+	/**
+	 * Durable store for rotated Linear OAuth tokens. Optional: without it the
+	 * refresh token is written only to router-config.json, which is ephemeral on
+	 * ACA and regenerated from env on every start — the exact combination that
+	 * caused the 2026-07-30 outage. Self-host deployments with no Key Vault
+	 * legitimately omit it.
+	 */
+	linearTokenStore: z
+		.object({
+			keyVaultUrl: z.string().min(1),
+		})
+		.optional(),
 	entra: z
 		.object({
 			tenantId: z.string().min(1),
@@ -259,6 +272,14 @@ const RouterConfigFileSchema = z.object({
  * process holding the same db open.
  */
 export class RouterCommand extends BaseCommand {
+	private linearTokenStore?: KeyVaultTokenStore;
+	/**
+	 * Per-workspace config/env refresh token in effect at startup. Written into
+	 * every envelope as `seedRefreshToken` so a later start can tell whether an
+	 * operator has re-seeded the chain.
+	 */
+	private linearTokenSeeds = new Map<string, string>();
+
 	async execute(args: string[]): Promise<void> {
 		const [subcommand, ...rest] = args;
 		switch (subcommand) {
@@ -424,6 +445,17 @@ export class RouterCommand extends BaseCommand {
 		const dbPath = this.resolveDbPath();
 		mkdirSync(dirname(dbPath), { recursive: true });
 
+		if (parsed.data.linearTokenStore) {
+			this.linearTokenStore = new KeyVaultTokenStore({
+				vaultUrl: parsed.data.linearTokenStore.keyVaultUrl,
+			});
+		}
+		for (const [workspaceId, ws] of Object.entries(parsed.data.workspaces)) {
+			if (ws.linearRefreshToken) {
+				this.linearTokenSeeds.set(workspaceId, ws.linearRefreshToken);
+			}
+		}
+
 		const config: RouterServerConfig = {
 			...parsed.data,
 			dbPath,
@@ -468,6 +500,36 @@ export class RouterCommand extends BaseCommand {
 	}
 
 	/**
+	 * Persists a rotated pair to both sinks. Key Vault is authoritative across
+	 * restarts; the config file remains a local cache so self-host deployments
+	 * behave exactly as before.
+	 *
+	 * Neither failure is fatal: the in-memory Linear client already holds the new
+	 * token, so the router keeps serving either way.
+	 */
+	private async persistRefreshedTokens(
+		configPath: string,
+		workspaceId: string,
+		tokens: { accessToken: string; refreshToken: string },
+	): Promise<void> {
+		this.persistRefreshedTokensToFile(configPath, workspaceId, tokens);
+		if (!this.linearTokenStore) return;
+		try {
+			await this.linearTokenStore.set(workspaceId, {
+				refreshToken: tokens.refreshToken,
+				accessToken: tokens.accessToken,
+				seedRefreshToken:
+					this.linearTokenSeeds.get(workspaceId) ?? tokens.refreshToken,
+				updatedMs: Date.now(),
+			});
+		} catch (error) {
+			this.logger.warn(
+				`Failed to persist refreshed Linear token to Key Vault for workspace ${workspaceId}: ${(error as Error).message}`,
+			);
+		}
+	}
+
+	/**
 	 * Writes a refreshed token pair back to `router-config.json`.
 	 *
 	 * Re-reads the file rather than mutating the parsed startup copy: an operator
@@ -477,7 +539,7 @@ export class RouterCommand extends BaseCommand {
 	 * fails to parse on the next start — which would strand the router with no
 	 * credentials at all.
 	 */
-	private persistRefreshedTokens(
+	private persistRefreshedTokensToFile(
 		configPath: string,
 		workspaceId: string,
 		tokens: { accessToken: string; refreshToken: string },

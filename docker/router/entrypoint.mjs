@@ -99,7 +99,8 @@ function generateConfig(env) {
 			env.CYRUS_ROUTER_ENTRA_AUDIENCE ||
 			env.CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN ||
 			env.CYRUS_ROUTER_ENTRA_JWKS_URL ||
-			env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID,
+			env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID ||
+			env.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL,
 	);
 
 	if (!anyProvided) {
@@ -218,6 +219,11 @@ function generateConfig(env) {
 						certificateIssuerId: env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID,
 					}
 				: {}),
+		};
+	}
+	if (env.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL) {
+		config.linearTokenStore = {
+			keyVaultUrl: env.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL,
 		};
 	}
 
