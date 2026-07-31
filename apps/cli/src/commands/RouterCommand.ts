@@ -1405,9 +1405,17 @@ export class RouterCommand extends BaseCommand {
 		if (!existsSync(configPath)) {
 			return this.exitWithError(`No router config found at ${configPath}`);
 		}
-		const parsed = RouterConfigFileSchema.safeParse(
-			JSON.parse(readFileSync(configPath, "utf-8")),
-		);
+
+		let raw: unknown;
+		try {
+			raw = JSON.parse(readFileSync(configPath, "utf-8"));
+		} catch (error) {
+			return this.exitWithError(
+				`Failed to parse ${configPath}: ${(error as Error).message}`,
+			);
+		}
+
+		const parsed = RouterConfigFileSchema.safeParse(raw);
 		if (!parsed.success) {
 			return this.exitWithError(
 				`Invalid router config at ${configPath}: ${parsed.error.message}`,
