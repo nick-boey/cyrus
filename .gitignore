@@ -56,6 +56,12 @@ docker/router/.env
 *.tfstate.*
 *.tfvars
 !*.tfvars.example
+# scripts/deploy-router-image.sh stages its rewrite in a mode-600 temp file
+# beside dev.tfvars. `*.tfvars` above does not match a name with a suffix after
+# `.tfvars`, and BSD mktemp only substitutes a TRAILING run of X's, so the temp
+# name cannot both be unique and end in `.tfvars`. Ignore the prefix instead:
+# a SIGKILL mid-rewrite leaves behind the client secret and both OAuth tokens.
+*.tfvars.tmp.*
 tfplan
 
 # Claude worktrees

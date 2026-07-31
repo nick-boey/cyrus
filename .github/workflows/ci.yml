@@ -18,6 +18,12 @@ jobs:
     - uses: azure/setup-bicep@v2
     - name: Check ACA ARM parity
       run: ./scripts/check-aca-arm-parity.sh
+    # `pnpm test` is workspace-only (pnpm-workspace.yaml is packages/* + apps/*),
+    # so nothing else in CI runs scripts/*.test.sh. Without this the rewrite
+    # suite — the only guard on a mode-600 tfvars holding the Linear client
+    # secret and both OAuth tokens — would rot unnoticed.
+    - name: Test router image deploy script
+      run: bash scripts/deploy-router-image.test.sh
 
   test:
     runs-on: ubuntu-latest
