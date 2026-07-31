@@ -2,6 +2,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -1347,6 +1348,71 @@ describe("RouterCommand", () => {
 			expect(app.logger.success).toHaveBeenCalledWith(
 				"Deleted 1 orphan ACA snapshot(s).",
 			);
+		});
+	});
+
+	describe("persistRefreshedTokens", () => {
+		let configPath: string;
+
+		beforeEach(() => {
+			configPath = join(cyrusHome, "router-config.json");
+			writeFileSync(
+				configPath,
+				JSON.stringify(
+					{
+						port: 8787,
+						workspaces: {
+							"ws-1": { linearToken: "at-1", linearRefreshToken: "rt-1" },
+						},
+						webhook: { verificationMode: "direct", secret: "shh" },
+					},
+					null,
+					2,
+				),
+			);
+		});
+
+		function makeRouterCommand(): RouterCommand {
+			return new RouterCommand(createMockApp(cyrusHome) as any);
+		}
+
+		it("writes the rotated pair to Key Vault with the recorded seed", async () => {
+			const set = vi.fn(async () => {});
+			const command = makeRouterCommand();
+			(command as any).linearTokenStore = { set };
+			(command as any).linearTokenSeeds = new Map([["ws-1", "rt-seed"]]);
+
+			await (command as any).persistRefreshedTokens(configPath, "ws-1", {
+				accessToken: "at-2",
+				refreshToken: "rt-2",
+			});
+
+			expect(set).toHaveBeenCalledWith(
+				"ws-1",
+				expect.objectContaining({
+					refreshToken: "rt-2",
+					accessToken: "at-2",
+					seedRefreshToken: "rt-seed",
+				}),
+			);
+		});
+
+		it("still writes the config file when the Key Vault write fails", async () => {
+			const command = makeRouterCommand();
+			(command as any).linearTokenStore = {
+				set: vi.fn(async () => {
+					throw new Error("kv down");
+				}),
+			};
+			(command as any).linearTokenSeeds = new Map([["ws-1", "rt-seed"]]);
+
+			await (command as any).persistRefreshedTokens(configPath, "ws-1", {
+				accessToken: "at-2",
+				refreshToken: "rt-2",
+			});
+
+			const written = JSON.parse(readFileSync(configPath, "utf-8"));
+			expect(written.workspaces["ws-1"].linearRefreshToken).toBe("rt-2");
 		});
 	});
 });

@@ -40,6 +40,18 @@ test("optional Azure env is absent by default", () => {
 	assert.equal(result.config.containers, undefined);
 	assert.equal(result.config.backup, undefined);
 	assert.equal(result.config.entra, undefined);
+	assert.equal(result.config.linearTokenStore, undefined);
+});
+
+test("maps CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL into linearTokenStore", () => {
+	const result = run({
+		CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL:
+			"https://kv-cyrus-dev.vault.azure.net/",
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(result.config.linearTokenStore, {
+		keyVaultUrl: "https://kv-cyrus-dev.vault.azure.net/",
+	});
 });
 
 test("passes containers, backup and complete Entra config through", () => {
