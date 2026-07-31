@@ -419,6 +419,11 @@ describe("terminal refresh failures", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1); // suppressed, not retried
 	});
 
+	// Reaches into the private refresh path deliberately: the patched
+	// `client.request` rethrows the ORIGINAL 401 on refresh failure (see its
+	// `catch (_refreshError) { throw error; }`), so the typed error is not
+	// observable through any public call. It is exported API — Task 2 Step 6
+	// branches on `instanceof` — so it needs direct coverage.
 	it("throws LinearRefreshTokenRejectedError from the suppressed path", async () => {
 		fetchMock.mockResolvedValue(new Response("nope", { status: 401 }));
 		const { raw, linearClient } = makeClient();
@@ -1105,25 +1110,56 @@ Add to `apps/cli/src/commands/RouterCommand.test.ts`:
 
 ```typescript
 describe("router linear status", () => {
-	it("reports ok for a working token and rejected for a dead one", async () => {
+	function captureStatus(fetchImpl: () => Promise<Response>) {
 		const command = makeRouterCommand();
 		(command as any).linearTokenStore = undefined;
 		const lines: string[] = [];
 		vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () =>
+		vi.stubGlobal("fetch", vi.fn(fetchImpl));
+		return { command, lines };
+	}
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.restoreAllMocks();
+	});
+
+	it("reports ok for a working token", async () => {
+		const { command, lines } = captureStatus(
+			async () =>
 				new Response(JSON.stringify({ data: { viewer: { id: "u1" } } }), {
 					status: 200,
 				}),
-			),
 		);
 
 		await (command as any).linear(["status"]);
 
 		expect(lines.join("\n")).toMatch(/ws-1/);
-		expect(lines.join("\n")).toMatch(/ok/);
-		vi.unstubAllGlobals();
+		expect(lines.join("\n")).toMatch(/\bok\b/);
+	});
+
+	it("reports rejected when Linear returns an auth error", async () => {
+		const { command, lines } = captureStatus(
+			async () =>
+				new Response(
+					JSON.stringify({ errors: [{ message: "Authentication required" }] }),
+					{ status: 200 },
+				),
+		);
+
+		await (command as any).linear(["status"]);
+
+		expect(lines.join("\n")).toMatch(/rejected \(auth error\)/);
+	});
+
+	it("reports rejected on a non-200 response", async () => {
+		const { command, lines } = captureStatus(
+			async () => new Response("nope", { status: 401 }),
+		);
+
+		await (command as any).linear(["status"]);
+
+		expect(lines.join("\n")).toMatch(/rejected \(HTTP 401\)/);
 	});
 
 	it("rejects an unknown subcommand", async () => {
