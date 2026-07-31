@@ -143,4 +143,62 @@ describe("recovery", () => {
 		);
 		expect(LinearIssueTrackerService.getRejectedWorkspace(WS)).toBeUndefined();
 	});
+
+	/**
+	 * The self-host config watcher re-authorizes a LIVE tracker — it calls
+	 * `setAccessToken()` on the existing instance rather than constructing a new
+	 * one (EdgeWorker.updateLinearWorkspaceTokens). Before this, registration
+	 * happened only in the constructor, so `cyrus refresh-token` on a rejected
+	 * workspace left the suppression standing until the process restarted and the
+	 * brand-new credential never got a single attempt.
+	 */
+	it("clears the rejection when a live tracker is handed a new refresh token", async () => {
+		fetchMock.mockResolvedValue(new Response("invalid_grant", { status: 400 }));
+		const { raw, linearClient } = makeClient();
+		const service = new LinearIssueTrackerService(
+			linearClient,
+			oauth("rt-dead"),
+			silentLogger(),
+		);
+		await expect(raw.request("query")).rejects.toThrow();
+		expect(LinearIssueTrackerService.getRejectedWorkspace(WS)).toBeDefined();
+
+		service.setAccessToken("at-fresh", "rt-fresh");
+
+		expect(LinearIssueTrackerService.getRejectedWorkspace(WS)).toBeUndefined();
+
+		// And the next refresh actually uses the new token rather than replaying
+		// the dead one.
+		fetchMock.mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					access_token: "at-2",
+					refresh_token: "rt-2",
+					expires_in: 3600,
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			),
+		);
+		// @ts-expect-error -- exercising the private refresh path directly
+		await expect(service.doTokenRefresh()).resolves.toBe("at-2");
+		const body = String(fetchMock.mock.calls.at(-1)?.[1]?.body);
+		expect(body).toContain("refresh_token=rt-fresh");
+	});
+
+	it("keeps the rejection when only the access token is replaced", async () => {
+		fetchMock.mockResolvedValue(new Response("invalid_grant", { status: 400 }));
+		const { raw, linearClient } = makeClient();
+		const service = new LinearIssueTrackerService(
+			linearClient,
+			oauth("rt-dead"),
+			silentLogger(),
+		);
+		await expect(raw.request("query")).rejects.toThrow();
+
+		// A bare access-token rotation is not a re-authorization: the refresh
+		// chain Linear refused is unchanged, so the suppression must stand.
+		service.setAccessToken("at-fresh");
+
+		expect(LinearIssueTrackerService.getRejectedWorkspace(WS)).toBeDefined();
+	});
 });

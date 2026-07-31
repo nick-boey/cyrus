@@ -1481,25 +1481,105 @@ describe("RouterCommand", () => {
 			expect(out["ws-1"].linearRefreshToken).toBe("rt-seed");
 			expect((command as any).linearTokenSources.get("ws-1")).toBe("config");
 		});
+
+		/**
+		 * Bind-mounted config (docs/ROUTER.md "Running the router in Docker"):
+		 * `persistRefreshedTokensToFile` writes each rotated token back into the
+		 * mounted file, so by the next start the config value has advanced past the
+		 * seed to the envelope's CURRENT head. Comparing against the seed alone
+		 * discarded a perfectly healthy chain there, logged "treating it as a fresh
+		 * re-authorization" on every restart forever, and left the Key Vault path
+		 * silently inert on exactly the deployments that mount their config.
+		 */
+		it("keeps the chain when a bind-mounted config already holds the rotated token", async () => {
+			const command = makeRouterCommand();
+			(command as any).linearTokenStore = {
+				get: async () => ({
+					refreshToken: "rt-rotated",
+					accessToken: "at-rotated",
+					seedRefreshToken: "rt-original-seed",
+					updatedMs: 456,
+				}),
+			};
+
+			const out = await (command as any).resolveWorkspaceTokens({
+				// What the mounted file looks like after one rotation: the head, not
+				// the seed the envelope was created with.
+				"ws-1": { linearToken: "at-rotated", linearRefreshToken: "rt-rotated" },
+			});
+
+			expect(out["ws-1"].linearRefreshToken).toBe("rt-rotated");
+			expect(out["ws-1"].linearToken).toBe("at-rotated");
+			expect((command as any).linearTokenSources.get("ws-1")).toBe("keyvault");
+		});
+
+		/**
+		 * The opt-in guarantee: with no `linearTokenStore` configured the resolver
+		 * must hand back the config values untouched and never reach for Key Vault.
+		 * This is the constraint the whole feature is built around, and nothing
+		 * else pins it.
+		 */
+		it("returns the config values byte-for-byte when no Key Vault is configured", async () => {
+			const command = makeRouterCommand();
+			expect((command as any).linearTokenStore).toBeUndefined();
+
+			const workspaces = {
+				"ws-1": { linearToken: "at-cfg", linearRefreshToken: "rt-seed" },
+				"ws-2": { linearToken: "at-cfg-2" },
+			};
+			const out = await (command as any).resolveWorkspaceTokens(workspaces);
+
+			expect(out).toEqual(workspaces);
+			expect((command as any).linearTokenSources.get("ws-1")).toBe("config");
+			expect((command as any).linearTokenSources.get("ws-2")).toBe("config");
+			expect((command as any).linearTokenUpdatedMs.size).toBe(0);
+		});
+
+		/**
+		 * Same guarantee one level up: a config with no `linearTokenStore` must not
+		 * construct a Key Vault client at all. `configureLinearTokenStore` is the
+		 * single place both `start` and `linear status` go through, so this is the
+		 * gate that keeps non-Azure deployments on the original codepath.
+		 */
+		it("configureLinearTokenStore builds no store when the config omits one", () => {
+			const command = makeRouterCommand();
+
+			(command as any).configureLinearTokenStore({
+				workspaces: {
+					"ws-1": { linearToken: "at-cfg", linearRefreshToken: "rt-seed" },
+				},
+			});
+
+			expect((command as any).linearTokenStore).toBeUndefined();
+			// Seeds are still recorded — they cost nothing and are only ever read
+			// when a store exists.
+			expect((command as any).linearTokenSeeds.get("ws-1")).toBe("rt-seed");
+		});
 	});
 
 	describe("router linear status", () => {
-		function makeRouterCommand(): RouterCommand {
+		function makeRouterCommand(
+			workspace: { linearToken: string; linearRefreshToken?: string } = {
+				linearToken: "at-1",
+				linearRefreshToken: "rt-1",
+			},
+		): RouterCommand {
 			writeFileSync(
 				join(cyrusHome, "router-config.json"),
 				JSON.stringify({
 					port: 8787,
-					workspaces: {
-						"ws-1": { linearToken: "at-1", linearRefreshToken: "rt-1" },
-					},
+					workspaces: { "ws-1": workspace },
 					webhook: { verificationMode: "direct", secret: "shh" },
 				}),
 			);
 			return new RouterCommand(createMockApp(cyrusHome) as any);
 		}
 
-		function captureStatus(fetchImpl: () => Promise<Response>) {
-			const command = makeRouterCommand();
+		function captureStatus(
+			fetchImpl: () => Promise<Response>,
+			workspace?: { linearToken: string; linearRefreshToken?: string },
+		) {
+			const command = makeRouterCommand(workspace);
 			(command as any).linearTokenStore = undefined;
 			const lines: string[] = [];
 			vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
@@ -1507,9 +1587,37 @@ describe("RouterCommand", () => {
 			return { command, lines };
 		}
 
+		/** A workspace whose access token is dead and has nothing to recover with. */
+		const noRefreshChain = { linearToken: "at-1" };
+
+		const authErrorResponse = () =>
+			Promise.resolve(
+				new Response(
+					JSON.stringify({ errors: [{ message: "Authentication required" }] }),
+					{ status: 200 },
+				),
+			);
+
 		afterEach(() => {
 			vi.unstubAllGlobals();
 			vi.restoreAllMocks();
+		});
+
+		it("names the probed column ACCESS TOKEN, not STATUS", async () => {
+			// The column header is load-bearing: `STATUS` invited reading a rejected
+			// 25-hour-old access token as "this workspace's Linear auth is broken",
+			// which in the re-auth runbook means burning a working refresh chain.
+			const { command, lines } = captureStatus(
+				async () =>
+					new Response(JSON.stringify({ data: { viewer: { id: "u1" } } }), {
+						status: 200,
+					}),
+			);
+
+			await (command as any).linear(["status"]);
+
+			expect(lines[0]).toContain("ACCESS TOKEN");
+			expect(lines[0]).not.toContain("STATUS");
 		});
 
 		it("reports ok for a working token", async () => {
@@ -1526,15 +1634,25 @@ describe("RouterCommand", () => {
 			expect(lines.join("\n")).toMatch(/\bok\b/);
 		});
 
-		it("reports rejected when Linear returns an auth error", async () => {
+		it("reports expired (refresh available) when a refresh token is on file", async () => {
+			// Linear expires access tokens after 24h, so a rejected one on a
+			// workspace that still holds a refresh token is the NORMAL first-deploy
+			// state — the router mints a fresh access token on its first 401. Calling
+			// that "rejected" sends an operator to re-authorize a healthy credential,
+			// the exact opposite of what this command is for.
+			const { command, lines } = captureStatus(authErrorResponse);
+
+			await (command as any).linear(["status"]);
+
+			const printed = lines.join("\n");
+			expect(printed).toMatch(/expired \(refresh available, auth error\)/);
+			expect(printed).not.toMatch(/\brejected\b/);
+		});
+
+		it("reports rejected when Linear returns an auth error and there is no refresh token", async () => {
 			const { command, lines } = captureStatus(
-				async () =>
-					new Response(
-						JSON.stringify({
-							errors: [{ message: "Authentication required" }],
-						}),
-						{ status: 200 },
-					),
+				authErrorResponse,
+				noRefreshChain,
 			);
 
 			await (command as any).linear(["status"]);
@@ -1545,6 +1663,7 @@ describe("RouterCommand", () => {
 		it("reports rejected on a non-200 response", async () => {
 			const { command, lines } = captureStatus(
 				async () => new Response("nope", { status: 401 }),
+				noRefreshChain,
 			);
 
 			await (command as any).linear(["status"]);
@@ -1556,6 +1675,10 @@ describe("RouterCommand", () => {
 			// The safety property this command exists for: a dead network path must
 			// never read as healthy. If a future change collapsed probeLinearToken's
 			// catch into returning "ok", this is the test that would catch it.
+			// It must also not be softened into "expired (refresh available)" — a
+			// probe that never reached Linear says nothing about the credential,
+			// whether or not a refresh token happens to be on file (this workspace
+			// has one).
 			const { command, lines } = captureStatus(async () => {
 				throw new Error("ECONNREFUSED");
 			});
@@ -1563,8 +1686,9 @@ describe("RouterCommand", () => {
 			await (command as any).linear(["status"]);
 
 			const printed = lines.join("\n");
-			expect(printed).toMatch(/unknown/);
+			expect(printed).toMatch(/unknown \(ECONNREFUSED\)/);
 			expect(printed).not.toMatch(/\bok\b/);
+			expect(printed).not.toMatch(/expired/);
 		});
 
 		it("reports the keyvault source when the stored envelope's seed matches config", async () => {

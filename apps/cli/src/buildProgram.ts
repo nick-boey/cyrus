@@ -345,6 +345,17 @@ export function buildProgram(
 			await action(...(options.yes ? ["--yes"] : []));
 		});
 
+	const routerLinearCommand = routerCommand
+		.command("linear")
+		.description("Inspect Linear authentication health");
+
+	routerLinearCommand
+		.command("status")
+		.description(
+			"Probe Linear with each workspace's resolved access token and report where the token came from",
+		)
+		.action(makeRouterAction("linear", "status"));
+
 	routerCommand
 		.command("unlock <issue>")
 		.description(

@@ -48,12 +48,19 @@ locals {
   }
 
   router_env_non_secret = {
-    LINEAR_WORKSPACE_ID               = var.linear_workspace_id
-    CYRUS_ROUTER_CONTAINERS_JSON      = jsonencode(local.router_containers_config)
-    CYRUS_ROUTER_BACKUP_BLOB_URL      = local.router_containers_config.backupBlobUrl
-    CYRUS_ROUTER_ENTRA_TENANT_ID      = var.entra_tenant_id
-    CYRUS_ROUTER_ENTRA_AUDIENCE       = var.entra_audience
-    CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN = var.entra_allowed_domain
+    LINEAR_WORKSPACE_ID          = var.linear_workspace_id
+    CYRUS_ROUTER_CONTAINERS_JSON = jsonencode(local.router_containers_config)
+    CYRUS_ROUTER_BACKUP_BLOB_URL = local.router_containers_config.backupBlobUrl
+    # Durable store for rotated Linear OAuth tokens. `/data` is wiped on every
+    # deploy, so without this the router replays the tfvars-seeded refresh token
+    # after each restart — a token Linear has already consumed and rotated,
+    # which fails permanently with HTTP 400 (the 2026-07-30 outage). The router
+    # UAI already holds Key Vault Secrets User + Secrets Officer (main.tf), which
+    # is what reading and writing `cyrus-linear-refresh-<workspaceId>` needs.
+    CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL = azurerm_key_vault.this.vault_uri
+    CYRUS_ROUTER_ENTRA_TENANT_ID                  = var.entra_tenant_id
+    CYRUS_ROUTER_ENTRA_AUDIENCE                   = var.entra_audience
+    CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN             = var.entra_allowed_domain
   }
 
   entra_enabled = var.entra_tenant_id != null && var.entra_audience != null
@@ -162,6 +169,10 @@ resource "azurerm_container_app" "router" {
       env {
         name  = "CYRUS_ROUTER_BACKUP_BLOB_URL"
         value = local.router_env_non_secret.CYRUS_ROUTER_BACKUP_BLOB_URL
+      }
+      env {
+        name  = "CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL"
+        value = local.router_env_non_secret.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL
       }
       env {
         name  = "AZURE_CLIENT_ID"

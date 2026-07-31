@@ -136,6 +136,28 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 		return LinearIssueTrackerService.rejectedWorkspaces.get(workspaceId);
 	}
 
+	/**
+	 * Records the refresh token in effect for a workspace, clearing any standing
+	 * rejection when the token actually changed.
+	 *
+	 * A *different* token than the one on record means an operator re-authorized,
+	 * so a standing rejection refers to a credential we no longer hold — keeping
+	 * it would suppress every refresh attempt on the new one until the process
+	 * restarts. Re-registering the same token is a no-op, so a rejection survives
+	 * anything that is not a real re-authorization.
+	 */
+	static registerRefreshToken(workspaceId: string, refreshToken: string): void {
+		const prior =
+			LinearIssueTrackerService.workspaceRefreshTokens.get(workspaceId);
+		if (prior !== refreshToken) {
+			LinearIssueTrackerService.rejectedWorkspaces.delete(workspaceId);
+		}
+		LinearIssueTrackerService.workspaceRefreshTokens.set(
+			workspaceId,
+			refreshToken,
+		);
+	}
+
 	/** Clears shared per-workspace auth state. Omit the id to clear everything. */
 	static resetWorkspaceAuthState(workspaceId?: string): void {
 		if (workspaceId === undefined) {
@@ -166,20 +188,10 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 		this.logger =
 			logger ?? createLogger({ component: "LinearIssueTrackerService" });
 
-		// Register initial refresh token in shared static map. A *different*
-		// token than the one on record means an operator re-authorized, so any
-		// standing rejection refers to a token we no longer hold — clear it so
-		// the new credential gets a real attempt.
+		// Register initial refresh token in shared static map, clearing any
+		// standing rejection if this is a newly authorized credential.
 		if (oauthConfig?.refreshToken) {
-			const prior = LinearIssueTrackerService.workspaceRefreshTokens.get(
-				oauthConfig.workspaceId,
-			);
-			if (prior !== oauthConfig.refreshToken) {
-				LinearIssueTrackerService.rejectedWorkspaces.delete(
-					oauthConfig.workspaceId,
-				);
-			}
-			LinearIssueTrackerService.workspaceRefreshTokens.set(
+			LinearIssueTrackerService.registerRefreshToken(
 				oauthConfig.workspaceId,
 				oauthConfig.refreshToken,
 			);
@@ -339,7 +351,9 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 					`Linear refused the refresh token for workspace ${workspaceId} (HTTP ${response.status}: ${body}). ` +
 						"This is terminal — Linear rotates refresh tokens on use, so a consumed or revoked token cannot recover. " +
 						"Cyrus can neither read nor write Linear for this workspace until re-authorized, and all worker activity posting will fail silently. " +
-						"Remedy: re-run `cyrus self-auth-linear`, update Key Vault secret `cyrus-linear-refresh-<workspaceId>` (or router-config.json), restart the router. " +
+						"Remedy: re-authorize Linear and give Cyrus the new refresh token. " +
+						"Running `cyrus start` yourself: `cyrus refresh-token` (or `cyrus self-auth-linear`) rewrites config.json and is picked up without a restart. " +
+						"Running a router: re-run `cyrus self-auth-linear`, update the workspace's refresh token wherever the router reads it from (router-config.json, or the deployment's env/Key Vault seed), then restart the router. " +
 						"If this appeared immediately after a credential change, check LINEAR_CLIENT_ID / LINEAR_CLIENT_SECRET match the app that issued the token. " +
 						"Suppressing further refresh attempts for this workspace.",
 				);
@@ -396,12 +410,28 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 	/**
 	 * Update the access token using setHeader on the underlying GraphQL client.
 	 * This is more efficient than recreating the entire LinearClient.
+	 *
 	 * @param token - New access token
+	 * @param refreshToken - New refresh token, when the caller has one. Callers
+	 *   that hot-reload credentials onto a live tracker (the self-host config
+	 *   watcher after `cyrus refresh-token` / `self-auth-linear`) MUST pass it:
+	 *   a standing rejection is only cleared when a *different* refresh token is
+	 *   registered, and registration otherwise happens only in the constructor.
+	 *   Without it, a live re-authorization leaves refreshes suppressed for the
+	 *   workspace until the process restarts — the new credential never gets an
+	 *   attempt.
 	 */
-	setAccessToken(token: string): void {
+	setAccessToken(token: string, refreshToken?: string): void {
 		// Clear any cached refresh promise so subsequent 401s trigger a fresh refresh
 		// rather than reusing a stale resolved promise with an old token.
 		this.refreshPromise = null;
+		if (refreshToken && this.oauthConfig) {
+			this.oauthConfig.refreshToken = refreshToken;
+			LinearIssueTrackerService.registerRefreshToken(
+				this.oauthConfig.workspaceId,
+				refreshToken,
+			);
+		}
 		// Guard for test mocks that may not have the .client property
 		if (this.linearClient.client) {
 			this.linearClient.client.setHeader("Authorization", `Bearer ${token}`);
