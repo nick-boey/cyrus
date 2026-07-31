@@ -9,8 +9,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * was never wired up in `buildProgram.ts` would still pass an `execute()`
  * based test while being completely unreachable from the real binary. That
  * exact gap shipped for `router users set-executor`, `router secrets
- * set/unset`, and `router containers list/destroy` (CYPACK task 9 finding 1) —
- * these tests are the regression guard for that class of bug.
+ * set/unset`, and `router containers list/destroy` (CYPACK task 9 finding 1),
+ * and then again for `router linear status` — whose own tests called
+ * `RouterCommand.linear([...])` directly, so a command Commander rejected with
+ * `unknown command 'linear'` looked fully covered. These tests are the
+ * regression guard for that class of bug; every router subcommand belongs here.
  *
  * `Application` and `RouterCommand` are mocked so these tests only assert
  * Commander's parsing/dispatch, not `RouterCommand`'s business logic (already
@@ -175,6 +178,19 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		]);
 	});
 
+	it("registers `router linear status`", async () => {
+		await run(["router", "linear", "status"]);
+
+		expect(routerExecute).toHaveBeenCalledWith(["linear", "status"]);
+		expect(applicationDisposeWatchers).toHaveBeenCalledTimes(1);
+	});
+
+	it("registers `router unlock <issue>`", async () => {
+		await run(["router", "unlock", "PAR-169"]);
+
+		expect(routerExecute).toHaveBeenCalledWith(["unlock", "PAR-169"]);
+	});
+
 	it("registers `container-boot`", async () => {
 		await run(["container-boot"]);
 
@@ -188,7 +204,7 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 	});
 
 	it("still rejects a genuinely unregistered router subcommand", async () => {
-		// Sanity check for the five tests above: confirms Commander actually
+		// Sanity check for every test above: confirms Commander actually
 		// errors on a command that was never registered, so the passing tests
 		// aren't passing vacuously (e.g. because unknown subcommands are
 		// silently swallowed). exitOverride() replaces Commander's default

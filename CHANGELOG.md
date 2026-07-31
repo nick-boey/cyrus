@@ -69,8 +69,12 @@ All notable changes to this project will be documented in this file.
 - Router mode: Linear authentication no longer breaks after a router restart. Previously the
   rotated Linear token was stored only on disk that is wiped on each deploy, so
   Cyrus would stop being able to read or post to Linear — silently — within a
-  day of restarting. A dead credential is now reported once, clearly, with
-  instructions to fix it, instead of failing quietly.
+  day of restarting.
+- A Linear credential Cyrus can no longer refresh is now reported once, clearly,
+  and with instructions to fix it, instead of failing quietly and repeating the
+  same stack trace on every request. Re-authorizing also takes effect
+  immediately now — previously Cyrus kept refusing to use the new credential
+  until it was restarted.
 
 ### Changed
 - Per-user container secrets are now keyed by the real environment-variable name (e.g. `CLAUDE_CODE_OAUTH_TOKEN`, `GIT_TOKEN`). Existing stored secrets are migrated automatically.

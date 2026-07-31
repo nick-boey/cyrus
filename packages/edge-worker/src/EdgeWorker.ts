@@ -3256,17 +3256,34 @@ ${taskSection}`;
 		let anyTokenChanged = false;
 
 		for (const [workspaceId, newWsConfig] of Object.entries(newWorkspaces)) {
-			const oldToken = oldWorkspaces[workspaceId]?.linearToken;
+			const oldWsConfig = oldWorkspaces[workspaceId];
+			const oldToken = oldWsConfig?.linearToken;
 			const newToken = newWsConfig.linearToken;
+			const newRefreshToken = newWsConfig.linearRefreshToken;
 
-			if (oldToken === newToken) continue;
+			if (
+				oldToken === newToken &&
+				oldWsConfig?.linearRefreshToken === newRefreshToken
+			) {
+				continue;
+			}
 
 			anyTokenChanged = true;
 
 			// Update existing issue tracker in-place
 			const issueTracker = this.issueTrackers.get(workspaceId);
 			if (issueTracker) {
-				(issueTracker as LinearIssueTrackerService).setAccessToken(newToken);
+				// Hand over the refresh token too, not just the access token. A
+				// re-authorization (`cyrus refresh-token` / `self-auth-linear`) lands
+				// here as a config.json change, and if Linear had already rejected the
+				// old refresh token the tracker is suppressing every refresh attempt
+				// for this workspace. That suppression is only lifted when a
+				// *different* refresh token is registered — so passing the access
+				// token alone would leave a live re-auth inert until restart.
+				(issueTracker as LinearIssueTrackerService).setAccessToken(
+					newToken,
+					newRefreshToken,
+				);
 				this.logger.info(
 					`🔑 Updated Linear token for workspace ${workspaceId}`,
 				);

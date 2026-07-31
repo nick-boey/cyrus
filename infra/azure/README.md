@@ -638,8 +638,21 @@ terraform -chdir=infra/azure/terraform apply -var-file=dev.tfvars
 az containerapp revision restart -g rg-cyrus -n app-cyrus-dev-router \
   --revision "$(az containerapp show -g rg-cyrus -n app-cyrus-dev-router \
     --query properties.latestRevisionName -o tsv)"
-cyrus router linear status   # expect: ok
+
+# Verify INSIDE the replica. Run from a laptop, `cyrus router linear status`
+# reads the laptop's ~/.cyrus/router-config.json, not the replica's
+# /data/router-config.json — same constraint as `cyrus router secrets set`.
+az containerapp exec --name app-cyrus-dev-router --resource-group rg-cyrus
+# Inside the replica:
+cyrus router linear status   # expect: ACCESS TOKEN = ok
 ```
+
+`ACCESS TOKEN` is the only column that probes Linear. `expired (refresh
+available)` means the seeded *access* token has aged out but a refresh token is
+present — normal, and not a reason to re-authorize again; the router mints a new
+access token on its first call. Only `rejected` with no refresh token, or a
+repeat of the HTTP 400 refusal in the logs, means the credential is genuinely
+dead.
 
 The router stores each rotated token in the runtime-created Key Vault secret
 `cyrus-linear-refresh-<workspaceId>`. That secret is **not** managed by

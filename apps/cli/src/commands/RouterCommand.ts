@@ -243,6 +243,18 @@ const RouterConfigFileSchema = z.object({
 });
 
 /**
+ * Result of a single `{ viewer { id } }` probe against Linear.
+ *
+ * `rejected` means Linear answered and refused the token; `unknown` means the
+ * probe never got an answer. They must stay distinguishable: only the first says
+ * anything about the credential.
+ */
+interface LinearTokenProbe {
+	outcome: "ok" | "rejected" | "unknown";
+	detail: string;
+}
+
+/**
  * Router server administration:
  *
  *   cyrus router start                          # start the router server
@@ -265,6 +277,7 @@ const RouterConfigFileSchema = z.object({
  *   cyrus router containers list                # list running ephemeral container devices
  *   cyrus router containers destroy <issueKey>  # drop a container device's row
  *   cyrus router containers gc-snapshots [--yes] # plan/delete orphan ACA snapshots
+ *   cyrus router linear status                  # probe each workspace's Linear access token + report its source
  *   cyrus router unlock <issueId|PAR-123>       # release a stuck issue lock (GUID or Linear identifier)
  *
  * Every subcommand except `start` opens a {@link RouterStore} directly on the
@@ -460,16 +473,7 @@ export class RouterCommand extends BaseCommand {
 		const dbPath = this.resolveDbPath();
 		mkdirSync(dirname(dbPath), { recursive: true });
 
-		if (parsed.data.linearTokenStore) {
-			this.linearTokenStore = new KeyVaultTokenStore({
-				vaultUrl: parsed.data.linearTokenStore.keyVaultUrl,
-			});
-		}
-		for (const [workspaceId, ws] of Object.entries(parsed.data.workspaces)) {
-			if (ws.linearRefreshToken) {
-				this.linearTokenSeeds.set(workspaceId, ws.linearRefreshToken);
-			}
-		}
+		this.configureLinearTokenStore(parsed.data);
 
 		const resolvedWorkspaces = await this.resolveWorkspaceTokens(
 			parsed.data.workspaces,
@@ -502,6 +506,34 @@ export class RouterCommand extends BaseCommand {
 		};
 		process.on("SIGINT", () => void shutdown());
 		process.on("SIGTERM", () => void shutdown());
+	}
+
+	/**
+	 * Wires up the durable Linear token store (when configured) and records this
+	 * start's config/env refresh tokens as chain seeds.
+	 *
+	 * Shared by {@link start} and {@link linearStatus} so the diagnostic resolves
+	 * tokens exactly the way the running router does. A second, drifting copy of
+	 * this block is how a diagnostic starts lying about the thing it exists to
+	 * report on.
+	 *
+	 * Opt-in: with no `linearTokenStore` in the config, `this.linearTokenStore`
+	 * stays undefined and {@link resolveWorkspaceTokens} short-circuits to the
+	 * config values — the pre-Key-Vault behavior, unchanged.
+	 */
+	private configureLinearTokenStore(
+		config: z.infer<typeof RouterConfigFileSchema>,
+	): void {
+		if (config.linearTokenStore) {
+			this.linearTokenStore = new KeyVaultTokenStore({
+				vaultUrl: config.linearTokenStore.keyVaultUrl,
+			});
+		}
+		for (const [workspaceId, ws] of Object.entries(config.workspaces)) {
+			if (ws.linearRefreshToken) {
+				this.linearTokenSeeds.set(workspaceId, ws.linearRefreshToken);
+			}
+		}
 	}
 
 	/**
@@ -548,9 +580,22 @@ export class RouterCommand extends BaseCommand {
 			}
 
 			if (!envelope) continue;
-			if (envelope.seedRefreshToken !== cfg.linearRefreshToken) {
+			// The chain is intact if the config value is either the seed we started
+			// from OR the head this router last stored. The second case is the
+			// bind-mounted config (docs/ROUTER.md): `persistRefreshedTokensToFile`
+			// writes each rotated token back into the mounted file, so on the next
+			// start the config value has already advanced past the seed. Comparing
+			// against the seed alone would discard a perfectly good envelope — and
+			// log "treating it as a fresh re-authorization" on every restart forever,
+			// leaving the Key Vault path silently inert. A genuinely fresh seed from
+			// Linear can never equal a token this router already rotated into, so a
+			// real re-authorization is still detected.
+			const chainIntact =
+				envelope.seedRefreshToken === cfg.linearRefreshToken ||
+				envelope.refreshToken === cfg.linearRefreshToken;
+			if (!chainIntact) {
 				this.logger.info(
-					`Configured Linear refresh token for workspace ${workspaceId} differs from the stored chain's seed; treating it as a fresh re-authorization and discarding the stored token.`,
+					`Configured Linear refresh token for workspace ${workspaceId} matches neither the stored chain's seed nor its current token; treating it as a fresh re-authorization and discarding the stored token.`,
 				);
 				continue;
 			}
@@ -1422,28 +1467,56 @@ export class RouterCommand extends BaseCommand {
 			);
 		}
 
-		if (parsed.data.linearTokenStore) {
-			this.linearTokenStore = new KeyVaultTokenStore({
-				vaultUrl: parsed.data.linearTokenStore.keyVaultUrl,
-			});
-		}
+		this.configureLinearTokenStore(parsed.data);
 		const resolved = await this.resolveWorkspaceTokens(parsed.data.workspaces);
 
+		// The last column is named for what is actually probed. Calling it
+		// "STATUS" invited reading a rejected 25-hour-old access token as "this
+		// workspace's Linear auth is broken", which in a re-auth runbook pushes an
+		// operator to re-authorize and burn a working refresh chain.
 		console.log(
-			`${"WORKSPACE".padEnd(38)} ${"SOURCE".padEnd(9)} ${"LAST REFRESH".padEnd(25)} STATUS`,
+			`${"WORKSPACE".padEnd(38)} ${"SOURCE".padEnd(9)} ${"LAST REFRESH".padEnd(25)} ACCESS TOKEN`,
 		);
 		for (const [workspaceId, ws] of Object.entries(resolved)) {
 			const source = this.linearTokenSources.get(workspaceId) ?? "config";
 			const updatedMs = this.linearTokenUpdatedMs.get(workspaceId);
 			const lastRefresh = updatedMs ? new Date(updatedMs).toISOString() : "—";
-			const status = await this.probeLinearToken(ws.linearToken);
+			const probe = await this.probeLinearToken(ws.linearToken);
+			const status = this.formatAccessTokenStatus(
+				probe,
+				Boolean(ws.linearRefreshToken),
+			);
 			console.log(
 				`${workspaceId.padEnd(38)} ${source.padEnd(9)} ${lastRefresh.padEnd(25)} ${status}`,
 			);
 		}
 	}
 
-	private async probeLinearToken(token: string): Promise<string> {
+	/**
+	 * Renders a probe result for the `ACCESS TOKEN` column.
+	 *
+	 * Linear expires access tokens after 24 hours, so a rejected one is the
+	 * *expected* steady state on a first deploy — the seeded value was minted
+	 * whenever `self-auth-linear` last ran, and the router mints a fresh one from
+	 * the refresh chain on its first 401. That is a healthy workspace, and it must
+	 * not read as a dead credential. Only a rejection with no refresh token left
+	 * to recover with is genuinely terminal.
+	 *
+	 * A probe that never reached Linear stays `unknown` either way: an unreachable
+	 * network says nothing about the credential, and must never read as healthy.
+	 */
+	private formatAccessTokenStatus(
+		probe: LinearTokenProbe,
+		hasRefreshToken: boolean,
+	): string {
+		if (probe.outcome === "ok") return "ok";
+		if (probe.outcome === "unknown") return `unknown (${probe.detail})`;
+		return hasRefreshToken
+			? `expired (refresh available, ${probe.detail})`
+			: `rejected (${probe.detail})`;
+	}
+
+	private async probeLinearToken(token: string): Promise<LinearTokenProbe> {
 		try {
 			const response = await fetch("https://api.linear.app/graphql", {
 				method: "POST",
@@ -1453,11 +1526,14 @@ export class RouterCommand extends BaseCommand {
 				},
 				body: JSON.stringify({ query: "{ viewer { id } }" }),
 			});
-			if (!response.ok) return `rejected (HTTP ${response.status})`;
+			if (!response.ok)
+				return { outcome: "rejected", detail: `HTTP ${response.status}` };
 			const body = (await response.json()) as { errors?: unknown[] };
-			return body.errors?.length ? "rejected (auth error)" : "ok";
+			return body.errors?.length
+				? { outcome: "rejected", detail: "auth error" }
+				: { outcome: "ok", detail: "" };
 		} catch (error) {
-			return `unknown (${(error as Error).message})`;
+			return { outcome: "unknown", detail: (error as Error).message };
 		}
 	}
 }
