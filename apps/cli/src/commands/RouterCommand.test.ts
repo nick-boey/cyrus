@@ -1552,6 +1552,53 @@ describe("RouterCommand", () => {
 			expect(lines.join("\n")).toMatch(/rejected \(HTTP 401\)/);
 		});
 
+		it("reports unknown (never ok) when the network probe itself fails", async () => {
+			// The safety property this command exists for: a dead network path must
+			// never read as healthy. If a future change collapsed probeLinearToken's
+			// catch into returning "ok", this is the test that would catch it.
+			const { command, lines } = captureStatus(async () => {
+				throw new Error("ECONNREFUSED");
+			});
+
+			await (command as any).linear(["status"]);
+
+			const printed = lines.join("\n");
+			expect(printed).toMatch(/unknown/);
+			expect(printed).not.toMatch(/\bok\b/);
+		});
+
+		it("reports the keyvault source when the stored envelope's seed matches config", async () => {
+			const command = makeRouterCommand();
+			(command as any).linearTokenStore = {
+				get: vi.fn(async () => ({
+					accessToken: "at-kv",
+					refreshToken: "rt-kv",
+					// Must equal the config's linearRefreshToken ("rt-1", set in
+					// makeRouterCommand) for resolveWorkspaceTokens to trust this
+					// envelope instead of falling back to the config value.
+					seedRefreshToken: "rt-1",
+					updatedMs: Date.UTC(2026, 0, 1),
+				})),
+			};
+			const lines: string[] = [];
+			vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(
+					async () =>
+						new Response(JSON.stringify({ data: { viewer: { id: "u1" } } }), {
+							status: 200,
+						}),
+				),
+			);
+
+			await (command as any).linear(["status"]);
+
+			const dataRow = lines.find((line) => line.includes("ws-1"));
+			expect(dataRow).toBeDefined();
+			expect(dataRow).toMatch(/\bkeyvault\b/);
+		});
+
 		it("rejects an unknown subcommand", async () => {
 			const command = makeRouterCommand();
 			const exit = vi
