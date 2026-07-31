@@ -78,7 +78,8 @@ Flags are limited to `--allow-dirty` and `-h`/`--help`.
    `az acr build -r "$REGISTRY" -t "$REPO:$TAG" -f docker/router/Dockerfile .`
 
 4. **Resolve the digest.**
-   `az acr repository show -n "$REGISTRY" --image "$REPO:$TAG" --query digest -o tsv`.
+   `az acr manifest show-metadata "$REGISTRY.azurecr.io/$REPO:$TAG" --query digest -o tsv`,
+   matching the command `infra/azure/README.md` already documents.
    An empty or malformed result is a hard failure — a wrong digest here is
    precisely the class of bug this script exists to prevent, so it must never be
    guessed or defaulted.
