@@ -624,6 +624,28 @@ the Key Vault secret directly as
 `u<sha256(lowercase-email):20>-<sha256(key):10>` with `email` and `key` tags. A
 laptop's default local file store does not mutate the remote replica's store.
 
+### Re-authorizing Linear
+
+Symptom: router logs `Linear refused the refresh token for workspace … (HTTP 400)`,
+and every Linear read/write fails — including all worker activity posting, which
+proxies through the router.
+
+```bash
+cyrus --env-file /secure/path/linear-app.env self-auth-linear
+# update linear_workspace_token + linear_workspace_refresh_token in tfvars,
+# then apply so the Key Vault secrets are updated:
+terraform -chdir=infra/azure/terraform apply -var-file=dev.tfvars
+az containerapp revision restart -g rg-cyrus -n app-cyrus-dev-router \
+  --revision "$(az containerapp show -g rg-cyrus -n app-cyrus-dev-router \
+    --query properties.latestRevisionName -o tsv)"
+cyrus router linear status   # expect: ok
+```
+
+The router stores each rotated token in the runtime-created Key Vault secret
+`cyrus-linear-refresh-<workspaceId>`. That secret is **not** managed by
+Terraform, so `terraform apply` never reverts it. Changing the seed in tfvars is
+what tells the router to abandon the stored chain and adopt the new credential.
+
 ### Entra enrollment
 
 Entra-gated device enrollment is optional and separate from the managed

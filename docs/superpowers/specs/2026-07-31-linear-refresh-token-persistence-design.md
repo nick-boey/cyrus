@@ -168,8 +168,12 @@ New `cyrus router linear status`, matching the existing
 Per workspace: id, token source (`keyvault` or `config`), last refresh time, and
 status (`ok`, or `rejected` with code and timestamp). Last refresh time is the
 envelope's `updatedMs`; it renders as `—` when the source is `config`, since a
-file-only deployment has no such record. Local-only — it makes no Linear API
-call, so it still works when auth is dead.
+file-only deployment has no such record. The command probes Linear with the resolved access token (`{ viewer { id } }`)
+rather than reading mirrored router state: it runs out of process and cannot see
+the running router's in-memory rejection map, and mirroring that state into
+SQLite would add a failure callback through `RouterServer` and `LinearOAuthConfig`
+for strictly less truthful output. The rejection's status code and timestamp
+remain in the once-only ERROR log.
 
 ## Error handling summary
 
