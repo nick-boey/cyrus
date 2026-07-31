@@ -24,3 +24,37 @@ code
 packages/*/test
 apps/*/test
 **/*.test.ts
+
+# ---- Terraform state and variables: LOAD-BEARING FOR SECRECY ----------------
+# Do not prune these as "unused" or "just build speed". scripts/deploy-router-image.sh
+# runs `az acr build … .`, which tars the whole working directory and UPLOADS it
+# to the registry, honouring this file (azure-cli
+# command_modules/acr/_archive_utils.py: _pack_source_code -> _load_dockerignore_file).
+# Without these entries every deploy would ship, off this machine:
+#   infra/azure/terraform/env/dev.tfvars    mode 600 — Linear client secret + both live OAuth tokens
+#   infra/azure/terraform/terraform.tfstate mode 600 — Terraform writes `sensitive` values to state in PLAINTEXT
+#   infra/azure/terraform/terraform.tfstate.backup
+#   infra/azure/terraform/.terraform/       638 MB provider cache (also busts the `COPY . .` layer every run)
+# None of it is needed by docker/router/Dockerfile, which builds only the pnpm
+# workspace — pnpm-workspace.yaml is `packages/*` + `apps/*`, so infra/ is not a member.
+#
+# Both the bare and the `**/` form of each rule are required, and `.terraform`
+# must NOT carry a trailing slash. ACR compiles `**/x` to `^.*/x$` (needs at
+# least one separator, so it misses a root-level file), `*.x` to `^[^/]*\.x$`
+# (misses a nested one), and a trailing `/` to a pattern ending in `/$`, which
+# no archive entry can ever match. Verified against the installed
+# _archive_utils.IgnoreRule, not assumed.
+.terraform
+**/.terraform
+*.tfvars
+**/*.tfvars
+*.tfstate
+**/*.tfstate
+*.tfstate.*
+**/*.tfstate.*
+tfplan
+**/tfplan
+# Residue of a SIGKILL'd rewrite in scripts/deploy-router-image.sh — a mode-600
+# copy of dev.tfvars, so it must never be uploaded either.
+*.tfvars.tmp.*
+**/*.tfvars.tmp.*

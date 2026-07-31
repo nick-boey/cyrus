@@ -77,9 +77,22 @@ Flags are limited to `--allow-dirty` and `-h`/`--help`.
 3. **Build.**
    `az acr build -r "$REGISTRY" -t "$REPO:$TAG" -f docker/router/Dockerfile .`
 
-4. **Resolve the digest.**
-   `az acr manifest show-metadata "$REGISTRY.azurecr.io/$REPO:$TAG" --query digest -o tsv`,
-   matching the command `infra/azure/README.md` already documents.
+4. **Resolve the digest — from the build run, not from the tag.**
+   The build is run as
+   `az acr build … --no-logs --query 'outputImages[0].digest' -o tsv .`, so the
+   digest is the one the build produced.
+
+   > **Corrected 2026-07-31 (final review, IMPORTANT 4).** This step originally
+   > specified a follow-up
+   > `az acr manifest show-metadata "$REGISTRY.azurecr.io/$REPO:$TAG" --query digest -o tsv`,
+   > matching `infra/azure/README.md`. That asks what the tag points at *now*:
+   > two operators deploying the same clean commit produce the same tag, so the
+   > second push re-points the first's tag and the first pins the second's image.
+   > A mutable indirection is the exact property this script exists to eliminate,
+   > so the digest must come from the run itself. `--no-logs` is what makes the
+   > run object rather than the log stream the command's result; the cost is that
+   > build output is no longer streamed live.
+
    An empty or malformed result is a hard failure — a wrong digest here is
    precisely the class of bug this script exists to prevent, so it must never be
    guessed or defaulted.
@@ -129,9 +142,38 @@ recover from. Therefore:
 - Only then `mv` it into place, atomically.
 - On verification failure, discard the temp file, leave the original untouched,
   and exit non-zero.
-- A `trap` removes the temp file on every exit path.
+- A `trap` removes the temp file on every exit path. The temp file is also named
+  so that any residue a SIGKILL leaves behind is gitignored and excluded from the
+  build context — it is a mode-600 copy of the secrets.
 - The script never prints the file's contents — only the old and new
   `router_image` values.
+
+### Handling the build context safely
+
+> **Added 2026-07-31 (final review, CRITICAL 2).** Not in the original design,
+> and the omission would have leaked the file this section is about.
+
+`az acr build … .` is not a local build: it tars the working directory and
+**uploads** it to the registry, honouring `.dockerignore`. The manual
+`docker buildx build` path it replaces kept the context on the local daemon, so
+nothing left the machine — switching to `az acr build` changed that, and the
+secrecy implications were never assessed at plan time.
+
+`.dockerignore` must therefore exclude `dev.tfvars`, `terraform.tfstate`
+(Terraform writes `sensitive` values to state in **plaintext**; `sensitive = true`
+only redacts CLI output), its `.backup`, the `.terraform/` provider cache, and any
+temp residue. None of it is needed by `docker/router/Dockerfile`, which builds only
+the pnpm workspace — `pnpm-workspace.yaml` is `packages/*` + `apps/*`, so `infra/`
+is not a member.
+
+The patterns are not the obvious ones. ACR compiles its own subset of Docker
+ignore syntax (`command_modules/acr/_archive_utils.py`, `IgnoreRule`): `**/x`
+becomes `^.*/x$`, which needs at least one separator and so misses a root-level
+file; `*.x` becomes `^[^/]*\.x$`, which misses a nested one; and a trailing `/`
+becomes a pattern ending in `/$`, which no archive entry can ever match — making
+`**/.terraform/` a silent no-op. Both forms of each rule are required, and
+`.terraform` must carry no trailing slash. Verify against the installed
+`IgnoreRule`/`_pack_source_code`, not by eye.
 
 ### Idempotence
 
@@ -160,14 +202,26 @@ destroy a secrets file, so it is extracted into a function and covered by
 - rewrites the `router_image` line to the new digest
 - refreshes the provenance comment to name the new tag
 - leaves every other line byte-identical
+- leaves `worker_image`'s identically-worded provenance comment alone
 - fails without writing when the fixture has no `router_image` line
-- leaves the original intact when verification fails
+- fails without writing when the fixture has two `router_image` lines
+- leaves the original intact when the rewrite fails — `awk` is shadowed on `PATH`
+  with a failing stub, and the function is called the way `main` calls it
+  (`… || true`, mirroring `… || die`), because that form disables `set -e` for
+  the whole function body; a bare call exercises a safety the script does not
+  have at the point of use
+- leaves the original intact when the rewrite truncates but exits 0 — the
+  truncated output still satisfies the content checks, so only a line-count
+  comparison catches it
+- the temp file name is gitignored
 
 Fixtures are built in a temp directory; no real tfvars is touched. The `az` and
 `terraform` invocations are single shell-outs with no branching and are not
 mocked — asserting that a mock was called would test nothing.
 
-The script must also pass `shellcheck` cleanly.
+The script must also pass `shellcheck` cleanly, and CI must actually run the
+suite: `pnpm test` is workspace-only, so `scripts/*.test.sh` needs its own step
+(it rides along in the `aca-parity` job) or the suite rots silently.
 
 ## Rollout
 
