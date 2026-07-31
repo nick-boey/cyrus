@@ -38,6 +38,12 @@ export {
 	keyVaultSecretName,
 } from "./KeyVaultSecretStore.js";
 export {
+	KeyVaultTokenStore,
+	type KeyVaultTokenStoreOptions,
+	type LinearTokenEnvelope,
+	linearTokenSecretName,
+} from "./KeyVaultTokenStore.js";
+export {
 	type DownloadedAttachment,
 	LinearExecutor,
 	type LinearExecutorOptions,
