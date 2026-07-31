@@ -52,8 +52,15 @@ apps/*/test
 **/*.tfstate
 *.tfstate.*
 **/*.tfstate.*
-tfplan
-**/tfplan
+# Saved plan files. A plan embeds sensitive values in PLAINTEXT regardless of
+# `sensitive = true`, so it leaks the same credentials state does. `-out=` takes
+# any name, so bare `tfplan` is not enough.
+tfplan*
+**/tfplan*
+*.tfplan
+**/*.tfplan
+plan.out
+**/plan.out
 # Residue of a SIGKILL'd rewrite in scripts/deploy-router-image.sh — a mode-600
 # copy of dev.tfvars, so it must never be uploaded either.
 *.tfvars.tmp.*
