@@ -225,11 +225,22 @@ runs — branch and `sha-*` tags (amd64 + arm64).
 | `CYRUS_ROUTER_ENTRA_TENANT_ID` | no | — | `entra.tenantId` (requires audience) |
 | `CYRUS_ROUTER_ENTRA_AUDIENCE` | no | — | `entra.audience` Application ID URI (requires tenant) |
 | `CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN` | no | — | `entra.allowedDomain` exact email domain |
+| `CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL` | no | — | `linearTokenStore.keyVaultUrl` — durable store for rotated Linear OAuth tokens |
 
 On every start, if the required variables are set the entrypoint regenerates
-`/data/router-config.json` from them (env is the source of truth). With no
-config variables set, an existing (e.g. bind-mounted) `router-config.json` is
-used as-is. Neither → the container exits 1 naming the missing variables.
+`/data/router-config.json` from them. With no config variables set, an existing
+(e.g. bind-mounted) `router-config.json` is used as-is. Neither → the container
+exits 1 naming the missing variables.
+
+**Exception — Linear OAuth tokens.** Env is *not* the source of truth for
+`linearToken` / `linearRefreshToken` when `CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL`
+is set. Linear rotates the refresh token on every use and access tokens live
+24 hours, so a config regenerated from a fixed env value replays an
+already-consumed token and fails permanently with HTTP 400. The router
+therefore persists each rotated pair to Key Vault and prefers the stored value
+at startup — unless the env/config refresh token has changed, which is read as
+a deliberate re-authorization and resets the chain. To re-authorize: run
+`cyrus self-auth-linear`, update the env/Key Vault seed, and restart.
 
 If you change the router port — via `CYRUS_ROUTER_PORT` or a mounted config — set `CYRUS_ROUTER_PORT` in the container environment either way (the image's HEALTHCHECK reads it) and adjust the compose port mapping to match.
 

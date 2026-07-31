@@ -66,6 +66,11 @@ All notable changes to this project will be documented in this file.
 - Router mode: the signal that releases an issue is now delivered reliably. It used to be sent once and silently dropped if the connection was down at that instant, stranding the issue. It is now stored on the device and re-sent until the router confirms it. **Router hosts and client devices must be updated together** — a device running the older version will be refused at connect with a protocol version mismatch.
 - `cyrus auth`, `cyrus check-tokens`, and `cyrus refresh-token` no longer hang after finishing their work. Each command completed successfully but never exited, leaving you to press Ctrl-C — which made them unusable in scripts and CI.
 - Forwarded and shared Slack messages are now included when you @mention Cyrus. Previously, forwarding a message (for example a Sentry alert) into a channel and @mentioning Cyrus passed along only your typed comment — the forwarded message's contents were dropped, so a forward with no comment gave Cyrus nothing to work with. The forwarded content is now part of the prompt. ([#1326](https://github.com/cyrusagents/cyrus/pull/1326))
+- Linear authentication no longer breaks after a router restart. Previously the
+  rotated Linear token was stored only on disk that is wiped on each deploy, so
+  Cyrus would stop being able to read or post to Linear — silently — within a
+  day of restarting. A dead credential is now reported once, clearly, with
+  instructions to fix it, instead of failing quietly.
 
 ### Changed
 - Per-user container secrets are now keyed by the real environment-variable name (e.g. `CLAUDE_CODE_OAUTH_TOKEN`, `GIT_TOKEN`). Existing stored secrets are migrated automatically.
