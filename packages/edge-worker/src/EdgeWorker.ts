@@ -547,6 +547,38 @@ export class EdgeWorker extends EventEmitter {
 			}
 		});
 
+		// Router mode: a session blocked on a user answer with no work in flight
+		// releases its device, so ContainerLifecycle can idle-suspend the
+		// container while it waits. Non-fatal: a failed park costs a suspend, not
+		// correctness — the container simply stays up until the next transition.
+		this.agentSessionManager.on("sessionParked", (sessionId: string) => {
+			if (this.config.platform !== "router") return;
+			try {
+				this.routerConnection?.sendSessionState(sessionId, "parked");
+			} catch (error) {
+				this.logger.error(
+					`Failed to signal parked state for session ${sessionId}; its container will stay up until the next transition`,
+					error,
+				);
+			}
+		});
+
+		// The counterpart. Durability cuts both ways: replaying a stale `parked`
+		// on a later reconnect would clear the affinity a live turn is posting
+		// under — the same hazard the `sessionResumed` listener above guards
+		// against for terminal frames.
+		this.agentSessionManager.on("sessionUnparked", (sessionId: string) => {
+			if (this.config.platform !== "router") return;
+			try {
+				this.routerConnection?.discardBufferedSessionState(sessionId);
+			} catch (error) {
+				this.logger.error(
+					`Failed to discard the buffered parked frame for session ${sessionId}`,
+					error,
+				);
+			}
+		});
+
 		// Router mode: when a session reaches a terminal state, tell the router
 		// so it can release the issue lock + session affinity. Guarded by
 		// platform inside the handler so the subscription is harmless otherwise.
@@ -7131,14 +7163,39 @@ ${input.userComment}
 		organizationId: string,
 	): AgentRunnerConfig["onAskUserQuestion"] {
 		return async (input, _sessionId, signal) => {
-			// Note: We use linearAgentSessionId (from closure) instead of the passed sessionId
-			// because the passed sessionId is the Claude session ID, not the Linear agent session ID
-			return this.askUserQuestionHandler.handleAskUserQuestion(
-				input,
-				linearAgentSessionId,
-				organizationId,
-				signal,
-			);
+			// Park for the duration of the elicitation: this await can outlive the
+			// container by hours, and it holds the SDK query open, so no terminal
+			// frame is ever sent and the router would otherwise pin the device
+			// forever (PAR-146).
+			//
+			// Only when nothing will wake the session on its own, though —
+			// suspending a container with a background build in flight freezes it,
+			// and its completion could then never arrive to wake us.
+			const canPark =
+				!this.agentSessionManager.hasPendingWork(linearAgentSessionId);
+			if (canPark) {
+				this.agentSessionManager.emit("sessionParked", linearAgentSessionId);
+			}
+			try {
+				// Note: We use linearAgentSessionId (from closure) instead of the passed sessionId
+				// because the passed sessionId is the Claude session ID, not the Linear agent session ID
+				return await this.askUserQuestionHandler.handleAskUserQuestion(
+					input,
+					linearAgentSessionId,
+					organizationId,
+					signal,
+				);
+			} finally {
+				// `finally`, not the success path: an abort or a throw leaves the
+				// session just as unparked, and a still-buffered `parked` frame
+				// would then replay over the next live turn.
+				if (canPark) {
+					this.agentSessionManager.emit(
+						"sessionUnparked",
+						linearAgentSessionId,
+					);
+				}
+			}
 		};
 	}
 
