@@ -109,8 +109,26 @@ export interface SetupUiConfig {
 	enabled: boolean;
 	/** REQUIRED when enabled. No default — the operator must state a strategy. */
 	auth?: SetupAuthMode;
+	/**
+	 * Email domain allowlist. The practical membership control for most
+	 * deployments, and cheaper than an Entra assignment policy: it keeps guest
+	 * and cross-tenant accounts out even when {@link autoProvisionUsers} is on.
+	 */
 	allowedDomain?: string;
-	/** Default FALSE. See F5 on NOR-265. */
+	/**
+	 * Whether a successful first sign-in creates the router user. Default
+	 * **true**, the intended posture for a single-organisation deployment.
+	 *
+	 * What it actually grants is narrow: a user row and an EMPTY secret record.
+	 * No credentials — the user supplies their own Claude token — and nothing
+	 * routes to them until they appear as the creator or assignee of a Linear
+	 * issue, so Linear membership is the effective gate on doing anything.
+	 *
+	 * Set it false where the Entra tenant is materially larger than the set of
+	 * people who should hold Cyrus credentials, and pair it with an Entra group
+	 * assignment or an `allowedPrincipals` policy — the flag alone restricts
+	 * nothing that sign-in has already permitted.
+	 */
 	autoProvisionUsers?: boolean;
 }
 

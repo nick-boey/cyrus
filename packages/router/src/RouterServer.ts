@@ -461,10 +461,20 @@ export class RouterServer {
 					store: this.store,
 					secrets: built.secrets,
 					requiredKeys: setupRequiredKeys,
-					// F5: default FALSE. Auto-provisioning lets any tenant user who
-					// can sign in create themselves a secret store, so it stays off
-					// until an operator has verified an Entra assignment gate.
-					autoProvisionUsers: config.setupUi.autoProvisionUsers ?? false,
+					// Defaults TRUE. Self-registration is the intended posture for a
+					// single-organisation deployment: signing in creates a user row
+					// and an EMPTY secret record, nothing more. It grants no
+					// credentials — the user still has to supply their own Claude
+					// token — and nothing routes to them until they appear as the
+					// creator or assignee of a Linear issue
+					// (`EventRouter` → `RouterStore.findUserForCreator`), so Linear
+					// membership is the effective gate.
+					//
+					// Set it false where the Entra tenant is materially larger than
+					// the set of people who should be able to hold Cyrus
+					// credentials; `setupUi.allowedDomain` is the cheaper control
+					// for the common case of keeping guests out.
+					autoProvisionUsers: config.setupUi.autoProvisionUsers ?? true,
 					logger: this.logger,
 				}),
 				// Per-process and in-memory on purpose. The router is single-replica,

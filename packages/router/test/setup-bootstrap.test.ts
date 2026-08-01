@@ -678,3 +678,22 @@ describe("resolveExecutor", () => {
 		}
 	});
 });
+
+describe("autoProvisionUsers", () => {
+	// A policy decision, not an implementation detail, and it has been reversed
+	// once already — pin both branches so a silent drift either way has to be
+	// reviewed rather than merely noticed later.
+	it("registers an unknown user when on", async () => {
+		const { bootstrap } = harness({ autoProvisionUsers: true });
+		await expect(
+			bootstrap.ensure({ email: "new@example.com" }),
+		).resolves.toMatchObject({ createdUser: true });
+	});
+
+	it("refuses an unknown user when off", async () => {
+		const { bootstrap } = harness({ autoProvisionUsers: false });
+		await expect(
+			bootstrap.ensure({ email: "new@example.com" }),
+		).rejects.toMatchObject({ status: 403 });
+	});
+});

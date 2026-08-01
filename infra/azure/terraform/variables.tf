@@ -411,7 +411,7 @@ variable "setup_ui_token_store_sas_expiry" {
 }
 
 variable "setup_ui_allowed_group_object_ids" {
-  description = "Entra GROUP object ids allowed to authenticate to the app, rendered into authConfigs `defaultAuthorizationPolicy.allowedPrincipals.groups`. Empty (the default) sends no policy at all — an empty policy is not the same as an absent one. Populating this, or attesting to an Entra assignment requirement via setup_ui_assignment_required_verified, is a HARD PREREQUISITE for setup_ui_auto_provision_users (F5): otherwise any account in the tenant can sign in and provision itself a Cyrus user with a secret store."
+  description = "Entra GROUP object ids allowed to authenticate to the app, rendered into authConfigs `defaultAuthorizationPolicy.allowedPrincipals.groups`. Empty (the default) sends no policy at all — an empty policy is not the same as an absent one. Populate this (or attest via setup_ui_assignment_required_verified) when the Entra tenant is larger than the set of people who should hold Cyrus credentials — it is what makes setup_ui_auto_provision_users = false meaningful, since a tenant-wide sign-in is otherwise the only gate."
   type        = list(string)
   default     = []
 }
@@ -501,23 +501,13 @@ variable "setup_ui_allowed_domain" {
 }
 
 variable "setup_ui_auto_provision_users" {
-  description = "Create a router user record on a teammate's first successful /setup sign-in. Defaults FALSE (F5): auto-provisioning converts 'can obtain a token for this app' into 'is a Cyrus user with a secret store', which is only safe once app access is genuinely restricted. Terraform therefore refuses to set this true unless membership is constrained — either an authConfigs allowedPrincipals policy (setup_ui_allowed_group_object_ids / setup_ui_allowed_principal_object_ids) or an attested Entra assignment requirement (setup_ui_assignment_required_verified)."
+  description = "Create a router user record on a teammate's first successful /setup sign-in. Defaults TRUE — the intended posture for a single-organisation deployment, where self-registration is wanted. What it grants is narrow: a user row and an EMPTY secret record. It hands out no credentials (the user supplies their own Claude token) and nothing routes to a user until they appear as the creator or assignee of a Linear issue, so Linear membership is the effective gate on doing anything. Set FALSE where the Entra tenant is materially larger than the set of people who should hold Cyrus credentials, and pair that with a membership gate — an authConfigs allowedPrincipals policy (setup_ui_allowed_group_object_ids / setup_ui_allowed_principal_object_ids) or an attested Entra assignment requirement. Note that setup_ui_allowed_domain is the cheaper control for the common case of excluding guest and cross-tenant accounts."
   type        = bool
-  default     = false
-
-  validation {
-    condition = (
-      !var.setup_ui_auto_provision_users ||
-      var.setup_ui_assignment_required_verified ||
-      length(var.setup_ui_allowed_group_object_ids) > 0 ||
-      length(var.setup_ui_allowed_principal_object_ids) > 0
-    )
-    error_message = "setup_ui_auto_provision_users = true requires a membership gate: populate setup_ui_allowed_group_object_ids (or setup_ui_allowed_principal_object_ids), or run the Entra assignment commands in README §11 step 3 and set setup_ui_assignment_required_verified = true. Without one of these, ANY account in the tenant can sign in and self-provision a Cyrus user — 'Assignment required' is not on by default, and setup_ui_allowed_domain does not provide it."
-  }
+  default     = true
 }
 
 variable "setup_ui_assignment_required_verified" {
-  description = "ATTESTATION that the app registration's service principal has appRoleAssignmentRequired = true AND the Cyrus users group is actually assigned to it — BOTH, verified with the `az ad sp show` / `az rest` readback in README §11 step 3. Setting appRoleAssignmentRequired without performing the assignment locks everyone out; performing the assignment without setting the flag restricts nobody. This is the alternative to an authConfigs allowedPrincipals policy for satisfying the setup_ui_auto_provision_users prerequisite."
+  description = "ATTESTATION that the app registration's service principal has appRoleAssignmentRequired = true AND the Cyrus users group is actually assigned to it — BOTH, verified with the `az ad sp show` / `az rest` readback in README §11 step 3. Setting appRoleAssignmentRequired without performing the assignment locks everyone out; performing the assignment without setting the flag restricts nobody. This is the alternative to an authConfigs allowedPrincipals policy when restricting who may reach /setup at all."
   type        = bool
   default     = false
 }

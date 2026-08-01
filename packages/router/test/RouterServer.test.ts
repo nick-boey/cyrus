@@ -719,3 +719,53 @@ describe("RouterServer without setupUi", () => {
 		});
 	});
 });
+
+describe("RouterServer autoProvisionUsers default", () => {
+	// Pins the SHIPPED default by exercising it end to end: an unknown
+	// principal provisioning successfully is the only observable difference
+	// between true and false, so anything less than a real request would pass
+	// regardless of the value.
+	it("lets an unknown principal register when setupUi omits the field", async () => {
+		const server = new RouterServer({
+			port: 0,
+			host: "127.0.0.1",
+			dbPath: join(mkdtempSync(join(tmpdir(), "router-autoprov-")), "r.db"),
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			containers: {
+				image: "example/worker:test",
+				routerUrlForContainers: "ws://127.0.0.1:9/",
+				repositories: [],
+			},
+			setupUi: { enabled: true, auth: { mode: "dev-insecure-headers" } },
+		});
+		await server.start();
+		try {
+			const base = `http://127.0.0.1:${server.port}`;
+			const identity = { "x-ms-client-principal-name": "stranger@example.com" };
+
+			const page = await fetch(`${base}/setup`, { headers: identity });
+			expect(page.status).toBe(200);
+			const csrf = /name="csrf" value="([^"]+)"/.exec(await page.text())?.[1];
+			expect(csrf).toBeTruthy();
+
+			const provision = await fetch(`${base}/setup/provision`, {
+				method: "POST",
+				headers: {
+					...identity,
+					"content-type": "application/x-www-form-urlencoded",
+				},
+				body: `csrf=${encodeURIComponent(String(csrf))}`,
+			});
+
+			// The whole point: with the default flipped to false this is a 403.
+			expect(provision.status).not.toBe(403);
+			expect(server.store.listUsers().map((u) => u.email)).toContain(
+				"stranger@example.com",
+			);
+		} finally {
+			await server.stop();
+		}
+	});
+});

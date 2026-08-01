@@ -543,7 +543,7 @@ path a request can take to reach the router, prefer `entra-token`.
       "idTokenAudience": "00000000-0000-0000-0000-000000000000"
     },
     "allowedDomain": "example.com",
-    "autoProvisionUsers": false
+    "autoProvisionUsers": true
   }
 }
 ```
@@ -564,20 +564,34 @@ Equivalent Docker environment variables:
 | `CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE` | yes if mode is `entra-token` | `setupUi.auth.idTokenAudience` |
 | `CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP` | yes, must be `true`, if mode is `easyauth-headers` | `setupUi.auth.verifiedHeaderStrip` |
 | `CYRUS_ROUTER_SETUP_UI_ALLOWED_DOMAIN` | no | `setupUi.allowedDomain` |
-| `CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION` | no (default `false`) | `setupUi.autoProvisionUsers` |
+| `CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION` | no (default `true`) | `setupUi.autoProvisionUsers` |
 
-### Auto-provisioning stays off by default
+### Auto-provisioning is on by default
 
-`autoProvisionUsers` defaults to **false**. `allowedDomain` does not change
-that: a domain check confirms an account is in the right tenant, not that it
-belongs to one of your teammates, so on its own it is not an admission gate.
-Turning auto-provisioning on is only safe once something else already refuses
-sign-in to everyone else in the tenant — an Entra app-role assignment, or an
-`authConfigs` allowed-principals policy. With auto-provisioning off, a
-registered teammate's first visit shows a "Set up your account" screen; anyone
-else gets a 403 naming the exact `cyrus router users add <email>` command to
-run. See "Restrict who can sign in" in `infra/azure/README.md` for both
-supported ways to add that gate.
+`autoProvisionUsers` defaults to **true**: a teammate's first visit shows a
+"Set up your account" button, and clicking it registers them. That is the
+intended posture for a single-organisation deployment, where you want people
+to onboard themselves.
+
+Be clear about what it does and does not grant. Registering creates a user row
+and an **empty** secret record — no credentials. The user still has to supply
+their own Claude token, and nothing routes to them until they appear as the
+creator or assignee of a Linear issue. So in practice the gates on doing
+anything useful are *having a Claude subscription* and *being in Linear*,
+neither of which this page hands out.
+
+The case for turning it off is when your Entra tenant is materially larger
+than the set of people who should be able to hold Cyrus credentials — a big
+company with a small Cyrus team. Then set it false, and add a real membership
+gate: an Entra app-role assignment or an `authConfigs` allowed-principals
+policy. Note that `allowedDomain` is *not* that gate — a domain check confirms
+an account is in the right tenant, not that it belongs to a teammate — but it
+is worth setting anyway, because it is the cheapest way to keep guest and
+cross-tenant accounts out. See "Restrict who can sign in" in
+`infra/azure/README.md` for both supported gates.
+
+With auto-provisioning off, an unregistered visitor gets a 403 naming the
+exact `cyrus router users add <email>` command to run.
 
 ### Rotation: a saved value doesn't reach a running worker
 
