@@ -59,6 +59,22 @@ export type AgentSessionManagerEvents = {
 	 * `sessionTerminal`, and what keeps terminal reporting monotonic.
 	 */
 	sessionResumed: (sessionId: string) => void;
+	/**
+	 * Emitted when a session blocks on a user answer with no work in flight.
+	 * Router platform mode listens for this to send a non-terminal `parked`
+	 * frame, which releases session affinity so the container can be
+	 * idle-suspended while it waits — without releasing the issue lock, since
+	 * the session is paused rather than finished.
+	 */
+	sessionParked: (sessionId: string) => void;
+	/**
+	 * Emitted when a parked session stops waiting — answered, cancelled, or
+	 * aborted. Router platform mode listens for this to drop any still-unacked
+	 * `parked` frame, so a later reconnect cannot replay it over a live turn.
+	 * The counterpart to `sessionParked`, exactly as `sessionResumed` is to
+	 * `sessionTerminal`.
+	 */
+	sessionUnparked: (sessionId: string) => void;
 };
 
 /**
@@ -530,9 +546,26 @@ export class AgentSessionManager extends EventEmitter {
 		if (!runner?.getPendingWork) return null;
 		const pendingWork = runner.getPendingWork();
 		return pendingWork.sessionCrons.length > 0 ||
-			pendingWork.backgroundTasks.length > 0
+			pendingWork.backgroundTasks.length > 0 ||
+			(pendingWork.liveBackgroundTasks?.length ?? 0) > 0
 			? pendingWork
 			: null;
+	}
+
+	/**
+	 * Whether this session has any work that will wake it later.
+	 *
+	 * Used as the "safe to park?" gate: a session blocked on a user answer with
+	 * a background build still running must NOT be parked, because suspending
+	 * the container freezes that build — and its completion, which would
+	 * normally wake the session, can then never arrive.
+	 *
+	 * A runner that reports nothing (an older runner, or one without
+	 * `getPendingWork`) reads as "no pending work". That is deliberate: the
+	 * conservative alternative would block parking forever for those runners.
+	 */
+	hasPendingWork(sessionId: string): boolean {
+		return this.getRunnerPendingWork(sessionId) !== null;
 	}
 
 	private consumeStopRequest(linearAgentActivitySessionId: string): boolean {

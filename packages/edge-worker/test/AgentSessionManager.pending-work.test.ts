@@ -331,4 +331,61 @@ describe("AgentSessionManager pending-work activities", () => {
 		);
 		expect(thought).toBeDefined();
 	});
+
+	// ── hasPendingWork: the "safe to park?" gate ───────────────────────────
+	// A session blocked on the user may only release its device when nothing
+	// will wake it on its own. Suspending a container with a background build
+	// in flight would freeze that build.
+
+	describe("hasPendingWork", () => {
+		it("is true when only live background tasks exist", () => {
+			// The mid-turn case: the Stop hook has not fired, so both of its
+			// arrays are empty, yet real work is running.
+			setup({
+				sessionCrons: [],
+				backgroundTasks: [],
+				liveBackgroundTasks: [
+					{ taskId: "t1", taskType: "bash", description: "pnpm build" },
+				],
+			});
+
+			expect(manager.hasPendingWork(sessionId)).toBe(true);
+		});
+
+		it("is true for session crons", () => {
+			setup(PENDING_WORK);
+
+			expect(manager.hasPendingWork(sessionId)).toBe(true);
+		});
+
+		it("is false when every pending-work source is empty", () => {
+			setup({
+				sessionCrons: [],
+				backgroundTasks: [],
+				liveBackgroundTasks: [],
+			});
+
+			expect(manager.hasPendingWork(sessionId)).toBe(false);
+		});
+
+		it("is false when the runner omits liveBackgroundTasks entirely", () => {
+			// An older runner that predates the level signal: absent means unknown,
+			// which we treat as empty rather than blocking parking forever.
+			setup({ sessionCrons: [], backgroundTasks: [] });
+
+			expect(manager.hasPendingWork(sessionId)).toBe(false);
+		});
+
+		it("is false when the runner does not report pending work at all", () => {
+			setup(null);
+
+			expect(manager.hasPendingWork(sessionId)).toBe(false);
+		});
+
+		it("is false for an unknown session", () => {
+			setup(null);
+
+			expect(manager.hasPendingWork("no-such-session")).toBe(false);
+		});
+	});
 });
