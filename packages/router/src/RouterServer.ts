@@ -35,6 +35,10 @@ import { RouterStore } from "./RouterStore.js";
 import { SecretStore, type SecretStoreBackend } from "./SecretStore.js";
 import { StateBackup } from "./StateBackup.js";
 import {
+	type SetupUiConfig,
+	validateSetupAuthConfig,
+} from "./setup/principal.js";
+import {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
 } from "./TerminalTeardown.js";
@@ -212,6 +216,16 @@ export interface RouterServerConfig {
 	};
 	/** Test seam for deterministic verification without a remote JWKS. */
 	entraTokenVerifier?: EntraTokenVerifier;
+	/**
+	 * Authenticated `/setup*` management UI. Opt-in and off by default.
+	 *
+	 * `setupUi.auth` is deliberately required when enabled: how identity is
+	 * established is an explicit operator choice, never inferred from `entra`
+	 * above (which governs enrollment bearer tokens for `/enroll` and says
+	 * nothing about what sits in front of this process). See
+	 * {@link validateSetupAuthConfig}.
+	 */
+	setupUi?: SetupUiConfig;
 }
 
 /**
@@ -265,6 +279,17 @@ export class RouterServer {
 	}
 
 	constructor(config: RouterServerConfig) {
+		// Before anything else: an ambiguous or unsafe setup-auth strategy must
+		// refuse to start rather than serve /setup with no enforceable trust
+		// boundary. `config.host ?? "127.0.0.1"` mirrors the default applied at
+		// listen() below, so the validator sees the host Fastify will really bind
+		// — the Docker entrypoint defaults it to 0.0.0.0, which is exactly the
+		// case `dev-insecure-headers` must refuse.
+		if (config.setupUi) {
+			validateSetupAuthConfig(config.setupUi, {
+				bindHost: config.host ?? "127.0.0.1",
+			});
+		}
 		this.config = config;
 		this.logger = config.logger ?? { info: () => {}, warn: () => {} };
 		this.store = new RouterStore(config.dbPath);

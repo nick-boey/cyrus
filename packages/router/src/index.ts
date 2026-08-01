@@ -80,6 +80,19 @@ export {
 	type StateBackupOptions,
 } from "./StateBackup.js";
 export {
+	parseEasyAuthPrincipal,
+	requireSetupPrincipal,
+	SETUP_ID_TOKEN_HEADER,
+	type SetupAuthConfig,
+	SetupAuthError,
+	type SetupAuthMode,
+	type SetupIdTokenVerifier,
+	type SetupPrincipal,
+	type SetupPrincipalDeps,
+	type SetupUiConfig,
+	validateSetupAuthConfig,
+} from "./setup/principal.js";
+export {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
 	type TerminalTeardownAction,

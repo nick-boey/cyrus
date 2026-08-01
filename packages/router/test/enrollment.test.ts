@@ -119,15 +119,15 @@ describe("Entra-gated enrollment", () => {
 		expect((await enroll(undefined)).status).toBe(401);
 	});
 
-	it.each([
-		v1Issuer,
-		v2Issuer,
-	])("accepts issuer %s and binds the token email", async (issuer) => {
-		expect((await enroll(await token({ issuer }))).status).toBe(200);
-		expect(
-			(await enroll(await token(), { codeEmail: "bob@example.com" })).status,
-		).toBe(401);
-	});
+	it.each([v1Issuer, v2Issuer])(
+		"accepts issuer %s and binds the token email",
+		async (issuer) => {
+			expect((await enroll(await token({ issuer }))).status).toBe(200);
+			expect(
+				(await enroll(await token(), { codeEmail: "bob@example.com" })).status,
+			).toBe(401);
+		},
+	);
 
 	it.each([
 		["wrong audience", { audience: "api://other" }],
@@ -175,6 +175,24 @@ describe("Entra-gated enrollment", () => {
 						claims: { preferred_username: "alice@evil-example.com" },
 					}),
 					{ allowedDomain: "example.com", codeEmail: "alice@evil-example.com" },
+				)
+			).status,
+		).toBe(403);
+	});
+
+	it("rejects an email whose local part smuggles the allowed domain", async () => {
+		// `alice@example.com@evil.test` splits to
+		// ["alice", "example.com", "evil.test"] — reading [1] rather than the
+		// last segment would have matched an allowlist of "example.com".
+		const smuggled = "alice@example.com@evil.test";
+		expect(
+			(
+				await enroll(
+					await token({ claims: { preferred_username: smuggled } }),
+					{
+						allowedDomain: "example.com",
+						codeEmail: smuggled,
+					},
 				)
 			).status,
 		).toBe(403);
