@@ -105,7 +105,16 @@ export class ContainerLifecycle {
 					);
 					continue;
 				}
-				const idleSince = row.lastRoutedMs ?? row.createdMs;
+				// `parkedAtMs` is when a session on this device blocked on a user
+				// answer. Without it the clock is `lastRoutedMs`, so an agent that
+				// worked for twenty minutes and only then asked a question would be
+				// suspended on the very next tick — the clock having expired while
+				// it was legitimately busy.
+				const idleSince = Math.max(
+					row.lastRoutedMs ?? 0,
+					row.parkedAtMs ?? 0,
+					row.createdMs,
+				);
 				const idleForMs = now - idleSince;
 				if (idleForMs > this.idleStopMs) {
 					// `status` is read only once the clock already qualifies, so the
@@ -121,6 +130,7 @@ export class ContainerLifecycle {
 							`Idle-stopped container for ${row.issueKey} ` +
 								`(device=${row.deviceId} affinity=${affinity} ` +
 								`lastRoutedMs=${row.lastRoutedMs ?? "none"} ` +
+								`parkedAtMs=${row.parkedAtMs ?? "none"} ` +
 								`createdMs=${row.createdMs} ` +
 								`idleForMs=${idleForMs} idleStopMs=${this.idleStopMs} ` +
 								`status=${status})`,

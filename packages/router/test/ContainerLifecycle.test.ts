@@ -148,6 +148,100 @@ describe("ContainerLifecycle", () => {
 		expect(docker.destroy).not.toHaveBeenCalled();
 	});
 
+	// ── parked devices ─────────────────────────────────────────────────────
+	// A parked session releases affinity but is NOT finished. The idle clock
+	// must therefore run from when it parked, not from the last route.
+
+	it("does not idle-stop a device that parked recently, however old the last route", async () => {
+		// The PAR-146 shape inverted: the agent worked for a long time and only
+		// then asked its question. Clocking from lastRoutedMs would suspend it on
+		// the very next sweep, the clock having expired while it was busy.
+		const { createdMs, deviceId } = makeContainerDevice("PAR-146", "docker");
+		const docker = fakeExecutor("docker", { status: "running" });
+		const idleStopMs = 300_000;
+		// No route since creation, so `createdMs` — 20 minutes stale — is the
+		// timestamp the old clock would have used.
+		const now = createdMs + 20 * 60_000;
+		store.setDeviceParkedAt(deviceId, now - 120_000); // parked 2 minutes ago
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			logger,
+			now: () => now,
+		});
+
+		await lifecycle.sweep();
+
+		expect(docker.stop).not.toHaveBeenCalled();
+	});
+
+	it("idle-stops a device parked longer than idleStopMs", async () => {
+		const { createdMs, deviceId } = makeContainerDevice("PAR-146", "docker");
+		const docker = fakeExecutor("docker", { status: "running" });
+		const idleStopMs = 300_000;
+		const now = createdMs + 20 * 60_000;
+		store.setDeviceParkedAt(deviceId, now - idleStopMs - 1);
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			logger,
+			now: () => now,
+		});
+
+		await lifecycle.sweep();
+
+		expect(docker.stop).toHaveBeenCalledWith("PAR-146");
+	});
+
+	it("never idle-stops a parked device that still holds affinity", async () => {
+		// Belt and braces: the affinity gate is unchanged by the parked work, and
+		// a device with any live session must survive however stale its stamps.
+		const { createdMs, deviceId } = makeContainerDevice("PAR-146", "docker");
+		store.setDeviceParkedAt(deviceId, createdMs);
+		store.setSessionAffinity("sess-other", deviceId);
+		const docker = fakeExecutor("docker", { status: "running" });
+		const idleStopMs = 300_000;
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			logger,
+			now: () => createdMs + idleStopMs * 10,
+		});
+
+		await lifecycle.sweep();
+
+		expect(docker.stop).not.toHaveBeenCalled();
+	});
+
+	it("logs parkedAtMs alongside the other idle-stop inputs", async () => {
+		const { createdMs, deviceId } = makeContainerDevice("PAR-LOG", "docker");
+		const docker = fakeExecutor("docker", { status: "running" });
+		const idleStopMs = 300_000;
+		const now = createdMs + 20 * 60_000;
+		const parkedAt = now - idleStopMs - 1;
+		store.setDeviceParkedAt(deviceId, parkedAt);
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			logger,
+			now: () => now,
+		});
+
+		await lifecycle.sweep();
+
+		const line = String(logger.info.mock.calls.at(-1)?.[0]);
+		expect(line).toContain(`parkedAtMs=${parkedAt}`);
+		expect(line).toContain(`idleForMs=${idleStopMs + 1}`);
+	});
+
 	it("stale-destroys a container past staleDestroyMs: destroy() + delete device row", async () => {
 		const { createdMs } = makeContainerDevice("CYPACK-2", "docker");
 		const docker = fakeExecutor("docker", { status: "stopped" });

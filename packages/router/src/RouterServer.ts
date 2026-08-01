@@ -59,8 +59,8 @@ import { registerWorkspacesRoute } from "./workspaces.js";
 const DEFAULT_EVENT_TTL_MS = 48 * 60 * 60 * 1000;
 /** How often {@link EventRouter.sweepExpired} runs. */
 const SWEEP_INTERVAL_MS = 60_000;
-/** 15 minutes — default {@link RouterContainersConfig.idleStopMs}. */
-const DEFAULT_IDLE_STOP_MS = 900_000;
+/** 5 minutes — default {@link RouterContainersConfig.idleStopMs}. */
+const DEFAULT_IDLE_STOP_MS = 300_000;
 /** 14 days — default {@link RouterContainersConfig.staleDestroyMs}. */
 const DEFAULT_STALE_DESTROY_MS = 1_209_600_000;
 /** 10 minutes — default terminal cleanup grace before forced destruction. */
