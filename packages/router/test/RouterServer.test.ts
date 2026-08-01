@@ -673,3 +673,49 @@ describe("RouterServer setupUi auth strategy", () => {
 		server.stop();
 	});
 });
+
+describe("RouterServer without setupUi", () => {
+	// The load-bearing "additive and non-breaking" guarantee: a deployment that
+	// does not opt in must behave exactly as it did before this feature existed.
+	// Driven over real HTTP rather than a Fastify inject seam, so this also
+	// covers route registration actually not happening.
+	async function withServer(
+		fn: (base: string) => Promise<void>,
+		extra: Record<string, unknown> = {},
+	) {
+		const server = new RouterServer({
+			port: 0,
+			dbPath: join(mkdtempSync(join(tmpdir(), "router-nosetup-")), "r.db"),
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			...extra,
+		});
+		await server.start();
+		try {
+			await fn(`http://127.0.0.1:${server.port}`);
+		} finally {
+			await server.stop();
+		}
+	}
+
+	it.each([
+		["GET", "/setup"],
+		["POST", "/setup/provision"],
+		["POST", "/setup/save"],
+		["POST", "/setup/variables"],
+		["GET", "/setup/assets/pico.css"],
+		["GET", "/setup/assets/htmx.js"],
+	])("404s %s %s when setupUi is absent", async (method, path) => {
+		await withServer(async (base) => {
+			const response = await fetch(`${base}${path}`, { method });
+			expect(response.status).toBe(404);
+		});
+	});
+
+	it("still answers /healthz", async () => {
+		await withServer(async (base) => {
+			expect((await fetch(`${base}/healthz`)).status).toBe(200);
+		});
+	});
+});
