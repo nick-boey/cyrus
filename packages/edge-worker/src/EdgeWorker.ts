@@ -449,6 +449,12 @@ export class EdgeWorker extends EventEmitter {
 			getIssueTracker: (linearWorkspaceId: string) => {
 				return this.getIssueTrackerForWorkspace(linearWorkspaceId);
 			},
+			// Routed through the same events as the AskUserQuestion path, so both
+			// kinds of "blocked on the user" converge on one park/unpark handler.
+			onSessionParked: (agentSessionId: string) =>
+				this.agentSessionManager.emit("sessionParked", agentSessionId),
+			onSessionUnparked: (agentSessionId: string) =>
+				this.agentSessionManager.emit("sessionUnparked", agentSessionId),
 		};
 		this.repositoryRouter = new RepositoryRouter(repositoryRouterDeps);
 		this.gitService = new GitService({ cyrusHome: this.cyrusHome });
