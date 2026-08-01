@@ -7,6 +7,7 @@ import {
 	type KeyWrapper,
 	MAX_BUNDLE_BYTES,
 	openBundle,
+	type SealedBundle,
 	sealBundle,
 } from "../src/setup/envelope.js";
 
@@ -44,6 +45,35 @@ function fakeWrapper(version = VERSION_A): KeyWrapper {
 			return dek;
 		},
 	};
+}
+
+/**
+ * A **real** {@link KeyVaultKeyWrapper} whose token and fetch seams are
+ * counted, so a test can prove that a rejected envelope cost zero credential
+ * acquisitions and zero Key Vault round trips.
+ */
+function countedVaultWrapper() {
+	let tokenCalls = 0;
+	const fetchFn = vi.fn(
+		async (input: string | URL, init?: RequestInit) =>
+			new Response(
+				JSON.stringify({
+					kid: String(input).replace(/\/(un)?wrapkey\?.*$/, ""),
+					value: (JSON.parse(String(init?.body)) as { value: string }).value,
+				}),
+				{ status: 200 },
+			),
+	);
+	const wrapper = new KeyVaultKeyWrapper({
+		keyId: KEY_ID,
+		tokenProvider: async () => {
+			tokenCalls++;
+			return "vault-token";
+		},
+		fetchFn: fetchFn as unknown as typeof fetch,
+		sleep: async () => {},
+	});
+	return { wrapper, fetchFn, tokenCalls: () => tokenCalls };
 }
 
 /** A wrapper that fails the test if it is ever touched. */
@@ -274,6 +304,80 @@ describe("openBundle never touches the key wrapper for a hostile version", () =>
 	});
 });
 
+/**
+ * R2-09: only `KekVersion` used to be validated up front. A principal with
+ * Table write access could put junk in any other column and still force a
+ * vault-scoped token acquisition plus a doomed unwrap call on every read.
+ *
+ * The pass criterion is the call counts, exactly as in the hostile-`KekVersion`
+ * suites above — not the wording of the rejection.
+ */
+describe("openBundle refuses a malformed stored field before any token or network use", () => {
+	const aad = `u${"a".repeat(64)}|bundle|1`;
+	const b64 = (bytes: number) => Buffer.alloc(bytes, 7).toString("base64");
+
+	const MALFORMED: ReadonlyArray<[string, keyof SealedBundle, string]> = [
+		// Not canonical standard base64. Node's decoder silently accepts all of
+		// these, which is exactly why a round-trip check is needed.
+		["wrappedDek: not base64 at all", "wrappedDek", "!!!!"],
+		["wrappedDek: base64url alphabet", "wrappedDek", "-_-_"],
+		["wrappedDek: unpadded", "wrappedDek", "AAA"],
+		["wrappedDek: empty", "wrappedDek", ""],
+		["iv: not base64 at all", "iv", "!!!!"],
+		["authTag: base64url alphabet", "authTag", "-_-_"],
+		["ciphertext: not base64 at all", "ciphertext", "!!!!"],
+		["ciphertext: empty", "ciphertext", ""],
+		// `ciphertext` has the loosest bounds of any field (1 byte .. the bundle
+		// ceiling), so these decode to a permitted length and can only be caught
+		// by the canonicality check itself — not incidentally by a length rule.
+		["ciphertext: base64url alphabet", "ciphertext", "-_-_"],
+		["ciphertext: non-canonical trailing bits", "ciphertext", "AB=="],
+		["ciphertext: unpadded", "ciphertext", "AAAAAAA"],
+		["ciphertext: embedded newline", "ciphertext", "AAAAAAAA\n"],
+		// Canonical base64, wrong length.
+		["wrappedDek: under the floor", "wrappedDek", b64(31)],
+		["wrappedDek: over the RSA-4096 ceiling", "wrappedDek", b64(513)],
+		["iv: 11 bytes", "iv", b64(11)],
+		["iv: 13 bytes", "iv", b64(13)],
+		["authTag: 15 bytes", "authTag", b64(15)],
+		["authTag: 17 bytes", "authTag", b64(17)],
+		[
+			"ciphertext: one byte over the bundle ceiling",
+			"ciphertext",
+			b64(MAX_BUNDLE_BYTES + 1),
+		],
+	];
+
+	it.each(MALFORMED)("%s", async (_label, field, value) => {
+		const sealed = await sealBundle({ K: "v" }, fakeWrapper(), aad);
+		const { wrapper, fetchFn, tokenCalls } = countedVaultWrapper();
+		await expect(
+			openBundle({ ...sealed, [field]: value }, wrapper, aad),
+		).rejects.toThrow();
+		expect(fetchFn).toHaveBeenCalledTimes(0);
+		expect(tokenCalls()).toBe(0);
+	});
+
+	it.each(["wrappedDek", "iv", "authTag", "ciphertext"] as const)(
+		"names %s in the rejection so an operator can find the bad column",
+		async (field) => {
+			const sealed = await sealBundle({ K: "v" }, fakeWrapper(), aad);
+			await expect(
+				openBundle({ ...sealed, [field]: "!!!!" }, forbiddenWrapper(), aad),
+			).rejects.toThrow(new RegExp(`"${field}"`));
+		},
+	);
+
+	it("still opens a well-formed bundle at the ceilings it enforces", async () => {
+		// A 512-byte wrapped DEK (RSA-4096) and a ciphertext at the bundle
+		// ceiling must both pass — the checks are bounds, not a fixed shape.
+		const sealed = await sealBundle({ K: "v" }, fakeWrapper(), aad);
+		expect(Buffer.from(sealed.iv, "base64")).toHaveLength(12);
+		expect(Buffer.from(sealed.authTag, "base64")).toHaveLength(16);
+		expect(await openBundle(sealed, fakeWrapper(), aad)).toEqual({ K: "v" });
+	});
+});
+
 describe("KeyVaultKeyWrapper", () => {
 	function harness(
 		responder?: (url: string, body: { alg: string; value: string }) => Response,
@@ -444,6 +548,56 @@ describe("KeyVaultKeyWrapper", () => {
 		).resolves.toBeDefined();
 		expect(fetchFn).toHaveBeenCalledTimes(2);
 		expect(sleep).toHaveBeenCalledWith(2000);
+	});
+
+	/**
+	 * R2-08: the token used to be awaited while building headers, outside the
+	 * deadline-wrapped dispatch. `DefaultAzureCredential.getToken` walks a
+	 * credential chain with no signal and no deadline of its own, so a hung
+	 * IMDS probe left the whole operation pending behind a policy that claimed
+	 * to be bounded.
+	 */
+	it("times out a never-resolving token provider instead of pending forever", async () => {
+		const fetchFn = vi.fn(async () => new Response("{}", { status: 200 }));
+		const wrapper = new KeyVaultKeyWrapper({
+			keyId: KEY_ID,
+			tokenProvider: () => new Promise<string>(() => {}),
+			fetchFn: fetchFn as unknown as typeof fetch,
+			requestTimeoutMs: 20,
+			sleep: async () => {},
+		});
+		await expect(wrapper.wrap(Buffer.alloc(32, 1))).rejects.toThrow(
+			/timed out after 20ms/,
+		);
+		expect(fetchFn).toHaveBeenCalledTimes(0);
+	});
+
+	it("acquires the token once per request, not once per retry", async () => {
+		let tokenCalls = 0;
+		let calls = 0;
+		const fetchFn = vi.fn(async (input: string | URL) => {
+			calls++;
+			if (calls === 1) return new Response("slow down", { status: 429 });
+			return new Response(
+				JSON.stringify({
+					kid: String(input).replace(/\/(un)?wrapkey\?.*$/, ""),
+					value: "AAAA",
+				}),
+				{ status: 200 },
+			);
+		});
+		const wrapper = new KeyVaultKeyWrapper({
+			keyId: KEY_ID,
+			tokenProvider: async () => {
+				tokenCalls++;
+				return "vault-token";
+			},
+			fetchFn: fetchFn as unknown as typeof fetch,
+			sleep: async () => {},
+		});
+		await wrapper.unwrap(VERSION_A, Buffer.alloc(32, 1));
+		expect(fetchFn).toHaveBeenCalledTimes(2);
+		expect(tokenCalls).toBe(1);
 	});
 
 	it("throws — never silently succeeds — when the vault keeps failing", async () => {

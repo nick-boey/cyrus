@@ -331,10 +331,17 @@ variable "entra_allowed_domain" {
 #               impersonate.
 #
 #   ┌── HARD GATE ────────────────────────────────────────────────────────────┐
-#   │ Run the machine-route regression check AND the header-strip probe from  │
-#   │ README §11 step 4 against the LIVE app. Only if both pass, record the   │
-#   │ result in `setup_auth_stage1_verified` (and, for easyauth-headers mode, │
-#   │ in `setup_ui_verified_header_strip`).                                   │
+#   │ ENFORCED, NOT ATTESTED (R2-01). A precondition on                       │
+#   │ azurerm_container_app.router reads the DEPLOYED authConfigs child out   │
+#   │ of Azure (data.azapi_resource.setup_auth_existing, setup_ui.tf) and     │
+#   │ refuses stage 2 unless a PREVIOUS apply created it and it is live.      │
+#   │ Setting all the flags true in one tfvars edit therefore fails at plan   │
+#   │ time — no boolean can satisfy it.                                       │
+#   │                                                                         │
+#   │ Separately, run the machine-route regression check from README §11 step │
+#   │ 4 against the LIVE app and record the result in                         │
+#   │ `setup_auth_stage1_verified`. That is a human observation of behaviour  │
+#   │ no data source can see; it is defence in depth, not the gate.           │
 #   └─────────────────────────────────────────────────────────────────────────┘
 #
 #   Stage 2   enable_setup_ui = true
@@ -416,13 +423,13 @@ variable "setup_ui_allowed_principal_object_ids" {
 }
 
 variable "setup_auth_stage1_verified" {
-  description = "ATTESTATION, not a switch. Set true only after `enable_setup_auth = true` has been applied in ITS OWN apply and BOTH post-apply checks in README §11 step 4 passed: (a) the machine-route regression check — /healthz, /linear-webhook and a worker WSS reconnect still work and do NOT 302 to /.auth/login/aad; and (b) the header-strip probe — a forged X-MS-CLIENT-PRINCIPAL-NAME does not authenticate. `enable_setup_ui` is refused until this is true, which is what makes the verification a gate rather than a footnote. Paste the command output into the change record."
+  description = "ATTESTATION, not a switch, and NO LONGER THE ORDERING GATE. Terraform now proves the ordering itself: `azurerm_container_app.router` carries preconditions over `data.azapi_resource.setup_auth_existing`, which reads the already-deployed authConfigs child from Azure, so stage 2 cannot plan until a PREVIOUS apply actually created it. What a data source cannot observe is whether a human ran the behavioural checks, which is what this flag still records: (a) the machine-route regression check — /healthz, /linear-webhook and a worker WSS reconnect still work and do NOT 302 to /.auth/login/aad; and (b) sign-in through /.auth/login/aad succeeds while /setup still 404s. Paste the command output into the change record."
   type        = bool
   default     = false
 }
 
 variable "enable_setup_ui" {
-  description = "STAGE 2 of the staged /setup rollout. Sets the CYRUS_ROUTER_SETUP_UI_* environment variables, which is what makes the router register the /setup* routes. Apply this ONLY in a separate, later apply, after enable_setup_auth is live and setup_auth_stage1_verified records a passing verification. Rolling back is safe and comes FIRST in a rollback: clear this, apply, confirm /setup 404s, then clear enable_setup_auth."
+  description = "STAGE 2 of the staged /setup rollout. Sets the CYRUS_ROUTER_SETUP_UI_* environment variables, which is what makes the router register the /setup* routes. Apply this ONLY in a separate, later apply, after enable_setup_auth is live and verified. Setting it in the same plan as enable_setup_auth is refused by a precondition on the Container App that reads the deployed authConfigs child from Azure — the variable validations below are a fast, friendly first line, not the enforcement. Rolling back is safe and comes FIRST in a rollback: clear this, apply, confirm /setup 404s, then clear enable_setup_auth."
   type        = bool
   default     = false
 
@@ -433,33 +440,29 @@ variable "enable_setup_ui" {
 
   validation {
     condition     = !var.enable_setup_ui || var.setup_auth_stage1_verified
-    error_message = "enable_setup_ui requires setup_auth_stage1_verified = true. Stage 1 must be applied on its own and verified live (README §11 step 4) BEFORE the routes exist. If you are setting both flags in the same apply, stop: that is the exact ordering hazard the two-stage design exists to prevent."
+    error_message = "enable_setup_ui requires setup_auth_stage1_verified = true. Stage 1 must be applied on its own and verified live (README §11 step 4) BEFORE the routes exist. Note this check is only an early, readable failure: even with this flag set, the plan is still refused unless the authConfigs child already exists in Azure."
   }
 }
 
 variable "setup_ui_auth_mode" {
-  description = "How the router establishes identity on /setup*. 'entra-token' (RECOMMENDED) cryptographically verifies the ID token the sidecar forwards in X-MS-TOKEN-AAD-ID-TOKEN, so a forged X-MS-CLIENT-PRINCIPAL-* header is ignored regardless of ingress topology; it requires the token store, which enable_setup_auth configures. 'easyauth-headers' trusts the injected identity headers and ADDITIONALLY requires setup_ui_verified_header_strip = true, recorded from a live probe."
+  description = "How the router establishes identity on /setup*. TERRAFORM-MANAGED DEPLOYMENTS MAY ONLY USE 'entra-token', which cryptographically verifies the ID token the sidecar forwards in X-MS-TOKEN-AAD-ID-TOKEN and therefore ignores a forged X-MS-CLIENT-PRINCIPAL-* header regardless of ingress topology; it requires the token store, which enable_setup_auth configures. The router also implements 'easyauth-headers', but this stack refuses it — see the validation below. The variable is kept (rather than hardcoded in router.tf) so that adding a second cryptographically verifiable mode later is a one-line change here."
   type        = string
   default     = "entra-token"
 
   validation {
-    condition     = contains(["entra-token", "easyauth-headers"], var.setup_ui_auth_mode)
-    error_message = "setup_ui_auth_mode must be 'entra-token' or 'easyauth-headers'. The router's third mode, 'dev-insecure-headers', reads headers with no verification and is refused on any non-loopback bind host — it is a laptop-only mode and is deliberately not reachable from this stack, which binds 0.0.0.0 behind public ingress."
+    condition     = var.setup_ui_auth_mode == "entra-token"
+    error_message = "setup_ui_auth_mode must be 'entra-token' in a Terraform-managed deployment. 'easyauth-headers' is refused here even though the router supports it: its trust boundary is the proxy topology in front of the process — that client-supplied X-MS-CLIENT-PRINCIPAL* headers are stripped before they reach the container — and that is a property of the deployed ingress which THIS CONFIGURATION CANNOT VERIFY. The previous design substituted an operator boolean (setup_ui_verified_header_strip) for that verification, which is an attestation, not a control. 'entra-token' verifies a signature and is independent of proxy topology, so it is correct by construction here. The mode remains supported in the application for self-hosted deployments that are not behind ACA and can reason about their own front door; it is only unreachable from this stack. The router's third mode, 'dev-insecure-headers', reads headers with no verification, is refused on any non-loopback bind host, and is likewise not reachable here."
   }
 
-  # Both rules below are conditioned on `enable_setup_ui`. This variable has a
-  # non-null DEFAULT, so an unconditional rule referencing it would fire on
-  # every stack that has never touched the setup UI — turning "the feature is
-  # off" into a failed plan. The mode is inert until stage 2 enables the routes.
-  validation {
-    condition = (
-      !var.enable_setup_ui ||
-      var.setup_ui_auth_mode != "easyauth-headers" ||
-      var.setup_ui_verified_header_strip
-    )
-    error_message = "setup_ui_auth_mode = 'easyauth-headers' requires setup_ui_verified_header_strip = true. That flag records a LIVE observation that the ingress strips client-supplied X-MS-CLIENT-PRINCIPAL* headers; without it the mode has no enforceable trust boundary. Prefer 'entra-token', which does not depend on proxy behaviour at all."
-  }
-
+  # Conditioned on `enable_setup_ui`. This variable has a non-null DEFAULT, so
+  # an unconditional rule referencing other setup inputs would fire on every
+  # stack that has never touched the setup UI — turning "the feature is off"
+  # into a failed plan. The mode is inert until stage 2 enables the routes.
+  #
+  # The `!= "entra-token"` clause is currently unreachable (the rule above
+  # admits nothing else) and is kept for two reasons: Terraform REQUIRES every
+  # validation condition to reference its own variable, and this keeps the rule
+  # correct if a second verifiable mode with different inputs is added later.
   validation {
     condition = (
       !var.enable_setup_ui ||
@@ -477,11 +480,19 @@ variable "setup_ui_id_token_audience" {
   default     = null
 }
 
-variable "setup_ui_verified_header_strip" {
-  description = "ATTESTATION required by setup_ui_auth_mode = 'easyauth-headers'. Set true only after observing, against the live FQDN, that a request carrying a forged X-MS-CLIENT-PRINCIPAL-NAME and no session cookie does NOT authenticate (README §11 step 4b). Meaningless — and ignored by the router — in 'entra-token' mode."
-  type        = bool
-  default     = false
-}
+# REMOVED (R2-01): `setup_ui_verified_header_strip`.
+#
+# It existed only to satisfy `setup_ui_auth_mode = "easyauth-headers"`, and it
+# was a boolean an operator typed — an attestation standing in for a property of
+# the deployed ingress. Now that this stack refuses the header mode outright,
+# the flag has nothing to gate, and reintroducing it would be reintroducing the
+# substitution. If `easyauth-headers` is ever wanted here, the answer is a live
+# probe executed as part of the pipeline whose result is an externally produced
+# artifact, not another `bool` in tfvars.
+#
+# Removing a variable is not a state change: nothing references it, and stale
+# `setup_ui_verified_header_strip = false` lines in a tfvars file will simply be
+# rejected as an undeclared variable. Delete the line.
 
 variable "setup_ui_allowed_domain" {
   description = "Optional email domain allowlist enforced IN THE ROUTER on /setup* (for example, 'example.com'). Defence in depth on top of the app registration's own assignment requirement, not a substitute for it: a domain check cannot distinguish an assigned teammate from any other account in the same tenant."
@@ -512,28 +523,42 @@ variable "setup_ui_assignment_required_verified" {
 }
 
 ################################################################################
-# Per-user secret storage backend (NOR-269 / D6')
+# Per-user secret storage backend (D6')
 #
-# The Azure Table, the envelope-encryption KEK, and the router's two new role
-# assignments live in setup_ui.tf and are CREATE-ONCE AND PERSISTENT — there is
-# deliberately no `enable_setup_table` flag. Gating them on a boolean while the
-# KEK carries `prevent_destroy` turns a flag flip into a guaranteed apply
-# failure; removing that guard to make the flag "work" would instead delete the
-# key that unwraps every stored secret. Neither is a rollback.
+# TWO SEPARATE CONTROLS, and conflating them is the mistake to avoid:
 #
-# The one reversible control is the SELECTOR below.
+#   enable_setup_secret_store  — CREATE the Table, the KEK and the two role
+#                                assignments. Default FALSE, so a stack that
+#                                does not want the feature gets no diff at all
+#                                (R2-06). ONE-WAY BY CONVENTION: see below.
+#
+#   enable_setup_table_backend — SELECT the Table as the router's secret
+#                                backend by rendering `containers.tableStore`.
+#                                Fully reversible in both directions. This is
+#                                the rollback control.
 ################################################################################
 
-variable "enable_setup_table_backend" {
-  description = "Point the router at the Azure Table secret backend by adding `containers.tableStore` to CYRUS_ROUTER_CONTAINERS_JSON. This is the ONLY reversible control over the feature: clearing it drops the router back to the Key Vault backend on the next revision, with no destroy and no data loss. Enable it only AFTER `cyrus router secrets migrate` has run and been verified (README → 'Key Vault to Table migration'). The Table, KEK, and role assignments exist regardless and are not affected by this flag."
+variable "enable_setup_secret_store" {
+  description = "CREATE the per-user secret storage infrastructure: the Azure Table, the envelope-encryption KEK, and the router's Storage Table Data Contributor + Key Vault Crypto User role assignments. Default FALSE so that a deployment enabling neither the setup UI nor the Table backend plans no changes and needs no key permissions on the vault. ONE-WAY BY CONVENTION: the KEK and Table carry prevent_destroy, so setting this back to false after they exist produces a hard plan error naming the protected resource rather than destroying the key that unwraps every stored secret. That refusal is intended — it is not the rollback path. To roll the FEATURE back, clear enable_setup_table_backend instead; to genuinely remove the infrastructure, follow README → 'Decommissioning the per-user secret store'."
   type        = bool
   default     = false
 }
 
+variable "enable_setup_table_backend" {
+  description = "SELECT the Azure Table secret backend by adding `containers.tableStore` to CYRUS_ROUTER_CONTAINERS_JSON. This is the ONLY reversible control over the feature: clearing it drops the router back to the Key Vault backend on the next revision, with no destroy and no data loss. Enable it only AFTER enable_setup_secret_store has been applied AND `cyrus router secrets migrate` has run and been verified (README → 'Key Vault to Table migration')."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.enable_setup_table_backend || var.enable_setup_secret_store
+    error_message = "enable_setup_table_backend requires enable_setup_secret_store = true. The selector points the router at a Table and a KEK that the creation flag is responsible for provisioning; without it there is nothing to select, and the rendered config would name resources that do not exist."
+  }
+}
+
 variable "router_default_executor" {
-  description = "Provider that users whose stored executor is the explicit `{\"type\":\"default\"}` sentinel inherit, rendered as `containers.defaultExecutor`. 'aca' matches this stack, whose sandbox group is always provisioned. Set null to omit the field entirely. SAFE BY CONSTRUCTION: a NULL/absent executor still means 'physical device' and is never captured by this default (F11), so existing users deliberately left on a device do not silently move to cloud sandboxes."
+  description = "Provider that users whose stored executor is the explicit `{\"type\":\"default\"}` sentinel inherit, rendered as `containers.defaultExecutor`. DEFAULTS TO NULL, which omits the field entirely (R2-06): a non-null default would change CYRUS_ROUTER_CONTAINERS_JSON — and so roll the single router replica — on every existing stack that never asked for the setting. Set 'aca' to opt in; it matches this stack, whose sandbox group is always provisioned. SAFE BY CONSTRUCTION even then: a NULL/absent stored executor still means 'physical device' and is never captured by this default (F11), so users deliberately left on a device do not silently move to cloud sandboxes."
   type        = string
-  default     = "aca"
+  default     = null
 
   validation {
     condition     = var.router_default_executor == null || contains(["aca", "docker"], coalesce(var.router_default_executor, "aca"))

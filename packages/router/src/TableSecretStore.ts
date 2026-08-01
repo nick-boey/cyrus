@@ -371,8 +371,10 @@ export class TableSecretStore implements SecretStoreBackend {
 			this.cache.delete(id);
 			return undefined;
 		}
-		const etag = this.requireEtag(response, "GET", url, correlationId);
+		// Parsed before the ETag is resolved because the payload is one of the
+		// two places the token may live — see `requireEtag`.
 		const entity = (await response.json()) as Record<string, unknown>;
+		const etag = this.requireEtag(response, "GET", url, correlationId, entity);
 		const bundle = await openBundle(
 			this.toSealed(entity, url, correlationId),
 			this.wrapper,
@@ -455,21 +457,50 @@ export class TableSecretStore implements SecretStoreBackend {
 	}
 
 	/**
-	 * A successful GET or write with no ETag is a protocol error, not a
-	 * default. Falling through to `""` would make the next write
-	 * unconditional, i.e. a silent upsert — the same hazard
-	 * `FileSecretStore.readAll` documents for read failures.
+	 * The entity's concurrency token, from either place the Table service is
+	 * documented to put it.
+	 *
+	 * Azure's own REST reference is inconsistent about the read path. The
+	 * published service contract (azure-rest-api-specs, and therefore the
+	 * `Table_queryEntitiesWithPartitionAndRowKey` header mapper generated into
+	 * `@azure/data-tables`) declares `ETag` as a response header on the point
+	 * GET at `odata=minimalmetadata` — but the prose "Query Entities" page
+	 * omits `ETag` from its response-header table, and the payload-format page
+	 * marks the `odata.etag` annotation `fullmetadata`-only. Meanwhile the
+	 * official SDK's `TableClient.getEntity` reads the etag out of the parsed
+	 * **body** (`odata.etag`), not the header, while its write paths read the
+	 * header. Relying on exactly one of the two would make every read of an
+	 * existing record fail if that source turned out to be the missing one.
+	 *
+	 * So: prefer the header, fall back to the payload, and fail closed when
+	 * neither is present. A missing token stays a protocol error — falling
+	 * through to `""` would make the next write unconditional, i.e. a silent
+	 * upsert, the same hazard `FileSecretStore.readAll` documents for read
+	 * failures.
 	 */
 	private requireEtag(
 		response: Response,
 		method: string,
 		url: string,
 		correlationId: string,
+		entity?: Record<string, unknown>,
 	): string {
-		const etag = response.headers.get("etag");
+		const header = response.headers.get("etag") || undefined;
+		// `odata.etag` is the OData 3.0 spelling Azure Table emits under
+		// `DataServiceVersion: 3.0`; `@odata.etag` is the OData 4.0 spelling,
+		// accepted here only so a future service version cannot break reads.
+		const payload = entity?.["odata.etag"] ?? entity?.["@odata.etag"];
+		const fromPayload =
+			typeof payload === "string" && payload.length > 0 ? payload : undefined;
+		if (header && fromPayload && header !== fromPayload) {
+			this.logger.warn(
+				`Azure Table ${method} ${url} [${correlationId}] returned disagreeing ETags (header ${header}, payload ${fromPayload}); using the header`,
+			);
+		}
+		const etag = header ?? fromPayload;
 		if (!etag) {
 			throw new Error(
-				`Azure Table ${method} ${url} returned ${response.status} with no ETag header [${correlationId}]; refusing to continue because the next write would become an unconditional upsert`,
+				`Azure Table ${method} ${url} returned ${response.status} with no ETag header and no "odata.etag" property [${correlationId}]; refusing to continue because the next write would become an unconditional upsert`,
 			);
 		}
 		return etag;
@@ -489,8 +520,11 @@ export class TableSecretStore implements SecretStoreBackend {
 			{
 				method,
 				url,
+				// The token is acquired inside `azureRequest`'s deadline rather
+				// than awaited here, so a hung credential chain cannot outlive
+				// the advertised per-request bound.
+				tokenProvider: this.tokenProvider,
 				headers: {
-					authorization: `Bearer ${await this.tokenProvider()}`,
 					"x-ms-version": X_MS_VERSION,
 					accept: ACCEPT,
 					"content-type": "application/json",

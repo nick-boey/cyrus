@@ -9,6 +9,8 @@ import type { UserSecretBundle } from "../SecretStore.js";
 const ALGORITHM = "aes-256-gcm";
 const DEK_BYTES = 32;
 const IV_BYTES = 12;
+/** AES-GCM authentication tag, in bytes. Node emits and expects exactly this. */
+const AUTH_TAG_BYTES = 16;
 const WRAP_ALG = "RSA-OAEP-256";
 const KEY_VAULT_SCOPE = "https://vault.azure.net/.default";
 const KEY_VAULT_API_VERSION = "7.4";
@@ -30,6 +32,73 @@ export const KEK_VERSION_RE = /^[0-9a-f]{32}$/;
 
 /** Key Vault object names: alphanumerics and dashes, 1–127 characters. */
 const KEY_NAME_RE = /^[0-9a-zA-Z-]{1,127}$/;
+
+/**
+ * Standard base64 (RFC 4648 §4) with canonical padding. Node's decoder is far
+ * more permissive than this: it silently ignores characters outside the
+ * alphabet, accepts the base64url alphabet, and tolerates missing padding — so
+ * a regex alone is not enough and {@link decodeSealedField} also re-encodes.
+ */
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * Bounds on the wrapped DEK. {@link openBundle} reaches Key Vault through the
+ * {@link KeyWrapper} seam and so cannot know the KEK's modulus; this is a
+ * sanity range rather than an exact length. An RSA-OAEP wrap is exactly the
+ * modulus size — 256 bytes for RSA-2048, 384 for RSA-3072, 512 for RSA-4096 —
+ * and nothing shorter than a bare DEK could carry one.
+ */
+const MIN_WRAPPED_DEK_BYTES = DEK_BYTES;
+const MAX_WRAPPED_DEK_BYTES = 512;
+
+/**
+ * Decodes one stored envelope field, refusing anything that is not canonical
+ * standard base64 of the expected length.
+ *
+ * Callers must run this before touching a token provider or the network. Only
+ * `KekVersion` used to be validated up front, so a principal with Table write
+ * access could put junk in `Iv`/`AuthTag`/`Ciphertext` and still force a Key
+ * Vault token acquisition plus a doomed unwrap call on every single read. The
+ * destination was never attacker-influenced (see {@link assertKekVersion}), but
+ * the wasted round trip was, and it is free to refuse it here instead.
+ */
+function decodeSealedField(
+	field: string,
+	value: unknown,
+	bounds: { exact?: number; min?: number; max?: number },
+): Buffer {
+	if (typeof value !== "string" || value.length === 0) {
+		throw new Error(
+			`Stored envelope field "${field}" is missing or not a string`,
+		);
+	}
+	const decoded = Buffer.from(value, "base64");
+	if (
+		value.length % 4 !== 0 ||
+		!BASE64_RE.test(value) ||
+		decoded.toString("base64") !== value
+	) {
+		throw new Error(
+			`Stored envelope field "${field}" is not canonical standard base64`,
+		);
+	}
+	if (bounds.exact !== undefined && decoded.length !== bounds.exact) {
+		throw new Error(
+			`Stored envelope field "${field}" must decode to exactly ${bounds.exact} bytes, got ${decoded.length}`,
+		);
+	}
+	if (bounds.min !== undefined && decoded.length < bounds.min) {
+		throw new Error(
+			`Stored envelope field "${field}" must decode to at least ${bounds.min} bytes, got ${decoded.length}`,
+		);
+	}
+	if (bounds.max !== undefined && decoded.length > bounds.max) {
+		throw new Error(
+			`Stored envelope field "${field}" must decode to at most ${bounds.max} bytes, got ${decoded.length}`,
+		);
+	}
+	return decoded;
+}
 
 /** Raised when a bundle is too large to store. Carries the offending name. */
 export class BundleTooLargeError extends Error {
@@ -162,23 +231,31 @@ export async function openBundle(
 	wrapper: KeyWrapper,
 	aad: string,
 ): Promise<UserSecretBundle> {
-	// Before anything else, and in particular before any token or network use.
+	// Every check below runs before anything else, and in particular before any
+	// token acquisition or network use: a malformed row must cost nothing.
 	assertKekVersion(sealed.kekVersion);
+	const wrappedDek = decodeSealedField("wrappedDek", sealed.wrappedDek, {
+		min: MIN_WRAPPED_DEK_BYTES,
+		max: MAX_WRAPPED_DEK_BYTES,
+	});
+	const iv = decodeSealedField("iv", sealed.iv, { exact: IV_BYTES });
+	const authTag = decodeSealedField("authTag", sealed.authTag, {
+		exact: AUTH_TAG_BYTES,
+	});
+	// AES-GCM ciphertext is exactly as long as its plaintext (the tag lives in
+	// its own column), so the plaintext ceiling is the ciphertext ceiling.
+	const ciphertext = decodeSealedField("ciphertext", sealed.ciphertext, {
+		min: 1,
+		max: MAX_BUNDLE_BYTES,
+	});
 
-	const dek = await wrapper.unwrap(
-		sealed.kekVersion,
-		Buffer.from(sealed.wrappedDek, "base64"),
-	);
+	const dek = await wrapper.unwrap(sealed.kekVersion, wrappedDek);
 	try {
-		const decipher = createDecipheriv(
-			ALGORITHM,
-			dek,
-			Buffer.from(sealed.iv, "base64"),
-		);
+		const decipher = createDecipheriv(ALGORITHM, dek, iv);
 		decipher.setAAD(Buffer.from(aad, "utf-8"));
-		decipher.setAuthTag(Buffer.from(sealed.authTag, "base64"));
+		decipher.setAuthTag(authTag);
 		const plaintext = Buffer.concat([
-			decipher.update(Buffer.from(sealed.ciphertext, "base64")),
+			decipher.update(ciphertext),
 			decipher.final(),
 		]);
 		const parsed: unknown = JSON.parse(plaintext.toString("utf-8"));
@@ -231,7 +308,19 @@ export interface AzureRequestPolicy {
 export interface AzureRequestInput {
 	method: string;
 	url: string;
+	/** Everything except `authorization`, which {@link azureRequest} adds. */
 	headers: Record<string, string>;
+	/**
+	 * Mints the bearer token. {@link azureRequest} awaits this **inside** the
+	 * request deadline rather than letting the caller await it while building
+	 * headers: `DefaultAzureCredential.getToken` walks a credential chain
+	 * (environment, workload identity, managed identity / IMDS, CLI) with no
+	 * signal and no deadline of its own, so a hung DNS lookup or an
+	 * unreachable IMDS endpoint would otherwise leave a request — and the
+	 * container boot behind it — pending forever despite an advertised bounded
+	 * policy. Same hazard class as Node's deadline-free `fetch`.
+	 */
+	tokenProvider: () => Promise<string>;
 	body?: string | undefined;
 	/** For error messages: "Azure Table" / "Key Vault". */
 	service: string;
@@ -299,9 +388,38 @@ function withDeadline(
 }
 
 /**
+ * Resolves `promise`, or rejects as soon as `signal` aborts.
+ *
+ * The underlying promise cannot be cancelled — an unresponsive credential
+ * chain keeps its own work pending — but the caller is released on time either
+ * way, which is what a deadline actually has to guarantee.
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	if (signal.aborted) return Promise.reject(new Error("aborted"));
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(new Error("aborted"));
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			},
+		);
+	});
+}
+
+/**
  * One Azure REST request with a deadline, a correlation id, and bounded
  * retries on 408/429/5xx honouring `Retry-After`. A 412 is a meaningful
  * answer, never a transient failure, and is never retried.
+ *
+ * The deadline covers credential acquisition as well as the round trip: the
+ * token is minted once per call, inside the first attempt's deadline, and
+ * reused across retries.
  *
  * Returns the raw {@link Response}; deciding which non-2xx statuses are
  * meaningful is the caller's job.
@@ -313,6 +431,7 @@ export async function azureRequest(
 	const correlationId = policy.newCorrelationId();
 	const noRetry = new Set<number>([412, ...(input.noRetryStatuses ?? [])]);
 	const label = `${input.service} ${input.method} ${input.url} [${correlationId}]`;
+	let token: string | undefined;
 
 	for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
 		if (policy.signal?.aborted) {
@@ -321,10 +440,13 @@ export async function azureRequest(
 		const deadline = withDeadline(policy.requestTimeoutMs, policy.signal);
 		let response: Response;
 		try {
+			// Inside the deadline on purpose — see AzureRequestInput.tokenProvider.
+			token ??= await raceAbort(input.tokenProvider(), deadline.signal);
 			response = await policy.fetchFn(input.url, {
 				method: input.method,
 				headers: {
 					...input.headers,
+					authorization: `Bearer ${token}`,
 					"x-ms-client-request-id": correlationId,
 				},
 				...(input.body === undefined ? {} : { body: input.body }),
@@ -517,10 +639,10 @@ export class KeyVaultKeyWrapper implements KeyWrapper {
 				method: "POST",
 				url,
 				headers: {
-					authorization: `Bearer ${await this.tokenProvider()}`,
 					"content-type": "application/json",
 					accept: "application/json",
 				},
+				tokenProvider: this.tokenProvider,
 				// Key Vault crypto payloads are base64url (RFC 4648 §5, unpadded)
 				// — a different encoding from the Table's standard base64.
 				body: JSON.stringify({ alg: WRAP_ALG, value }),

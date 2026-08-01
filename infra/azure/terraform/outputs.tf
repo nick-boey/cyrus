@@ -92,11 +92,16 @@ output "setup_ui_url" {
 }
 
 output "setup_table_name" {
-  description = "Name of the Azure Table holding one envelope-encrypted record per user. Created unconditionally and persistent (D6'); it is inert until `enable_setup_table_backend` points the router at it. Use with `az storage entity query --table-name <this> --auth-mode login`."
-  value       = azurerm_storage_table.setup.name
+  description = "Name of the Azure Table holding one envelope-encrypted record per user. NULL unless `enable_setup_secret_store` is true. Once created it is persistent (D6') and inert until `enable_setup_table_backend` points the router at it. Use with `az storage entity query --table-name <this> --auth-mode login`."
+  value       = one(azurerm_storage_table.setup[*].name)
+}
+
+output "setup_table_endpoint" {
+  description = "Table service endpoint of the storage account holding the per-user secret records, exactly as rendered into `containers.tableStore.endpoint`. NULL unless `enable_setup_secret_store` is true. Needed by `cyrus router secrets migrate --to-endpoint`, which names its target explicitly so the copy can run BEFORE `enable_setup_table_backend` points the router at the Table."
+  value       = var.enable_setup_secret_store ? azurerm_storage_account.this.primary_table_endpoint : null
 }
 
 output "setup_kek_versioned_key_id" {
-  description = "VERSIONED Key Vault key id of the envelope-encryption KEK, exactly as rendered into `containers.tableStore.keyId`. Not a secret — it names a public key handle, and every wrap/unwrap URL is rebuilt from this configured value rather than from anything a stored record supplies. Records pin the version segment they were wrapped with, so old versions must stay ENABLED until a re-wrap pass has run."
-  value       = azurerm_key_vault_key.setup_kek.id
+  description = "VERSIONED Key Vault key id of the envelope-encryption KEK, exactly as rendered into `containers.tableStore.keyId`. NULL unless `enable_setup_secret_store` is true. Not a secret — it names a public key handle, and every wrap/unwrap URL is rebuilt from this configured value rather than from anything a stored record supplies. Records pin the version segment they were wrapped with, so old versions must stay ENABLED until a re-wrap pass has run."
+  value       = one(azurerm_key_vault_key.setup_kek[*].id)
 }

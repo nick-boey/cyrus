@@ -5,14 +5,18 @@
 # by opposite lifecycle rules and it is worth seeing that contrast in one place:
 #
 #   1. AUTHENTICATION (D7) is STAGED and REVERSIBLE. Two variables applied in
-#      two separate applies — `enable_setup_auth` then `enable_setup_ui` — with
-#      a live verification gate in between. Both roll back cleanly.
+#      two separate applies — `enable_setup_auth` then `enable_setup_ui` — and
+#      the ordering is ENFORCED AGAINST REMOTE STATE, not attested. See
+#      `data.azapi_resource.setup_auth_existing` below and the preconditions on
+#      `azurerm_container_app.router`. Both stages roll back cleanly.
 #
-#   2. PER-USER SECRET STORAGE (D6') is CREATE-ONCE and PERSISTENT. The Table,
-#      the KEK, and the two role assignments are NOT flag-gated at all. Rollback
-#      is expressed only by dropping `containers.tableStore` from the rendered
-#      router config (`enable_setup_table_backend = false`), never by destroying
-#      the key that decrypts every stored secret.
+#   2. PER-USER SECRET STORAGE (D6') is CREATE-ONCE and PERSISTENT, but it is
+#      OPT-IN: nothing here is created unless `enable_setup_secret_store` is
+#      true, so a stack that wants neither /setup nor the Table backend gets a
+#      strictly empty diff from this file. The flag is ONE-WAY BY CONVENTION —
+#      flipping it back does not destroy the KEK or the Table; `prevent_destroy`
+#      converts that attempt into a loud plan failure. Feature rollback is the
+#      SELECTOR (`enable_setup_table_backend = false`), never a destroy.
 ################################################################################
 
 locals {
@@ -21,10 +25,29 @@ locals {
   setup_auth_enabled = var.enable_setup_auth
 
   # Stage 2 of D7. Only sets CYRUS_ROUTER_SETUP_UI_* on the container, which is
-  # what actually makes the router register /setup*. Gated by variable
-  # validation on `enable_setup_auth` + `setup_auth_stage1_verified` so it
-  # cannot legitimately be reached in the same apply as stage 1.
+  # what actually makes the router register /setup*.
   setup_ui_enabled = var.enable_setup_ui
+
+  # Resource id of the authConfigs child, assembled from INPUT VARIABLES AND A
+  # PROVIDER DATA SOURCE ONLY.
+  #
+  # DO NOT "simplify" this to
+  #   "${azurerm_container_app.router.id}/authConfigs/current"
+  # or to `azapi_resource.router_auth[0].id`, and do not swap the data source
+  # below for `name`/`parent_id` fed from a managed resource. Every one of those
+  # forms makes the id UNKNOWN at plan time on a fresh stack, which makes the
+  # data source deferred, which makes the preconditions that consume it
+  # deferred, which deletes the entire ordering guarantee — silently, and
+  # precisely in the case (first apply of a brand-new stack) that the guarantee
+  # is for. `local.router_app_name` (main.tf), `local.resource_group_name`
+  # (main.tf) and `data.azurerm_client_config.current` are all resolvable
+  # before any resource is touched, which is the whole point.
+  setup_auth_config_resource_id = join("", [
+    "/subscriptions/${data.azurerm_client_config.current.subscription_id}",
+    "/resourceGroups/${local.resource_group_name}",
+    "/providers/Microsoft.App/containerApps/${local.router_app_name}",
+    "/authConfigs/current",
+  ])
 
   # A2/D2′: an EasyAuth **ID** token carries the BARE CLIENT-ID GUID in `aud`,
   # not the `api://<client-id>` Application ID URI that `entra_audience` holds
@@ -90,12 +113,14 @@ resource "azurerm_key_vault_secret" "setup_ui_client_secret" {
 # forwarded when the ACA **token store** is enabled, which is why this container
 # exists.
 #
-# The alternative router mode, `easyauth-headers`, trusts the injected identity
-# headers instead. It ADDITIONALLY requires the live header-strip verification
-# (README §11 step 4) to have been run and its result recorded in
-# `setup_ui_verified_header_strip` — the router refuses to start otherwise. Even
-# then it is the weaker posture, because its trust boundary is proxy topology
-# rather than a signature.
+# The router ALSO implements `easyauth-headers`, which trusts the injected
+# identity headers instead of verifying a signature. That mode is NOT reachable
+# from this stack — `setup_ui_auth_mode` validation refuses it (see
+# variables.tf). Its trust boundary is proxy topology, which is a property of
+# the deployed ingress and cannot be established from configuration; a
+# Terraform-managed ACA deployment therefore always uses the token mode. The
+# mode remains supported in the application for self-hosted deployments that
+# are not behind ACA and can reason about their own front door.
 #
 # API-VERSION CONSTRAINT: `Microsoft.App/containerApps/authConfigs@2024-03-01`
 # models `BlobStorageTokenStore` with exactly one property — `sasUrlSettingName`
@@ -251,35 +276,109 @@ resource "azapi_resource" "router_auth" {
 }
 
 ################################################################################
-# PER-USER SECRET STORAGE (NOR-269 / D6′) — CREATE-ONCE AND PERSISTENT
+# STAGE-ORDERING ENFORCEMENT (R2-01)
 #
-# Read this before adding a `count` to anything below.
+# THIS DATA SOURCE IS THE GATE. Read the whole comment before editing it.
 #
-# These four resources are deliberately NOT flag-gated. An earlier design gated
-# them on `enable_setup_table` while carrying `prevent_destroy = true` on the
-# KEK, which turns "flip the flag back" into a guaranteed plan failure dressed
-# up as a feature flag. Worse, if the guard were ever removed to make the flag
-# "work", flipping it would delete the key that unwraps every stored per-user
-# secret — unrecoverably, since the wrapped DEKs are useless without it.
+# The previous design gated stage 2 on `setup_auth_stage1_verified`, an operator
+# boolean. A boolean supplied in the same plan cannot express "a PREVIOUS apply
+# created the auth child", so nothing stopped `enable_setup_auth`,
+# `setup_auth_stage1_verified` and `enable_setup_ui` all being set true at once
+# — in CI, by a merge, or by an operator editing one tfvars file. Because
+# `azapi_resource.router_auth` depends on the Container App, that single apply
+# publishes a revision that serves /setup BEFORE the auth child attaches: the
+# exact public window the staging exists to prevent.
 #
-# So: the Table, the KEK, and the two role assignments are created once and kept.
-# They are cheap (an empty Table and an unused RSA key cost effectively nothing)
-# and inert until something reads them.
+# A data source is different in kind, not just in strictness. It is answered by
+# ARM against REAL REMOTE STATE at plan time. `exists = false` is therefore a
+# statement about deployment history that no combination of input values can
+# fake. That is why the enforcement lives here and not in another validation.
 #
-# Rollback of the FEATURE is `enable_setup_table_backend = false`, which removes
-# `containers.tableStore` from the rendered router config and drops the router
-# straight back to the Key Vault backend. No destroy, no data loss, one revision.
+# THREE PROPERTIES MUST BE PRESERVED BY ANY FUTURE EDIT:
 #
-# DECOMMISSIONING is a separate, explicit, gated workflow — export and verify,
-# disable the backend, retire key versions, then remove the resources and their
-# state entries by hand. It is written up in README → "Decommissioning the
-# per-user secret store". `prevent_destroy` below is what forces that path.
+#   1. `resource_id` must stay free of managed-resource references (see
+#      `local.setup_auth_config_resource_id`). An unknown id defers the read,
+#      and a deferred read defers the preconditions — the gate quietly becomes
+#      a no-op on a fresh stack.
+#   2. `ignore_not_found = true` must stay. Without it a missing auth child is a
+#      raw ARM 404 from the provider; with it we get `exists` and can fail with
+#      an error message that says what to do.
+#   3. The consumers must be `precondition` blocks (hard failures), not `check`
+#      blocks — a `check` warns and applies anyway.
+#
+# Reading LIVE PROPERTIES (not merely existence) is deliberate: an authConfigs
+# child can exist with `platform.enabled = false`, or with the Entra identity
+# provider disabled, in which case no identity is ever injected and /setup would
+# again be reachable without authentication.
+################################################################################
+
+data "azapi_resource" "setup_auth_existing" {
+  count = var.enable_setup_ui ? 1 : 0
+
+  type        = "Microsoft.App/containerApps/authConfigs@2024-03-01"
+  resource_id = local.setup_auth_config_resource_id
+
+  # A stack that has never applied stage 1 — or a fresh stack where the Container
+  # App itself does not exist yet — answers 404 here. That is a legitimate
+  # (and expected) outcome, not a provider error, so it must not abort the plan
+  # before the preconditions get a chance to explain it.
+  ignore_not_found = true
+
+  # Whole body. The preconditions traverse it with `try()`, so a shape change in
+  # a future API version degrades to "gate refuses" rather than "gate crashes".
+  response_export_values = ["*"]
+}
+
+################################################################################
+# PER-USER SECRET STORAGE (D6′) — OPT-IN, THEN CREATE-ONCE
+#
+# Read this before changing the gating below. It reconciles two requirements
+# that look contradictory and are not.
+#
+# REQUIREMENT A (R2-06). A deployment that enables neither `setupUi` nor the
+# Table backend must produce a STRICTLY EMPTY diff. Creating these resources
+# unconditionally failed that: an unrelated apply on an existing production
+# stack would try to create an RSA key and grant the router two new roles, and
+# would hard-fail outright if the applying principal lacked "Key Vault Crypto
+# Officer". Hence `var.enable_setup_secret_store`, default FALSE.
+#
+# REQUIREMENT B (D6′). The KEK and the Table must NOT be destroyable by flipping
+# a flag back. The wrapped DEKs are useless without the KEK, so destroying it
+# destroys every stored secret irrecoverably.
+#
+# THE RECONCILIATION. `enable_setup_secret_store` is a CREATION flag and it is
+# ONE-WAY BY CONVENTION. `prevent_destroy` on the Table and the KEK is what
+# makes the convention enforceable: flipping the flag back to false does not
+# destroy them, it produces a hard plan error naming the protected resource.
+# That is the intended and documented behaviour, not a bug — the flag's job is
+# to keep resources from being created, never to remove them once they hold
+# key material.
+#
+# TRADEOFF, STATED PLAINLY. `count` + `prevent_destroy` means the flag is not
+# symmetric: on -> off is refused at plan time. An operator who genuinely wants
+# these gone must follow the decommissioning runbook (export and verify, disable
+# the backend, retire key versions, `terraform state rm`, delete by hand). We
+# accept an asymmetric flag over the alternative — a flag whose "off" position
+# silently deletes the only key that can read the data.
+#
+# The two ROLE ASSIGNMENTS carry no `prevent_destroy`: they hold no state, and
+# re-granting them is idempotent. They follow the flag in both directions so
+# that turning the feature off before it was ever used leaves no privilege
+# behind.
+#
+# ROLLBACK OF THE FEATURE remains `enable_setup_table_backend = false`, which
+# removes `containers.tableStore` from the rendered router config and drops the
+# router back to the Key Vault backend. No destroy, no data loss, one revision.
 ################################################################################
 
 resource "azurerm_storage_table" "setup" {
+  count              = var.enable_setup_secret_store ? 1 : 0
   name               = local.setup_table_name
   storage_account_id = azurerm_storage_account.this.id
 
+  # Deliberately interacts with `count` as described above: setting
+  # `enable_setup_secret_store = false` after this Table exists is REFUSED, not
+  # silently destructive.
   lifecycle {
     prevent_destroy = true
   }
@@ -289,10 +388,15 @@ resource "azurerm_storage_table" "setup" {
 # keys — it never sees a plaintext secret. `key_opts` is minimal on purpose.
 #
 # Creating this requires the APPLYING principal to hold "Key Vault Crypto
-# Officer" on the vault. The stack's existing Secrets User / Secrets Officer
-# grants are for the ROUTER identity and cover secrets only, not key operations;
-# neither one lets you create a key. See README → "Setup UI prerequisites".
+# Officer" on the vault. Verified against main.tf: the only vault grants this
+# stack makes are `router_kv_secrets_user` ("Key Vault Secrets User") and
+# `router_kv_secrets_officer` ("Key Vault Secrets Officer"), both to the ROUTER
+# identity, and both scoped to secrets — neither permits any key operation, and
+# neither applies to the principal running `terraform apply`. That missing
+# permission is exactly why this resource must not be created by a stack that
+# never asked for the feature. See README → "Setup UI prerequisites".
 resource "azurerm_key_vault_key" "setup_kek" {
+  count        = var.enable_setup_secret_store ? 1 : 0
   name         = local.setup_kek_name
   key_vault_id = azurerm_key_vault.this.id
   key_type     = "RSA"
@@ -305,6 +409,9 @@ resource "azurerm_key_vault_key" "setup_kek" {
   # against that version, with the vault and key name taken exclusively from
   # `containers.tableStore.keyId` below. Old key versions must therefore stay
   # ENABLED until a re-wrap pass has run.
+  #
+  # And see the block comment above: this guard is what makes
+  # `enable_setup_secret_store` one-way rather than data-destroying.
   lifecycle {
     prevent_destroy = true
   }
@@ -313,15 +420,18 @@ resource "azurerm_key_vault_key" "setup_kek" {
 # Table-scoped, not account-scoped: this grant must not reach the router-backups
 # blob container or the artifacts share.
 resource "azurerm_role_assignment" "router_table_data_contributor" {
-  scope                = azurerm_storage_table.setup.resource_manager_id
+  count                = var.enable_setup_secret_store ? 1 : 0
+  scope                = azurerm_storage_table.setup[0].resource_manager_id
   role_definition_name = "Storage Table Data Contributor"
   principal_id         = azurerm_user_assigned_identity.router.principal_id
 }
 
 # Vault-scoped. "Key Vault Crypto User" grants wrapKey/unwrapKey and is a
 # DIFFERENT role from the Secrets User + Secrets Officer assignments in main.tf,
-# neither of which permits any key operation.
+# neither of which permits any key operation (re-verified against main.tf when
+# this gating was added).
 resource "azurerm_role_assignment" "router_kv_crypto_user" {
+  count                = var.enable_setup_secret_store ? 1 : 0
   scope                = azurerm_key_vault.this.id
   role_definition_name = "Key Vault Crypto User"
   principal_id         = azurerm_user_assigned_identity.router.principal_id

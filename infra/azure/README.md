@@ -446,19 +446,34 @@ So the flags are split, and Terraform refuses to let you collapse them:
 | Variable | Apply | Effect |
 | --- | --- | --- |
 | `enable_setup_auth` | **first, alone** | Entra client secret, token store, `authConfigs`. `/setup` still 404s. |
-| — | **verification gate** | Steps 4a–4c below. Recorded in `setup_auth_stage1_verified`. |
+| — | **verification gate** | Steps 4a–4c below. Recorded in `setup_auth_stage1_verified`. **Ordering is enforced against Azure, not by that flag** — see below. |
 | `enable_setup_ui` | **second, separate apply** | Sets `CYRUS_ROUTER_SETUP_UI_*`, which is what registers the routes. |
 
 `enable_setup_ui = true` fails variable validation unless both
-`enable_setup_auth` and `setup_auth_stage1_verified` are already true. Setting
-all three in one tfvars edit is the exact mistake this design exists to prevent.
+`enable_setup_auth` and `setup_auth_stage1_verified` are already true — and,
+more importantly, `azurerm_container_app.router` carries preconditions over a
+data source that reads the **already-deployed** `authConfigs` child out of
+Azure. Setting all three in one tfvars edit therefore fails at **plan** time,
+because on that plan the auth child genuinely does not exist yet.
+
+The booleans are a fast, readable first line of defence; the data source is the
+actual control. A boolean an operator supplies in the same plan can only ever
+attest to intent — it cannot establish that a prior apply happened.
 
 **Rollback reverses the order**: clear `enable_setup_ui`, apply, confirm `/setup`
 returns 404, and only then clear `enable_setup_auth`.
 
+> **If you already applied an earlier revision of this stack**, the Table and
+> KEK were created unconditionally at that time. Set
+> `enable_setup_secret_store = true` to keep them. Leaving it false produces a
+> `prevent_destroy` plan error naming the protected resource — deliberately, so
+> the flag can never silently destroy the only key that can decrypt existing
+> records. Only the dev stack should be affected; this has not shipped.
+
 #### Prerequisites
 
-- The applying principal needs **Key Vault Crypto Officer** on the vault. The
+- **Only when `enable_setup_secret_store = true`:** the applying principal
+  needs **Key Vault Crypto Officer** on the vault. The
   stack creates an RSA KEK (`azurerm_key_vault_key.setup_kek`), and the existing
   Secrets User / Secrets Officer grants are for the *router* identity and cover
   secrets only — no role in this stack permits creating a key.
@@ -622,8 +637,10 @@ No `/setup` route is created.
 #### Step 5 — THE GATE
 
 **This is an acceptance criterion, not a formality.** `authConfigs` changes
-ingress behaviour for *every* path on the app, and the whole trust model of
-`easyauth-headers` mode rests on 5b. Do not proceed to stage 2 until all three
+ingress behaviour for *every* path on the app. Steps 5a and 5c are the required
+behavioural checks recorded in `setup_auth_stage1_verified`; 5b is retained as a
+defence-in-depth probe rather than the trust basis of a selectable mode, since
+Terraform no longer offers `easyauth-headers`. Do not proceed to stage 2 until all three
 pass. Paste the output into the change record.
 
 **5a — machine routes still reach the app.** A `302` to `/.auth/login/aad` on
@@ -653,7 +670,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 # A 200 at any point means STOP AND ESCALATE.
 ```
 
-If this ever returns 200, do not use `setup_ui_auth_mode = "easyauth-headers"`.
+Terraform refuses `easyauth-headers` outright — `setup_ui_auth_mode` accepts only `entra-token`, because the header mode's trust boundary is proxy topology the configuration cannot verify. A 200 here is still STOP-AND-ESCALATE: it means the ingress is injecting or passing identity you did not expect.
 Use the default `entra-token` mode, which verifies the forwarded ID token
 cryptographically and ignores `X-MS-CLIENT-PRINCIPAL-*` entirely — its trust
 boundary is a signature, not proxy topology.
@@ -672,8 +689,6 @@ Record the result:
 
 ```hcl
 setup_auth_stage1_verified = true
-# only if you intend easyauth-headers mode AND 5b passed:
-# setup_ui_verified_header_strip = true
 ```
 
 #### Step 6 — STAGE 2 APPLY: enable the routes
@@ -713,7 +728,7 @@ The Azure Table (`cyrussetup`), the envelope-encryption KEK, and the router's
 created by every apply and are independent of the `/setup` flags. Cutting the
 router **over** to them is a separate, ordered operation:
 
-1. Apply the stack. The Table and KEK now exist; the router still reads Key
+1. Set `enable_setup_secret_store = true` and apply. The Table and KEK now exist; the router still reads Key
    Vault, because `enable_setup_table_backend` is `false`.
 2. `az containerapp exec` into the replica and dry-run the copy. The target is
    named explicitly, because `containers.tableStore` is deliberately NOT in the
@@ -1119,7 +1134,7 @@ terraform/
   router.tf       router Container App + env + Files mount + custom domain flag
   sandbox.tf      azapi_resource sandbox group + Data Owner RBAC + optional ACR
   setup_ui.tf     /setup: staged EasyAuth (authConfigs + token store) AND the
-                  create-once Table/KEK/RBAC for per-user secrets — see §11
+                  opt-in, then create-once Table/KEK/RBAC for per-user secrets — see §11
   outputs.tf      paste-ready outputs (N8)
   env/dev.tfvars.example  complete variable checklist
 bicep/

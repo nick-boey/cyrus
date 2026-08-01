@@ -654,6 +654,53 @@ describe("TableSecretStore — deadlines, retries, and failure modes", () => {
 		await expect(store.get(ALICE)).rejects.toThrow(/timed out/);
 	});
 
+	/**
+	 * R2-08: the token was awaited while building headers, i.e. before the
+	 * deadline-wrapped dispatch, so a hung credential chain (DNS, IMDS,
+	 * managed identity) left the request — and any container boot waiting on
+	 * it — pending indefinitely behind a policy that advertised a bound.
+	 */
+	it("times out a never-resolving token provider instead of hanging forever", async () => {
+		const h = harness();
+		const store = h.create({
+			tokenProvider: () => new Promise<string>(() => {}),
+			requestTimeoutMs: 20,
+		});
+		await expect(store.get(ALICE)).rejects.toThrow(/timed out after 20ms/);
+		expect(h.fetchFn).not.toHaveBeenCalled();
+	});
+
+	it("releases a pending token acquisition when the shutdown signal fires", async () => {
+		const h = harness();
+		const controller = new AbortController();
+		const store = h.create({
+			signal: controller.signal,
+			tokenProvider: () => new Promise<string>(() => {}),
+			requestTimeoutMs: 600_000,
+		});
+		const pending = store.get(ALICE);
+		controller.abort();
+		await expect(pending).rejects.toThrow(/abort/i);
+		expect(h.fetchFn).not.toHaveBeenCalled();
+	});
+
+	it("acquires the token once per request, not once per retry", async () => {
+		const h = harness();
+		let tokenCalls = 0;
+		const store = h.create({
+			tokenProvider: async () => {
+				tokenCalls++;
+				return "storage-token";
+			},
+		});
+		h.fetchFn.mockImplementationOnce(
+			async () => new Response("throttled", { status: 429 }),
+		);
+		expect(await store.get(ALICE)).toEqual({});
+		expect(h.fetchFn.mock.calls.length).toBe(2);
+		expect(tokenCalls).toBe(1);
+	});
+
 	it("honours an externally aborted signal without dispatching", async () => {
 		const h = harness();
 		const controller = new AbortController();
@@ -671,6 +718,137 @@ describe("TableSecretStore — deadlines, retries, and failure modes", () => {
 		expect(h.rows.size).toBe(0);
 		expect(h.kvUrls).toHaveLength(0);
 	});
+});
+
+/**
+ * R2-05. Azure's own reference is inconsistent about where a point GET's
+ * concurrency token lives at `odata=minimalmetadata`: the published service
+ * contract declares an `ETag` response header on
+ * `Table_queryEntitiesWithPartitionAndRowKey`, the prose "Query Entities" page
+ * omits `ETag` from its response-header table, the payload-format page marks
+ * `odata.etag` as `fullmetadata`-only, and `@azure/data-tables`' own
+ * `getEntity` reads the token from the **body**. Reads must therefore accept
+ * either source — and still fail closed when there is genuinely no token,
+ * because falling through would make the next write an unconditional upsert.
+ */
+describe("TableSecretStore — where a read's ETag comes from", () => {
+	/** Replays the stored row with a chosen header/payload ETag combination. */
+	async function readWith(
+		h: ReturnType<typeof harness>,
+		opts: {
+			header?: string;
+			payload?: unknown;
+			logger?: { warn(m: string): void };
+		},
+	) {
+		const row: Record<string, unknown> = { ...h.rows.get(entityKey(ALICE))! };
+		if (opts.payload !== undefined) row["odata.etag"] = opts.payload;
+		const store = h.create(opts.logger ? { logger: opts.logger } : {});
+		h.fetchFn.mockImplementationOnce(
+			async () =>
+				new Response(JSON.stringify(row), {
+					status: 200,
+					...(opts.header === undefined
+						? {}
+						: { headers: { ETag: opts.header } }),
+				}),
+		);
+		return store.getRecord(ALICE);
+	}
+
+	it("uses the response header when only the header is present", async () => {
+		const h = harness();
+		await h.store.set(ALICE, "A", "1");
+		const record = await readWith(h, { header: 'W/"from-header"' });
+		expect(record?.etag).toBe('W/"from-header"');
+		expect(record?.bundle).toEqual({ A: "1" });
+	});
+
+	it("falls back to the payload's odata.etag when the header is absent", async () => {
+		const h = harness();
+		await h.store.set(ALICE, "A", "1");
+		const record = await readWith(h, { payload: 'W/"from-payload"' });
+		expect(record?.etag).toBe('W/"from-payload"');
+		expect(record?.bundle).toEqual({ A: "1" });
+	});
+
+	it("uses the agreed value when both sources are present and agree", async () => {
+		const h = harness();
+		await h.store.set(ALICE, "A", "1");
+		const record = await readWith(h, {
+			header: 'W/"agreed"',
+			payload: 'W/"agreed"',
+		});
+		expect(record?.etag).toBe('W/"agreed"');
+	});
+
+	it("prefers the header and warns when the two sources disagree", async () => {
+		const h = harness();
+		await h.store.set(ALICE, "A", "1");
+		const warn = vi.fn();
+		const record = await readWith(h, {
+			header: 'W/"from-header"',
+			payload: 'W/"from-payload"',
+			logger: { warn },
+		});
+		expect(record?.etag).toBe('W/"from-header"');
+		expect(warn).toHaveBeenCalledWith(expect.stringMatching(/disagreeing/));
+	});
+
+	it("throws when neither source carries a token", async () => {
+		const h = harness();
+		await h.store.set(ALICE, "A", "1");
+		await expect(readWith(h, {})).rejects.toThrow(/ETag/);
+	});
+
+	// A token has to be a usable If-Match value. Anything else must fail closed
+	// rather than be echoed into the next conditional write.
+	it.each([
+		["empty string", ""],
+		["a number", 12345],
+		["an object", { etag: 'W/"x"' }],
+		["null", null],
+	])("ignores an odata.etag that is %s", async (_label, payload) => {
+		const h = harness();
+		await h.store.set(ALICE, "A", "1");
+		await expect(readWith(h, { payload })).rejects.toThrow(/ETag/);
+	});
+
+	it("still sends a concrete If-Match on the write that follows a payload-sourced read", async () => {
+		const h = harness();
+		await h.store.set(ALICE, "A", "1");
+		const record = await readWith(h, { payload: 'W/"from-payload"' });
+		// The fake throws on a PUT with no If-Match, and 412s on a mismatch —
+		// so reaching a SetupConflictError proves a concrete token was sent.
+		await expect(
+			h.store.putRecord(ALICE, { A: "2" }, record!.etag),
+		).rejects.toBeInstanceOf(SetupConflictError);
+	});
+});
+
+/** R2-09, at the store boundary: a tampered column must cost nothing. */
+describe("TableSecretStore — a stored crypto column is never trusted", () => {
+	const HOSTILE_COLUMNS = [
+		["Iv", "AAAA"], // 3 bytes, not 12
+		["AuthTag", "AAAA"], // 3 bytes, not 16
+		["WrappedDek", "AAAA"], // 3 bytes, under the floor
+		["Ciphertext", "!!!!"], // not base64 at all
+		["Ciphertext", "-_-_"], // base64url, not standard base64
+	] as const;
+
+	it.each(HOSTILE_COLUMNS)(
+		"makes zero Key Vault calls for %s = %j",
+		async (column, value) => {
+			const h = harness();
+			await h.store.set(ALICE, "A", "1");
+			h.rows.get(entityKey(ALICE))![column] = value;
+			const kvBefore = h.kvUrls.length;
+			const vaultBefore = h.vaultTokenCalls();
+			await expect(h.create().get(ALICE)).rejects.toThrow();
+			expect(h.kvUrls.length).toBe(kvBefore);
+			expect(h.vaultTokenCalls()).toBe(vaultBefore);
+		},
+	);
 });
 
 describe("TableSecretStore — a stored KekVersion is never trusted (D4′)", () => {
