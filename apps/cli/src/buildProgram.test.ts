@@ -140,6 +140,62 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		]);
 	});
 
+	it("registers `router secrets migrate` and forwards its flags as string args", async () => {
+		await run([
+			"router",
+			"secrets",
+			"migrate",
+			"--from",
+			"keyvault",
+			"--to",
+			"table",
+		]);
+
+		expect(routerExecute).toHaveBeenCalledWith([
+			"secrets",
+			"migrate",
+			"--from",
+			"keyvault",
+			"--to",
+			"table",
+		]);
+	});
+
+	it("forwards `router secrets migrate` target overrides and --dry-run", async () => {
+		await run([
+			"router",
+			"secrets",
+			"migrate",
+			"--from",
+			"keyvault",
+			"--to",
+			"table",
+			"--to-endpoint",
+			"https://stexample.table.core.windows.net/",
+			"--to-key-id",
+			"https://kv.vault.azure.net/keys/kek/abc123",
+			"--to-table",
+			"cyrussetup",
+			"--dry-run",
+		]);
+
+		expect(routerExecute).toHaveBeenCalledWith([
+			"secrets",
+			"migrate",
+			"--from",
+			"keyvault",
+			"--to",
+			"table",
+			"--to-endpoint",
+			"https://stexample.table.core.windows.net/",
+			"--to-key-id",
+			"https://kv.vault.azure.net/keys/kek/abc123",
+			"--to-table",
+			"cyrussetup",
+			"--dry-run",
+		]);
+	});
+
 	it("registers `router devices list`", async () => {
 		await run(["router", "devices", "list"]);
 

@@ -320,6 +320,56 @@ export function buildProgram(
 			);
 		});
 
+	routerSecretsCommand
+		.command("migrate")
+		.description(
+			"Migrate per-user secrets between backends (Key Vault -> Azure Table)",
+		)
+		.option("--from <backend>", "Source backend. Only 'keyvault' is supported.")
+		.option("--to <backend>", "Target backend. Only 'table' is supported.")
+		.option(
+			"--to-endpoint <url>",
+			"Target table endpoint, e.g. https://<account>.table.core.windows.net. Defaults to containers.tableStore.endpoint. Pass explicitly to migrate BEFORE that config block exists — the documented order.",
+		)
+		.option(
+			"--to-key-id <id>",
+			"Versioned Key Vault key id of the envelope-encryption KEK. Defaults to containers.tableStore.keyId.",
+		)
+		.option(
+			"--to-table <name>",
+			"Target table name. Defaults to containers.tableStore.tableName.",
+		)
+		.option(
+			"--dry-run",
+			"List what would be migrated without writing. Values are never printed.",
+		)
+		.action(
+			async (options: {
+				from?: string;
+				to?: string;
+				toEndpoint?: string;
+				toKeyId?: string;
+				toTable?: string;
+				dryRun?: boolean;
+			}) => {
+				// makeRouterAction forwards only string args, so translate the parsed
+				// options back into the flag form RouterCommand.secretsMigrate parses.
+				// Absent options are omitted rather than passed as undefined, so the
+				// handler's own fallbacks to containers.tableStore still apply.
+				const argv: string[] = [];
+				if (options.from !== undefined) argv.push("--from", options.from);
+				if (options.to !== undefined) argv.push("--to", options.to);
+				if (options.toEndpoint !== undefined)
+					argv.push("--to-endpoint", options.toEndpoint);
+				if (options.toKeyId !== undefined)
+					argv.push("--to-key-id", options.toKeyId);
+				if (options.toTable !== undefined)
+					argv.push("--to-table", options.toTable);
+				if (options.dryRun) argv.push("--dry-run");
+				await makeRouterAction("secrets", "migrate")(...argv);
+			},
+		);
+
 	const routerContainersCommand = routerCommand
 		.command("containers")
 		.description("Manage ephemeral container devices");
