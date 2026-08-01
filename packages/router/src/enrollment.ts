@@ -92,7 +92,13 @@ export function registerEnrollmentRoute(
 			}
 
 			if (entra.allowedDomain) {
-				const domain = tokenEmail.split("@")[1]?.toLowerCase();
+				// Last @-segment, not the first: `alice@example.com@evil.test`
+				// splits to ["alice", "example.com", "evil.test"], so taking [1]
+				// would match an allowlist of "example.com" while the real domain
+				// is evil.test. Entra constrains UPN format so this is defence in
+				// depth rather than an open door, but the gate should not depend
+				// on that.
+				const domain = tokenEmail.split("@").pop()?.toLowerCase();
 				if (domain !== entra.allowedDomain.toLowerCase()) {
 					return reply
 						.status(403)

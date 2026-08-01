@@ -241,18 +241,92 @@ describe("KeyVaultSecretStore", () => {
 		expect(logger.warn).toHaveBeenCalledOnce();
 	});
 
-	it.each([
-		"CYRUS_ROUTER_URL",
-		"not a name",
-		"1BAD",
-	])("rejects invalid/reserved key %s before network access", async (key) => {
-		const fetchFn = vi.fn();
+	it.each(["CYRUS_ROUTER_URL", "not a name", "1BAD"])(
+		"rejects invalid/reserved key %s before network access",
+		async (key) => {
+			const fetchFn = vi.fn();
+			const store = new KeyVaultSecretStore({
+				vaultUrl: VAULT,
+				tokenProvider: async () => "token",
+				fetchFn,
+			});
+			await expect(store.set("a@example.com", key, "x")).rejects.toThrow();
+			expect(fetchFn).not.toHaveBeenCalled();
+		},
+	);
+});
+
+describe("KeyVaultSecretStore.listEmails", () => {
+	function page(
+		items: Array<{ email?: string; key?: string; deleted?: boolean }>,
+		nextLink?: string,
+	) {
+		return JSON.stringify({
+			value: items.map((item, index) => ({
+				id: `${VAULT}/secrets/secret-${index}`,
+				tags: {
+					...(item.email ? { email: item.email } : {}),
+					...(item.key ? { key: item.key } : {}),
+					...(item.deleted ? { cyrusDeleted: "true" } : {}),
+				},
+			})),
+			...(nextLink ? { nextLink } : {}),
+		});
+	}
+
+	it("paginates to completion and returns distinct lowercased emails", async () => {
+		// A partial enumeration would silently migrate a subset and look like
+		// success, so following nextLink is the load-bearing behaviour here.
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValueOnce(
+				new Response(
+					page(
+						[
+							{ email: "Alice@Example.com", key: "GIT_TOKEN" },
+							{ email: "alice@example.com", key: "CLAUDE_CODE_OAUTH_TOKEN" },
+						],
+						`${VAULT}/secrets?api-version=7.4&$skiptoken=2`,
+					),
+					{ status: 200 },
+				),
+			)
+			.mockResolvedValueOnce(
+				new Response(page([{ email: "bob@example.com", key: "GIT_TOKEN" }]), {
+					status: 200,
+				}),
+			);
 		const store = new KeyVaultSecretStore({
 			vaultUrl: VAULT,
 			tokenProvider: async () => "token",
 			fetchFn,
 		});
-		await expect(store.set("a@example.com", key, "x")).rejects.toThrow();
-		expect(fetchFn).not.toHaveBeenCalled();
+
+		expect(await store.listEmails()).toEqual([
+			"alice@example.com",
+			"bob@example.com",
+		]);
+		expect(fetchFn).toHaveBeenCalledTimes(2);
+	});
+
+	it("omits tombstoned and untagged secrets", async () => {
+		const fetchFn = vi.fn(
+			async () =>
+				new Response(
+					page([
+						{ email: "gone@example.com", key: "GIT_TOKEN", deleted: true },
+						{ key: "GIT_TOKEN" },
+						{ email: "live@example.com", key: "GIT_TOKEN" },
+					]),
+					{ status: 200 },
+				),
+		);
+		const store = new KeyVaultSecretStore({
+			vaultUrl: VAULT,
+			tokenProvider: async () => "token",
+			fetchFn,
+		});
+
+		expect(await store.listEmails()).toEqual(["live@example.com"]);
 	});
 });

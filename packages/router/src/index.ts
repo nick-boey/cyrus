@@ -80,6 +80,50 @@ export {
 	type StateBackupOptions,
 } from "./StateBackup.js";
 export {
+	EXECUTOR_TYPE_DEFAULT,
+	EXECUTOR_TYPE_DEVICE,
+	resolveExecutor,
+	SetupBootstrap,
+	type SetupBootstrapDeps,
+} from "./setup/bootstrap.js";
+export {
+	assertKekVersion,
+	BundleTooLargeError,
+	KeyVaultKeyWrapper,
+	type KeyWrapper,
+	MAX_BUNDLE_BYTES,
+	openBundle,
+	type SealedBundle,
+	sealBundle,
+} from "./setup/envelope.js";
+export {
+	createSetupIdTokenVerifier,
+	type SetupIdTokenConfig,
+	SetupIdTokenError,
+} from "./setup/idTokenVerifier.js";
+export {
+	parseEasyAuthPrincipal,
+	requireSetupPrincipal,
+	SETUP_ID_TOKEN_HEADER,
+	type SetupAuthConfig,
+	SetupAuthError,
+	type SetupAuthMode,
+	type SetupIdTokenVerifier,
+	type SetupPrincipal,
+	type SetupPrincipalDeps,
+	type SetupUiConfig,
+	validateSetupAuthConfig,
+} from "./setup/principal.js";
+export {
+	createTableStorageTokenProvider,
+	DEFAULT_TABLE_NAME,
+	SETUP_ROW_KEY,
+	SetupConflictError,
+	setupPartitionKey,
+	TableSecretStore,
+	type TableSecretStoreOptions,
+} from "./TableSecretStore.js";
+export {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
 	type TerminalTeardownAction,

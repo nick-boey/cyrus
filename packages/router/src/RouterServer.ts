@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
@@ -32,8 +33,22 @@ import {
 import { KeyVaultSecretStore } from "./KeyVaultSecretStore.js";
 import { LinearExecutor } from "./LinearExecutor.js";
 import { RouterStore } from "./RouterStore.js";
-import { SecretStore, type SecretStoreBackend } from "./SecretStore.js";
+import {
+	DEFAULT_REQUIRED_SECRET_KEYS,
+	SecretStore,
+	type SecretStoreBackend,
+} from "./SecretStore.js";
 import { StateBackup } from "./StateBackup.js";
+import { SetupBootstrap } from "./setup/bootstrap.js";
+import { createCsrfTokens } from "./setup/csrf.js";
+import {
+	type SetupAuthMode,
+	type SetupIdTokenVerifier,
+	type SetupUiConfig,
+	validateSetupAuthConfig,
+} from "./setup/principal.js";
+import { registerSetupRoutes } from "./setup/routes.js";
+import { TableSecretStore } from "./TableSecretStore.js";
 import {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
@@ -90,6 +105,27 @@ export interface RouterContainersConfig {
 	secretsPath?: string;
 	/** Selects Azure Key Vault instead of the local secrets file. */
 	keyVaultUrl?: string;
+	/**
+	 * Selects the Azure Table backend, which stores one envelope-encrypted
+	 * entity per user. Highest precedence: `tableStore`, then
+	 * {@link keyVaultUrl}, then the 0600 file store.
+	 *
+	 * Per D6′ the Table, KEK, and role assignments are create-once; rollback is
+	 * expressed by removing this field, never by destroying the infrastructure.
+	 */
+	tableStore?: {
+		/** Bare https origin, e.g. "https://stexample.table.core.windows.net". */
+		endpoint: string;
+		/** Default "cyrussetup". */
+		tableName?: string;
+		/**
+		 * Versioned Key Vault key id used as the KEK, e.g.
+		 * `https://<vault>/keys/<name>/<32-hex-version>`. Parsed once at
+		 * construction; every request URL is rebuilt from it, and no stored
+		 * value ever contributes a host or path (D4′).
+		 */
+		keyId: string;
+	};
 	/** Default 900_000 (15 minutes). */
 	idleStopMs?: number;
 	/** Default 1_209_600_000 (14 days). */
@@ -103,6 +139,12 @@ export interface RouterContainersConfig {
 	 * ["GIT_TOKEN", "LINEAR_API_TOKEN"].
 	 */
 	requiredSecretKeys?: string[];
+	/**
+	 * Provider users inherit when their stored executor is the explicit
+	 * `{"type":"default"}` sentinel. A NULL/absent executor keeps meaning
+	 * "physical device" and is deliberately NOT captured — see F11 on NOR-270.
+	 */
+	defaultExecutor?: string;
 	docker?: { memoryLimit?: string; network?: string };
 	/**
 	 * Azure Container Apps (ACA) Sandboxes provider settings. When present,
@@ -212,6 +254,27 @@ export interface RouterServerConfig {
 	};
 	/** Test seam for deterministic verification without a remote JWKS. */
 	entraTokenVerifier?: EntraTokenVerifier;
+	/**
+	 * Authenticated `/setup*` management UI. Opt-in and off by default.
+	 *
+	 * `setupUi.auth` is deliberately required when enabled: how identity is
+	 * established is an explicit operator choice, never inferred from `entra`
+	 * above (which governs enrollment bearer tokens for `/enroll` and says
+	 * nothing about what sits in front of this process). See
+	 * {@link validateSetupAuthConfig}.
+	 */
+	setupUi?: SetupUiConfig;
+	/**
+	 * Verifies the Entra ID token forwarded by the ACA token store. REQUIRED
+	 * when `setupUi.auth.mode` is `"entra-token"`; without it every /setup
+	 * request fails with a 500 rather than degrading to header trust.
+	 *
+	 * Injected rather than constructed here because it needs a DIFFERENT
+	 * audience from `entra.audience` — that one is the `api://` Application ID
+	 * URI carried by enrollment *access* tokens, whereas an ID token carries
+	 * the bare client-id GUID (D2').
+	 */
+	setupIdTokenVerifier?: SetupIdTokenVerifier;
 }
 
 /**
@@ -228,6 +291,13 @@ export class RouterServer {
 	 * webhook source. Not part of the runtime wiring surface.
 	 */
 	readonly eventRouter: EventRouter;
+	/**
+	 * Which per-user secret backend the container path resolved to. A
+	 * diagnostic seam — it is logged at startup and asserted in tests, because
+	 * "why is my secret not there" is otherwise invisible. `"none"` when
+	 * `config.containers` is absent and no backend was built.
+	 */
+	readonly secretBackendKind: "none" | "file" | "keyvault" | "table";
 	/**
 	 * Idle-stop / stale-destroy / orphan-GC sweep for ephemeral containers.
 	 * Constructed in {@link buildContainerTargets} only when
@@ -265,6 +335,17 @@ export class RouterServer {
 	}
 
 	constructor(config: RouterServerConfig) {
+		// Before anything else: an ambiguous or unsafe setup-auth strategy must
+		// refuse to start rather than serve /setup with no enforceable trust
+		// boundary. `config.host ?? "127.0.0.1"` mirrors the default applied at
+		// listen() below, so the validator sees the host Fastify will really bind
+		// — the Docker entrypoint defaults it to 0.0.0.0, which is exactly the
+		// case `dev-insecure-headers` must refuse.
+		if (config.setupUi) {
+			validateSetupAuthConfig(config.setupUi, {
+				bindHost: config.host ?? "127.0.0.1",
+			});
+		}
 		this.config = config;
 		this.logger = config.logger ?? { info: () => {}, warn: () => {} };
 		this.store = new RouterStore(config.dbPath);
@@ -306,10 +387,15 @@ export class RouterServer {
 		const artifactsDir =
 			config.containers?.artifactsDir ??
 			join(dirname(config.dbPath), "artifacts");
-		const containerTargets = this.buildContainerTargets(
-			config.containers,
-			artifactsDir,
-		);
+		const built = this.buildContainerTargets(config.containers, artifactsDir);
+		const containerTargets = built?.service;
+		// Assigned here rather than inside buildContainerTargets because a
+		// `readonly` field may only be written from the constructor, and the
+		// method early-returns when `containers` is absent.
+		this.secretBackendKind = built?.kind ?? "none";
+		if (built) {
+			this.logger.info(`Per-user secret backend: ${this.secretBackendKind}`);
+		}
 
 		this.eventRouter = new EventRouter({
 			store: this.store,
@@ -345,6 +431,67 @@ export class RouterServer {
 		// serverless platforms). Registered in the constructor because Fastify
 		// v5 forbids adding routes once the server is listening.
 		this.fastify.get("/healthz", async () => ({ status: "ok" }));
+
+		if (config.setupUi?.enabled) {
+			if (!built) {
+				throw new Error(
+					"setupUi.enabled requires a `containers` block: the setup page edits the per-user secret bundle that container launches consume, and no secret backend is constructed without it.",
+				);
+			}
+			// Exactly the expression ContainerTargets.buildEnv uses, so the page
+			// and the boot gate can never disagree about what "required" means.
+			const setupRequiredKeys = [
+				...new Set([
+					...DEFAULT_REQUIRED_SECRET_KEYS,
+					...(config.containers?.requiredSecretKeys ?? []),
+				]),
+			];
+			registerSetupRoutes(this.fastify, {
+				secrets: built.secrets,
+				requiredKeys: setupRequiredKeys,
+				auth: {
+					// validateSetupAuthConfig ran at the top of this constructor and
+					// throws when `auth` is unset, so this is proven non-null.
+					auth: config.setupUi.auth as SetupAuthMode,
+					...(config.setupUi.allowedDomain
+						? { allowedDomain: config.setupUi.allowedDomain }
+						: {}),
+				},
+				bootstrap: new SetupBootstrap({
+					store: this.store,
+					secrets: built.secrets,
+					requiredKeys: setupRequiredKeys,
+					// Defaults TRUE. Self-registration is the intended posture for a
+					// single-organisation deployment: signing in creates a user row
+					// and an EMPTY secret record, nothing more. It grants no
+					// credentials — the user still has to supply their own Claude
+					// token — and nothing routes to them until they appear as the
+					// creator or assignee of a Linear issue
+					// (`EventRouter` → `RouterStore.findUserForCreator`), so Linear
+					// membership is the effective gate.
+					//
+					// Set it false where the Entra tenant is materially larger than
+					// the set of people who should be able to hold Cyrus
+					// credentials; `setupUi.allowedDomain` is the cheaper control
+					// for the common case of keeping guests out.
+					autoProvisionUsers: config.setupUi.autoProvisionUsers ?? true,
+					logger: this.logger,
+				}),
+				// Per-process and in-memory on purpose. The router is single-replica,
+				// so a restart just invalidates outstanding tokens and the next action
+				// re-renders with a fresh one. Deliberately NOT sourced from config or
+				// shared with the webhook secret: a file-backed value survives restarts
+				// and would widen a config leak into CSRF forgery.
+				csrf: createCsrfTokens(randomBytes(32).toString("base64url")),
+				...(config.setupIdTokenVerifier
+					? { verifyIdToken: config.setupIdTokenVerifier }
+					: {}),
+				logger: this.logger,
+			});
+			this.logger.info(
+				`Setup UI enabled at /setup (auth: ${config.setupUi.auth?.mode})`,
+			);
+		}
 
 		this.gateway.on("rpc", (deviceId: number, frame: RpcRequestFrame) => {
 			void this.executor
@@ -498,18 +645,40 @@ export class RouterServer {
 	private buildContainerTargets(
 		containers: RouterContainersConfig | undefined,
 		artifactsDir: string,
-	): ContainerTargetService | undefined {
+	):
+		| {
+				service: ContainerTargetService;
+				secrets: SecretStoreBackend;
+				kind: "file" | "keyvault" | "table";
+		  }
+		| undefined {
 		if (!containers) return undefined;
 
 		const secretsPath =
 			containers.secretsPath ??
 			join(dirname(this.config.dbPath), "user-secrets.json");
-		const secrets: SecretStoreBackend = containers.keyVaultUrl
-			? new KeyVaultSecretStore({
-					vaultUrl: containers.keyVaultUrl,
-					logger: this.logger,
-				})
-			: new SecretStore(secretsPath);
+		// Precedence: Table, then Key Vault, then the 0600 file store. A
+		// deployment with none of these fields set is byte-identical to today.
+		let secrets: SecretStoreBackend;
+		let kind: "file" | "keyvault" | "table";
+		if (containers.tableStore) {
+			secrets = new TableSecretStore({
+				tableEndpoint: containers.tableStore.endpoint,
+				tableName: containers.tableStore.tableName,
+				keyId: containers.tableStore.keyId,
+				logger: this.logger,
+			});
+			kind = "table";
+		} else if (containers.keyVaultUrl) {
+			secrets = new KeyVaultSecretStore({
+				vaultUrl: containers.keyVaultUrl,
+				logger: this.logger,
+			});
+			kind = "keyvault";
+		} else {
+			secrets = new SecretStore(secretsPath);
+			kind = "file";
+		}
 
 		const executorRegistryFactory =
 			this.config.executorRegistryFactory ??
@@ -560,6 +729,7 @@ export class RouterServer {
 				routerUrlForContainers: containers.routerUrlForContainers,
 				repositories: containers.repositories,
 				requiredSecretKeys: containers.requiredSecretKeys,
+				defaultExecutor: containers.defaultExecutor,
 			},
 			postActivity: (workspaceId, agentSessionId, body) =>
 				this.executor.postActivity(workspaceId, agentSessionId, body),
@@ -586,7 +756,7 @@ export class RouterServer {
 			this.terminalTeardown,
 		);
 
-		return containerTargets;
+		return { service: containerTargets, secrets, kind };
 	}
 
 	/**

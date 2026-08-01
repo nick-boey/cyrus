@@ -547,3 +547,225 @@ describe("RouterServer containers wiring", () => {
 		expect(docker.ensureRunning).not.toHaveBeenCalled();
 	});
 });
+
+describe("RouterServer secret backend selection", () => {
+	const containers = {
+		image: "example/worker:test",
+		routerUrlForContainers: "ws://127.0.0.1:9/",
+		repositories: [],
+	};
+
+	function build(extra: Record<string, unknown> = {}) {
+		return new RouterServer({
+			port: 0,
+			dbPath: join(mkdtempSync(join(tmpdir(), "router-backend-")), "router.db"),
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			...extra,
+		});
+	}
+
+	it("reports no backend when containers is absent", () => {
+		const server = build();
+		expect(server.secretBackendKind).toBe("none");
+		server.stop();
+	});
+
+	it("falls back to the 0600 file store", () => {
+		const server = build({ containers });
+		expect(server.secretBackendKind).toBe("file");
+		server.stop();
+	});
+
+	it("selects Key Vault when keyVaultUrl is set", () => {
+		const server = build({
+			containers: { ...containers, keyVaultUrl: "https://kv.vault.azure.net" },
+		});
+		expect(server.secretBackendKind).toBe("keyvault");
+		server.stop();
+	});
+
+	it("gives tableStore precedence over keyVaultUrl", () => {
+		const server = build({
+			containers: {
+				...containers,
+				keyVaultUrl: "https://kv.vault.azure.net",
+				tableStore: {
+					endpoint: "https://stexample.table.core.windows.net",
+					keyId: `https://kv.vault.azure.net/keys/kek/${"a".repeat(32)}`,
+				},
+			},
+		});
+		expect(server.secretBackendKind).toBe("table");
+		server.stop();
+	});
+});
+
+describe("RouterServer setupUi auth strategy", () => {
+	// The setup page edits the per-user secret bundle, so it needs a secret
+	// backend — which only exists when `containers` is configured.
+	const containers = {
+		image: "example/worker:test",
+		routerUrlForContainers: "ws://127.0.0.1:9/",
+		repositories: [],
+	};
+
+	function build(setupUi: unknown, host?: string, withContainers = true) {
+		return () =>
+			new RouterServer({
+				port: 0,
+				host,
+				dbPath: join(mkdtempSync(join(tmpdir(), "router-setupui-")), "r.db"),
+				workspaces: { "ws-1": { linearToken: "test-token" } },
+				webhook: { verificationMode: "direct", secret: "test-secret" },
+				trackerFactory: () => new CLIIssueTrackerService(),
+				...(withContainers ? { containers } : {}),
+				// biome-ignore lint/suspicious/noExplicitAny: exercising invalid config
+				setupUi: setupUi as any,
+			});
+	}
+
+	it("refuses to start when the UI is enabled with no strategy", () => {
+		expect(build({ enabled: true })).toThrow(/setupUi\.auth is not set/);
+	});
+
+	it("refuses easyauth-headers until the header strip is verified", () => {
+		expect(
+			build({ enabled: true, auth: { mode: "easyauth-headers" } }),
+		).toThrow(/verifiedHeaderStrip/);
+	});
+
+	it("refuses dev-insecure-headers off loopback", () => {
+		expect(
+			build(
+				{ enabled: true, auth: { mode: "dev-insecure-headers" } },
+				"0.0.0.0",
+			),
+		).toThrow(/loopback/);
+	});
+
+	it("accepts dev-insecure-headers on loopback", () => {
+		const server = build(
+			{ enabled: true, auth: { mode: "dev-insecure-headers" } },
+			"127.0.0.1",
+		)();
+		expect(server).toBeInstanceOf(RouterServer);
+		server.stop();
+	});
+
+	it("refuses to enable the UI without a containers block", () => {
+		// F21: the plan shipped two incompatible local recipes — one enabling
+		// setupUi with no containers, which cannot work because no secret
+		// backend is built. Fail at construction rather than at first request.
+		expect(
+			build(
+				{ enabled: true, auth: { mode: "dev-insecure-headers" } },
+				"127.0.0.1",
+				false,
+			),
+		).toThrow(/requires a `containers` block/);
+	});
+
+	it("does not police a disabled setup UI", () => {
+		const server = build({ enabled: false })();
+		expect(server).toBeInstanceOf(RouterServer);
+		server.stop();
+	});
+});
+
+describe("RouterServer without setupUi", () => {
+	// The load-bearing "additive and non-breaking" guarantee: a deployment that
+	// does not opt in must behave exactly as it did before this feature existed.
+	// Driven over real HTTP rather than a Fastify inject seam, so this also
+	// covers route registration actually not happening.
+	async function withServer(
+		fn: (base: string) => Promise<void>,
+		extra: Record<string, unknown> = {},
+	) {
+		const server = new RouterServer({
+			port: 0,
+			dbPath: join(mkdtempSync(join(tmpdir(), "router-nosetup-")), "r.db"),
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			...extra,
+		});
+		await server.start();
+		try {
+			await fn(`http://127.0.0.1:${server.port}`);
+		} finally {
+			await server.stop();
+		}
+	}
+
+	it.each([
+		["GET", "/setup"],
+		["POST", "/setup/provision"],
+		["POST", "/setup/save"],
+		["POST", "/setup/variables"],
+		["GET", "/setup/assets/pico.css"],
+		["GET", "/setup/assets/htmx.js"],
+	])("404s %s %s when setupUi is absent", async (method, path) => {
+		await withServer(async (base) => {
+			const response = await fetch(`${base}${path}`, { method });
+			expect(response.status).toBe(404);
+		});
+	});
+
+	it("still answers /healthz", async () => {
+		await withServer(async (base) => {
+			expect((await fetch(`${base}/healthz`)).status).toBe(200);
+		});
+	});
+});
+
+describe("RouterServer autoProvisionUsers default", () => {
+	// Pins the SHIPPED default by exercising it end to end: an unknown
+	// principal provisioning successfully is the only observable difference
+	// between true and false, so anything less than a real request would pass
+	// regardless of the value.
+	it("lets an unknown principal register when setupUi omits the field", async () => {
+		const server = new RouterServer({
+			port: 0,
+			host: "127.0.0.1",
+			dbPath: join(mkdtempSync(join(tmpdir(), "router-autoprov-")), "r.db"),
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			containers: {
+				image: "example/worker:test",
+				routerUrlForContainers: "ws://127.0.0.1:9/",
+				repositories: [],
+			},
+			setupUi: { enabled: true, auth: { mode: "dev-insecure-headers" } },
+		});
+		await server.start();
+		try {
+			const base = `http://127.0.0.1:${server.port}`;
+			const identity = { "x-ms-client-principal-name": "stranger@example.com" };
+
+			const page = await fetch(`${base}/setup`, { headers: identity });
+			expect(page.status).toBe(200);
+			const csrf = /name="csrf" value="([^"]+)"/.exec(await page.text())?.[1];
+			expect(csrf).toBeTruthy();
+
+			const provision = await fetch(`${base}/setup/provision`, {
+				method: "POST",
+				headers: {
+					...identity,
+					"content-type": "application/x-www-form-urlencoded",
+				},
+				body: `csrf=${encodeURIComponent(String(csrf))}`,
+			});
+
+			// The whole point: with the default flipped to false this is a 403.
+			expect(provision.status).not.toBe(403);
+			expect(server.store.listUsers().map((u) => u.email)).toContain(
+				"stranger@example.com",
+			);
+		} finally {
+			await server.stop();
+		}
+	});
+});

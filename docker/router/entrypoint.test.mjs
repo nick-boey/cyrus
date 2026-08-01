@@ -105,3 +105,85 @@ test("an incomplete canonical Entra group names tenant and audience precisely", 
 	assert.match(result.stderr, /CYRUS_ROUTER_ENTRA_TENANT_ID/);
 	assert.match(result.stderr, /CYRUS_ROUTER_ENTRA_AUDIENCE/);
 });
+
+test("setupUi is absent unless explicitly enabled", () => {
+	const result = run();
+	assert.equal(result.status, 0, result.stderr);
+	assert.equal(result.config.setupUi, undefined);
+});
+
+test("maps the entra-token strategy into setupUi", () => {
+	const result = run({
+		CYRUS_ROUTER_SETUP_UI_ENABLED: "true",
+		CYRUS_ROUTER_SETUP_UI_AUTH_MODE: "entra-token",
+		CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE: "client-id-guid",
+		CYRUS_ROUTER_SETUP_UI_ALLOWED_DOMAIN: "example.com",
+		CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION: "true",
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(result.config.setupUi, {
+		enabled: true,
+		auth: { mode: "entra-token", idTokenAudience: "client-id-guid" },
+		allowedDomain: "example.com",
+		autoProvisionUsers: true,
+	});
+});
+
+test("entra-token without an audience names the missing variable", () => {
+	const result = run({
+		CYRUS_ROUTER_SETUP_UI_ENABLED: "true",
+		CYRUS_ROUTER_SETUP_UI_AUTH_MODE: "entra-token",
+	});
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE/);
+});
+
+test("easyauth-headers refuses without the verified header-strip flag", () => {
+	const result = run({
+		CYRUS_ROUTER_SETUP_UI_ENABLED: "true",
+		CYRUS_ROUTER_SETUP_UI_AUTH_MODE: "easyauth-headers",
+	});
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /VERIFIED_HEADER_STRIP/);
+});
+
+test("easyauth-headers is accepted once the header strip is verified", () => {
+	const result = run({
+		CYRUS_ROUTER_SETUP_UI_ENABLED: "true",
+		CYRUS_ROUTER_SETUP_UI_AUTH_MODE: "easyauth-headers",
+		CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP: "true",
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(result.config.setupUi.auth, {
+		mode: "easyauth-headers",
+		verifiedHeaderStrip: true,
+	});
+});
+
+test("an unrecognised auth mode is refused rather than defaulted", () => {
+	const result = run({
+		CYRUS_ROUTER_SETUP_UI_ENABLED: "true",
+		CYRUS_ROUTER_SETUP_UI_AUTH_MODE: "trust-me",
+	});
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /CYRUS_ROUTER_SETUP_UI_AUTH_MODE/);
+});
+
+test("autoProvisionUsers is not enabled by a non-true value", () => {
+	const result = run({
+		CYRUS_ROUTER_SETUP_UI_ENABLED: "true",
+		CYRUS_ROUTER_SETUP_UI_AUTH_MODE: "dev-insecure-headers",
+		CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION: "yes",
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.equal(result.config.setupUi.autoProvisionUsers, false);
+});
+
+test("SETUP_UI_ENABLED alone regenerates config rather than being ignored", () => {
+	// The anyProvided gate: an env var missing from that list is silently
+	// dropped whenever a config file already exists.
+	const result = run({ CYRUS_ROUTER_SETUP_UI_ENABLED: "true" });
+	// Fails on the auth mode, which proves the gate fired and generation ran.
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /CYRUS_ROUTER_SETUP_UI_AUTH_MODE/);
+});

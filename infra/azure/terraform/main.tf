@@ -8,6 +8,17 @@ locals {
   }, var.tags)
 
   resource_group_name = var.resource_group_name != null ? var.resource_group_name : "rg-${local.name_prefix}"
+
+  # The router Container App's name, derived from INPUT VARIABLES ONLY.
+  #
+  # This is deliberately a local rather than `azurerm_container_app.router.name`
+  # so that the authConfigs resource id in setup_ui.tf can be assembled without
+  # referencing any managed resource. See the long note above
+  # `data.azapi_resource.setup_auth_existing` — that data source has to be
+  # readable at PLAN time for the staged-rollout gate to have any force, and a
+  # reference to a managed resource would make it unknown (and therefore
+  # deferred) on exactly the fresh-stack plan the gate exists to refuse.
+  router_app_name = "app-${local.name_prefix}-router"
 }
 
 ################################################################################

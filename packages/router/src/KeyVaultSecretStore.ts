@@ -134,6 +134,42 @@ export class KeyVaultSecretStore implements SecretStoreBackend {
 		return { ok: missing.length === 0, missing };
 	}
 
+	/**
+	 * Every email that owns at least one live (non-tombstoned) secret in this
+	 * vault, lowercased and de-duplicated.
+	 *
+	 * Public because migrating this vault to another backend has to *discover*
+	 * its users — `listForEmail` cannot, since it needs the email up front.
+	 * Paginates `nextLink` to completion: a partial enumeration would silently
+	 * migrate a subset and read as success.
+	 */
+	async listEmails(): Promise<string[]> {
+		const emails = new Set<string>();
+		for (const item of await this.listAllItems()) {
+			const email = item.tags?.email?.toLowerCase();
+			if (!email || item.tags?.[TOMBSTONE_TAG] === "true") continue;
+			emails.add(email);
+		}
+		return [...emails].sort();
+	}
+
+	private async listAllItems(): Promise<
+		Array<{ id?: string; tags?: Record<string, string> }>
+	> {
+		const items: Array<{ id?: string; tags?: Record<string, string> }> = [];
+		let nextUrl: string | undefined =
+			`${this.vaultUrl}/secrets?api-version=7.4`;
+		while (nextUrl) {
+			const page: {
+				value?: Array<{ id?: string; tags?: Record<string, string> }>;
+				nextLink?: string;
+			} = await this.request("GET", nextUrl);
+			items.push(...(page.value ?? []));
+			nextUrl = page.nextLink;
+		}
+		return items;
+	}
+
 	private async listForEmail(
 		email: string,
 	): Promise<Array<{ name: string; key: string }>> {

@@ -62,3 +62,46 @@ output "sandbox_group_identity_principal_id" {
   description = "Principal id of the sandbox group's system-assigned identity. Grant this AcrPull on a private registry to use a private worker image."
   value       = azapi_resource.sandbox_group.output.identity.principalId
 }
+
+################################################################################
+# Setup management UI (/setup)
+#
+# Three URLs, deliberately gated on DIFFERENT flags, so `terraform output` shows
+# exactly which stage of the D7 rollout the stack is in:
+#
+#   redirect URI  always      — needed to configure Entra BEFORE stage 1
+#   sign-in URL   stage 1     — provable sign-in while /setup still 404s
+#   /setup URL    stage 2     — the routes exist
+#
+# A stack showing a sign-in URL but no /setup URL is mid-rollout and correct.
+################################################################################
+
+output "setup_ui_redirect_uri" {
+  description = "The web redirect URI to register on the router Entra app registration for EasyAuth sign-in. Emitted unconditionally because it must be configured BEFORE `enable_setup_auth` is applied. `az ad app update --web-redirect-uris` REPLACES the whole list, so re-send the existing URIs alongside this one or you will break enrollment sign-in — README §11 step 2 has the read-then-write form."
+  value       = "https://${azurerm_container_app.router.ingress[0].fqdn}/.auth/login/aad/callback"
+}
+
+output "setup_ui_sign_in_url" {
+  description = "Entra sign-in entry point served by the ACA built-in auth sidecar. Non-null once STAGE 1 (`enable_setup_auth`) is applied — which is what lets you prove sign-in works while `/setup` still returns 404, before stage 2 creates any route. `/.auth/logout` ends the session. These endpoints are handled entirely by the sidecar; the router never sees them."
+  value       = var.enable_setup_auth ? "https://${azurerm_container_app.router.ingress[0].fqdn}/.auth/login/aad" : null
+}
+
+output "setup_ui_url" {
+  description = "Where teammates manage their own container environment variables. Non-null only after STAGE 2 (`enable_setup_ui`) is applied. Null while the stack is at stage 1 or has the feature off."
+  value       = var.enable_setup_ui ? "https://${azurerm_container_app.router.ingress[0].fqdn}/setup" : null
+}
+
+output "setup_table_name" {
+  description = "Name of the Azure Table holding one envelope-encrypted record per user. NULL unless `enable_setup_secret_store` is true. Once created it is persistent (D6') and inert until `enable_setup_table_backend` points the router at it. Use with `az storage entity query --table-name <this> --auth-mode login`."
+  value       = one(azurerm_storage_table.setup[*].name)
+}
+
+output "setup_table_endpoint" {
+  description = "Table service endpoint of the storage account holding the per-user secret records, exactly as rendered into `containers.tableStore.endpoint`. NULL unless `enable_setup_secret_store` is true. Needed by `cyrus router secrets migrate --to-endpoint`, which names its target explicitly so the copy can run BEFORE `enable_setup_table_backend` points the router at the Table."
+  value       = var.enable_setup_secret_store ? azurerm_storage_account.this.primary_table_endpoint : null
+}
+
+output "setup_kek_versioned_key_id" {
+  description = "VERSIONED Key Vault key id of the envelope-encryption KEK, exactly as rendered into `containers.tableStore.keyId`. NULL unless `enable_setup_secret_store` is true. Not a secret — it names a public key handle, and every wrap/unwrap URL is rebuilt from this configured value rather than from anything a stored record supplies. Records pin the version segment they were wrapped with, so old versions must stay ENABLED until a re-wrap pass has run."
+  value       = one(azurerm_key_vault_key.setup_kek[*].id)
+}

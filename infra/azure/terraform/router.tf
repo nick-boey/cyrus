@@ -10,7 +10,7 @@ locals {
   # via the ACA app's `latest_revision_fqdn`, which Terraform resolves after
   # the revision exists. (README documents the self-reference ordering
   # constraint and the operator-copy fallback.)
-  router_containers_config = {
+  router_containers_base = {
     image                  = var.worker_image
     routerUrlForContainers = var.router_url_for_containers != null ? var.router_url_for_containers : "wss://REPLACE-ME-set-router_url_for_containers-from-terraform-output"
     repositories = [
@@ -47,6 +47,46 @@ locals {
     backupBlobUrl = "https://${azurerm_storage_account.this.name}.blob.core.windows.net/${azurerm_storage_container.router_backups.name}"
   }
 
+  # Optional `containers.*` fields are merged in rather than written inline with
+  # a `null`, because the router config is re-parsed by `cyrus router start`
+  # through a Zod schema that rejects an explicit null where it accepts an
+  # absent key — a literal `"tableStore": null` would fail startup.
+  router_containers_config = merge(
+    local.router_containers_base,
+
+    # F11: only users whose stored executor is the explicit `{"type":"default"}`
+    # sentinel inherit this. NULL/absent still means physical device, so turning
+    # this on cannot silently migrate a deliberately device-bound user onto ACA
+    # sandboxes.
+    #
+    # R2-06: `router_default_executor` DEFAULTS TO NULL, so this merge
+    # contributes nothing unless an operator opts in. It used to default to
+    # "aca", which changed CYRUS_ROUTER_CONTAINERS_JSON — and therefore rolled
+    # the single router replica — on stacks that had never heard of the setting.
+    var.router_default_executor != null ? {
+      defaultExecutor = var.router_default_executor
+    } : {},
+
+    # D6′: the ONLY reversible expression of the Table secret backend. The Table
+    # and KEK in setup_ui.tf are opt-in to create and one-way once created;
+    # clearing this flag drops the router back to the Key Vault backend on the
+    # next revision without destroying anything.
+    #
+    # The [0] indexes are safe: `enable_setup_table_backend` is refused by
+    # variable validation unless `enable_setup_secret_store` is also true.
+    var.enable_setup_table_backend ? {
+      tableStore = {
+        endpoint  = "https://${azurerm_storage_account.this.name}.table.core.windows.net"
+        tableName = azurerm_storage_table.setup[0].name
+        # VERSIONED key id (`.id`, not `.versionless_id`). Each record stores the
+        # bare version segment it was wrapped with and unwraps against that
+        # version; vault and key name are taken exclusively from this configured
+        # value and never from anything a row supplies (D4′).
+        keyId = azurerm_key_vault_key.setup_kek[0].id
+      }
+    } : {},
+  )
+
   router_env_non_secret = {
     LINEAR_WORKSPACE_ID          = var.linear_workspace_id
     CYRUS_ROUTER_CONTAINERS_JSON = jsonencode(local.router_containers_config)
@@ -61,13 +101,29 @@ locals {
     CYRUS_ROUTER_ENTRA_TENANT_ID                  = var.entra_tenant_id
     CYRUS_ROUTER_ENTRA_AUDIENCE                   = var.entra_audience
     CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN             = var.entra_allowed_domain
+
+    # STAGE 2 of D7 (see variables.tf). These are the ONLY inputs that make the
+    # router register /setup*; the auth sidecar attached in stage 1 does not by
+    # itself create a route. `entra` above is unrelated — it governs enrollment
+    # bearer tokens for /enroll and says nothing about setup identity (D1′).
+    CYRUS_ROUTER_SETUP_UI_ENABLED           = "true"
+    CYRUS_ROUTER_SETUP_UI_AUTH_MODE         = var.setup_ui_auth_mode
+    CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE = local.setup_ui_id_token_audience
+    CYRUS_ROUTER_SETUP_UI_ALLOWED_DOMAIN    = var.setup_ui_allowed_domain
+    CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION    = tostring(var.setup_ui_auto_provision_users)
+    # CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP is intentionally absent: it is
+    # only meaningful for `easyauth-headers`, which this stack refuses (R2-01).
   }
 
   entra_enabled = var.entra_tenant_id != null && var.entra_audience != null
 }
 
 resource "azurerm_container_app" "router" {
-  name                         = "app-${local.name_prefix}-router"
+  # Must stay `local.router_app_name`: setup_ui.tf assembles the authConfigs
+  # resource id from the same local so the stage-ordering data source can be
+  # read without referencing this resource. Renaming here without renaming there
+  # would point the gate at a nonexistent app and refuse every stage-2 plan.
+  name                         = local.router_app_name
   resource_group_name          = azurerm_resource_group.this.name
   container_app_environment_id = azurerm_container_app_environment.this.id
   revision_mode                = "Single"
@@ -126,6 +182,28 @@ resource "azurerm_container_app" "router" {
     name                = "linear-client-secret"
     identity            = azurerm_user_assigned_identity.router.id
     key_vault_secret_id = azurerm_key_vault_secret.linear_client_secret.versionless_id
+  }
+
+  # STAGE 1 of D7. Both secrets are consumed by the EasyAuth SIDECAR, not by the
+  # router process — `authConfigs` resolves `clientSecretSettingName` and
+  # `sasUrlSettingName` against this collection by name, which is why they are
+  # declared here and gated on the same variable as the authConfigs resource in
+  # setup_ui.tf. Neither is exposed to the container as an env var.
+  dynamic "secret" {
+    for_each = local.setup_auth_enabled ? toset(["setup-ui"]) : toset([])
+    content {
+      name                = "setup-ui-client-secret"
+      identity            = azurerm_user_assigned_identity.router.id
+      key_vault_secret_id = azurerm_key_vault_secret.setup_ui_client_secret[0].versionless_id
+    }
+  }
+  dynamic "secret" {
+    for_each = local.setup_auth_enabled ? toset(["setup-ui-token-store"]) : toset([])
+    content {
+      name                = "setup-ui-token-store-sas"
+      identity            = azurerm_user_assigned_identity.router.id
+      key_vault_secret_id = azurerm_key_vault_secret.setup_ui_token_store_sas[0].versionless_id
+    }
   }
 
   template {
@@ -202,6 +280,53 @@ resource "azurerm_container_app" "router" {
         }
       }
 
+      # STAGE 2 of D7. Everything below is gated on `enable_setup_ui`, which is
+      # applied in its own apply AFTER stage 1 is live and verified. Until then
+      # the router registers no /setup route and these vars are absent, so the
+      # revision published by stage 1 exposes nothing new.
+      dynamic "env" {
+        for_each = local.setup_ui_enabled ? toset(["setup-ui"]) : toset([])
+        content {
+          name  = "CYRUS_ROUTER_SETUP_UI_ENABLED"
+          value = local.router_env_non_secret.CYRUS_ROUTER_SETUP_UI_ENABLED
+        }
+      }
+      # The router requires an explicit auth strategy when the UI is enabled and
+      # refuses to start without one — it never infers identity handling from
+      # the presence of `entra`.
+      dynamic "env" {
+        for_each = local.setup_ui_enabled ? toset(["setup-ui-mode"]) : toset([])
+        content {
+          name  = "CYRUS_ROUTER_SETUP_UI_AUTH_MODE"
+          value = local.router_env_non_secret.CYRUS_ROUTER_SETUP_UI_AUTH_MODE
+        }
+      }
+      # `setup_ui_auth_mode` is validated to "entra-token" for this stack, so the
+      # audience is always required when the UI is on. The mode is still read
+      # from the variable rather than hardcoded, so that adding another
+      # cryptographically verifiable mode later is a variables.tf change.
+      dynamic "env" {
+        for_each = local.setup_ui_enabled ? toset(["setup-ui-aud"]) : toset([])
+        content {
+          name  = "CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE"
+          value = local.router_env_non_secret.CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE
+        }
+      }
+      dynamic "env" {
+        for_each = local.setup_ui_enabled && var.setup_ui_allowed_domain != null ? toset(["setup-ui-domain"]) : toset([])
+        content {
+          name  = "CYRUS_ROUTER_SETUP_UI_ALLOWED_DOMAIN"
+          value = local.router_env_non_secret.CYRUS_ROUTER_SETUP_UI_ALLOWED_DOMAIN
+        }
+      }
+      dynamic "env" {
+        for_each = local.setup_ui_enabled ? toset(["setup-ui-provision"]) : toset([])
+        content {
+          name  = "CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION"
+          value = local.router_env_non_secret.CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION
+        }
+      }
+
       volume_mounts {
         name = "artifacts"
         path = "/data/artifacts"
@@ -242,6 +367,45 @@ resource "azurerm_container_app" "router" {
     }
   }
 
+  # STAGE-ORDERING ENFORCEMENT (R2-01).
+  #
+  # This resource IS stage 2 — the CYRUS_ROUTER_SETUP_UI_* env vars above are
+  # what make the router register /setup*, and they ship inside this app's
+  # revision. So the gate has to sit here, on the thing that publishes the
+  # route, and it has to be a `precondition` (hard failure) rather than a
+  # `check` (warning).
+  #
+  # `data.azapi_resource.setup_auth_existing` is answered by ARM against real
+  # remote state at plan time — see the long comment above it in setup_ui.tf.
+  # `enable_setup_auth`, `setup_auth_stage1_verified` and `enable_setup_ui` set
+  # true in one plan can no longer publish a /setup revision ahead of the auth
+  # child, because on such a plan the auth child does not yet exist and this
+  # condition is false.
+  #
+  # Both conditions are short-circuited on `!var.enable_setup_ui` so a stack
+  # with the feature off never pays for them, and both use `try()` so a shape
+  # change in a future authConfigs API version fails CLOSED.
+  lifecycle {
+    precondition {
+      condition = (
+        !var.enable_setup_ui ||
+        try(one(data.azapi_resource.setup_auth_existing).exists, false)
+      )
+      error_message = "enable_setup_ui = true, but no authConfigs child exists on the router Container App in Azure. Stage 1 (enable_setup_auth = true) must be applied ON ITS OWN and complete BEFORE stage 2 is planned. If you set enable_setup_auth and enable_setup_ui in the same apply, that is the ordering hazard this gate exists to refuse: this app's revision would start serving /setup before the auth sidecar attached. Apply stage 1, run the README §11 step 4 verification, then apply stage 2."
+    }
+
+    precondition {
+      condition = (
+        !var.enable_setup_ui ||
+        (
+          try(one(data.azapi_resource.setup_auth_existing).output.properties.platform.enabled, false) == true &&
+          try(one(data.azapi_resource.setup_auth_existing).output.properties.identityProviders.azureActiveDirectory.enabled, false) == true
+        )
+      )
+      error_message = "The router's authConfigs child exists but is not live: platform.enabled and identityProviders.azureActiveDirectory.enabled must BOTH be true in Azure before /setup routes are published. An authConfigs resource in that state injects no identity, so the router would serve /setup to requests that carry no principal at all. Re-apply stage 1 and confirm with `az containerapp auth show`."
+    }
+  }
+
   # `latest_revision_fqdn` is computed after create; expose it both as part of
   # the containers JSON above (resolves to the same value) and as a top-level
   # output so operators can paste the canonical router WSS URL. ACA resolves
@@ -251,6 +415,15 @@ resource "azurerm_container_app" "router" {
     azurerm_role_assignment.router_acr_pull,
     azurerm_role_assignment.router_kv_secrets_user,
     azurerm_role_assignment.router_kv_secrets_officer,
+    # The Table backend needs both of these at RUNTIME, and neither is implied
+    # by a reference in this resource. Ordering them ahead of the revision gives
+    # RBAC propagation a head start instead of letting the first /setup read
+    # fail on a role that exists but has not landed yet. Both are now counted on
+    # `enable_setup_secret_store`; a whole-resource depends_on entry resolves to
+    # zero instances (and no ordering constraint) when the flag is off, which is
+    # what keeps a feature-off stack diff-free.
+    azurerm_role_assignment.router_table_data_contributor,
+    azurerm_role_assignment.router_kv_crypto_user,
   ]
 }
 

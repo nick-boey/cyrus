@@ -6,6 +6,7 @@ import {
 	isReservedEnvKey,
 	type SecretStoreBackend,
 } from "./SecretStore.js";
+import { resolveExecutor } from "./setup/bootstrap.js";
 
 /**
  * A device/webhook-supplied issue key flows into filesystem paths, Docker
@@ -78,6 +79,13 @@ export interface ContainerRoutingDeps {
 		 * (see buildEnv). Defaults to none when omitted.
 		 */
 		requiredSecretKeys?: string[];
+		/**
+		 * Provider every user routes to unless their `executor_json` says
+		 * otherwise. Only an explicit `{"type":"default"}` inherits it — a NULL
+		 * or absent value keeps its historical meaning of "physical device".
+		 * See {@link resolveExecutor}.
+		 */
+		defaultExecutor?: string;
 	};
 	postActivity: (
 		workspaceId: string,
@@ -105,19 +113,27 @@ export class ContainerTargetService {
 		return this.deps.now ? this.deps.now() : Date.now();
 	}
 
-	/** Provider name from users.executor_json, or undefined for physical-device users. */
+	/**
+	 * Provider name from `users.executor_json`, or undefined for physical-device
+	 * users. See {@link resolveExecutor} for the full resolution table.
+	 *
+	 * The load-bearing rule: a NULL/absent value keeps its historical meaning of
+	 * "physical device" and is **never** captured by `defaultExecutor`. Only an
+	 * explicit `{"type":"default"}` inherits. NULL is already ambiguous today
+	 * between "deliberately set to device" and "never configured", and nothing
+	 * can recover that intent after the fact — so inheriting on NULL would
+	 * silently move every device user onto cloud sandboxes. Every ambiguous or
+	 * corrupt value likewise degrades to physical device rather than up to a
+	 * sandbox.
+	 */
 	executorFor(userId: number): string | undefined {
-		const json = this.deps.store.getUserExecutor(userId);
-		if (!json) return undefined;
-		try {
-			const parsed = JSON.parse(json) as { type?: string };
-			return parsed.type && parsed.type !== "device" ? parsed.type : undefined;
-		} catch {
-			this.deps.logger.warn(
-				`Corrupt executor_json for user ${userId}; using physical device`,
-			);
-			return undefined;
-		}
+		return resolveExecutor(
+			this.deps.store.getUserExecutor(userId),
+			this.deps.containersConfig.defaultExecutor,
+			{
+				warn: (msg) => this.deps.logger.warn(`${msg} (user ${userId})`),
+			},
+		);
 	}
 
 	/**

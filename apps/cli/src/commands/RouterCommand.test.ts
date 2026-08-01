@@ -716,6 +716,147 @@ describe("RouterCommand", () => {
 			expect(app.logger.success).not.toHaveBeenCalled();
 		});
 
+		it("refuses to migrate without both endpoints configured", async () => {
+			// The documented cutover keeps tableStore out of config until after
+			// migration, which is exactly why source and target are named
+			// explicitly rather than inferred — but the target block still has to
+			// be present in the file for the command to have somewhere to write.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "worker:latest",
+						routerUrlForContainers: "wss://router.example.com",
+						repositories: [],
+						keyVaultUrl: "https://vault.vault.azure.net",
+					},
+				}),
+			);
+			const app = createMockApp(cyrusHome);
+			await expect(
+				new RouterCommand(app as any).execute([
+					"secrets",
+					"migrate",
+					"--from",
+					"keyvault",
+					"--to",
+					"table",
+				]),
+			).rejects.toThrow(/process\.exit/);
+			expect(app.logger.error).toHaveBeenCalledWith(
+				expect.stringMatching(/containers\.tableStore/),
+			);
+		});
+
+		it("accepts an explicit target so migration can precede the config flip", async () => {
+			// R2-04: the documented cutover migrates BEFORE containers.tableStore
+			// is added, so requiring it in config made the runbook unrunnable.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "worker:latest",
+						routerUrlForContainers: "wss://router.example.com",
+						repositories: [],
+						keyVaultUrl: "https://vault.vault.azure.net",
+					},
+				}),
+			);
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			// Reaches the Azure call and fails there, not on argument validation —
+			// which is what proves the target was accepted without config.
+			await expect(
+				command.execute([
+					"secrets",
+					"migrate",
+					"--from",
+					"keyvault",
+					"--to",
+					"table",
+					"--dry-run",
+					"--to-endpoint",
+					"https://stexample.table.core.windows.net",
+					"--to-key-id",
+					`https://vault.vault.azure.net/keys/kek/${"a".repeat(32)}`,
+				]),
+			).rejects.toThrow();
+			expect(app.logger.error).not.toHaveBeenCalledWith(
+				expect.stringMatching(/Migration target is not configured/),
+			);
+		});
+
+		it("rejects an unsupported migration direction", async () => {
+			const app = createMockApp(cyrusHome);
+			await expect(
+				new RouterCommand(app as any).execute([
+					"secrets",
+					"migrate",
+					"--from",
+					"table",
+					"--to",
+					"keyvault",
+				]),
+			).rejects.toThrow(/process\.exit/);
+			expect(app.logger.error).toHaveBeenCalledWith(
+				expect.stringMatching(/Usage/),
+			);
+		});
+
+		it("selects the Table backend over Key Vault, and survives the schema", async () => {
+			// tableStore is stripped on EVERY `router start` if it is not modelled
+			// in RouterConfigFileSchema, so this asserts the field both parses and
+			// wins the precedence contest against keyVaultUrl.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "worker:latest",
+						routerUrlForContainers: "wss://router.example.com",
+						repositories: [],
+						keyVaultUrl: "https://vault.vault.azure.net",
+						tableStore: {
+							endpoint: "https://stexample.table.core.windows.net",
+							keyId: `https://vault.vault.azure.net/keys/kek/${"a".repeat(32)}`,
+						},
+					},
+				}),
+			);
+			const command = new RouterCommand(createMockApp(cyrusHome) as any);
+			const store = (command as any).openSecretStore();
+			expect(store.constructor.name).toBe("TableSecretStore");
+		});
+
+		it("keeps setupUi through the config schema", async () => {
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					setupUi: {
+						enabled: true,
+						auth: { mode: "entra-token", idTokenAudience: "client-guid" },
+					},
+				}),
+			);
+			const command = new RouterCommand(createMockApp(cyrusHome) as any);
+			const config = (command as any).readRouterConfig();
+			expect(config.setupUi).toEqual({
+				enabled: true,
+				auth: { mode: "entra-token", idTokenAudience: "client-guid" },
+			});
+		});
+
 		it("fails all secret operations for schema-invalid router config", async () => {
 			writeFileSync(
 				join(cyrusHome, "router-config.json"),

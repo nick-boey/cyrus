@@ -486,6 +486,165 @@ data-plane children.
 
 ---
 
+## Setup management UI
+
+`/setup` is an authenticated page where a teammate manages their own per-user
+container environment variables in a browser. It replaces `az containerapp
+exec` + `az keyvault secret set` (or `cyrus router secrets set`) as the
+*documented* path for a teammate to add their own `CLAUDE_CODE_OAUTH_TOKEN`,
+`GH_TOKEN`, or any other tool credential — those commands still work and
+remain the break-glass path.
+
+It is **off by default**, and enabling it requires a `containers` block: the
+page edits the same per-user secret bundle that container launches consume,
+and no secret backend exists without one. `setupUi.enabled: true` with no
+`containers` block refuses to start, naming the reason.
+
+### Choosing an auth mode
+
+`setupUi.auth` has no default — you state how identity is established, or the
+router refuses to start. Three modes:
+
+- **`entra-token` (recommended).** Cryptographically verifies the Entra ID
+  token the ACA auth ("EasyAuth") sidecar forwards in
+  `X-MS-TOKEN-AAD-ID-TOKEN`. The trust boundary is a signature, not proxy
+  topology, so it does not matter how a request physically reached the
+  router.
+- **`easyauth-headers`.** Trusts the `X-MS-CLIENT-PRINCIPAL*` identity headers
+  the EasyAuth sidecar injects. Only sound if every request that can reach the
+  router has passed through that sidecar, which strips any client-supplied
+  copy of those headers first. The router refuses to start in this mode
+  unless you also set `verifiedHeaderStrip: true` by hand — this is not
+  something the router can check for you; you set it only after verifying,
+  live, against your real ingress, that a forged `X-MS-CLIENT-PRINCIPAL-NAME`
+  header with no session cookie is rejected.
+- **`dev-insecure-headers`.** Local development only. Reads the same headers
+  with no verification, and the router refuses to start unless it is bound to
+  a loopback address (`127.0.0.1`, `::1`, `localhost`).
+
+**The header-strip guarantee cannot be confirmed from documentation alone.**
+Microsoft documents that guarantee for external, internet-facing requests.
+This router additionally attaches its `/device` WebSocket endpoint to the same
+raw HTTP server and, under Docker, listens on `0.0.0.0` — neither is something
+that guarantee was written to cover. Until you have verified live, from every
+path a request can take to reach the router, prefer `entra-token`.
+
+### Configuration
+
+`router-config.json`:
+
+```json
+{
+  "containers": { "...": "..." },
+  "setupUi": {
+    "enabled": true,
+    "auth": {
+      "mode": "entra-token",
+      "idTokenAudience": "00000000-0000-0000-0000-000000000000"
+    },
+    "allowedDomain": "example.com",
+    "autoProvisionUsers": true
+  }
+}
+```
+
+`entra-token` mode also requires `entra.tenantId` elsewhere in the file — it
+names the tenant whose JWKS signs the ID token, reusing the app registration
+`entra.audience` already names for `/enroll` under a different audience (see
+"Optional Entra-gated enrollment" above). `idTokenAudience` is the bare
+client-id GUID, **not** the `api://` Application ID URI used for enrollment
+access tokens; the router rejects the `api://` form at startup.
+
+Equivalent Docker environment variables:
+
+| Variable | Required | Maps to |
+|----------|----------|---------|
+| `CYRUS_ROUTER_SETUP_UI_ENABLED` | no (default off) | `setupUi.enabled` |
+| `CYRUS_ROUTER_SETUP_UI_AUTH_MODE` | yes if enabled | `setupUi.auth.mode` — `entra-token`, `easyauth-headers`, or `dev-insecure-headers` |
+| `CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE` | yes if mode is `entra-token` | `setupUi.auth.idTokenAudience` |
+| `CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP` | yes, must be `true`, if mode is `easyauth-headers` | `setupUi.auth.verifiedHeaderStrip` |
+| `CYRUS_ROUTER_SETUP_UI_ALLOWED_DOMAIN` | no | `setupUi.allowedDomain` |
+| `CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION` | no (default `true`) | `setupUi.autoProvisionUsers` |
+
+### Auto-provisioning is on by default
+
+`autoProvisionUsers` defaults to **true**: a teammate's first visit shows a
+"Set up your account" button, and clicking it registers them. That is the
+intended posture for a single-organisation deployment, where you want people
+to onboard themselves.
+
+Be clear about what it does and does not grant. Registering creates a user row
+and an **empty** secret record — no credentials. The user still has to supply
+their own Claude token, and nothing routes to them until they appear as the
+creator or assignee of a Linear issue. So in practice the gates on doing
+anything useful are *having a Claude subscription* and *being in Linear*,
+neither of which this page hands out.
+
+The case for turning it off is when your Entra tenant is materially larger
+than the set of people who should be able to hold Cyrus credentials — a big
+company with a small Cyrus team. Then set it false, and add a real membership
+gate: an Entra app-role assignment or an `authConfigs` allowed-principals
+policy. Note that `allowedDomain` is *not* that gate — a domain check confirms
+an account is in the right tenant, not that it belongs to a teammate — but it
+is worth setting anyway, because it is the cheapest way to keep guest and
+cross-tenant accounts out. See "Restrict who can sign in" in
+`infra/azure/README.md` for both supported gates.
+
+With auto-provisioning off, an unregistered visitor gets a 403 naming the
+exact `cyrus router users add <email>` command to run.
+
+### Rotation: a saved value doesn't reach a running worker
+
+Saving a value here only changes what the *next* container is created with —
+a running, suspended, or snapshot-restored sandbox keeps the environment it
+already has, because injection happens once, at create-from-image. To push a
+rotated value out immediately:
+
+```bash
+cyrus router containers destroy <issueKey>
+```
+
+Then re-prompt the issue so its replacement container is created fresh with
+the new value. This is the single most common point of confusion with the
+feature — a save that looks like it "did nothing" is almost always this.
+
+### Storage backend
+
+Per-user secrets live in one of three places, selected by what's present under
+`containers`: a local JSON file (`secretsPath`, single-host only), Azure Key
+Vault (`keyVaultUrl`), or an Azure Table (`tableStore`) with envelope
+encryption, where each user's bundle is encrypted with its own data key,
+wrapped by a Key Vault RSA key. `/setup` works against all three; the
+"someone else changed this while you were editing" conflict check only
+applies to the Table backend, the only one of the three with a row version to
+check against.
+
+Move from Key Vault to the Table backend with:
+
+```bash
+cyrus router secrets migrate --from keyvault --to table --dry-run
+cyrus router secrets migrate --from keyvault --to table
+```
+
+Both `containers.keyVaultUrl` (source) and `containers.tableStore` (target)
+must already be present in `router-config.json` — the command copies between
+whatever the config names; it does not infer which backend is active. It
+never prints a value, only key names and byte counts; it skips a user with
+nothing to migrate, and never overwrites a record the target already has. The
+router keeps reading Key Vault until you separately add `containers.tableStore`
+to the config it starts with. `cyrus router secrets set/list/unset` keep
+working against whichever backend is active, and remain the break-glass path
+when the UI itself is unreachable.
+
+For the full staged Terraform rollout — the two-apply sequence, the live
+verification gate in between, and how to decommission the Table and its
+encryption key safely — see
+["Optional: the setup management UI (`/setup`)"](../infra/azure/README.md#11-optional-the-setup-management-ui-setup)
+in `infra/azure/README.md`. That runbook is the source of truth for the Azure
+deployment path; nothing here should contradict it.
+
+---
+
 ## Device setup (each client)
 
 > **Guided path.** Run `/cyrus-setup` and choose **Client device** at the mode
@@ -736,5 +895,6 @@ handoff mechanism.
 | `cyrus router secrets set <email> <ENV_VAR_NAME> <value>` | host | Store a per-user container secret. Never echoes the value. |
 | `cyrus router secrets unset <email> <ENV_VAR_NAME>` | host | Remove a per-user container secret. |
 | `cyrus router secrets list <email> [--check-scopes]` | host | List stored secret keys (values masked) + any missing required keys. `--check-scopes` additionally reports the stored `GH_TOKEN`/`GIT_TOKEN` OAuth scopes — advisory only, never rejects a usable token, never prints values. |
+| `cyrus router secrets migrate --from keyvault --to table [--dry-run]` | host | Copy every user's per-user secrets from the Key Vault backend to the Table backend named in `containers`. Never prints values; `--dry-run` lists what would move without writing anything. |
 | `cyrus connect <url> --code <code> [--entra <audience>]` | device | Enroll this device, optionally using an Azure CLI Entra token. |
 | `cyrus start` | device | Begin receiving and running your routed sessions. |

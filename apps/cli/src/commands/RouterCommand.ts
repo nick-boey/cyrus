@@ -12,6 +12,7 @@ import {
 	buildGitHubTokenScopeReport,
 	type ContainerDeviceInfo,
 	createAcaSandboxesProvider,
+	createSetupIdTokenVerifier,
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	type DeviceInfo,
 	GITHUB_TOKEN_SECRET_KEYS,
@@ -29,6 +30,7 @@ import {
 	SecretStore,
 	type SecretStoreBackend,
 	type SessionInfo,
+	TableSecretStore,
 } from "cyrus-router";
 import { z } from "zod";
 import { BaseCommand } from "./ICommand.js";
@@ -183,6 +185,25 @@ const RouterConfigFileSchema = z.object({
 			artifactsDir: z.string().optional(),
 			secretsPath: z.string().optional(),
 			keyVaultUrl: z.string().optional(),
+			// Azure Table backend for per-user secrets. Takes precedence over
+			// keyVaultUrl. Unmodelled fields are stripped on EVERY `router start`
+			// (safeParse + spread below), not merely on rewrite — so omitting this
+			// would make the field silently vanish in every deployment.
+			tableStore: z
+				.object({
+					endpoint: z.string().min(1),
+					tableName: z.string().optional(),
+					keyId: z.string().min(1),
+				})
+				.optional(),
+			/**
+			 * Executor inherited by users whose stored executor is the explicit
+			 * `{"type":"default"}` sentinel. A NULL/absent executor still means
+			 * physical device and is deliberately NOT captured by this — see F11
+			 * on NOR-270. Without that distinction, enabling this would silently
+			 * move every deliberately-set-to-device user onto cloud sandboxes.
+			 */
+			defaultExecutor: z.string().min(1).optional(),
 			idleStopMs: z.number().optional(),
 			staleDestroyMs: z.number().optional(),
 			teardownGraceMs: z.number().optional(),
@@ -238,6 +259,35 @@ const RouterConfigFileSchema = z.object({
 					managementEndpoint: z.string().optional(),
 				})
 				.optional(),
+		})
+		.optional(),
+	/**
+	 * Authenticated `/setup*` management UI. Off by default.
+	 *
+	 * `auth` is intentionally a required discriminated union when enabled: how
+	 * identity is established is an explicit operator choice, never inferred
+	 * from `entra` above (which governs enrollment tokens for `/enroll`). The
+	 * router refuses to start on an ambiguous strategy — see D1' on NOR-265.
+	 */
+	setupUi: z
+		.object({
+			enabled: z.boolean(),
+			auth: z
+				.discriminatedUnion("mode", [
+					z.object({
+						mode: z.literal("easyauth-headers"),
+						verifiedHeaderStrip: z.literal(true),
+					}),
+					z.object({
+						mode: z.literal("entra-token"),
+						idTokenAudience: z.string().min(1),
+					}),
+					z.object({ mode: z.literal("dev-insecure-headers") }),
+				])
+				.optional(),
+			allowedDomain: z.string().optional(),
+			/** Default false — see F5 on NOR-265. */
+			autoProvisionUsers: z.boolean().optional(),
 		})
 		.optional(),
 });
@@ -404,11 +454,24 @@ export class RouterCommand extends BaseCommand {
 		return this.readRouterConfig()?.containers?.secretsPath ?? defaultPath;
 	}
 
+	/**
+	 * Resolves the break-glass secret backend, matching the router's own
+	 * precedence in `RouterServer.buildContainerTargets`: Table, then Key Vault,
+	 * then the 0600 file store. Drift here would have the CLI reading a
+	 * different store than the one a container boot reads.
+	 */
 	private openSecretStore(): SecretStoreBackend {
-		const keyVaultUrl = this.readRouterConfig()?.containers?.keyVaultUrl;
-		if (keyVaultUrl)
+		const containers = this.readRouterConfig()?.containers;
+		if (containers?.tableStore)
+			return new TableSecretStore({
+				tableEndpoint: containers.tableStore.endpoint,
+				tableName: containers.tableStore.tableName,
+				keyId: containers.tableStore.keyId,
+				logger: this.logger,
+			});
+		if (containers?.keyVaultUrl)
 			return new KeyVaultSecretStore({
-				vaultUrl: keyVaultUrl,
+				vaultUrl: containers.keyVaultUrl,
 				logger: this.logger,
 			});
 		return new SecretStore(this.resolveSecretsPath());
@@ -490,6 +553,19 @@ export class RouterCommand extends BaseCommand {
 				info: (msg: string) => this.logger.info(msg),
 				warn: (msg: string) => this.logger.warn(msg),
 			},
+			// The recommended production mode for /setup verifies the ID token the
+			// ACA token store forwards, rather than trusting proxy-injected headers.
+			// It needs its own verifier: the enrollment one pins the `api://`
+			// access-token audience and returns only an email (D2').
+			...(parsed.data.setupUi?.enabled &&
+			parsed.data.setupUi.auth?.mode === "entra-token"
+				? {
+						setupIdTokenVerifier: createSetupIdTokenVerifier({
+							tenantId: this.requireEntraTenantForSetup(parsed.data),
+							idTokenAudience: parsed.data.setupUi.auth.idTokenAudience,
+						}),
+					}
+				: {}),
 		};
 
 		const server = await RouterServer.create(config);
@@ -1120,9 +1196,11 @@ export class RouterCommand extends BaseCommand {
 					secretRest[0],
 					secretRest.includes("--check-scopes"),
 				);
+			case "migrate":
+				return this.secretsMigrate(secretRest);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router secrets <set <email> <ENV_VAR_NAME> <value>|unset <email> <ENV_VAR_NAME>|list <email> [--check-scopes]>",
+					"Usage: cyrus router secrets <set <email> <ENV_VAR_NAME> <value>|unset <email> <ENV_VAR_NAME>|list <email> [--check-scopes]|migrate --from keyvault --to table [--dry-run]>",
 				);
 		}
 	}
@@ -1171,6 +1249,151 @@ export class RouterCommand extends BaseCommand {
 		}
 		await this.openSecretStore().set(email, key, undefined);
 		this.logSuccess(`Unset ${key} for ${email}.`);
+	}
+
+	/**
+	 * Copies every per-user secret bundle from one backend to another.
+	 *
+	 * Source and target are named explicitly rather than inferred from the
+	 * active config, because the documented cutover keeps `containers.tableStore`
+	 * OUT of the config until after the migration has run and been verified —
+	 * so at migration time the config describes only the source. Inferring
+	 * would make the command unrunnable in exactly the state the runbook puts
+	 * you in, and once `tableStore` IS set, precedence would hide the source.
+	 *
+	 * Both endpoints are read from `containers`, so the Table config must be
+	 * present in the file; `--to table` selects it, it does not invent it.
+	 */
+	/**
+	 * The tenant whose JWKS signs setup ID tokens. Reuses `entra.tenantId`
+	 * because a router deployment has exactly one app registration and one
+	 * tenant (a standing invariant); only the AUDIENCE differs between
+	 * enrollment access tokens and setup ID tokens.
+	 *
+	 * Fails loudly rather than defaulting: a wrong tenant would mean every
+	 * /setup request 500s at first use, which is a much worse failure than
+	 * refusing to start.
+	 */
+	private requireEntraTenantForSetup(
+		config: z.infer<typeof RouterConfigFileSchema>,
+	): string {
+		const tenantId = config.entra?.tenantId;
+		if (!tenantId) {
+			this.exitWithError(
+				'setupUi.auth.mode "entra-token" requires entra.tenantId in router-config.json — it names the tenant whose JWKS signs the ID token. Set CYRUS_ROUTER_ENTRA_TENANT_ID, or use a different setup auth mode.',
+			);
+		}
+		return tenantId as string;
+	}
+
+	private async secretsMigrate(args: string[]): Promise<void> {
+		const flag = (name: string): string | undefined => {
+			const index = args.indexOf(name);
+			return index >= 0 ? args[index + 1] : undefined;
+		};
+		const from = flag("--from");
+		const to = flag("--to");
+		const dryRun = args.includes("--dry-run");
+		if (from !== "keyvault" || to !== "table") {
+			this.exitWithError(
+				"Usage: cyrus router secrets migrate --from keyvault --to table [--to-endpoint <url> --to-key-id <versioned key id> [--to-table <name>]] [--dry-run]",
+			);
+			return;
+		}
+
+		const containers = this.readRouterConfig()?.containers;
+		if (!containers?.keyVaultUrl) {
+			this.exitWithError(
+				"Migration source requires containers.keyVaultUrl in router-config.json.",
+			);
+			return;
+		}
+
+		// The target may be named on the command line so migration can run BEFORE
+		// `containers.tableStore` is added to the config. That ordering is the
+		// documented safe one — adding the block is what makes the router START
+		// USING the Table, so it must come after the data is verified in place.
+		// Requiring the block here would have made the documented sequence
+		// impossible to follow (round-2 finding R2-04).
+		const toEndpoint = flag("--to-endpoint") ?? containers.tableStore?.endpoint;
+		const toKeyId = flag("--to-key-id") ?? containers.tableStore?.keyId;
+		const toTable =
+			flag("--to-table") ?? containers.tableStore?.tableName ?? undefined;
+		if (!toEndpoint || !toKeyId) {
+			this.exitWithError(
+				"Migration target is not configured. Either pass --to-endpoint <https://<account>.table.core.windows.net> --to-key-id <versioned Key Vault key id>, or add containers.tableStore to router-config.json. Passing them explicitly is the documented order: migrate and verify first, then add the config block that makes the router read from the Table.",
+			);
+			return;
+		}
+
+		const source = new KeyVaultSecretStore({
+			vaultUrl: containers.keyVaultUrl,
+			logger: this.logger,
+		});
+		const target = new TableSecretStore({
+			tableEndpoint: toEndpoint,
+			...(toTable ? { tableName: toTable } : {}),
+			keyId: toKeyId,
+			logger: this.logger,
+		});
+
+		const emails = await source.listEmails();
+		this.logger.info(
+			`Found ${emails.length} user(s) with secrets in the Key Vault backend.`,
+		);
+
+		let migrated = 0;
+		let skipped = 0;
+		const failures: string[] = [];
+		for (const email of emails) {
+			const bundle = await source.get(email);
+			const keys = Object.keys(bundle).sort();
+			if (keys.length === 0) {
+				skipped++;
+				continue;
+			}
+			if (dryRun) {
+				// Names only — never the values.
+				this.logger.info(`[dry-run] ${email}: ${keys.join(", ")}`);
+				migrated++;
+				continue;
+			}
+			try {
+				const existing = await target.getRecord(email);
+				if (existing) {
+					// Never clobber a record the target already holds: it may carry
+					// writes made through the UI after an earlier migration pass.
+					this.logger.warn(
+						`${email}: target record already exists — skipping. Verify and remove it first if you intend to re-migrate.`,
+					);
+					skipped++;
+					continue;
+				}
+				await target.putRecord(email, bundle);
+				this.logger.info(`${email}: migrated ${keys.length} value(s).`);
+				migrated++;
+			} catch (error) {
+				// Keep going: one unreadable user must not strand the rest, and the
+				// summary has to name every failure rather than exiting on the first.
+				failures.push(`${email}: ${(error as Error).message}`);
+			}
+		}
+
+		this.logger.info(
+			`Migration ${dryRun ? "(dry run) " : ""}complete: ${migrated} migrated, ${skipped} skipped, ${failures.length} failed.`,
+		);
+		if (failures.length > 0) {
+			for (const failure of failures) this.logger.error(failure);
+			this.exitWithError(
+				`${failures.length} user(s) failed to migrate. The Key Vault source is untouched; re-run after resolving.`,
+			);
+			return;
+		}
+		if (!dryRun) {
+			this.logSuccess(
+				"Verify with `cyrus router secrets list <email>` against both backends before setting containers.tableStore at router start.",
+			);
+		}
 	}
 
 	private async secretsList(

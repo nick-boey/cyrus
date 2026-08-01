@@ -128,3 +128,87 @@ custom_domain_certificate_zone_id = null
 entra_tenant_id     = null
 entra_audience      = null
 entra_allowed_domain = null
+
+# ---- Setup management UI (/setup) — STAGED, see README §11 -------------------
+# TWO SEPARATE APPLIES with a live verification gate between them. `authConfigs`
+# is a child of the Container App, so a single flag would necessarily publish the
+# revision serving /setup BEFORE the auth sidecar exists.
+#
+# YOU CANNOT COLLAPSE THE STAGES BY EDITING THIS FILE. The gate is not a boolean
+# here: the Container App carries preconditions over a data source that reads
+# the ALREADY-DEPLOYED authConfigs child out of Azure. Setting enable_setup_auth
+# and enable_setup_ui true in one apply fails at plan time, because on that plan
+# the auth child genuinely does not exist yet.
+#
+#   Apply 1: enable_setup_auth = true   (routes still 404)
+#   GATE:    README §11 step 5 — machine routes + sign-in, then attest below
+#   Apply 2: enable_setup_ui   = true   (routes exist)
+# Rollback reverses the order.
+enable_setup_auth = false
+enable_setup_ui   = false
+
+# Required when enable_setup_auth = true. Reuse the EXISTING router app
+# registration — one app registration/audience per router deployment.
+setup_ui_client_id     = null # bare client-id GUID, e.g. "00000000-0000-0000-0000-000000000000"
+setup_ui_client_secret = null # SENSITIVE — `az ad app credential reset`, shown once
+
+# Required when enable_setup_auth = true. Static RFC 3339 window for the ACA
+# token-store SAS. Do NOT derive from timestamp(): that re-evaluates on every
+# plan and rolls a new router revision each apply. EXPIRY IS A LIVE FAILURE
+# DEADLINE — past it, sign-in breaks. Diarise the renewal.
+setup_ui_token_store_sas_start  = null # "2026-01-01T00:00:00Z"
+setup_ui_token_store_sas_expiry = null # "2027-01-01T00:00:00Z"
+
+# ATTESTATION, not a switch, and no longer the ordering gate (Terraform now
+# proves the ordering against Azure). Set true only after applying stage 1 ALONE
+# and passing the README §11 step 5 behavioural checks against the live app:
+# machine routes do not 302 to /.auth, and sign-in works while /setup still 404s.
+setup_auth_stage1_verified = false
+
+# 'entra-token' is the ONLY value this stack accepts. It verifies the forwarded
+# ID token cryptographically and ignores X-MS-CLIENT-PRINCIPAL-* entirely.
+# 'easyauth-headers' is refused here: its trust boundary is the ingress topology,
+# which the configuration cannot verify. (The router still supports that mode for
+# self-hosted deployments that are not behind ACA.)
+setup_ui_auth_mode         = "entra-token"
+setup_ui_id_token_audience = null # defaults to setup_ui_client_id; NOT the api:// URI
+
+# Optional in-router domain allowlist. Defence in depth only — it cannot tell an
+# assigned teammate from any other account in the same tenant.
+setup_ui_allowed_domain = null # "example.com"
+
+# Auto-provisioning is OFF by default. Terraform refuses to enable it without a
+# membership gate: populate an allowedPrincipals list below, or run the Entra
+# assignment commands in README §11 step 3 and attest to them.
+setup_ui_auto_provision_users         = false
+setup_ui_allowed_group_object_ids     = []
+setup_ui_allowed_principal_object_ids = []
+setup_ui_assignment_required_verified = false
+
+# ---- Per-user secret storage backend (opt-in infra; see README) --------------
+# TWO FLAGS, and they are not interchangeable.
+#
+# enable_setup_secret_store CREATES the Azure Table, the envelope-encryption KEK
+# and the router's Storage Table Data Contributor + Key Vault Crypto User roles.
+# It is FALSE by default so that a stack wanting none of this plans no changes at
+# all — and so that an apply run by a principal without "Key Vault Crypto
+# Officer" on the vault does not fail trying to create an RSA key it never asked
+# for. It is ONE-WAY BY CONVENTION: the Table and the KEK carry prevent_destroy,
+# so setting it back to false after they exist is REFUSED at plan time rather
+# than destroying the key that unwraps every stored secret. That is deliberate.
+enable_setup_secret_store = false
+
+# enable_setup_table_backend SELECTS that Table as the router's secret backend.
+# This is the reversible control and the rollback path: clearing it drops the
+# router back to Key Vault on the next revision, with no destroy and no data
+# loss. Requires enable_setup_secret_store. Enable it only AFTER
+# `cyrus router secrets migrate` has run and been verified.
+enable_setup_table_backend = false
+
+# Provider inherited by users whose stored executor is the explicit
+# {"type":"default"} sentinel. NULL (the default) omits the field entirely and
+# leaves the rendered router config — and therefore the running revision —
+# untouched. Set "aca" to opt in. Even then, a NULL/absent stored executor still
+# means "physical device" and is never captured by this, so nobody silently
+# moves to ACA.
+router_default_executor = null

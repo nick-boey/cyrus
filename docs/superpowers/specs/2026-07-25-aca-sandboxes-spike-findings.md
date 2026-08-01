@@ -1,7 +1,7 @@
 # ACA Sandboxes — Task 0 Spike Findings
 
 > Companion to `docs/superpowers/plans/2026-07-25-container-executors-azure-aca-sandboxes.md`.
-> **Run date:** 2026-07-26 · **Operator:** nick.boey
+> **Run date:** 2026-07-26
 > **Environment:** subscription `dit-development` (`1efb7cc3-4a62-4f9b-9c01-d9f532c0c526`),
 > tenant `c9857cc6-…` (Northrop), resource group `rg-cyrus-aca-spike`, region **australiaeast**,
 > sandbox group `cyrus-spike-grp`.
@@ -26,9 +26,9 @@
 was replaced by something better. The corrections below are mostly mechanical (wire shapes),
 with three genuine design consequences (**F1**, **F2** and **F3**).
 
-> **S0 addendum, 2026-07-26 (operator nick.boey).** S0 was run separately from the Azure spikes
-> against the live Linear workspace `northrop-digital` and the pm2-hosted `cyrus-router` on this
-> host (ngrok tunnel `unaired-aviation-easing.ngrok-free.dev` → `localhost:8787`). It involves no
+> **S0 addendum, 2026-07-26.** S0 was run separately from the Azure spikes
+> against the live Linear workspace and the pm2-hosted `cyrus-router` on this
+> host (an ngrok tunnel → `localhost:8787`). It involves no
 > Azure resources. Task 6 is no longer gated.
 
 ---
@@ -79,7 +79,7 @@ create body works; a follow-up `POST /lifecycle` also works.
 the plan does not account for. Both were found by live test, not inference (S0).
 
 1. **Linear does not notify you about your own actions.** All 29 notifications in the corpus had a
-   *human* actor (`actorId` = Nick Boey) and the Cyrus app user as recipient. When the same state
+   *human* actor (`actorId` = the human operator) and the Cyrus app user as recipient. When the same state
    change was driven **using the Cyrus app's own OAuth token**, `Issue/update` fired normally but
    `issueStatusChanged` **did not fire at all**. So any terminal transition performed by the app
    user itself — a Cyrus session closing its own issue, or any automation sharing that OAuth
