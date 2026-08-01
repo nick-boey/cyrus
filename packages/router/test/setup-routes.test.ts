@@ -1144,6 +1144,36 @@ describe("applyEdits", () => {
 		).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "old", MY_TOOL_KEY: "new" });
 	});
 
+	// `buildModel` renders a row for every name in `requiredKeys` ∪ the bundle's
+	// keys, so a required key missing from the bundle IS on the page with an
+	// editable input. This function accepted only keys already present, so that
+	// row silently discarded whatever was typed into it and the save reported
+	// "No changes to save" — the page looked functional and wrote nothing.
+	//
+	// The realistic trigger is adding a name to `containers.requiredSecretKeys`
+	// after teammates are provisioned: every existing bundle lacks it, so the
+	// new credential can never be entered through the UI. A record that was
+	// deleted or restored incomplete hits the same wall.
+	it("accepts a required key that is absent from the bundle", () => {
+		const result = applyEdits(
+			{},
+			{ "value:CLAUDE_CODE_OAUTH_TOKEN": ["fresh"] },
+			REQUIRED,
+		);
+		expect(result.ignored).toEqual([]);
+		expect(result.changed).toBe(true);
+		expect(result.next).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "fresh" });
+	});
+
+	// The guard still has to reject anything that never appeared on a row —
+	// widening it to "required ∪ present" must not widen it to "anything".
+	it("still ignores a name that is neither required nor already stored", () => {
+		const result = applyEdits({}, { "value:INJECTED_KEY": ["x"] }, REQUIRED);
+		expect(result.ignored).toEqual(["INJECTED_KEY"]);
+		expect(result.changed).toBe(false);
+		expect(result.next).toEqual({});
+	});
+
 	it("leaves an empty value unchanged", () => {
 		expect(
 			applyEdits(current, { "value:MY_TOOL_KEY": [""] }, REQUIRED).next,

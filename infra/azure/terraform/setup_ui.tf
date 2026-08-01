@@ -219,6 +219,25 @@ resource "azapi_resource" "router_auth" {
         }
       }
       login = {
+        # REQUIRED for /setup to be able to SAVE anything, not a redirect nicety.
+        #
+        # EasyAuth's built-in CSRF mitigation rejects a request when ALL of:
+        #   1. it is a POST authenticated by the session cookie,
+        #   2. the User-Agent says a real browser sent it,
+        #   3. Origin/Referer is absent or not in THIS list, and
+        #   4. Origin is absent or not in the ingress CORS origin list.
+        # The /setup page's htmx save is 1 and 2 by construction, and with this
+        # list empty it was also 3 and 4 — so the sidecar returned a BODYLESS
+        # 403 before the router ever saw the request. The page rendered and read
+        # correctly while every write died silently in front of the app, which
+        # is why it looked like an application bug.
+        #
+        # Listing our own origin breaks condition 3. It widens nothing: this is
+        # the origin EasyAuth already redirects back to after sign-in.
+        # https://learn.microsoft.com/azure/app-service/overview-authentication-authorization
+        allowedExternalRedirectUrls = [
+          "https://${azurerm_container_app.router.ingress[0].fqdn}",
+        ]
         tokenStore = {
           enabled = true
           azureBlobStorage = {

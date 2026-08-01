@@ -508,8 +508,21 @@ export function applyEdits(
 		edits.set(name, entry);
 	}
 
+	// The set of names the user could legitimately have edited, which must mirror
+	// what `buildModel` puts on the page: `requiredKeys` ∪ the stored keys.
+	// Checking `Object.hasOwn(next, name)` alone was narrower than the rendered
+	// form, so a required key absent from the bundle rendered an editable row
+	// whose contents were then silently discarded — the save answered "No
+	// changes to save" and wrote nothing. That happens whenever a name is added
+	// to `containers.requiredSecretKeys` after a teammate was provisioned, and
+	// to any record deleted or restored without its full key set.
+	const editable = new Set([
+		...requiredKeys.map((key) => normalizeSecretKey(key)),
+		...Object.keys(next),
+	]);
+
 	for (const [name, edit] of edits) {
-		if (!Object.hasOwn(next, name)) {
+		if (!editable.has(name)) {
 			ignored.push(name);
 			continue;
 		}
@@ -525,10 +538,9 @@ export function applyEdits(
 		next[name] = edit.value;
 	}
 
-	// Not consulted above — every clear is a set-to-empty regardless of whether
-	// the key is required — but kept in the signature so a future divergence in
-	// required-key handling has an obvious home.
-	void requiredKeys;
+	// `requiredKeys` is consulted above, to build the editable-name set. It is
+	// deliberately NOT consulted in the loop: a clear is a set-to-empty whether
+	// or not the key is required.
 	return { next, changed, ignored };
 }
 
