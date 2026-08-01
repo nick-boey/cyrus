@@ -129,6 +129,12 @@ export interface RouterContainersConfig {
 	 * ["GIT_TOKEN", "LINEAR_API_TOKEN"].
 	 */
 	requiredSecretKeys?: string[];
+	/**
+	 * Provider users inherit when their stored executor is the explicit
+	 * `{"type":"default"}` sentinel. A NULL/absent executor keeps meaning
+	 * "physical device" and is deliberately NOT captured — see F11 on NOR-270.
+	 */
+	defaultExecutor?: string;
 	docker?: { memoryLimit?: string; network?: string };
 	/**
 	 * Azure Container Apps (ACA) Sandboxes provider settings. When present,
@@ -641,6 +647,7 @@ export class RouterServer {
 				routerUrlForContainers: containers.routerUrlForContainers,
 				repositories: containers.repositories,
 				requiredSecretKeys: containers.requiredSecretKeys,
+				defaultExecutor: containers.defaultExecutor,
 			},
 			postActivity: (workspaceId, agentSessionId, body) =>
 				this.executor.postActivity(workspaceId, agentSessionId, body),

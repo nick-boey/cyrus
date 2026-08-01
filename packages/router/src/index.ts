@@ -80,6 +80,13 @@ export {
 	type StateBackupOptions,
 } from "./StateBackup.js";
 export {
+	EXECUTOR_TYPE_DEFAULT,
+	EXECUTOR_TYPE_DEVICE,
+	resolveExecutor,
+	SetupBootstrap,
+	type SetupBootstrapDeps,
+} from "./setup/bootstrap.js";
+export {
 	assertKekVersion,
 	BundleTooLargeError,
 	KeyVaultKeyWrapper,

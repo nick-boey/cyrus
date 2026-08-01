@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   name TEXT,
   linear_id TEXT,
-  executor_json TEXT
+  executor_json TEXT,
+  entra_object_id TEXT
 );
 CREATE TABLE IF NOT EXISTS devices (
   device_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -359,6 +360,14 @@ export class RouterStore {
 			!userCols.some((c) => c.name === "executor_json")
 		) {
 			this.db.exec("ALTER TABLE users ADD COLUMN executor_json TEXT");
+		}
+		// `userCols` is snapshotted above, before the executor_json ALTER, so it
+		// is still the right basis for this independent check.
+		if (
+			userCols.length > 0 &&
+			!userCols.some((c) => c.name === "entra_object_id")
+		) {
+			this.db.exec("ALTER TABLE users ADD COLUMN entra_object_id TEXT");
 		}
 	}
 
@@ -953,6 +962,28 @@ export class RouterStore {
 			.prepare("SELECT executor_json FROM users WHERE user_id = ?")
 			.get(userId) as { executor_json: string | null } | undefined;
 		return row?.executor_json ?? undefined;
+	}
+
+	/**
+	 * The Entra `oid` this user row was first bound to.
+	 *
+	 * Interim mitigation for NOR-274 (re-keying identity from mutable email to
+	 * `(tenantId, oid)`): recording it now is what gives that migration the data
+	 * it needs, and lets {@link SetupBootstrap} warn when a known email presents
+	 * a different Entra object — the UPN-rename / email-reuse signal.
+	 */
+	getUserEntraObjectId(userId: number): string | undefined {
+		const row = this.db
+			.prepare("SELECT entra_object_id FROM users WHERE user_id = ?")
+			.get(userId) as { entra_object_id: string | null } | undefined;
+		return row?.entra_object_id ?? undefined;
+	}
+
+	setUserEntraObjectId(userId: number, objectId: string): boolean {
+		const result = this.db
+			.prepare("UPDATE users SET entra_object_id = ? WHERE user_id = ?")
+			.run(objectId, userId);
+		return result.changes > 0;
 	}
 
 	getUserEmail(userId: number): string | undefined {
