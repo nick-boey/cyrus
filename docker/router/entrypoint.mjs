@@ -100,7 +100,8 @@ function generateConfig(env) {
 			env.CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN ||
 			env.CYRUS_ROUTER_ENTRA_JWKS_URL ||
 			env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID ||
-			env.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL,
+			env.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL ||
+			env.CYRUS_ROUTER_SETUP_UI_ENABLED,
 	);
 
 	if (!anyProvided) {
@@ -224,6 +225,53 @@ function generateConfig(env) {
 	if (env.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL) {
 		config.linearTokenStore = {
 			keyVaultUrl: env.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL,
+		};
+	}
+	if (env.CYRUS_ROUTER_SETUP_UI_ENABLED === "true") {
+		// `auth` is deliberately required by the router when enabled — an
+		// ambiguous strategy refuses to start rather than serving /setup with no
+		// enforceable trust boundary. easyauth-headers additionally demands
+		// CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP=true, which an operator
+		// sets by hand only after verifying live that the ACA ingress strips
+		// client-supplied X-MS-CLIENT-PRINCIPAL* headers.
+		const mode = env.CYRUS_ROUTER_SETUP_UI_AUTH_MODE;
+		let auth;
+		if (mode === "entra-token") {
+			if (!env.CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE) {
+				fail(
+					"missing required environment variables: CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE (required by CYRUS_ROUTER_SETUP_UI_AUTH_MODE=entra-token)",
+				);
+			}
+			auth = {
+				mode,
+				idTokenAudience: env.CYRUS_ROUTER_SETUP_UI_ID_TOKEN_AUDIENCE,
+			};
+		} else if (mode === "easyauth-headers") {
+			if (env.CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP !== "true") {
+				fail(
+					'CYRUS_ROUTER_SETUP_UI_AUTH_MODE=easyauth-headers requires CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP=true. Set it only after verifying live that the ingress strips client-supplied X-MS-CLIENT-PRINCIPAL* headers; prefer entra-token, which does not depend on proxy topology.',
+				);
+			}
+			auth = { mode, verifiedHeaderStrip: true };
+		} else if (mode === "dev-insecure-headers") {
+			auth = { mode };
+		} else {
+			fail(
+				`CYRUS_ROUTER_SETUP_UI_AUTH_MODE must be one of "entra-token", "easyauth-headers", "dev-insecure-headers" (got ${JSON.stringify(mode)})`,
+			);
+		}
+		config.setupUi = {
+			enabled: true,
+			auth,
+			...(env.CYRUS_ROUTER_SETUP_UI_ALLOWED_DOMAIN
+				? { allowedDomain: env.CYRUS_ROUTER_SETUP_UI_ALLOWED_DOMAIN }
+				: {}),
+			...(env.CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION
+				? {
+						autoProvisionUsers:
+							env.CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION === "true",
+					}
+				: {}),
 		};
 	}
 

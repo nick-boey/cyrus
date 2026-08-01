@@ -716,6 +716,54 @@ describe("RouterCommand", () => {
 			expect(app.logger.success).not.toHaveBeenCalled();
 		});
 
+		it("selects the Table backend over Key Vault, and survives the schema", async () => {
+			// tableStore is stripped on EVERY `router start` if it is not modelled
+			// in RouterConfigFileSchema, so this asserts the field both parses and
+			// wins the precedence contest against keyVaultUrl.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "worker:latest",
+						routerUrlForContainers: "wss://router.example.com",
+						repositories: [],
+						keyVaultUrl: "https://vault.vault.azure.net",
+						tableStore: {
+							endpoint: "https://stexample.table.core.windows.net",
+							keyId: `https://vault.vault.azure.net/keys/kek/${"a".repeat(32)}`,
+						},
+					},
+				}),
+			);
+			const command = new RouterCommand(createMockApp(cyrusHome) as any);
+			const store = (command as any).openSecretStore();
+			expect(store.constructor.name).toBe("TableSecretStore");
+		});
+
+		it("keeps setupUi through the config schema", async () => {
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					setupUi: {
+						enabled: true,
+						auth: { mode: "entra-token", idTokenAudience: "client-guid" },
+					},
+				}),
+			);
+			const command = new RouterCommand(createMockApp(cyrusHome) as any);
+			const config = (command as any).readRouterConfig();
+			expect(config.setupUi).toEqual({
+				enabled: true,
+				auth: { mode: "entra-token", idTokenAudience: "client-guid" },
+			});
+		});
+
 		it("fails all secret operations for schema-invalid router config", async () => {
 			writeFileSync(
 				join(cyrusHome, "router-config.json"),

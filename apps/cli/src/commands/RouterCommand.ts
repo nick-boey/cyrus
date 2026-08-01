@@ -29,6 +29,7 @@ import {
 	SecretStore,
 	type SecretStoreBackend,
 	type SessionInfo,
+	TableSecretStore,
 } from "cyrus-router";
 import { z } from "zod";
 import { BaseCommand } from "./ICommand.js";
@@ -183,6 +184,25 @@ const RouterConfigFileSchema = z.object({
 			artifactsDir: z.string().optional(),
 			secretsPath: z.string().optional(),
 			keyVaultUrl: z.string().optional(),
+			// Azure Table backend for per-user secrets. Takes precedence over
+			// keyVaultUrl. Unmodelled fields are stripped on EVERY `router start`
+			// (safeParse + spread below), not merely on rewrite — so omitting this
+			// would make the field silently vanish in every deployment.
+			tableStore: z
+				.object({
+					endpoint: z.string().min(1),
+					tableName: z.string().optional(),
+					keyId: z.string().min(1),
+				})
+				.optional(),
+			/**
+			 * Executor inherited by users whose stored executor is the explicit
+			 * `{"type":"default"}` sentinel. A NULL/absent executor still means
+			 * physical device and is deliberately NOT captured by this — see F11
+			 * on NOR-270. Without that distinction, enabling this would silently
+			 * move every deliberately-set-to-device user onto cloud sandboxes.
+			 */
+			defaultExecutor: z.string().min(1).optional(),
 			idleStopMs: z.number().optional(),
 			staleDestroyMs: z.number().optional(),
 			teardownGraceMs: z.number().optional(),
@@ -238,6 +258,35 @@ const RouterConfigFileSchema = z.object({
 					managementEndpoint: z.string().optional(),
 				})
 				.optional(),
+		})
+		.optional(),
+	/**
+	 * Authenticated `/setup*` management UI. Off by default.
+	 *
+	 * `auth` is intentionally a required discriminated union when enabled: how
+	 * identity is established is an explicit operator choice, never inferred
+	 * from `entra` above (which governs enrollment tokens for `/enroll`). The
+	 * router refuses to start on an ambiguous strategy — see D1' on NOR-265.
+	 */
+	setupUi: z
+		.object({
+			enabled: z.boolean(),
+			auth: z
+				.discriminatedUnion("mode", [
+					z.object({
+						mode: z.literal("easyauth-headers"),
+						verifiedHeaderStrip: z.literal(true),
+					}),
+					z.object({
+						mode: z.literal("entra-token"),
+						idTokenAudience: z.string().min(1),
+					}),
+					z.object({ mode: z.literal("dev-insecure-headers") }),
+				])
+				.optional(),
+			allowedDomain: z.string().optional(),
+			/** Default false — see F5 on NOR-265. */
+			autoProvisionUsers: z.boolean().optional(),
 		})
 		.optional(),
 });
@@ -404,11 +453,24 @@ export class RouterCommand extends BaseCommand {
 		return this.readRouterConfig()?.containers?.secretsPath ?? defaultPath;
 	}
 
+	/**
+	 * Resolves the break-glass secret backend, matching the router's own
+	 * precedence in `RouterServer.buildContainerTargets`: Table, then Key Vault,
+	 * then the 0600 file store. Drift here would have the CLI reading a
+	 * different store than the one a container boot reads.
+	 */
 	private openSecretStore(): SecretStoreBackend {
-		const keyVaultUrl = this.readRouterConfig()?.containers?.keyVaultUrl;
-		if (keyVaultUrl)
+		const containers = this.readRouterConfig()?.containers;
+		if (containers?.tableStore)
+			return new TableSecretStore({
+				tableEndpoint: containers.tableStore.endpoint,
+				tableName: containers.tableStore.tableName,
+				keyId: containers.tableStore.keyId,
+				logger: this.logger,
+			});
+		if (containers?.keyVaultUrl)
 			return new KeyVaultSecretStore({
-				vaultUrl: keyVaultUrl,
+				vaultUrl: containers.keyVaultUrl,
 				logger: this.logger,
 			});
 		return new SecretStore(this.resolveSecretsPath());
