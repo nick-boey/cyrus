@@ -733,4 +733,66 @@ describe("container devices (schema v2)", () => {
 			store.close();
 		});
 	});
+
+	describe("parked_at_ms", () => {
+		const makeContainerDevice = (store: RouterStore, issueKey: string) => {
+			const { userId } = store.addUser({ email: `${issueKey}@example.com` });
+			return store.createContainerDevice(userId, issueKey, "aca").deviceId;
+		};
+		const parkedAtFor = (store: RouterStore, deviceId: number) =>
+			store.listContainerDevices().find((d) => d.deviceId === deviceId)
+				?.parkedAtMs;
+
+		it("round-trips through listContainerDevices", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-1");
+
+			store.setDeviceParkedAt(deviceId, 1_700_000_000_000);
+
+			expect(parkedAtFor(store, deviceId)).toBe(1_700_000_000_000);
+			store.close();
+		});
+
+		it("is undefined until a session parks", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-2");
+
+			expect(parkedAtFor(store, deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		it("clears on clearDeviceParkedAt", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-3");
+
+			store.setDeviceParkedAt(deviceId, 1_700_000_000_000);
+			store.clearDeviceParkedAt(deviceId);
+
+			expect(parkedAtFor(store, deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		it("clears when affinity is re-established for the device", () => {
+			// A device with a live session is by definition not parked. Leaving a
+			// stale stamp would make the idle clock read from a park that ended.
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-4");
+
+			store.setDeviceParkedAt(deviceId, 1_700_000_000_000);
+			store.setSessionAffinity("session-1", deviceId);
+
+			expect(parkedAtFor(store, deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		it("is exposed on getContainerDeviceForIssue too", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-5");
+
+			store.setDeviceParkedAt(deviceId, 42);
+
+			expect(store.getContainerDeviceForIssue("PAR-5")?.parkedAtMs).toBe(42);
+			store.close();
+		});
+	});
 });

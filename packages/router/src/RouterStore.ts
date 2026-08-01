@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS devices (
   created_ms INTEGER NOT NULL,
   next_seq INTEGER NOT NULL DEFAULT 1,
   last_seen_ms INTEGER,
-  last_routed_ms INTEGER
+  last_routed_ms INTEGER,
+  parked_at_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS enrollment_codes (
   code_hash TEXT PRIMARY KEY,
@@ -133,6 +134,7 @@ interface DeviceRow {
 	next_seq: number;
 	last_seen_ms: number | null;
 	last_routed_ms: number | null;
+	parked_at_ms: number | null;
 }
 
 interface ContainerDeviceRow {
@@ -143,6 +145,7 @@ interface ContainerDeviceRow {
 	created_ms: number;
 	last_seen_ms: number | null;
 	last_routed_ms: number | null;
+	parked_at_ms: number | null;
 }
 
 export interface ContainerDeviceInfo {
@@ -153,6 +156,12 @@ export interface ContainerDeviceInfo {
 	createdMs: number;
 	lastSeenMs?: number;
 	lastRoutedMs?: number;
+	/**
+	 * When a session on this device last parked (blocked on a user answer with
+	 * no work in flight). Read by ContainerLifecycle as part of the idle clock;
+	 * absent when no session is parked.
+	 */
+	parkedAtMs?: number;
 }
 
 interface ContainerTeardownRow {
@@ -253,6 +262,7 @@ function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
 		createdMs: row.created_ms,
 		lastSeenMs: row.last_seen_ms ?? undefined,
 		lastRoutedMs: row.last_routed_ms ?? undefined,
+		parkedAtMs: row.parked_at_ms ?? undefined,
 	};
 }
 
@@ -368,6 +378,18 @@ export class RouterStore {
 			!userCols.some((c) => c.name === "entra_object_id")
 		) {
 			this.db.exec("ALTER TABLE users ADD COLUMN entra_object_id TEXT");
+		}
+
+		// Re-read rather than reusing `deviceCols`: that snapshot predates the
+		// v1->v2 rebuild above, which recreates the table without this column.
+		const deviceColsNow = this.db
+			.prepare("PRAGMA table_info(devices)")
+			.all() as Array<{ name: string }>;
+		if (
+			deviceColsNow.length > 0 &&
+			!deviceColsNow.some((c) => c.name === "parked_at_ms")
+		) {
+			this.db.exec("ALTER TABLE devices ADD COLUMN parked_at_ms INTEGER");
 		}
 	}
 
@@ -648,7 +670,7 @@ export class RouterStore {
 	): ContainerDeviceInfo | undefined {
 		const row = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms
 				 FROM devices WHERE kind = 'container' AND issue_key = ?`,
 			)
 			.get(issueKey) as ContainerDeviceRow | undefined;
@@ -718,11 +740,32 @@ export class RouterStore {
 	listContainerDevices(): ContainerDeviceInfo[] {
 		const rows = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms
 				 FROM devices WHERE kind = 'container'`,
 			)
 			.all() as ContainerDeviceRow[];
 		return rows.map(toContainerDeviceInfo);
+	}
+
+	/**
+	 * Stamp when a session on this device parked — blocked on a user answer with
+	 * no work in flight.
+	 *
+	 * ContainerLifecycle folds this into its idle clock. Without it the clock is
+	 * `last_routed_ms`, so an agent that worked for twenty minutes and only then
+	 * asked a question would be suspended on the very next sweep, the clock
+	 * having expired while it was legitimately busy.
+	 */
+	setDeviceParkedAt(deviceId: number, parkedAtMs: number): void {
+		this.db
+			.prepare("UPDATE devices SET parked_at_ms = ? WHERE device_id = ?")
+			.run(parkedAtMs, deviceId);
+	}
+
+	clearDeviceParkedAt(deviceId: number): void {
+		this.db
+			.prepare("UPDATE devices SET parked_at_ms = NULL WHERE device_id = ?")
+			.run(deviceId);
 	}
 
 	// ── Terminal teardown bookkeeping ──────────────────────────────────────
@@ -1214,6 +1257,9 @@ export class RouterStore {
 					creator_json = excluded.creator_json`,
 			)
 			.run(sessionId, deviceId, creatorJson ?? null);
+		// A device with a live session is by definition not parked. Leaving the
+		// stamp would let the idle clock read from a park that has since ended.
+		this.clearDeviceParkedAt(deviceId);
 	}
 
 	getSessionAffinity(sessionId: string): number | undefined {
