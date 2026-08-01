@@ -80,6 +80,16 @@ export {
 	type StateBackupOptions,
 } from "./StateBackup.js";
 export {
+	assertKekVersion,
+	BundleTooLargeError,
+	KeyVaultKeyWrapper,
+	type KeyWrapper,
+	MAX_BUNDLE_BYTES,
+	openBundle,
+	type SealedBundle,
+	sealBundle,
+} from "./setup/envelope.js";
+export {
 	parseEasyAuthPrincipal,
 	requireSetupPrincipal,
 	SETUP_ID_TOKEN_HEADER,
@@ -92,6 +102,15 @@ export {
 	type SetupUiConfig,
 	validateSetupAuthConfig,
 } from "./setup/principal.js";
+export {
+	createTableStorageTokenProvider,
+	DEFAULT_TABLE_NAME,
+	SETUP_ROW_KEY,
+	SetupConflictError,
+	setupPartitionKey,
+	TableSecretStore,
+	type TableSecretStoreOptions,
+} from "./TableSecretStore.js";
 export {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,

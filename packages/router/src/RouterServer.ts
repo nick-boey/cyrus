@@ -38,6 +38,7 @@ import {
 	type SetupUiConfig,
 	validateSetupAuthConfig,
 } from "./setup/principal.js";
+import { TableSecretStore } from "./TableSecretStore.js";
 import {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
@@ -94,6 +95,27 @@ export interface RouterContainersConfig {
 	secretsPath?: string;
 	/** Selects Azure Key Vault instead of the local secrets file. */
 	keyVaultUrl?: string;
+	/**
+	 * Selects the Azure Table backend, which stores one envelope-encrypted
+	 * entity per user. Highest precedence: `tableStore`, then
+	 * {@link keyVaultUrl}, then the 0600 file store.
+	 *
+	 * Per D6′ the Table, KEK, and role assignments are create-once; rollback is
+	 * expressed by removing this field, never by destroying the infrastructure.
+	 */
+	tableStore?: {
+		/** Bare https origin, e.g. "https://stexample.table.core.windows.net". */
+		endpoint: string;
+		/** Default "cyrussetup". */
+		tableName?: string;
+		/**
+		 * Versioned Key Vault key id used as the KEK, e.g.
+		 * `https://<vault>/keys/<name>/<32-hex-version>`. Parsed once at
+		 * construction; every request URL is rebuilt from it, and no stored
+		 * value ever contributes a host or path (D4′).
+		 */
+		keyId: string;
+	};
 	/** Default 900_000 (15 minutes). */
 	idleStopMs?: number;
 	/** Default 1_209_600_000 (14 days). */
@@ -243,6 +265,13 @@ export class RouterServer {
 	 */
 	readonly eventRouter: EventRouter;
 	/**
+	 * Which per-user secret backend the container path resolved to. A
+	 * diagnostic seam — it is logged at startup and asserted in tests, because
+	 * "why is my secret not there" is otherwise invisible. `"none"` when
+	 * `config.containers` is absent and no backend was built.
+	 */
+	readonly secretBackendKind: "none" | "file" | "keyvault" | "table";
+	/**
 	 * Idle-stop / stale-destroy / orphan-GC sweep for ephemeral containers.
 	 * Constructed in {@link buildContainerTargets} only when
 	 * `config.containers` is set; otherwise stays `undefined` and the sweep
@@ -331,10 +360,15 @@ export class RouterServer {
 		const artifactsDir =
 			config.containers?.artifactsDir ??
 			join(dirname(config.dbPath), "artifacts");
-		const containerTargets = this.buildContainerTargets(
-			config.containers,
-			artifactsDir,
-		);
+		const built = this.buildContainerTargets(config.containers, artifactsDir);
+		const containerTargets = built?.service;
+		// Assigned here rather than inside buildContainerTargets because a
+		// `readonly` field may only be written from the constructor, and the
+		// method early-returns when `containers` is absent.
+		this.secretBackendKind = built?.kind ?? "none";
+		if (built) {
+			this.logger.info(`Per-user secret backend: ${this.secretBackendKind}`);
+		}
 
 		this.eventRouter = new EventRouter({
 			store: this.store,
@@ -523,18 +557,40 @@ export class RouterServer {
 	private buildContainerTargets(
 		containers: RouterContainersConfig | undefined,
 		artifactsDir: string,
-	): ContainerTargetService | undefined {
+	):
+		| {
+				service: ContainerTargetService;
+				secrets: SecretStoreBackend;
+				kind: "file" | "keyvault" | "table";
+		  }
+		| undefined {
 		if (!containers) return undefined;
 
 		const secretsPath =
 			containers.secretsPath ??
 			join(dirname(this.config.dbPath), "user-secrets.json");
-		const secrets: SecretStoreBackend = containers.keyVaultUrl
-			? new KeyVaultSecretStore({
-					vaultUrl: containers.keyVaultUrl,
-					logger: this.logger,
-				})
-			: new SecretStore(secretsPath);
+		// Precedence: Table, then Key Vault, then the 0600 file store. A
+		// deployment with none of these fields set is byte-identical to today.
+		let secrets: SecretStoreBackend;
+		let kind: "file" | "keyvault" | "table";
+		if (containers.tableStore) {
+			secrets = new TableSecretStore({
+				tableEndpoint: containers.tableStore.endpoint,
+				tableName: containers.tableStore.tableName,
+				keyId: containers.tableStore.keyId,
+				logger: this.logger,
+			});
+			kind = "table";
+		} else if (containers.keyVaultUrl) {
+			secrets = new KeyVaultSecretStore({
+				vaultUrl: containers.keyVaultUrl,
+				logger: this.logger,
+			});
+			kind = "keyvault";
+		} else {
+			secrets = new SecretStore(secretsPath);
+			kind = "file";
+		}
 
 		const executorRegistryFactory =
 			this.config.executorRegistryFactory ??
@@ -611,7 +667,7 @@ export class RouterServer {
 			this.terminalTeardown,
 		);
 
-		return containerTargets;
+		return { service: containerTargets, secrets, kind };
 	}
 
 	/**

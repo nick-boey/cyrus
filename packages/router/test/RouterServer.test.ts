@@ -547,3 +547,107 @@ describe("RouterServer containers wiring", () => {
 		expect(docker.ensureRunning).not.toHaveBeenCalled();
 	});
 });
+
+describe("RouterServer secret backend selection", () => {
+	const containers = {
+		image: "example/worker:test",
+		routerUrlForContainers: "ws://127.0.0.1:9/",
+		repositories: [],
+	};
+
+	function build(extra: Record<string, unknown> = {}) {
+		return new RouterServer({
+			port: 0,
+			dbPath: join(mkdtempSync(join(tmpdir(), "router-backend-")), "router.db"),
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			...extra,
+		});
+	}
+
+	it("reports no backend when containers is absent", () => {
+		const server = build();
+		expect(server.secretBackendKind).toBe("none");
+		server.stop();
+	});
+
+	it("falls back to the 0600 file store", () => {
+		const server = build({ containers });
+		expect(server.secretBackendKind).toBe("file");
+		server.stop();
+	});
+
+	it("selects Key Vault when keyVaultUrl is set", () => {
+		const server = build({
+			containers: { ...containers, keyVaultUrl: "https://kv.vault.azure.net" },
+		});
+		expect(server.secretBackendKind).toBe("keyvault");
+		server.stop();
+	});
+
+	it("gives tableStore precedence over keyVaultUrl", () => {
+		const server = build({
+			containers: {
+				...containers,
+				keyVaultUrl: "https://kv.vault.azure.net",
+				tableStore: {
+					endpoint: "https://stexample.table.core.windows.net",
+					keyId: `https://kv.vault.azure.net/keys/kek/${"a".repeat(32)}`,
+				},
+			},
+		});
+		expect(server.secretBackendKind).toBe("table");
+		server.stop();
+	});
+});
+
+describe("RouterServer setupUi auth strategy", () => {
+	function build(setupUi: unknown, host?: string) {
+		return () =>
+			new RouterServer({
+				port: 0,
+				host,
+				dbPath: ":memory:",
+				workspaces: { "ws-1": { linearToken: "test-token" } },
+				webhook: { verificationMode: "direct", secret: "test-secret" },
+				trackerFactory: () => new CLIIssueTrackerService(),
+				// biome-ignore lint/suspicious/noExplicitAny: exercising invalid config
+				setupUi: setupUi as any,
+			});
+	}
+
+	it("refuses to start when the UI is enabled with no strategy", () => {
+		expect(build({ enabled: true })).toThrow(/setupUi\.auth is not set/);
+	});
+
+	it("refuses easyauth-headers until the header strip is verified", () => {
+		expect(
+			build({ enabled: true, auth: { mode: "easyauth-headers" } }),
+		).toThrow(/verifiedHeaderStrip/);
+	});
+
+	it("refuses dev-insecure-headers off loopback", () => {
+		expect(
+			build(
+				{ enabled: true, auth: { mode: "dev-insecure-headers" } },
+				"0.0.0.0",
+			),
+		).toThrow(/loopback/);
+	});
+
+	it("accepts dev-insecure-headers on loopback", () => {
+		const server = build(
+			{ enabled: true, auth: { mode: "dev-insecure-headers" } },
+			"127.0.0.1",
+		)();
+		expect(server).toBeInstanceOf(RouterServer);
+		server.stop();
+	});
+
+	it("does not police a disabled setup UI", () => {
+		const server = build({ enabled: false })();
+		expect(server).toBeInstanceOf(RouterServer);
+		server.stop();
+	});
+});
