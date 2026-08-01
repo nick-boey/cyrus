@@ -48,6 +48,29 @@ export interface AgentPendingWork {
 	sessionCrons: SessionCronSummary[];
 	/** In-flight background work (running/pending + backgrounded tasks). */
 	backgroundTasks: BackgroundTaskSummary[];
+	/**
+	 * Live background work as of the last `background_tasks_changed` signal.
+	 *
+	 * Optional: runners predating the signal omit it, and an absent value means
+	 * "unknown", which callers treat as empty. Unlike {@link backgroundTasks}
+	 * this is observable MID-turn, which is what makes it usable as a "safe to
+	 * suspend?" predicate while the agent is blocked on an elicitation.
+	 */
+	liveBackgroundTasks?: LiveBackgroundTask[];
+}
+
+/**
+ * A background task currently live inside the CLI process, from the SDK's
+ * `background_tasks_changed` level signal.
+ *
+ * The signal carries the FULL live set on every membership change, so
+ * consumers replace their set wholesale rather than pairing start/stop edges —
+ * a missed bookend therefore cannot wedge a stale "still running" indicator.
+ */
+export interface LiveBackgroundTask {
+	taskId: string;
+	taskType: string;
+	description: string;
 }
 
 /**

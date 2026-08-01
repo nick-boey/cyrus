@@ -44,6 +44,7 @@ export type {
 	HookEvent,
 	IAgentRunner,
 	IMessageFormatter,
+	LiveBackgroundTask,
 	McpServerConfig,
 	OnAskUserQuestion,
 	SDKAssistantMessage,
