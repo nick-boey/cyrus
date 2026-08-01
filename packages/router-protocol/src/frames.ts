@@ -79,7 +79,21 @@ const sessionStateFrame = z.object({
 	// by the router's idempotent lock release rather than double-applied.
 	id: z.string().min(1),
 	sessionId: z.string().min(1),
-	state: z.enum(["complete", "error", "stopped"]),
+	// `complete`/`error`/`stopped` are terminal: the router releases both the
+	// issue lock and session affinity.
+	//
+	// `parked` is NOT terminal. It says the session is blocked on a user answer
+	// with no work in flight, so the router releases session affinity ONLY —
+	// which is what lets ContainerLifecycle idle-stop the container — while
+	// keeping the issue lock so no other session claims the issue mid-
+	// conversation.
+	//
+	// Additive: PROTOCOL_VERSION is deliberately NOT bumped, since an older
+	// worker simply never sends this value and bumping would reject it outright.
+	// The corollary is a deploy-ordering requirement — the router must ship
+	// BEFORE the worker image, because an older router cannot parse `parked`
+	// and would drop the device connection on receiving one.
+	state: z.enum(["complete", "error", "stopped", "parked"]),
 });
 const sessionStateAckFrame = z.object({
 	type: z.literal("session_state_ack"),

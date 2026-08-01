@@ -692,6 +692,66 @@ describe("RouterConnection", () => {
 		conn.close();
 	});
 
+	// ── parked (non-terminal) session_state ────────────────────────────────
+	// `parked` says the session is blocked on a user answer with no work in
+	// flight, so the router may release its affinity and idle-suspend the
+	// container. Losing one costs a suspend rather than stranding an issue, but
+	// it rides the same durable buffer — and, critically, the same per-session
+	// supersede rule, so a later terminal frame replaces it.
+
+	it("(p) sends a parked frame over the wire and buffers it until acked", async () => {
+		const conn = makeConn();
+		conn.connect();
+		await once(conn, "connected");
+
+		conn.sendSessionState("sess-1", "parked");
+
+		await vi.waitFor(() => expect(sessionStates()).toHaveLength(1));
+		expect(sessionStates()[0]).toMatchObject({
+			sessionId: "sess-1",
+			state: "parked",
+		});
+		expect(sessionStates()[0]?.id).toBeTruthy();
+		// Unacked by this router, so it stays on disk for replay.
+		expect(readJsonl(bufferPath())).toHaveLength(1);
+		conn.close();
+	});
+
+	it("(q) a terminal frame supersedes an unacked parked frame", async () => {
+		const conn = makeConn();
+		conn.sendSessionState("sess-1", "parked");
+		conn.sendSessionState("sess-1", "complete");
+
+		// Replaying `parked` after the session finished would release affinity
+		// over a turn that has already moved on.
+		const buffered = readJsonl(bufferPath()) as Array<{
+			sessionId: string;
+			state: string;
+		}>;
+		expect(buffered).toHaveLength(1);
+		expect(buffered[0]).toMatchObject({
+			sessionId: "sess-1",
+			state: "complete",
+		});
+		conn.close();
+	});
+
+	it("(r) discards an unacked parked frame when the session unparks", async () => {
+		const conn = makeConn();
+		conn.sendSessionState("sess-1", "parked");
+		expect(readJsonl(bufferPath())).toHaveLength(1);
+
+		conn.discardBufferedSessionState("sess-1");
+
+		expect(readJsonl(bufferPath())).toHaveLength(0);
+		router.onFrame = ackAll;
+		conn.connect();
+		await once(conn, "connected");
+		await new Promise((r) => setTimeout(r, 50));
+		expect(sessionStates()).toHaveLength(0);
+		conn.close();
+	});
+
 	it("(o) discarding a session with no buffered frame is a no-op", async () => {
 		const conn = makeConn();
 		conn.sendSessionState("sess-1", "complete");

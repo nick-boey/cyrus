@@ -45,6 +45,35 @@ describe("frames", () => {
 		expect(frame.seq).toBe(7);
 	});
 
+	it.each(["complete", "error", "stopped", "parked"])(
+		"parses a %s session_state frame",
+		(state) => {
+			const frame = parseDeviceFrame(
+				JSON.stringify({
+					type: "session_state",
+					id: "f1",
+					sessionId: "sess-1",
+					state,
+				}),
+			);
+			if (frame.type !== "session_state") throw new Error("wrong type");
+			expect(frame.state).toBe(state);
+		},
+	);
+
+	it("rejects an unknown session_state value", () => {
+		expect(() =>
+			parseDeviceFrame(
+				JSON.stringify({
+					type: "session_state",
+					id: "f1",
+					sessionId: "sess-1",
+					state: "napping",
+				}),
+			),
+		).toThrow();
+	});
+
 	it("session-scoped methods are a subset of the allowlist", () => {
 		for (const m of SESSION_SCOPED_RPC_METHODS) {
 			expect(RPC_METHODS).toContain(m);

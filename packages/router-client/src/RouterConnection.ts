@@ -125,7 +125,7 @@ interface InboxEntry {
 interface SessionStateEntry {
 	id: string;
 	sessionId: string;
-	state: "complete" | "error" | "stopped";
+	state: "complete" | "error" | "stopped" | "parked";
 }
 
 interface PersistedState {
@@ -332,10 +332,17 @@ export class RouterConnection extends EventEmitter {
 	 *
 	 * Delivery is at-least-once: a lost ack replays the frame, and the router's
 	 * release is idempotent.
+	 *
+	 * The non-terminal `parked` state rides the same buffer. Its stakes are
+	 * lower — losing one costs a suspend rather than stranding an issue, since
+	 * it releases affinity but not the issue lock — but it needs the same
+	 * per-session supersede rule, so a later terminal frame replaces a
+	 * still-unacked `parked` rather than both replaying. Callers MUST pair it
+	 * with {@link discardBufferedSessionState} when the session unparks.
 	 */
 	sendSessionState(
 		sessionId: string,
-		state: "complete" | "error" | "stopped",
+		state: "complete" | "error" | "stopped" | "parked",
 	): void {
 		const entry: SessionStateEntry = { id: randomUUID(), sessionId, state };
 		this.appendSessionStateEntry(entry);
