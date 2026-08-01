@@ -124,6 +124,17 @@ variable "aca_memory" {
   default     = "8192Mi"
 }
 
+variable "idle_stop_ms" {
+  description = "How long a container may sit idle before the router suspends it (snapshot + memory-suspend; a later prompt resumes it warm). The sweep NEVER touches a device that holds session affinity, and a session only releases affinity when it finishes or `parked`s — blocked on a user answer with no crons or background tasks in flight. So this bounds idle cost without ever freezing work. Counts from the later of the last routed event and the park."
+  type        = number
+  default     = 300000
+
+  validation {
+    condition     = var.idle_stop_ms > 0
+    error_message = "idle_stop_ms must be greater than 0."
+  }
+}
+
 variable "aca_auto_suspend_seconds" {
   description = "ACA-side auto-suspend interval in seconds. 0 = DISABLED (the Cyrus default, spike N5 / F2). ACA-side suspend has NO session-affinity gate and can freeze a live session mid-task; the router's affinity-aware `idleStopMs` is the sole idle controller. Leave this at 0."
   type        = number

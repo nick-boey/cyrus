@@ -22,6 +22,12 @@ locals {
     ]
     keyVaultUrl  = azurerm_key_vault.this.vault_uri
     artifactsDir = "/data/artifacts"
+    # Stated explicitly rather than left to the router's default: this is the
+    # knob that bounds idle sandbox cost, so the deployed value should be
+    # visible here rather than tracking whatever the image happens to default
+    # to. The router's sweep is affinity-aware and park-aware, so this never
+    # suspends a session that is working or has background work in flight.
+    idleStopMs = var.idle_stop_ms
     aca = {
       subscriptionId     = data.azurerm_client_config.current.subscription_id
       resourceGroup      = azurerm_resource_group.this.name

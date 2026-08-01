@@ -77,7 +77,7 @@ them out unless you have a specific reason to relocate those paths:
         "baseBranch": "main"
       }
     ],
-    "idleStopMs": 900000,
+    "idleStopMs": 300000,
     "staleDestroyMs": 1209600000,
     "docker": {
       "memoryLimit": "2g",
@@ -148,10 +148,27 @@ them out unless you have a specific reason to relocate those paths:
 | `artifactsDir` | `<cyrusHome>/router/artifacts` (e.g. `~/.cyrus/router/artifacts`) | Where the router stores per-issue floor bundles (git branch + Claude transcripts) uploaded by containers. **Leave this unset** — only set it if you deliberately want the bundles stored somewhere other than the default. Setting it to a Linux path like `/home/cyrus/...` will fail on macOS, where `/home` is an unwritable autofs mount. |
 | `secretsPath` | `<cyrusHome>/router/user-secrets.json` (e.g. `~/.cyrus/router/user-secrets.json`) | Where per-user container secrets are stored — an arbitrary set of environment-variable-named credentials per user (Claude token, git identity, GitHub token, and anything else a session needs; see [Per-user tool credentials and secrets management](#per-user-tool-credentials-and-secrets-management)). `cyrus router secrets set` writes here. **Leave this unset** for the same reason as `artifactsDir` above. |
 | `requiredSecretKeys` | `[]` (only the Claude OAuth token is required) | Extra secret keys a user must have stored before their containers are allowed to boot, on top of the always-required `CLAUDE_CODE_OAUTH_TOKEN` — e.g. `["GIT_TOKEN", "LINEAR_API_TOKEN"]`. See [Per-user tool credentials and secrets management](#per-user-tool-credentials-and-secrets-management). |
-| `idleStopMs` | `900000` (15 min) | A running container with no active session is `stop()`ped after this long — parked, volume retained, cheap to resume. |
+| `idleStopMs` | `300000` (5 min) | A running container with no active session is `stop()`ped after this long — parked, volume retained, cheap to resume. The clock runs from the later of the last routed event and the moment a session *parked* (see below), so an agent that works for a long time and only then asks a question is not suspended on the next sweep tick. |
 | `staleDestroyMs` | `1209600000` (14 days) | A container untouched this long is fully destroyed (container **and** volume). Safe because the floor (git branch + artifact bundle) survives — a later prompt rebuilds the workspace from scratch via the restore ladder. |
 | `docker.memoryLimit` | (none — host default) | Passed as `docker run --memory <value>`, e.g. `"2g"`. Strongly recommended if you're running several containers on one host — this is the fix for the small-VM OOM problem the design doc mentions. |
 | `docker.network` | (none — Docker's default bridge) | Passed as `docker run --network <value>` if your containers need a specific Docker network (e.g. to reach an internal registry or reverse proxy). |
+
+> ### Parked sessions
+>
+> A session blocked on a user answer — an `AskUserQuestion` elicitation, or the
+> repository-selection prompt — is **parked**: it tells the router it is waiting,
+> which releases its session affinity so the idle sweep can suspend the container,
+> while keeping its issue lock so no other session claims the issue. The user's
+> reply resumes the same container warm, with the pending question intact.
+>
+> A session is only parked when nothing will wake it on its own. If it has a
+> scheduled wakeup, a cron, or a background task in flight, it holds its device and
+> the container keeps running — suspending it would freeze that work, and the
+> completion that would normally wake the session could then never arrive.
+>
+> Before this, an elicitation held the container up indefinitely: the SDK query
+> stays open inside the tool call, so no terminal frame is ever sent and the
+> affinity gate never opens.
 
 > ### `routerUrlForContainers` must be reachable from *inside* the container
 >

@@ -439,4 +439,115 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			[...tracker.getState().comments.values()].map((c) => c.body),
 		).toEqual(["linear-mcp-ok turn 1", "linear-mcp-ok turn 2"]);
 	});
+
+	// ── the PAR-146 cycle ──────────────────────────────────────────────────
+	// Turn 2 is still open: the agent asked the user a question, so the SDK
+	// query never returned and no terminal frame will ever be sent. Before
+	// `parked` existed the router held this device's affinity forever and the
+	// container ran indefinitely — 41 minutes at 4 vCPU / 8 GiB, in the real
+	// incident. The park releases affinity WITHOUT ending the session.
+
+	it("park cycle: a parked session releases affinity but keeps its issue lock", async () => {
+		const device = server.store.getContainerDeviceForIssue(ISSUE.identifier);
+		if (!device) throw new Error("expected turn 2's device row");
+		const stack = executor.current(ISSUE.identifier);
+		if (!stack) throw new Error("expected turn 2's device stack");
+
+		expect(
+			server.store.countSessionAffinityForDevice(device.deviceId),
+		).toBeGreaterThan(0);
+		server.store.acquireIssueLock(ISSUE.id, "sess-mcp-2", device.deviceId);
+
+		stack.connection.sendSessionState("sess-mcp-2", "parked");
+
+		await vi.waitFor(() =>
+			expect(server.store.countSessionAffinityForDevice(device.deviceId)).toBe(
+				0,
+			),
+		);
+		// Not finished — a different session must not be able to claim the issue.
+		expect(
+			server.store.acquireIssueLock(ISSUE.id, "sess-other", device.deviceId),
+		).toBe(false);
+		// And the park time is recorded for the idle clock.
+		expect(
+			server.store.getContainerDeviceForIssue(ISSUE.identifier)?.parkedAtMs,
+		).toBeGreaterThan(0);
+	});
+
+	it("park cycle: the real sweep idle-stops the parked container once past idleStopMs", async () => {
+		const device = server.store.getContainerDeviceForIssue(ISSUE.identifier);
+		if (!device) throw new Error("expected the parked device row");
+		const parkedAtMs = device.parkedAtMs;
+		if (parkedAtMs === undefined) throw new Error("expected a park stamp");
+
+		const stopsBefore = executor.stopCalls.filter(
+			(k) => k === ISSUE.identifier,
+		).length;
+
+		// Just before the threshold, measured from the PARK — not from the last
+		// route, which is what would otherwise have expired long ago.
+		const early = new ContainerLifecycle({
+			store: server.store,
+			executors: new Map<string, ContainerExecutor>([["docker", executor]]),
+			idleStopMs: IDLE_STOP_MS,
+			staleDestroyMs: STALE_DESTROY_MS,
+			logger: { info: () => {}, warn: () => {} },
+			now: () => parkedAtMs + IDLE_STOP_MS - 1,
+		});
+		await early.sweep();
+		expect(
+			executor.stopCalls.filter((k) => k === ISSUE.identifier).length,
+		).toBe(stopsBefore);
+
+		// Past it, the container is suspended.
+		const late = new ContainerLifecycle({
+			store: server.store,
+			executors: new Map<string, ContainerExecutor>([["docker", executor]]),
+			idleStopMs: IDLE_STOP_MS,
+			staleDestroyMs: STALE_DESTROY_MS,
+			logger: { info: () => {}, warn: () => {} },
+			now: () => parkedAtMs + IDLE_STOP_MS + 1,
+		});
+		await late.sweep();
+		expect(
+			executor.stopCalls.filter((k) => k === ISSUE.identifier).length,
+		).toBe(stopsBefore + 1);
+		await vi.waitFor(() =>
+			expect(server.isDeviceOnline(device.deviceId)).toBe(false),
+		);
+	});
+
+	it("park cycle: the user's answer resumes the same container and clears the park stamp", async () => {
+		const deviceBefore = server.store.getContainerDeviceForIssue(
+			ISSUE.identifier,
+		);
+		if (!deviceBefore) throw new Error("expected the parked device row");
+		const stacksBefore =
+			executor.stacksByIssue.get(ISSUE.identifier)?.length ?? 0;
+
+		await server.eventRouter.route(
+			promptedFixture({ sessionId: "sess-mcp-2", body: "CSV only" }),
+		);
+
+		await vi.waitFor(
+			() =>
+				expect(executor.stacksByIssue.get(ISSUE.identifier)?.length ?? 0).toBe(
+					stacksBefore + 1,
+				),
+			{ timeout: 3000 },
+		);
+
+		// Same device row: a resume of one worker, not a replacement.
+		const deviceAfter = server.store.getContainerDeviceForIssue(
+			ISSUE.identifier,
+		);
+		expect(deviceAfter?.deviceId).toBe(deviceBefore.deviceId);
+		// Affinity is back and the stamp is cleared, so the sweep will not
+		// immediately re-stop the container it just woke.
+		expect(
+			server.store.countSessionAffinityForDevice(deviceBefore.deviceId),
+		).toBeGreaterThan(0);
+		expect(deviceAfter?.parkedAtMs).toBeUndefined();
+	});
 });

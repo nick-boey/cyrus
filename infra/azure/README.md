@@ -847,7 +847,9 @@ number of sandboxes via the group's ARM properties.** Cost control is the
 router's job:
 
 - Keep `idleStopMs` and `staleDestroyMs` (router config) healthy — these are
-  the actual idle and abandon controllers.
+  the actual idle and abandon controllers. `idleStopMs` defaults to 5 minutes
+  and is set explicitly by Terraform (`var.idle_stop_ms`). It counts from the
+  later of the last routed event and the moment a session *parked*.
 - Set up `gc-snapshots` (Task 7) on a schedule.
 - Rate-limit issue assignment (Linear automation) if you want a hard ceiling
   on concurrent workers — the platform will not enforce one.
@@ -1001,6 +1003,23 @@ provider sets the lifecycle policy explicitly on every create path. **Do not
 flip this to a non-zero value** unless you have also turned the router's
 session-affinity gate off. The router's `idleStopMs` remains the sole idle
 controller.
+
+### Parked sessions and deploy ordering
+
+A session blocked on a user answer holds the SDK query open, so it never sends
+a terminal frame. It instead sends a non-terminal `session_state: "parked"`,
+which releases its session affinity — letting the idle sweep suspend the
+container — while keeping its issue lock. A session with a scheduled wakeup,
+cron, or in-flight background task never parks, so suspension cannot freeze
+work that nothing would later wake.
+
+> **Deploy the router BEFORE bumping the worker image.** `parked` is an
+> additive frame value and `PROTOCOL_VERSION` is deliberately unchanged, so a
+> new router accepts old workers indefinitely. The reverse does not hold: an
+> older router cannot parse `parked` and drops the device connection on
+> receiving one. A worker image bump already forces sandbox replacement via the
+> `cyrus.disk` label, so the correct order falls out of the normal rollout —
+> but do not invert it.
 
 ### Labels and liveness (S5 / F1)
 
