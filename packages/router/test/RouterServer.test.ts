@@ -603,15 +603,24 @@ describe("RouterServer secret backend selection", () => {
 });
 
 describe("RouterServer setupUi auth strategy", () => {
-	function build(setupUi: unknown, host?: string) {
+	// The setup page edits the per-user secret bundle, so it needs a secret
+	// backend — which only exists when `containers` is configured.
+	const containers = {
+		image: "example/worker:test",
+		routerUrlForContainers: "ws://127.0.0.1:9/",
+		repositories: [],
+	};
+
+	function build(setupUi: unknown, host?: string, withContainers = true) {
 		return () =>
 			new RouterServer({
 				port: 0,
 				host,
-				dbPath: ":memory:",
+				dbPath: join(mkdtempSync(join(tmpdir(), "router-setupui-")), "r.db"),
 				workspaces: { "ws-1": { linearToken: "test-token" } },
 				webhook: { verificationMode: "direct", secret: "test-secret" },
 				trackerFactory: () => new CLIIssueTrackerService(),
+				...(withContainers ? { containers } : {}),
 				// biome-ignore lint/suspicious/noExplicitAny: exercising invalid config
 				setupUi: setupUi as any,
 			});
@@ -643,6 +652,19 @@ describe("RouterServer setupUi auth strategy", () => {
 		)();
 		expect(server).toBeInstanceOf(RouterServer);
 		server.stop();
+	});
+
+	it("refuses to enable the UI without a containers block", () => {
+		// F21: the plan shipped two incompatible local recipes — one enabling
+		// setupUi with no containers, which cannot work because no secret
+		// backend is built. Fail at construction rather than at first request.
+		expect(
+			build(
+				{ enabled: true, auth: { mode: "dev-insecure-headers" } },
+				"127.0.0.1",
+				false,
+			),
+		).toThrow(/requires a `containers` block/);
 	});
 
 	it("does not police a disabled setup UI", () => {

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
@@ -32,12 +33,21 @@ import {
 import { KeyVaultSecretStore } from "./KeyVaultSecretStore.js";
 import { LinearExecutor } from "./LinearExecutor.js";
 import { RouterStore } from "./RouterStore.js";
-import { SecretStore, type SecretStoreBackend } from "./SecretStore.js";
-import { StateBackup } from "./StateBackup.js";
 import {
+	DEFAULT_REQUIRED_SECRET_KEYS,
+	SecretStore,
+	type SecretStoreBackend,
+} from "./SecretStore.js";
+import { StateBackup } from "./StateBackup.js";
+import { SetupBootstrap } from "./setup/bootstrap.js";
+import { createCsrfTokens } from "./setup/csrf.js";
+import {
+	type SetupAuthMode,
+	type SetupIdTokenVerifier,
 	type SetupUiConfig,
 	validateSetupAuthConfig,
 } from "./setup/principal.js";
+import { registerSetupRoutes } from "./setup/routes.js";
 import { TableSecretStore } from "./TableSecretStore.js";
 import {
 	registerTerminalTeardownRoute,
@@ -254,6 +264,17 @@ export interface RouterServerConfig {
 	 * {@link validateSetupAuthConfig}.
 	 */
 	setupUi?: SetupUiConfig;
+	/**
+	 * Verifies the Entra ID token forwarded by the ACA token store. REQUIRED
+	 * when `setupUi.auth.mode` is `"entra-token"`; without it every /setup
+	 * request fails with a 500 rather than degrading to header trust.
+	 *
+	 * Injected rather than constructed here because it needs a DIFFERENT
+	 * audience from `entra.audience` — that one is the `api://` Application ID
+	 * URI carried by enrollment *access* tokens, whereas an ID token carries
+	 * the bare client-id GUID (D2').
+	 */
+	setupIdTokenVerifier?: SetupIdTokenVerifier;
 }
 
 /**
@@ -410,6 +431,57 @@ export class RouterServer {
 		// serverless platforms). Registered in the constructor because Fastify
 		// v5 forbids adding routes once the server is listening.
 		this.fastify.get("/healthz", async () => ({ status: "ok" }));
+
+		if (config.setupUi?.enabled) {
+			if (!built) {
+				throw new Error(
+					"setupUi.enabled requires a `containers` block: the setup page edits the per-user secret bundle that container launches consume, and no secret backend is constructed without it.",
+				);
+			}
+			// Exactly the expression ContainerTargets.buildEnv uses, so the page
+			// and the boot gate can never disagree about what "required" means.
+			const setupRequiredKeys = [
+				...new Set([
+					...DEFAULT_REQUIRED_SECRET_KEYS,
+					...(config.containers?.requiredSecretKeys ?? []),
+				]),
+			];
+			registerSetupRoutes(this.fastify, {
+				secrets: built.secrets,
+				requiredKeys: setupRequiredKeys,
+				auth: {
+					// validateSetupAuthConfig ran at the top of this constructor and
+					// throws when `auth` is unset, so this is proven non-null.
+					auth: config.setupUi.auth as SetupAuthMode,
+					...(config.setupUi.allowedDomain
+						? { allowedDomain: config.setupUi.allowedDomain }
+						: {}),
+				},
+				bootstrap: new SetupBootstrap({
+					store: this.store,
+					secrets: built.secrets,
+					requiredKeys: setupRequiredKeys,
+					// F5: default FALSE. Auto-provisioning lets any tenant user who
+					// can sign in create themselves a secret store, so it stays off
+					// until an operator has verified an Entra assignment gate.
+					autoProvisionUsers: config.setupUi.autoProvisionUsers ?? false,
+					logger: this.logger,
+				}),
+				// Per-process and in-memory on purpose. The router is single-replica,
+				// so a restart just invalidates outstanding tokens and the next action
+				// re-renders with a fresh one. Deliberately NOT sourced from config or
+				// shared with the webhook secret: a file-backed value survives restarts
+				// and would widen a config leak into CSRF forgery.
+				csrf: createCsrfTokens(randomBytes(32).toString("base64url")),
+				...(config.setupIdTokenVerifier
+					? { verifyIdToken: config.setupIdTokenVerifier }
+					: {}),
+				logger: this.logger,
+			});
+			this.logger.info(
+				`Setup UI enabled at /setup (auth: ${config.setupUi.auth?.mode})`,
+			);
+		}
 
 		this.gateway.on("rpc", (deviceId: number, frame: RpcRequestFrame) => {
 			void this.executor

@@ -97,6 +97,11 @@ export {
 	sealBundle,
 } from "./setup/envelope.js";
 export {
+	createSetupIdTokenVerifier,
+	type SetupIdTokenConfig,
+	SetupIdTokenError,
+} from "./setup/idTokenVerifier.js";
+export {
 	parseEasyAuthPrincipal,
 	requireSetupPrincipal,
 	SETUP_ID_TOKEN_HEADER,

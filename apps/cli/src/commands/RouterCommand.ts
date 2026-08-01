@@ -12,6 +12,7 @@ import {
 	buildGitHubTokenScopeReport,
 	type ContainerDeviceInfo,
 	createAcaSandboxesProvider,
+	createSetupIdTokenVerifier,
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	type DeviceInfo,
 	GITHUB_TOKEN_SECRET_KEYS,
@@ -552,6 +553,19 @@ export class RouterCommand extends BaseCommand {
 				info: (msg: string) => this.logger.info(msg),
 				warn: (msg: string) => this.logger.warn(msg),
 			},
+			// The recommended production mode for /setup verifies the ID token the
+			// ACA token store forwards, rather than trusting proxy-injected headers.
+			// It needs its own verifier: the enrollment one pins the `api://`
+			// access-token audience and returns only an email (D2').
+			...(parsed.data.setupUi?.enabled &&
+			parsed.data.setupUi.auth?.mode === "entra-token"
+				? {
+						setupIdTokenVerifier: createSetupIdTokenVerifier({
+							tenantId: this.requireEntraTenantForSetup(parsed.data),
+							idTokenAudience: parsed.data.setupUi.auth.idTokenAudience,
+						}),
+					}
+				: {}),
 		};
 
 		const server = await RouterServer.create(config);
@@ -1250,6 +1264,28 @@ export class RouterCommand extends BaseCommand {
 	 * Both endpoints are read from `containers`, so the Table config must be
 	 * present in the file; `--to table` selects it, it does not invent it.
 	 */
+	/**
+	 * The tenant whose JWKS signs setup ID tokens. Reuses `entra.tenantId`
+	 * because a router deployment has exactly one app registration and one
+	 * tenant (a standing invariant); only the AUDIENCE differs between
+	 * enrollment access tokens and setup ID tokens.
+	 *
+	 * Fails loudly rather than defaulting: a wrong tenant would mean every
+	 * /setup request 500s at first use, which is a much worse failure than
+	 * refusing to start.
+	 */
+	private requireEntraTenantForSetup(
+		config: z.infer<typeof RouterConfigFileSchema>,
+	): string {
+		const tenantId = config.entra?.tenantId;
+		if (!tenantId) {
+			this.exitWithError(
+				'setupUi.auth.mode "entra-token" requires entra.tenantId in router-config.json — it names the tenant whose JWKS signs the ID token. Set CYRUS_ROUTER_ENTRA_TENANT_ID, or use a different setup auth mode.',
+			);
+		}
+		return tenantId as string;
+	}
+
 	private async secretsMigrate(args: string[]): Promise<void> {
 		const flag = (name: string): string | undefined => {
 			const index = args.indexOf(name);

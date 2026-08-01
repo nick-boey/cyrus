@@ -318,3 +318,225 @@ variable "entra_allowed_domain" {
   type        = string
   default     = null
 }
+
+################################################################################
+# Setup management UI (/setup) — STAGED ROLLOUT (D7)
+#
+# Reaching a live `/setup` takes TWO separate `terraform apply`s, and that is
+# the security property, not an inconvenience:
+#
+#   Stage 1   enable_setup_auth = true
+#             → Entra client secret, ACA built-in auth (EasyAuth) sidecar,
+#               token store. `/setup` still 404s, so there is nothing to
+#               impersonate.
+#
+#   ┌── HARD GATE ────────────────────────────────────────────────────────────┐
+#   │ Run the machine-route regression check AND the header-strip probe from  │
+#   │ README §11 step 4 against the LIVE app. Only if both pass, record the   │
+#   │ result in `setup_auth_stage1_verified` (and, for easyauth-headers mode, │
+#   │ in `setup_ui_verified_header_strip`).                                   │
+#   └─────────────────────────────────────────────────────────────────────────┘
+#
+#   Stage 2   enable_setup_ui = true
+#             → CYRUS_ROUTER_SETUP_UI_* env vars, which is what makes the
+#               router register the routes.
+#
+# Why not one flag: `authConfigs` is a CHILD of the Container App. Terraform
+# must create the app (and therefore publish the revision that serves /setup)
+# before it can attach the auth sidecar. A single flag guarantees a window in
+# which an unauthenticated `/setup` is on the public internet. No post-apply
+# check can close a window that opens mid-apply.
+#
+# Rollback reverses the order: clear `enable_setup_ui`, apply, confirm /setup
+# 404s, and only then clear `enable_setup_auth`.
+################################################################################
+
+variable "enable_setup_auth" {
+  description = "STAGE 1 of the staged /setup rollout. Attaches the ACA built-in auth (EasyAuth) sidecar to the router Container App: seeds the Entra client secret into Key Vault, creates the token-store blob container + SAS, and creates the `authConfigs` child resource. Does NOT enable any /setup route — that is `enable_setup_ui`, applied separately AFTER the live verification gate. Apply this ALONE first."
+  type        = bool
+  default     = false
+
+  validation {
+    condition = (
+      !var.enable_setup_auth ||
+      (var.setup_ui_client_id != null && var.setup_ui_client_secret != null)
+    )
+    error_message = "enable_setup_auth requires setup_ui_client_id and setup_ui_client_secret. Create them on the EXISTING router app registration (README §11 step 2) rather than minting a second one — 'one app registration/audience per router deployment' is a standing invariant."
+  }
+
+  validation {
+    condition     = !var.enable_setup_auth || var.entra_tenant_id != null
+    error_message = "enable_setup_auth requires entra_tenant_id: the sidecar's openIdIssuer is https://login.microsoftonline.com/<tenant>/v2.0. Setting entra_tenant_id also requires entra_audience, which is intended — the same app registration serves both /enroll access tokens and /setup sign-in."
+  }
+
+  validation {
+    condition = (
+      !var.enable_setup_auth ||
+      (var.setup_ui_token_store_sas_start != null && var.setup_ui_token_store_sas_expiry != null)
+    )
+    error_message = "enable_setup_auth requires setup_ui_token_store_sas_start and setup_ui_token_store_sas_expiry. Microsoft.App/containerApps/authConfigs@2024-03-01 models the token store as a SAS URL only (`sasUrlSettingName` is its single, required property), so the SAS window is explicit operator input. Do not derive it from timestamp() — that re-evaluates every plan and would roll a new router revision on every apply."
+  }
+}
+
+variable "setup_ui_client_id" {
+  description = "Client id (bare GUID) of the EXISTING router Entra app registration, reused by the auth sidecar. Required when enable_setup_auth is true. This is also the audience of the ID token the sidecar forwards — distinct from `entra_audience`, which is the `api://<client-id>` Application ID URI carried by ACCESS tokens on /enroll."
+  type        = string
+  default     = null
+}
+
+variable "setup_ui_client_secret" {
+  description = "Client secret for setup_ui_client_id, generated with `az ad app credential reset`. Seeded into the Key Vault secret 'setup-ui-client-secret' and referenced by the Container App as a secret; never rendered into an output. Rotate in Entra first, then `az keyvault secret set` — the Container App references it by versionless id, so a rotation lands on the next revision without a Terraform apply."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "setup_ui_token_store_sas_start" {
+  description = "RFC 3339 UTC start of the token-store SAS window (for example '2026-01-01T00:00:00Z'). Required when enable_setup_auth is true. Static by design: deriving it from timestamp() re-evaluates on every plan, producing a permanent diff and a needless router revision roll each apply."
+  type        = string
+  default     = null
+}
+
+variable "setup_ui_token_store_sas_expiry" {
+  description = "RFC 3339 UTC expiry of the token-store SAS window (for example '2027-01-01T00:00:00Z'). Required when enable_setup_auth is true. EXPIRY IS A LIVE FAILURE: once past, the sidecar can no longer persist sessions and sign-in breaks. Diarise the renewal — bump this value and apply. See README → 'Rotating the setup UI secrets'."
+  type        = string
+  default     = null
+}
+
+variable "setup_ui_allowed_group_object_ids" {
+  description = "Entra GROUP object ids allowed to authenticate to the app, rendered into authConfigs `defaultAuthorizationPolicy.allowedPrincipals.groups`. Empty (the default) sends no policy at all — an empty policy is not the same as an absent one. Populating this, or attesting to an Entra assignment requirement via setup_ui_assignment_required_verified, is a HARD PREREQUISITE for setup_ui_auto_provision_users (F5): otherwise any account in the tenant can sign in and provision itself a Cyrus user with a secret store."
+  type        = list(string)
+  default     = []
+}
+
+variable "setup_ui_allowed_principal_object_ids" {
+  description = "Entra USER/service-principal object ids allowed to authenticate to the app, rendered into authConfigs `defaultAuthorizationPolicy.allowedPrincipals.identities`. Prefer setup_ui_allowed_group_object_ids — a group is one policy edit instead of a Terraform apply per joiner/leaver."
+  type        = list(string)
+  default     = []
+}
+
+variable "setup_auth_stage1_verified" {
+  description = "ATTESTATION, not a switch. Set true only after `enable_setup_auth = true` has been applied in ITS OWN apply and BOTH post-apply checks in README §11 step 4 passed: (a) the machine-route regression check — /healthz, /linear-webhook and a worker WSS reconnect still work and do NOT 302 to /.auth/login/aad; and (b) the header-strip probe — a forged X-MS-CLIENT-PRINCIPAL-NAME does not authenticate. `enable_setup_ui` is refused until this is true, which is what makes the verification a gate rather than a footnote. Paste the command output into the change record."
+  type        = bool
+  default     = false
+}
+
+variable "enable_setup_ui" {
+  description = "STAGE 2 of the staged /setup rollout. Sets the CYRUS_ROUTER_SETUP_UI_* environment variables, which is what makes the router register the /setup* routes. Apply this ONLY in a separate, later apply, after enable_setup_auth is live and setup_auth_stage1_verified records a passing verification. Rolling back is safe and comes FIRST in a rollback: clear this, apply, confirm /setup 404s, then clear enable_setup_auth."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.enable_setup_ui || var.enable_setup_auth
+    error_message = "enable_setup_ui requires enable_setup_auth. Enabling the routes without the auth sidecar publishes an unauthenticated /setup; the router will refuse to start in that state, so the practical result is an outage rather than a breach — but do not rely on that as the control."
+  }
+
+  validation {
+    condition     = !var.enable_setup_ui || var.setup_auth_stage1_verified
+    error_message = "enable_setup_ui requires setup_auth_stage1_verified = true. Stage 1 must be applied on its own and verified live (README §11 step 4) BEFORE the routes exist. If you are setting both flags in the same apply, stop: that is the exact ordering hazard the two-stage design exists to prevent."
+  }
+}
+
+variable "setup_ui_auth_mode" {
+  description = "How the router establishes identity on /setup*. 'entra-token' (RECOMMENDED) cryptographically verifies the ID token the sidecar forwards in X-MS-TOKEN-AAD-ID-TOKEN, so a forged X-MS-CLIENT-PRINCIPAL-* header is ignored regardless of ingress topology; it requires the token store, which enable_setup_auth configures. 'easyauth-headers' trusts the injected identity headers and ADDITIONALLY requires setup_ui_verified_header_strip = true, recorded from a live probe."
+  type        = string
+  default     = "entra-token"
+
+  validation {
+    condition     = contains(["entra-token", "easyauth-headers"], var.setup_ui_auth_mode)
+    error_message = "setup_ui_auth_mode must be 'entra-token' or 'easyauth-headers'. The router's third mode, 'dev-insecure-headers', reads headers with no verification and is refused on any non-loopback bind host — it is a laptop-only mode and is deliberately not reachable from this stack, which binds 0.0.0.0 behind public ingress."
+  }
+
+  # Both rules below are conditioned on `enable_setup_ui`. This variable has a
+  # non-null DEFAULT, so an unconditional rule referencing it would fire on
+  # every stack that has never touched the setup UI — turning "the feature is
+  # off" into a failed plan. The mode is inert until stage 2 enables the routes.
+  validation {
+    condition = (
+      !var.enable_setup_ui ||
+      var.setup_ui_auth_mode != "easyauth-headers" ||
+      var.setup_ui_verified_header_strip
+    )
+    error_message = "setup_ui_auth_mode = 'easyauth-headers' requires setup_ui_verified_header_strip = true. That flag records a LIVE observation that the ingress strips client-supplied X-MS-CLIENT-PRINCIPAL* headers; without it the mode has no enforceable trust boundary. Prefer 'entra-token', which does not depend on proxy behaviour at all."
+  }
+
+  validation {
+    condition = (
+      !var.enable_setup_ui ||
+      var.setup_ui_auth_mode != "entra-token" ||
+      var.setup_ui_id_token_audience != null ||
+      var.setup_ui_client_id != null
+    )
+    error_message = "setup_ui_auth_mode = 'entra-token' needs an ID token audience: set setup_ui_client_id (the audience defaults to it) or override setup_ui_id_token_audience explicitly."
+  }
+}
+
+variable "setup_ui_id_token_audience" {
+  description = "Override for the expected `aud` of the ID token verified in 'entra-token' mode. Defaults to setup_ui_client_id, which is correct for Entra: an ID token carries the BARE CLIENT-ID GUID, not the `api://<client-id>` Application ID URI in `entra_audience` (that is the access-token audience). Set this only if your identity provider issues something else."
+  type        = string
+  default     = null
+}
+
+variable "setup_ui_verified_header_strip" {
+  description = "ATTESTATION required by setup_ui_auth_mode = 'easyauth-headers'. Set true only after observing, against the live FQDN, that a request carrying a forged X-MS-CLIENT-PRINCIPAL-NAME and no session cookie does NOT authenticate (README §11 step 4b). Meaningless — and ignored by the router — in 'entra-token' mode."
+  type        = bool
+  default     = false
+}
+
+variable "setup_ui_allowed_domain" {
+  description = "Optional email domain allowlist enforced IN THE ROUTER on /setup* (for example, 'example.com'). Defence in depth on top of the app registration's own assignment requirement, not a substitute for it: a domain check cannot distinguish an assigned teammate from any other account in the same tenant."
+  type        = string
+  default     = null
+}
+
+variable "setup_ui_auto_provision_users" {
+  description = "Create a router user record on a teammate's first successful /setup sign-in. Defaults FALSE (F5): auto-provisioning converts 'can obtain a token for this app' into 'is a Cyrus user with a secret store', which is only safe once app access is genuinely restricted. Terraform therefore refuses to set this true unless membership is constrained — either an authConfigs allowedPrincipals policy (setup_ui_allowed_group_object_ids / setup_ui_allowed_principal_object_ids) or an attested Entra assignment requirement (setup_ui_assignment_required_verified)."
+  type        = bool
+  default     = false
+
+  validation {
+    condition = (
+      !var.setup_ui_auto_provision_users ||
+      var.setup_ui_assignment_required_verified ||
+      length(var.setup_ui_allowed_group_object_ids) > 0 ||
+      length(var.setup_ui_allowed_principal_object_ids) > 0
+    )
+    error_message = "setup_ui_auto_provision_users = true requires a membership gate: populate setup_ui_allowed_group_object_ids (or setup_ui_allowed_principal_object_ids), or run the Entra assignment commands in README §11 step 3 and set setup_ui_assignment_required_verified = true. Without one of these, ANY account in the tenant can sign in and self-provision a Cyrus user — 'Assignment required' is not on by default, and setup_ui_allowed_domain does not provide it."
+  }
+}
+
+variable "setup_ui_assignment_required_verified" {
+  description = "ATTESTATION that the app registration's service principal has appRoleAssignmentRequired = true AND the Cyrus users group is actually assigned to it — BOTH, verified with the `az ad sp show` / `az rest` readback in README §11 step 3. Setting appRoleAssignmentRequired without performing the assignment locks everyone out; performing the assignment without setting the flag restricts nobody. This is the alternative to an authConfigs allowedPrincipals policy for satisfying the setup_ui_auto_provision_users prerequisite."
+  type        = bool
+  default     = false
+}
+
+################################################################################
+# Per-user secret storage backend (NOR-269 / D6')
+#
+# The Azure Table, the envelope-encryption KEK, and the router's two new role
+# assignments live in setup_ui.tf and are CREATE-ONCE AND PERSISTENT — there is
+# deliberately no `enable_setup_table` flag. Gating them on a boolean while the
+# KEK carries `prevent_destroy` turns a flag flip into a guaranteed apply
+# failure; removing that guard to make the flag "work" would instead delete the
+# key that unwraps every stored secret. Neither is a rollback.
+#
+# The one reversible control is the SELECTOR below.
+################################################################################
+
+variable "enable_setup_table_backend" {
+  description = "Point the router at the Azure Table secret backend by adding `containers.tableStore` to CYRUS_ROUTER_CONTAINERS_JSON. This is the ONLY reversible control over the feature: clearing it drops the router back to the Key Vault backend on the next revision, with no destroy and no data loss. Enable it only AFTER `cyrus router secrets migrate` has run and been verified (README → 'Key Vault to Table migration'). The Table, KEK, and role assignments exist regardless and are not affected by this flag."
+  type        = bool
+  default     = false
+}
+
+variable "router_default_executor" {
+  description = "Provider that users whose stored executor is the explicit `{\"type\":\"default\"}` sentinel inherit, rendered as `containers.defaultExecutor`. 'aca' matches this stack, whose sandbox group is always provisioned. Set null to omit the field entirely. SAFE BY CONSTRUCTION: a NULL/absent executor still means 'physical device' and is never captured by this default (F11), so existing users deliberately left on a device do not silently move to cloud sandboxes."
+  type        = string
+  default     = "aca"
+
+  validation {
+    condition     = var.router_default_executor == null || contains(["aca", "docker"], coalesce(var.router_default_executor, "aca"))
+    error_message = "router_default_executor must be a container provider name ('aca' or 'docker'), or null to omit it. 'device' and 'default' are rejected: neither is a provider, and the router would degrade every affected user to a physical device with a warning."
+  }
+}

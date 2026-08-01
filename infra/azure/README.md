@@ -424,6 +424,361 @@ perform a Linear MCP read/write. Then test idle stop, follow-up recovery, Done
 cleanup, and snapshot removal. Current live-test defects and their acceptance
 criteria are tracked in [`TODO.md`](../../TODO.md).
 
+### 11. Optional: the setup management UI (`/setup`)
+
+`/setup` lets a teammate manage their own container environment variables in a
+browser instead of through `az containerapp exec`. It is off by default, and
+turning it on is a **two-apply sequence with a live verification gate in the
+middle**. Read this whole section before starting; the ordering is the security
+property, not a suggestion.
+
+#### Why two applies
+
+`authConfigs` — the ACA built-in auth ("EasyAuth") sidecar — is an ARM **child**
+of the Container App. Terraform must create the app, and therefore publish the
+revision that serves `/setup`, *before* it can attach the sidecar. A single
+`enable_setup_ui` flag would guarantee a window in which an unauthenticated
+`/setup` is reachable on the public internet, and no post-apply check can close
+a window that opens mid-apply.
+
+So the flags are split, and Terraform refuses to let you collapse them:
+
+| Variable | Apply | Effect |
+| --- | --- | --- |
+| `enable_setup_auth` | **first, alone** | Entra client secret, token store, `authConfigs`. `/setup` still 404s. |
+| — | **verification gate** | Steps 4a–4c below. Recorded in `setup_auth_stage1_verified`. |
+| `enable_setup_ui` | **second, separate apply** | Sets `CYRUS_ROUTER_SETUP_UI_*`, which is what registers the routes. |
+
+`enable_setup_ui = true` fails variable validation unless both
+`enable_setup_auth` and `setup_auth_stage1_verified` are already true. Setting
+all three in one tfvars edit is the exact mistake this design exists to prevent.
+
+**Rollback reverses the order**: clear `enable_setup_ui`, apply, confirm `/setup`
+returns 404, and only then clear `enable_setup_auth`.
+
+#### Prerequisites
+
+- The applying principal needs **Key Vault Crypto Officer** on the vault. The
+  stack creates an RSA KEK (`azurerm_key_vault_key.setup_kek`), and the existing
+  Secrets User / Secrets Officer grants are for the *router* identity and cover
+  secrets only — no role in this stack permits creating a key.
+
+  ```bash
+  KV_ID=$(az keyvault show -n "$(terraform output -raw key_vault_name)" --query id -o tsv)
+  az role assignment create \
+    --assignee "<your-object-id>" \
+    --role "Key Vault Crypto Officer" \
+    --scope "$KV_ID"
+  ```
+
+- The storage account must allow shared-key access, because
+  `azurerm_storage_table` and the token-store SAS are both data-plane operations
+  keyed on the account key. If you have disabled shared key, set
+  `storage_use_azuread = true` in the `provider "azurerm"` block and grant the
+  applying principal *Storage Table Data Contributor* first.
+
+- Entra tenant admin (or Application Administrator) to edit the app
+  registration in step 2.
+
+> **The Azure Table and the KEK are created unconditionally and are not part of
+> this feature flag.** They are cheap and inert until something reads them, and
+> they are deliberately *not* gated: see "Decommissioning the per-user secret
+> store" for why, and for the only supported way to remove them.
+
+#### Step 1 — read the values Terraform already knows
+
+```bash
+cd infra/azure/terraform
+FQDN=$(terraform output -raw router_fqdn)
+REDIRECT=$(terraform output -raw setup_ui_redirect_uri)
+RG=$(terraform output -raw resource_group_name)
+APP=$(terraform output -raw router_app_name)
+```
+
+`setup_ui_redirect_uri` is emitted unconditionally, precisely so it is available
+*before* stage 1 — you cannot configure Entra from a value that only exists once
+the thing you are configuring is already live.
+
+#### Step 2 — extend the EXISTING router app registration
+
+Do not mint a second app. "One app registration/audience per router deployment"
+is a standing invariant, and `entra_audience` (the `api://<client-id>`
+Application ID URI used by `/enroll` access tokens) and the setup UI's ID-token
+audience (the bare client-id GUID) are two audiences of the *same* app.
+
+```bash
+APP_ID="<the existing router app registration's client id>"
+
+# EasyAuth performs an implicit ID-token flow.
+az ad app update --id "$APP_ID" --enable-id-token-issuance true
+
+# `--web-redirect-uris` REPLACES the whole list. Read it back first or you will
+# silently break enrollment sign-in.
+EXISTING=$(az ad app show --id "$APP_ID" --query "web.redirectUris" -o tsv | tr '\n' ' ')
+az ad app update --id "$APP_ID" --web-redirect-uris $EXISTING "$REDIRECT"
+
+# Verify the old URIs survived.
+az ad app show --id "$APP_ID" --query "web.redirectUris" -o tsv
+
+# One client secret for the sidecar. The value is shown ONCE.
+az ad app credential reset --id "$APP_ID" \
+  --display-name "cyrus-router-easyauth" --years 2 --query password -o tsv
+```
+
+Record both values in your gitignored tfvars:
+
+```hcl
+setup_ui_client_id     = "<APP_ID>"
+setup_ui_client_secret = "<the password printed above>"
+
+# Static SAS window for the ACA token store. Must NOT be derived from
+# timestamp(): that re-evaluates every plan and would roll a new router
+# revision on every apply. Diarise the expiry — see "Rotating the setup UI
+# secrets".
+setup_ui_token_store_sas_start  = "2026-01-01T00:00:00Z"
+setup_ui_token_store_sas_expiry = "2027-01-01T00:00:00Z"
+```
+
+#### Step 3 — restrict who can sign in (HARD PREREQUISITE for auto-provisioning)
+
+By default **any** account in the tenant can obtain a token for the app.
+`setup_ui_allowed_domain` does not change that — a domain check cannot tell an
+assigned teammate from any other account in the same tenant. So if
+`setup_ui_auto_provision_users` is left at its default of `false`, an unknown
+signer is refused and you can skip to step 4. If you want first sign-in to
+create the user, you must restrict membership first, and Terraform enforces it:
+`setup_ui_auto_provision_users = true` fails validation unless one of the two
+options below is in place.
+
+**Option A — `authConfigs` allowed principals (no Entra premium licence).**
+Terraform renders these into
+`identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedPrincipals`:
+
+```hcl
+setup_ui_allowed_group_object_ids     = ["00000000-0000-0000-0000-000000000000"]
+# or, less maintainably, one entry per person:
+setup_ui_allowed_principal_object_ids = []
+setup_ui_auto_provision_users         = true
+```
+
+An empty list sends **no** policy at all — an empty policy is not the same as an
+absent one, so do not treat `[]` as "deny everyone".
+
+**Option B — Entra assignment requirement.** Two changes, and *both* are
+required: `appRoleAssignmentRequired` without an assignment locks everyone out,
+and an assignment without the flag restricts nobody.
+
+```bash
+SP_OID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
+GROUP_OID=$(az ad group show --group "<your Cyrus users group>" --query id -o tsv)
+
+az ad sp update --id "$APP_ID" --set appRoleAssignmentRequired=true
+
+# Assign the group to the app's "default access" role. The all-zero GUID is the
+# documented well-known id for that role, not a placeholder to fill in.
+az rest --method POST \
+  --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SP_OID/appRoleAssignedTo" \
+  --headers 'Content-Type=application/json' \
+  --body "{\"principalId\":\"$GROUP_OID\",\"resourceId\":\"$SP_OID\",\"appRoleId\":\"00000000-0000-0000-0000-000000000000\"}"
+```
+
+Read both back, and keep the output:
+
+```bash
+az ad sp show --id "$APP_ID" --query appRoleAssignmentRequired -o tsv   # expect: true
+az rest --method GET \
+  --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SP_OID/appRoleAssignedTo" \
+  --query 'value[].principalDisplayName' -o tsv                        # expect: your group
+```
+
+Only then:
+
+```hcl
+setup_ui_assignment_required_verified = true
+setup_ui_auto_provision_users         = true
+```
+
+> **Licensing:** assigning a *group* to an app role requires Entra ID P1/P2.
+> Without it, assign users individually or use Option A, which has no licence
+> requirement.
+
+#### Step 4 — STAGE 1 APPLY: auth only
+
+```hcl
+enable_setup_auth = true
+# enable_setup_ui stays FALSE. Do not set it in this edit.
+```
+
+```bash
+terraform plan  -var-file=dev.tfvars -out=tfplan
+terraform apply tfplan
+```
+
+Expected diff: one Key Vault secret for the client secret, one blob container +
+one Key Vault secret for the token-store SAS, two new `secret {}` blocks on the
+Container App (so a new revision), and the `azapi_resource.router_auth` child.
+No `/setup` route is created.
+
+#### Step 5 — THE GATE
+
+**This is an acceptance criterion, not a formality.** `authConfigs` changes
+ingress behaviour for *every* path on the app, and the whole trust model of
+`easyauth-headers` mode rests on 5b. Do not proceed to stage 2 until all three
+pass. Paste the output into the change record.
+
+**5a — machine routes still reach the app.** A `302` to `/.auth/login/aad` on
+any of these means the auth config is wrong and webhook delivery and worker
+reconnects are broken *right now*:
+
+```bash
+curl -fsS "https://$FQDN/healthz"                                     # {"status":"ok"}
+curl -s -o /dev/null -w '%{http_code}\n' "https://$FQDN/workspaces"   # 401 from OUR app, not 302
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  "https://$FQDN/linear-webhook"                                      # 4xx from our handler, not 302
+
+# Force a real reconnect rather than trusting a stale row: bounce the revision,
+# then confirm a worker re-completes its hello + heartbeat.
+az containerapp exec --name "$APP" --resource-group "$RG"
+#   inside: cyrus router containers list   → an existing worker shows connected
+```
+
+**5b — the header-strip probe.** A forged identity header with no session cookie
+must not authenticate:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'X-MS-CLIENT-PRINCIPAL-NAME: attacker@example.com' \
+  "https://$FQDN/setup"
+# expect 404 at this stage (routes do not exist yet) — and, after stage 2, 401.
+# A 200 at any point means STOP AND ESCALATE.
+```
+
+If this ever returns 200, do not use `setup_ui_auth_mode = "easyauth-headers"`.
+Use the default `entra-token` mode, which verifies the forwarded ID token
+cryptographically and ignores `X-MS-CLIENT-PRINCIPAL-*` entirely — its trust
+boundary is a signature, not proxy topology.
+
+**5c — sign-in works.** Stage 1 is what makes this provable before any route
+exists:
+
+```bash
+open "$(terraform output -raw setup_ui_sign_in_url)"
+```
+
+You should complete an Entra sign-in and land back on the app. If step 3 Option
+B is in place, confirm an **unassigned** tenant account is refused here.
+
+Record the result:
+
+```hcl
+setup_auth_stage1_verified = true
+# only if you intend easyauth-headers mode AND 5b passed:
+# setup_ui_verified_header_strip = true
+```
+
+#### Step 6 — STAGE 2 APPLY: enable the routes
+
+```hcl
+enable_setup_ui = true
+setup_ui_auth_mode      = "entra-token"   # recommended; the default
+setup_ui_allowed_domain = "example.com"   # optional defence in depth
+```
+
+```bash
+terraform plan  -var-file=dev.tfvars -out=tfplan
+terraform apply tfplan
+terraform output -raw setup_ui_url
+```
+
+Expected diff: `CYRUS_ROUTER_SETUP_UI_*` env vars on the container, and the
+resulting revision. Then re-run **5b** — it must now return `401`, not `200` —
+and sign in to `setup_ui_url` as a real teammate.
+
+#### Rolling back
+
+1. `enable_setup_ui = false`; apply. Confirm `curl -o /dev/null -w '%{http_code}'
+   "https://$FQDN/setup"` returns `404`.
+2. Only then `enable_setup_auth = false`; apply. This destroys the token-store
+   container (session state only — everyone is signed out, nothing is lost) and
+   the `authConfigs` child.
+3. Leave `setup_auth_stage1_verified` as it is; it records history, not intent.
+
+Never do these in one apply, and never step 2 before step 1 — that is the
+unauthenticated-`/setup` window again, in reverse.
+
+### Key Vault → Table migration for per-user secrets
+
+The Azure Table (`cyrussetup`), the envelope-encryption KEK, and the router's
+*Storage Table Data Contributor* + *Key Vault Crypto User* role assignments are
+created by every apply and are independent of the `/setup` flags. Cutting the
+router **over** to them is a separate, ordered operation:
+
+1. Apply the stack. The Table and KEK now exist; the router still reads Key
+   Vault, because `enable_setup_table_backend` is `false`.
+2. `az containerapp exec` into the replica and dry-run the copy:
+   ```bash
+   cyrus router secrets migrate --dry-run
+   ```
+   Eyeball the `email  KEY  (n bytes)` list. Values are never printed.
+3. `cyrus router secrets migrate`.
+4. Set `enable_setup_table_backend = true` and apply. This adds
+   `containers.tableStore` to `CYRUS_ROUTER_CONTAINERS_JSON` and rolls one
+   revision.
+5. `cyrus router secrets list <email>` for two users — the key sets must match
+   what step 2 reported.
+6. Delegate a test issue and confirm the worker boots with its environment.
+7. **Leave the Key Vault secrets in place for at least a week.** They are the
+   rollback path. Deleting them is a separate change.
+
+Rollback is `enable_setup_table_backend = false` + apply: the router drops back
+to the Key Vault backend on the next revision. Nothing is destroyed, so this is
+safe to do at any time.
+
+### Rotating the setup UI secrets
+
+- **Entra client secret.** Rotate in Entra first
+  (`az ad app credential reset --id "$APP_ID" --display-name cyrus-router-easyauth`),
+  then `az keyvault secret set --vault-name <vault> --name setup-ui-client-secret
+  --value <new>`. The Container App references it by *versionless* id, so the
+  sidecar picks it up on the next revision without a Terraform apply. Update
+  `setup_ui_client_secret` in tfvars in the same change or the next apply will
+  overwrite the rotation.
+- **Token-store SAS.** `setup_ui_token_store_sas_expiry` is a **live failure
+  deadline**: past it, the sidecar can no longer persist sessions and sign-in
+  breaks. Bump both window variables and apply. `Microsoft.App/containerApps/
+  authConfigs@2024-03-01` models the token store as `sasUrlSettingName` only —
+  there is no managed-identity token store on any shipped Microsoft.App auth
+  API version — so a SAS is the only available shape, not a shortcut.
+- **KEK.** Rotating the key does **not** re-wrap existing rows. Each record
+  pins the key *version* it was wrapped with, so old versions must stay
+  **enabled** until a re-wrap pass has run.
+
+### Decommissioning the per-user secret store
+
+There is deliberately no flag that removes the Table, the KEK, or the two role
+assignments. Both the Table and the KEK carry `prevent_destroy = true`, so
+`terraform destroy` — and any plan that would remove them — **fails on purpose**.
+Destroying the KEK makes every wrapped record permanently unreadable; the
+wrapped DEKs are useless without it. That is not a state a boolean should be
+able to reach.
+
+The supported workflow, in order:
+
+1. Export every record and verify the export opens (`cyrus router secrets list`
+   per user against the Table backend, plus a read-back of at least two users'
+   full key sets).
+2. `enable_setup_table_backend = false`; apply. The router is now off the Table.
+3. Confirm workers still boot for a migrated user.
+4. Retire KEK versions in Key Vault only after step 3 has held for a full
+   retention window.
+5. Only then remove the resources: delete the blocks from `setup_ui.tf`, drop
+   the `prevent_destroy` guards in the same commit, and apply. To retire the
+   Azure resources while keeping them out of Terraform's hands instead, use
+   `terraform state rm` and delete them manually.
+
+The same applies to whole-stack teardown — see "Teardown (M5)", which now has a
+step for this.
+
 ### `routerUrlForContainers` two-apply rationale
 
 The stable ingress FQDN is known only after the Container App exists. Embedding
@@ -497,7 +852,17 @@ aca sandbox snapshot delete --resource-group <rg> --sandbox-group <group> --id <
 aca sandboxgroup disk list  --resource-group <rg> --sandbox-group <group>
 aca sandboxgroup disk delete --name <disk> --resource-group <rg> --sandbox-group <group>
 
-# 4. THEN destroy the stack.
+# 4. Clear the per-user secret store guards. `azurerm_storage_table.setup` and
+#    `azurerm_key_vault_key.setup_kek` carry `prevent_destroy = true`, so the
+#    destroy below FAILS while they are in state. That is intentional: the KEK
+#    unwraps every stored per-user secret, and losing it is unrecoverable.
+#    Export and verify first (README → "Decommissioning the per-user secret
+#    store"), then either delete the resource blocks together with their
+#    `prevent_destroy` guards, or drop them from state and remove them by hand:
+terraform -chdir=infra/azure/terraform state rm \
+  azurerm_storage_table.setup azurerm_key_vault_key.setup_kek
+
+# 5. THEN destroy the stack.
 terraform -chdir=infra/azure/terraform destroy -var-file=dev.tfvars
 ```
 
@@ -684,6 +1049,12 @@ exact audience, and authenticate operators/users with `az login`. Set
 `CYRUS_ROUTER_ENTRA_TENANT_ID`, `CYRUS_ROUTER_ENTRA_AUDIENCE`, and
 `CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN` environment variables.
 
+That **same** app registration is reused for `/setup` sign-in (§11) — one app,
+two audiences: the `api://<client-id>` Application ID URI in `entra_audience`
+for `/enroll` **access** tokens, and the bare client-id GUID for the **ID**
+token the auth sidecar forwards. Do not mint a second app, and do not set
+`setup_ui_id_token_audience` to the `api://` form.
+
 ### Egress (D7 / M4)
 
 Default `aca_egress_default_action = "Deny"` + `trafficInspection = "Full"`.
@@ -733,6 +1104,8 @@ terraform/
   main.tf         RG, Log Analytics, KV, UAI, storage, CAE, RBAC, seed secrets
   router.tf       router Container App + env + Files mount + custom domain flag
   sandbox.tf      azapi_resource sandbox group + Data Owner RBAC + optional ACR
+  setup_ui.tf     /setup: staged EasyAuth (authConfigs + token store) AND the
+                  create-once Table/KEK/RBAC for per-user secrets — see §11
   outputs.tf      paste-ready outputs (N8)
   env/dev.tfvars.example  complete variable checklist
 bicep/
