@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Router hosts can now turn on a `/setup` page so teammates manage their own container credentials (Claude token, GitHub token, and so on) from a browser, instead of asking an admin to run `cyrus router secrets set` for them. It is off by default and an operator has to choose how sign-in is verified before it will start.
+- `cyrus router secrets migrate --from keyvault --to table [--dry-run]` moves a router's per-user secrets onto the new Table-backed storage option without ever printing a value, for operators who want its "someone else changed this while you were editing" protection.
 - Startup now reports the health of each MCP server — connected, degraded and retrying, or skipped — so a Linear or `cyrus-tools` server that fails to come up is visible instead of only showing up as tools mysteriously missing mid-session.
 - `cyrus router secrets list <email> --check-scopes` reports which GitHub scopes a stored token actually has. It only warns: a token missing `read:org` still works for everything except organization-level queries, and is never rejected. Token values are never printed.
 - `cyrus router containers list` now shows a `TEARDOWN` column, so you can see when a closed issue's worker is still waiting on its cleanup callback rather than guessing why it hasn't gone away yet.
