@@ -715,12 +715,18 @@ router **over** to them is a separate, ordered operation:
 
 1. Apply the stack. The Table and KEK now exist; the router still reads Key
    Vault, because `enable_setup_table_backend` is `false`.
-2. `az containerapp exec` into the replica and dry-run the copy:
+2. `az containerapp exec` into the replica and dry-run the copy. The target is
+   named explicitly, because `containers.tableStore` is deliberately NOT in the
+   config yet — adding it is what makes the router start *reading* from the
+   Table, which must come after the data is verified in place. Take the two
+   values from `terraform output`:
    ```bash
-   cyrus router secrets migrate --dry-run
+   cyrus router secrets migrate --from keyvault --to table --dry-run \
+     --to-endpoint "$(terraform output -raw setup_table_endpoint)" \
+     --to-key-id  "$(terraform output -raw setup_kek_versioned_key_id)"
    ```
    Eyeball the `email  KEY  (n bytes)` list. Values are never printed.
-3. `cyrus router secrets migrate`.
+3. Re-run without `--dry-run`, same flags.
 4. Set `enable_setup_table_backend = true` and apply. This adds
    `containers.tableStore` to `CYRUS_ROUTER_CONTAINERS_JSON` and rolls one
    revision.
@@ -730,9 +736,17 @@ router **over** to them is a separate, ordered operation:
 7. **Leave the Key Vault secrets in place for at least a week.** They are the
    rollback path. Deleting them is a separate change.
 
-Rollback is `enable_setup_table_backend = false` + apply: the router drops back
-to the Key Vault backend on the next revision. Nothing is destroyed, so this is
-safe to do at any time.
+**Rollback is only safe until the first write through the UI.** Flipping
+`enable_setup_table_backend = false` drops the router back to the Key Vault
+backend, and nothing is destroyed — but migration is one-way, so every value a
+user has added, changed, or rotated through `/setup` since cutover exists only
+in the Table. Rolling back after that point silently restores the migration-time
+snapshot, which can reinstate a credential the user believed they had replaced
+or revoked.
+
+Treat the Key Vault copy as a rollback path for the cutover window only. Once
+users are editing through the UI, a return to Key Vault requires an explicit
+reverse export that does not exist yet — do not assume it is a flag flip.
 
 ### Rotating the setup UI secrets
 

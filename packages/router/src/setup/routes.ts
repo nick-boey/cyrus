@@ -147,9 +147,17 @@ function asRecordStore(
 	return store as RecordCapableStore;
 }
 
-/** What a render saw: the bundle, whether a record exists, and its version. */
+/**
+ * What a render saw: the stored bundle and, where the backend has one, the
+ * version it was read at.
+ *
+ * Deliberately NOT a source of "is this teammate provisioned?" (R2-02). An
+ * earlier version reported `exists: Object.keys(bundle).length > 0`, which made
+ * registration inferable from a record — and a record was something any
+ * authenticated principal could cause to be created. Provisioning is a
+ * RouterStore fact; ask {@link SetupBootstrap.isRegistered} for it.
+ */
 interface RecordState {
-	exists: boolean;
 	bundle: UserSecretBundle;
 	/** Absent on a backend with no record API, or when no record exists. */
 	etag?: string;
@@ -162,15 +170,11 @@ async function readState(
 	const record = asRecordStore(deps.secrets);
 	if (record) {
 		const found = await record.getRecord(email);
-		if (!found) return { exists: false, bundle: {} };
-		return { exists: true, bundle: found.bundle, etag: found.etag };
+		if (!found) return { bundle: {} };
+		return { bundle: found.bundle, etag: found.etag };
 	}
-	// File / Key Vault backends are per-key stores with no version at all. An
-	// empty bundle is the "never bootstrapped" state: `SetupBootstrap` writes
-	// every required key (as "") on first provision, so a provisioned user is
-	// never empty.
-	const bundle = await deps.secrets.get(email);
-	return { exists: Object.keys(bundle).length > 0, bundle };
+	// File / Key Vault backends are per-key stores with no version at all.
+	return { bundle: await deps.secrets.get(email) };
 }
 
 /* --------------------------------------------------------- version token -- */
@@ -365,20 +369,36 @@ async function authenticate(
 }
 
 /**
- * The shared mutation guard: **principal → CSRF → fields**, in that order and
- * factored exactly once so no mutating route can drift out of it.
+ * The shared mutation guard: **principal → CSRF → registration → fields**, in
+ * that order and factored exactly once so no mutating route can drift out of it.
  *
  * Order matters. Checking CSRF first would let an unauthenticated caller probe
  * token validity, and a 403 where a 401 belongs also breaks the sign-in
- * redirect. Bootstrapping is deliberately NOT part of this guard: it is a
- * state change, and it belongs to exactly one route (`POST /setup/provision`).
+ * redirect.
  *
- * The token is read from the parsed body or the `X-CSRF-Token` header, and
+ * The registration check (R2-02) is the answer to "authentication is not
+ * authorization": getting past the auth sidecar proves only that the caller is
+ * *some* principal in the tenant. Without this step, any such principal could
+ * load `/setup`, take the CSRF token it was handed, and drive a route into
+ * creating an encrypted secret record for an unregistered address — values that
+ * would then attach to the real account the moment an administrator registered
+ * that email. It runs **before any secret read or write**, and it asks
+ * {@link SetupBootstrap.authorize}, which resolves an existing user and never
+ * creates one, rather than duplicating the rule here.
+ *
+ * `allowUnregistered` exists for exactly one route: `POST /setup/provision`,
+ * whose whole purpose is to create the user, and which therefore calls
+ * `bootstrap.ensure` (the auto-provisioning path) instead. Defaulting it to
+ * false is what makes a future mutating route fail closed if its author forgets
+ * this paragraph exists.
+ *
+ * The CSRF token is read from the parsed body or the `X-CSRF-Token` header, and
  * **never** from `request.query` (F18).
  */
 async function requireMutation(
 	deps: SetupRouteDeps,
 	request: FastifyRequest,
+	options: { allowUnregistered?: boolean } = {},
 ): Promise<
 	| { principal: SetupPrincipal; fields: Record<string, unknown> }
 	| {
@@ -399,6 +419,15 @@ async function requireMutation(
 				"This page expired, or the request did not come from it. Reload the page and try again.",
 			),
 		};
+	}
+
+	if (!options.allowUnregistered) {
+		try {
+			deps.bootstrap.authorize(auth.principal);
+		} catch (error) {
+			if (error instanceof SetupAuthError) return { error };
+			throw error;
+		}
 	}
 	return { principal: auth.principal, fields };
 }
@@ -560,8 +589,12 @@ export function registerSetupRoutes(
 		const auth = await authenticate(deps, request);
 		if ("error" in auth) return sendError(reply, auth.error);
 
-		const state = await readState(deps, auth.principal.email);
-		if (!state.exists) {
+		// "Provisioned" is a RouterStore fact, not a shape the secret bundle
+		// happens to have (R2-02). Reading it from the bundle let a principal who
+		// had caused a record to exist be treated as registered — and the record
+		// is the thing an unregistered principal could create. Asking the store
+		// first also means an unregistered principal's GET reads no secret at all.
+		if (!deps.bootstrap.isRegistered(auth.principal)) {
 			return secureHtml(reply).send(
 				renderProvisionPage(
 					auth.principal.email,
@@ -569,6 +602,7 @@ export function registerSetupRoutes(
 				),
 			);
 		}
+		const state = await readState(deps, auth.principal.email);
 		return secureHtml(reply).send(
 			renderPage(buildModel(deps, auth.principal, state)),
 		);
@@ -589,7 +623,12 @@ export function registerSetupRoutes(
 	 * triggered by a cross-site navigation or an image tag.
 	 */
 	fastify.post("/setup/provision", async (request, reply) => {
-		const guard = await requireMutation(deps, request);
+		// The one route that may be reached by a principal with no user row: it
+		// is the route that creates it. Authorization is `bootstrap.ensure`'s
+		// `autoProvisionUsers` decision instead.
+		const guard = await requireMutation(deps, request, {
+			allowUnregistered: true,
+		});
 		if ("error" in guard) return sendError(reply, guard.error);
 
 		try {

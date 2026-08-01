@@ -246,6 +246,24 @@ function post(
 	});
 }
 
+/**
+ * A DELETE shaped exactly like the one the vendored htmx emits (R2-03):
+ * **no request body and no query string** — the token rides in `X-CSRF-Token`.
+ *
+ * This helper used to inject a urlencoded DELETE body. htmx never sends one:
+ * its `methodsThatUseUrlParams` list contains `delete`, so anything it
+ * collects goes in the URL, which this route refuses by design. Every delete
+ * test therefore passed against a transport no browser produces, which is
+ * precisely what hid the fact that the button 403'd on every real click.
+ */
+function del(h: Harness, name: string, email = ALICE) {
+	return h.app.inject({
+		method: "DELETE",
+		url: `/setup/variables/${encodeURIComponent(name)}`,
+		headers: { ...signedIn(email), "x-csrf-token": h.csrf.issue(email) },
+	});
+}
+
 /* ------------------------------------------------------------------ auth -- */
 
 describe("setup routes — authentication", () => {
@@ -529,6 +547,170 @@ describe("shared mutation guard", () => {
 	});
 });
 
+/* ---------------------------------------------- registration gate (R2-02) -- */
+
+/**
+ * Authentication is not authorization. Every mutating route must also confirm
+ * the principal maps to an existing RouterStore user; otherwise any tenant
+ * principal EasyAuth admits can load `/setup`, take the CSRF token it is handed,
+ * and have the router create an encrypted secret record for an address that was
+ * never registered — pre-seeding values that attach to the real account the
+ * moment an administrator registers that email.
+ *
+ * `POST /setup/provision` is the deliberate exception: it is the route whose
+ * entire job is to create that user, so it goes through `bootstrap.ensure`,
+ * which may auto-provision when the operator has enabled it.
+ */
+describe("registration gate (R2-02)", () => {
+	const STRANGER = "stranger@example.com";
+
+	/**
+	 * A signed-in principal with no `users` row, auto-provisioning off. ALICE is
+	 * registered in the same harness so a passing test can never be explained by
+	 * "the secret store was never reachable at all".
+	 */
+	async function gate() {
+		const secrets = new FakeRecordStore();
+		const h = await harness({ secrets, autoProvisionUsers: false });
+		h.store.addUser({ email: ALICE });
+		await h.bootstrap.ensure({ email: ALICE });
+		// ALICE's own provisioning writes are setup, not evidence.
+		secrets.setCalls.length = 0;
+		secrets.putRecordCalls.length = 0;
+		const calls = {
+			get: vi.spyOn(secrets, "get"),
+			getRecord: vi.spyOn(secrets, "getRecord"),
+			set: vi.spyOn(secrets, "set"),
+			putRecord: vi.spyOn(secrets, "putRecord"),
+		};
+		return { h, secrets, calls };
+	}
+
+	type Gate = Awaited<ReturnType<typeof gate>>;
+
+	/** The whole point: not merely "403", but "the store was never touched". */
+	function expectNoSecretAccess({ calls, secrets }: Gate): void {
+		expect(calls.set).not.toHaveBeenCalled();
+		expect(calls.putRecord).not.toHaveBeenCalled();
+		expect(calls.get).not.toHaveBeenCalled();
+		expect(calls.getRecord).not.toHaveBeenCalled();
+		expect(secrets.setCalls).toEqual([]);
+		expect(secrets.putRecordCalls).toEqual([]);
+	}
+
+	it("403s POST /setup/variables and writes nothing", async () => {
+		const g = await gate();
+		const res = await post(
+			g.h,
+			"/setup/variables",
+			{ name: "FOO", csrf: g.h.csrf.issue(STRANGER) },
+			STRANGER,
+		);
+		expect(res.statusCode).toBe(403);
+		expect(res.body).toContain("cyrus router users add");
+		expectNoSecretAccess(g);
+		expect(await g.secrets.get(STRANGER)).toEqual({});
+		expect(g.h.store.listUsers().map((u) => u.email)).toEqual([ALICE]);
+	});
+
+	it("403s DELETE /setup/variables/:name and writes nothing", async () => {
+		const g = await gate();
+		const res = await del(g.h, "MY_TOOL_KEY", STRANGER);
+		expect(res.statusCode).toBe(403);
+		expect(res.body).toContain("cyrus router users add");
+		expectNoSecretAccess(g);
+	});
+
+	it("403s POST /setup/save and writes nothing", async () => {
+		const g = await gate();
+		const res = await post(
+			g.h,
+			"/setup/save",
+			{
+				csrf: g.h.csrf.issue(STRANGER),
+				"value:CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-attacker",
+			},
+			STRANGER,
+		);
+		expect(res.statusCode).toBe(403);
+		expect(res.body).not.toContain("sk-ant-attacker");
+		expectNoSecretAccess(g);
+	});
+
+	it("still lets a registered user mutate, and the counters prove it", async () => {
+		const g = await gate();
+		const add = await post(
+			g.h,
+			"/setup/variables",
+			{ name: "MY_TOOL_KEY", csrf: g.h.csrf.issue(ALICE) },
+			ALICE,
+		);
+		expect(add.statusCode).toBe(200);
+		expect(g.calls.set).toHaveBeenCalled();
+
+		const removed = await del(g.h, "MY_TOOL_KEY", ALICE);
+		expect(removed.statusCode).toBe(200);
+
+		const page = await get(g.h, "/setup", ALICE);
+		const saved = await post(
+			g.h,
+			"/setup/save",
+			{
+				csrf: field(page.body, "csrf"),
+				version: field(page.body, "version"),
+				"value:CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-legit",
+			},
+			ALICE,
+		);
+		expect(saved.statusCode).toBe(200);
+		expect(await g.secrets.get(ALICE)).toMatchObject({
+			CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-legit",
+		});
+	});
+
+	it("keeps POST /setup/provision as the one route that may create the user", async () => {
+		const h = await harness({ autoProvisionUsers: true });
+		const res = await post(
+			h,
+			"/setup/provision",
+			{ csrf: h.csrf.issue(STRANGER) },
+			STRANGER,
+		);
+		expect(res.statusCode).toBe(200);
+		expect(h.store.listUsers().map((u) => u.email)).toContain(STRANGER);
+	});
+
+	/**
+	 * Readiness must come from the RouterStore user, not from "the bundle has
+	 * some key in it". Otherwise a record prepared by any of the routes above —
+	 * or by an earlier build that had no gate — makes the router treat an
+	 * unregistered principal as fully provisioned.
+	 */
+	it("treats an unregistered principal with a secret record as NOT provisioned", async () => {
+		const secrets = new FakeRecordStore();
+		const h = await harness({ secrets, autoProvisionUsers: false });
+		await secrets.set(STRANGER, "PLANTED_KEY", "prepared-earlier");
+
+		const res = await get(h, "/setup", STRANGER);
+		expect(res.statusCode).toBe(200);
+		expect(res.body).toMatch(/set up your account/i);
+		expect(res.body).not.toContain("PLANTED_KEY");
+		expect(res.body).not.toContain("prepared-earlier");
+	});
+
+	it("renders the variables page for a registered user whose record is empty", async () => {
+		const secrets = new FakeRecordStore();
+		const h = await harness({ secrets, autoProvisionUsers: false });
+		// `cyrus router users add` creates the row and nothing else.
+		h.store.addUser({ email: ALICE });
+
+		const res = await get(h, "/setup", ALICE);
+		expect(res.statusCode).toBe(200);
+		expect(res.body).toContain('id="variables"');
+		expect(res.body).toContain("CLAUDE_CODE_OAUTH_TOKEN");
+	});
+});
+
 /* ------------------------------------------------ POST /setup/variables --- */
 
 describe("POST /setup/variables", () => {
@@ -614,16 +796,7 @@ describe("POST /setup/variables", () => {
 /* --------------------------------------- DELETE /setup/variables/:name ---- */
 
 describe("DELETE /setup/variables/:name", () => {
-	function del(h: Harness, name: string, email = ALICE) {
-		return h.app.inject({
-			method: "DELETE",
-			url: `/setup/variables/${encodeURIComponent(name)}`,
-			payload: form({ csrf: h.csrf.issue(email) }),
-			headers: formHeaders(email),
-		});
-	}
-
-	it("removes an optional variable", async () => {
+	it("removes an optional variable, with the token in a header and no body (R2-03)", async () => {
 		const h = await provisioned(await harness());
 		await h.secrets.set(ALICE, "MY_TOOL_KEY", "v");
 		const res = await del(h, "MY_TOOL_KEY");

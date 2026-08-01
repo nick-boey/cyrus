@@ -78,7 +78,30 @@ function renderMissingBanner(missing: string[]): string {
 	</article>`;
 }
 
-function renderRow(variable: VariableView): string {
+/**
+ * The delete control's CSRF token travels as a **request header** (R2-03).
+ *
+ * htmx lists `delete` in `methodsThatUseUrlParams`, so every parameter it
+ * collects for a DELETE is appended to the URL rather than sent as a body. The
+ * original control did `hx-include="#csrf"`, which put an 8-hour token in the
+ * query string — into access logs and browser history — and the routes layer
+ * refuses a query-string token by design, so the button also 403'd on every
+ * real click. A header is the one transport that is both private and accepted.
+ *
+ * `hx-params="none"` is the belt to that braces: htmx folds in
+ * `closest(elt, 'form')` for any non-GET verb, so wrapping this table in a
+ * `<form>` later would otherwise sweep every hidden field — csrf included —
+ * straight back into the URL this fix just cleaned up.
+ *
+ * The JSON is HTML-escaped, so no raw quote of either kind can terminate the
+ * attribute early; the browser hands htmx the decoded text.
+ */
+function renderDeleteButton(name: string, csrfToken: string): string {
+	const headers = escapeHtml(JSON.stringify({ "X-CSRF-Token": csrfToken }));
+	return `<button type="button" class="secondary" hx-delete="/setup/variables/${encodeURIComponent(name)}" hx-target="#variables" hx-swap="outerHTML" hx-headers="${headers}" hx-params="none">Delete</button>`;
+}
+
+function renderRow(variable: VariableView, csrfToken: string): string {
 	const name = escapeHtml(variable.name);
 	const requiredBadge = variable.required
 		? ' <small aria-label="required">required</small>'
@@ -91,7 +114,7 @@ function renderRow(variable: VariableView): string {
 		? variable.isSet
 			? `<label><input type="checkbox" name="clear:${name}"> Clear this value</label>`
 			: ""
-		: `<button type="button" class="secondary" hx-delete="/setup/variables/${encodeURIComponent(variable.name)}" hx-target="#variables" hx-swap="outerHTML" hx-include="#csrf">Delete</button>`;
+		: renderDeleteButton(variable.name, csrfToken);
 
 	return `
 	<tr>
@@ -115,21 +138,47 @@ function renderRow(variable: VariableView): string {
  * redaction rule that applies to the value/password inputs (F22).
  */
 export function renderVariablesTable(model: SetupPageModel): string {
-	const rows = model.variables.map(renderRow).join("");
+	const rows = model.variables
+		.map((variable) => renderRow(variable, model.csrfToken))
+		.join("");
 	const versionField =
 		model.versionToken === undefined
 			? ""
 			: `<input type="hidden" name="version" value="${escapeHtml(model.versionToken)}">`;
+	// The value inputs, the hidden csrf/version fields, and the save button all
+	// live inside ONE form posting to /setup/save, because that route reads
+	// `value:<NAME>`, `clear:<NAME>`, `csrf`, and `version` from a single body.
+	// Without this form the save route was implemented, routed, and tested but
+	// completely unreachable from the page.
+	//
+	// The delete buttons sit inside this form too. That is safe only because
+	// each carries `hx-params="none"` — otherwise htmx would fold every field
+	// of the enclosing form, csrf and every typed password included, into the
+	// DELETE query string (R2-03).
 	return `<div id="variables">
 	${renderMissingBanner(model.missingRequired)}
-	<input type="hidden" id="csrf" name="csrf" value="${escapeHtml(model.csrfToken)}">
-	${versionField}
-	<table>
-		<thead>
-			<tr><th>Variable</th><th>Status</th><th>New value</th><th></th></tr>
-		</thead>
-		<tbody>${rows}</tbody>
-	</table>
+	<form hx-post="/setup/save" hx-target="#variables" hx-swap="outerHTML">
+		<input type="hidden" id="csrf" name="csrf" value="${escapeHtml(model.csrfToken)}">
+		${versionField}
+		<table>
+			<thead>
+				<tr><th>Variable</th><th>Status</th><th>New value</th><th></th></tr>
+			</thead>
+			<tbody>${rows}</tbody>
+		</table>
+		<button type="submit">Save changes</button>
+		<p><small>A blank field leaves the stored value unchanged.</small></p>
+	</form>
+	<hr>
+	<form hx-post="/setup/variables" hx-target="#variables" hx-swap="outerHTML">
+		<input type="hidden" name="csrf" value="${escapeHtml(model.csrfToken)}">
+		<label for="new-variable">Add an optional variable</label>
+		<input type="text" id="new-variable" name="name" required
+			pattern="[A-Za-z_][A-Za-z0-9_]*"
+			autocomplete="off" spellcheck="false"
+			placeholder="MY_TOOL_KEY">
+		<button type="submit" class="secondary">Add variable</button>
+	</form>
 </div>`;
 }
 

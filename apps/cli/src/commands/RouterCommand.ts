@@ -1296,7 +1296,7 @@ export class RouterCommand extends BaseCommand {
 		const dryRun = args.includes("--dry-run");
 		if (from !== "keyvault" || to !== "table") {
 			this.exitWithError(
-				"Usage: cyrus router secrets migrate --from keyvault --to table [--dry-run]",
+				"Usage: cyrus router secrets migrate --from keyvault --to table [--to-endpoint <url> --to-key-id <versioned key id> [--to-table <name>]] [--dry-run]",
 			);
 			return;
 		}
@@ -1308,9 +1308,20 @@ export class RouterCommand extends BaseCommand {
 			);
 			return;
 		}
-		if (!containers.tableStore) {
+
+		// The target may be named on the command line so migration can run BEFORE
+		// `containers.tableStore` is added to the config. That ordering is the
+		// documented safe one — adding the block is what makes the router START
+		// USING the Table, so it must come after the data is verified in place.
+		// Requiring the block here would have made the documented sequence
+		// impossible to follow (round-2 finding R2-04).
+		const toEndpoint = flag("--to-endpoint") ?? containers.tableStore?.endpoint;
+		const toKeyId = flag("--to-key-id") ?? containers.tableStore?.keyId;
+		const toTable =
+			flag("--to-table") ?? containers.tableStore?.tableName ?? undefined;
+		if (!toEndpoint || !toKeyId) {
 			this.exitWithError(
-				"Migration target requires containers.tableStore in router-config.json. Add the block (endpoint + keyId) before migrating; the router only starts USING it once the same block is present at start time.",
+				"Migration target is not configured. Either pass --to-endpoint <https://<account>.table.core.windows.net> --to-key-id <versioned Key Vault key id>, or add containers.tableStore to router-config.json. Passing them explicitly is the documented order: migrate and verify first, then add the config block that makes the router read from the Table.",
 			);
 			return;
 		}
@@ -1320,9 +1331,9 @@ export class RouterCommand extends BaseCommand {
 			logger: this.logger,
 		});
 		const target = new TableSecretStore({
-			tableEndpoint: containers.tableStore.endpoint,
-			tableName: containers.tableStore.tableName,
-			keyId: containers.tableStore.keyId,
+			tableEndpoint: toEndpoint,
+			...(toTable ? { tableName: toTable } : {}),
+			keyId: toKeyId,
 			logger: this.logger,
 		});
 

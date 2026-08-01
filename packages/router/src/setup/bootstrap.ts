@@ -117,6 +117,18 @@ export function resolveExecutor(
 	return fallback;
 }
 
+/** The form `users.email` is compared on: `UNIQUE COLLATE NOCASE`. */
+function normalizeEmail(email: string | undefined): string {
+	return String(email ?? "")
+		.trim()
+		.toLowerCase();
+}
+
+/** One wording for "no such user", so authorize and ensure cannot diverge. */
+function unregisteredMessage(email: string): string {
+	return `${email} is not a registered Cyrus user. Ask an administrator to run: cyrus router users add ${email}`;
+}
+
 export interface SetupBootstrapLogger {
 	info(msg: string): void;
 	warn(msg: string): void;
@@ -207,10 +219,48 @@ export class SetupBootstrap {
 		this.store = deps.store;
 	}
 
+	/**
+	 * Resolves the RouterStore user a signed-in principal maps to, and refuses
+	 * the request when there is not one. **Creates nothing, ever.**
+	 *
+	 * This is the authorization half of {@link ensure}, split out because the two
+	 * answer different questions and only one of them is a state change:
+	 *
+	 * - `ensure` asks *"may this principal become a user?"* — the question
+	 *   `POST /setup/provision` exists to ask, governed by `autoProvisionUsers`.
+	 * - `authorize` asks *"is this principal already a user?"* — what every
+	 *   other mutating route needs to know **before it touches the secret
+	 *   store**, and which no auto-provisioning setting may answer "yes" to.
+	 *
+	 * Collapsing the two is the R2-02 defect: routes that called neither let any
+	 * tenant principal the auth sidecar admits create an encrypted secret record
+	 * for an unregistered address, pre-seeding values that would attach to the
+	 * real account the moment an administrator registered that email.
+	 */
+	authorize(principal: SetupPrincipal): { userId: number; email: string } {
+		const email = normalizeEmail(principal.email);
+		if (!email) {
+			throw new SetupAuthError(401, "signed-in identity carries no email");
+		}
+		const existing = this.findUser(email);
+		if (!existing) throw new SetupAuthError(403, unregisteredMessage(email));
+		return { userId: existing.userId, email };
+	}
+
+	/**
+	 * Non-throwing form of {@link authorize}, for choosing which page to render.
+	 *
+	 * This is the only correct source of "is this teammate provisioned?".
+	 * Inferring it from a non-empty secret bundle — as `/setup` originally did —
+	 * treats a record the principal created themselves as proof of registration.
+	 */
+	isRegistered(principal: SetupPrincipal): boolean {
+		const email = normalizeEmail(principal.email);
+		return email !== "" && this.findUser(email) !== undefined;
+	}
+
 	async ensure(principal: SetupPrincipal): Promise<SetupBootstrapResult> {
-		const email = String(principal.email ?? "")
-			.trim()
-			.toLowerCase();
+		const email = normalizeEmail(principal.email);
 		if (!email) {
 			// `requireSetupPrincipal` already rejects this; re-checking here keeps
 			// the invariant local, because an empty email would otherwise become a
@@ -246,10 +296,7 @@ export class SetupBootstrap {
 		if (existing) return { userId: existing.userId, createdUser: false };
 
 		if (!this.deps.autoProvisionUsers) {
-			throw new SetupAuthError(
-				403,
-				`${email} is not a registered Cyrus user. Ask an administrator to run: cyrus router users add ${email}`,
-			);
+			throw new SetupAuthError(403, unregisteredMessage(email));
 		}
 
 		let userId: number;
@@ -284,13 +331,23 @@ export class SetupBootstrap {
 	 * NOR-274, which re-keys identity from email to `(tenantId, oid)`. Storing
 	 * it now (cheap, additive) is what gives that migration the data it needs.
 	 *
-	 * A known email presenting a *different* `oid` is the UPN-rename /
-	 * email-reuse signal: the same address is now a different Entra object, so
-	 * old router state has been re-attached to a new principal. That is a
-	 * warning, not a block — email is still the key everywhere else, and failing
-	 * the sign-in would lock out the far more common benign case. The stored
-	 * value is deliberately NOT overwritten, so the warning repeats on every
-	 * sign-in until an operator resolves it instead of firing once and vanishing.
+	 * A known email presenting a *different* `oid` is **refused with a 403**.
+	 *
+	 * This was previously a warning. It should not have been: a UPN rename
+	 * changes the *email* and keeps the `oid`, so it produces a NEW user row,
+	 * not a mismatch. The only thing that produces a mismatch is the same
+	 * address now resolving to a different Entra object — an address reused for
+	 * a different person, which is precisely the case where letting the sign-in
+	 * proceed would hand them the previous holder's stored secrets (R2-07).
+	 *
+	 * An account deleted and recreated for the same human also lands here. That
+	 * is indistinguishable from reuse without out-of-band knowledge, so it is
+	 * resolved the same way: an operator rebinds the row deliberately. Failing
+	 * closed costs that person one support request; failing open costs the
+	 * previous holder every credential they ever stored.
+	 *
+	 * The stored value is never overwritten, so the block persists until an
+	 * operator acts rather than curing itself on the next sign-in.
 	 */
 	private recordObjectId(
 		userId: number,
@@ -309,11 +366,16 @@ export class SetupBootstrap {
 		}
 		if (stored === objectId) return;
 		this.deps.logger.warn(
-			`Entra object id for ${email} changed from ${stored} to ${objectId}. ` +
-				"The same email address now belongs to a different Entra object " +
-				"(a UPN rename, or an address reused for a new person), so this " +
-				"user's existing router state has been re-attached to it. Verify " +
-				"the account before trusting its stored secrets. Tracked by NOR-274.",
+			`Refusing setup access for ${email}: its Entra object id changed from ` +
+				`${stored} to ${objectId}. The same address now belongs to a ` +
+				"different Entra object, so honouring this sign-in would hand the " +
+				"previous holder's stored secrets to a new principal. An operator " +
+				"must confirm the account and rebind the row deliberately. Tracked " +
+				"by NOR-274, which re-keys identity from email to (tenant, oid).",
+		);
+		throw new SetupAuthError(
+			403,
+			"This account is not recognised. Your directory identity has changed since it was registered — contact an administrator to re-link it.",
 		);
 	}
 

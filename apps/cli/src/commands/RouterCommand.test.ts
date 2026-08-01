@@ -751,6 +751,47 @@ describe("RouterCommand", () => {
 			);
 		});
 
+		it("accepts an explicit target so migration can precede the config flip", async () => {
+			// R2-04: the documented cutover migrates BEFORE containers.tableStore
+			// is added, so requiring it in config made the runbook unrunnable.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "worker:latest",
+						routerUrlForContainers: "wss://router.example.com",
+						repositories: [],
+						keyVaultUrl: "https://vault.vault.azure.net",
+					},
+				}),
+			);
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			// Reaches the Azure call and fails there, not on argument validation —
+			// which is what proves the target was accepted without config.
+			await expect(
+				command.execute([
+					"secrets",
+					"migrate",
+					"--from",
+					"keyvault",
+					"--to",
+					"table",
+					"--dry-run",
+					"--to-endpoint",
+					"https://stexample.table.core.windows.net",
+					"--to-key-id",
+					`https://vault.vault.azure.net/keys/kek/${"a".repeat(32)}`,
+				]),
+			).rejects.toThrow();
+			expect(app.logger.error).not.toHaveBeenCalledWith(
+				expect.stringMatching(/Migration target is not configured/),
+			);
+		});
+
 		it("rejects an unsupported migration direction", async () => {
 			const app = createMockApp(cyrusHome);
 			await expect(

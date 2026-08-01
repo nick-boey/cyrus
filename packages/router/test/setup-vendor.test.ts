@@ -55,6 +55,21 @@ describe("setup vendor assets", () => {
 		expect(HTMX_JS.toLowerCase()).toContain("htmx");
 	});
 
+	/**
+	 * R2-03. This one line of htmx configuration is why the delete control in
+	 * `views.ts` sends its CSRF token as a header: for these verbs htmx appends
+	 * everything it collects to the URL instead of sending a request body, and
+	 * `requireMutation` refuses a query-string token by design. If a future
+	 * vendoring bump changes this list, revisit that control.
+	 */
+	it("still treats DELETE as a URL-parameter method", () => {
+		expect(HTMX_JS).toContain('methodsThatUseUrlParams:["get","delete"]');
+	});
+
+	it("supports the hx-headers attribute the delete control relies on", () => {
+		expect(HTMX_JS).toContain("hx-headers");
+	});
+
 	it("neither asset embeds a sourceMappingURL reference", () => {
 		expect(PICO_CSS).not.toContain("sourceMappingURL");
 		expect(HTMX_JS).not.toContain("sourceMappingURL");

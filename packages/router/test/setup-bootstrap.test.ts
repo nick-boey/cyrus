@@ -387,7 +387,12 @@ describe("SetupBootstrap.ensure — Entra object id (interim NOR-274 mitigation)
 		expect(logger.warn).not.toHaveBeenCalled();
 	});
 
-	it("warns without blocking when a known email presents a different oid", async () => {
+	it("refuses a known email presenting a different oid (R2-07)", async () => {
+		// A UPN rename changes the EMAIL and keeps the oid, producing a new user
+		// row rather than a mismatch. The only thing that lands here is the same
+		// address resolving to a different Entra object — an address reused for
+		// a different person — where proceeding would hand them the previous
+		// holder's stored secrets.
 		const store = withEntraObjectIds(new RouterStore(":memory:"));
 		const { bootstrap, logger } = harness({ store });
 		const { userId } = await bootstrap.ensure({
@@ -395,20 +400,30 @@ describe("SetupBootstrap.ensure — Entra object id (interim NOR-274 mitigation)
 			objectId: "oid-1",
 		});
 
-		const result = await bootstrap.ensure({
-			email: "alice@example.com",
-			objectId: "oid-2",
-		});
+		await expect(
+			bootstrap.ensure({ email: "alice@example.com", objectId: "oid-2" }),
+		).rejects.toMatchObject({ status: 403 });
 
-		expect(result.userId).toBe(userId);
-		expect(logger.warn).toHaveBeenCalledTimes(1);
 		const message = String(logger.warn.mock.calls[0]?.[0]);
 		expect(message).toContain("alice@example.com");
 		expect(message).toContain("oid-1");
 		expect(message).toContain("oid-2");
-		// The first-seen binding is kept, so the signal repeats on every sign-in
-		// instead of firing once and then silently disappearing.
+		// The first-seen binding is never overwritten, so the block persists
+		// until an operator rebinds rather than curing itself on the next visit.
 		expect(store.getUserEntraObjectId(userId)).toBe("oid-1");
+	});
+
+	it("does not leak the stored oid to the refused caller", async () => {
+		const store = withEntraObjectIds(new RouterStore(":memory:"));
+		const { bootstrap } = harness({ store });
+		await bootstrap.ensure({ email: "alice@example.com", objectId: "oid-1" });
+
+		await expect(
+			bootstrap.ensure({ email: "alice@example.com", objectId: "oid-2" }),
+		).rejects.toSatisfy(
+			(error: Error) =>
+				!error.message.includes("oid-1") && !error.message.includes("oid-2"),
+		);
 	});
 
 	it("does not warn when the same oid signs in again", async () => {

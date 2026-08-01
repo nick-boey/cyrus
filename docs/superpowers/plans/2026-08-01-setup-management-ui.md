@@ -513,7 +513,7 @@ The parent issue should stay focused on scope, sequencing, and overall delivery.
 
 ## Comments
 
-### Comment — **@nboey** - *49 minutes ago* [thread: 384361fa-ac04-4f1b-8984-2b91c90d3185]
+### Comment
 
 ## Implementation plan — Setup management UI (parent)
 
@@ -616,7 +616,7 @@ NOR-268 (Entra + auth sidecar) ──┬────────┘             
 Happy to also drop the consolidated version into `docs/superpowers/plans/` alongside the other design docs if you want it in-repo.
 
 
-#### Reply — **@nboey** - *29 minutes ago*
+#### Reply
 
 **Open questions resolved** (2026-08-01):
 
@@ -638,7 +638,7 @@ Net effect on scope: one additional task on NOR-270 (~half a day, including the 
 
 # NOR-266: Build setup management backend foundation
 
-**State:** Todo | **Priority:** --- | **Assignee:** @nboey | **Project:** Cyrus | **Milestone:** First multi-user release
+**State:** Todo | **Priority:** --- | **Assignee:** (author) | **Project:** Cyrus | **Milestone:** First multi-user release
 
 Create the backend foundation for the setup management feature, including authentication prerequisites, user bootstrap, and persistent storage for user environment variables. This issue groups the server-side work needed before the UI can fully function.
 
@@ -656,7 +656,7 @@ Create the backend foundation for the setup management feature, including authen
 
 ## Comments
 
-### Comment — **@nboey** - *48 minutes ago* [thread: 453cdfec-976a-46d3-aaf6-74ca35afc2e5]
+### Comment
 
 ## Implementation plan — backend foundation (grouping issue)
 
@@ -830,7 +830,7 @@ Configure authentication for the setup management application using Entra and th
 
 ## Comments
 
-### Comment — **@nboey** - *46 minutes ago* [thread: a3ae290d-70b9-4499-842a-d09278c3ec93]
+### Comment
 
 ## Implementation plan — Entra authentication and app registration
 
@@ -1560,7 +1560,7 @@ Replace key vault storage for user environment variables with Azure Table storag
 
 ## Comments
 
-### Comment — **@nboey** - *43 minutes ago* [thread: d9a62f4b-2277-4960-aed0-dc5a77228408]
+### Comment
 
 ## Implementation plan — Azure Table storage with envelope encryption
 
@@ -2697,7 +2697,7 @@ When a user logs in for the first time, create their setup record with all requi
 
 ## Comments
 
-### Comment — **@nboey** - *41 minutes ago* [thread: 1552dd1d-844b-45a5-8424-3f80ecd13c28]
+### Comment
 
 ## Implementation plan — create user setup records on first sign-in
 
@@ -3164,7 +3164,7 @@ Add a `RouterServer.test.ts` case for it.
 4. `autoProvisionUsers: false` + unknown email → `SetupAuthError(403)` and no row written.
 
 
-#### Reply — **@nboey** - *36 minutes ago*
+#### Reply
 
 Correction to Task 3 Step 2 — `buildContainerTargets` must stash **three** fields, not one. NOR-271's route registration reads all three, and the plan above only named `setupBootstrap`:
 
@@ -3193,7 +3193,7 @@ this.setupBootstrap = new SetupBootstrap({
 `requiredKeys` also feeds `ContainerTargetService`'s `containersConfig` so the boot gate and the page compute the required set from the same call — that is the point of hoisting `resolveRequiredSecretKeys` in Step 1.
 
 
-#### Reply — **@nboey** - *28 minutes ago*
+#### Reply
 
 ## Added: Task 4 — router-level default executor
 
@@ -3445,7 +3445,7 @@ Create the authenticated setup management UI for viewing and editing user enviro
 
 ## Comments
 
-### Comment — **@nboey** - *48 minutes ago* [thread: 923a4059-3f5b-42ee-b6b4-1da99a5df93a]
+### Comment
 
 ## Implementation plan — setup management UI (grouping issue)
 
@@ -3585,7 +3585,7 @@ Build the initial static HTMX page for setup management, styled with Pico CSS an
 
 ## Comments
 
-### Comment — **@nboey** - *39 minutes ago* [thread: e72acbad-48ef-4c58-9d14-e717bab676b6]
+### Comment
 
 ## Implementation plan — authenticated setup management page shell
 
@@ -4411,7 +4411,7 @@ Show environment variables in a simple table and allow users to add and delete n
 
 ## Comments
 
-### Comment — **@nboey** - *38 minutes ago* [thread: ce56ad03-014e-4489-8ec7-3243934a171d]
+### Comment
 
 ## Implementation plan — add and delete optional environment variables
 
@@ -4932,7 +4932,7 @@ Implement the save flow that persists environment variable changes from the setu
 
 ## Comments
 
-### Comment — **@nboey** - *36 minutes ago* [thread: 45b3e596-930a-4bad-96d4-b4cf0a33413e]
+### Comment
 
 ## Implementation plan — persist setup changes from the UI
 

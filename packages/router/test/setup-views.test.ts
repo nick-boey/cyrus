@@ -86,6 +86,63 @@ describe("renderVariablesTable", () => {
 		expect(rowFor(html, "MY_TOOL_KEY")).toContain("hx-delete");
 	});
 
+	/**
+	 * R2-03. The vendored htmx ships `methodsThatUseUrlParams:["get","delete"]`
+	 * (pinned by a test in `setup-vendor.test.ts`), so **every parameter htmx
+	 * collects for a DELETE is appended to the URL** rather than sent as a body.
+	 * The original control did `hx-include="#csrf"`, which put the 8-hour CSRF
+	 * token in the query string — where it lands in access logs and browser
+	 * history, and where `requireMutation` deliberately refuses to read it, so
+	 * the button also 403'd on every click in a real browser.
+	 *
+	 * The token therefore travels as a request HEADER, and the control must
+	 * carry nothing that can contribute a URL parameter. `hx-params="none"` is
+	 * belt-and-braces: htmx includes `closest(elt, 'form')` for any non-GET
+	 * verb, so wrapping this table in a `<form>` later would otherwise sweep
+	 * every hidden field — csrf included — back into the URL.
+	 */
+	describe("delete control CSRF transport (R2-03)", () => {
+		it("carries the token in an X-CSRF-Token header via hx-headers", () => {
+			const row = rowFor(renderVariablesTable(model), "MY_TOOL_KEY");
+			expect(row).toMatch(/hx-headers="[^"]*X-CSRF-Token[^"]*"/);
+			expect(row).toContain("tok.123");
+		});
+
+		it("parses as JSON once the browser has decoded the attribute", () => {
+			const row = rowFor(renderVariablesTable(model), "MY_TOOL_KEY");
+			const raw = row.match(/hx-headers="([^"]*)"/)?.[1] ?? "";
+			// The attribute is HTML-escaped, so no raw quote of either kind can
+			// terminate it early; htmx sees the decoded text.
+			const decoded = raw
+				.replaceAll("&quot;", '"')
+				.replaceAll("&#39;", "'")
+				.replaceAll("&lt;", "<")
+				.replaceAll("&gt;", ">")
+				.replaceAll("&amp;", "&");
+			expect(JSON.parse(decoded)).toEqual({ "X-CSRF-Token": "tok.123" });
+		});
+
+		it("carries no attribute that would place a parameter in the delete URL", () => {
+			const row = rowFor(renderVariablesTable(model), "MY_TOOL_KEY");
+			expect(row).not.toContain("hx-include");
+			expect(row).not.toContain("hx-vals");
+			expect(row).toContain('hx-params="none"');
+			expect(row).not.toMatch(/hx-delete="[^"]*[?&]/);
+		});
+
+		it("escapes a hostile csrf token inside the header attribute", () => {
+			const row = rowFor(
+				renderVariablesTable({
+					...model,
+					csrfToken: `"><script>alert(1)</script>`,
+				}),
+				"MY_TOOL_KEY",
+			);
+			expect(row).not.toContain("<script>alert(1)</script>");
+			expect(row).toContain("&lt;script&gt;");
+		});
+	});
+
 	it("distinguishes set from unset without revealing anything", () => {
 		const html = renderVariablesTable(model);
 		expect(rowFor(html, "GIT_TOKEN")).toContain("Not set");
@@ -293,5 +350,53 @@ describe("renderPage", () => {
 				/values? never travels? to the browser/i,
 			);
 		});
+	});
+});
+
+describe("the page can actually reach every implemented route", () => {
+	// Regression guard for a real gap: POST /setup/save and POST
+	// /setup/variables were implemented, routed, and server-tested while the
+	// rendered page contained no control able to submit either. Server-side
+	// route tests cannot catch that — only asserting on the markup can.
+	const model: SetupPageModel = {
+		email: "alice@example.com",
+		variables: [
+			{ name: "CLAUDE_CODE_OAUTH_TOKEN", required: true, isSet: true },
+			{ name: "MY_TOOL_KEY", required: false, isSet: true },
+		],
+		missingRequired: [],
+		csrfToken: "tok.123",
+		versionToken: "ver.456",
+	};
+
+	it("submits the value inputs to /setup/save", () => {
+		const html = renderVariablesTable(model);
+		expect(html).toMatch(/<form[^>]*hx-post="\/setup\/save"/);
+		expect(html).toMatch(/<button[^>]*type="submit"/);
+	});
+
+	it("carries csrf and the render-time version inside the save form", () => {
+		const html = renderVariablesTable(model);
+		const form = html.slice(html.indexOf('hx-post="/setup/save"'));
+		expect(form).toContain('name="csrf"');
+		expect(form).toContain('name="version"');
+		expect(form).toContain('value="ver.456"');
+		// The value inputs must be inside it, or a save submits nothing.
+		expect(form).toContain('name="value:CLAUDE_CODE_OAUTH_TOKEN"');
+	});
+
+	it("offers a control that posts a new variable name to /setup/variables", () => {
+		const html = renderVariablesTable(model);
+		expect(html).toMatch(/<form[^>]*hx-post="\/setup\/variables"/);
+		expect(html).toMatch(/<input[^>]*name="name"/);
+	});
+
+	it("keeps delete out of the enclosing form's parameter sweep", () => {
+		// Delete now sits inside the save form. Without hx-params="none" htmx
+		// would fold csrf, version, and every typed password into the DELETE
+		// URL — reintroducing R2-03 by a different route.
+		const html = renderVariablesTable(model);
+		const del = html.slice(html.indexOf("hx-delete"));
+		expect(del).toContain('hx-params="none"');
 	});
 });
