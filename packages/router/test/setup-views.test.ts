@@ -313,6 +313,46 @@ describe("renderPage", () => {
 		expect(html).toContain("e.detail.isError = false;");
 	});
 
+	// The assertions above only prove the source text is on the page. They passed
+	// while the handler never ran at all: the script sits in <head> with no
+	// `defer` (which is ignored on inline scripts anyway), so it executes during
+	// head parsing, when `document.body` is still null. `document.body.add-
+	// EventListener` threw a TypeError, htmx kept its default of not swapping
+	// 4xx, and every error fragment vanished silently — the page just sat there.
+	// So execute the script the way the browser does, with a null body.
+	it("registers the beforeSwap handler even though it runs before <body> exists", () => {
+		const html = renderPage(model);
+		const script =
+			html.match(/<script nonce="[^"]*">([\s\S]*?)<\/script>/)?.[1] ?? "";
+		expect(script).toContain("htmx:beforeSwap");
+
+		const listeners: Record<string, (e: unknown) => void> = {};
+		// `body: null` is precisely the state during head parsing.
+		const fakeDocument = {
+			body: null,
+			addEventListener(type: string, fn: (e: unknown) => void) {
+				listeners[type] = fn;
+			},
+		};
+
+		expect(() => {
+			new Function("document", script)(fakeDocument);
+		}).not.toThrow();
+		expect(typeof listeners["htmx:beforeSwap"]).toBe("function");
+
+		// And it must actually opt the error statuses back into swapping.
+		for (const status of [400, 403, 409]) {
+			const detail = { xhr: { status }, shouldSwap: false, isError: true };
+			listeners["htmx:beforeSwap"]?.({ detail });
+			expect(detail.shouldSwap).toBe(true);
+			expect(detail.isError).toBe(false);
+		}
+		// A success status must be left alone for htmx's normal handling.
+		const ok = { xhr: { status: 200 }, shouldSwap: false, isError: false };
+		listeners["htmx:beforeSwap"]?.({ detail: ok });
+		expect(ok.shouldSwap).toBe(false);
+	});
+
 	it("serves the beforeSwap handler as an inline script permitted by the CSP nonce", () => {
 		const html = renderPage(model);
 		const nonceMatch = html.match(/'nonce-([A-Za-z0-9+/=]+)'/);

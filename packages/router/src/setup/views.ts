@@ -191,7 +191,15 @@ export function renderVariablesTable(model: SetupPageModel): string {
  * handler is the documented seam (`htmx:beforeSwap`) for opting specific
  * error statuses back into swapping.
  */
-const BEFORE_SWAP_SCRIPT = `document.body.addEventListener("htmx:beforeSwap", (e) => {
+// Bound to `document`, NOT `document.body`. This script tag sits in <head>, so
+// it executes during head parsing while `document.body` is still null — and
+// `defer` is ignored on inline scripts, so it cannot be deferred into place.
+// `document.body.addEventListener` therefore threw a TypeError before the
+// listener was ever registered, htmx kept its default of not swapping 4xx, and
+// every error fragment was discarded in silence. htmx events bubble to
+// `document`, which exists from the first byte, so this is equivalent at
+// runtime and immune to where the tag ends up.
+const BEFORE_SWAP_SCRIPT = `document.addEventListener("htmx:beforeSwap", (e) => {
 	if ([400, 403, 409].includes(e.detail.xhr.status)) {
 		e.detail.shouldSwap = true;
 		e.detail.isError = false;

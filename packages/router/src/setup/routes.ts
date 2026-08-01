@@ -352,7 +352,25 @@ async function respond(
 		.send(`${renderMessage(model.message)}${renderVariablesTable(model)}`);
 }
 
-function sendError(reply: FastifyReply, error: SetupAuthError): FastifyReply {
+/**
+ * The single funnel for every rejected /setup* request, and therefore the only
+ * place that can record WHY one was rejected.
+ *
+ * This used to return the fragment silently. A 401/403 then left no trace at
+ * all: the browser showed a bare status code, the fragment explaining the cause
+ * was discarded client-side (see the `htmx:beforeSwap` note in views.ts), and
+ * the logs said nothing — so an operator debugging a refused save had no signal
+ * on either side of the wire. The message is server-authored and carries no
+ * credential; the email is already logged on the provisioning path.
+ */
+function sendError(
+	deps: SetupRouteDeps,
+	reply: FastifyReply,
+	error: SetupAuthError,
+): FastifyReply {
+	deps.logger.warn(
+		`Setup request refused with ${error.status}: ${error.message}`,
+	);
 	return secureHtml(reply).status(error.status).send(renderError(error));
 }
 
@@ -592,7 +610,7 @@ export function registerSetupRoutes(
 	 */
 	fastify.get("/setup", async (request, reply) => {
 		const auth = await authenticate(deps, request);
-		if ("error" in auth) return sendError(reply, auth.error);
+		if ("error" in auth) return sendError(deps, reply, auth.error);
 
 		// "Provisioned" is a RouterStore fact, not a shape the secret bundle
 		// happens to have (R2-02). Reading it from the bundle let a principal who
@@ -616,7 +634,7 @@ export function registerSetupRoutes(
 	/** The table fragment on its own, for an explicit refresh. Read-only. */
 	fastify.get("/setup/variables", async (request, reply) => {
 		const auth = await authenticate(deps, request);
-		if ("error" in auth) return sendError(reply, auth.error);
+		if ("error" in auth) return sendError(deps, reply, auth.error);
 		const state = await readState(deps, auth.principal.email);
 		return secureHtml(reply).send(
 			renderVariablesTable(buildModel(deps, auth.principal, state)),
@@ -634,14 +652,14 @@ export function registerSetupRoutes(
 		const guard = await requireMutation(deps, request, {
 			allowUnregistered: true,
 		});
-		if ("error" in guard) return sendError(reply, guard.error);
+		if ("error" in guard) return sendError(deps, reply, guard.error);
 
 		try {
 			await deps.bootstrap.ensure(guard.principal);
 		} catch (error) {
 			// An unregistered user with auto-provisioning off lands here with the
 			// 403 and the exact command an administrator has to run.
-			if (error instanceof SetupAuthError) return sendError(reply, error);
+			if (error instanceof SetupAuthError) return sendError(deps, reply, error);
 			throw error;
 		}
 		const state = await readState(deps, guard.principal.email);
@@ -657,7 +675,7 @@ export function registerSetupRoutes(
 
 	fastify.post("/setup/variables", async (request, reply) => {
 		const guard = await requireMutation(deps, request);
-		if ("error" in guard) return sendError(reply, guard.error);
+		if ("error" in guard) return sendError(deps, reply, guard.error);
 
 		const raw = lastValue(guard.fields.name)?.trim() ?? "";
 		let name: string;
@@ -692,7 +710,7 @@ export function registerSetupRoutes(
 		"/setup/variables/:name",
 		async (request, reply) => {
 			const guard = await requireMutation(deps, request);
-			if ("error" in guard) return sendError(reply, guard.error);
+			if ("error" in guard) return sendError(deps, reply, guard.error);
 
 			let name: string;
 			try {
@@ -733,7 +751,7 @@ export function registerSetupRoutes(
 
 	fastify.post("/setup/save", async (request, reply) => {
 		const guard = await requireMutation(deps, request);
-		if ("error" in guard) return sendError(reply, guard.error);
+		if ("error" in guard) return sendError(deps, reply, guard.error);
 
 		const email = guard.principal.email;
 		const recordStore = asRecordStore(deps.secrets);
