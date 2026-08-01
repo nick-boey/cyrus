@@ -1182,9 +1182,11 @@ export class RouterCommand extends BaseCommand {
 					secretRest[0],
 					secretRest.includes("--check-scopes"),
 				);
+			case "migrate":
+				return this.secretsMigrate(secretRest);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router secrets <set <email> <ENV_VAR_NAME> <value>|unset <email> <ENV_VAR_NAME>|list <email> [--check-scopes]>",
+					"Usage: cyrus router secrets <set <email> <ENV_VAR_NAME> <value>|unset <email> <ENV_VAR_NAME>|list <email> [--check-scopes]|migrate --from keyvault --to table [--dry-run]>",
 				);
 		}
 	}
@@ -1233,6 +1235,118 @@ export class RouterCommand extends BaseCommand {
 		}
 		await this.openSecretStore().set(email, key, undefined);
 		this.logSuccess(`Unset ${key} for ${email}.`);
+	}
+
+	/**
+	 * Copies every per-user secret bundle from one backend to another.
+	 *
+	 * Source and target are named explicitly rather than inferred from the
+	 * active config, because the documented cutover keeps `containers.tableStore`
+	 * OUT of the config until after the migration has run and been verified —
+	 * so at migration time the config describes only the source. Inferring
+	 * would make the command unrunnable in exactly the state the runbook puts
+	 * you in, and once `tableStore` IS set, precedence would hide the source.
+	 *
+	 * Both endpoints are read from `containers`, so the Table config must be
+	 * present in the file; `--to table` selects it, it does not invent it.
+	 */
+	private async secretsMigrate(args: string[]): Promise<void> {
+		const flag = (name: string): string | undefined => {
+			const index = args.indexOf(name);
+			return index >= 0 ? args[index + 1] : undefined;
+		};
+		const from = flag("--from");
+		const to = flag("--to");
+		const dryRun = args.includes("--dry-run");
+		if (from !== "keyvault" || to !== "table") {
+			this.exitWithError(
+				"Usage: cyrus router secrets migrate --from keyvault --to table [--dry-run]",
+			);
+			return;
+		}
+
+		const containers = this.readRouterConfig()?.containers;
+		if (!containers?.keyVaultUrl) {
+			this.exitWithError(
+				"Migration source requires containers.keyVaultUrl in router-config.json.",
+			);
+			return;
+		}
+		if (!containers.tableStore) {
+			this.exitWithError(
+				"Migration target requires containers.tableStore in router-config.json. Add the block (endpoint + keyId) before migrating; the router only starts USING it once the same block is present at start time.",
+			);
+			return;
+		}
+
+		const source = new KeyVaultSecretStore({
+			vaultUrl: containers.keyVaultUrl,
+			logger: this.logger,
+		});
+		const target = new TableSecretStore({
+			tableEndpoint: containers.tableStore.endpoint,
+			tableName: containers.tableStore.tableName,
+			keyId: containers.tableStore.keyId,
+			logger: this.logger,
+		});
+
+		const emails = await source.listEmails();
+		this.logger.info(
+			`Found ${emails.length} user(s) with secrets in the Key Vault backend.`,
+		);
+
+		let migrated = 0;
+		let skipped = 0;
+		const failures: string[] = [];
+		for (const email of emails) {
+			const bundle = await source.get(email);
+			const keys = Object.keys(bundle).sort();
+			if (keys.length === 0) {
+				skipped++;
+				continue;
+			}
+			if (dryRun) {
+				// Names only — never the values.
+				this.logger.info(`[dry-run] ${email}: ${keys.join(", ")}`);
+				migrated++;
+				continue;
+			}
+			try {
+				const existing = await target.getRecord(email);
+				if (existing) {
+					// Never clobber a record the target already holds: it may carry
+					// writes made through the UI after an earlier migration pass.
+					this.logger.warn(
+						`${email}: target record already exists — skipping. Verify and remove it first if you intend to re-migrate.`,
+					);
+					skipped++;
+					continue;
+				}
+				await target.putRecord(email, bundle);
+				this.logger.info(`${email}: migrated ${keys.length} value(s).`);
+				migrated++;
+			} catch (error) {
+				// Keep going: one unreadable user must not strand the rest, and the
+				// summary has to name every failure rather than exiting on the first.
+				failures.push(`${email}: ${(error as Error).message}`);
+			}
+		}
+
+		this.logger.info(
+			`Migration ${dryRun ? "(dry run) " : ""}complete: ${migrated} migrated, ${skipped} skipped, ${failures.length} failed.`,
+		);
+		if (failures.length > 0) {
+			for (const failure of failures) this.logger.error(failure);
+			this.exitWithError(
+				`${failures.length} user(s) failed to migrate. The Key Vault source is untouched; re-run after resolving.`,
+			);
+			return;
+		}
+		if (!dryRun) {
+			this.logSuccess(
+				"Verify with `cyrus router secrets list <email>` against both backends before setting containers.tableStore at router start.",
+			);
+		}
 	}
 
 	private async secretsList(

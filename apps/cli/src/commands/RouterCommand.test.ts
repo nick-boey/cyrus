@@ -716,6 +716,58 @@ describe("RouterCommand", () => {
 			expect(app.logger.success).not.toHaveBeenCalled();
 		});
 
+		it("refuses to migrate without both endpoints configured", async () => {
+			// The documented cutover keeps tableStore out of config until after
+			// migration, which is exactly why source and target are named
+			// explicitly rather than inferred — but the target block still has to
+			// be present in the file for the command to have somewhere to write.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "worker:latest",
+						routerUrlForContainers: "wss://router.example.com",
+						repositories: [],
+						keyVaultUrl: "https://vault.vault.azure.net",
+					},
+				}),
+			);
+			const app = createMockApp(cyrusHome);
+			await expect(
+				new RouterCommand(app as any).execute([
+					"secrets",
+					"migrate",
+					"--from",
+					"keyvault",
+					"--to",
+					"table",
+				]),
+			).rejects.toThrow(/process\.exit/);
+			expect(app.logger.error).toHaveBeenCalledWith(
+				expect.stringMatching(/containers\.tableStore/),
+			);
+		});
+
+		it("rejects an unsupported migration direction", async () => {
+			const app = createMockApp(cyrusHome);
+			await expect(
+				new RouterCommand(app as any).execute([
+					"secrets",
+					"migrate",
+					"--from",
+					"table",
+					"--to",
+					"keyvault",
+				]),
+			).rejects.toThrow(/process\.exit/);
+			expect(app.logger.error).toHaveBeenCalledWith(
+				expect.stringMatching(/Usage/),
+			);
+		});
+
 		it("selects the Table backend over Key Vault, and survives the schema", async () => {
 			// tableStore is stripped on EVERY `router start` if it is not modelled
 			// in RouterConfigFileSchema, so this asserts the field both parses and
