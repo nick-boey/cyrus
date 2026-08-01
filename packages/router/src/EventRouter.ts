@@ -346,11 +346,31 @@ export class EventRouter {
 	}
 
 	/**
-	 * Releases the issue lock and session affinity for a session that has
-	 * reached a terminal state. Every `session_state` value (complete / error /
-	 * stopped) is terminal, so this always releases.
+	 * Applies a `session_state` frame.
+	 *
+	 * Terminal states (complete / error / stopped) release the issue lock AND
+	 * session affinity, and forget the session's in-memory bookkeeping.
+	 *
+	 * `parked` is NOT terminal: the session is blocked on a user answer with no
+	 * work in flight. It releases session affinity ONLY — which is what lets
+	 * {@link ContainerLifecycle} idle-stop the container — while keeping:
+	 *  - the issue lock, so no other session claims the issue mid-conversation;
+	 *  - `notifiedSessions`/`sessionWorkspace`, which the session still needs
+	 *    when the user's answer resumes it.
+	 * It also stamps the park time, which the sweep uses as its idle clock.
+	 *
+	 * Both paths are idempotent: the device replays unacked frames on
+	 * reconnect, and the router acks only after applying.
 	 */
 	handleSessionState(deviceId: number, frame: SessionStateFrame): void {
+		if (frame.state === "parked") {
+			this.store.clearSessionAffinity(frame.sessionId);
+			this.store.setDeviceParkedAt(deviceId, this.now());
+			this.logger.info(
+				`Session ${frame.sessionId} parked on device ${deviceId}; released affinity, retained the issue lock`,
+			);
+			return;
+		}
 		this.store.releaseIssueLockForSession(frame.sessionId);
 		this.store.clearSessionAffinity(frame.sessionId);
 		this.notifiedSessions.delete(frame.sessionId);

@@ -582,6 +582,73 @@ describe("EventRouter", () => {
 		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(true);
 	});
 
+	// ── parked (non-terminal) session state ────────────────────────────────
+	// A session blocked on a user answer with no work in flight releases its
+	// device so ContainerLifecycle can idle-suspend the container — but it is
+	// NOT finished, so it keeps the issue lock.
+
+	it("(e2) handleSessionState(parked) releases affinity but keeps the issue lock", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router } = makeRouter(store);
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+
+		// Affinity gone → the sweep's affinity gate no longer protects the device.
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+		// Lock retained → no other session can claim the issue mid-conversation.
+		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(false);
+	});
+
+	it("(e3) handleSessionState(parked) stamps parkedAtMs on the device", async () => {
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-146", "aca");
+		const { router, clock } = makeRouter(store);
+		store.setSessionAffinity("sess-1", deviceId);
+		clock.value = 5_000;
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+
+		expect(store.getContainerDeviceForIssue("PAR-146")?.parkedAtMs).toBe(5_000);
+	});
+
+	it("(e4) a prompt after parking re-establishes affinity and clears the stamp", async () => {
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-146", "aca");
+		const { router } = makeRouter(store);
+		store.setSessionAffinity("sess-1", deviceId);
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+		expect(
+			store.getContainerDeviceForIssue("PAR-146")?.parkedAtMs,
+		).toBeDefined();
+
+		// The user's answer routes back to the same device.
+		store.setSessionAffinity("sess-1", deviceId);
+
+		expect(
+			store.getContainerDeviceForIssue("PAR-146")?.parkedAtMs,
+		).toBeUndefined();
+	});
+
 	it("(f) sweepExpired posts the TTL expiry activity and frees an undelivered created event's lock", async () => {
 		const aliceDevice = enroll(store, "alice@example.com", {
 			linearId: "lin-alice",
