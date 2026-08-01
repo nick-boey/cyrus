@@ -290,6 +290,18 @@ describe("renderPage", () => {
 		expect(csp).not.toMatch(/https?:\/\//);
 	});
 
+	// The meta policy and the response header are enforced independently, so
+	// BOTH must permit the htmx XHR — allowing it in only one still blocks the
+	// save. See the matching assertion in setup-routes.test.ts.
+	it("allows same-origin XHR in the meta CSP so htmx can save", () => {
+		const html = renderPage(model);
+		const csp =
+			html.match(
+				/<meta http-equiv="Content-Security-Policy" content="([^"]*)">/,
+			)?.[1] ?? "";
+		expect(csp).toContain("connect-src 'self'");
+	});
+
 	// F12: htmx 2.x does not swap 4xx/5xx responses by default, so every
 	// planned 400/403/409 fragment (including a fresh CSRF token) would be
 	// silently discarded without this handler.

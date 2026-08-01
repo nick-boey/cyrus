@@ -220,6 +220,10 @@ export function renderPage(model: SetupPageModel): string {
 		"style-src 'self' 'unsafe-inline'",
 		`script-src 'self' 'nonce-${nonce}'`,
 		"img-src 'self'",
+		// Same-origin XHR for htmx's POST to /setup/save. This meta policy and
+		// the response header in routes.ts are enforced independently, so both
+		// must allow it — permitting it in only one still blocks the save.
+		"connect-src 'self'",
 		"form-action 'self'",
 		"frame-ancestors 'none'",
 		"base-uri 'none'",

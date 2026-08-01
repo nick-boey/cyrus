@@ -80,6 +80,11 @@ const CSP = [
 	"style-src 'self' 'unsafe-inline'",
 	"script-src 'self' 'unsafe-inline'",
 	"img-src 'self' data:",
+	// htmx posts /setup/save over XMLHttpRequest. XHR is governed by
+	// `connect-src`, NOT `form-action` — that one only covers real form
+	// submissions — so without this the request falls back to `default-src
+	// 'none'` and every save is blocked while the page still renders fine.
+	"connect-src 'self'",
 	"form-action 'self'",
 	"frame-ancestors 'none'",
 	"base-uri 'none'",

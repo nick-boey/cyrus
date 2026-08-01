@@ -392,6 +392,19 @@ describe("GET /setup — read-only (F18)", () => {
 		expect(res.headers["x-frame-options"]).toBe("DENY");
 	});
 
+	// htmx issues its POST to /setup/save over XMLHttpRequest, which CSP governs
+	// with `connect-src` — NOT `form-action`, which only covers real form
+	// submissions. With `connect-src` absent it falls back to `default-src
+	// 'none'` and the browser blocks every save, so the page renders and reads
+	// correctly while silently refusing to write anything.
+	it("allows same-origin XHR so htmx can POST /setup/save", async () => {
+		const h = await provisioned(await harness());
+		const res = await get(h, "/setup", ALICE);
+		expect(res.headers["content-security-policy"]).toContain(
+			"connect-src 'self'",
+		);
+	});
+
 	it("embeds a version token bound to the principal", async () => {
 		const h = await provisioned(
 			await harness({ secrets: new FakeRecordStore() }),
