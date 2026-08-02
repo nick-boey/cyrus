@@ -11,6 +11,32 @@
 import type { LinearClient } from "@linear/sdk";
 
 /**
+ * Linear refused the refresh token itself (HTTP 400/401 from the token
+ * endpoint) rather than failing transiently.
+ *
+ * This is terminal by construction: Linear rotates the refresh token on every
+ * use, and we persist the new one only on success — so a retry is already the
+ * replay of the same token, which Linear honours for 30 minutes. A 400 outside
+ * that window means the token is consumed or revoked and no amount of retrying
+ * recovers it. Only a re-authorization does.
+ */
+export class LinearRefreshTokenRejectedError extends Error {
+	readonly workspaceId: string;
+	readonly status: number;
+	readonly body: string;
+
+	constructor(workspaceId: string, status: number, body: string) {
+		super(
+			`Linear rejected the refresh token for workspace ${workspaceId} (HTTP ${status})`,
+		);
+		this.name = "LinearRefreshTokenRejectedError";
+		this.workspaceId = workspaceId;
+		this.status = status;
+		this.body = body;
+	}
+}
+
+/**
  * OAuth configuration for automatic token refresh.
  */
 export interface LinearOAuthConfig {
@@ -42,6 +68,7 @@ import type {
 	IAgentEventTransport,
 	IIssueTrackerService,
 	Issue,
+	IssueRelationSummary,
 	IssueUpdateInput,
 	IssueWithChildren,
 	Label,
@@ -93,6 +120,58 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 	private static workspaceRefreshTokens: Map<string, string> = new Map();
 
 	/**
+	 * Workspaces whose refresh token Linear has rejected outright. Once present,
+	 * refresh attempts short-circuit without an HTTP call — otherwise every
+	 * 401'd API call re-triggers a doomed refresh, which is how a dead token
+	 * produced twelve identical stack traces per burst in production.
+	 */
+	private static rejectedWorkspaces: Map<
+		string,
+		{ at: number; status: number; body: string }
+	> = new Map();
+
+	static getRejectedWorkspace(
+		workspaceId: string,
+	): { at: number; status: number; body: string } | undefined {
+		return LinearIssueTrackerService.rejectedWorkspaces.get(workspaceId);
+	}
+
+	/**
+	 * Records the refresh token in effect for a workspace, clearing any standing
+	 * rejection when the token actually changed.
+	 *
+	 * A *different* token than the one on record means an operator re-authorized,
+	 * so a standing rejection refers to a credential we no longer hold — keeping
+	 * it would suppress every refresh attempt on the new one until the process
+	 * restarts. Re-registering the same token is a no-op, so a rejection survives
+	 * anything that is not a real re-authorization.
+	 */
+	static registerRefreshToken(workspaceId: string, refreshToken: string): void {
+		const prior =
+			LinearIssueTrackerService.workspaceRefreshTokens.get(workspaceId);
+		if (prior !== refreshToken) {
+			LinearIssueTrackerService.rejectedWorkspaces.delete(workspaceId);
+		}
+		LinearIssueTrackerService.workspaceRefreshTokens.set(
+			workspaceId,
+			refreshToken,
+		);
+	}
+
+	/** Clears shared per-workspace auth state. Omit the id to clear everything. */
+	static resetWorkspaceAuthState(workspaceId?: string): void {
+		if (workspaceId === undefined) {
+			LinearIssueTrackerService.rejectedWorkspaces.clear();
+			LinearIssueTrackerService.workspaceRefreshTokens.clear();
+			LinearIssueTrackerService.pendingRefreshes.clear();
+			return;
+		}
+		LinearIssueTrackerService.rejectedWorkspaces.delete(workspaceId);
+		LinearIssueTrackerService.workspaceRefreshTokens.delete(workspaceId);
+		LinearIssueTrackerService.pendingRefreshes.delete(workspaceId);
+	}
+
+	/**
 	 * Create a new LinearIssueTrackerService.
 	 *
 	 * @param linearClient - Configured LinearClient instance
@@ -109,9 +188,10 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 		this.logger =
 			logger ?? createLogger({ component: "LinearIssueTrackerService" });
 
-		// Register initial refresh token in shared static map
+		// Register initial refresh token in shared static map, clearing any
+		// standing rejection if this is a newly authorized credential.
 		if (oauthConfig?.refreshToken) {
-			LinearIssueTrackerService.workspaceRefreshTokens.set(
+			LinearIssueTrackerService.registerRefreshToken(
 				oauthConfig.workspaceId,
 				oauthConfig.refreshToken,
 			);
@@ -149,7 +229,13 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 							(refreshError) => {
 								// On failure, clear the promise so next 401 can retry fresh
 								this.refreshPromise = null;
-								this.logger.error("Token refresh failed:", refreshError);
+								// The terminal case already logged once, with a remedy.
+								// Re-logging it per 401'd request is the noise this change removes.
+								if (
+									!(refreshError instanceof LinearRefreshTokenRejectedError)
+								) {
+									this.logger.error("Token refresh failed:", refreshError);
+								}
 								throw refreshError;
 							},
 						);
@@ -218,6 +304,16 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 		const { clientId, clientSecret, workspaceId, onTokenRefresh } =
 			this.oauthConfig!;
 
+		const standingRejection =
+			LinearIssueTrackerService.rejectedWorkspaces.get(workspaceId);
+		if (standingRejection) {
+			throw new LinearRefreshTokenRejectedError(
+				workspaceId,
+				standingRejection.status,
+				standingRejection.body,
+			);
+		}
+
 		// Read current refresh token from shared static map (may have been updated by another instance)
 		const refreshToken =
 			LinearIssueTrackerService.workspaceRefreshTokens.get(workspaceId);
@@ -244,6 +340,29 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 		});
 
 		if (!response.ok) {
+			const body = await response.text();
+			if (response.status === 400 || response.status === 401) {
+				LinearIssueTrackerService.rejectedWorkspaces.set(workspaceId, {
+					at: Date.now(),
+					status: response.status,
+					body,
+				});
+				this.logger.error(
+					`Linear refused the refresh token for workspace ${workspaceId} (HTTP ${response.status}: ${body}). ` +
+						"This is terminal — Linear rotates refresh tokens on use, so a consumed or revoked token cannot recover. " +
+						"Cyrus can neither read nor write Linear for this workspace until re-authorized, and all worker activity posting will fail silently. " +
+						"Remedy: re-authorize Linear and give Cyrus the new refresh token. " +
+						"Running `cyrus start` yourself: `cyrus refresh-token` (or `cyrus self-auth-linear`) rewrites config.json and is picked up without a restart. " +
+						"Running a router: re-run `cyrus self-auth-linear`, update the workspace's refresh token wherever the router reads it from (router-config.json, or the deployment's env/Key Vault seed), then restart the router. " +
+						"If this appeared immediately after a credential change, check LINEAR_CLIENT_ID / LINEAR_CLIENT_SECRET match the app that issued the token. " +
+						"Suppressing further refresh attempts for this workspace.",
+				);
+				throw new LinearRefreshTokenRejectedError(
+					workspaceId,
+					response.status,
+					body,
+				);
+			}
 			throw new Error(`Token refresh failed: ${response.status}`);
 		}
 
@@ -258,6 +377,9 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 			workspaceId,
 			data.refresh_token,
 		);
+
+		// A success supersedes any earlier rejection for this workspace.
+		LinearIssueTrackerService.rejectedWorkspaces.delete(workspaceId);
 
 		// Notify caller so they can persist tokens to disk
 		if (onTokenRefresh) {
@@ -288,12 +410,28 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 	/**
 	 * Update the access token using setHeader on the underlying GraphQL client.
 	 * This is more efficient than recreating the entire LinearClient.
+	 *
 	 * @param token - New access token
+	 * @param refreshToken - New refresh token, when the caller has one. Callers
+	 *   that hot-reload credentials onto a live tracker (the self-host config
+	 *   watcher after `cyrus refresh-token` / `self-auth-linear`) MUST pass it:
+	 *   a standing rejection is only cleared when a *different* refresh token is
+	 *   registered, and registration otherwise happens only in the constructor.
+	 *   Without it, a live re-authorization leaves refreshes suppressed for the
+	 *   workspace until the process restarts — the new credential never gets an
+	 *   attempt.
 	 */
-	setAccessToken(token: string): void {
+	setAccessToken(token: string, refreshToken?: string): void {
 		// Clear any cached refresh promise so subsequent 401s trigger a fresh refresh
 		// rather than reusing a stale resolved promise with an old token.
 		this.refreshPromise = null;
+		if (refreshToken && this.oauthConfig) {
+			this.oauthConfig.refreshToken = refreshToken;
+			LinearIssueTrackerService.registerRefreshToken(
+				this.oauthConfig.workspaceId,
+				refreshToken,
+			);
+		}
 		// Guard for test mocks that may not have the .client property
 		if (this.linearClient.client) {
 			this.linearClient.client.setHeader("Authorization", `Bearer ${token}`);
@@ -432,6 +570,45 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 		} catch (error) {
 			const err = new Error(
 				`Failed to fetch attachments for issue ${issueId}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			if (error instanceof Error) {
+				err.cause = error;
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Fetch inverse relations with `issue`/`relatedIssue` resolved.
+	 *
+	 * The SDK exposes those as lazily-resolved promises. Awaiting them here — on
+	 * the side that holds the Linear token — is what lets this result cross a
+	 * JSON transport intact (a `Promise` would serialize to `{}`).
+	 */
+	async fetchIssueInverseRelations(
+		issueId: string,
+	): Promise<IssueRelationSummary[]> {
+		try {
+			const issue = await this.linearClient.issue(issueId);
+			if (!issue) {
+				throw new Error(`Issue ${issueId} not found`);
+			}
+
+			const relations = await issue.inverseRelations();
+			return await Promise.all(
+				relations.nodes.map(async (relation) => ({
+					id: relation.id,
+					type: relation.type,
+					createdAt: relation.createdAt,
+					updatedAt: relation.updatedAt,
+					archivedAt: relation.archivedAt,
+					issue: (await relation.issue) as Issue | undefined,
+					relatedIssue: (await relation.relatedIssue) as Issue | undefined,
+				})),
+			);
+		} catch (error) {
+			const err = new Error(
+				`Failed to fetch inverse relations for issue ${issueId}: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			if (error instanceof Error) {
 				err.cause = error;

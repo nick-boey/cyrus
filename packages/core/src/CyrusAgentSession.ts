@@ -65,6 +65,32 @@ export interface RepositoryContext {
 	branchName?: string;
 	/** The base branch for PRs (e.g., "main" or a Graphite parent branch) */
 	baseBranchName?: string;
+	/**
+	 * How `baseBranchName` was resolved when the workspace was created (see
+	 * {@link BaseBranchResolution.source}). Only `"commit-ish"` means the
+	 * session's issue explicitly requested this base branch (e.g. a
+	 * `[repo=name#branch]` description selector) — the other sources
+	 * (`"graphite-blocked-by"`, `"parent-issue"`, `"default"`) are ordinary
+	 * auto-resolutions that should be free to re-derive if the workspace is
+	 * ever recreated (e.g. a parent issue's branch may have changed since).
+	 * Used by `EdgeWorker.ensureSessionWorkspaceExists` to decide which
+	 * repos' base branches must be pinned via `baseBranchOverrides` on
+	 * worktree recreation, vs. left to `determineBaseBranch` to recompute
+	 * (which also preserves worktree-continuity resume-from-issue-branch
+	 * behavior for non-overridden repos).
+	 */
+	baseBranchSource?: BaseBranchResolution["source"];
+}
+
+/**
+ * The tracker-side user who created the session (from
+ * `webhook.agentSession.creator`). Used to resolve per-user credentials —
+ * credentials follow the session creator, not later prompters.
+ */
+export interface SessionCreator {
+	id?: string;
+	email?: string;
+	name?: string;
 }
 
 export interface CyrusAgentSession {
@@ -74,6 +100,20 @@ export interface CyrusAgentSession {
 	externalSessionId?: string;
 	type: AgentSessionType.CommentThread;
 	status: AgentSessionStatus;
+	/**
+	 * The terminal state this session has already signalled to its terminal-state
+	 * observers (the router's issue-lock/affinity release, the persistence floor).
+	 * Set — and persisted — at the moment the signal is emitted, and cleared when a
+	 * new runner re-attaches and the session advances to another turn.
+	 *
+	 * This is the durable half of the one-shot terminal signal, and exists so a
+	 * cold restore can tell "this session finished and already reported it" from
+	 * "this session was mid-run when its host died". Without it, a session that
+	 * completed cleanly *after* the last state flush restores looking active and
+	 * runner-less — indistinguishable from an interrupted one — and gets a bogus
+	 * `error` activity plus a stale terminal frame replayed over the top of it.
+	 */
+	terminalState?: "complete" | "error" | "stopped";
 	context: AgentSessionType.CommentThread;
 	createdAt: number; // e.g. Date.now()
 	updatedAt: number; // e.g. Date.now()
@@ -89,6 +129,8 @@ export interface CyrusAgentSession {
 	/** Repository contexts for this session (always array, never undefined) */
 	repositories: RepositoryContext[];
 	workspace: Workspace;
+	/** Linear user who created the session (set for Linear sessions only). */
+	creator?: SessionCreator;
 	// NOTE: Only one of these will be populated
 	claudeSessionId?: string; // Claude-specific session ID (assigned once it initializes)
 	geminiSessionId?: string; // Gemini-specific session ID (assigned once it initializes)

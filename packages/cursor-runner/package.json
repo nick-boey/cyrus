@@ -21,13 +21,13 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@cursor/sdk": "^1.0.19",
+		"@cursor/sdk": "^1.0.24",
 		"cyrus-core": "workspace:*",
 		"cyrus-simple-agent-runner": "workspace:*"
 	},
 	"devDependencies": {
-		"@types/node": "^20.0.0",
-		"typescript": "^5.3.3",
+		"@types/node": "^20.19.43",
+		"typescript": "^5.9.3",
 		"vitest": "^4.1.10"
 	},
 	"publishConfig": {

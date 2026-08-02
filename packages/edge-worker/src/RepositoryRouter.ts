@@ -56,6 +56,20 @@ export interface RepositoryRouterDeps {
 
 	/** Get issue tracker service for a workspace */
 	getIssueTracker: (workspaceId: string) => IIssueTrackerService | undefined;
+
+	/**
+	 * Called once a repository-selection elicitation has been posted and the
+	 * session is genuinely waiting on the user.
+	 *
+	 * In router mode this releases the session's device so the container can be
+	 * idle-suspended while it waits. There is no runner at this point — the
+	 * session has not been initialised yet — so unlike the AskUserQuestion path
+	 * there is no pending work to check first.
+	 */
+	onSessionParked?: (agentSessionId: string) => void;
+
+	/** Called when a parked selection is answered, so the park can be undone. */
+	onSessionUnparked?: (agentSessionId: string) => void;
 }
 
 /**
@@ -576,7 +590,7 @@ export class RepositoryRouter {
 
 				const fullIssue = await issueTracker.fetchIssue(issueId);
 				const project = await fullIssue?.project;
-				if (!project || !project.name) {
+				if (!project?.name) {
 					this.logger.debug(
 						`No project name found for issue ${issueId} in repository ${repo.name}`,
 					);
@@ -664,6 +678,11 @@ export class RepositoryRouter {
 			this.logger.info(
 				`Posted repository selection elicitation with ${options.length} options`,
 			);
+
+			// Only after a successful post: parking on a failed post would release
+			// the device with nothing for the user to answer, so nothing would ever
+			// wake the session.
+			this.deps.onSessionParked?.(agentSessionId);
 		} catch (error) {
 			this.logger.error(
 				`Failed to post repository selection elicitation:`,
@@ -728,6 +747,9 @@ export class RepositoryRouter {
 
 		// Remove from pending map
 		this.pendingSelections.delete(agentSessionId);
+		// The session is no longer waiting on the user, so drop any still-unacked
+		// `parked` frame before the turn it is about to start posts anything.
+		this.deps.onSessionUnparked?.(agentSessionId);
 
 		// Find selected repository by GitHub/GitLab URL or name
 		const selectedRepo = pendingData.workspaceRepos.find(

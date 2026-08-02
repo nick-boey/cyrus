@@ -92,6 +92,13 @@ export class AskUserQuestionHandler {
 	 * @param linearAgentSessionId - Linear agent session ID (for tracking and API calls)
 	 * @param organizationId - Linear organization/workspace ID
 	 * @param signal - AbortSignal for cancellation
+	 * @param onPosted - Invoked once the elicitation is in front of the user, and
+	 *   only then. The caller parks the session from here (see
+	 *   `EdgeWorker.createAskUserQuestionCallback`): parking is what releases the
+	 *   router's session affinity, and the post above is a session-scoped RPC, so
+	 *   parking any earlier makes the post itself fail with "session not owned by
+	 *   this device" — PAR-146. Mirrors the ordering `RepositoryRouter` already
+	 *   uses for its own elicitation.
 	 * @returns Promise resolving to the user's answer or denial
 	 */
 	async handleAskUserQuestion(
@@ -99,9 +106,10 @@ export class AskUserQuestionHandler {
 		linearAgentSessionId: string,
 		organizationId: string,
 		signal: AbortSignal,
+		onPosted?: () => void,
 	): Promise<AskUserQuestionResult> {
 		// Validate: only 1 question at a time
-		if (!input.questions || input.questions.length !== 1) {
+		if (input.questions?.length !== 1) {
 			this.logger.error(
 				`Invalid input: expected exactly 1 question, got ${input.questions?.length ?? 0}`,
 			);
@@ -187,6 +195,11 @@ export class AskUserQuestionHandler {
 				message: `Failed to present question to user: ${errorMessage}`,
 			};
 		}
+
+		// Outside the try: a throw from `onPosted` is not a failed post, and
+		// reporting it as one would tell the model its question never landed when
+		// it did. Only now is parking safe — see the `onPosted` param docs.
+		onPosted?.();
 
 		// Create promise to wait for user response
 		// Cleanup is handled via AbortSignal when the session ends

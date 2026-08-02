@@ -15,6 +15,28 @@ permissions:
   id-token: write
 
 jobs:
+  aca-parity:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    # There is no `azure/setup-bicep` action — referencing it failed the job at
+    # "Prepare all required actions" with "repository not found", before a single
+    # step ran. The runner ships the Azure CLI, which installs bicep to
+    # ~/.azure/bin; check-aca-arm-parity.sh invokes a bare `bicep`, so put that
+    # directory on PATH rather than calling `az bicep` from the script.
+    - name: Install Bicep
+      run: |
+        az bicep install
+        echo "$HOME/.azure/bin" >> "$GITHUB_PATH"
+    - name: Check ACA ARM parity
+      run: ./scripts/check-aca-arm-parity.sh
+    # `pnpm test` is workspace-only (pnpm-workspace.yaml is packages/* + apps/*),
+    # so nothing else in CI runs scripts/*.test.sh. Without this the rewrite
+    # suite — the only guard on a mode-600 tfvars holding the Linear client
+    # secret and both OAuth tokens — would rot unnoticed.
+    - name: Test router image deploy script
+      run: bash scripts/deploy-router-image.test.sh
+
   test:
     runs-on: ubuntu-latest
     

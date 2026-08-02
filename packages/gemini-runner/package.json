@@ -21,19 +21,19 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@linear/sdk": "^60.0.0",
+		"@linear/sdk": "^60.0.1",
 		"cyrus-claude-runner": "workspace:*",
 		"cyrus-core": "workspace:*",
 		"cyrus-simple-agent-runner": "workspace:*",
 		"dotenv": "^16.6.1",
-		"fs-extra": "^11.3.0",
-		"zod": "^4.3.6"
+		"fs-extra": "^11.4.0",
+		"zod": "4.3.6"
 	},
 	"devDependencies": {
 		"@google/gemini-cli-core": "0.52.0",
 		"@types/fs-extra": "^11.0.4",
-		"@types/node": "^20.0.0",
-		"typescript": "^5.3.3",
+		"@types/node": "^20.19.43",
+		"typescript": "^5.9.3",
 		"vitest": "^4.1.10"
 	},
 	"publishConfig": {

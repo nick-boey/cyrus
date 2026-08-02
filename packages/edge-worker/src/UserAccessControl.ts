@@ -23,7 +23,7 @@ export const DEFAULT_BLOCK_MESSAGE =
  * @param identifier - The identifier to match against
  * @returns true if the user matches the identifier
  */
-function userMatchesIdentifier(
+export function userMatchesIdentifier(
 	userId: string | undefined,
 	userEmail: string | undefined,
 	identifier: UserIdentifier,

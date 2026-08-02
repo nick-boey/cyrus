@@ -61,4 +61,77 @@ describe("LinearEventTransport", () => {
 			expect(deprecatedReply.code).toHaveBeenCalledWith(401);
 		});
 	});
+
+	/**
+	 * Regression guard for the 2026-07-27 diagnosis. Both direct-mode rejection
+	 * paths returned a bare 401 with no log line, so a webhook Linear really did
+	 * send left zero trace anywhere — the console showed only the events that
+	 * were accepted. That made a delivery problem indistinguishable from Linear
+	 * never having sent the event at all.
+	 */
+	describe("direct mode rejection logging", () => {
+		const makeLogger = () => ({
+			info: vi.fn(),
+			warn: vi.fn(),
+			error: vi.fn(),
+			debug: vi.fn(),
+		});
+
+		const directHandler = (logger: ReturnType<typeof makeLogger>) => {
+			const post = vi.fn();
+			const fastifyServer = { post } as unknown as FastifyInstance;
+			const transport = new LinearEventTransport(
+				{
+					fastifyServer,
+					verificationMode: "direct",
+					secret: "test-secret",
+				},
+				logger as never,
+			);
+			transport.register();
+			const calls = post.mock.calls as Array<
+				[string, (request: unknown, reply: unknown) => Promise<void>]
+			>;
+			return calls.find(([path]) => path === "/linear-webhook")![1];
+		};
+
+		const makeReply = () => ({
+			code: vi.fn().mockReturnThis(),
+			send: vi.fn().mockReturnThis(),
+		});
+
+		it("logs a warning when the linear-signature header is missing", async () => {
+			const logger = makeLogger();
+			const handler = directHandler(logger);
+			const reply = makeReply();
+
+			await handler({ headers: {}, body: {}, ip: "1.2.3.4" }, reply);
+
+			expect(reply.code).toHaveBeenCalledWith(401);
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("linear-signature"),
+			);
+		});
+
+		it("logs a warning when the signature does not verify", async () => {
+			const logger = makeLogger();
+			const handler = directHandler(logger);
+			const reply = makeReply();
+
+			await handler(
+				{
+					headers: { "linear-signature": "deadbeef" },
+					body: { type: "AgentSessionEvent", action: "created" },
+					rawBody: '{"type":"AgentSessionEvent","action":"created"}',
+					ip: "1.2.3.4",
+				},
+				reply,
+			);
+
+			expect(reply.code).toHaveBeenCalledWith(401);
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("signature"),
+			);
+		});
+	});
 });

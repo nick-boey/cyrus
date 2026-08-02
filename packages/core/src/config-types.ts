@@ -123,8 +123,33 @@ export interface EdgeWorkerRuntimeConfig {
 	 * Issue tracker platform type (default: "linear")
 	 * - "linear": Uses Linear as the issue tracker (default production mode)
 	 * - "cli": Uses an in-memory issue tracker for CLI-based testing and development
+	 * - "router": Routes issue-tracker operations through the Cyrus Router over
+	 *   a WebSocket (device holds no Linear tokens — the router does)
 	 */
-	platform?: "linear" | "cli";
+	platform?: "linear" | "cli" | "router";
+
+	/**
+	 * Router connection config. Required when `platform === "router"`.
+	 * `url` is the base router WebSocket URL (the `/device` path is appended by
+	 * the client); `deviceToken` authenticates this device to the router.
+	 */
+	router?: {
+		url: string;
+		deviceToken: string;
+		/**
+		 * Enables the persistence-floor `WorkspaceSyncService`. Defaults to OFF
+		 * — set `true` to opt this device in (every ephemeral container gets
+		 * this automatically via `ContainerBootCommand.writeConfig`; a physical
+		 * device opts in explicitly, e.g. to enable device -> container
+		 * migration). Defaulting off preserves existing router+physical-device
+		 * behavior: without this, every session end and a 5-minute timer would
+		 * start pushing `wip: auto-saved by cyrus…` commits onto a teammate's
+		 * issue branches (including open PRs) with no opt-in on their part. See
+		 * `EdgeConfigSchema.router` in config-schemas.ts for the
+		 * persisted-config counterpart.
+		 */
+		floorSync?: boolean;
+	};
 
 	// --- Agent Configuration (for CLI mode) ---
 

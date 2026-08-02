@@ -1,0 +1,67 @@
+.git
+node_modules
+**/node_modules
+**/dist
+**/coverage
+**/worktrees
+**/.env
+docs
+spec
+code
+.claude
+.codex
+.opencode
+.superpowers
+.husky
+.github
+# Test sources are never compiled into the image: every package/app tsconfig
+# builds `src/**` only and excludes `**/*.test.ts`, so nothing under these paths
+# can reach `/out`. Excluding them keeps a test-only edit from invalidating the
+# `COPY . .` layer and forcing a full ~8-minute rebuild — which is exactly what
+# blows the 300s `beforeAll` hook timeout in
+# packages/router/test/containers-real-docker.e2e.test.ts (that suite builds this
+# image itself). Recorded as a gotcha by the 2026-07-17 router-mode drive.
+packages/*/test
+apps/*/test
+**/*.test.ts
+
+# ---- Terraform state and variables: LOAD-BEARING FOR SECRECY ----------------
+# Do not prune these as "unused" or "just build speed". scripts/deploy-router-image.sh
+# runs `az acr build … .`, which tars the whole working directory and UPLOADS it
+# to the registry, honouring this file (azure-cli
+# command_modules/acr/_archive_utils.py: _pack_source_code -> _load_dockerignore_file).
+# Without these entries every deploy would ship, off this machine:
+#   infra/azure/terraform/env/dev.tfvars    mode 600 — Linear client secret + both live OAuth tokens
+#   infra/azure/terraform/terraform.tfstate mode 600 — Terraform writes `sensitive` values to state in PLAINTEXT
+#   infra/azure/terraform/terraform.tfstate.backup
+#   infra/azure/terraform/.terraform/       638 MB provider cache (also busts the `COPY . .` layer every run)
+# None of it is needed by docker/router/Dockerfile, which builds only the pnpm
+# workspace — pnpm-workspace.yaml is `packages/*` + `apps/*`, so infra/ is not a member.
+#
+# Both the bare and the `**/` form of each rule are required, and `.terraform`
+# must NOT carry a trailing slash. ACR compiles `**/x` to `^.*/x$` (needs at
+# least one separator, so it misses a root-level file), `*.x` to `^[^/]*\.x$`
+# (misses a nested one), and a trailing `/` to a pattern ending in `/$`, which
+# no archive entry can ever match. Verified against the installed
+# _archive_utils.IgnoreRule, not assumed.
+.terraform
+**/.terraform
+*.tfvars
+**/*.tfvars
+*.tfstate
+**/*.tfstate
+*.tfstate.*
+**/*.tfstate.*
+# Saved plan files. A plan embeds sensitive values in PLAINTEXT regardless of
+# `sensitive = true`, so it leaks the same credentials state does. `-out=` takes
+# any name, so bare `tfplan` is not enough.
+tfplan*
+**/tfplan*
+*.tfplan
+**/*.tfplan
+plan.out
+**/plan.out
+# Residue of a SIGKILL'd rewrite in scripts/deploy-router-image.sh — a mode-600
+# copy of dev.tfvars, so it must never be uploaded either.
+*.tfvars.tmp.*
+**/*.tfvars.tmp.*

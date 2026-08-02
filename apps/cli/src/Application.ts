@@ -308,6 +308,15 @@ export class Application {
 			repositories.forEach((repo) => {
 				this.logger.info(`   • ${repo.name} (${repo.repositoryPath})`);
 			});
+
+			// MCP connection health — see the equivalent block in StartCommand.
+			const mcpHealth = this.worker.getMcpHealthDiagnostics();
+			if (mcpHealth.length > 0) {
+				this.logger.info("");
+				for (const line of mcpHealth) {
+					this.logger.info(line);
+				}
+			}
 			this.logger.divider(70);
 		} catch (error) {
 			this.logger.error(`❌ Failed to transition to normal mode: ${error}`);
@@ -316,18 +325,31 @@ export class Application {
 	}
 
 	/**
+	 * Close the .env/config file watchers.
+	 *
+	 * These `fs.watch` handles keep the event loop alive for as long as they
+	 * are open. Long-running commands (`start`, `router start`) want that;
+	 * one-shot commands (`router users …`, `connect`) would otherwise hang
+	 * after doing their work, so they call this to let the process exit
+	 * naturally with code 0.
+	 */
+	disposeWatchers(): void {
+		if (this.envWatcher) {
+			this.envWatcher.close();
+			this.envWatcher = undefined;
+		}
+
+		if (this.configWatcher) {
+			this.configWatcher.close();
+			this.configWatcher = undefined;
+		}
+	}
+
+	/**
 	 * Handle graceful shutdown
 	 */
 	async shutdown(): Promise<void> {
-		// Close .env file watcher
-		if (this.envWatcher) {
-			this.envWatcher.close();
-		}
-
-		// Close config file watcher
-		if (this.configWatcher) {
-			this.configWatcher.close();
-		}
+		this.disposeWatchers();
 
 		await this.worker.stop();
 

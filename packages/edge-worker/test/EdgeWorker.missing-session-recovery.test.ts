@@ -104,6 +104,11 @@ describe("EdgeWorker - Missing Session/Repository Recovery (CYPACK-852)", () => 
 			createResponseActivity: vi.fn().mockResolvedValue(undefined),
 			postAnalyzingThought: vi.fn().mockResolvedValue(undefined),
 			requestSessionStop: vi.fn(),
+			// The full-kill stop path calls this to emit "sessionTerminal", which is
+			// what releases the router's issue lock. Without it on the mock the call
+			// throws — and handleWebhook's catch-all swallows the error, so the test
+			// would go green while the release never happened.
+			abortSession: vi.fn(),
 			setActivitySink: vi.fn(),
 			on: vi.fn(),
 		};
@@ -426,6 +431,68 @@ describe("EdgeWorker - Missing Session/Repository Recovery (CYPACK-852)", () => 
 
 			expect(anyFeedbackPosted).toBe(true);
 		});
+
+		it("aborts the session on a full kill so the router releases the issue lock", async () => {
+			// A non-warm runner (no interrupt) forces the full-kill branch. That kill
+			// tears the SDK query down before it can yield a result, so
+			// completeSession() — the only other place "sessionTerminal" is emitted —
+			// never runs. Without an explicit abortSession() the router keeps the
+			// issue locked until an admin runs `cyrus router unlock`.
+			const stop = vi.fn();
+			mockAgentSessionManager.getSession.mockReturnValue({
+				agentRunner: { stop }, // no interrupt/isWarm ⇒ supportsInterrupt === false
+			});
+
+			const webhook = createStopSignalWebhook();
+			await (edgeWorker as any).handleWebhook(webhook, [mockRepository]);
+
+			expect(stop).toHaveBeenCalled();
+			expect(mockAgentSessionManager.requestSessionStop).toHaveBeenCalledWith(
+				"agent-session-legacy-456",
+			);
+			expect(mockAgentSessionManager.abortSession).toHaveBeenCalledWith(
+				"agent-session-legacy-456",
+				{ force: true },
+			);
+		});
+
+		// Routing a stop's `prompted` webhook re-establishes this device's session
+		// affinity on the router. Whatever the worker then decides to do, it owes
+		// the router a terminal frame — otherwise the row it just wrote is never
+		// cleared, and ContainerLifecycle skips any device with affinity > 0, so
+		// the container is neither idle-stopped nor stale-destroyed. PAR-146
+		// device 10 sat pinned for 40+ minutes at 4 vCPU / 8 GiB on this path.
+
+		it("hands ownership back when the stop lands on a session it no longer has", async () => {
+			mockAgentSessionManager.getSession.mockReturnValue(null);
+
+			const webhook = createStopSignalWebhook();
+			await (edgeWorker as any).handleWebhook(webhook, [mockRepository]);
+
+			// Acknowledging the user is not enough on its own — the router is still
+			// holding affinity it will never drop.
+			expect(mockAgentSessionManager.createResponseActivity).toHaveBeenCalled();
+			expect(mockAgentSessionManager.abortSession).toHaveBeenCalledWith(
+				"agent-session-legacy-456",
+				{ force: true },
+			);
+		});
+
+		it("forces the terminal frame so a stop on an already-finished session still releases affinity", async () => {
+			// The session exists but has already gone terminal, so its one-shot is
+			// spent. Without `force` the abort is a silent no-op and the affinity
+			// row the router just wrote strands the device.
+			const stop = vi.fn();
+			mockAgentSessionManager.getSession.mockReturnValue({
+				agentRunner: { stop },
+			});
+
+			const webhook = createStopSignalWebhook();
+			await (edgeWorker as any).handleWebhook(webhook, [mockRepository]);
+
+			const call = mockAgentSessionManager.abortSession.mock.calls.at(-1);
+			expect(call?.[1]).toEqual({ force: true });
+		});
 	});
 
 	// =========================================================================
@@ -560,6 +627,9 @@ describe("EdgeWorker - Missing Session/Repository Recovery (CYPACK-852)", () => 
 				[mockRepository],
 				mockAgentSessionManager,
 				"test-workspace",
+				undefined, // baseBranchOverrides
+				undefined, // routingMethod
+				expect.objectContaining({ name: "Test User" }), // session creator
 			);
 		});
 	});

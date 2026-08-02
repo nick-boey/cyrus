@@ -2130,4 +2130,67 @@ describe("RepositoryRouter", () => {
 			});
 		});
 	});
+	// ── parking while awaiting repository selection ────────────────────────
+	// Same class of bug as the AskUserQuestion elicitation, different
+	// mechanism: this one stores a pending selection and returns, leaving the
+	// session with no runner and no terminal frame — so the router pinned the
+	// device until the user picked. There is no runner here, hence no pending
+	// work to check: parking is unconditionally safe.
+
+	describe("session parking", () => {
+		it("parks the session after the elicitation is posted", async () => {
+			const onSessionParked = vi.fn();
+			env.mockDeps.onSessionParked = onSessionParked;
+			const repo1 = env.repository("repo-1", "Frontend").build();
+			const repo2 = env.repository("repo-2", "Backend").build();
+			const webhook = env.webhook().withSession("session-1").build();
+
+			await env.router.elicitUserRepositorySelection(webhook, [repo1, repo2]);
+
+			expect(onSessionParked).toHaveBeenCalledWith("session-1");
+		});
+
+		it("does NOT park when the elicitation post fails", async () => {
+			// Parking on a failed post would release the device with nothing
+			// posted for the user to answer — nothing would ever wake it.
+			const onSessionParked = vi.fn();
+			env.mockDeps.onSessionParked = onSessionParked;
+			env.mockLinearClient.createAgentActivity.mockRejectedValueOnce(
+				new Error("linear down"),
+			);
+			const repo = env.repository("repo-1", "Frontend").build();
+			const webhook = env.webhook().withSession("session-1").build();
+
+			await env.router.elicitUserRepositorySelection(webhook, [repo]);
+
+			expect(onSessionParked).not.toHaveBeenCalled();
+		});
+
+		it("unparks when the selection is resolved", async () => {
+			const onSessionUnparked = vi.fn();
+			env.mockDeps.onSessionUnparked = onSessionUnparked;
+			const repo1 = env
+				.repository("repo-1", "Frontend")
+				.withGithubUrl("https://github.com/org/frontend")
+				.build();
+			const webhook = env.webhook().withSession("session-1").build();
+			await env.router.elicitUserRepositorySelection(webhook, [repo1]);
+
+			await env.router.selectRepositoryFromResponse(
+				"session-1",
+				"https://github.com/org/frontend",
+			);
+
+			expect(onSessionUnparked).toHaveBeenCalledWith("session-1");
+		});
+
+		it("does not unpark a session with no pending selection", async () => {
+			const onSessionUnparked = vi.fn();
+			env.mockDeps.onSessionUnparked = onSessionUnparked;
+
+			await env.router.selectRepositoryFromResponse("session-unknown", "x");
+
+			expect(onSessionUnparked).not.toHaveBeenCalled();
+		});
+	});
 });

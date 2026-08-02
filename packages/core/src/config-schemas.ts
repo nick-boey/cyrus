@@ -489,6 +489,54 @@ export const EdgeConfigSchema = z.object({
 	 * all agent network traffic through it for inspection and filtering.
 	 */
 	sandbox: SandboxConfigSchema.optional(),
+
+	/**
+	 * Issue tracker platform type (default: "linear").
+	 * - "linear": Uses Linear directly (default production mode)
+	 * - "cli": Uses an in-memory issue tracker for CLI-based testing
+	 * - "router": Routes every issue-tracker operation through the Cyrus Router
+	 *   over a WebSocket. The device holds no Linear tokens — the router does.
+	 *
+	 * Persisted here (not just on the runtime config) so `cyrus connect` can
+	 * write it and `cyrus start` reads it back on load.
+	 */
+	platform: z.enum(["linear", "cli", "router"]).optional(),
+
+	/**
+	 * Router connection config. Required when `platform === "router"`.
+	 * `url` is the base router WebSocket URL (the `/device` path is appended by
+	 * the client); `deviceToken` authenticates this device to the router.
+	 */
+	router: z
+		.object({
+			url: z.string(),
+			deviceToken: z.string(),
+			/**
+			 * Linear workspace ids the router serves, fetched from `GET /workspaces`
+			 * at enrollment. Advisory: used to fill `repositories[].linearWorkspaceId`
+			 * without hand-copying the id off the router host. Absent when enrolling
+			 * against a router predating that route.
+			 */
+			workspaceIds: z.array(z.string()).optional(),
+			/**
+			 * Enables the persistence-floor `WorkspaceSyncService` (WIP-push +
+			 * session bundle upload) on session end, on shutdown, and on a
+			 * timer. Defaults to OFF for router-platform devices — set `true`
+			 * to opt a device in. Every ephemeral container gets this
+			 * automatically (`ContainerBootCommand.writeConfig` always sets
+			 * `floorSync: true` for containers it boots); a physical device
+			 * (e.g. a teammate's laptop connected via `cyrus connect`) opts in
+			 * explicitly, typically to enable device -> container migration.
+			 * Defaulting off is deliberate: without it, this would otherwise
+			 * push `wip: auto-saved by cyrus…` commits onto a teammate's issue
+			 * branches (including open PRs) on every session end and every
+			 * 5-minute tick, with no opt-in on their part — existing
+			 * router+physical-device behavior must not change underneath
+			 * someone who never asked for the floor.
+			 */
+			floorSync: z.boolean().optional(),
+		})
+		.optional(),
 });
 
 /**

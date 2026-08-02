@@ -32,6 +32,11 @@ export interface CodexRunnerConfig extends AgentRunnerConfig {
 	 */
 	codexHome?: string;
 	/**
+	 * Additional environment variables for the Codex child process, merged
+	 * over the inherited env.
+	 */
+	additionalEnv?: Record<string, string>;
+	/**
 	 * Override Codex reasoning effort.
 	 * If omitted, CodexRunner applies a safe default for known model constraints.
 	 */

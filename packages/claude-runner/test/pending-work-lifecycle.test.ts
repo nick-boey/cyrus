@@ -70,6 +70,25 @@ function makeSystemInit(): SDKMessage {
 }
 
 /**
+ * The SDK's `background_tasks_changed` level signal: the FULL live set after
+ * every membership change, emitted mid-turn. Unlike the Stop hook's
+ * `background_tasks` it is observable while the turn is still open, which is
+ * what makes it usable as a "safe to suspend?" predicate while the agent is
+ * blocked on an elicitation.
+ */
+function makeBackgroundTasksChanged(
+	tasks: { task_id: string; task_type: string; description: string }[],
+): SDKMessage {
+	return {
+		type: "system",
+		subtype: "background_tasks_changed",
+		tasks,
+		session_id: "claude-session-1",
+		uuid: "uuid-bg-1",
+	} as unknown as SDKMessage;
+}
+
+/**
  * Build a mock SDK query whose turns are driven by the test. Each call to
  * `endTurn(cronList, resultText)` fires the recorded Stop hooks (with the
  * given session_crons) and then emits a result message — mirroring the real
@@ -88,10 +107,13 @@ function installMockQuery(mockQuery: ReturnType<typeof vi.mocked<any>>) {
 			work: { sessionCrons?: any[]; backgroundTasks?: any[] },
 			resultText: string,
 		) => Promise<void>;
+		/** Emit an arbitrary SDK message mid-turn (no Stop hook, no result). */
+		emit: (message: SDKMessage) => void;
 	} = {
 		queryOptions: null,
 		endTurn: async () => {},
 		endTurnWithWork: async () => {},
+		emit: () => {},
 	};
 
 	mockQuery.mockImplementation(({ options, prompt }: any) => {
@@ -132,6 +154,10 @@ function installMockQuery(mockQuery: ReturnType<typeof vi.mocked<any>>) {
 		};
 		state.endTurn = (crons, resultText) =>
 			state.endTurnWithWork({ sessionCrons: crons }, resultText);
+		state.emit = (message) => {
+			emitted.push(message);
+			notify?.();
+		};
 
 		return {
 			async *[Symbol.asyncIterator]() {
@@ -327,5 +353,133 @@ describe("ClaudeRunner pending-work lifecycle (CYPACK-1310)", () => {
 		// Cleanup: complete the stream so the mock iterator ends.
 		runner.completeStream();
 		await sessionPromise;
+	});
+
+	describe("live background tasks (background_tasks_changed)", () => {
+		const BUILD = {
+			task_id: "t1",
+			task_type: "bash",
+			description: "pnpm build",
+		};
+		const REVIEW = {
+			task_id: "t2",
+			task_type: "agent",
+			description: "review",
+		};
+
+		it("records the live set mid-turn, before any Stop hook fires", async () => {
+			const state = installMockQuery(mockQuery);
+			const runner = new ClaudeRunner(defaultConfig, true);
+
+			const sessionPromise = runner.startStreaming("run a background build");
+			await vi.waitFor(() => {
+				expect(state.queryOptions).not.toBeNull();
+			});
+
+			const seen = waitForMessageCount(runner, 2);
+			state.emit(makeBackgroundTasksChanged([BUILD]));
+			await seen;
+
+			// The Stop hook has NOT fired — this is exactly the blind spot the
+			// level signal closes.
+			expect(runner.getPendingWork().backgroundTasks).toEqual([]);
+			expect(runner.getPendingWork().liveBackgroundTasks).toEqual([
+				{ taskId: "t1", taskType: "bash", description: "pnpm build" },
+			]);
+			expect(runner.hasPendingWork()).toBe(true);
+
+			runner.completeStream();
+			await sessionPromise;
+		});
+
+		it("replaces rather than merges the live set", async () => {
+			const state = installMockQuery(mockQuery);
+			const runner = new ClaudeRunner(defaultConfig, true);
+
+			const sessionPromise = runner.startStreaming("run two background tasks");
+			await vi.waitFor(() => {
+				expect(state.queryOptions).not.toBeNull();
+			});
+
+			const bothSeen = waitForMessageCount(runner, 2);
+			state.emit(makeBackgroundTasksChanged([BUILD, REVIEW]));
+			await bothSeen;
+			expect(runner.getPendingWork().liveBackgroundTasks).toHaveLength(2);
+
+			const oneSeen = waitForMessageCount(runner, 1);
+			state.emit(makeBackgroundTasksChanged([REVIEW]));
+			await oneSeen;
+
+			// Merging would leave t1 behind and wedge hasPendingWork() on forever.
+			expect(runner.getPendingWork().liveBackgroundTasks).toEqual([
+				{ taskId: "t2", taskType: "agent", description: "review" },
+			]);
+
+			runner.completeStream();
+			await sessionPromise;
+		});
+
+		it("reports no pending work once the live set empties", async () => {
+			const state = installMockQuery(mockQuery);
+			const runner = new ClaudeRunner(defaultConfig, true);
+
+			const sessionPromise = runner.startStreaming("run a background build");
+			await vi.waitFor(() => {
+				expect(state.queryOptions).not.toBeNull();
+			});
+
+			const started = waitForMessageCount(runner, 2);
+			state.emit(makeBackgroundTasksChanged([BUILD]));
+			await started;
+			expect(runner.hasPendingWork()).toBe(true);
+
+			const settled = waitForMessageCount(runner, 1);
+			state.emit(makeBackgroundTasksChanged([]));
+			await settled;
+
+			expect(runner.getPendingWork().liveBackgroundTasks).toEqual([]);
+			expect(runner.hasPendingWork()).toBe(false);
+
+			runner.completeStream();
+			await sessionPromise;
+		});
+
+		it("holds the prompt open for a live task the Stop hook never reported", async () => {
+			// The behaviour change this widening buys: previously a turn ending
+			// with an unreported background task completed the prompt and killed
+			// the task with stdin.
+			const state = installMockQuery(mockQuery);
+			const runner = new ClaudeRunner(defaultConfig, false);
+
+			const sessionPromise = runner.startStreaming("run a background build");
+			await vi.waitFor(() => {
+				expect(state.queryOptions).not.toBeNull();
+			});
+
+			const started = waitForMessageCount(runner, 2);
+			state.emit(makeBackgroundTasksChanged([BUILD]));
+			await started;
+
+			const completed = new Promise<void>((resolve) => {
+				runner.on("complete", () => resolve());
+			});
+
+			// Stop hook reports nothing, but the live set is non-empty.
+			await state.endTurnWithWork({ backgroundTasks: [] }, "STARTED");
+			await vi.waitFor(() => {
+				expect(runner.hasPendingWork()).toBe(true);
+			});
+			expect(runner.isRunning()).toBe(true);
+
+			// The task settles; the next turn ends with nothing live.
+			const settled = waitForMessageCount(runner, 1);
+			state.emit(makeBackgroundTasksChanged([]));
+			await settled;
+			await state.endTurnWithWork({ backgroundTasks: [] }, "done");
+
+			await completed;
+			expect(runner.hasPendingWork()).toBe(false);
+			await sessionPromise;
+		});
 	});
 });

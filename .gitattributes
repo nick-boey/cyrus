@@ -1,0 +1,47 @@
+# Normalize every text file to LF in the repository AND check it out as LF on
+# every platform, Windows included.
+#
+# Why this is not optional: Git's Windows default (`core.autocrlf=true`)
+# rewrites text files to CRLF on checkout. Anything COPYed from that working
+# tree into a Linux container image then carries CRLF, and a shell script whose
+# shebang reads `#!/bin/sh\r` fails to exec with a bare
+# "No such file or directory" — the interpreter path itself is wrong.
+#
+# That is exactly how `docker/worker/entrypoint.sh` silently stopped booting the
+# ACA worker on 2026-07-27: the sandbox reported `Running` (ACA's own
+# `tini -- sleep infinity` keep-alive is PID 1 regardless), no worker process
+# ever started, nothing dialed the router, and the Linear delegation hung with
+# no error logged anywhere. The committed blob was correct LF the whole time —
+# only the Windows checkout was corrupt, so CI-built images worked and
+# locally-built ones did not.
+#
+# Guarded by packages/router/test/worker-entrypoint-line-endings.test.ts.
+* text=auto eol=lf
+
+# Belt-and-braces for the executable assets that actually get COPYed into an
+# image and run. Listed explicitly so the protection survives any future
+# narrowing of the blanket rule above.
+*.sh text eol=lf
+*.bash text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+
+# Binary types: never apply EOL conversion. The repo tracks no binaries today;
+# these are here so adding one later cannot corrupt it.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.node binary
+*.wasm binary

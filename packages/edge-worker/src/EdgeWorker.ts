@@ -43,6 +43,7 @@ import type {
 	RepositoryConfig,
 	RunnerType,
 	SerializableEdgeWorkerState,
+	SessionCreator,
 	SessionStartMessage,
 	StopSignalMessage,
 	UnassignMessage,
@@ -56,6 +57,7 @@ import {
 	CLIRPCServer,
 	createLogger,
 	DEFAULT_PROXY_URL,
+	getDefaultWorktreesDir,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isContentUpdateMessage,
@@ -72,6 +74,7 @@ import {
 	isStopSignalMessage,
 	isUnassignMessage,
 	isUserPromptMessage,
+	McpHealthRegistry,
 	PersistenceManager,
 	requireLinearWorkspaceId,
 	resolvePath,
@@ -136,9 +139,14 @@ import {
 	type ResolvedSession,
 } from "cyrus-mcp-tools";
 import {
+	RouterConnection,
+	RouterIssueTrackerService,
+} from "cyrus-router-client";
+import {
 	SlackEventTransport,
 	type SlackWebhookEvent,
 } from "cyrus-slack-event-transport";
+import { postTeardownComplete, toHttpBase } from "cyrus-workspace-sync";
 import { Sessions, streamableHttp } from "fastify-mcp";
 import { ActivityPoster } from "./ActivityPoster.js";
 import { AgentSessionManager } from "./AgentSessionManager.js";
@@ -152,6 +160,7 @@ import { EgressProxy } from "./EgressProxy.js";
 import { GitService } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
 import { McpConfigService } from "./McpConfigService.js";
+import { McpHealthMonitor } from "./McpHealthMonitor.js";
 import { PromptBuilder } from "./PromptBuilder.js";
 import type {
 	IssueContextResult,
@@ -177,9 +186,11 @@ import {
 import { SlackChatAdapter } from "./SlackChatAdapter.js";
 import type { IActivitySink } from "./sinks/IActivitySink.js";
 import { LinearActivitySink } from "./sinks/LinearActivitySink.js";
+import { TeardownCallbackQueue } from "./TeardownCallbackQueue.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
 import type { AgentSessionData, EdgeWorkerEvents } from "./types.js";
 import { UserAccessControl } from "./UserAccessControl.js";
+import { WorkspaceSyncService } from "./WorkspaceSyncService.js";
 
 export declare interface EdgeWorker {
 	on<K extends keyof EdgeWorkerEvents>(
@@ -221,6 +232,16 @@ export class EdgeWorker extends EventEmitter {
 	private gitHubCommentService: GitHubCommentService; // Service for posting comments back to GitHub PRs
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
+	private routerConnection?: RouterConnection; // Shared device-side WebSocket connection to the Cyrus Router (router platform mode)
+	/**
+	 * A fully-wired router connection whose dial loop has not started yet.
+	 * `initializeComponents` attaches the event listeners and parks the connection
+	 * here; `start()` dials it only after interrupted-session reconciliation has
+	 * finished, so no queued prompt can race a terminal signal.
+	 */
+	private pendingRouterDial?: RouterConnection;
+	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, opt-in via floorSync === true)
+	private teardownCallbacks?: TeardownCallbackQueue; // Durable, retrying "terminal cleanup is done" callback to the router (router platform mode)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
 	private persistenceManager: PersistenceManager;
 	private sharedApplicationServer: SharedApplicationServer;
@@ -241,6 +262,13 @@ export class EdgeWorker extends EventEmitter {
 	private runnerSelectionService: RunnerSelectionService;
 	private toolPermissionResolver: ToolPermissionResolver;
 	private mcpConfigService: McpConfigService;
+	/**
+	 * Single view of MCP connection health, shared by `McpConfigService` (which
+	 * declares configured servers and records headless skips) and
+	 * `McpHealthMonitor` (which probes and folds in per-session SDK statuses).
+	 */
+	private readonly mcpHealthRegistry = new McpHealthRegistry();
+	private mcpHealthMonitor: McpHealthMonitor;
 	private runnerConfigBuilder: RunnerConfigBuilder;
 	private activityPoster: ActivityPoster;
 	private configManager: ConfigManager;
@@ -421,6 +449,12 @@ export class EdgeWorker extends EventEmitter {
 			getIssueTracker: (linearWorkspaceId: string) => {
 				return this.getIssueTrackerForWorkspace(linearWorkspaceId);
 			},
+			// Routed through the same events as the AskUserQuestion path, so both
+			// kinds of "blocked on the user" converge on one park/unpark handler.
+			onSessionParked: (agentSessionId: string) =>
+				this.agentSessionManager.emit("sessionParked", agentSessionId),
+			onSessionUnparked: (agentSessionId: string) =>
+				this.agentSessionManager.emit("sessionUnparked", agentSessionId),
 		};
 		this.repositoryRouter = new RepositoryRouter(repositoryRouterDeps);
 		this.gitService = new GitService({ cyrusHome: this.cyrusHome });
@@ -452,7 +486,11 @@ export class EdgeWorker extends EventEmitter {
 		// Initialize shared application server
 		const serverPort = config.serverPort || config.webhookPort || 3456;
 		const serverHost = config.serverHost || "localhost";
-		const skipTunnel = config.platform === "cli"; // Skip Cloudflare tunnel in CLI mode
+		// Skip the Cloudflare tunnel when there is no inbound webhook surface to
+		// expose: CLI mode (in-memory tracker) and router mode (events arrive
+		// over the device WebSocket, not an HTTP webhook).
+		const skipTunnel =
+			config.platform === "cli" || config.platform === "router";
 		this.sharedApplicationServer = new SharedApplicationServer(
 			serverPort,
 			serverHost,
@@ -487,6 +525,113 @@ export class EdgeWorker extends EventEmitter {
 					childSessionId,
 				);
 			},
+			undefined, // logger
+			// The terminal path flushes state to disk before it signals, so both
+			// the router's affinity release and the persistence floor's bundle see
+			// a session that reads terminal and carries its final response entry.
+			() => this.savePersistedState(),
+		);
+
+		// Router mode: a session that just picked up a new runner has advanced past
+		// whatever terminal state it last reported, so any still-unacked terminal
+		// frame for it is stale. Drop it rather than let the next reconnect replay
+		// it: the router applies terminal frames unconditionally, so a replay
+		// lands mid-turn, clears the session affinity this turn's activities post
+		// under, and the turn's final response is rejected with "session not owned
+		// by this device". The session emits a fresh terminal frame when it
+		// genuinely finishes (addAgentRunner re-arms the one-shot), so nothing is
+		// lost by dropping the old one.
+		this.agentSessionManager.on("sessionResumed", (sessionId: string) => {
+			if (this.config.platform !== "router") return;
+			try {
+				this.routerConnection?.discardBufferedSessionState(sessionId);
+			} catch (error) {
+				this.logger.error(
+					`Failed to discard the buffered terminal frame for session ${sessionId}`,
+					error,
+				);
+			}
+		});
+
+		// Router mode: a session blocked on a user answer with no work in flight
+		// releases its device, so ContainerLifecycle can idle-suspend the
+		// container while it waits. Non-fatal: a failed park costs a suspend, not
+		// correctness — the container simply stays up until the next transition.
+		this.agentSessionManager.on("sessionParked", (sessionId: string) => {
+			if (this.config.platform !== "router") return;
+			try {
+				this.routerConnection?.sendSessionState(sessionId, "parked");
+			} catch (error) {
+				this.logger.error(
+					`Failed to signal parked state for session ${sessionId}; its container will stay up until the next transition`,
+					error,
+				);
+			}
+		});
+
+		// The counterpart. Durability cuts both ways: replaying a stale `parked`
+		// on a later reconnect would clear the affinity a live turn is posting
+		// under — the same hazard the `sessionResumed` listener above guards
+		// against for terminal frames.
+		//
+		// Dropping the buffered frame is only half of it, and only the half that
+		// helps while the frame is still unsent. Once the router has applied a
+		// `parked`, affinity is gone on its side, and nothing local can bring it
+		// back — the session runs on with every activity rejected as "session not
+		// owned by this device" (PAR-146). `sendSessionUnparked` does both.
+		this.agentSessionManager.on("sessionUnparked", (sessionId: string) => {
+			if (this.config.platform !== "router") return;
+			try {
+				this.routerConnection?.sendSessionUnparked(sessionId);
+			} catch (error) {
+				this.logger.error(
+					`Failed to unpark session ${sessionId}; it will keep its parked state on the router until the next terminal frame`,
+					error,
+				);
+			}
+		});
+
+		// Router mode: when a session reaches a terminal state, tell the router
+		// so it can release the issue lock + session affinity. Guarded by
+		// platform inside the handler so the subscription is harmless otherwise.
+		this.agentSessionManager.on(
+			"sessionTerminal",
+			(sessionId: string, state: "complete" | "error" | "stopped") => {
+				if (this.config.platform !== "router") return;
+				try {
+					this.routerConnection?.sendSessionState(sessionId, state);
+				} catch (error) {
+					// sendSessionState persists the frame to disk before transmitting.
+					// A failure there must not abort session teardown (this listener
+					// runs synchronously inside the emit, e.g. from the stop handler),
+					// but it does mean the router keeps this issue locked until an
+					// admin runs `cyrus router unlock` — so say so loudly.
+					this.logger.error(
+						`Failed to signal terminal state '${state}' for session ${sessionId} to the router; its issue lock may need \`cyrus router unlock\``,
+						error,
+					);
+				}
+
+				// Persistence floor: WIP-push + bundle-upload this issue now that a
+				// session on it just ended. syncIssueOnTermination() is independent
+				// of the sendSessionState try/catch above — a router-lock signalling
+				// failure must not skip the floor sync, and vice versa. It removes
+				// this session from the issue's live-session refcount immediately,
+				// then stops protecting the issue (removes it from the touched set)
+				// once BOTH that refcount is empty (no other session on the same
+				// issue is still running) AND a sync actually succeeds — a failed
+				// sync, or another still-live session on the issue, leaves it
+				// touched so a later periodic tick retries/re-evaluates it instead
+				// of dropping protection forever.
+				const session = this.agentSessionManager.getSession(sessionId);
+				const identifier = session?.issue?.identifier;
+				if (identifier) {
+					void this.workspaceSync?.syncIssueOnTermination(
+						identifier,
+						sessionId,
+					);
+				}
+			},
 		);
 
 		// Initialize repositories with path resolution
@@ -511,6 +656,92 @@ export class EdgeWorker extends EventEmitter {
 			}
 		}
 
+		// Router mode: create ONE shared device-side connection to the router.
+		// The device holds no Linear tokens for issue-tracker operations — those
+		// are forwarded to the router over this connection. (An operator MAY
+		// still provision a static per-user Linear token via config.linearWorkspaces
+		// — from LINEAR_API_TOKEN — purely to authenticate the hosted Linear MCP
+		// inside the container's Claude session; that path does not go through the
+		// router connection.)
+		if (this.config.platform === "router") {
+			if (!config.router) {
+				throw new Error(
+					"platform 'router' requires config.router { url, deviceToken }",
+				);
+			}
+			this.routerConnection = new RouterConnection({
+				url: config.router.url,
+				deviceToken: config.router.deviceToken,
+				stateDir: join(this.cyrusHome, "router-client"),
+				// Declare the sessions we're still responsible for terminal-
+				// signalling on every (re)connect, so the router can reclaim issue
+				// locks for the rest — sessions we lost (e.g. a corrupt state file
+				// wiped them) or that completed but whose terminal signal died with
+				// a previous process. See AgentSessionManager.getLiveSessionIds.
+				getActiveSessions: () => this.agentSessionManager.getLiveSessionIds(),
+			});
+
+			// Durable record of "I owe the router a teardown callback". Written
+			// before terminal cleanup starts and retried until the router accepts
+			// it, so an idle-stopped-then-woken worker gets its sandbox destroyed
+			// promptly instead of waiting out the router's 10-minute grace.
+			const routerHttpBase = toHttpBase(config.router.url);
+			const routerDeviceToken = config.router.deviceToken;
+			this.teardownCallbacks = new TeardownCallbackQueue({
+				stateDir: join(this.cyrusHome, "router-client"),
+				post: (issueKey, idempotencyKey) =>
+					postTeardownComplete(routerHttpBase, routerDeviceToken, issueKey, {
+						idempotencyKey,
+					}),
+				logger: {
+					info: (msg) => this.logger.info(msg),
+					warn: (msg) => this.logger.warn(msg),
+				},
+			});
+
+			// Persistence floor: WIP-push + bundle-upload sync so container death
+			// (idle-stop, crash, host loss, executor switch) never loses work.
+			// Opt-IN via `router.floorSync: true` — defaults OFF so this is a
+			// no-op for every router-platform device that hasn't asked for it.
+			// Before this feature, a WIP push only ran on worktree teardown; this
+			// service additionally runs on every session end and on a 5-minute
+			// timer, which would otherwise push `wip: auto-saved by cyrus…`
+			// commits onto a teammate's issue branches (including open PRs)
+			// roughly 12x/hour with no opt-in on their part — a real behavior
+			// change for existing router+physical-device deployments, which the
+			// container-executors design explicitly promised would be
+			// unaffected. `ContainerBootCommand.writeConfig` sets `floorSync:
+			// true` for every container it boots (that's what makes the
+			// container restore ladder work); a physical-device user who wants
+			// the floor too (e.g. to enable device -> container migration) opts
+			// in the same way, by setting `floorSync: true` themselves.
+			if (config.router.floorSync === true) {
+				this.workspaceSync = new WorkspaceSyncService({
+					cyrusHome: this.cyrusHome,
+					routerUrl: config.router.url,
+					deviceToken: config.router.deviceToken,
+					gitService: this.gitService,
+					logger: this.logger,
+				});
+				this.workspaceSync.start();
+			}
+		}
+
+		// Router mode has no linearWorkspaces block (the device holds no Linear
+		// tokens — the router does). Build one RouterIssueTrackerService per
+		// unique repo workspace id, backed by the shared RouterConnection.
+		if (this.config.platform === "router") {
+			for (const repo of this.repositories.values()) {
+				const wsId = repo.linearWorkspaceId;
+				if (wsId && !this.issueTrackers.has(wsId)) {
+					this.issueTrackers.set(
+						wsId,
+						new RouterIssueTrackerService(this.getRouterConnection(), wsId),
+					);
+				}
+			}
+		}
+
 		// Initialize issue trackers per workspace (one per workspace, not per repo)
 		if (config.linearWorkspaces) {
 			for (const [linearWorkspaceId, wsConfig] of Object.entries(
@@ -523,13 +754,20 @@ export class EdgeWorker extends EventEmitter {
 								service.seedDefaultData();
 								return service;
 							})()
-						: new LinearIssueTrackerService(
-								new LinearClient({
-									accessToken: wsConfig.linearToken,
-								}),
-								this.buildOAuthConfig(linearWorkspaceId),
-							);
-				this.issueTrackers.set(linearWorkspaceId, issueTracker);
+						: this.config.platform === "router"
+							? new RouterIssueTrackerService(
+									this.getRouterConnection(),
+									linearWorkspaceId,
+								)
+							: new LinearIssueTrackerService(
+									new LinearClient({
+										accessToken: wsConfig.linearToken,
+									}),
+									this.buildOAuthConfig(linearWorkspaceId),
+								);
+				if (!this.issueTrackers.has(linearWorkspaceId)) {
+					this.issueTrackers.set(linearWorkspaceId, issueTracker);
+				}
 			}
 		}
 
@@ -556,11 +794,16 @@ export class EdgeWorker extends EventEmitter {
 			repoAccessConfigs,
 		);
 
-		// Initialize extracted service modules
+		// Initialize extracted service modules. In router mode the device has no
+		// Linear token, so attachment downloads are proxied through the router
+		// via a delegate that reaches the download RPC above both token guards.
 		this.attachmentService = new AttachmentService(
 			this.logger,
 			this.cyrusHome,
 			this.config.linearWorkspaces || {},
+			this.config.platform === "router"
+				? (url) => this.downloadAttachmentViaRouter(url)
+				: undefined,
 		);
 		this.runnerSelectionService = new RunnerSelectionService(this.config);
 		this.toolPermissionResolver = new ToolPermissionResolver(
@@ -579,6 +822,11 @@ export class EdgeWorker extends EventEmitter {
 			getCyrusToolsMcpUrl: () => this.getCyrusToolsMcpUrl(),
 			createCyrusToolsOptions: (parentSessionId) =>
 				this.createCyrusToolsOptions(parentSessionId),
+			healthRegistry: this.mcpHealthRegistry,
+		});
+		this.mcpHealthMonitor = new McpHealthMonitor({
+			registry: this.mcpHealthRegistry,
+			logger: this.logger,
 		});
 		this.runnerConfigBuilder = new RunnerConfigBuilder(
 			this.toolPermissionResolver,
@@ -705,8 +953,54 @@ export class EdgeWorker extends EventEmitter {
 			});
 		}
 
+		// Report any session the previous process was running when it died. Runs
+		// after initializeComponents() so the activity sinks and issue trackers
+		// exist, and — critically — before the HTTP server accepts a webhook or the
+		// router dial can deliver a queued prompt. Reconciliation drives a session
+		// to `error` and emits a terminal signal that releases the router's issue
+		// lock and session affinity; if a prompt for that same session is already
+		// being resumed when it fires, it strips the affinity mid-turn and every
+		// activity that turn posts — including its final response — is rejected
+		// with "session not owned by this device". Ordering it ahead of all inbound
+		// work is what makes that unreachable: `addAgentRunner` then always
+		// observes the reconciled state and re-arms the session cleanly.
+		//
+		// Safe to run while offline: both the activity post and the terminal signal
+		// are durable across a router disconnect.
+		//
+		// Non-fatal: a worker that cannot reconcile must still come up and serve
+		// new work.
+		try {
+			const interrupted =
+				await this.agentSessionManager.reconcileInterruptedSessions();
+			if (interrupted.length > 0) {
+				this.logger.warn(
+					`Reconciled ${interrupted.length} session(s) interrupted by a host restart`,
+				);
+			}
+		} catch (error) {
+			this.logger.error("Failed to reconcile interrupted sessions:", error);
+		}
+
 		// Start shared application server (this also starts Cloudflare tunnel if CLOUDFLARE_TOKEN is set)
 		await this.sharedApplicationServer.start();
+
+		// Probe MCP connectivity now that the cyrus-tools endpoint is listening.
+		// Deliberately NOT awaited: a slow or unreachable MCP server must never
+		// delay accepting webhooks. Results land in `mcpHealthRegistry` and are
+		// rendered by `getMcpHealthDiagnostics()` in the startup banner.
+		this.probeMcpHealth().catch((error) => {
+			this.logger.warn("MCP health probe failed (non-fatal):", error);
+		});
+
+		// Router mode: begin the dial loop. Deferred from initializeComponents() to
+		// here so reconciliation above has already settled every restored session
+		// before the router can deliver a queued prompt for one of them.
+		if (this.pendingRouterDial) {
+			const routerConnection = this.pendingRouterDial;
+			this.pendingRouterDial = undefined;
+			routerConnection.connect();
+		}
 	}
 
 	/**
@@ -777,6 +1071,92 @@ export class EdgeWorker extends EventEmitter {
 				this.logger.info(
 					"   Event listener: listening for AgentSessionCreated events",
 				);
+			}
+		} else if (this.config.platform === "router") {
+			// Router mode: events arrive over the shared device WebSocket, not an
+			// HTTP webhook. Ensure a RouterIssueTrackerService exists per repo
+			// workspace (the constructor already created these; this mirrors the
+			// CLI fallback loop for robustness/idempotency).
+			for (const repo of this.repositories.values()) {
+				const wsId = repo.linearWorkspaceId;
+				if (wsId && !this.issueTrackers.has(wsId)) {
+					const tracker = new RouterIssueTrackerService(
+						this.getRouterConnection(),
+						wsId,
+					);
+					this.issueTrackers.set(wsId, tracker);
+					this.activitySinks.set(wsId, new LinearActivitySink(tracker, wsId));
+				}
+			}
+
+			const firstRouterTracker = Array.from(this.issueTrackers.values()).find(
+				(tracker): tracker is RouterIssueTrackerService =>
+					tracker instanceof RouterIssueTrackerService,
+			);
+
+			if (firstRouterTracker) {
+				const routerConnection = this.getRouterConnection();
+
+				// Surface fatal connection errors (e.g. a rejected device token →
+				// hello_error, emitted by RouterConnection as "error") instead of
+				// letting them go unhandled. Attach BEFORE connect().
+				routerConnection.on("error", (error: Error) => {
+					this.handleError(error);
+				});
+
+				// Replay any teardown callback a previous process recorded but never
+				// delivered — deliberately gated on "connected" rather than fired at
+				// startup. The callback rides the router's HTTP surface, and a
+				// reconnect (including the liveness watchdog's post-ACA-resume
+				// redial) is the first point at which we know the router is
+				// reachable at all. Runs on every reconnect; a no-op when the queue
+				// is empty, which is the normal case.
+				routerConnection.on("connected", () => {
+					void this.teardownCallbacks?.resume();
+				});
+
+				// SYNCHRONOUS-CONSUMER CONTRACT: RouterConnection marks its durable
+				// inbox entry processed the instant its "event" emit returns, and
+				// RouterEventTransport re-emits synchronously. So the transport
+				// "event" → handleWebhook handoff MUST be wired synchronously and
+				// BEFORE connect() — mirroring the CLI/Linear "event" wiring exactly,
+				// with no extra await/defer inserted between transport "event" and
+				// handleWebhook. The transport ignores this config (no HTTP surface).
+				const routerEventTransport = firstRouterTracker.createEventTransport({
+					platform: "linear",
+					verificationMode: "proxy",
+					secret: "",
+					fastifyServer: this.sharedApplicationServer.getFastifyInstance(),
+				});
+
+				// Listen for legacy webhook events (mirrors CLI/Linear "event" path)
+				routerEventTransport.on("event", (event: AgentEvent) => {
+					const repos = Array.from(this.repositories.values());
+					this.handleWebhook(event as unknown as Webhook, repos);
+				});
+
+				// Listen for unified internal messages (new message bus)
+				routerEventTransport.on("message", (message: InternalMessage) => {
+					this.handleMessage(message);
+				});
+
+				// Listen for transport errors
+				routerEventTransport.on("error", (error: Error) => {
+					this.handleError(error);
+				});
+
+				// No-op for the router transport (no HTTP endpoint to mount), but
+				// call it to honor the IAgentEventTransport contract.
+				routerEventTransport.register();
+
+				// The dial loop is deliberately NOT started here. Listeners are
+				// attached now (so no replayed or live event can be emitted with zero
+				// "event" consumers), but dialing waits until start() has reconciled
+				// interrupted sessions — see the note there.
+				this.pendingRouterDial = routerConnection;
+
+				this.logger.info("✅ Router event transport registered");
+				this.logger.info(`   Connecting to router: ${this.config.router?.url}`);
 			}
 		} else {
 			// Linear mode: Create and register LinearEventTransport
@@ -2635,6 +3015,20 @@ ${taskSection}`;
 
 		// Stop shared application server (this also stops Cloudflare tunnel if running)
 		await this.sharedApplicationServer.stop();
+
+		// Persistence floor: this is the last chance to WIP-push + upload
+		// session bundles before the process (and possibly the container it
+		// runs in) is gone. Deliberately LAST — runner kill, egress-proxy
+		// stop, and server stop must not wait behind a potentially slow git
+		// push / router upload. `stop()` never throws (every per-issue sync
+		// swallows and logs its own errors) and is internally time-capped, so
+		// it can't block process exit indefinitely either.
+		await this.workspaceSync?.stop();
+
+		// Abandon in-flight callback retries rather than holding the process
+		// open on backoff sleeps. Anything still queued is on disk and replays
+		// on the next start (and the router's grace deadline covers the gap).
+		this.teardownCallbacks?.stop();
 	}
 
 	/**
@@ -2906,17 +3300,34 @@ ${taskSection}`;
 		let anyTokenChanged = false;
 
 		for (const [workspaceId, newWsConfig] of Object.entries(newWorkspaces)) {
-			const oldToken = oldWorkspaces[workspaceId]?.linearToken;
+			const oldWsConfig = oldWorkspaces[workspaceId];
+			const oldToken = oldWsConfig?.linearToken;
 			const newToken = newWsConfig.linearToken;
+			const newRefreshToken = newWsConfig.linearRefreshToken;
 
-			if (oldToken === newToken) continue;
+			if (
+				oldToken === newToken &&
+				oldWsConfig?.linearRefreshToken === newRefreshToken
+			) {
+				continue;
+			}
 
 			anyTokenChanged = true;
 
 			// Update existing issue tracker in-place
 			const issueTracker = this.issueTrackers.get(workspaceId);
 			if (issueTracker) {
-				(issueTracker as LinearIssueTrackerService).setAccessToken(newToken);
+				// Hand over the refresh token too, not just the access token. A
+				// re-authorization (`cyrus refresh-token` / `self-auth-linear`) lands
+				// here as a config.json change, and if Linear had already rejected the
+				// old refresh token the tracker is suppressing every refresh attempt
+				// for this workspace. That suppression is only lifted when a
+				// *different* refresh token is registered — so passing the access
+				// token alone would leave a live re-auth inert until restart.
+				(issueTracker as LinearIssueTrackerService).setAccessToken(
+					newToken,
+					newRefreshToken,
+				);
 				this.logger.info(
 					`🔑 Updated Linear token for workspace ${workspaceId}`,
 				);
@@ -3371,14 +3782,43 @@ ${taskSection}`;
 	}
 
 	/**
+	 * Derive the git branch name for an issue exactly the way
+	 * GitService.createSingleRepoWorktree does (`issue.branchName` when set,
+	 * otherwise `<identifier>-<slugified-title-30-chars>`). Used by
+	 * pre-teardown WIP push so the push targets the same branch the worktree
+	 * was actually created on, even when Linear didn't suggest a branch name.
+	 *
+	 * Delegates to GitService.deriveWorktreeBranchName — the single source
+	 * of truth for this fallback — so worktree creation and teardown's WIP
+	 * push can never drift onto different branches.
+	 */
+	private deriveWorktreeBranchName(issue: IssueMinimal): string {
+		return this.gitService.deriveWorktreeBranchName(issue);
+	}
+
+	/**
 	 * Handle issue state change message (terminal state reached).
 	 * Stops active sessions and deletes worktrees for the issue.
 	 */
 	private async handleIssueStateChangeMessage(
 		message: IssueStateChangeMessage,
 	): Promise<void> {
+		// FIRST, and synchronously — before this method's first `await`, so the
+		// write lands inside the window where RouterConnection's inbox entry for
+		// this webhook is still unprocessed. From here on, a kill at ANY point
+		// (mid floor flush, mid worktree removal, or in the gap before the
+		// callback) leaves the intent on disk to be replayed on the next start.
+		const teardownCallbackKey =
+			this.config.platform === "router"
+				? this.teardownCallbacks?.record(message.workItemIdentifier)
+				: undefined;
+
 		this.logger.info(
-			`[MessageBus] Issue reached terminal state: ${message.workItemIdentifier}`,
+			`[MessageBus] Issue reached terminal state: ${message.workItemIdentifier}${
+				teardownCallbackKey
+					? ` (teardown callback ${teardownCallbackKey} recorded)`
+					: ""
+			}`,
 		);
 
 		const issueId = message.workItemId;
@@ -3392,6 +3832,14 @@ ${taskSection}`;
 			this.agentSessionManager.requestSessionStop(session.id);
 			session.agentRunner?.stop();
 		}
+
+		// Capture the terminal sessions and their worktrees before removeSession
+		// erases them from persisted state or deleteWorktree marks the workspace
+		// gone. A forced call waits out any periodic sync and then performs a
+		// fresh pass rather than coalescing with stale in-flight work.
+		await this.workspaceSync?.syncIssue(message.workItemIdentifier, {
+			force: true,
+		});
 
 		// Post a response activity to each stopped session's Linear thread,
 		// then remove the session so subsequent prompts don't find stale state.
@@ -3418,10 +3866,71 @@ ${taskSection}`;
 			if (repo) teardownRepositories.push(repo);
 		}
 
+		// Push any uncommitted WIP to origin before teardown scripts run and
+		// worktrees are removed, so a session on another device can resume this
+		// issue via GitService.remoteBranchExists (worktree continuity). A push
+		// failure must never block cleanup — log a warning and continue.
+		if (teardownRepositories.length > 0) {
+			// A session's `issue.branchName` can be empty even when an issue is
+			// attached (Linear doesn't always suggest one) — GitService's own
+			// worktree creation falls back to a derived name in that case
+			// (see createSingleRepoWorktree), so mirror that fallback here via
+			// deriveWorktreeBranchName rather than requiring a truthy
+			// branchName, which would otherwise silently skip this push for any
+			// issue Linear didn't suggest a branch name for.
+			const sessionWithIssue = sessions.find((session) => session.issue);
+			if (sessionWithIssue?.issue) {
+				// deriveWorktreeBranchName already returns a sanitized branch
+				// name (it delegates to GitService.deriveWorktreeBranchName,
+				// which sanitizes internally) — no further sanitization needed.
+				const branchName = this.deriveWorktreeBranchName(
+					sessionWithIssue.issue,
+				);
+				// Mirrors the worktree layout GitService.deleteWorktree resolves
+				// internally: single repo -> workspace root IS the worktree;
+				// multi-repo -> each repo's worktree is a named subdirectory.
+				const workspacePath = join(
+					getDefaultWorktreesDir(this.cyrusHome),
+					message.workItemIdentifier,
+				);
+				const worktreePaths =
+					teardownRepositories.length > 1
+						? teardownRepositories.map((repo) => join(workspacePath, repo.name))
+						: [workspacePath];
+				for (const worktreePath of worktreePaths) {
+					try {
+						await this.gitService.pushWipIfDirty(worktreePath, branchName);
+					} catch (error) {
+						this.logger.warn(
+							`Failed to push WIP for ${message.workItemIdentifier} at ${worktreePath} before teardown: ${(error as Error).message}`,
+						);
+					}
+				}
+			} else {
+				// No session carries any issue data at all (e.g. only
+				// standalone/no-issue sessions were found for this issueId) —
+				// there is no branch name to derive from, so the push is
+				// genuinely un-performable. Warn rather than silently
+				// stranding any uncommitted WIP.
+				this.logger.warn(
+					`Skipping pre-teardown WIP push for ${message.workItemIdentifier}: no session has issue data to derive a branch name from`,
+				);
+			}
+		}
+
 		// Delete worktrees for this issue, keyed by the Linear issue identifier.
 		await this.gitService.deleteWorktree(message.workItemIdentifier, {
 			repositories: teardownRepositories,
 		});
+
+		// Last by design: provider destruction is only safe after all in-container
+		// cleanup, including worktree deletion, has completed. The queue retries
+		// the recorded callback (same idempotency key) until the router accepts
+		// it, and never rejects — the router's grace deadline runs the same
+		// destroy path if delivery ultimately fails.
+		if (teardownCallbackKey) {
+			await this.teardownCallbacks?.flush();
+		}
 
 		this.logger.info(
 			`Completed cleanup for ${message.workItemIdentifier}: stopped ${sessions.length} session(s)`,
@@ -4031,9 +4540,44 @@ ${taskSection}`;
 	private getLinearTokenForWorkspace(linearWorkspaceId: string): string | null {
 		const workspaceConfig = this.config.linearWorkspaces?.[linearWorkspaceId];
 		if (!workspaceConfig) {
-			return null; // CLI platform or unconfigured workspace
+			return null; // CLI platform / router platform / unconfigured workspace
 		}
 		return workspaceConfig.linearToken;
+	}
+
+	/**
+	 * Return the shared RouterConnection, asserting it exists. Only valid to
+	 * call in router mode (the constructor creates it when
+	 * `platform === "router"`).
+	 */
+	private getRouterConnection(): RouterConnection {
+		if (!this.routerConnection) {
+			throw new Error(
+				"RouterConnection is not initialized (platform is not 'router')",
+			);
+		}
+		return this.routerConnection;
+	}
+
+	/**
+	 * Download an attachment's bytes through the router (router mode). The
+	 * device holds no Linear token, so it asks the router — which does — to
+	 * fetch the attachment URL and return the bytes. Uses the first available
+	 * router-backed tracker; a router device is bound to its own workspace(s)
+	 * through a single connection, so any router tracker resolves the same
+	 * download RPC.
+	 */
+	private downloadAttachmentViaRouter(
+		url: string,
+	): Promise<{ base64: string; contentType: string }> {
+		for (const tracker of this.issueTrackers.values()) {
+			if (tracker instanceof RouterIssueTrackerService) {
+				return tracker.downloadAttachment(url);
+			}
+		}
+		return Promise.reject(
+			new Error("No router issue tracker available for attachment download"),
+		);
 	}
 
 	/**
@@ -4053,6 +4597,7 @@ ${taskSection}`;
 		linearWorkspaceId: string,
 		baseBranchOverrides?: Map<string, string>,
 		routingMethod?: string,
+		creator?: SessionCreator,
 	): Promise<AgentSessionData> {
 		const repositories = Array.isArray(repositoriesOrSingle)
 			? repositoriesOrSingle
@@ -4111,6 +4656,7 @@ ${taskSection}`;
 			branchName: issueMinimal.branchName,
 			baseBranchName:
 				workspace.resolvedBaseBranches?.[repo.id]?.branch ?? repo.baseBranch,
+			baseBranchSource: workspace.resolvedBaseBranches?.[repo.id]?.source,
 		}));
 
 		agentSessionManager.createCyrusAgentSession(
@@ -4120,6 +4666,7 @@ ${taskSection}`;
 			workspace,
 			"linear",
 			repositoryContexts,
+			creator,
 		);
 
 		// Register session-to-repo mapping and activity sink (use primary repo)
@@ -4410,6 +4957,17 @@ ${taskSection}`;
 			return;
 		}
 
+		// Persistence floor: this issue is about to get a runner that may work
+		// for a long time before its session ever reaches a terminal state.
+		// touch() here (rather than only at session end) is what lets the
+		// periodic timer keep re-syncing it on every tick while it runs, and
+		// registers `sessionId` as a live session on the issue (a refcount —
+		// see WorkspaceSyncService's class doc — so a sibling session on the
+		// same issue can't be un-protected by this one's eventual termination).
+		// A no-op on non-router platforms — `workspaceSync` is only
+		// constructed when `platform === "router"`.
+		this.workspaceSync?.touch(issue.identifier, sessionId);
+
 		const primaryRepo = repositories[0]!;
 
 		const log = this.logger.withContext({
@@ -4448,6 +5006,12 @@ ${taskSection}`;
 		await this.postInstantAcknowledgment(sessionId, linearWorkspaceId);
 
 		// Create the session using the shared method (pass full repositories array)
+		// agentSession.creator is threaded onto the session on every entry path
+		// (created webhook, parked auto-wake, parked reprompt,
+		// repository-selection response) for session provenance/bookkeeping —
+		// e.g. display attribution and router-mode device routing (see
+		// EventRouter.resolveTarget's creator-based user/device lookup) —
+		// not for per-user credential resolution, which was removed.
 		const sessionData = await this.createCyrusAgentSession(
 			sessionId,
 			issue,
@@ -4456,6 +5020,7 @@ ${taskSection}`;
 			linearWorkspaceId,
 			baseBranchOverrides,
 			routingMethod,
+			agentSession.creator ?? undefined,
 		);
 
 		// Destructure the session data (excluding allowedTools which we'll build with promptType)
@@ -4653,6 +5218,16 @@ ${taskSection}`;
 				agentSessionId,
 				`Stop signal received for ${issueTitle}. No active session was found (the session may have ended or the system was restarted). No further action is needed.`,
 			);
+			// Acknowledging the user is not the whole job. Routing this stop's
+			// `prompted` webhook re-established the router's session affinity for
+			// this device, and only a terminal frame drops it again. Returning here
+			// leaves a row nothing will ever clear, and ContainerLifecycle skips
+			// any device with affinity > 0 — so the container is neither
+			// idle-stopped nor stale-destroyed (PAR-146). Forced, because a session
+			// we cannot find may well have emitted its terminal already.
+			await this.agentSessionManager.abortSession(agentSessionId, {
+				force: true,
+			});
 			return;
 		}
 
@@ -4685,13 +5260,33 @@ ${taskSection}`;
 						: `Stopped session ${agentSessionId} (interrupt not supported)`,
 				);
 			}
-			this.lastStopTimeBySession.delete(agentSessionId);
+			// Post the closing response BEFORE going terminal, for the same reason
+			// completeSession does: the router drops this device's ownership of the
+			// session the instant it sees the terminal state and rejects anything
+			// posted afterwards with "session not owned by this device". Posting
+			// after the abort cost this path its final response, leaving the thread
+			// with no record that the stop ever landed.
 			await this.agentSessionManager.createResponseActivity(
 				agentSessionId,
 				isDoubleStop
 					? `I've fully stopped working on ${issueTitle}.\n\n**Stop Signal:** Received from ${senderName} (second stop)\n**Action Taken:** Session terminated`
 					: `I've stopped working on ${issueTitle}.\n\n**Stop Signal:** Received from ${senderName}\n**Action Taken:** Session terminated`,
 			);
+			// The kill tears the query down before it can yield a result, so
+			// completeSession() — and with it the "sessionTerminal" emit — never
+			// runs. Signal the terminal state explicitly, or router mode holds this
+			// issue's lock until an admin runs `cyrus router unlock`. The interrupt
+			// branch below needs no such call: the query still returns a result.
+			//
+			// Forced: a stop can land on a session that already finished, whose
+			// terminal one-shot is therefore spent. Routing the stop re-established
+			// the router's session affinity, so a silent no-op here strands that
+			// row and pins the container forever (PAR-146). When the session really
+			// is live the one-shot is unspent and `force` changes nothing.
+			await this.agentSessionManager.abortSession(agentSessionId, {
+				force: true,
+			});
+			this.lastStopTimeBySession.delete(agentSessionId);
 		} else {
 			// First stop on a warm session — interrupt current turn, keep session warm
 			await existingRunner!.interrupt!();
@@ -4821,6 +5416,29 @@ ${taskSection}`;
 	}
 
 	/**
+	 * Releases the router-side claim for a prompted event we cannot service.
+	 *
+	 * The router re-establishes session affinity for EVERY prompt, including one
+	 * for an already-completed session (deliberately — a Linear agent session
+	 * outlives its turns). If we then drop the event silently, no terminal frame
+	 * ever follows and that affinity row is permanent, pinning the container out
+	 * of the idle sweep. Non-fatal: reconciliation is the real backstop.
+	 */
+	private signalUnserviceablePrompt(sessionId: string, reason: string): void {
+		if (this.config.platform !== "router") return;
+		try {
+			this.routerConnection?.sendSessionState(sessionId, "error");
+			this.logger.warn(
+				`Released router claim for unserviceable prompt on session ${sessionId}: ${reason}`,
+			);
+		} catch (err) {
+			this.logger.warn(
+				`Failed to release router claim for session ${sessionId}: ${String(err)}`,
+			);
+		}
+	}
+
+	/**
 	 * Handle normal prompted activity (existing session continuation)
 	 * Branch 3 of agentSessionPrompted (see packages/CLAUDE.md)
 	 */
@@ -4837,11 +5455,13 @@ ${taskSection}`;
 
 		if (!issue) {
 			this.logger.warn("Cannot handle prompted activity without issue");
+			this.signalUnserviceablePrompt(sessionId, "missing issue");
 			return;
 		}
 
 		if (!webhook.agentActivity) {
 			this.logger.warn("Cannot handle prompted activity without agentActivity");
+			this.signalUnserviceablePrompt(sessionId, "missing agentActivity");
 			return;
 		}
 
@@ -4873,6 +5493,9 @@ ${taskSection}`;
 				repositories,
 				agentSessionManager,
 				linearWorkspaceId,
+				undefined, // baseBranchOverrides
+				undefined, // routingMethod
+				webhook.agentSession.creator ?? undefined,
 			);
 
 			// Destructure session data for new session
@@ -5220,9 +5843,59 @@ ${taskSection}`;
 	private async handleClaudeMessage(
 		sessionId: string,
 		message: SDKMessage,
-		_repositoryId: string,
+		repositoryId: string,
 	): Promise<void> {
+		this.recordMcpSessionInit(sessionId, message, repositoryId);
 		await this.agentSessionManager.handleClaudeMessage(sessionId, message);
+	}
+
+	/**
+	 * Fold the SDK's per-session MCP connection report into the health registry.
+	 *
+	 * The `system`/`init` message is the only place the SDK reports per-server
+	 * connection state, and with `MCP_CONNECTION_NONBLOCKING=true` a server that
+	 * never connected does not fail the session — so this is the hook that turns
+	 * "the agent mentioned MCP was reconnecting" into an operator-visible
+	 * diagnostic plus a bounded re-probe of anything that failed transiently.
+	 *
+	 * Never throws: MCP diagnostics must not be able to break message handling.
+	 */
+	private recordMcpSessionInit(
+		sessionId: string,
+		message: SDKMessage,
+		repositoryId: string,
+	): void {
+		if (message.type !== "system" || message.subtype !== "init") return;
+		const servers = message.mcp_servers;
+		if (!servers || servers.length === 0) return;
+
+		try {
+			// Re-derive the configs so a transient failure can be re-probed. Safe
+			// and side-effect-free (no context is registered).
+			let configs: Record<string, McpServerConfig> | undefined;
+			const repo = this.repositories.get(repositoryId);
+			if (repo) {
+				try {
+					configs = this.mcpConfigService.describeMcpServers(
+						repo.id,
+						requireLinearWorkspaceId(repo),
+					);
+					// `cyrus-tools` cannot be probed without a live session context —
+					// see the exemption in probeMcpHealth().
+					delete configs["cyrus-tools"];
+				} catch {
+					configs = undefined;
+				}
+			}
+
+			this.mcpHealthMonitor.recordSessionInit({
+				sessionId,
+				servers,
+				...(configs ? { configs } : {}),
+			});
+		} catch (error) {
+			this.logger.warn("Failed to record MCP session init statuses:", error);
+		}
 	}
 
 	/**
@@ -5737,12 +6410,26 @@ ${taskSection}`;
 					);
 				}
 
-				const sdkServer =
-					context.prebuiltServer ||
-					createCyrusToolsServer(
-						context.linearClient,
+				let sdkServer = context.prebuiltServer;
+				if (!sdkServer) {
+					// Rebuild for a subsequent connection to the same context (the
+					// prebuilt server is cleared after first use). Router-mode
+					// contexts carry a tracker backing instead of a LinearClient.
+					const backing = context.linearClient
+						? context.linearClient
+						: context.issueTracker
+							? { issueTracker: context.issueTracker }
+							: undefined;
+					if (!backing) {
+						throw new Error(
+							`No cyrus-tools backing available for context '${contextId}'`,
+						);
+					}
+					sdkServer = createCyrusToolsServer(
+						backing,
 						this.createCyrusToolsOptions(context.parentSessionId),
 					);
+				}
 				this.mcpConfigService.clearPrebuiltServer(contextId);
 
 				return sdkServer.server;
@@ -6531,14 +7218,53 @@ ${input.userComment}
 		organizationId: string,
 	): AgentRunnerConfig["onAskUserQuestion"] {
 		return async (input, _sessionId, signal) => {
-			// Note: We use linearAgentSessionId (from closure) instead of the passed sessionId
-			// because the passed sessionId is the Claude session ID, not the Linear agent session ID
-			return this.askUserQuestionHandler.handleAskUserQuestion(
-				input,
-				linearAgentSessionId,
-				organizationId,
-				signal,
-			);
+			// Park for the duration of the elicitation: this await can outlive the
+			// container by hours, and it holds the SDK query open, so no terminal
+			// frame is ever sent and the router would otherwise pin the device
+			// forever (PAR-146).
+			//
+			// But ONLY once the question is actually in front of the user. Parking
+			// releases the router's session affinity, and posting the elicitation
+			// is a session-scoped RPC — so parking first makes the post fail with
+			// "session not owned by this device". That failure is silent and
+			// unrecoverable: no question ever reaches the user, so nothing wakes
+			// the session, and every activity the agent posts for the rest of the
+			// turn is rejected the same way. `RepositoryRouter` parks after its own
+			// successful post for exactly this reason; this is the same ordering.
+			let parked = false;
+			try {
+				// Note: We use linearAgentSessionId (from closure) instead of the passed sessionId
+				// because the passed sessionId is the Claude session ID, not the Linear agent session ID
+				return await this.askUserQuestionHandler.handleAskUserQuestion(
+					input,
+					linearAgentSessionId,
+					organizationId,
+					signal,
+					() => {
+						// Evaluated here, not on entry: the post is an await, and a
+						// background task started during it must still block the park.
+						// Suspending a container with a build in flight freezes it, and
+						// its completion could then never arrive to wake us.
+						if (this.agentSessionManager.hasPendingWork(linearAgentSessionId))
+							return;
+						parked = true;
+						this.agentSessionManager.emit(
+							"sessionParked",
+							linearAgentSessionId,
+						);
+					},
+				);
+			} finally {
+				// `finally`, not the success path: an abort or a throw leaves the
+				// session just as unparked, and a still-buffered `parked` frame
+				// would then replay over the next live turn.
+				if (parked) {
+					this.agentSessionManager.emit(
+						"sessionUnparked",
+						linearAgentSessionId,
+					);
+				}
+			}
 		};
 	}
 
@@ -6668,6 +7394,72 @@ ${input.userComment}
 		}
 		// For "silent" behavior, we don't post any activity.
 		// The session will remain in "Working" state until manually stopped or timed out.
+	}
+
+	/**
+	 * Diagnostic lines describing MCP connection health — which servers
+	 * connected, which are retrying/degraded/failed, and which were deliberately
+	 * skipped (e.g. `cyrus-docs` in a headless container).
+	 *
+	 * Consumed by the CLI's startup banner alongside the port / repository lines,
+	 * so an operator sees MCP state in the same place as everything else. Returns
+	 * `[]` before the first probe or config build, so callers can splice it in
+	 * unconditionally.
+	 */
+	getMcpHealthDiagnostics(): string[] {
+		return this.mcpHealthMonitor.diagnosticLines();
+	}
+
+	/**
+	 * Probe every remote MCP server Cyrus would configure, once, at startup.
+	 *
+	 * Builds the MCP config for each configured repository (the same call the
+	 * live session path makes, minus a parent session id) and hands the deduped
+	 * union to `McpHealthMonitor`, which handshakes each remote server with
+	 * bounded exponential backoff. Servers dropped for headless mode are already
+	 * recorded as `skipped` by `McpConfigService` and are not probed.
+	 *
+	 * Never throws — an unreachable MCP server is a diagnostic, not a boot
+	 * failure.
+	 */
+	private async probeMcpHealth(): Promise<void> {
+		const servers: Record<string, McpServerConfig> = {};
+		for (const repo of this.repositories.values()) {
+			try {
+				const workspaceId = requireLinearWorkspaceId(repo);
+				Object.assign(
+					servers,
+					this.mcpConfigService.describeMcpServers(repo.id, workspaceId),
+				);
+			} catch (error) {
+				this.logger.debug(
+					`Skipping MCP health probe for repository ${repo.id}:`,
+					error,
+				);
+			}
+		}
+
+		if (Object.keys(servers).length === 0) return;
+
+		if (this.mcpConfigService.isHeadless()) {
+			this.logger.info(
+				"🔌 MCP: headless container mode — servers requiring interactive OAuth are omitted",
+			);
+		}
+
+		await this.mcpHealthMonitor.probeAll(servers, {
+			// `cyrus-tools` is served by THIS process and only answers a request
+			// carrying a live `x-cyrus-mcp-context-id` (see
+			// registerCyrusToolsMcpEndpoint). A context-free probe would get a 500
+			// and be recorded as a false failure, so its health comes from the SDK's
+			// per-session `system`/`init` report instead — which is now blocking for
+			// this server (`alwaysLoad: true`), so a genuine failure shows up on the
+			// very first turn.
+			skip: ["cyrus-tools"],
+		});
+		for (const line of this.getMcpHealthDiagnostics()) {
+			this.logger.info(line);
+		}
 	}
 
 	/**
@@ -7119,6 +7911,117 @@ ${input.userComment}
 	}
 
 	/**
+	 * Restore-ladder gap-closer: re-creates a session's git-worktree workspace
+	 * if it no longer exists (or was reduced to an empty/invalid directory)
+	 * before a resume attempts to use it as the runner's cwd.
+	 *
+	 * This is the single choke point for every resume path — new-comment
+	 * continuation (`handleNormalPromptedActivity`), parent-resume-from-child,
+	 * and feedback-to-child all funnel through `resumeAgentSession`, which
+	 * calls this before `buildAgentRunnerConfig` sets `cwd = session.workspace.path`.
+	 * Without it, a destroyed-and-recreated container (or a worktree deleted by
+	 * hand on a physical device) would resume the Claude transcript into a
+	 * directory `ClaudeRunner`'s own `mkdirSync(cwd, { recursive: true })`
+	 * silently manufactures empty — no repo, no `.git`, and no visibility of
+	 * any WIP commits the persistence floor already pushed to origin.
+	 *
+	 * A no-op on the happy path: `GitService.isWorkspaceValid` is a cheap
+	 * filesystem check, and plain (non-git) workspaces always report valid
+	 * (a missing one is already handled correctly by a plain `mkdir`).
+	 *
+	 * Reuses the exact same workspace-creation path `createCyrusAgentSession`
+	 * uses for brand-new sessions — the custom `handlers.createWorkspace`
+	 * override when configured (the path production takes), else
+	 * `GitService.createGitWorktree` directly. Both already implement
+	 * "worktree continuity": when the issue's branch already exists on
+	 * origin (which it will, since the floor pushes WIP there), the new
+	 * worktree is checked out from `origin/<branch>` instead of branching
+	 * fresh from the base branch — so re-creation here never loses
+	 * committed-but-unmerged work.
+	 */
+	private async ensureSessionWorkspaceExists(
+		session: CyrusAgentSession,
+		repository: RepositoryConfig,
+		fullIssue: Issue,
+		sessionId: string,
+		linearWorkspaceId: string,
+	): Promise<void> {
+		if (this.gitService.isWorkspaceValid(session.workspace)) {
+			return;
+		}
+
+		this.logger.warn(
+			`Workspace missing/invalid for session ${sessionId} (issue ${fullIssue.identifier}) at ${session.workspace.path} — recreating the worktree from the issue branch before resuming. Likely cause: destroyed/recreated container or a manually removed worktree.`,
+		);
+
+		const repositoriesForSession = session.repositories
+			.map((ctx) => this.repositories.get(ctx.repositoryId))
+			.filter((r): r is RepositoryConfig => Boolean(r));
+		const resolvedRepositories =
+			repositoriesForSession.length > 0 ? repositoriesForSession : [repository];
+
+		// Recreation must land the worktree on the same EXPLICIT base branch
+		// the session originally resolved to (e.g. a `[repo=name#branch]`
+		// description selector), not whatever `determineBaseBranch` would
+		// re-derive today. The session's own persisted
+		// `RepositoryContext.baseBranchName` already carries that resolved
+		// branch per repo (set once in `createCyrusAgentSession`), so reuse
+		// it here as a `baseBranchOverrides` map — the same mechanism
+		// `createCyrusAgentSession` itself passes through — instead of
+		// re-deriving from scratch.
+		//
+		// Only repos whose `baseBranchSource === "commit-ish"` are pinned
+		// this way. Passing an override unconditionally would also disable
+		// worktree continuity (`createSingleRepoWorktree`'s check for an
+		// already-pushed `origin/<issueBranch>`, which only runs when NO
+		// override is given) for the common case where `baseBranchName` is
+		// just an ordinary "default"/graphite/parent-issue resolution rather
+		// than a real user-specified override — silently discarding any WIP
+		// already pushed to the issue's own branch by the persistence floor
+		// and rebranching fresh from the base instead. Leaving those repos
+		// out of the map lets `determineBaseBranch` recompute exactly as it
+		// would for a brand-new session, so continuity keeps working.
+		const baseBranchOverrides = new Map<string, string>();
+		for (const ctx of session.repositories) {
+			if (ctx.baseBranchName && ctx.baseBranchSource === "commit-ish") {
+				baseBranchOverrides.set(ctx.repositoryId, ctx.baseBranchName);
+			}
+		}
+
+		const workspace = this.config.handlers?.createWorkspace
+			? await this.config.handlers.createWorkspace(
+					fullIssue,
+					resolvedRepositories,
+					{
+						baseBranchOverrides:
+							baseBranchOverrides.size > 0 ? baseBranchOverrides : undefined,
+						onRepoSetupHookEvent: (activity) =>
+							this.activityPoster.postRepoSetupHookActivity(
+								sessionId,
+								linearWorkspaceId,
+								activity,
+							),
+					},
+				)
+			: await this.gitService.createGitWorktree(
+					fullIssue,
+					resolvedRepositories,
+					{
+						baseBranchOverrides:
+							baseBranchOverrides.size > 0 ? baseBranchOverrides : undefined,
+						onRepoSetupHookEvent: (activity) =>
+							this.activityPoster.postRepoSetupHookActivity(
+								sessionId,
+								linearWorkspaceId,
+								activity,
+							),
+					},
+				);
+
+		session.workspace = workspace;
+	}
+
+	/**
 	 * Resume or create an Agent session with the given prompt
 	 * This is the core logic for handling prompted agent activities
 	 * @param session The Cyrus agent session
@@ -7144,6 +8047,26 @@ ${input.userComment}
 		commentTimestamp?: string,
 	): Promise<void> {
 		const log = this.logger.withContext({ sessionId });
+
+		// Persistence floor: this turn (new or resumed) may run for a long time
+		// before the session next reaches a terminal state. Touching here —
+		// not only at session end — is what lets the periodic timer keep
+		// re-syncing this issue on every tick while the runner is active, and
+		// (re-)registers this sessionId as live on the issue (idempotent — see
+		// WorkspaceSyncService's refcount). A no-op on non-router platforms
+		// (`workspaceSync` is only constructed when `platform === "router"`).
+		if (session.issue?.identifier) {
+			this.workspaceSync?.touch(session.issue.identifier, sessionId);
+		}
+
+		// A prompt is an explicit instruction to continue, so drop any stop request
+		// left over from a previous turn. Without this, a stop delivered while the
+		// runner was already dead (OOM kill, crash) stays latched and is consumed
+		// by this turn's result — swallowing the prompt and reporting the session
+		// as stopped. Cleared before both branches: the streaming path completes
+		// through the same `completeSession`.
+		agentSessionManager.clearStopRequest(sessionId);
+
 		// Check for existing runner
 		const existingRunner = session.agentRunner;
 
@@ -7196,6 +8119,17 @@ ${input.userComment}
 				`Failed to fetch full issue details for ${issueIdForResume}`,
 			);
 		}
+
+		// Restore-ladder gap-closer: re-create the workspace if it no longer
+		// exists (or was reduced to an empty/invalid directory) before it's
+		// used as the runner's cwd below. See ensureSessionWorkspaceExists.
+		await this.ensureSessionWorkspaceExists(
+			session,
+			repository,
+			fullIssue,
+			sessionId,
+			resolvedWorkspaceId,
+		);
 
 		// Fetch issue labels early to determine runner type
 		const labels = await this.fetchIssueLabels(fullIssue);
