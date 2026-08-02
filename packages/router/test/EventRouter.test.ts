@@ -221,6 +221,7 @@ function makeRouter(
 			eventTtlMs: number;
 			issueLock: boolean;
 			creatorOnlyPrompting: boolean;
+			affinityGraceMs: number;
 		}>;
 	},
 ) {
@@ -246,6 +247,7 @@ function makeRouter(
 			eventTtlMs: TTL_MS,
 			issueLock: true,
 			creatorOnlyPrompting: false,
+			affinityGraceMs: 600_000,
 			...overrides?.config,
 		},
 		logger: overrides?.logger ?? { info: () => {}, warn: () => {} },
@@ -1675,6 +1677,95 @@ describe("EventRouter reconcileDeviceLocks", () => {
 		await expect(
 			router.reconcileDeviceLocks(aliceDevice, []),
 		).resolves.toBeUndefined();
+	});
+});
+
+describe("EventRouter reconcileDeviceAffinity", () => {
+	const GRACE = 600_000;
+	let store: RouterStore;
+	let router: EventRouter;
+	let aliceDevice: number;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+		aliceDevice = enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		({ router } = makeRouter(store, { config: { affinityGraceMs: GRACE } }));
+	});
+
+	it("reclaims an undeclared row older than the grace window", () => {
+		// The PAR-146 shape: affinity for a session that already went terminal,
+		// with no issue lock, because routePrompted sets affinity without one.
+		store.setSessionAffinity("dead-sess", aliceDevice, undefined, 1_000);
+
+		const remaining = router.reconcileDeviceAffinity(
+			aliceDevice,
+			[],
+			1_000 + GRACE + 1,
+		);
+
+		expect(remaining).toBe(0);
+		expect(store.countSessionAffinityForDevice(aliceDevice)).toBe(0);
+	});
+
+	it("keeps an undeclared row still inside the grace window", () => {
+		// Just routed: the worker has the event queued but has not started
+		// tracking the session yet, so it cannot declare it.
+		store.setSessionAffinity("fresh-sess", aliceDevice, undefined, 1_000);
+
+		const remaining = router.reconcileDeviceAffinity(
+			aliceDevice,
+			[],
+			1_000 + GRACE - 1,
+		);
+
+		expect(remaining).toBe(1);
+		expect(store.countSessionAffinityForDevice(aliceDevice)).toBe(1);
+	});
+
+	it("keeps a declared row no matter how old it is", () => {
+		// A session that has legitimately been working for hours.
+		store.setSessionAffinity("live-sess", aliceDevice, undefined, 1_000);
+
+		const remaining = router.reconcileDeviceAffinity(
+			aliceDevice,
+			["live-sess"],
+			1_000 + GRACE * 1_000,
+		);
+
+		expect(remaining).toBe(1);
+		expect(store.countSessionAffinityForDevice(aliceDevice)).toBe(1);
+	});
+
+	it("reclaims nothing when the device declared no list", () => {
+		store.setSessionAffinity("dead-sess", aliceDevice, undefined, 1_000);
+
+		const remaining = router.reconcileDeviceAffinity(
+			aliceDevice,
+			undefined,
+			1_000 + GRACE + 1,
+		);
+
+		expect(remaining).toBe(1);
+		expect(store.countSessionAffinityForDevice(aliceDevice)).toBe(1);
+	});
+
+	it("preserves the creator gate for rows it keeps", () => {
+		store.setSessionAffinity(
+			"live-sess",
+			aliceDevice,
+			JSON.stringify({ id: "u1" }),
+			1_000,
+		);
+
+		router.reconcileDeviceAffinity(
+			aliceDevice,
+			["live-sess"],
+			1_000 + GRACE + 1,
+		);
+
+		expect(store.getSessionCreator("live-sess")).toBe(
+			JSON.stringify({ id: "u1" }),
+		);
 	});
 });
 

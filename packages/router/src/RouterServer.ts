@@ -65,6 +65,10 @@ const DEFAULT_IDLE_STOP_MS = 300_000;
 const DEFAULT_STALE_DESTROY_MS = 1_209_600_000;
 /** 10 minutes — default terminal cleanup grace before forced destruction. */
 const DEFAULT_TEARDOWN_GRACE_MS = 600_000;
+/** 10 minutes — default {@link RouterContainersConfig.affinityGraceMs}. Must
+ *  exceed the worst-case gap between routing a session and the worker starting
+ *  to track it (a cold ACA boot is ~60s). */
+const DEFAULT_AFFINITY_GRACE_MS = 600_000;
 
 /** Per-workspace Linear credentials as stored in `router-config.json`. */
 export interface RouterWorkspaceConfig {
@@ -132,6 +136,8 @@ export interface RouterContainersConfig {
 	staleDestroyMs?: number;
 	/** Default 600_000 (10 minutes). */
 	teardownGraceMs?: number;
+	/** Default 600_000 (10 minutes). */
+	affinityGraceMs?: number;
 	/**
 	 * Extra env-var names a user must have stored before any container boots
 	 * for them, on top of the always-required Claude token. Each entry must be
@@ -410,6 +416,8 @@ export class RouterServer {
 				eventTtlMs: config.eventTtlMs ?? DEFAULT_EVENT_TTL_MS,
 				issueLock: config.issueLock ?? true,
 				creatorOnlyPrompting: config.creatorOnlyPrompting ?? true,
+				affinityGraceMs:
+					config.containers?.affinityGraceMs ?? DEFAULT_AFFINITY_GRACE_MS,
 			},
 			logger: this.logger,
 		});

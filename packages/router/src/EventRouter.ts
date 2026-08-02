@@ -97,6 +97,9 @@ export interface EventRouterOptions {
 		 * {@link DEFAULT_WEBHOOK_CLAIM_RETENTION_MS}.
 		 */
 		webhookClaimRetentionMs?: number;
+		/** An undeclared affinity row younger than this is never reclaimed — it may
+		 *  belong to a session the device was routed but has not started tracking. */
+		affinityGraceMs: number;
 	};
 	logger: { info(msg: string): void; warn(msg: string): void };
 	/** Injectable clock (default `Date.now`) so TTL behavior is deterministic in tests. */
@@ -141,6 +144,9 @@ export class EventRouter {
 		eventTtlMs: number;
 		issueLock: boolean;
 		creatorOnlyPrompting: boolean;
+		/** An undeclared affinity row younger than this is never reclaimed — it may
+		 *  belong to a session the device was routed but has not started tracking. */
+		affinityGraceMs: number;
 	};
 	private readonly webhookClaimRetentionMs: number;
 	private readonly logger: { info(msg: string): void; warn(msg: string): void };
@@ -509,6 +515,54 @@ export class EventRouter {
 				`Reclaimed orphaned lock for issue ${issueId}: device ${deviceId} reconnected without tracking session ${sessionId}`,
 			);
 		}
+	}
+
+	/**
+	 * Re-derives a device's affinity set from what the device says it is running,
+	 * and returns the count that remains.
+	 *
+	 * Affinity is written on routing and cleared only by a terminal frame the
+	 * worker may never send — `routePrompted` re-establishes it for an
+	 * already-terminal session (deliberately; a Linear agent session outlives its
+	 * turns), takes no issue lock, and logs nothing when the device is online. If
+	 * that session never goes terminal again the row is permanent, and
+	 * `ContainerLifecycle.sweep` skips the device at its affinity gate forever.
+	 * That is PAR-146: parked correctly, then ran 28+ minutes at 4 vCPU / 8 GiB.
+	 *
+	 * Two guards, both required:
+	 * - `declared === undefined` means the device could not tell us. Reclaiming
+	 *   would be a guess, so we do nothing.
+	 * - A row younger than `affinityGraceMs` is kept even when undeclared: it may
+	 *   have been routed seconds ago with the event still queued, so the device
+	 *   genuinely cannot declare it yet.
+	 */
+	reconcileDeviceAffinity(
+		deviceId: number,
+		declared: string[] | undefined,
+		nowMs: number,
+	): number {
+		const rows = this.store.listSessionAffinityForDevice(deviceId);
+		if (declared === undefined) return rows.length;
+
+		const declaredSet = new Set(declared);
+		let remaining = 0;
+		for (const { sessionId, establishedMs } of rows) {
+			if (declaredSet.has(sessionId)) {
+				remaining++;
+				continue;
+			}
+			if (nowMs - establishedMs < this.config.affinityGraceMs) {
+				remaining++;
+				continue;
+			}
+			this.store.clearSessionAffinity(sessionId);
+			this.logger.info(
+				`Reclaimed stale affinity for session ${sessionId} on device ${deviceId}: ` +
+					`the device does not report it running (established ${nowMs - establishedMs}ms ago, ` +
+					`grace ${this.config.affinityGraceMs}ms)`,
+			);
+		}
+		return remaining;
 	}
 
 	async sweepExpired(): Promise<void> {
