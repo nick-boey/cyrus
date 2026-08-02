@@ -69,6 +69,11 @@ const DEFAULT_TEARDOWN_GRACE_MS = 600_000;
  *  exceed the worst-case gap between routing a session and the worker starting
  *  to track it (a cold ACA boot is ~60s). */
 const DEFAULT_AFFINITY_GRACE_MS = 600_000;
+/** 1 hour — default {@link RouterContainersConfig.offlineAgeOutMs}. */
+const DEFAULT_OFFLINE_AGE_OUT_MS = 3_600_000;
+/** 5 seconds — default {@link RouterContainersConfig.sessionsQueryTimeoutMs},
+ *  well inside the 60s sweep tick. */
+const DEFAULT_SESSIONS_QUERY_TIMEOUT_MS = 5_000;
 
 /** Per-workspace Linear credentials as stored in `router-config.json`. */
 export interface RouterWorkspaceConfig {
@@ -138,6 +143,10 @@ export interface RouterContainersConfig {
 	teardownGraceMs?: number;
 	/** Default 600_000 (10 minutes). */
 	affinityGraceMs?: number;
+	/** Default 3_600_000 (1 hour). */
+	offlineAgeOutMs?: number;
+	/** Default 5_000 (5 seconds). */
+	sessionsQueryTimeoutMs?: number;
 	/**
 	 * Extra env-var names a user must have stored before any container boots
 	 * for them, on top of the always-required Claude token. Each entry must be
@@ -744,12 +753,31 @@ export class RouterServer {
 			logger: this.logger,
 		});
 
+		const sessionsQueryTimeoutMs =
+			containers.sessionsQueryTimeoutMs ?? DEFAULT_SESSIONS_QUERY_TIMEOUT_MS;
 		this.containerLifecycle = new ContainerLifecycle({
 			store: this.store,
 			executors,
 			idleStopMs: containers.idleStopMs ?? DEFAULT_IDLE_STOP_MS,
 			staleDestroyMs: containers.staleDestroyMs ?? DEFAULT_STALE_DESTROY_MS,
+			offlineAgeOutMs: containers.offlineAgeOutMs ?? DEFAULT_OFFLINE_AGE_OUT_MS,
 			logger: this.logger,
+			sessionReconciler: {
+				isOnline: (deviceId) => this.gateway.isOnline(deviceId),
+				reconcile: async (deviceId) => {
+					const declared = await this.gateway.querySessions(
+						deviceId,
+						sessionsQueryTimeoutMs,
+					);
+					// `undefined` (no answer) flows straight through: reconcileDeviceAffinity
+					// treats it as "can't tell" and reclaims nothing.
+					return this.eventRouter.reconcileDeviceAffinity(
+						deviceId,
+						declared,
+						Date.now(),
+					);
+				},
+			},
 		});
 		this.terminalTeardown = new TerminalTeardown({
 			store: this.store,

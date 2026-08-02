@@ -1,6 +1,19 @@
 import type { ExecutorRegistry } from "cyrus-router-executors";
 import type { ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
 
+/**
+ * Lets the sweep re-derive a device's affinity from the device itself rather
+ * than trusting rows that only ever clear on a frame the worker may never
+ * send. Injected so the sweep stays unit-testable without a gateway.
+ */
+export interface SessionReconciler {
+	/** Reconciles the device's affinity against what it reports running.
+	 *  Returns the affinity count remaining afterwards. */
+	reconcile(deviceId: number): Promise<number>;
+	/** True when the router currently holds a live socket for the device. */
+	isOnline(deviceId: number): boolean;
+}
+
 export interface ContainerLifecycleOptions {
 	store: RouterStore;
 	executors: ExecutorRegistry;
@@ -8,6 +21,12 @@ export interface ContainerLifecycleOptions {
 	idleStopMs: number;
 	/** Backstop: a container untouched past this many ms is destroyed and its device row deleted (default: 14 days). */
 	staleDestroyMs: number;
+	/** Affinity on an OFFLINE device older than this stops blocking the sweep.
+	 *  Safe because an offline device is by definition running nothing, so there
+	 *  is no live session to freeze. Default: 1 hour. */
+	offlineAgeOutMs: number;
+	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
+	sessionReconciler?: SessionReconciler;
 	logger: { info(msg: string): void; warn(msg: string): void };
 	/** Injectable clock (default `Date.now`) so time-based policy is deterministic in tests. */
 	now?: () => number;
@@ -50,6 +69,10 @@ export class ContainerLifecycle {
 	private readonly executors: ExecutorRegistry;
 	private readonly idleStopMs: number;
 	private readonly staleDestroyMs: number;
+	private readonly offlineAgeOutMs: number;
+	private readonly sessionReconciler: SessionReconciler | undefined;
+	/** Devices already reported as pinned, so the 60s tick logs on transition only. */
+	private readonly pinnedDevices = new Set<number>();
 	private readonly logger: { info(msg: string): void; warn(msg: string): void };
 	private readonly now: () => number;
 
@@ -58,8 +81,57 @@ export class ContainerLifecycle {
 		this.executors = opts.executors;
 		this.idleStopMs = opts.idleStopMs;
 		this.staleDestroyMs = opts.staleDestroyMs;
+		this.offlineAgeOutMs = opts.offlineAgeOutMs;
+		this.sessionReconciler = opts.sessionReconciler;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
+	}
+
+	/**
+	 * The affinity count the sweep should actually gate on.
+	 *
+	 * A raw row count is not trustworthy: `routePrompted` can leave affinity for a
+	 * session that never goes terminal again, which pins the device out of
+	 * idle-stop permanently. So we ask the device when we can, and fall back to
+	 * ageing out rows when we cannot — but only for an OFFLINE device, where there
+	 * is no live session that ageing out could freeze.
+	 */
+	private async resolveAffinity(
+		deviceId: number,
+		now: number,
+	): Promise<number> {
+		const affinity = this.store.countSessionAffinityForDevice(deviceId);
+		if (affinity === 0 || !this.sessionReconciler) return affinity;
+
+		if (this.sessionReconciler.isOnline(deviceId)) {
+			return await this.sessionReconciler.reconcile(deviceId);
+		}
+		return this.store
+			.listSessionAffinityForDevice(deviceId)
+			.filter((r) => now - r.establishedMs <= this.offlineAgeOutMs).length;
+	}
+
+	private notePinned(deviceId: number, issueKey: string): void {
+		if (this.pinnedDevices.has(deviceId)) return;
+		this.pinnedDevices.add(deviceId);
+		const held = this.store
+			.listSessionAffinityForDevice(deviceId)
+			.map((r) => r.sessionId)
+			.join(", ");
+		// Logged ABOVE the gate on purpose. Until now this path returned before the
+		// idle-stop diagnostic, so a device pinned out of idle-stop was completely
+		// silent — diagnosing PAR-146 meant downloading and querying the blob backup.
+		this.logger.info(
+			`Container for ${issueKey} (device=${deviceId}) is pinned out of idle-stop ` +
+				`by session affinity: ${held || "none"}`,
+		);
+	}
+
+	private noteUnpinned(deviceId: number): void {
+		if (!this.pinnedDevices.delete(deviceId)) return;
+		this.logger.info(
+			`Container device ${deviceId} is no longer pinned by session affinity`,
+		);
 	}
 
 	async sweep(): Promise<void> {
@@ -85,8 +157,12 @@ export class ContainerLifecycle {
 			const executor = this.executors.get(row.provider);
 			if (!executor) continue;
 			try {
-				const affinity = this.store.countSessionAffinityForDevice(row.deviceId);
-				if (affinity > 0) continue;
+				const affinity = await this.resolveAffinity(row.deviceId, now);
+				if (affinity > 0) {
+					this.notePinned(row.deviceId, row.issueKey);
+					continue;
+				}
+				this.noteUnpinned(row.deviceId);
 				const lastTouch = Math.max(
 					row.lastRoutedMs ?? 0,
 					row.lastSeenMs ?? 0,

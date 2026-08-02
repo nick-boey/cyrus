@@ -109,6 +109,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				artifactsDir: join(dir, "artifacts"),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
+				offlineAgeOutMs: 3_600_000,
 			};
 			server = new RouterServer({
 				port,
@@ -189,6 +190,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				]),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
+				offlineAgeOutMs: 3_600_000,
 				logger: { info: () => {}, warn: () => {} },
 				now: () => Date.now() + IDLE_STOP_MS + 5_000,
 			});
@@ -222,6 +224,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				]),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
+				offlineAgeOutMs: 3_600_000,
 				logger: { info: () => {}, warn: () => {} },
 				now: () => Date.now() + STALE_DESTROY_MS + 5_000,
 			});
@@ -263,6 +266,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 						]),
 						idleStopMs: IDLE_STOP_MS,
 						staleDestroyMs: STALE_DESTROY_MS,
+						offlineAgeOutMs: 3_600_000,
 						logger: { info: () => {}, warn: () => {} },
 						now: () => Date.now(),
 					});
@@ -329,6 +333,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				artifactsDir: join(dir, "artifacts"),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
+				offlineAgeOutMs: 3_600_000,
 			};
 			server = new RouterServer({
 				port,
@@ -565,6 +570,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				artifactsDir: join(dir, "artifacts"),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
+				offlineAgeOutMs: 3_600_000,
 			};
 			server = new RouterServer({
 				port,
@@ -744,6 +750,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					artifactsDir: join(dir, "artifacts"),
 					idleStopMs: IDLE_STOP_MS,
 					staleDestroyMs: STALE_DESTROY_MS,
+					offlineAgeOutMs: 3_600_000,
 				},
 				executorRegistryFactory: () => new Map([["docker", docker]]),
 			});
@@ -978,6 +985,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					// from under the session mid-test.
 					idleStopMs: STALE_DESTROY_MS,
 					staleDestroyMs: STALE_DESTROY_MS,
+					offlineAgeOutMs: 3_600_000,
 				},
 				// Scoped so BOTH the container-targets executor AND RouterServer's
 				// own internal periodic sweep are bounded to this run's container —
@@ -1125,6 +1133,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				]),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
+				offlineAgeOutMs: 3_600_000,
 				logger: { info: () => {}, warn: () => {} },
 				now: () => Date.now() + IDLE_STOP_MS + 5_000,
 			});

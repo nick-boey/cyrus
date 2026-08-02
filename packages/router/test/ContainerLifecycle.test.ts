@@ -80,6 +80,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => createdMs + idleStopMs + 1,
 		});
@@ -109,6 +110,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => now,
 		});
@@ -137,6 +139,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			// Far past idleStopMs — would trigger idle-stop if affinity were ignored.
 			now: () => createdMs + idleStopMs * 10,
@@ -168,6 +171,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => now,
 		});
@@ -188,6 +192,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => now,
 		});
@@ -210,6 +215,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => createdMs + idleStopMs * 10,
 		});
@@ -231,6 +237,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => now,
 		});
@@ -296,6 +303,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs: 900_000,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => 1_000_000,
 		});
@@ -316,6 +324,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs: 14 * 24 * 60 * 60_000, // far in the future — no idle/stale firing
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => 1_000_000,
 		});
@@ -348,6 +357,7 @@ describe("ContainerLifecycle", () => {
 			]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			// Anchor to the good device's clock (broken device's createdMs is close
 			// enough in wall-clock terms that it also qualifies as idle).
@@ -387,6 +397,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs: 900_000,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => 1_000_000,
 		});
@@ -404,6 +415,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>(),
 			idleStopMs: 900_000,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => 1_000_000,
 		});
@@ -439,6 +451,7 @@ describe("ContainerLifecycle", () => {
 			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
 			idleStopMs,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => now,
 		});
@@ -492,6 +505,7 @@ describe("ContainerLifecycle", () => {
 			]),
 			idleStopMs: 900_000,
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
 			logger,
 			now: () => 1_000_000,
 		});
@@ -500,5 +514,190 @@ describe("ContainerLifecycle", () => {
 
 		expect(goodDocker.destroy).toHaveBeenCalledWith("CYPACK-ORPHAN");
 		expect(logger.warn).toHaveBeenCalled();
+	});
+
+	// ── affinity reconciliation ────────────────────────────────────────────
+	// Affinity clears only on a terminal frame the worker may never send, so a
+	// leaked row pins its device out of idle-stop forever. The sweep therefore
+	// re-derives the set from the device before applying its gate.
+
+	it("idle-stops a parked device pinned only by a leaked affinity row", async () => {
+		// PAR-146 (2026-08-02). Session A completed; a later prompt re-established
+		// its affinity via routePrompted (affinity without an issue lock, logged
+		// nowhere). Session B then parked. The sweep's affinity gate skipped the
+		// device forever and it ran 28+ minutes at 4 vCPU / 8 GiB.
+		const { deviceId, createdMs } = makeContainerDevice("PAR-146", "aca");
+		const aca = fakeExecutor("aca", { status: "running" });
+		const idleStopMs = 300_000;
+		const now = createdMs + idleStopMs + 60_000;
+
+		store.setSessionAffinity(
+			"session-a-complete",
+			deviceId,
+			undefined,
+			createdMs,
+		);
+		store.setDeviceParkedAt(deviceId, createdMs + 1_000);
+
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
+			logger,
+			now: () => now,
+			sessionReconciler: {
+				isOnline: () => true,
+				// The worker is up and reports it is running nothing.
+				reconcile: async (id: number) => {
+					store.clearSessionAffinity("session-a-complete");
+					expect(id).toBe(deviceId);
+					return 0;
+				},
+			},
+		});
+
+		await lifecycle.sweep();
+
+		expect(aca.stop).toHaveBeenCalledWith("PAR-146");
+	});
+
+	it("never stops a device whose worker still declares a session", async () => {
+		const { deviceId, createdMs } = makeContainerDevice("PAR-200", "aca");
+		const aca = fakeExecutor("aca", { status: "running" });
+		const idleStopMs = 300_000;
+
+		store.setSessionAffinity("live", deviceId, undefined, createdMs);
+
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
+			logger,
+			now: () => createdMs + idleStopMs * 100,
+			sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+		});
+
+		await lifecycle.sweep();
+
+		expect(aca.stop).not.toHaveBeenCalled();
+	});
+
+	it("does not reconcile a device that has no affinity at all", async () => {
+		const { createdMs } = makeContainerDevice("PAR-201", "aca");
+		const aca = fakeExecutor("aca", { status: "running" });
+		const reconcile = vi.fn(async () => 0);
+
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+			idleStopMs: 300_000,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
+			logger,
+			now: () => createdMs + 300_001,
+			sessionReconciler: { isOnline: () => true, reconcile },
+		});
+
+		await lifecycle.sweep();
+
+		expect(reconcile).not.toHaveBeenCalled();
+		expect(aca.stop).toHaveBeenCalledWith("PAR-201");
+	});
+
+	it("ages out affinity on an offline device so stale-destroy can proceed", async () => {
+		const { deviceId, createdMs } = makeContainerDevice("PAR-202", "aca");
+		const aca = fakeExecutor("aca", { status: "running" });
+		const offlineAgeOutMs = 3_600_000;
+		const reconcile = vi.fn(async () => 1);
+
+		store.setSessionAffinity("orphan", deviceId, undefined, createdMs);
+
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+			idleStopMs: 300_000,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs,
+			logger,
+			now: () => createdMs + offlineAgeOutMs + 1,
+			sessionReconciler: { isOnline: () => false, reconcile },
+		});
+
+		await lifecycle.sweep();
+
+		// Never asked — the device is offline.
+		expect(reconcile).not.toHaveBeenCalled();
+		expect(aca.stop).toHaveBeenCalledWith("PAR-202");
+		// The row itself survives; it carries creator_json for a session that may
+		// still be legitimately re-prompted.
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(1);
+	});
+
+	it("keeps an offline device pinned while its affinity is still fresh", async () => {
+		const { deviceId, createdMs } = makeContainerDevice("PAR-203", "aca");
+		const aca = fakeExecutor("aca", { status: "running" });
+		const offlineAgeOutMs = 3_600_000;
+
+		store.setSessionAffinity("recent", deviceId, undefined, createdMs);
+
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+			idleStopMs: 300_000,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs,
+			logger,
+			now: () => createdMs + offlineAgeOutMs - 1,
+			sessionReconciler: { isOnline: () => false, reconcile: async () => 1 },
+		});
+
+		await lifecycle.sweep();
+
+		expect(aca.stop).not.toHaveBeenCalled();
+	});
+
+	it("logs once when a device becomes pinned and once when it clears", async () => {
+		const { deviceId, createdMs } = makeContainerDevice("PAR-204", "aca");
+		const aca = fakeExecutor("aca", { status: "running" });
+		let remaining = 1;
+
+		store.setSessionAffinity("held", deviceId, undefined, createdMs);
+
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+			idleStopMs: 300_000,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
+			logger,
+			now: () => createdMs + 300_001,
+			sessionReconciler: {
+				isOnline: () => true,
+				reconcile: async () => remaining,
+			},
+		});
+
+		await lifecycle.sweep();
+		await lifecycle.sweep(); // still pinned — must NOT log again
+
+		const pinnedLogs = logger.info.mock.calls.filter(([m]) =>
+			String(m).includes("pinned out of idle-stop"),
+		);
+		expect(pinnedLogs).toHaveLength(1);
+		expect(String(pinnedLogs[0]?.[0])).toContain("held");
+
+		remaining = 0;
+		store.clearSessionAffinity("held");
+		await lifecycle.sweep();
+
+		expect(
+			logger.info.mock.calls.filter(([m]) =>
+				String(m).includes("no longer pinned"),
+			),
+		).toHaveLength(1);
 	});
 });

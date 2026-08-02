@@ -369,6 +369,7 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 			secretsPath,
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
+			offlineAgeOutMs: 3_600_000,
 		};
 
 		server = new RouterServer({
@@ -523,6 +524,7 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 			]),
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
+			offlineAgeOutMs: 3_600_000,
 			logger: { info: () => {}, warn: () => {} },
 			now: () => future,
 		});

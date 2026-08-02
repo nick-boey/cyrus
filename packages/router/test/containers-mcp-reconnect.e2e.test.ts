@@ -268,6 +268,7 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			secretsPath,
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
+			offlineAgeOutMs: 3_600_000,
 		};
 
 		server = new RouterServer({
@@ -365,6 +366,7 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			executors: new Map<string, ContainerExecutor>([["docker", executor]]),
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
+			offlineAgeOutMs: 3_600_000,
 			logger: { info: () => {}, warn: () => {} },
 			now: () => Date.now() + IDLE_STOP_MS + 5_000,
 		});
@@ -492,6 +494,7 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			executors: new Map<string, ContainerExecutor>([["docker", executor]]),
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
+			offlineAgeOutMs: 3_600_000,
 			logger: { info: () => {}, warn: () => {} },
 			now: () => parkedAtMs + IDLE_STOP_MS - 1,
 		});
@@ -506,6 +509,7 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			executors: new Map<string, ContainerExecutor>([["docker", executor]]),
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
+			offlineAgeOutMs: 3_600_000,
 			logger: { info: () => {}, warn: () => {} },
 			now: () => parkedAtMs + IDLE_STOP_MS + 1,
 		});
