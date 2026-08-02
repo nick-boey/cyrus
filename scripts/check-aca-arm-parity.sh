@@ -30,7 +30,10 @@
 #
 set -euo pipefail
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." -- && pwd)"
+# No trailing `--`: that is a second operand to `cd`, not an end-of-options
+# marker. bash 3.2 (macOS) ignores it, bash 5 (CI) fails with "too many
+# arguments" — which is why this only ever broke on the runner.
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BICEP_FILE="${REPO_ROOT}/infra/azure/bicep/sandbox-group.bicep"
 TF_FILE="${REPO_ROOT}/infra/azure/terraform/sandbox.tf"
 

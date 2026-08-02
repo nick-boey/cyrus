@@ -19,6 +19,21 @@ vi.spyOn(process, "exit").mockImplementation((code?: number) => {
 	throw new Error(`process.exit called with ${code}`);
 });
 
+// `secrets migrate` runs past argument validation into a real Key Vault call,
+// and RouterCommand exposes no seam to inject the store. Without this the test
+// depends on how fast the ambient environment fails to reach Azure: on a dev
+// laptop DefaultAzureCredential gives up almost immediately, but on a CI runner
+// it probes the IMDS endpoint with retries and blew the 5s test timeout.
+// Returning no token reproduces the intended outcome — the migration rejects —
+// deterministically and offline, mirroring the Linear stub above.
+vi.mock("@azure/identity", () => ({
+	DefaultAzureCredential: class {
+		async getToken(): Promise<null> {
+			return null;
+		}
+	},
+}));
+
 /**
  * RouterCommand with `resolveIssueGuid` stubbed so `unlock <identifier>` tests
  * never make a live Linear call. Set `resolveResult` to the mapping the stub
