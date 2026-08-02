@@ -268,8 +268,16 @@ describe("AskUserQuestionHandler", () => {
 				order.push("post");
 				return { success: true };
 			});
+			// Awaited directly rather than slept past: a fixed delay turns this
+			// ordering assertion into a race against the event loop, which fails
+			// spuriously on a loaded machine.
+			let markPosted!: () => void;
+			const posted = new Promise<void>((resolve) => {
+				markPosted = resolve;
+			});
 			const onPosted = vi.fn(() => {
 				order.push("posted");
+				markPosted();
 			});
 
 			const resultPromise = handler.handleAskUserQuestion(
@@ -279,7 +287,8 @@ describe("AskUserQuestionHandler", () => {
 				new AbortController().signal,
 				onPosted,
 			);
-			await new Promise((resolve) => setTimeout(resolve, 10));
+			// Times out — a real failure — if the hook is never invoked.
+			await posted;
 
 			expect(order).toEqual(["post", "posted"]);
 
