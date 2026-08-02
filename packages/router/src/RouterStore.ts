@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS rpc_mutations (
   PRIMARY KEY (device_id, mutation_id)
 );
 CREATE TABLE IF NOT EXISTS session_affinity (
-  session_id TEXT PRIMARY KEY, device_id INTEGER NOT NULL, creator_json TEXT
+  session_id TEXT PRIMARY KEY, device_id INTEGER NOT NULL, creator_json TEXT, established_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS issue_affinity (
   issue_id TEXT PRIMARY KEY, device_id INTEGER NOT NULL
@@ -284,6 +284,8 @@ interface SessionAffinityRow {
 	session_id: string;
 	device_id: number;
 	creator_json: string | null;
+	/** NULL only in a hand-edited database; the migration backfills existing rows. */
+	established_ms: number | null;
 }
 
 interface IssueAffinityRow {
@@ -390,6 +392,27 @@ export class RouterStore {
 			!deviceColsNow.some((c) => c.name === "parked_at_ms")
 		) {
 			this.db.exec("ALTER TABLE devices ADD COLUMN parked_at_ms INTEGER");
+		}
+
+		// Existing rows predate the column. Backfill them to migration time rather
+		// than leaving NULL: the offline age-out path reads this as a clock, and
+		// treating every pre-upgrade row as infinitely old would lift the affinity
+		// gate on devices we have not actually verified.
+		const affinityCols = this.db
+			.prepare("PRAGMA table_info(session_affinity)")
+			.all() as Array<{ name: string }>;
+		if (
+			affinityCols.length > 0 &&
+			!affinityCols.some((c) => c.name === "established_ms")
+		) {
+			this.db.exec(
+				"ALTER TABLE session_affinity ADD COLUMN established_ms INTEGER",
+			);
+			this.db
+				.prepare(
+					"UPDATE session_affinity SET established_ms = ? WHERE established_ms IS NULL",
+				)
+				.run(Date.now());
 		}
 	}
 
@@ -1247,16 +1270,18 @@ export class RouterStore {
 		sessionId: string,
 		deviceId: number,
 		creatorJson?: string,
+		establishedMs: number = Date.now(),
 	): void {
 		this.db
 			.prepare(
-				`INSERT INTO session_affinity (session_id, device_id, creator_json)
-				 VALUES (?, ?, ?)
+				`INSERT INTO session_affinity (session_id, device_id, creator_json, established_ms)
+				 VALUES (?, ?, ?, ?)
 				 ON CONFLICT(session_id) DO UPDATE SET
 					device_id = excluded.device_id,
-					creator_json = excluded.creator_json`,
+					creator_json = excluded.creator_json,
+					established_ms = excluded.established_ms`,
 			)
-			.run(sessionId, deviceId, creatorJson ?? null);
+			.run(sessionId, deviceId, creatorJson ?? null, establishedMs);
 		// A device with a live session is by definition not parked. Leaving the
 		// stamp would let the idle clock read from a park that has since ended.
 		this.clearDeviceParkedAt(deviceId);
@@ -1280,6 +1305,31 @@ export class RouterStore {
 		this.db
 			.prepare("DELETE FROM session_affinity WHERE session_id = ?")
 			.run(sessionId);
+	}
+
+	/**
+	 * Affinity rows held for a device, with the time each claim was established.
+	 * `established_ms` is NOT NULL in practice — the schema stamps it on insert and
+	 * the migration backfills existing rows — so a NULL can only come from a
+	 * hand-edited database. Reading that as 0 (ancient) is the safe default:
+	 * reclamation additionally requires the device to not declare the session, so
+	 * an ancient-looking row for a live session is still never reclaimed.
+	 */
+	listSessionAffinityForDevice(
+		deviceId: number,
+	): Array<{ sessionId: string; establishedMs: number }> {
+		const rows = this.db
+			.prepare(
+				"SELECT session_id, established_ms FROM session_affinity WHERE device_id = ? ORDER BY established_ms ASC",
+			)
+			.all(deviceId) as Array<{
+			session_id: string;
+			established_ms: number | null;
+		}>;
+		return rows.map((r) => ({
+			sessionId: r.session_id,
+			establishedMs: r.established_ms ?? 0,
+		}));
 	}
 
 	setIssueAffinity(issueId: string, deviceId: number): void {

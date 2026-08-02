@@ -541,6 +541,42 @@ describe("container devices (schema v2)", () => {
 		expect(store.listContainerDevices()[0]?.lastRoutedMs).toBe(1000);
 	});
 
+	it("stamps established_ms on session affinity and lists it per device", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-1", "aca");
+
+		store.setSessionAffinity("sess-1", deviceId, undefined, 1_000);
+		store.setSessionAffinity("sess-2", deviceId, undefined, 2_000);
+
+		expect(store.listSessionAffinityForDevice(deviceId)).toEqual([
+			{ sessionId: "sess-1", establishedMs: 1_000 },
+			{ sessionId: "sess-2", establishedMs: 2_000 },
+		]);
+	});
+
+	it("refreshes established_ms when affinity is re-established", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-1", "aca");
+
+		store.setSessionAffinity("sess-1", deviceId, undefined, 1_000);
+		// A re-prompt is a fresh claim, not a continuation of the old one.
+		store.setSessionAffinity("sess-1", deviceId, undefined, 9_000);
+
+		expect(store.listSessionAffinityForDevice(deviceId)).toEqual([
+			{ sessionId: "sess-1", establishedMs: 9_000 },
+		]);
+	});
+
+	it("returns an empty list for a device with no affinity", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-1", "aca");
+
+		expect(store.listSessionAffinityForDevice(deviceId)).toEqual([]);
+	});
+
 	it("includes crashed containers in devicesOfflineSince so stranded locks are reclaimed", () => {
 		// A container that died mid-session holds affinity/locks; the existing
 		// offline sweep must reclaim them exactly as for physical devices.
