@@ -207,6 +207,9 @@ const RouterConfigFileSchema = z.object({
 			idleStopMs: z.number().optional(),
 			staleDestroyMs: z.number().optional(),
 			teardownGraceMs: z.number().optional(),
+			affinityGraceMs: z.number().optional(),
+			offlineAgeOutMs: z.number().optional(),
+			sessionsQueryTimeoutMs: z.number().optional(),
 			requiredSecretKeys: z
 				.array(
 					z.string().refine(isStorableSecretKey, {

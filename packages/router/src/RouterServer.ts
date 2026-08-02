@@ -558,6 +558,19 @@ export class RouterServer {
 							`reconcileDeviceLocks failed for device ${deviceId}: ${String(err)}`,
 						);
 					});
+				// Affinity leaks independently of locks: routePrompted writes affinity
+				// with NO issue lock, so reconcileDeviceLocks cannot see those rows.
+				try {
+					this.eventRouter.reconcileDeviceAffinity(
+						deviceId,
+						activeSessions,
+						Date.now(),
+					);
+				} catch (err: unknown) {
+					this.logger.warn(
+						`reconcileDeviceAffinity failed for device ${deviceId}: ${String(err)}`,
+					);
+				}
 			},
 		);
 	}

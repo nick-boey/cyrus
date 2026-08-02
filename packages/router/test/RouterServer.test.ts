@@ -110,7 +110,7 @@ describe("RouterServer session_state", () => {
 	});
 
 	/** Enrolls a device and returns an authenticated socket + a frame reader. */
-	async function connectDevice(srv: RouterServer) {
+	async function connectDevice(srv: RouterServer, activeSessions?: string[]) {
 		srv.store.addUser({ email: "alice@example.com" });
 		const code = srv.store.mintEnrollmentCode("alice@example.com", Date.now());
 		const res = await fetch(`http://127.0.0.1:${srv.port}/enroll`, {
@@ -143,6 +143,7 @@ describe("RouterServer session_state", () => {
 				deviceToken,
 				protocolVersion: PROTOCOL_VERSION,
 				lastAckedSeq: 0,
+				...(activeSessions ? { activeSessions } : {}),
 			}),
 		);
 		expect(JSON.parse(await next()).type).toBe("hello_ack");
@@ -204,6 +205,21 @@ describe("RouterServer session_state", () => {
 			type: "session_state_ack",
 			id: "ss-dup",
 		});
+		ws.terminate();
+	});
+
+	it("reconciles affinity when a device connects, alongside lock reconciliation", async () => {
+		// Both reconcilers must run: locks and affinity leak independently, and
+		// routePrompted produces affinity with NO lock, which the lock reconciler
+		// cannot see.
+		server = makeServer();
+		await server.start();
+		const spy = vi.spyOn(server.eventRouter, "reconcileDeviceAffinity");
+
+		const { ws } = await connectDevice(server, ["sess-live"]);
+
+		await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+		expect(spy).toHaveBeenCalledWith(1, ["sess-live"], expect.any(Number));
 		ws.terminate();
 	});
 });
