@@ -5416,6 +5416,29 @@ ${taskSection}`;
 	}
 
 	/**
+	 * Releases the router-side claim for a prompted event we cannot service.
+	 *
+	 * The router re-establishes session affinity for EVERY prompt, including one
+	 * for an already-completed session (deliberately — a Linear agent session
+	 * outlives its turns). If we then drop the event silently, no terminal frame
+	 * ever follows and that affinity row is permanent, pinning the container out
+	 * of the idle sweep. Non-fatal: reconciliation is the real backstop.
+	 */
+	private signalUnserviceablePrompt(sessionId: string, reason: string): void {
+		if (this.config.platform !== "router") return;
+		try {
+			this.routerConnection?.sendSessionState(sessionId, "error");
+			this.logger.warn(
+				`Released router claim for unserviceable prompt on session ${sessionId}: ${reason}`,
+			);
+		} catch (err) {
+			this.logger.warn(
+				`Failed to release router claim for session ${sessionId}: ${String(err)}`,
+			);
+		}
+	}
+
+	/**
 	 * Handle normal prompted activity (existing session continuation)
 	 * Branch 3 of agentSessionPrompted (see packages/CLAUDE.md)
 	 */
@@ -5432,11 +5455,13 @@ ${taskSection}`;
 
 		if (!issue) {
 			this.logger.warn("Cannot handle prompted activity without issue");
+			this.signalUnserviceablePrompt(sessionId, "missing issue");
 			return;
 		}
 
 		if (!webhook.agentActivity) {
 			this.logger.warn("Cannot handle prompted activity without agentActivity");
+			this.signalUnserviceablePrompt(sessionId, "missing agentActivity");
 			return;
 		}
 
