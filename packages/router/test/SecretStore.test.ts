@@ -196,12 +196,15 @@ describe("SecretStore", () => {
 			"a non-string value",
 			`${JSON.stringify({ "a@x.com": { GIT_TOKEN: 1 } })}`,
 		],
-	])("throws (never resets) on structurally-corrupt-but-valid JSON: %s", (_label, contents) => {
-		const path = freshPath();
-		writeFileSync(path, contents, { mode: 0o600 });
-		const store = new SecretStore(path);
-		expect(() => store.set("b@x.com", "GIT_TOKEN", "y")).toThrow();
-		// Bytes untouched.
-		expect(readFileSync(path, "utf-8")).toBe(contents);
-	});
+	])(
+		"throws (never resets) on structurally-corrupt-but-valid JSON: %s",
+		(_label, contents) => {
+			const path = freshPath();
+			writeFileSync(path, contents, { mode: 0o600 });
+			const store = new SecretStore(path);
+			expect(() => store.set("b@x.com", "GIT_TOKEN", "y")).toThrow();
+			// Bytes untouched.
+			expect(readFileSync(path, "utf-8")).toBe(contents);
+		},
+	);
 });

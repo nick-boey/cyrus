@@ -249,7 +249,7 @@ function generateConfig(env) {
 		} else if (mode === "easyauth-headers") {
 			if (env.CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP !== "true") {
 				fail(
-					'CYRUS_ROUTER_SETUP_UI_AUTH_MODE=easyauth-headers requires CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP=true. Set it only after verifying live that the ingress strips client-supplied X-MS-CLIENT-PRINCIPAL* headers; prefer entra-token, which does not depend on proxy topology.',
+					"CYRUS_ROUTER_SETUP_UI_AUTH_MODE=easyauth-headers requires CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP=true. Set it only after verifying live that the ingress strips client-supplied X-MS-CLIENT-PRINCIPAL* headers; prefer entra-token, which does not depend on proxy topology.",
 				);
 			}
 			auth = { mode, verifiedHeaderStrip: true };
