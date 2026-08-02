@@ -121,20 +121,33 @@ interface DeviceStack {
 	events: AgentEvent[];
 	/** Incremented every time this stack completes a hello handshake. */
 	connects: number;
+	/**
+	 * Sessions this worker is running, as a real worker's session map would
+	 * report them. Backs both the hello `activeSessions` list and the
+	 * `sessions_report` reply the router's affinity reconciliation reads.
+	 */
+	sessions: Set<string>;
 }
 
 async function connectDevice(
 	port: number,
 	deviceToken: string,
 	stateDir: string,
+	/** Shared across boots for an issue, like a worker's persistent session map. */
+	sessions?: Set<string>,
 ): Promise<DeviceStack> {
 	mkdirSync(stateDir, { recursive: true });
+	const liveSessions = sessions ?? new Set<string>();
 	const connection = new RouterConnection({
 		url: `ws://127.0.0.1:${port}`,
 		deviceToken,
 		stateDir,
 		reconnectBaseMs: 20,
 		rpcTimeoutMs: 2000,
+		// Only wired when the caller opts in: declaring sessions also enables
+		// hello-time lock reconciliation, which the older scenarios in this file
+		// deliberately do not exercise.
+		...(sessions ? { getActiveSessions: () => [...liveSessions] } : {}),
 	});
 	connection.on("error", () => {});
 	const stack: DeviceStack = {
@@ -143,6 +156,7 @@ async function connectDevice(
 		tracker: new RouterIssueTrackerService(connection, WORKSPACE),
 		events: [],
 		connects: 0,
+		sessions: liveSessions,
 	};
 	connection.on("connected", () => {
 		stack.connects += 1;
@@ -171,19 +185,30 @@ class ReconnectingExecutor implements ContainerExecutor {
 	readonly stacksByIssue = new Map<string, DeviceStack[]>();
 	private readonly statuses = new Map<string, ContainerStatus>();
 
+	/** Per-issue session sets, surviving reboots like a worker's warm volume. */
+	private readonly sessionsByIssue = new Map<string, Set<string>>();
+
 	constructor(
 		private readonly getPort: () => number,
 		private readonly stateDirRoot: string,
+		/** Opt-in: boot workers that declare their sessions to the router. */
+		private readonly declareSessions = false,
 	) {}
 
 	async ensureRunning(ctx: IssueExecutionContext): Promise<void> {
 		this.ensureRunningCalls.push(ctx.issueKey);
 		if (this.statuses.get(ctx.issueKey) === "running") return;
+		let sessions = this.sessionsByIssue.get(ctx.issueKey);
+		if (this.declareSessions && !sessions) {
+			sessions = new Set<string>();
+			this.sessionsByIssue.set(ctx.issueKey, sessions);
+		}
 		const stack = await connectDevice(
 			this.getPort(),
 			ctx.mintDeviceToken(),
 			// Same state dir across boots — the warm-volume fast path.
 			join(this.stateDirRoot, ctx.issueKey),
+			sessions,
 		);
 		const stacks = this.stacksByIssue.get(ctx.issueKey) ?? [];
 		stacks.push(stack);
@@ -553,5 +578,169 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			server.store.countSessionAffinityForDevice(deviceBefore.deviceId),
 		).toBeGreaterThan(0);
 		expect(deviceAfter?.parkedAtMs).toBeUndefined();
+	});
+});
+
+/**
+ * End-to-end PAR-146: a session that already finished leaves an affinity row
+ * behind (routePrompted re-establishes affinity for every prompt, takes no
+ * issue lock, and logs nothing), and the sweep's `affinity > 0` gate then skips
+ * the device forever. The container ran 28+ minutes at 4 vCPU / 8 GiB.
+ *
+ * The full stack is real here: a real RouterServer, a real WebSocket, and a
+ * real worker that answers `sessions_query` from its own session set. Only the
+ * clock is injected.
+ */
+describe("a leaked affinity row no longer pins a parked container (real RouterServer + real WebSocket)", () => {
+	const LEAK_ISSUE = {
+		id: "issue-leak-1",
+		identifier: "CYLEAK-1",
+		title: "A leaked affinity row must not pin the container",
+	};
+
+	let server: RouterServer;
+	let tracker: CLIIssueTrackerServiceType;
+	let executor: ReconnectingExecutor;
+	let stateDir: string;
+	let secretsDir: string;
+
+	beforeAll(async () => {
+		tracker = new CLIIssueTrackerService();
+		tracker.seedDefaultData();
+		seedIssue(tracker, LEAK_ISSUE);
+		seedSession(tracker, "sess-leak-live", LEAK_ISSUE.id);
+
+		stateDir = mkdtempSync(join(tmpdir(), "cyrus-router-leak-"));
+		secretsDir = mkdtempSync(join(tmpdir(), "cyrus-router-leak-secrets-"));
+		const secretsPath = join(secretsDir, "user-secrets.json");
+		const secrets = new SecretStore(secretsPath);
+
+		// `declareSessions` boots workers that report their live session set —
+		// exactly what a real worker does, and what reconciliation reads.
+		executor = new ReconnectingExecutor(
+			() => server.port,
+			join(stateDir, "devices"),
+			true,
+		);
+
+		const containers: RouterContainersConfig = {
+			image: "cyrus-worker:test",
+			routerUrlForContainers: "ws://host.docker.internal:3456",
+			repositories: [
+				{
+					name: "cyrus",
+					githubSlug: "ceedaragents/cyrus",
+					linearWorkspaceId: WORKSPACE,
+					baseBranch: "main",
+				},
+			],
+			secretsPath,
+			idleStopMs: IDLE_STOP_MS,
+			staleDestroyMs: STALE_DESTROY_MS,
+			offlineAgeOutMs: 3_600_000,
+		};
+
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { [WORKSPACE]: { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => tracker,
+			heartbeatMs: 30_000,
+			logger: { info: () => {}, warn: () => {} },
+			containers,
+			executorRegistryFactory: () =>
+				new Map<string, ContainerExecutor>([["docker", executor]]),
+		});
+		await server.start();
+
+		server.store.addUser({ email: CREATOR.email, linearId: CREATOR.id });
+		server.store.setUserExecutor(
+			CREATOR.email,
+			JSON.stringify({ type: "docker" }),
+		);
+		secrets.set(CREATOR.email, "claudeOauthToken", "fake-claude-token");
+	});
+
+	afterAll(async () => {
+		executor?.closeAll();
+		await server?.stop();
+		rmSync(stateDir, { recursive: true, force: true });
+		rmSync(secretsDir, { recursive: true, force: true });
+	});
+
+	it("idle-stops a parked container that a leaked affinity row is pinning", async () => {
+		await server.eventRouter.route(
+			createdFixture({
+				sessionId: "sess-leak-live",
+				issue: LEAK_ISSUE,
+				creator: CREATOR,
+			}),
+		);
+
+		await vi.waitFor(
+			() => expect(executor.current(LEAK_ISSUE.identifier)).toBeDefined(),
+			{ timeout: 3000 },
+		);
+		const device = server.store.getContainerDeviceForIssue(
+			LEAK_ISSUE.identifier,
+		);
+		if (!device) throw new Error("expected a container device row");
+		const stack = executor.current(LEAK_ISSUE.identifier);
+		if (!stack) throw new Error("expected a device stack");
+
+		// The worker picks the routed session up and starts tracking it.
+		stack.sessions.add("sess-leak-live");
+
+		// …and a session that finished long ago leaves its row behind. Nothing
+		// will ever clear it: no terminal frame is coming, and it holds no lock.
+		const leakedEstablishedMs = Date.now() - 60 * 60_000;
+		server.store.setSessionAffinity(
+			"sess-leak-orphan",
+			device.deviceId,
+			undefined,
+			leakedEstablishedMs,
+		);
+
+		// The live session parks on a question. Affinity for it is released, the
+		// park stamp is set — and the leaked row is all that is left.
+		stack.sessions.delete("sess-leak-live");
+		stack.connection.sendSessionState("sess-leak-live", "parked");
+
+		await vi.waitFor(() =>
+			expect(server.store.countSessionAffinityForDevice(device.deviceId)).toBe(
+				1,
+			),
+		);
+		const parkedAtMs = server.store.getContainerDeviceForIssue(
+			LEAK_ISSUE.identifier,
+		)?.parkedAtMs;
+		if (parkedAtMs === undefined) throw new Error("expected a park stamp");
+
+		// The real sweep, wired exactly as RouterServer wires it — the reconciler
+		// asks the live worker over the real socket — with only the clock injected.
+		const sweep = new ContainerLifecycle({
+			store: server.store,
+			executors: new Map<string, ContainerExecutor>([["docker", executor]]),
+			idleStopMs: IDLE_STOP_MS,
+			staleDestroyMs: STALE_DESTROY_MS,
+			offlineAgeOutMs: 3_600_000,
+			logger: { info: () => {}, warn: () => {} },
+			now: () => parkedAtMs + IDLE_STOP_MS + 1,
+			sessionReconciler: {
+				isOnline: (deviceId) => server.isDeviceOnline(deviceId),
+				reconcile: async (deviceId) =>
+					server.eventRouter.reconcileDeviceAffinity(
+						deviceId,
+						await server.queryDeviceSessions(deviceId, 2_000),
+						Date.now(),
+					),
+			},
+		});
+
+		await sweep.sweep();
+
+		expect(await executor.status(LEAK_ISSUE.identifier)).toBe("stopped");
+		expect(server.store.countSessionAffinityForDevice(device.deviceId)).toBe(0);
 	});
 });

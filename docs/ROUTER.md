@@ -271,6 +271,14 @@ docker compose exec cyrus-router cyrus router unlock <issueId>
   `wss://` and Linear can reach `https://…/linear-webhook`.
 - **Backups:** the `cyrus-router-data` volume is the only state; snapshot it
   (or `sqlite3 /data/router/router.db ".backup …"`) to back up the router.
+- **Deploy the router before the worker image.** `sessions_report` is a new
+  device→router frame, and `DeviceGateway` closes a socket with
+  `1002 invalid frame` on any frame it cannot parse — so a worker that ships
+  ahead of the router would have its connection dropped on the first reply. The
+  reverse is safe: `RouterConnection` ignores unknown server frames, so a router
+  that ships first simply gets no answer and skips reconciliation for that
+  device. A worker image bump already forces sandbox replacement via the
+  `cyrus.disk` label, so correct ordering falls out of the normal rollout.
 
 ---
 

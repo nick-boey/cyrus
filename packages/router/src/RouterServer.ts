@@ -581,6 +581,19 @@ export class RouterServer {
 	 * observe a disconnect (so a subsequent routed event takes the offline
 	 * queue-and-notice path) instead of racing a fixed sleep.
 	 */
+	/**
+	 * Test seam: asks a device which sessions it is running, the same call the
+	 * sweep's affinity reconciler makes. Exposed so the e2e suite can drive the
+	 * real gateway/worker round trip with only the clock injected, rather than
+	 * standing up a second gateway. Resolves `undefined` for "can't tell".
+	 */
+	queryDeviceSessions(
+		deviceId: number,
+		timeoutMs: number,
+	): Promise<string[] | undefined> {
+		return this.gateway.querySessions(deviceId, timeoutMs);
+	}
+
 	isDeviceOnline(deviceId: number): boolean {
 		return this.gateway.isOnline(deviceId);
 	}
