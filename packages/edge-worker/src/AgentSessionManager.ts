@@ -623,8 +623,19 @@ export class AgentSessionManager extends EventEmitter {
 	private async emitTerminalOnce(
 		sessionId: string,
 		state: "complete" | "error" | "stopped",
+		opts?: { force?: boolean },
 	): Promise<void> {
-		if (this.terminalEmittedSessions.has(sessionId)) return;
+		// `force` is for an explicit, user-driven stop that arrives after the
+		// session already went terminal. The guard below exists to swallow a late
+		// *duplicate result* for work that has already been reported; a fresh stop
+		// signal is a different event. The router re-establishes this device's
+		// session affinity when it routes the stop's `prompted` webhook, so
+		// staying silent leaves an affinity row that nothing will ever clear —
+		// and ContainerLifecycle never reclaims a device with affinity > 0
+		// (PAR-146). The flag is deliberately NOT a reset: the session stays in
+		// `terminalEmittedSessions`, so a later duplicate result is still
+		// swallowed exactly as before.
+		if (this.terminalEmittedSessions.has(sessionId) && !opts?.force) return;
 		this.terminalEmittedSessions.add(sessionId);
 
 		const session = this.sessions.get(sessionId);
@@ -665,9 +676,12 @@ export class AgentSessionManager extends EventEmitter {
 	 * sets a flag that `completeSession` consumes, and `completeSession` never
 	 * runs on this path.
 	 */
-	async abortSession(linearAgentActivitySessionId: string): Promise<void> {
+	async abortSession(
+		linearAgentActivitySessionId: string,
+		opts?: { force?: boolean },
+	): Promise<void> {
 		this.activeTasksBySession.delete(linearAgentActivitySessionId);
-		await this.emitTerminalOnce(linearAgentActivitySessionId, "stopped");
+		await this.emitTerminalOnce(linearAgentActivitySessionId, "stopped", opts);
 	}
 
 	/**

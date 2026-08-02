@@ -452,7 +452,46 @@ describe("EdgeWorker - Missing Session/Repository Recovery (CYPACK-852)", () => 
 			);
 			expect(mockAgentSessionManager.abortSession).toHaveBeenCalledWith(
 				"agent-session-legacy-456",
+				{ force: true },
 			);
+		});
+
+		// Routing a stop's `prompted` webhook re-establishes this device's session
+		// affinity on the router. Whatever the worker then decides to do, it owes
+		// the router a terminal frame — otherwise the row it just wrote is never
+		// cleared, and ContainerLifecycle skips any device with affinity > 0, so
+		// the container is neither idle-stopped nor stale-destroyed. PAR-146
+		// device 10 sat pinned for 40+ minutes at 4 vCPU / 8 GiB on this path.
+
+		it("hands ownership back when the stop lands on a session it no longer has", async () => {
+			mockAgentSessionManager.getSession.mockReturnValue(null);
+
+			const webhook = createStopSignalWebhook();
+			await (edgeWorker as any).handleWebhook(webhook, [mockRepository]);
+
+			// Acknowledging the user is not enough on its own — the router is still
+			// holding affinity it will never drop.
+			expect(mockAgentSessionManager.createResponseActivity).toHaveBeenCalled();
+			expect(mockAgentSessionManager.abortSession).toHaveBeenCalledWith(
+				"agent-session-legacy-456",
+				{ force: true },
+			);
+		});
+
+		it("forces the terminal frame so a stop on an already-finished session still releases affinity", async () => {
+			// The session exists but has already gone terminal, so its one-shot is
+			// spent. Without `force` the abort is a silent no-op and the affinity
+			// row the router just wrote strands the device.
+			const stop = vi.fn();
+			mockAgentSessionManager.getSession.mockReturnValue({
+				agentRunner: { stop },
+			});
+
+			const webhook = createStopSignalWebhook();
+			await (edgeWorker as any).handleWebhook(webhook, [mockRepository]);
+
+			const call = mockAgentSessionManager.abortSession.mock.calls.at(-1);
+			expect(call?.[1]).toEqual({ force: true });
 		});
 	});
 

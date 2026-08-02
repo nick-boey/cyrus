@@ -88,12 +88,20 @@ const sessionStateFrame = z.object({
 	// keeping the issue lock so no other session claims the issue mid-
 	// conversation.
 	//
+	// `active` is `parked`'s counterpart and is likewise NOT terminal: the
+	// session resumed without the user ever answering (the elicitation was
+	// abandoned, replaced, or failed). It restores session affinity and clears
+	// the idle stamp. Without it a park is one-way — the device keeps running
+	// with no affinity, so every session-scoped RPC it makes is rejected with
+	// "session not owned by this device" and the whole turn is dropped in
+	// silence (PAR-146).
+	//
 	// Additive: PROTOCOL_VERSION is deliberately NOT bumped, since an older
-	// worker simply never sends this value and bumping would reject it outright.
-	// The corollary is a deploy-ordering requirement — the router must ship
-	// BEFORE the worker image, because an older router cannot parse `parked`
-	// and would drop the device connection on receiving one.
-	state: z.enum(["complete", "error", "stopped", "parked"]),
+	// worker simply never sends these values and bumping would reject it
+	// outright. The corollary is a deploy-ordering requirement — the router must
+	// ship BEFORE the worker image, because an older router cannot parse
+	// `parked`/`active` and would drop the device connection on receiving one.
+	state: z.enum(["complete", "error", "stopped", "parked", "active"]),
 });
 const sessionStateAckFrame = z.object({
 	type: z.literal("session_state_ack"),

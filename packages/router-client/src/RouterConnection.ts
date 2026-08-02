@@ -125,7 +125,7 @@ interface InboxEntry {
 interface SessionStateEntry {
 	id: string;
 	sessionId: string;
-	state: "complete" | "error" | "stopped" | "parked";
+	state: "complete" | "error" | "stopped" | "parked" | "active";
 }
 
 interface PersistedState {
@@ -337,12 +337,13 @@ export class RouterConnection extends EventEmitter {
 	 * lower — losing one costs a suspend rather than stranding an issue, since
 	 * it releases affinity but not the issue lock — but it needs the same
 	 * per-session supersede rule, so a later terminal frame replaces a
-	 * still-unacked `parked` rather than both replaying. Callers MUST pair it
-	 * with {@link discardBufferedSessionState} when the session unparks.
+	 * still-unacked `parked` rather than both replaying. To unpark, call
+	 * {@link sendSessionUnparked} rather than this method — it pairs the wire
+	 * frame with the buffer drop that must accompany it.
 	 */
 	sendSessionState(
 		sessionId: string,
-		state: "complete" | "error" | "stopped" | "parked",
+		state: "complete" | "error" | "stopped" | "parked" | "active",
 	): void {
 		const entry: SessionStateEntry = { id: randomUUID(), sessionId, state };
 		this.appendSessionStateEntry(entry);
@@ -841,6 +842,27 @@ export class RouterConnection extends EventEmitter {
 	 * leaks by dropping the frame: the resumed session re-arms its terminal
 	 * one-shot and emits a fresh frame when it actually finishes.
 	 */
+	/**
+	 * Reverses a park: drops any still-unacked `parked` frame so it can never
+	 * replay, then sends `active` so a park the router has *already applied* is
+	 * undone too.
+	 *
+	 * Both halves are needed, and the second is the one that matters. Discarding
+	 * the buffer alone only helps while the frame is unsent; once the router has
+	 * applied a `parked`, session affinity is gone, and a device with no
+	 * affinity has every session-scoped RPC rejected with "session not owned by
+	 * this device" — silently, for the rest of the turn (PAR-146).
+	 *
+	 * The `active` frame rides the same durable buffer as the terminal states,
+	 * because a lost unpark is precisely what strands a live session. Sending
+	 * one for a session the router never parked is harmless: it ignores an
+	 * `active` with no park on record rather than inventing affinity.
+	 */
+	sendSessionUnparked(sessionId: string): void {
+		this.discardBufferedSessionState(sessionId);
+		this.sendSessionState(sessionId, "active");
+	}
+
 	discardBufferedSessionState(sessionId: string): void {
 		const remaining = this.sessionStateEntries.filter(
 			(e) => e.sessionId !== sessionId,

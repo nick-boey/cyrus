@@ -155,6 +155,24 @@ export class EventRouter {
 	 * still released, only the courtesy post may be skipped).
 	 */
 	private readonly sessionWorkspace = new Map<string, string>();
+	/**
+	 * Sessions currently parked, mapped to the `creator_json` their affinity row
+	 * carried before the park deleted it (`undefined` when they had none).
+	 *
+	 * Two jobs. Membership authorizes an `active` frame — only a session this
+	 * router saw park may have its affinity restored, so a stray or replayed
+	 * frame cannot mint ownership. The value restores `creator_json` intact,
+	 * which matters because that field gates who may prompt the session; writing
+	 * it back as NULL would quietly discard the record.
+	 *
+	 * In-memory for the same reason as {@link sessionWorkspace}: a router
+	 * restart loses the hint, and the creator check falls back to the webhook's
+	 * `agentSession.creator` exactly as it already does after a terminal state.
+	 */
+	private readonly parkedSessionCreators = new Map<
+		string,
+		string | undefined
+	>();
 
 	constructor(opts: EventRouterOptions) {
 		this.store = opts.store;
@@ -359,11 +377,30 @@ export class EventRouter {
 	 *    when the user's answer resumes it.
 	 * It also stamps the park time, which the sweep uses as its idle clock.
 	 *
-	 * Both paths are idempotent: the device replays unacked frames on
+	 * `active` reverses a park the user never answered — the elicitation was
+	 * abandoned, replaced, or failed to post, and the agent went back to work.
+	 * It restores affinity to the sending device and clears the idle stamp,
+	 * keeping the issue lock exactly as `parked` did. Without it a park is
+	 * one-way: the session keeps running with no affinity, so every
+	 * session-scoped RPC it makes is rejected with "session not owned by this
+	 * device" and the entire turn is lost in silence (PAR-146).
+	 *
+	 * All paths are idempotent: the device replays unacked frames on
 	 * reconnect, and the router acks only after applying.
 	 */
 	handleSessionState(deviceId: number, frame: SessionStateFrame): void {
 		if (frame.state === "parked") {
+			// Stashed, not dropped: `clearSessionAffinity` deletes the row that
+			// carries `creator_json`, and that field is the gate on who may prompt
+			// this session. Holding it here lets `active` put it back intact.
+			// In-memory by the same reasoning as `notifiedSessions` below — a
+			// router restart re-derives it from the webhook's `agentSession.creator`.
+			// Always recorded, even when the creator is absent: membership is what
+			// tells `active` this device really parked the session.
+			this.parkedSessionCreators.set(
+				frame.sessionId,
+				this.store.getSessionCreator(frame.sessionId),
+			);
 			this.store.clearSessionAffinity(frame.sessionId);
 			this.store.setDeviceParkedAt(deviceId, this.now());
 			this.logger.info(
@@ -371,6 +408,25 @@ export class EventRouter {
 			);
 			return;
 		}
+		if (frame.state === "active") {
+			// Only for a session this device actually parked. A replayed or stray
+			// `active` must not mint ownership out of nothing.
+			if (!this.parkedSessionCreators.has(frame.sessionId)) {
+				this.logger.info(
+					`Ignoring 'active' for session ${frame.sessionId} on device ${deviceId}: no park on record`,
+				);
+				return;
+			}
+			const creator = this.parkedSessionCreators.get(frame.sessionId);
+			this.parkedSessionCreators.delete(frame.sessionId);
+			// setSessionAffinity clears the device's park stamp as a side effect.
+			this.store.setSessionAffinity(frame.sessionId, deviceId, creator);
+			this.logger.info(
+				`Session ${frame.sessionId} unparked on device ${deviceId}; restored affinity and cleared the idle stamp`,
+			);
+			return;
+		}
+		this.parkedSessionCreators.delete(frame.sessionId);
 		this.store.releaseIssueLockForSession(frame.sessionId);
 		this.store.clearSessionAffinity(frame.sessionId);
 		this.notifiedSessions.delete(frame.sessionId);

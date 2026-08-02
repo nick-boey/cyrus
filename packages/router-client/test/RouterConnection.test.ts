@@ -759,4 +759,51 @@ describe("RouterConnection", () => {
 		expect(readJsonl(bufferPath())).toHaveLength(1);
 		conn.close();
 	});
+
+	// ── unparking ──────────────────────────────────────────────────────────
+	// Dropping the local buffer only helps while the `parked` frame is still
+	// unsent. Once the router has applied one, affinity is gone and nothing
+	// short of a frame on the wire brings it back.
+
+	it("(s) unparking sends an active frame over the wire", async () => {
+		const conn = makeConn();
+		conn.connect();
+		await once(conn, "connected");
+		conn.sendSessionState("sess-1", "parked");
+		await vi.waitFor(() => expect(sessionStates()).toHaveLength(1));
+
+		conn.sendSessionUnparked("sess-1");
+
+		await vi.waitFor(() => expect(sessionStates()).toHaveLength(2));
+		expect(sessionStates()[1]).toMatchObject({
+			sessionId: "sess-1",
+			state: "active",
+		});
+		conn.close();
+	});
+
+	it("(t) unparking also drops a still-unacked parked frame", async () => {
+		const conn = makeConn();
+		conn.sendSessionUnparked("sess-1");
+		// Offline: nothing was ever delivered, so the only thing that matters is
+		// that the stale `parked` can never replay.
+		const buffered = readJsonl(bufferPath()) as Array<{ state: string }>;
+		expect(buffered.filter((e) => e.state === "parked")).toHaveLength(0);
+		conn.close();
+	});
+
+	it("(u) an unacked active frame survives to replay on reconnect", async () => {
+		const conn = makeConn();
+		conn.sendSessionUnparked("sess-1");
+
+		// A lost unpark is what strands a live session with no affinity, so it
+		// needs the same durability the terminal frames get.
+		const buffered = readJsonl(bufferPath()) as Array<{
+			sessionId: string;
+			state: string;
+		}>;
+		expect(buffered).toHaveLength(1);
+		expect(buffered[0]).toMatchObject({ sessionId: "sess-1", state: "active" });
+		conn.close();
+	});
 });

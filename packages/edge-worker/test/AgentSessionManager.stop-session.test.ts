@@ -184,6 +184,68 @@ describe("AgentSessionManager stop-session behavior", () => {
 		expect(terminal).toHaveBeenCalledWith(sessionId, "stopped");
 	});
 
+	it("re-emits sessionTerminal for an explicit stop after the session already finished", async () => {
+		// The one-shot above exists to swallow a *late duplicate result*. An
+		// explicit stop is not that: the router re-established this device's
+		// session affinity when it routed the stop's `prompted` webhook, so the
+		// device must hand ownership back. Staying silent leaves an affinity row
+		// nothing will ever clear, and ContainerLifecycle skips any device with
+		// affinity > 0 — the container is then never idle-stopped nor
+		// stale-destroyed. Observed live on PAR-146 device 10, pinned for 40+
+		// minutes at 4 vCPU / 8 GiB after a stop landed on a completed session.
+		await manager.completeSession(sessionId, {
+			type: "result",
+			subtype: "success",
+			duration_ms: 1,
+			duration_api_ms: 1,
+			is_error: false,
+			num_turns: 1,
+			result: "done",
+			total_cost_usd: 0,
+			usage: {},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: "result-1",
+			session_id: "sdk-session",
+		} as any);
+
+		// Attached after the first terminal so only the re-emit is observed.
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+
+		await manager.abortSession(sessionId, { force: true });
+
+		expect(terminal).toHaveBeenCalledTimes(1);
+		expect(terminal).toHaveBeenCalledWith(sessionId, "stopped");
+	});
+
+	it("a forced terminal does not re-open the one-shot for later duplicates", async () => {
+		await manager.abortSession(sessionId, { force: true });
+
+		const terminal = vi.fn();
+		manager.on("sessionTerminal", terminal);
+
+		// A late SDK result after the forced emit must still be swallowed —
+		// forcing is a one-off for the explicit stop, not a reset.
+		await manager.completeSession(sessionId, {
+			type: "result",
+			subtype: "success",
+			duration_ms: 1,
+			duration_api_ms: 1,
+			is_error: false,
+			num_turns: 1,
+			result: "late",
+			total_cost_usd: 0,
+			usage: {},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: "result-late",
+			session_id: "sdk-session",
+		} as any);
+
+		expect(terminal).not.toHaveBeenCalled();
+	});
+
 	it("still emits sessionTerminal('complete') on a normal finish", async () => {
 		const terminal = vi.fn();
 		manager.on("sessionTerminal", terminal);

@@ -239,6 +239,92 @@ describe("AskUserQuestionHandler", () => {
 		});
 	});
 
+	/**
+	 * The park signal releases the router's session affinity, and
+	 * `createAgentActivity` is a session-scoped RPC — so parking before the post
+	 * makes the post impossible ("session not owned by this device"), which is
+	 * exactly how PAR-146 lost its question and then every activity after it.
+	 * The handler owns the only moment that is safe to park: after the
+	 * elicitation is in front of the user.
+	 */
+	describe("onPosted hook", () => {
+		const input: AskUserQuestionInput = {
+			questions: [
+				{
+					question: "Continue?",
+					header: "Continue",
+					options: [
+						{ label: "Yes", description: "Proceed" },
+						{ label: "No", description: "Stop" },
+					],
+					multiSelect: false,
+				},
+			],
+		};
+
+		it("fires onPosted only after the elicitation reaches Linear", async () => {
+			const order: string[] = [];
+			mockCreateAgentActivity.mockImplementation(async () => {
+				order.push("post");
+				return { success: true };
+			});
+			const onPosted = vi.fn(() => {
+				order.push("posted");
+			});
+
+			const resultPromise = handler.handleAskUserQuestion(
+				input,
+				"session-123",
+				"org-123",
+				new AbortController().signal,
+				onPosted,
+			);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			expect(order).toEqual(["post", "posted"]);
+
+			handler.handleUserResponse("session-123", "Yes");
+			await resultPromise;
+		});
+
+		it("does not fire onPosted when the elicitation post fails", async () => {
+			mockCreateAgentActivity.mockRejectedValue(
+				new Error("session not owned by this device"),
+			);
+			const onPosted = vi.fn();
+
+			const result = await handler.handleAskUserQuestion(
+				input,
+				"session-123",
+				"org-123",
+				new AbortController().signal,
+				onPosted,
+			);
+
+			expect(result.answered).toBe(false);
+			expect(result.message).toContain("Failed to present question to user");
+			// Parking here would strand the session: no question is in front of the
+			// user, so nothing will ever wake it, and the affinity it needs to post
+			// anything at all is gone.
+			expect(onPosted).not.toHaveBeenCalled();
+		});
+
+		it("does not fire onPosted when validation rejects the input", async () => {
+			const onPosted = vi.fn();
+
+			await handler.handleAskUserQuestion(
+				{ questions: [] },
+				"session-123",
+				"org-123",
+				new AbortController().signal,
+				onPosted,
+			);
+
+			expect(mockCreateAgentActivity).not.toHaveBeenCalled();
+			expect(onPosted).not.toHaveBeenCalled();
+		});
+	});
+
 	describe("response handling", () => {
 		it("should resolve promise when user responds", async () => {
 			const input: AskUserQuestionInput = {

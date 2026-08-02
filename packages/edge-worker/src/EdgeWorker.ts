@@ -573,13 +573,19 @@ export class EdgeWorker extends EventEmitter {
 		// on a later reconnect would clear the affinity a live turn is posting
 		// under — the same hazard the `sessionResumed` listener above guards
 		// against for terminal frames.
+		//
+		// Dropping the buffered frame is only half of it, and only the half that
+		// helps while the frame is still unsent. Once the router has applied a
+		// `parked`, affinity is gone on its side, and nothing local can bring it
+		// back — the session runs on with every activity rejected as "session not
+		// owned by this device" (PAR-146). `sendSessionUnparked` does both.
 		this.agentSessionManager.on("sessionUnparked", (sessionId: string) => {
 			if (this.config.platform !== "router") return;
 			try {
-				this.routerConnection?.discardBufferedSessionState(sessionId);
+				this.routerConnection?.sendSessionUnparked(sessionId);
 			} catch (error) {
 				this.logger.error(
-					`Failed to discard the buffered parked frame for session ${sessionId}`,
+					`Failed to unpark session ${sessionId}; it will keep its parked state on the router until the next terminal frame`,
 					error,
 				);
 			}
@@ -5212,6 +5218,16 @@ ${taskSection}`;
 				agentSessionId,
 				`Stop signal received for ${issueTitle}. No active session was found (the session may have ended or the system was restarted). No further action is needed.`,
 			);
+			// Acknowledging the user is not the whole job. Routing this stop's
+			// `prompted` webhook re-established the router's session affinity for
+			// this device, and only a terminal frame drops it again. Returning here
+			// leaves a row nothing will ever clear, and ContainerLifecycle skips
+			// any device with affinity > 0 — so the container is neither
+			// idle-stopped nor stale-destroyed (PAR-146). Forced, because a session
+			// we cannot find may well have emitted its terminal already.
+			await this.agentSessionManager.abortSession(agentSessionId, {
+				force: true,
+			});
 			return;
 		}
 
@@ -5261,7 +5277,15 @@ ${taskSection}`;
 			// runs. Signal the terminal state explicitly, or router mode holds this
 			// issue's lock until an admin runs `cyrus router unlock`. The interrupt
 			// branch below needs no such call: the query still returns a result.
-			await this.agentSessionManager.abortSession(agentSessionId);
+			//
+			// Forced: a stop can land on a session that already finished, whose
+			// terminal one-shot is therefore spent. Routing the stop re-established
+			// the router's session affinity, so a silent no-op here strands that
+			// row and pins the container forever (PAR-146). When the session really
+			// is live the one-shot is unspent and `force` changes nothing.
+			await this.agentSessionManager.abortSession(agentSessionId, {
+				force: true,
+			});
 			this.lastStopTimeBySession.delete(agentSessionId);
 		} else {
 			// First stop on a warm session — interrupt current turn, keep session warm
@@ -7174,14 +7198,15 @@ ${input.userComment}
 			// frame is ever sent and the router would otherwise pin the device
 			// forever (PAR-146).
 			//
-			// Only when nothing will wake the session on its own, though —
-			// suspending a container with a background build in flight freezes it,
-			// and its completion could then never arrive to wake us.
-			const canPark =
-				!this.agentSessionManager.hasPendingWork(linearAgentSessionId);
-			if (canPark) {
-				this.agentSessionManager.emit("sessionParked", linearAgentSessionId);
-			}
+			// But ONLY once the question is actually in front of the user. Parking
+			// releases the router's session affinity, and posting the elicitation
+			// is a session-scoped RPC — so parking first makes the post fail with
+			// "session not owned by this device". That failure is silent and
+			// unrecoverable: no question ever reaches the user, so nothing wakes
+			// the session, and every activity the agent posts for the rest of the
+			// turn is rejected the same way. `RepositoryRouter` parks after its own
+			// successful post for exactly this reason; this is the same ordering.
+			let parked = false;
 			try {
 				// Note: We use linearAgentSessionId (from closure) instead of the passed sessionId
 				// because the passed sessionId is the Claude session ID, not the Linear agent session ID
@@ -7190,12 +7215,25 @@ ${input.userComment}
 					linearAgentSessionId,
 					organizationId,
 					signal,
+					() => {
+						// Evaluated here, not on entry: the post is an await, and a
+						// background task started during it must still block the park.
+						// Suspending a container with a build in flight freezes it, and
+						// its completion could then never arrive to wake us.
+						if (this.agentSessionManager.hasPendingWork(linearAgentSessionId))
+							return;
+						parked = true;
+						this.agentSessionManager.emit(
+							"sessionParked",
+							linearAgentSessionId,
+						);
+					},
 				);
 			} finally {
 				// `finally`, not the success path: an abort or a throw leaves the
 				// session just as unparked, and a still-buffered `parked` frame
 				// would then replay over the next live turn.
-				if (canPark) {
+				if (parked) {
 					this.agentSessionManager.emit(
 						"sessionUnparked",
 						linearAgentSessionId,

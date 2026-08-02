@@ -649,6 +649,144 @@ describe("EventRouter", () => {
 		).toBeUndefined();
 	});
 
+	// ── active (unpark) session state ──────────────────────────────────────
+	// A park that is never answered — the elicitation was abandoned, or the
+	// agent went back to work — must be revocable by the device itself.
+	// Without this the session runs on with no affinity, so every
+	// session-scoped RPC it makes is rejected with "session not owned by this
+	// device" and its whole turn is silently dropped (PAR-146).
+
+	it("(e5) handleSessionState(active) restores affinity and clears the stamp", () => {
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-146", "aca");
+		const { router } = makeRouter(store);
+		store.setSessionAffinity("sess-1", deviceId);
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "ss-2",
+			sessionId: "sess-1",
+			state: "active",
+		});
+
+		expect(store.getSessionAffinity("sess-1")).toBe(deviceId);
+		expect(
+			store.getContainerDeviceForIssue("PAR-146")?.parkedAtMs,
+		).toBeUndefined();
+	});
+
+	it("(e6) handleSessionState(active) preserves the session creator", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router } = makeRouter(store);
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+		const creatorBefore = store.getSessionCreator("sess-1");
+		expect(creatorBefore).toBeDefined();
+
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-2",
+			sessionId: "sess-1",
+			state: "active",
+		});
+
+		// `creator_json` gates who may prompt a session. Restoring affinity with
+		// a null creator would drop that record on the floor.
+		expect(store.getSessionCreator("sess-1")).toBe(creatorBefore);
+	});
+
+	it("(e7) handleSessionState(active) keeps the issue lock held", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router } = makeRouter(store);
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-2",
+			sessionId: "sess-1",
+			state: "active",
+		});
+
+		// Unparking is a resumption, not a completion.
+		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(false);
+	});
+
+	it("(e9) a replayed active after a terminal state cannot resurrect affinity", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router } = makeRouter(store);
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-2",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+
+		// At-least-once delivery means an unacked `active` can arrive after the
+		// session has already finished. Re-pinning a finished session to a device
+		// would block the sweep from ever reclaiming that container.
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-3",
+			sessionId: "sess-1",
+			state: "active",
+		});
+
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+	});
+
+	it("(e8) handleSessionState(active) is inert for a session that never parked", () => {
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-146", "aca");
+		const { router } = makeRouter(store);
+
+		// No affinity, no park. A replayed `active` must not invent ownership for
+		// a session this device does not have.
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-unknown",
+			state: "active",
+		});
+
+		expect(store.getSessionAffinity("sess-unknown")).toBeUndefined();
+	});
+
 	it("(f) sweepExpired posts the TTL expiry activity and frees an undelivered created event's lock", async () => {
 		const aliceDevice = enroll(store, "alice@example.com", {
 			linearId: "lin-alice",
