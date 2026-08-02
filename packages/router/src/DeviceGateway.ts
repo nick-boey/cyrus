@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { Server as HttpServer } from "node:http";
 import {
@@ -8,6 +9,7 @@ import {
 	PROTOCOL_VERSION,
 	parseDeviceFrame,
 	type RpcResponseFrame,
+	SESSIONS_QUERY_CAPABILITY,
 } from "cyrus-router-protocol";
 import { WebSocket, WebSocketServer } from "ws";
 import type { RouterStore } from "./RouterStore.js";
@@ -19,6 +21,7 @@ interface SocketState {
 	isAlive: boolean;
 	missedHeartbeats: number;
 	helloTimer?: NodeJS.Timeout;
+	capabilities?: Set<string>;
 }
 
 /**
@@ -37,6 +40,11 @@ export class DeviceGateway extends EventEmitter {
 	private readonly heartbeatMs: number;
 	private readonly sockets = new Map<number, WebSocket>();
 	private readonly socketState = new WeakMap<WebSocket, SocketState>();
+	private readonly capabilities = new Map<number, Set<string>>();
+	private readonly pendingSessionQueries = new Map<
+		string,
+		{ resolve: (v: string[] | undefined) => void; timer: NodeJS.Timeout }
+	>();
 	private wss: WebSocketServer | undefined;
 	private heartbeatInterval: NodeJS.Timeout | undefined;
 
@@ -102,6 +110,37 @@ export class DeviceGateway extends EventEmitter {
 		ws.send(JSON.stringify({ type: "session_state_ack", id }));
 	}
 
+	/**
+	 * Asks a device which sessions it is currently running.
+	 *
+	 * Resolves `undefined` — never an empty array — when the device is offline,
+	 * does not advertise the capability, or fails to answer in time. Callers
+	 * treat `undefined` as "can't tell, skip" and an empty array as "running
+	 * nothing". Collapsing the two would let a silent device be read as
+	 * permission to reclaim its affinity.
+	 */
+	async querySessions(
+		deviceId: number,
+		timeoutMs: number,
+	): Promise<string[] | undefined> {
+		const ws = this.sockets.get(deviceId);
+		if (!ws || ws.readyState !== WebSocket.OPEN) return undefined;
+		if (!this.capabilities.get(deviceId)?.has(SESSIONS_QUERY_CAPABILITY)) {
+			return undefined;
+		}
+
+		const id = randomUUID();
+		return new Promise<string[] | undefined>((resolve) => {
+			const timer = setTimeout(() => {
+				this.pendingSessionQueries.delete(id);
+				resolve(undefined);
+			}, timeoutMs);
+			timer.unref?.();
+			this.pendingSessionQueries.set(id, { resolve, timer });
+			ws.send(JSON.stringify({ type: "sessions_query", id }));
+		});
+	}
+
 	close(): void {
 		if (this.heartbeatInterval) {
 			clearInterval(this.heartbeatInterval);
@@ -118,6 +157,13 @@ export class DeviceGateway extends EventEmitter {
 			ws.on("error", () => {});
 			ws.close();
 		}
+		// Settle anything in flight so a shutdown cannot hang a caller.
+		for (const [id, pending] of this.pendingSessionQueries) {
+			clearTimeout(pending.timer);
+			pending.resolve(undefined);
+			this.pendingSessionQueries.delete(id);
+		}
+		this.capabilities.clear();
 		this.sockets.clear();
 		if (this.wss) {
 			this.wss.close();
@@ -157,6 +203,7 @@ export class DeviceGateway extends EventEmitter {
 			// stale close must not clear it or report the device offline.
 			if (this.sockets.get(deviceId) === ws) {
 				this.sockets.delete(deviceId);
+				this.capabilities.delete(deviceId);
 				this.emit("deviceDisconnected", deviceId);
 			}
 		});
@@ -198,6 +245,14 @@ export class DeviceGateway extends EventEmitter {
 			case "session_state":
 				this.emit("sessionState", deviceId, frame);
 				break;
+			case "sessions_report": {
+				const pending = this.pendingSessionQueries.get(frame.id);
+				if (!pending) break; // Late or unsolicited reply — the timeout already won.
+				this.pendingSessionQueries.delete(frame.id);
+				clearTimeout(pending.timer);
+				pending.resolve(frame.activeSessions);
+				break;
+			}
 		}
 	}
 
@@ -245,6 +300,8 @@ export class DeviceGateway extends EventEmitter {
 
 		state.deviceId = deviceId;
 		this.sockets.set(deviceId, ws);
+		state.capabilities = new Set(frame.capabilities ?? []);
+		this.capabilities.set(deviceId, state.capabilities);
 
 		ws.send(
 			JSON.stringify({

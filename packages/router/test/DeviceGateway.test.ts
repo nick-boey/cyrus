@@ -427,3 +427,120 @@ describe("DeviceGateway", () => {
 		httpServer.close();
 	});
 });
+
+describe("DeviceGateway.querySessions", () => {
+	/**
+	 * Connects and completes the handshake, optionally advertising capabilities,
+	 * and returns the socket plus a reader positioned after the hello_ack.
+	 */
+	async function connectDevice(
+		port: number,
+		deviceToken: string,
+		capabilities?: string[],
+	) {
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+				...(capabilities ? { capabilities } : {}),
+			}),
+		);
+		await nextMessage(); // hello_ack
+		return { ws, nextMessage };
+	}
+
+	it("returns the device's declared sessions", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		const { ws, nextMessage } = await connectDevice(port, device.deviceToken, [
+			"sessions_query",
+		]);
+
+		const pending = gateway.querySessions(device.deviceId, 1_000);
+
+		const query = JSON.parse(await nextMessage());
+		expect(query).toMatchObject({ type: "sessions_query" });
+		ws.send(
+			JSON.stringify({
+				type: "sessions_report",
+				id: query.id,
+				activeSessions: ["sess-1"],
+			}),
+		);
+
+		await expect(pending).resolves.toEqual(["sess-1"]);
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("distinguishes an empty declared list from no answer", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		const { ws, nextMessage } = await connectDevice(port, device.deviceToken, [
+			"sessions_query",
+		]);
+
+		const pending = gateway.querySessions(device.deviceId, 1_000);
+		const query = JSON.parse(await nextMessage());
+		ws.send(
+			JSON.stringify({
+				type: "sessions_report",
+				id: query.id,
+				activeSessions: [],
+			}),
+		);
+
+		await expect(pending).resolves.toEqual([]);
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("resolves undefined when the device never replies", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		await connectDevice(port, device.deviceToken, ["sessions_query"]);
+
+		await expect(
+			gateway.querySessions(device.deviceId, 20),
+		).resolves.toBeUndefined();
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("resolves undefined without sending anything when the device lacks the capability", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		const { ws } = await connectDevice(port, device.deviceToken);
+		const sent: unknown[] = [];
+		ws.on("message", (raw) => sent.push(JSON.parse(raw.toString())));
+
+		await expect(
+			gateway.querySessions(device.deviceId, 20),
+		).resolves.toBeUndefined();
+		expect(
+			sent.filter((f) => (f as { type: string }).type === "sessions_query"),
+		).toEqual([]);
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("resolves undefined for an offline device", async () => {
+		const { gateway, httpServer } = await setup();
+		await expect(gateway.querySessions(9999, 20)).resolves.toBeUndefined();
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("settles a query in flight when the gateway closes", async () => {
+		// A shutdown mid-sweep must not hang the caller forever.
+		const { gateway, device, port, httpServer } = await setup();
+		await connectDevice(port, device.deviceToken, ["sessions_query"]);
+
+		const pending = gateway.querySessions(device.deviceId, 60_000);
+		gateway.close();
+
+		await expect(pending).resolves.toBeUndefined();
+		httpServer.close();
+	});
+});
