@@ -24,15 +24,24 @@ vi.spyOn(process, "exit").mockImplementation((code?: number) => {
 // depends on how fast the ambient environment fails to reach Azure: on a dev
 // laptop DefaultAzureCredential gives up almost immediately, but on a CI runner
 // it probes the IMDS endpoint with retries and blew the 5s test timeout.
-// Returning no token reproduces the intended outcome — the migration rejects —
-// deterministically and offline, mirroring the Linear stub above.
-vi.mock("@azure/identity", () => ({
-	DefaultAzureCredential: class {
-		async getToken(): Promise<null> {
-			return null;
-		}
-	},
-}));
+//
+// Mocked at `cyrus-router` rather than at `@azure/identity`: the credential is
+// pulled in by a dynamic import inside cyrus-router, which resolves from
+// node_modules and is therefore never transformed by vitest, so mocking it
+// there has no effect. RouterCommand.ts *is* transformed, so intercepting its
+// import is what actually swaps the store out. Everything else is passed
+// through untouched. Mirrors the "never make a live Linear call" stub above.
+vi.mock("cyrus-router", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("cyrus-router")>();
+	return {
+		...actual,
+		KeyVaultSecretStore: class {
+			async listEmails(): Promise<string[]> {
+				throw new Error("Key Vault unreachable (stubbed in tests)");
+			}
+		},
+	};
+});
 
 /**
  * RouterCommand with `resolveIssueGuid` stubbed so `unlock <identifier>` tests
@@ -801,7 +810,10 @@ describe("RouterCommand", () => {
 					"--to-key-id",
 					`https://vault.vault.azure.net/keys/kek/${"a".repeat(32)}`,
 				]),
-			).rejects.toThrow();
+				// Asserting the STUB's message, not just "it threw": that is what
+				// proves execution reached the Key Vault call rather than bailing
+				// out earlier for an unrelated reason.
+			).rejects.toThrow(/Key Vault unreachable \(stubbed in tests\)/);
 			expect(app.logger.error).not.toHaveBeenCalledWith(
 				expect.stringMatching(/Migration target is not configured/),
 			);
