@@ -9,7 +9,7 @@ import {
 	type RpcRequestFrame,
 	type SessionStateFrame,
 } from "cyrus-router-protocol";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type RawData, type WebSocket, WebSocketServer } from "ws";
 import { RouterConnection } from "../src/RouterConnection.js";
 
@@ -187,6 +187,65 @@ describe("RouterConnection", () => {
 		conn.connect();
 		await once(conn, "connected");
 		expect(router.hellos.at(-1)).not.toHaveProperty("activeSessions");
+		conn.close();
+	});
+
+	it("(a4) advertises the sessions_query capability on hello when a provider is wired", async () => {
+		const conn = makeConn({ getActiveSessions: () => ["s1"] });
+		conn.connect();
+		await once(conn, "connected");
+		expect(router.hellos.at(-1)).toMatchObject({
+			type: "hello",
+			capabilities: ["sessions_query"],
+		});
+		conn.close();
+	});
+
+	it("(a5) omits the capability when no provider is wired", async () => {
+		const conn = makeConn();
+		conn.connect();
+		await once(conn, "connected");
+		expect(router.hellos.at(-1)).not.toHaveProperty("capabilities");
+		conn.close();
+	});
+
+	it("(a6) replies to sessions_query with the live session ids and echoes the id", async () => {
+		const conn = makeConn({ getActiveSessions: () => ["s1", "s2"] });
+		conn.connect();
+		await once(conn, "connected");
+
+		router.lastSocket.send(
+			JSON.stringify({ type: "sessions_query", id: "q-7" }),
+		);
+
+		await vi.waitFor(() =>
+			expect(router.received).toContainEqual({
+				type: "sessions_report",
+				id: "q-7",
+				activeSessions: ["s1", "s2"],
+			}),
+		);
+		conn.close();
+	});
+
+	it("(a7) reports an empty list rather than staying silent when nothing is running", async () => {
+		// An empty list is meaningful ("running nothing"); silence would be read
+		// as "can't tell" and leave the container pinned out of idle-stop.
+		const conn = makeConn({ getActiveSessions: () => [] });
+		conn.connect();
+		await once(conn, "connected");
+
+		router.lastSocket.send(
+			JSON.stringify({ type: "sessions_query", id: "q-8" }),
+		);
+
+		await vi.waitFor(() =>
+			expect(router.received).toContainEqual({
+				type: "sessions_report",
+				id: "q-8",
+				activeSessions: [],
+			}),
+		);
 		conn.close();
 	});
 

@@ -19,8 +19,10 @@ import {
 	parseServerFrame,
 	type RpcRequestFrame,
 	type RpcResponseFrame,
+	SESSIONS_QUERY_CAPABILITY,
 	type ServerFrame,
 	type SessionStateAckFrame,
+	type SessionsQueryFrame,
 } from "cyrus-router-protocol";
 import { WebSocket } from "ws";
 import { reviveDates } from "./date-revival.js";
@@ -427,8 +429,15 @@ export class RouterConnection extends EventEmitter {
 			// the device's current sessions. Omit the field entirely when no
 			// provider is wired — the router distinguishes "no list" (skip) from
 			// an empty list (device tracks nothing; reclaim all its locks).
+			// Gating the capability on the same provider is deliberate: without it
+			// there is nothing to answer a query with, and advertising would make
+			// the router wait out its timeout every sweep tick for a reply that can
+			// never come.
 			...(this.getActiveSessions
-				? { activeSessions: this.getActiveSessions() }
+				? {
+						activeSessions: this.getActiveSessions(),
+						capabilities: [SESSIONS_QUERY_CAPABILITY],
+					}
 				: {}),
 		};
 		ws.send(JSON.stringify(frame));
@@ -540,7 +549,28 @@ export class RouterConnection extends EventEmitter {
 			case "session_state_ack":
 				this.onSessionStateAck(frame);
 				break;
+			case "sessions_query":
+				this.onSessionsQuery(frame);
+				break;
 		}
+	}
+
+	/**
+	 * The router asking which sessions we are actually running, so it can reclaim
+	 * affinity rows nothing backs. Always answers — an empty list is meaningful
+	 * ("running nothing"), and staying silent would be read as "can't tell" and
+	 * leave the container pinned.
+	 */
+	private onSessionsQuery(frame: SessionsQueryFrame): void {
+		if (!this.isOnline() || !this.ws) return;
+		const activeSessions = this.getActiveSessions?.() ?? [];
+		this.ws.send(
+			JSON.stringify({
+				type: "sessions_report",
+				id: frame.id,
+				activeSessions,
+			}),
+		);
 	}
 
 	private onHelloAck(frame: HelloAckFrame): void {
