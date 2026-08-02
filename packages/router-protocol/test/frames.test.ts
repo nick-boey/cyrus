@@ -5,6 +5,7 @@ import {
 	parseServerFrame,
 	RPC_METHODS,
 	SESSION_SCOPED_RPC_METHODS,
+	SESSIONS_QUERY_CAPABILITY,
 } from "../src/index.js";
 
 describe("frames", () => {
@@ -78,5 +79,68 @@ describe("frames", () => {
 		for (const m of SESSION_SCOPED_RPC_METHODS) {
 			expect(RPC_METHODS).toContain(m);
 		}
+	});
+});
+
+describe("sessions query frames", () => {
+	it("parses a sessions_query as a server frame", () => {
+		const raw = JSON.stringify({ type: "sessions_query", id: "q-1" });
+		expect(parseServerFrame(raw)).toEqual({
+			type: "sessions_query",
+			id: "q-1",
+		});
+	});
+
+	it("parses a sessions_report as a device frame", () => {
+		const raw = JSON.stringify({
+			type: "sessions_report",
+			id: "q-1",
+			activeSessions: ["sess-1", "sess-2"],
+		});
+		expect(parseDeviceFrame(raw)).toEqual({
+			type: "sessions_report",
+			id: "q-1",
+			activeSessions: ["sess-1", "sess-2"],
+		});
+	});
+
+	it("accepts an empty activeSessions list, distinct from omitting the field", () => {
+		const raw = JSON.stringify({
+			type: "sessions_report",
+			id: "q-1",
+			activeSessions: [],
+		});
+		expect(parseDeviceFrame(raw)).toEqual({
+			type: "sessions_report",
+			id: "q-1",
+			activeSessions: [],
+		});
+		expect(() =>
+			parseDeviceFrame(JSON.stringify({ type: "sessions_report", id: "q-1" })),
+		).toThrow();
+	});
+
+	it("carries optional capabilities on hello without bumping PROTOCOL_VERSION", () => {
+		const withCaps = parseDeviceFrame(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: "t",
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+				capabilities: [SESSIONS_QUERY_CAPABILITY],
+			}),
+		);
+		expect(withCaps).toMatchObject({ capabilities: ["sessions_query"] });
+
+		// An old worker omits the field entirely and must still parse.
+		const withoutCaps = parseDeviceFrame(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: "t",
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+		expect(withoutCaps).not.toHaveProperty("capabilities");
 	});
 });

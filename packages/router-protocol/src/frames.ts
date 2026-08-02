@@ -45,6 +45,16 @@ export const MAX_MISSED_HEARTBEATS = 2;
 export const DEVICE_LIVENESS_TIMEOUT_MS =
 	HEARTBEAT_INTERVAL_MS * MAX_MISSED_HEARTBEATS;
 
+/**
+ * Advertised in `hello.capabilities` by a device that answers `sessions_query`.
+ *
+ * NOT a safety mechanism: a device that omits it simply ignores the frame
+ * (`RouterConnection.handleMessage` swallows unknown server frames), and the
+ * router's query times out into its "can't tell, skip" path. This exists to
+ * turn that 5s timeout per old device per sweep tick into an immediate skip.
+ */
+export const SESSIONS_QUERY_CAPABILITY = "sessions_query";
+
 const helloFrame = z.object({
 	type: z.literal("hello"),
 	deviceToken: z.string().min(1),
@@ -58,6 +68,9 @@ const helloFrame = z.object({
 	// router reads as "unknown" and skips reclamation for — preserving
 	// pre-reconcile behavior rather than wrongly releasing every lock.
 	activeSessions: z.array(z.string()).optional(),
+	// Feature flags the device supports, e.g. SESSIONS_QUERY_CAPABILITY.
+	// Optional and additive: it does NOT bump PROTOCOL_VERSION.
+	capabilities: z.array(z.string()).optional(),
 });
 const eventAckFrame = z.object({
 	type: z.literal("event_ack"),
@@ -107,6 +120,18 @@ const sessionStateAckFrame = z.object({
 	type: z.literal("session_state_ack"),
 	id: z.string().min(1),
 });
+const sessionsQueryFrame = z.object({
+	type: z.literal("sessions_query"),
+	id: z.string().min(1),
+});
+const sessionsReportFrame = z.object({
+	type: z.literal("sessions_report"),
+	id: z.string().min(1),
+	// Required, not optional: an ABSENT list means "can't tell" and an EMPTY
+	// list means "I am running nothing". Collapsing them would let a malformed
+	// reply be read as permission to reclaim every row.
+	activeSessions: z.array(z.string()),
+});
 const helloAckFrame = z.object({
 	type: z.literal("hello_ack"),
 	user: z.object({
@@ -144,6 +169,7 @@ const deviceFrame = z.discriminatedUnion("type", [
 	eventAckFrame,
 	rpcRequestFrame,
 	sessionStateFrame,
+	sessionsReportFrame,
 ]);
 const serverFrame = z.discriminatedUnion("type", [
 	helloAckFrame,
@@ -151,6 +177,7 @@ const serverFrame = z.discriminatedUnion("type", [
 	eventFrame,
 	rpcResponseFrame,
 	sessionStateAckFrame,
+	sessionsQueryFrame,
 ]);
 
 export type HelloFrame = z.infer<typeof helloFrame>;
@@ -158,6 +185,8 @@ export type EventAckFrame = z.infer<typeof eventAckFrame>;
 export type RpcRequestFrame = z.infer<typeof rpcRequestFrame>;
 export type SessionStateFrame = z.infer<typeof sessionStateFrame>;
 export type SessionStateAckFrame = z.infer<typeof sessionStateAckFrame>;
+export type SessionsQueryFrame = z.infer<typeof sessionsQueryFrame>;
+export type SessionsReportFrame = z.infer<typeof sessionsReportFrame>;
 export type HelloAckFrame = z.infer<typeof helloAckFrame>;
 export type HelloErrorFrame = z.infer<typeof helloErrorFrame>;
 export type EventFrame = z.infer<typeof eventFrame>;
