@@ -133,11 +133,24 @@ Two new frames, both additive:
 extensible field rather than a boolean per feature. The router sends
 `sessions_query` only to devices advertising `"sessions_query"`.
 
-**`PROTOCOL_VERSION` is not bumped.** `parseServerFrame` is a
-`discriminatedUnion.parse`, so an old worker receiving `sessions_query` would
-throw and drop its connection — worse than the old-router/new-worker case the
-park design guarded against. The capability flag makes old workers simply never
-queried; they behave exactly as today.
+**`PROTOCOL_VERSION` is not bumped.** The two sides handle unknown frames
+asymmetrically, and the direction matters:
+
+- **Client is lenient.** `RouterConnection.handleMessage` catches the
+  `parseServerFrame` throw and returns (`RouterConnection.ts:524-525`,
+  `// Ignore unparseable / unknown frames`). An old worker sent a
+  `sessions_query` therefore ignores it and simply never replies — which lands
+  on the `undefined` "can't tell, skip" path that is already correct. Sending
+  the frame to an old worker is safe.
+- **Router is strict.** `DeviceGateway.handleMessage` closes the socket with
+  `1002 invalid frame` on a parse failure (`DeviceGateway.ts:173-176`). An
+  **old router** receiving `sessions_report` from a new worker would drop that
+  device's connection.
+
+So the capability flag is **not** a safety mechanism — it is a latency
+optimization that turns a 5s timeout per old device per sweep tick into an
+immediate skip. The genuine compatibility constraint is the router-side
+strictness, which is exactly why deploy ordering below is load-bearing.
 
 The existing three-way distinction carries over unchanged: **absent** = "can't
 tell, skip"; **empty array** = "device tracks nothing, reclaim everything".
@@ -240,7 +253,7 @@ tracked in an in-memory set.
 | Device declares the session | Affinity kept — the normal case |
 | Undeclared, older than grace | Reclaimed and logged — the bug in this incident |
 | Undeclared, within grace | Kept. Covers the routed-but-not-yet-tracked race the pending-events bail was reaching for |
-| Old worker, no capability | Never queried, never guessed. Heals on next reconnect via the connect path |
+| Old worker, no capability | Never queried, never guessed. Heals on next reconnect via the connect path. Even if queried it would ignore the frame and time out into the same path |
 | Query times out or errors | Skip, log, retry next tick. Never reclaim on silence |
 | Reclaim races a terminal frame | Both delete the same row — idempotent |
 | Reclaim races a fresh route | Grace window covers it; store is re-read before acting |
