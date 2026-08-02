@@ -104,7 +104,7 @@ export class CodexConfigBuilder {
 	private buildEnvOverride(
 		codexHome: string,
 	): Record<string, string> | undefined {
-		if (!this.config.codexHome) {
+		if (!this.config.codexHome && !this.config.additionalEnv) {
 			return undefined;
 		}
 		const env: Record<string, string> = {};
@@ -112,6 +112,9 @@ export class CodexConfigBuilder {
 			if (typeof value === "string") {
 				env[key] = value;
 			}
+		}
+		if (this.config.additionalEnv) {
+			Object.assign(env, this.config.additionalEnv);
 		}
 		env.CODEX_HOME = codexHome;
 		return env;
@@ -203,10 +206,18 @@ export class CodexConfigBuilder {
 			const { execFile } = await import("node:child_process");
 			const { promisify } = await import("node:util");
 			const execFileAsync = promisify(execFile);
+			// Run the check against the SAME Codex home the session will use —
+			// otherwise a per-user codexHome would be probed via the host's
+			// global ~/.codex login state.
 			const { stdout, stderr } = await execFileAsync(
 				codexBin,
 				["login", "status"],
-				{ timeout: 5_000 },
+				{
+					timeout: 5_000,
+					env: this.config.codexHome
+						? { ...process.env, CODEX_HOME: this.config.codexHome }
+						: process.env,
+				},
 			);
 			const result = /logged in using chatgpt/i.test(stdout + stderr);
 			console.log(

@@ -456,7 +456,29 @@ The agent automatically moves issues to the "started" state when assigned. Linea
 
    Symptom of forgetting this: self-host sessions crash with `ENOENT: no such file or directory, open '~/.cyrus/...'` while cloud sessions (which get absolute paths from cyrus-hosted) work fine. This bit us with the three platform MCP config arrays added in CYHOST-967 / v0.2.53 — they were the only path-bearing fields on `EdgeWorkerConfig` that bypassed normalization, and crashed every self-host session that had a connected platform MCP integration.
 
+12. **ACA executor and Azure router invariants**:
+   - ACA sandboxes use server-assigned GUIDs; issue identity is labels-only (`cyrus.issue`, `cyrus.device-id`, `cyrus.disk`). The ARM sandbox-group body is `properties: {}` and has no `maxSandboxCount` or default CPU/memory/disk fields. Per-sandbox create config is the source of truth.
+   - ACA `Running` is infrastructure state, not worker-process liveness: an exited entrypoint can leave `tini` and the sandbox Running. Reconciliation must include router device/WSS heartbeat state. This applies to `resumeSandbox` too — `AcaSandboxesProvider` polls the router's `deviceConnectivity` seam after a resume (`resumeConnectTimeoutMs`, default 90s) and replaces a sandbox whose worker never rejoins, rather than reporting success on infrastructure state alone.
+   - Suspend delivers no SIGTERM. Keep ACA auto-suspend disabled and let the affinity-aware router idle sweep stop workers. Explicit snapshots preserve env/device tokens, require lineage checks, and are never garbage-collected by Azure.
+   - A memory suspend also **freezes every JavaScript timer** in the sandbox, so any device-side liveness check must compare **wall-clock** time (`Date.now()`), never accumulated timer ticks — a tick-counting check sees no gap after resume. `RouterConnection`'s watchdog terminates its socket after `MAX_MISSED_HEARTBEATS` × the router's advertised `heartbeatMs` of inbound silence (both constants live in `cyrus-router-protocol`; the router advertises its real cadence in `hello_ack`). Derive new liveness deadlines from those constants rather than hardcoding a number.
+   - Azure router hosting must remain one replica. SQLite stays on ephemeral local storage and is periodically backed up to Blob; Azure Files is for artifact bundles, not SQLite WAL. Blob restores are at-least-once within the backup interval, and overlapping revision uploads can be out of order.
+   - `containers.keyVaultUrl` selects the Key Vault secret backend. Rotated per-user values reach only create-from-image; destroy and re-prompt existing issues to apply them. Entra enrollment uses one app registration/audience per router deployment.
+   - Terminal teardown order is force floor flush, WIP/teardown/worktree removal, authenticated callback, provider destroy (including snapshots), then device-row deletion; only deleted issues lose their floor bundle. Self-actored closes and Linear's `duplicate` state miss `issueStatusChanged` and rely on stale GC/manual cleanup.
+   - The teardown callback is durable on both sides. Device: `TeardownCallbackQueue` records the intent (plus its idempotency key) to `~/.cyrus/router-client/teardown-callbacks.jsonl` **synchronously, before the first `await` of `handleIssueStateChangeMessage`** — that is what puts the write inside the window where `RouterConnection`'s inbox entry is still unprocessed, so a kill anywhere in the sequence replays instead of losing the callback. It replays on the connection's `"connected"` event and retries the same key with backoff. Router: `TerminalTeardown` mirrors each pending teardown into the `container_teardowns` table so the out-of-process `router containers list` can render its `TEARDOWN` column; that mirror is observability + retry accounting, NOT a restart journal, and is cleared on construction to match the coordinator's empty in-memory state. Re-delivered callbacks log as `callback retry`, distinct from `grace expiry`.
+   - `ContainerTargets.inFlightBoots` joins a concurrent boot **only as a dedup of overlapping `ensureRunning`/`mintDeviceToken` work — never as evidence the container ended up running**. The joined attempt may predate the event the joiner is reacting to (classically: the idle sweep parked the container while it was still starting), so after joining, re-check `executor.status()` and boot for real if it is not running. Getting this wrong silently swallows a terminal-teardown wake, and only the grace deadline then reclaims the container. An attempt in flight past `BOOT_JOIN_TIMEOUT_MS` is abandoned rather than joined, so a hung provider call cannot permanently disable booting for a device. Every `AcaSandboxClient` request also carries a `requestTimeoutMs` deadline (default 120s) because Node's `fetch` has none, and an unbounded call blocks the provider mutex and the boot slot behind it.
+   - Before Azure stack deletion, destroy managed sandboxes and sweep snapshots before destroying the sandbox group. Keep the operator Blob role for corrupt-backup break glass. See `infra/azure/README.md` and `docs/ROUTER.md`.
+
 ## Dependency Security Policy (MANDATE)
+
+> **Config location (pnpm ≥10):** The root `package.json` `pnpm` field
+> (`pnpm.overrides`, `pnpm.onlyBuiltDependencies`) is **no longer read** by the
+> pinned pnpm (`packageManager: pnpm@10.33.1` emits a warning and ignores it).
+> Both settings now live in the root **`pnpm-workspace.yaml`** (`overrides:` and
+> `onlyBuiltDependencies:` top-level keys). Add/edit overrides and native-build
+> allowlist entries **there**, not in `package.json`. A new native dependency
+> (e.g. `better-sqlite3`) must be added to `pnpm-workspace.yaml`'s
+> `onlyBuiltDependencies` list. Any overrides still sitting in `package.json`'s
+> `pnpm` block are inert until migrated to `pnpm-workspace.yaml`.
 
 Our team's mandated approach for addressing Dependabot advisories and other
 transitive-dependency vulnerabilities:
@@ -468,18 +490,19 @@ transitive-dependency vulnerabilities:
    transitive. Regenerate the lockfile and let pnpm's natural resolution do the
    work.
 
-2. **Only use root `pnpm.overrides` when a direct-dep bump cannot reach the
-   vulnerable transitive.** This is the fallback for deep transitives (3+
-   levels deep) whose owning direct dep has no released version that resolves
-   to the patched transitive — typically because upstream hasn't released yet
-   or pins its transitive too loosely for us to reach. Document the reason
-   inline with a brief comment or commit message.
+2. **Only use the root `overrides` map in `pnpm-workspace.yaml` when a
+   direct-dep bump cannot reach the vulnerable transitive.** This is the
+   fallback for deep transitives (3+ levels deep) whose owning direct dep has no
+   released version that resolves to the patched transitive — typically because
+   upstream hasn't released yet or pins its transitive too loosely for us to
+   reach. Document the reason inline with a brief comment or commit message.
 
 3. **Always clean up overrides when a future dep bump makes them redundant.**
    When you update a direct dependency (security or otherwise), check whether
-   any existing entry in `pnpm.overrides` is now satisfied naturally by the
-   new resolution. If so, **remove that override in the same change**. Verify
-   with `pnpm install && pnpm audit` that the removal is safe before committing.
+   any existing entry in `pnpm-workspace.yaml`'s `overrides` is now satisfied
+   naturally by the new resolution. If so, **remove that override in the same
+   change**. Verify with `pnpm install && pnpm audit` that the removal is safe
+   before committing.
 
 4. **Verify with `pnpm audit`.** After any dependency change, `pnpm audit`
    must report zero advisories. Commit the regenerated `pnpm-lock.yaml`

@@ -3,6 +3,7 @@ export { LinearEventTransport } from "./LinearEventTransport.js";
 export {
 	LinearIssueTrackerService,
 	type LinearOAuthConfig,
+	LinearRefreshTokenRejectedError,
 } from "./LinearIssueTrackerService.js";
 export { LinearMessageTranslator } from "./LinearMessageTranslator.js";
 export type {

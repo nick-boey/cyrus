@@ -115,11 +115,15 @@ describe("AppServerCodexBackend", () => {
 			codexPath: "/bin/true",
 			configOverrides: { mcp_servers: { linear: { command: "linear-mcp" } } },
 		});
+		// Assert the request happened before reading through it: member access on
+		// the optional chain's undefined would throw a TypeError rather than fail.
+		const startReq = client.lastRequest("thread/start");
+		expect(startReq).toBeDefined();
 		const cfg = (
-			client.lastRequest("thread/start")?.params as {
+			startReq?.params as {
 				config?: Record<string, unknown>;
 			}
-		).config;
+		)?.config;
 		expect(cfg?.mcp_servers).toEqual({ linear: { command: "linear-mcp" } });
 	});
 
@@ -215,9 +219,12 @@ describe("AppServerCodexBackend", () => {
 
 		const turnDone = backend.runTurn([{ type: "text", text: "go" }]);
 		await Promise.resolve();
+		// toBeUndefined() would also pass if no request were made at all, so pin
+		// the request's existence separately.
+		const turnReq = client.lastRequest("turn/start");
+		expect(turnReq).toBeDefined();
 		expect(
-			(client.lastRequest("turn/start")?.params as { sandboxPolicy?: unknown })
-				.sandboxPolicy,
+			(turnReq?.params as { sandboxPolicy?: unknown })?.sandboxPolicy,
 		).toBeUndefined();
 		client.push("turn/completed", {
 			threadId: "thread-1",
@@ -236,9 +243,10 @@ describe("AppServerCodexBackend", () => {
 		});
 		const turnDone = backend.runTurn([{ type: "text", text: "go" }]);
 		await Promise.resolve();
+		const schemaReq = client.lastRequest("turn/start");
+		expect(schemaReq).toBeDefined();
 		expect(
-			(client.lastRequest("turn/start")?.params as { outputSchema?: unknown })
-				.outputSchema,
+			(schemaReq?.params as { outputSchema?: unknown })?.outputSchema,
 		).toEqual(schema);
 		client.push("turn/completed", {
 			threadId: "thread-1",

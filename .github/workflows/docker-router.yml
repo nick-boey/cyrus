@@ -1,0 +1,88 @@
+name: Docker Router Image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: docker-router-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag immutability matters for durable deployments (the Azure router
+      # Container App). IMMUTABLE — safe to pin in Terraform:
+      #   type=semver {{version}}  -> v1.2.3   (a release tag is cut once)
+      #   type=sha                 -> sha-a1b2c3d
+      # MUTABLE — convenience only, NEVER pin these in a durable environment:
+      #   type=ref,event=branch    -> main, deploy, …
+      #   type=semver {{major}}.{{minor}} -> 1.2 (moves on each patch)
+      #   type=raw latest
+      # `infra/azure/terraform` REJECTS mutable refs for `router_image` /
+      # `worker_image`. See infra/azure/README.md → "Router image tag policy".
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cyrus-router
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/router/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Echo only the refs that are safe to pin, so an operator deploying the
+      # Azure router can copy one straight into dev.tfvars.
+      - name: Summarize immutable refs
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/cyrus-router
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo '### Immutable router image refs (pin one of these)'
+            echo
+            echo '```hcl'
+            echo "router_image = \"${IMAGE}@${DIGEST}\""
+            echo "router_image = \"${IMAGE}:sha-$(git rev-parse --short=7 HEAD)\""
+            echo '```'
+            echo
+            echo 'Never pin a branch tag or `:latest` in a durable environment —'
+            echo 'see infra/azure/README.md → "Router image tag policy".'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -21,7 +21,11 @@ import {
 	type SessionCronSummary,
 	type StopHookInput,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentPendingWork, AskUserQuestionInput } from "cyrus-core";
+import type {
+	AgentPendingWork,
+	AskUserQuestionInput,
+	LiveBackgroundTask,
+} from "cyrus-core";
 import {
 	createLogger,
 	type IAgentRunner,
@@ -36,14 +40,12 @@ import {
 	checkLinuxSandboxRequirements,
 	logSandboxRequirementFailures,
 } from "./sandbox-requirements.js";
-import {
-	buildBaseSessionEnv,
-	normalizeMcpHttpTransport,
-} from "./session-env.js";
+import { composeSessionEnv, normalizeMcpHttpTransport } from "./session-env.js";
 import type {
 	ClaudeRunnerConfig,
 	ClaudeRunnerEvents,
 	ClaudeSessionInfo,
+	McpServerStatusReport,
 } from "./types.js";
 
 // AbortError is no longer exported in v1.0.95, so we define it locally
@@ -276,6 +278,18 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	private keepSessionWarm: boolean;
 	private pendingSessionCrons: SessionCronSummary[] = [];
 	private pendingBackgroundTasks: BackgroundTaskSummary[] = [];
+	/**
+	 * Live background tasks, keyed by task id, from the SDK's
+	 * `background_tasks_changed` level signal.
+	 *
+	 * REPLACE semantics — the SDK emits the full set on every membership
+	 * change, so merging would leak completed tasks and wedge
+	 * {@link hasPendingWork} on forever. Unlike
+	 * {@link pendingBackgroundTasks} (Stop hook only, reset per turn) this is
+	 * populated MID-turn, which is what lets a session blocked on an
+	 * elicitation tell whether it is genuinely safe to suspend.
+	 */
+	private liveBackgroundTasks = new Map<string, LiveBackgroundTask>();
 
 	constructor(config: ClaudeRunnerConfig, keepSessionWarm = false) {
 		super();
@@ -469,6 +483,10 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 		// Reset pending-work state from any previous query on this runner
 		this.pendingSessionCrons = [];
 		this.pendingBackgroundTasks = [];
+		// The level signal is per-CLI-process and nothing is emitted at startup,
+		// so a set carried across a restart would never be corrected and would
+		// block this session's suspends forever.
+		this.liveBackgroundTasks.clear();
 
 		const isResumed = !!this.config.resumeSessionId;
 		this.logger.event(isResumed ? "session_resumed" : "session_started", {
@@ -668,14 +686,17 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					// see: https://docs.claude.com/en/docs/claude-code/sdk/migration-guide#settings-sources-no-longer-loaded-by-default
 					settingSources: ["user", "project", "local"],
 					env: {
-						...buildBaseSessionEnv(),
 						// CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is intentionally NOT set while
 						// the Linux bubblewrap sandbox side effects it triggers are being
 						// investigated. The sandbox requirements precheck is still run
 						// above so the diagnostics remain available when we re-enable.
 						// See: CYPACK-1108.
-						...this.repositoryEnv,
-						...this.config.additionalEnv,
+						// composeSessionEnv merges base env → repository .env →
+						// additionalEnv.
+						...composeSessionEnv({
+							repositoryEnv: this.repositoryEnv,
+							additionalEnv: this.config.additionalEnv,
+						}),
 						// When logging at DEBUG level, enable the SDK's own debug output so
 						// --debug-to-stderr and DEBUG=1 propagate to the Claude subprocess.
 						// Explicitly set or unset to override any leaked value from process.env.
@@ -822,6 +843,7 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					claudeSessionId: this.sessionInfo?.sessionId,
 				});
 				this.emit("message", message);
+				this.recordLiveBackgroundTasks(message);
 				this.processMessage(message);
 				if (
 					message.type === "result" &&
@@ -1020,7 +1042,39 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 		return {
 			sessionCrons: [...this.pendingSessionCrons],
 			backgroundTasks: [...this.pendingBackgroundTasks],
+			liveBackgroundTasks: [...this.liveBackgroundTasks.values()],
 		};
+	}
+
+	/**
+	 * Swap the live background-task set for the payload of a
+	 * `background_tasks_changed` message. A no-op for every other message.
+	 *
+	 * Deliberately a wholesale replace: the SDK documents this as a level
+	 * signal precisely so a consumer that missed an edge cannot be left with a
+	 * stale "still running" entry.
+	 */
+	private recordLiveBackgroundTasks(message: SDKMessage): void {
+		if (
+			message.type !== "system" ||
+			message.subtype !== "background_tasks_changed"
+		) {
+			return;
+		}
+		this.liveBackgroundTasks = new Map(
+			message.tasks.map((task) => [
+				task.task_id,
+				{
+					taskId: task.task_id,
+					taskType: task.task_type,
+					description: task.description,
+				},
+			]),
+		);
+		this.logger.event("live_background_tasks_changed", {
+			liveBackgroundTaskCount: this.liveBackgroundTasks.size,
+			claudeSessionId: this.sessionInfo?.sessionId,
+		});
 	}
 
 	/**
@@ -1030,7 +1084,8 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	hasPendingWork(): boolean {
 		return (
 			this.pendingSessionCrons.length > 0 ||
-			this.pendingBackgroundTasks.length > 0
+			this.pendingBackgroundTasks.length > 0 ||
+			this.liveBackgroundTasks.size > 0
 		);
 	}
 
@@ -1168,7 +1223,15 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 				break;
 
 			case "system":
-				// System messages are for initialization
+				// The `init` system message is the ONLY report the SDK gives us of
+				// per-server MCP connection state. Surface it instead of dropping
+				// it: with MCP_CONNECTION_NONBLOCKING=true a server that never
+				// connected (or is retrying) otherwise fails silently, which is
+				// exactly how the live ACA drive lost visibility into `linear` and
+				// `cyrus-tools` reconnecting mid-session.
+				if (message.subtype === "init") {
+					this.reportMcpServerStatuses(message.mcp_servers);
+				}
 				break;
 
 			case "rate_limit_event":
@@ -1182,6 +1245,40 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 
 			default:
 				this.logger.debug(`Unhandled message type: ${(message as any).type}`);
+		}
+	}
+
+	/**
+	 * Log the SDK's per-session MCP connection statuses and forward them to the
+	 * `onMcpServerStatus` callback / `mcp-server-status` event so the EdgeWorker
+	 * can fold them into MCP health diagnostics and start a bounded re-probe of
+	 * anything that failed transiently.
+	 *
+	 * Never throws: an MCP diagnostic must not be able to abort a live session.
+	 */
+	private reportMcpServerStatuses(
+		servers: readonly McpServerStatusReport[] | undefined,
+	): void {
+		if (!servers || servers.length === 0) return;
+
+		const sessionId = this.sessionInfo?.sessionId ?? "unknown";
+		const rendered = servers
+			.map((server) => `${server.name}=${server.status}`)
+			.join(", ");
+		const unhealthy = servers.filter(
+			(server) => server.status?.toLowerCase() !== "connected",
+		);
+		if (unhealthy.length > 0) {
+			this.logger.warn(`MCP servers for session ${sessionId}: ${rendered}`);
+		} else {
+			this.logger.info(`MCP servers for session ${sessionId}: ${rendered}`);
+		}
+
+		this.emit("mcp-server-status", servers, sessionId);
+		try {
+			void this.config.onMcpServerStatus?.(servers, sessionId);
+		} catch (error) {
+			this.logger.warn("onMcpServerStatus callback threw:", error);
 		}
 	}
 

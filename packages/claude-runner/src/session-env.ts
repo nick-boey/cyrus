@@ -73,6 +73,23 @@ export function buildBaseSessionEnv(
 }
 
 /**
+ * Compose the final env for a Claude session subprocess.
+ *
+ * Merge order: base (process.env + Cyrus flags) → repository .env →
+ * per-session additionalEnv.
+ */
+export function composeSessionEnv(options: {
+	repositoryEnv?: Record<string, string>;
+	additionalEnv?: Record<string, string>;
+}): Record<string, string> {
+	return {
+		...buildBaseSessionEnv(),
+		...(options.repositoryEnv ?? {}),
+		...(options.additionalEnv ?? {}),
+	};
+}
+
+/**
  * Normalize MCP server configs loaded from JSON files.
  *
  * Config files (.mcp.json, mcp-*.json) often omit the `type` field,

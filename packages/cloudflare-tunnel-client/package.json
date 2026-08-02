@@ -25,9 +25,9 @@
 		"cloudflared": "^0.7.1"
 	},
 	"devDependencies": {
-		"@types/node": "^20.12.7",
-		"typescript": "^5.4.5",
-		"vitest": "^4.1.0"
+		"@types/node": "^20.19.43",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.10"
 	},
 	"keywords": [
 		"cloudflare",

@@ -50,6 +50,31 @@ After completion, verify:
 gh auth status
 ```
 
+**Scopes.** For a classic personal access token, `repo` is the functional
+minimum for private-repository work — it covers clone, commit, push, and
+issue/PR access. `read:org` is required **only** for organization-level queries
+(listing an org's teams, members, or repositories) and is not used by the core
+flow.
+
+`gh auth status` warns that `read:org` is missing even for tokens that work
+correctly, because `gh` wants it for its own org-listing features. **Do not
+treat that warning as a failure and do not re-run authentication because of
+it.** If the user actually needs org queries:
+
+```bash
+gh auth refresh -h github.com -s read:org
+```
+
+Fine-grained PATs use per-resource permissions instead of scopes (grant
+**Contents: read and write**, plus **Pull requests** and **Issues** if Cyrus
+should open PRs or comment). They report no scope list at all, so `gh auth
+status` cannot introspect them — also not a failure.
+
+The GitHub App configured in Part B is a separate mechanism: it uses App
+**permissions** (set in the manifest in Step 7), not PAT scopes. See
+[docs/GIT_GITHUB.md](../../docs/GIT_GITHUB.md#token-scopes) for the full
+breakdown of which tier applies when.
+
 ### Step 3: Configure Git Identity
 
 If git user name or email are not set, ask the user for their preferred values:

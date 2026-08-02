@@ -47,3 +47,30 @@ CLAUDE.local.md
 
 # Claude Code harness runtime artifacts
 .claude/scheduled_tasks.lock
+
+docker/router/.env
+
+# Terraform local state and sensitive variable files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+# scripts/deploy-router-image.sh stages its rewrite in a mode-600 temp file
+# beside dev.tfvars. `*.tfvars` above does not match a name with a suffix after
+# `.tfvars`, and BSD mktemp only substitutes a TRAILING run of X's, so the temp
+# name cannot both be unique and end in `.tfvars`. Ignore the prefix instead:
+# a SIGKILL mid-rewrite leaves behind the client secret and both OAuth tokens.
+*.tfvars.tmp.*
+# Saved plan files. A plan embeds sensitive values in PLAINTEXT regardless of
+# `sensitive = true` — that only redacts CLI output — so a committed plan leaks
+# the Linear client secret and both OAuth tokens exactly as state would. Bare
+# `tfplan` alone is too narrow: `-out=` takes any name, and `tfplan.bin` /
+# `plan.out` are common enough that one of them will get used.
+tfplan*
+*.tfplan
+plan.out
+
+# Claude worktrees
+.claude/worktrees
+.superpowers/

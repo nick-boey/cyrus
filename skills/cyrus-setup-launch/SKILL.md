@@ -9,6 +9,14 @@ description: Print a summary of the Cyrus setup and offer to start the agent.
 
 Prints a summary of the completed setup and offers to start Cyrus.
 
+> **Client variant.** When invoked from `cyrus-setup-client` (a router client
+> device), two things change: **skip Step 4 (Start ngrok)** entirely — a client
+> device has no public endpoint — and print the **client summary** in Step 2
+> instead of the surface summary. Everything else (persistence via pm2/systemd/
+> foreground, verify) is the same; `cyrus` and `cyrus start` are the same default
+> command, so `pm2 start cyrus` works for a client too (its `config.json` has
+> `platform: "router"`, so it dials the router instead of listening for webhooks).
+
 ## Step 1: Gather Configuration
 
 Read current state:
@@ -31,11 +39,37 @@ cat ~/.cyrus/config.json 2>/dev/null
 
 # Claude auth
 grep -c -E '^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=' ~/.cyrus/.env 2>/dev/null
+
+# Deployment mode — "router" means this is a client device
+jq -r '.platform // "standalone"' ~/.cyrus/config.json 2>/dev/null
+
+# Router URL (client mode only)
+jq -r '.router.url // empty' ~/.cyrus/config.json 2>/dev/null
 ```
 
 ## Step 2: Print Summary
 
-Print a formatted summary:
+**Client variant** (deployment mode is `router`): print a client-oriented
+summary instead of the surface table below — a client device has no Linear
+OAuth app, tunnel, or Slack bot of its own:
+
+```
+┌─────────────────────────────────────┐
+│      Cyrus Client Device Ready      │
+├─────────────────────────────────────┤
+│                                     │
+│  Router:   https://router.example…  │
+│  Claude:   ✓ authenticated          │
+│  GitHub:   ✓ CLI (native creds)     │
+│  Linear:   ✓ local MCP OAuth'd      │
+│                                     │
+│  Repositories:                      │
+│    • yourorg/yourrepo               │
+│                                     │
+└─────────────────────────────────────┘
+```
+
+**Standalone variant:** print a formatted summary:
 
 ```
 ┌─────────────────────────────────────┐
@@ -91,9 +125,20 @@ The agent should run all of these commands directly:
    ```bash
    CYRUS_BIN=$(which cyrus)
    CYRUS_USER=$(whoami)
+   # Do NOT assume /home/$CYRUS_USER — root's home is /root, and some distros
+   # place users elsewhere. Ask the passwd database.
+   CYRUS_HOME=$(getent passwd "$CYRUS_USER" | cut -d: -f6)
    ```
 
-2. Write the service file:
+   Sanity-check the values before writing the unit — `echo "$CYRUS_BIN" "$CYRUS_USER" "$CYRUS_HOME"`.
+   If `CYRUS_HOME` is empty, fall back to `$HOME`.
+
+2. Write the service file. **Keep the closing `EOF` flush against the left
+   margin** — `<< EOF` only ends at an `EOF` with no leading whitespace, so an
+   indented one silently swallows the rest of the script into the unit file. The
+   body may stay indented; systemd strips leading whitespace. Leave the delimiter
+   unquoted so `$CYRUS_USER` / `$CYRUS_HOME` / `$CYRUS_BIN` expand.
+
    ```bash
    sudo tee /etc/systemd/system/cyrus.service > /dev/null << EOF
    [Unit]
@@ -103,15 +148,36 @@ The agent should run all of these commands directly:
    [Service]
    Type=simple
    User=$CYRUS_USER
-   EnvironmentFile=/home/$CYRUS_USER/.cyrus/.env
-   ExecStart=$CYRUS_BIN
+   EnvironmentFile=-$CYRUS_HOME/.cyrus/.env
+   ExecStart=$CYRUS_BIN start
    Restart=always
    RestartSec=10
 
    [Install]
    WantedBy=multi-user.target
-   EOF
+EOF
    ```
+
+   Notes on that unit — all three matter, and getting them wrong fails in ways
+   that are hard to diagnose:
+
+   - **`EnvironmentFile` must use the resolved home, not `/home/$CYRUS_USER`.**
+     The heredoc is unquoted, so the shell interpolates `$CYRUS_HOME` when the
+     file is written. systemd itself does *not* expand `$HOME` inside
+     `EnvironmentFile=`, so the path has to be literal by the time it lands in
+     the unit. The leading `-` makes the file optional, so the service still
+     starts if `.cyrus/.env` doesn't exist yet.
+   - **`ExecStart` must name the `start` subcommand explicitly.** Bare
+     `ExecStart=$CYRUS_BIN` happens to work today only because `start` is
+     registered with `isDefault: true` in the CLI; spelling it out means the
+     unit doesn't silently change behaviour if that default ever moves.
+   - **`$CYRUS_BIN` pins whatever `which cyrus` resolved to.** On a machine with
+     a local dev build linked globally that's the working tree's
+     `apps/cli/dist/src/app.js`, not the published `cyrus-ai` package. Confirm
+     this is the binary you want before installing the unit.
+
+   For a **router host**, use the same unit with `ExecStart=$CYRUS_BIN router start`
+   and a distinct unit name (`cyrus-router.service`).
 
 3. Enable and start:
    ```bash
@@ -119,6 +185,17 @@ The agent should run all of these commands directly:
    sudo systemctl enable cyrus
    sudo systemctl start cyrus
    ```
+
+   **If Cyrus is already running** (started in the foreground, `setsid`'d into the
+   background, or under pm2), stop it first — otherwise two instances race for the
+   same port and state directory. Check with `pgrep -af 'cyrus|app\.js'` and
+   `pm2 list`, and only cut over when no sessions are in flight: installing the
+   unit means killing the current process along with any Claude Agent SDK children
+   still working an issue.
+
+   Under systemd, stdout/stderr go to the journal, so logs survive reboots and are
+   rotated by journald — unlike a backgrounded process whose output was redirected
+   into a temp file.
 
 After setup, inform the user of useful commands:
 - `sudo systemctl status cyrus` — check status
@@ -134,6 +211,9 @@ cyrus
 ```
 
 ## Step 4: Start ngrok (if applicable)
+
+**Client variant: skip this step entirely** — a client device has no public
+endpoint or tunnel.
 
 If the user configured ngrok in the endpoint step, the agent should start it:
 

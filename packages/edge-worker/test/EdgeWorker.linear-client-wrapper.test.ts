@@ -1,6 +1,7 @@
 import { LinearClient } from "@linear/sdk";
 import type { EdgeWorkerConfig } from "cyrus-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { LinearIssueTrackerService } from "cyrus-linear-event-transport";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 
 // Mock modules
@@ -188,6 +189,12 @@ describe("EdgeWorker LinearClient Wrapper", () => {
 	});
 
 	describe("Dynamic Linear token updates", () => {
+		// The rejection/refresh-token maps are static on LinearIssueTrackerService
+		// and therefore shared across every test in this file.
+		afterEach(() => {
+			LinearIssueTrackerService.resetWorkspaceAuthState();
+		});
+
 		it("should call setAccessToken on existing issue trackers when workspace token changes", () => {
 			edgeWorker = new EdgeWorker(mockConfig);
 
@@ -208,7 +215,53 @@ describe("EdgeWorker LinearClient Wrapper", () => {
 
 			(edgeWorker as any).updateLinearWorkspaceTokens(newConfig);
 
-			expect(setAccessTokenSpy).toHaveBeenCalledWith("refreshed_token");
+			// The refresh token rides along: it is what clears a standing rejection
+			// for the workspace (see the re-authorization test below).
+			expect(setAccessTokenSpy).toHaveBeenCalledWith(
+				"refreshed_token",
+				"new_refresh_token",
+			);
+		});
+
+		/**
+		 * A live re-authorization must actually take effect.
+		 *
+		 * `cyrus refresh-token` / `self-auth-linear` rewrites config.json, and the
+		 * watcher lands here — on the EXISTING tracker, not a new one. Registration
+		 * used to happen only in `LinearIssueTrackerService`'s constructor, so a
+		 * workspace Linear had already rejected stayed suppressed until the process
+		 * restarted: the brand-new credential never got a single attempt, and the
+		 * user was told to re-authorize again.
+		 */
+		it("clears a standing refresh-token rejection when the config is re-authorized", () => {
+			LinearIssueTrackerService.resetWorkspaceAuthState();
+			edgeWorker = new EdgeWorker(mockConfig);
+
+			// Simulate Linear having refused the seeded refresh token.
+			(LinearIssueTrackerService as any).rejectedWorkspaces.set(
+				"workspace-123",
+				{ at: Date.now(), status: 400, body: "invalid_grant" },
+			);
+			expect(
+				LinearIssueTrackerService.getRejectedWorkspace("workspace-123"),
+			).toBeDefined();
+
+			const newConfig: EdgeWorkerConfig = {
+				...mockConfig,
+				linearWorkspaces: {
+					"workspace-123": {
+						linearToken: "reauthorized_token",
+						linearRefreshToken: "reauthorized_refresh_token",
+						linearWorkspaceName: "Test Workspace",
+					},
+				},
+			};
+
+			(edgeWorker as any).updateLinearWorkspaceTokens(newConfig);
+
+			expect(
+				LinearIssueTrackerService.getRejectedWorkspace("workspace-123"),
+			).toBeUndefined();
 		});
 
 		it("should not call setAccessToken when token has not changed", () => {

@@ -4,16 +4,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Command } from "commander";
 import { setGlobalErrorReporter } from "cyrus-core";
 import dotenv from "dotenv";
-import { Application } from "./Application.js";
-import { AuthCommand } from "./commands/AuthCommand.js";
-import { CheckTokensCommand } from "./commands/CheckTokensCommand.js";
-import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
-import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
-import { SelfAuthCommand } from "./commands/SelfAuthCommand.js";
-import { StartCommand } from "./commands/StartCommand.js";
+import { buildProgram } from "./buildProgram.js";
 import { createErrorReporter } from "./services/createErrorReporter.js";
 
 // Get the directory of the current module for reading package.json
@@ -38,131 +31,8 @@ preloadEnvForBootstrap();
 const errorReporter = createErrorReporter({ release: packageJson.version });
 setGlobalErrorReporter(errorReporter);
 
-// Setup Commander program
-const program = new Command();
-
-program
-	.name("cyrus")
-	.description("AI-powered Linear issue automation using Claude")
-	.version(packageJson.version)
-	.option(
-		"--cyrus-home <path>",
-		"Specify custom Cyrus config directory",
-		resolve(homedir(), ".cyrus"),
-	)
-	.option("--env-file <path>", "Path to environment variables file");
-
-// Start command (default)
-program
-	.command("start", { isDefault: true })
-	.description("Start the edge worker")
-	.action(async () => {
-		const opts = program.opts();
-		const app = new Application(
-			opts.cyrusHome,
-			opts.envFile,
-			packageJson.version,
-			errorReporter,
-		);
-		await new StartCommand(app).execute([]);
-	});
-
-// Auth command
-program
-	.command("auth <auth-key>")
-	.description("Authenticate with Cyrus using auth key")
-	.action(async (authKey: string) => {
-		const opts = program.opts();
-		const app = new Application(
-			opts.cyrusHome,
-			opts.envFile,
-			packageJson.version,
-			errorReporter,
-		);
-		await new AuthCommand(app).execute([authKey]);
-	});
-
-// Check tokens command
-program
-	.command("check-tokens")
-	.description("Check the status of all Linear tokens")
-	.action(async () => {
-		const opts = program.opts();
-		const app = new Application(
-			opts.cyrusHome,
-			opts.envFile,
-			packageJson.version,
-			errorReporter,
-		);
-		await new CheckTokensCommand(app).execute([]);
-	});
-
-// Refresh token command
-program
-	.command("refresh-token")
-	.description("Refresh a specific Linear token")
-	.action(async () => {
-		const opts = program.opts();
-		const app = new Application(
-			opts.cyrusHome,
-			opts.envFile,
-			packageJson.version,
-			errorReporter,
-		);
-		await new RefreshTokenCommand(app).execute([]);
-	});
-
-// Self-auth-linear command - Linear OAuth directly from CLI
-program
-	.command("self-auth-linear")
-	.description("Authenticate with Linear OAuth directly")
-	.action(async () => {
-		const opts = program.opts();
-		const app = new Application(
-			opts.cyrusHome,
-			opts.envFile,
-			packageJson.version,
-			errorReporter,
-		);
-		await new SelfAuthCommand(app).execute([]);
-	});
-
-// Self-add-repo command - Clone and add repository
-program
-	.command("self-add-repo [url] [workspace]")
-	.description(
-		'Clone a repo and add it to config. URL accepts any valid git clone address (e.g., "https://github.com/org/repo.git"). Workspace is the display name of the Linear workspace (e.g., "My Workspace"). If URL is omitted, prompts interactively.',
-	)
-	.option(
-		"-l, --label <labels>",
-		"Comma-separated routing labels (defaults to repo name)",
-	)
-	.option(
-		"-b, --base-branch <branch>",
-		"Base branch name (auto-detected from remote if not specified)",
-	)
-	.action(
-		async (
-			url: string | undefined,
-			workspace: string | undefined,
-			cmdOpts: { label?: string; baseBranch?: string },
-		) => {
-			const opts = program.opts();
-			const app = new Application(
-				opts.cyrusHome,
-				opts.envFile,
-				packageJson.version,
-			);
-			const args = [url, workspace].filter(Boolean) as string[];
-			if (cmdOpts.label) {
-				args.push("-l", cmdOpts.label);
-			}
-			if (cmdOpts.baseBranch) {
-				args.push("-b", cmdOpts.baseBranch);
-			}
-			await new SelfAddRepoCommand(app).execute(args);
-		},
-	);
+// Build the Commander program (see buildProgram.ts for the full command tree)
+const program = buildProgram(packageJson, errorReporter);
 
 // Parse and execute
 (async () => {

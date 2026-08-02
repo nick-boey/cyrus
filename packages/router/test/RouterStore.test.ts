@@ -1,0 +1,834 @@
+import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
+import { describe, expect, it } from "vitest";
+import { RouterStore } from "../src/RouterStore.js";
+
+const NOW = 1_000_000;
+
+// Copy of the pre-migration (v1) SCHEMA constant from RouterStore.ts, used to
+// build a v1 database by hand and verify the migration path.
+const V1_SCHEMA = `
+CREATE TABLE IF NOT EXISTS users (
+  user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  name TEXT,
+  linear_id TEXT
+);
+CREATE TABLE IF NOT EXISTS devices (
+  device_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL UNIQUE REFERENCES users(user_id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_ms INTEGER NOT NULL,
+  next_seq INTEGER NOT NULL DEFAULT 1,
+  last_seen_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS enrollment_codes (
+  code_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  expires_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+  device_id INTEGER NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  enqueued_ms INTEGER NOT NULL,
+  expires_ms INTEGER NOT NULL,
+  PRIMARY KEY (device_id, seq)
+);
+CREATE TABLE IF NOT EXISTS rpc_mutations (
+  device_id INTEGER NOT NULL,
+  mutation_id TEXT NOT NULL,
+  response_json TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  PRIMARY KEY (device_id, mutation_id)
+);
+CREATE TABLE IF NOT EXISTS session_affinity (
+  session_id TEXT PRIMARY KEY, device_id INTEGER NOT NULL, creator_json TEXT
+);
+CREATE TABLE IF NOT EXISTS issue_affinity (
+  issue_id TEXT PRIMARY KEY, device_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS issue_locks (
+  issue_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, device_id INTEGER NOT NULL
+);
+`;
+
+function storeWithDevice() {
+	const store = new RouterStore(":memory:");
+	store.addUser({ email: "alice@example.com", name: "Alice" });
+	const code = store.mintEnrollmentCode("alice@example.com", NOW);
+	const device = store.redeemEnrollmentCode(code, NOW + 1000);
+	if (!device) throw new Error("redeem failed");
+	return { store, device };
+}
+
+describe("RouterStore", () => {
+	it("enrolls a device via one-time code and burns the code", () => {
+		const { store, device } = storeWithDevice();
+		expect(store.getDeviceByToken(device.deviceToken)?.deviceId).toBe(
+			device.deviceId,
+		);
+		// burned: second redeem fails
+		expect(store.redeemEnrollmentCode("nonsense", NOW)).toBeUndefined();
+	});
+
+	it("expires enrollment codes after 15 minutes", () => {
+		const store = new RouterStore(":memory:");
+		store.addUser({ email: "a@x.com" });
+		const code = store.mintEnrollmentCode("a@x.com", NOW);
+		expect(store.redeemEnrollmentCode(code, NOW + 16 * 60_000)).toBeUndefined();
+	});
+
+	it("re-enrollment replaces the device and invalidates the old token", () => {
+		const { store, device } = storeWithDevice();
+		const code2 = store.mintEnrollmentCode("alice@example.com", NOW);
+		const device2 = store.redeemEnrollmentCode(code2, NOW);
+		expect(device2).toBeDefined();
+		expect(store.getDeviceByToken(device.deviceToken)).toBeUndefined();
+	});
+
+	it("matches creators by email case-insensitively and by linearId", () => {
+		const store = new RouterStore(":memory:");
+		store.addUser({ email: "Bob@Example.com", linearId: "lin-1" });
+		expect(
+			store.findUserForCreator({ email: "bob@example.com" }),
+		).toBeDefined();
+		expect(store.findUserForCreator({ id: "lin-1" })).toBeDefined();
+		expect(store.findUserForCreator({ email: "nobody@x.com" })).toBeUndefined();
+	});
+
+	it("queues events FIFO per device with monotonic seq and ack removal", () => {
+		const { store, device } = storeWithDevice();
+		const s1 = store.enqueueEvent(device.deviceId, '{"n":1}', NOW, 60_000);
+		const s2 = store.enqueueEvent(device.deviceId, '{"n":2}', NOW, 60_000);
+		expect(s2).toBe(s1 + 1);
+		expect(
+			store.pendingEvents(device.deviceId, 0, NOW).map((e) => e.seq),
+		).toEqual([s1, s2]);
+		store.ackEvent(device.deviceId, s1);
+		expect(
+			store.pendingEvents(device.deviceId, 0, NOW).map((e) => e.seq),
+		).toEqual([s2]);
+	});
+
+	it("never reuses a seq after the queue fully drains", () => {
+		const { store, device } = storeWithDevice();
+		const s1 = store.enqueueEvent(device.deviceId, '{"n":1}', NOW, 60_000);
+		store.ackEvent(device.deviceId, s1);
+		const s2 = store.enqueueEvent(device.deviceId, '{"n":2}', NOW, 60_000);
+		expect(s2).toBe(s1 + 1); // a MAX(seq)-based counter would reuse s1 here and the client would drop the event
+	});
+
+	it("records and replays mutation responses idempotently", () => {
+		const { store, device } = storeWithDevice();
+		expect(store.getMutation(device.deviceId, "m-1")).toBeUndefined();
+		store.recordMutation(device.deviceId, "m-1", '{"success":true}', NOW);
+		expect(store.getMutation(device.deviceId, "m-1")).toBe('{"success":true}');
+	});
+
+	it("tracks device last-seen for offline sweeps", () => {
+		const { store, device } = storeWithDevice();
+		store.touchDevice(device.deviceId, NOW);
+		expect(store.devicesOfflineSince(NOW - 1)).toHaveLength(0);
+		expect(store.devicesOfflineSince(NOW + 1).map((d) => d.deviceId)).toEqual([
+			device.deviceId,
+		]);
+	});
+
+	it("expireEvents removes and returns events past their TTL", () => {
+		const { store, device } = storeWithDevice();
+		store.enqueueEvent(device.deviceId, '{"n":1}', NOW, 1000);
+		const expired = store.expireEvents(NOW + 2000);
+		expect(expired).toHaveLength(1);
+		expect(store.pendingEvents(device.deviceId, 0, NOW + 2000)).toHaveLength(0);
+	});
+
+	it("issue lock is exclusive per issue and released by session", () => {
+		const { store, device } = storeWithDevice();
+		expect(store.acquireIssueLock("ISS-1", "sess-1", device.deviceId)).toBe(
+			true,
+		);
+		// same session re-acquire is fine
+		expect(store.acquireIssueLock("ISS-1", "sess-1", device.deviceId)).toBe(
+			true,
+		);
+		expect(store.acquireIssueLock("ISS-1", "sess-2", device.deviceId)).toBe(
+			false,
+		);
+		store.releaseIssueLockForSession("sess-1");
+		expect(store.acquireIssueLock("ISS-1", "sess-2", device.deviceId)).toBe(
+			true,
+		);
+	});
+
+	it("stores session and issue affinity", () => {
+		const { store, device } = storeWithDevice();
+		store.setSessionAffinity("sess-1", device.deviceId);
+		store.setIssueAffinity("ISS-1", device.deviceId);
+		expect(store.getSessionAffinity("sess-1")).toBe(device.deviceId);
+		expect(store.getIssueAffinity("ISS-1")).toBe(device.deviceId);
+	});
+
+	it("re-enrollment releases the old device's lock and affinity", () => {
+		const { store, device } = storeWithDevice();
+		store.setSessionAffinity("sess-1", device.deviceId);
+		store.setIssueAffinity("ISS-1", device.deviceId);
+		expect(store.acquireIssueLock("ISS-1", "sess-1", device.deviceId)).toBe(
+			true,
+		);
+
+		// Re-enroll: get a fresh device for the same user.
+		const code2 = store.mintEnrollmentCode("alice@example.com", NOW);
+		const device2 = store.redeemEnrollmentCode(code2, NOW);
+		expect(device2).toBeDefined();
+		if (!device2) throw new Error("redeem failed");
+		expect(device2.deviceId).not.toBe(device.deviceId);
+
+		// The stale lock/affinity rows tied to the old device_id must be gone,
+		// so a new session on the new device can acquire the same issue lock.
+		expect(store.acquireIssueLock("ISS-1", "sess-2", device2.deviceId)).toBe(
+			true,
+		);
+		// The purged affinity was never re-created for device2 — it must
+		// resolve to undefined, not silently point at the dead old device.
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+		expect(store.getIssueAffinity("ISS-1")).toBeUndefined();
+	});
+
+	it("re-enrollment purges only the physical device when containers and stranded rows coexist", () => {
+		const { store, device: physical } = storeWithDevice();
+		const user = store.findUserForCreator({ email: "alice@example.com" });
+		if (!user) throw new Error("user missing");
+		const container = store.createContainerDevice(
+			user.userId,
+			"CYPACK-1",
+			"docker",
+		);
+		store.setSessionAffinity("physical-session", physical.deviceId);
+		store.setIssueAffinity("physical-issue", physical.deviceId);
+		store.acquireIssueLock(
+			"physical-lock",
+			"physical-session",
+			physical.deviceId,
+		);
+		store.setSessionAffinity("container-session", container.deviceId);
+		store.setIssueAffinity("container-issue", container.deviceId);
+		store.acquireIssueLock(
+			"container-lock",
+			"container-session",
+			container.deviceId,
+		);
+		store.recordMutation(container.deviceId, "container-mutation", "ok", NOW);
+
+		const code = store.mintEnrollmentCode("alice@example.com", NOW);
+		const replacement = store.redeemEnrollmentCode(code, NOW);
+		expect(replacement).toBeDefined();
+
+		expect(store.getDeviceByToken(physical.deviceToken)).toBeUndefined();
+		expect(store.getSessionAffinity("physical-session")).toBeUndefined();
+		expect(store.getIssueAffinity("physical-issue")).toBeUndefined();
+		expect(store.getContainerDeviceForIssue("CYPACK-1")?.deviceId).toBe(
+			container.deviceId,
+		);
+		expect(store.getSessionAffinity("container-session")).toBe(
+			container.deviceId,
+		);
+		expect(store.getIssueAffinity("container-issue")).toBe(container.deviceId);
+		expect(store.getMutation(container.deviceId, "container-mutation")).toBe(
+			"ok",
+		);
+		expect(
+			store.acquireIssueLock(
+				"container-lock",
+				"other-session",
+				container.deviceId,
+			),
+		).toBe(false);
+	});
+
+	it("removeUser purges the device's locks and affinity", () => {
+		const { store, device } = storeWithDevice();
+		store.setSessionAffinity("sess-1", device.deviceId);
+		store.setIssueAffinity("ISS-1", device.deviceId);
+		expect(store.acquireIssueLock("ISS-1", "sess-1", device.deviceId)).toBe(
+			true,
+		);
+		store.recordMutation(device.deviceId, "m-1", '{"success":true}', NOW);
+
+		expect(store.removeUser("alice@example.com")).toBe(true);
+
+		// Re-add the user and enroll a fresh device; the old device's rows
+		// must not strand the issue lock or leak stale affinity.
+		store.addUser({ email: "alice@example.com", name: "Alice" });
+		const code2 = store.mintEnrollmentCode("alice@example.com", NOW);
+		const device2 = store.redeemEnrollmentCode(code2, NOW);
+		expect(device2).toBeDefined();
+		if (!device2) throw new Error("redeem failed");
+
+		expect(store.acquireIssueLock("ISS-1", "sess-new", device2.deviceId)).toBe(
+			true,
+		);
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+		expect(store.getMutation(device2.deviceId, "m-1")).toBeUndefined();
+	});
+
+	it("listDevices returns physical and container devices joined to their user's email", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const code = store.mintEnrollmentCode("alice@example.com", NOW);
+		const physical = store.redeemEnrollmentCode(code, NOW);
+		if (!physical) throw new Error("redeem failed");
+		const container = store.createContainerDevice(userId, "CYPACK-1", "docker");
+
+		const devices = store.listDevices();
+		expect(devices).toHaveLength(2);
+
+		const physicalRow = devices.find((d) => d.deviceId === physical.deviceId);
+		expect(physicalRow).toMatchObject({
+			email: "alice@example.com",
+			kind: "device",
+			issueKey: undefined,
+			provider: undefined,
+		});
+
+		const containerRow = devices.find((d) => d.deviceId === container.deviceId);
+		expect(containerRow).toMatchObject({
+			email: "alice@example.com",
+			kind: "container",
+			issueKey: "CYPACK-1",
+			provider: "docker",
+		});
+	});
+
+	it("listSessions reports running, locked, and stranded sessions with issue + session ids", () => {
+		const { store, device } = storeWithDevice();
+
+		// A running session that also holds an issue lock.
+		store.setSessionAffinity(
+			"sess-locked",
+			device.deviceId,
+			JSON.stringify({ email: "alice@example.com", name: "Alice" }),
+		);
+		store.acquireIssueLock("issue-guid-1", "sess-locked", device.deviceId);
+
+		// A running session with no lock.
+		store.setSessionAffinity("sess-running", device.deviceId);
+
+		// A stranded lock: an issue_locks row whose session has no affinity row,
+		// the leaked-lock case an operator hunts for when unlocking.
+		store.acquireIssueLock("issue-guid-2", "sess-stranded", device.deviceId);
+
+		const sessions = store.listSessions();
+		expect(sessions).toHaveLength(3);
+
+		const locked = sessions.find((s) => s.sessionId === "sess-locked");
+		expect(locked).toMatchObject({
+			issueId: "issue-guid-1",
+			locked: true,
+			hasAffinity: true,
+			email: "alice@example.com",
+			creatorEmail: "alice@example.com",
+			creatorName: "Alice",
+		});
+
+		const running = sessions.find((s) => s.sessionId === "sess-running");
+		expect(running).toMatchObject({
+			issueId: undefined,
+			locked: false,
+			hasAffinity: true,
+		});
+
+		const stranded = sessions.find((s) => s.sessionId === "sess-stranded");
+		expect(stranded).toMatchObject({
+			issueId: "issue-guid-2",
+			locked: true,
+			hasAffinity: false,
+		});
+	});
+
+	it("removeUser purges scoped rows for EVERY device the user owned, not just the first", () => {
+		// Regression test: removeUser used to purge only the first device row
+		// returned by `.get()`. A user with a physical device AND container
+		// devices would leave the others' issue_locks/session_affinity/
+		// rpc_mutations rows stranded once the cascade delete removed their
+		// `devices` rows out from under them.
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "multi@example.com" });
+		const code = store.mintEnrollmentCode("multi@example.com", NOW);
+		const physical = store.redeemEnrollmentCode(code, NOW);
+		if (!physical) throw new Error("redeem failed");
+		const container1 = store.createContainerDevice(
+			userId,
+			"CYPACK-1",
+			"docker",
+		);
+		const container2 = store.createContainerDevice(
+			userId,
+			"CYPACK-2",
+			"docker",
+		);
+
+		store.setSessionAffinity("sess-phys", physical.deviceId);
+		store.setSessionAffinity("sess-c1", container1.deviceId);
+		store.setSessionAffinity("sess-c2", container2.deviceId);
+		store.acquireIssueLock("ISS-phys", "sess-phys", physical.deviceId);
+		store.acquireIssueLock("CYPACK-1", "sess-c1", container1.deviceId);
+		store.acquireIssueLock("CYPACK-2", "sess-c2", container2.deviceId);
+		store.recordMutation(container2.deviceId, "m-1", '{"ok":true}', NOW);
+
+		expect(store.removeUser("multi@example.com")).toBe(true);
+
+		// Re-add the user and mint fresh devices at the same issue keys/locks;
+		// none of them should be blocked by a stranded row left behind by a
+		// device this fix now purges.
+		const { userId: userId2 } = store.addUser({ email: "multi@example.com" });
+		const freshContainer1 = store.createContainerDevice(
+			userId2,
+			"CYPACK-1",
+			"docker",
+		);
+		expect(
+			store.acquireIssueLock("CYPACK-1", "sess-new", freshContainer1.deviceId),
+		).toBe(true);
+		expect(store.getSessionAffinity("sess-c1")).toBeUndefined();
+		expect(store.getSessionAffinity("sess-c2")).toBeUndefined();
+		expect(store.getMutation(freshContainer1.deviceId, "m-1")).toBeUndefined();
+	});
+});
+
+describe("container devices (schema v2)", () => {
+	it("creates a container device and finds it by issue key and token", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId, deviceToken } = store.createContainerDevice(
+			userId,
+			"CYPACK-1",
+			"docker",
+		);
+		expect(store.getDeviceByToken(deviceToken)).toEqual({ deviceId, userId });
+		expect(store.getContainerDeviceForIssue("CYPACK-1")).toMatchObject({
+			deviceId,
+			userId,
+			issueKey: "CYPACK-1",
+			provider: "docker",
+		});
+		expect(store.getDeviceInfo(deviceId)).toMatchObject({
+			kind: "container",
+			issueKey: "CYPACK-1",
+		});
+	});
+
+	it("allows a physical device AND container devices for the same user", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.createContainerDevice(userId, "CYPACK-1", "docker");
+		store.createContainerDevice(userId, "CYPACK-2", "docker");
+		const code = store.mintEnrollmentCode("a@example.com", Date.now());
+		const enrolled = store.redeemEnrollmentCode(code, Date.now());
+		expect(enrolled).toBeDefined();
+		// getDeviceForUser returns ONLY the physical device
+		expect(store.getDeviceForUser(userId)?.deviceId).toBe(enrolled?.deviceId);
+	});
+
+	it("revokeDevice removes only the physical device row; container devices for the same user survive", () => {
+		// Regression test for the bug where `revokeDevice` ran `DELETE FROM
+		// devices WHERE user_id = ?` with no `kind` filter: an operator
+		// revoking a teammate's laptop (e.g. after a new-laptop enrollment)
+		// would ALSO delete every one of that user's running container
+		// devices, which ContainerLifecycle's orphan-GC sweep then reaps
+		// (container AND volume) within one tick, killing any in-flight
+		// session with no session-affinity guard.
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const code = store.mintEnrollmentCode("alice@example.com", NOW);
+		const physical = store.redeemEnrollmentCode(code, NOW);
+		if (!physical) throw new Error("redeem failed");
+		const container = store.createContainerDevice(userId, "CYPACK-1", "docker");
+
+		expect(store.revokeDevice("alice@example.com")).toBe(true);
+
+		expect(store.getDeviceForUser(userId)).toBeUndefined();
+		expect(store.getDeviceByToken(physical.deviceToken)).toBeUndefined();
+		// The container device must be untouched.
+		expect(store.getContainerDeviceForIssue("CYPACK-1")).toMatchObject({
+			deviceId: container.deviceId,
+			provider: "docker",
+		});
+		expect(store.getDeviceInfo(container.deviceId)).toMatchObject({
+			kind: "container",
+		});
+	});
+
+	it("revokeDevice is a no-op (returns false) for a user with only container devices", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "docker-only@example.com" });
+		store.createContainerDevice(userId, "CYPACK-1", "docker");
+
+		expect(store.revokeDevice("docker-only@example.com")).toBe(false);
+		expect(store.getContainerDeviceForIssue("CYPACK-1")).toBeDefined();
+	});
+
+	it("enforces one container per issue", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.createContainerDevice(userId, "CYPACK-1", "docker");
+		expect(() =>
+			store.createContainerDevice(userId, "CYPACK-1", "docker"),
+		).toThrow();
+	});
+
+	it("rotates a container token, invalidating the old one", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId, deviceToken } = store.createContainerDevice(
+			userId,
+			"CYPACK-1",
+			"docker",
+		);
+		const fresh = store.rotateContainerDeviceToken(deviceId);
+		expect(store.getDeviceByToken(deviceToken)).toBeUndefined();
+		expect(store.getDeviceByToken(fresh)?.deviceId).toBe(deviceId);
+	});
+
+	it("deletes a container device and purges its scoped rows", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(
+			userId,
+			"CYPACK-1",
+			"docker",
+		);
+		store.setSessionAffinity("sess-1", deviceId);
+		store.deleteContainerDevice(deviceId);
+		expect(store.getContainerDeviceForIssue("CYPACK-1")).toBeUndefined();
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+	});
+
+	it("stores and reads a user executor config", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		expect(store.getUserExecutor(userId)).toBeUndefined();
+		expect(store.setUserExecutor("a@example.com", '{"type":"docker"}')).toBe(
+			true,
+		);
+		expect(store.getUserExecutor(userId)).toBe('{"type":"docker"}');
+		expect(store.setUserExecutor("a@example.com", null)).toBe(true);
+		expect(store.getUserExecutor(userId)).toBeUndefined();
+	});
+
+	it("reads a user's email by id, and undefined for an unknown user", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		expect(store.getUserEmail(userId)).toBe("a@example.com");
+		expect(store.getUserEmail(userId + 999)).toBeUndefined();
+	});
+
+	it("counts session affinity rows per device and tracks last_routed_ms", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(
+			userId,
+			"CYPACK-1",
+			"docker",
+		);
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(0);
+		store.setSessionAffinity("sess-1", deviceId);
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(1);
+		store.enqueueEvent(deviceId, "{}", 1000, 60_000);
+		expect(store.listContainerDevices()[0]?.lastRoutedMs).toBe(1000);
+	});
+
+	it("stamps established_ms on session affinity and lists it per device", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-1", "aca");
+
+		store.setSessionAffinity("sess-1", deviceId, undefined, 1_000);
+		store.setSessionAffinity("sess-2", deviceId, undefined, 2_000);
+
+		expect(store.listSessionAffinityForDevice(deviceId)).toEqual([
+			{ sessionId: "sess-1", establishedMs: 1_000 },
+			{ sessionId: "sess-2", establishedMs: 2_000 },
+		]);
+	});
+
+	it("refreshes established_ms when affinity is re-established", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-1", "aca");
+
+		store.setSessionAffinity("sess-1", deviceId, undefined, 1_000);
+		// A re-prompt is a fresh claim, not a continuation of the old one.
+		store.setSessionAffinity("sess-1", deviceId, undefined, 9_000);
+
+		expect(store.listSessionAffinityForDevice(deviceId)).toEqual([
+			{ sessionId: "sess-1", establishedMs: 9_000 },
+		]);
+	});
+
+	it("returns an empty list for a device with no affinity", () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-1", "aca");
+
+		expect(store.listSessionAffinityForDevice(deviceId)).toEqual([]);
+	});
+
+	it("includes crashed containers in devicesOfflineSince so stranded locks are reclaimed", () => {
+		// A container that died mid-session holds affinity/locks; the existing
+		// offline sweep must reclaim them exactly as for physical devices.
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(
+			userId,
+			"CYPACK-1",
+			"docker",
+		);
+		store.touchDevice(deviceId, 1000);
+		expect(store.devicesOfflineSince(2000).map((d) => d.deviceId)).toContain(
+			deviceId,
+		);
+	});
+
+	it("migrates a v1 database in place, preserving device ids and events", () => {
+		// Build a v1 db by hand, then open it with RouterStore and assert the
+		// old device still authenticates and its queued events survive.
+		const dir = mkdtempSync(join(tmpdir(), "router-store-"));
+		const dbPath = join(dir, "router.db");
+		const raw = new Database(dbPath);
+		raw.exec(V1_SCHEMA); // copy of the pre-migration SCHEMA constant, inline in the test
+		raw.prepare("INSERT INTO users (email) VALUES ('a@example.com')").run();
+		raw
+			.prepare(
+				"INSERT INTO devices (user_id, token_hash, created_ms, next_seq) VALUES (1, ?, 1, 2)",
+			)
+			.run(createHash("sha256").update("tok").digest("hex"));
+		raw
+			.prepare(
+				"INSERT INTO events (device_id, seq, payload_json, enqueued_ms, expires_ms) VALUES (1, 1, '{}', 1, 99999999999999)",
+			)
+			.run();
+		raw.close();
+
+		const store = new RouterStore(dbPath);
+		expect(store.getDeviceByToken("tok")).toEqual({ deviceId: 1, userId: 1 });
+		expect(store.pendingEvents(1, 0, 2)).toHaveLength(1);
+		// New columns usable post-migration:
+		const { deviceId } = store.createContainerDevice(1, "CYPACK-1", "docker");
+		expect(deviceId).toBeGreaterThan(1); // AUTOINCREMENT sequence preserved
+		store.close();
+	});
+
+	it("keeps foreign_keys enforcement live after migrating a v1 database", () => {
+		// migrate() turns foreign_keys OFF for the duration of the v1->v2
+		// devices rebuild (so DROP TABLE devices doesn't cascade-delete
+		// queued events) and must restore it to ON afterwards no matter how
+		// the rebuild transaction exits. Verify restoration on the success
+		// path by proving ON DELETE CASCADE still fires on this connection:
+		// deleting a user must cascade users -> devices -> events.
+		const dir = mkdtempSync(join(tmpdir(), "router-store-fk-"));
+		const dbPath = join(dir, "router.db");
+		const raw = new Database(dbPath);
+		raw.exec(V1_SCHEMA);
+		raw.prepare("INSERT INTO users (email) VALUES ('b@example.com')").run();
+		raw
+			.prepare(
+				"INSERT INTO devices (user_id, token_hash, created_ms, next_seq) VALUES (1, ?, 1, 2)",
+			)
+			.run(createHash("sha256").update("tok2").digest("hex"));
+		raw
+			.prepare(
+				"INSERT INTO events (device_id, seq, payload_json, enqueued_ms, expires_ms) VALUES (1, 1, '{}', 1, 99999999999999)",
+			)
+			.run();
+		raw.close();
+
+		const store = new RouterStore(dbPath);
+		const device = store.getDeviceByToken("tok2");
+		expect(device).toEqual({ deviceId: 1, userId: 1 });
+		expect(store.pendingEvents(device!.deviceId, 0, 2)).toHaveLength(1);
+
+		expect(store.removeUser("b@example.com")).toBe(true);
+		// If foreign_keys enforcement had been left OFF, both rows below
+		// would still be present since the cascade would never have fired.
+		expect(store.getDeviceByToken("tok2")).toBeUndefined();
+		expect(store.pendingEvents(device!.deviceId, 0, 2)).toHaveLength(0);
+
+		store.close();
+	});
+	describe("container teardown bookkeeping", () => {
+		function seedContainer(store: RouterStore, issueKey = "CYPACK-1") {
+			const { userId } = store.addUser({ email: `${issueKey}@example.com` });
+			return store.createContainerDevice(userId, issueKey, "aca");
+		}
+
+		it("upserts, reads, and lists pending teardowns", () => {
+			const store = new RouterStore(":memory:");
+			const { deviceId } = seedContainer(store);
+
+			expect(store.getPendingTeardown("CYPACK-1")).toBeUndefined();
+			store.upsertPendingTeardown({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "closed",
+				registeredMs: 10,
+				deadlineMs: 610,
+			});
+			expect(store.getPendingTeardown("CYPACK-1")).toEqual({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "closed",
+				registeredMs: 10,
+				deadlineMs: 610,
+				callbackId: undefined,
+				callbackReceivedMs: undefined,
+				callbackAttempts: 0,
+			});
+			expect(store.listPendingTeardowns()).toHaveLength(1);
+
+			// An upgrade to `deleted` overwrites in place rather than duplicating.
+			store.upsertPendingTeardown({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "deleted",
+				registeredMs: 20,
+				deadlineMs: 620,
+			});
+			expect(store.listPendingTeardowns()).toHaveLength(1);
+			expect(store.getPendingTeardown("CYPACK-1")?.action).toBe("deleted");
+
+			store.deletePendingTeardown("CYPACK-1");
+			expect(store.listPendingTeardowns()).toEqual([]);
+			store.close();
+		});
+
+		it("counts callback deliveries and flags a repeat of the same key as a retry", () => {
+			const store = new RouterStore(":memory:");
+			const { deviceId } = seedContainer(store);
+			store.upsertPendingTeardown({
+				issueKey: "CYPACK-1",
+				deviceId,
+				action: "closed",
+				registeredMs: 10,
+				deadlineMs: 610,
+			});
+
+			const first = store.recordTeardownCallback("CYPACK-1", "cb-1", 100);
+			expect(first?.retry).toBe(false);
+			expect(first?.info).toMatchObject({
+				callbackId: "cb-1",
+				callbackReceivedMs: 100,
+				callbackAttempts: 1,
+			});
+
+			// The device replays the SAME key until we accept it; the first
+			// received-at timestamp is preserved so it stays the source of truth.
+			const second = store.recordTeardownCallback("CYPACK-1", "cb-1", 200);
+			expect(second?.retry).toBe(true);
+			expect(second?.info).toMatchObject({
+				callbackId: "cb-1",
+				callbackReceivedMs: 100,
+				callbackAttempts: 2,
+			});
+
+			// No pending row -> nothing to record.
+			expect(
+				store.recordTeardownCallback("CYPACK-404", "cb-9", 300),
+			).toBeUndefined();
+			store.close();
+		});
+
+		it("clears every row, and drops a row when its container device is deleted", () => {
+			const store = new RouterStore(":memory:");
+			const a = seedContainer(store, "CYPACK-1");
+			const b = seedContainer(store, "CYPACK-2");
+			for (const [issueKey, deviceId] of [
+				["CYPACK-1", a.deviceId],
+				["CYPACK-2", b.deviceId],
+			] as const) {
+				store.upsertPendingTeardown({
+					issueKey,
+					deviceId,
+					action: "closed",
+					registeredMs: 1,
+					deadlineMs: 2,
+				});
+			}
+
+			store.deleteContainerDevice(a.deviceId);
+			expect(store.listPendingTeardowns().map((r) => r.issueKey)).toEqual([
+				"CYPACK-2",
+			]);
+
+			expect(store.clearPendingTeardowns()).toBe(1);
+			expect(store.listPendingTeardowns()).toEqual([]);
+			expect(store.clearPendingTeardowns()).toBe(0);
+			store.close();
+		});
+	});
+
+	describe("parked_at_ms", () => {
+		const makeContainerDevice = (store: RouterStore, issueKey: string) => {
+			const { userId } = store.addUser({ email: `${issueKey}@example.com` });
+			return store.createContainerDevice(userId, issueKey, "aca").deviceId;
+		};
+		const parkedAtFor = (store: RouterStore, deviceId: number) =>
+			store.listContainerDevices().find((d) => d.deviceId === deviceId)
+				?.parkedAtMs;
+
+		it("round-trips through listContainerDevices", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-1");
+
+			store.setDeviceParkedAt(deviceId, 1_700_000_000_000);
+
+			expect(parkedAtFor(store, deviceId)).toBe(1_700_000_000_000);
+			store.close();
+		});
+
+		it("is undefined until a session parks", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-2");
+
+			expect(parkedAtFor(store, deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		it("clears on clearDeviceParkedAt", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-3");
+
+			store.setDeviceParkedAt(deviceId, 1_700_000_000_000);
+			store.clearDeviceParkedAt(deviceId);
+
+			expect(parkedAtFor(store, deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		it("clears when affinity is re-established for the device", () => {
+			// A device with a live session is by definition not parked. Leaving a
+			// stale stamp would make the idle clock read from a park that ended.
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-4");
+
+			store.setDeviceParkedAt(deviceId, 1_700_000_000_000);
+			store.setSessionAffinity("session-1", deviceId);
+
+			expect(parkedAtFor(store, deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		it("is exposed on getContainerDeviceForIssue too", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "PAR-5");
+
+			store.setDeviceParkedAt(deviceId, 42);
+
+			expect(store.getContainerDeviceForIssue("PAR-5")?.parkedAtMs).toBe(42);
+			store.close();
+		});
+	});
+});

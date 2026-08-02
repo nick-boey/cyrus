@@ -44,6 +44,7 @@ export type {
 	HookEvent,
 	IAgentRunner,
 	IMessageFormatter,
+	LiveBackgroundTask,
 	McpServerConfig,
 	OnAskUserQuestion,
 	SDKAssistantMessage,
@@ -69,6 +70,7 @@ export type {
 	IssueContext,
 	IssueMinimal,
 	RepositoryContext,
+	SessionCreator,
 	Workspace,
 } from "./CyrusAgentSession.js";
 // Configuration types
@@ -146,6 +148,7 @@ export type {
 	Issue,
 	IssueDeletedWebhook,
 	IssueRelation,
+	IssueRelationSummary,
 	IssueStateChangeWebhook,
 	IssueUnassignedWebhook,
 	IssueUpdateInput,
@@ -186,6 +189,38 @@ export {
 	isIssueUnassignedWebhook,
 	isNewCommentEvent,
 } from "./issue-tracker/index.js";
+// MCP connection health, bounded-backoff retry, and headless-safe selection
+export type {
+	HeadlessMcpFilterResult,
+	McpFailureClass,
+	McpFailureClassification,
+	McpHealthSource,
+	McpHealthState,
+	McpHealthSummary,
+	McpInitServerStatus,
+	McpRetryAttempt,
+	McpRetryOptions,
+	McpRetryPolicy,
+	McpRetryResult,
+	McpServerHealth,
+	OmittedMcpServer,
+} from "./mcp/index.js";
+export {
+	classifyMcpFailure,
+	computeMcpRetryDelayMs,
+	DEFAULT_MCP_RETRY_POLICY,
+	filterHeadlessSafeMcpServers,
+	formatMcpHealthDiagnostics,
+	formatMcpServerHealth,
+	INTERACTIVE_OAUTH_MCP_SERVERS,
+	isHeadlessContainerMode,
+	isMcpServerPreconfigured,
+	McpHealthRegistry,
+	recordMcpInitStatuses,
+	requiresInteractiveOAuth,
+	resolveMcpRetryPolicy,
+	retryMcpConnection,
+} from "./mcp/index.js";
 // Internal Message Bus
 export type {
 	ContentChanges,

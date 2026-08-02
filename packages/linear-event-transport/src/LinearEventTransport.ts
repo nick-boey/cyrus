@@ -150,10 +150,25 @@ export class LinearEventTransport
 		// Get Linear signature from headers
 		const signature = request.headers["linear-signature"] as string;
 		if (!signature) {
+			// Logged, not silent: a rejected delivery that leaves no trace is
+			// indistinguishable from Linear never having sent the event.
+			this.logger.warn(
+				`Rejected Linear webhook from ${request.ip}: missing linear-signature header`,
+			);
 			reply.code(401).send({ error: "Missing linear-signature header" });
 			return;
 		}
 
+		// Verification is scoped to its OWN try/catch, deliberately excluding the
+		// emit calls below. Previously one try wrapped both, so an exception
+		// raised by a downstream "event"/"message" listener was reported to
+		// Linear as `401 Invalid webhook signature` — sending the operator
+		// hunting a signing-secret problem that did not exist, and telling Linear
+		// to retry a delivery that had in fact already been accepted. A listener
+		// failure is a server-side fault: it belongs to the 500 path in
+		// `register()`, not here.
+		let isValid: boolean;
+		let verifyError: unknown;
 		try {
 			// Use the raw body bytes that SharedApplicationServer stashed on the request
 			// so signature verification uses the exact payload Linear signed, rather than
@@ -162,31 +177,39 @@ export class LinearEventTransport
 			const bodyBuffer = rawBody
 				? Buffer.from(rawBody)
 				: Buffer.from(JSON.stringify(request.body));
-			const isValid = this.linearWebhookClient.verify(bodyBuffer, signature);
-
-			if (!isValid) {
-				reply.code(401).send({ error: "Invalid webhook signature" });
-				return;
-			}
-
-			const payload = request.body as LinearWebhookPayload;
-
-			// Emit "event" for legacy IAgentEventTransport compatibility
-			this.emit("event", payload);
-
-			// Emit "message" with translated internal message
-			this.emitMessage(payload);
-
-			// Send success response
-			reply.code(200).send({ success: true });
+			isValid = this.linearWebhookClient.verify(bodyBuffer, signature);
 		} catch (error) {
-			const err = new Error("Direct webhook verification failed");
-			if (error instanceof Error) {
-				err.cause = error;
-			}
-			this.logger.error("Direct webhook verification failed", err);
-			reply.code(401).send({ error: "Invalid webhook signature" });
+			// `verify()` THROWS on a malformed/mismatched signature rather than
+			// returning false, so this is a normal rejection, not an anomaly.
+			isValid = false;
+			verifyError = error;
 		}
+
+		if (!isValid) {
+			// Name the event type when the payload parsed, so a signing-secret
+			// mismatch is obvious from the log alone rather than presenting as
+			// "Linear stopped sending us X".
+			const detail =
+				verifyError instanceof Error ? `: ${verifyError.message}` : "";
+			this.logger.warn(
+				`Rejected Linear webhook from ${request.ip}: signature verification failed${describePayload(
+					request.body,
+				)}${detail} — check that the webhook signing secret matches LINEAR_WEBHOOK_SECRET`,
+			);
+			reply.code(401).send({ error: "Invalid webhook signature" });
+			return;
+		}
+
+		const payload = request.body as LinearWebhookPayload;
+
+		// Emit "event" for legacy IAgentEventTransport compatibility
+		this.emit("event", payload);
+
+		// Emit "message" with translated internal message
+		this.emitMessage(payload);
+
+		// Send success response
+		reply.code(200).send({ success: true });
 	}
 
 	/**
@@ -247,4 +270,18 @@ export class LinearEventTransport
 			this.logger.debug(`Message translation skipped: ${result.reason}`);
 		}
 	}
+}
+
+/**
+ * ` (AgentSessionEvent/created)` for a recognisable payload, else `""`.
+ *
+ * Read defensively off an untyped view: the body of a webhook that failed
+ * signature verification is by definition untrusted, so this must degrade to a
+ * bare string rather than throw inside the rejection path.
+ */
+function describePayload(body: unknown): string {
+	if (!body || typeof body !== "object") return "";
+	const { type, action } = body as { type?: unknown; action?: unknown };
+	if (typeof type !== "string") return "";
+	return typeof action === "string" ? ` (${type}/${action})` : ` (${type})`;
 }

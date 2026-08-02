@@ -2,6 +2,7 @@ import { tmpdir } from "node:os";
 import { basename, extname } from "node:path";
 import { IssueRelationType, type LinearClient } from "@linear/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { IIssueTrackerService } from "cyrus-core";
 import fs from "fs-extra";
 import OpenAI from "openai";
 import { z } from "zod";
@@ -12,6 +13,33 @@ import {
 	type ResolveSessionFromCwd,
 	registerLogFailureModeTool,
 } from "./log-failure-mode.js";
+
+/**
+ * cyrus-tools can be backed by either the raw Linear SDK client (default,
+ * token-authenticated Linear/CLI mode) or the platform-agnostic
+ * `IIssueTrackerService` interface (router mode, where the device holds no
+ * Linear token — every operation is forwarded to the Cyrus Router, which
+ * holds the real Linear credentials).
+ */
+export type CyrusToolsBacking =
+	| LinearClient
+	| { issueTracker: IIssueTrackerService };
+
+/**
+ * Discriminates a tracker backing from a raw `LinearClient`. A `LinearClient`
+ * has no `issueTracker` property, so the `in` check is a safe discriminator;
+ * `{} as any` (used in some tests) is also treated as a `LinearClient`.
+ */
+function isTrackerBacking(
+	backing: CyrusToolsBacking,
+): backing is { issueTracker: IIssueTrackerService } {
+	return (
+		typeof backing === "object" &&
+		backing !== null &&
+		"issueTracker" in backing &&
+		(backing as { issueTracker?: unknown }).issueTracker != null
+	);
+}
 
 /**
  * Detect MIME type based on file extension
@@ -112,15 +140,36 @@ export interface CyrusToolsOptions {
 
 /**
  * Create a standard MCP SDK server with Cyrus tools.
+ *
+ * Accepts either a raw `LinearClient` (default, token-authenticated mode) or
+ * `{ issueTracker }` (router mode). In router mode the tools are implemented
+ * over the `IIssueTrackerService` interface; tools that genuinely require raw
+ * Linear SDK capabilities (`linear_set_issue_relation`,
+ * `linear_get_agent_sessions`) are omitted and the omission is logged. The
+ * full catalog of tool names is unchanged — router mode simply exposes a
+ * subset — so cyrus-hosted's `KNOWN_MCP_TOOLS` catalog needs no update.
  */
 export function createCyrusToolsServer(
-	linearClient: LinearClient,
+	backing: CyrusToolsBacking,
 	options: CyrusToolsOptions = {},
 ): McpServer {
 	const server = new McpServer({
 		name: "cyrus-tools",
 		version: "1.0.0",
 	});
+
+	// Router mode: back the tools with the platform-agnostic tracker interface
+	// instead of the raw Linear SDK client, then return early.
+	if (isTrackerBacking(backing)) {
+		return registerCyrusToolsOverIssueTracker(
+			server,
+			backing.issueTracker,
+			options,
+		);
+	}
+
+	// Linear/CLI mode: `backing` is narrowed to a raw LinearClient.
+	const linearClient = backing;
 
 	server.registerTool(
 		"linear_upload_file",
@@ -1010,4 +1059,497 @@ export function createCyrusToolsServer(
 	}
 
 	return server;
+}
+
+/**
+ * Wrap a JSON-serializable payload into the MCP tool text-content result shape.
+ */
+function toolResult(payload: unknown): {
+	content: Array<{ type: "text"; text: string }>;
+} {
+	return {
+		content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+	};
+}
+
+/**
+ * Serialize a value that may be a `Date` (Linear/CLI in-process) or an ISO
+ * string (router wire JSON) into an ISO string, tolerating both shapes.
+ */
+function toIsoString(value: unknown): string | null {
+	if (value instanceof Date) return value.toISOString();
+	if (typeof value === "string") return value;
+	return null;
+}
+
+/**
+ * Await a value that may already be resolved. The `IIssueTrackerService`
+ * relationship getters are typed as Promises, but over the router wire they
+ * arrive as plain (already-resolved) JSON — `await` handles both.
+ */
+async function awaitMaybe<T>(
+	value: Promise<T> | T | undefined,
+): Promise<Awaited<T> | undefined> {
+	if (value === undefined || value === null) return undefined;
+	return await value;
+}
+
+/**
+ * Register cyrus-tools over the platform-agnostic `IIssueTrackerService`
+ * (router mode). Implements every tool that maps cleanly onto interface
+ * methods; omits `linear_set_issue_relation` and `linear_get_agent_sessions`
+ * (which require raw Linear SDK access the interface doesn't expose) and logs
+ * the omission. The set of registered names is a subset of the Linear-client
+ * catalog — no new tool names are introduced.
+ */
+function registerCyrusToolsOverIssueTracker(
+	server: McpServer,
+	issueTracker: IIssueTrackerService,
+	options: CyrusToolsOptions,
+): McpServer {
+	console.info(
+		"[CyrusTools] Backing cyrus-tools with the issue-tracker interface (router mode). " +
+			"Omitting tools that require direct Linear SDK access: linear_set_issue_relation, linear_get_agent_sessions.",
+	);
+
+	server.registerTool(
+		"linear_upload_file",
+		{
+			description:
+				"Upload a file to Linear. Returns an asset URL that can be used in issue descriptions or comments.",
+			inputSchema: {
+				filePath: z
+					.string()
+					.describe("The absolute path to the file to upload"),
+				filename: z
+					.string()
+					.optional()
+					.describe(
+						"The filename to use in Linear (optional, defaults to basename of filePath)",
+					),
+				contentType: z
+					.string()
+					.optional()
+					.describe(
+						"MIME type of the file (optional, auto-detected if not provided)",
+					),
+				makePublic: z
+					.boolean()
+					.optional()
+					.describe(
+						"Whether to make the file publicly accessible (default: false)",
+					),
+			},
+		},
+		async ({ filePath, filename, contentType, makePublic }) => {
+			try {
+				const stats = await fs.stat(filePath);
+				if (!stats.isFile()) {
+					return toolResult({
+						success: false,
+						error: `Path ${filePath} is not a file`,
+					});
+				}
+
+				const fileBuffer = await fs.readFile(filePath);
+				const finalFilename = filename || basename(filePath);
+				const finalContentType = contentType || getMimeType(finalFilename);
+				const size = stats.size;
+
+				const upload = await issueTracker.requestFileUpload({
+					contentType: finalContentType,
+					filename: finalFilename,
+					size,
+					makePublic,
+				});
+
+				const uploadHeaders: Record<string, string> = {
+					"Content-Type": finalContentType,
+					"Cache-Control": "public, max-age=31536000",
+					...upload.headers,
+				};
+
+				const uploadResponse = await fetch(upload.uploadUrl, {
+					method: "PUT",
+					headers: uploadHeaders,
+					body: fileBuffer,
+				});
+
+				if (!uploadResponse.ok) {
+					const errorText = await uploadResponse.text();
+					return toolResult({
+						success: false,
+						error: `Failed to upload file: ${uploadResponse.status} ${uploadResponse.statusText} - ${errorText}`,
+					});
+				}
+
+				return toolResult({
+					success: true,
+					assetUrl: upload.assetUrl,
+					filename: finalFilename,
+					size,
+					contentType: finalContentType,
+				});
+			} catch (error) {
+				return toolResult({
+					success: false,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		},
+	);
+
+	server.registerTool(
+		"linear_agent_session_create",
+		{
+			description:
+				"Create an agent session on a Linear issue to track AI/bot activity.",
+			inputSchema: {
+				issueId: z
+					.string()
+					.describe(
+						'The ID or identifier of the Linear issue (e.g., "ABC-123" or UUID)',
+					),
+				externalLink: z
+					.string()
+					.optional()
+					.describe(
+						"Optional URL of an external agent-hosted page associated with this session",
+					),
+			},
+		},
+		async ({ issueId, externalLink }) => {
+			try {
+				const payload = await issueTracker.createAgentSessionOnIssue({
+					issueId,
+					...(externalLink ? { externalLink } : {}),
+				});
+				if (!payload.success) {
+					return toolResult({
+						success: false,
+						error: "Failed to create agent session",
+					});
+				}
+				const agentSession = await awaitMaybe(payload.agentSession);
+				const agentSessionId = agentSession?.id;
+				if (
+					agentSessionId &&
+					options.parentSessionId &&
+					options.onSessionCreated
+				) {
+					options.onSessionCreated(agentSessionId, options.parentSessionId);
+				}
+				return toolResult({
+					success: payload.success,
+					agentSessionId,
+					lastSyncId: payload.lastSyncId,
+				});
+			} catch (error) {
+				return toolResult({
+					success: false,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		},
+	);
+
+	server.registerTool(
+		"linear_agent_session_create_on_comment",
+		{
+			description:
+				"Create an agent session on a Linear root comment (not a reply) to trigger a sub-agent for processing child issues or tasks. See Linear API docs: https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference/inputs/AgentSessionCreateOnComment",
+			inputSchema: {
+				commentId: z
+					.string()
+					.describe(
+						"The ID of the Linear root comment (not a reply) to create the session on",
+					),
+				externalLink: z
+					.string()
+					.optional()
+					.describe(
+						"Optional URL of an external agent-hosted page associated with this session",
+					),
+			},
+		},
+		async ({ commentId, externalLink }) => {
+			try {
+				const payload = await issueTracker.createAgentSessionOnComment({
+					commentId,
+					...(externalLink ? { externalLink } : {}),
+				});
+				if (!payload.success) {
+					return toolResult({
+						success: false,
+						error: "Failed to create agent session on comment",
+					});
+				}
+				const agentSession = await awaitMaybe(payload.agentSession);
+				const agentSessionId = agentSession?.id;
+				if (
+					agentSessionId &&
+					options.parentSessionId &&
+					options.onSessionCreated
+				) {
+					options.onSessionCreated(agentSessionId, options.parentSessionId);
+				}
+				return toolResult({
+					success: payload.success,
+					agentSessionId,
+					lastSyncId: payload.lastSyncId,
+				});
+			} catch (error) {
+				return toolResult({
+					success: false,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		},
+	);
+
+	registerGiveFeedbackTool(server, options);
+
+	server.registerTool(
+		"linear_get_child_issues",
+		{
+			description:
+				"Get all child issues (sub-issues) for a given Linear issue. Takes an issue identifier like 'CYHOST-91' and returns a list of child issue ids and their titles.",
+			inputSchema: {
+				issueId: z
+					.string()
+					.describe(
+						"The ID or identifier of the parent issue (e.g., 'CYHOST-91' or UUID)",
+					),
+				limit: z
+					.number()
+					.optional()
+					.describe(
+						"Maximum number of child issues to return (default: 50, max: 250)",
+					),
+				includeCompleted: z
+					.boolean()
+					.optional()
+					.describe(
+						"Whether to include completed child issues (default: true)",
+					),
+				includeArchived: z
+					.boolean()
+					.optional()
+					.describe(
+						"Whether to include archived child issues (default: false)",
+					),
+			},
+		},
+		async ({
+			issueId,
+			limit = 50,
+			includeCompleted = true,
+			includeArchived = false,
+		}) => {
+			try {
+				const finalLimit = Math.min(Math.max(1, limit), 250);
+				const parent = await issueTracker.fetchIssueChildren(issueId, {
+					limit: finalLimit,
+					includeCompleted,
+					includeArchived,
+				});
+
+				if (!parent) {
+					return toolResult({
+						success: false,
+						error: `Issue ${issueId} not found`,
+					});
+				}
+
+				const childrenData = await Promise.all(
+					parent.children.map(async (child) => {
+						const state = await awaitMaybe(child.state);
+						const assignee = await awaitMaybe(child.assignee);
+						return {
+							id: child.id,
+							identifier: child.identifier,
+							title: child.title,
+							state: state?.name || "Unknown",
+							stateType: state?.type || null,
+							assignee: assignee?.name || null,
+							assigneeId: assignee?.id || null,
+							priority: child.priority,
+							createdAt: toIsoString(child.createdAt),
+							updatedAt: toIsoString(child.updatedAt),
+							url: child.url,
+							archivedAt: toIsoString(child.archivedAt ?? null),
+						};
+					}),
+				);
+
+				return toolResult({
+					success: true,
+					parentIssue: {
+						id: parent.id,
+						identifier: parent.identifier,
+						title: parent.title,
+						url: parent.url,
+					},
+					childCount: childrenData.length,
+					children: childrenData,
+				});
+			} catch (error) {
+				return toolResult({
+					success: false,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		},
+	);
+
+	server.registerTool(
+		"linear_get_agent_session",
+		{
+			description:
+				"Get a single agent session by ID. Returns detailed information about the agent session including its status, timestamps, associated issue, and metadata.",
+			inputSchema: {
+				sessionId: z
+					.string()
+					.describe("The ID of the agent session to retrieve (UUID)"),
+			},
+		},
+		async ({ sessionId }) => {
+			try {
+				const session = await issueTracker.fetchAgentSession(sessionId);
+				if (!session) {
+					return toolResult({
+						success: false,
+						error: `Agent session ${sessionId} not found`,
+					});
+				}
+
+				const [issue, creator, appUser, comment] = await Promise.all([
+					awaitMaybe(session.issue),
+					awaitMaybe(session.creator),
+					awaitMaybe(session.appUser),
+					awaitMaybe(session.comment),
+				]);
+
+				return toolResult({
+					success: true,
+					session: {
+						id: session.id,
+						createdAt: toIsoString(session.createdAt),
+						updatedAt: toIsoString(session.updatedAt),
+						startedAt: toIsoString(session.startedAt ?? null),
+						endedAt: toIsoString(session.endedAt ?? null),
+						archivedAt: toIsoString(session.archivedAt ?? null),
+						externalLink: session.externalLink || null,
+						summary: session.summary || null,
+						issue: issue
+							? {
+									id: issue.id,
+									identifier: issue.identifier,
+									title: issue.title,
+									url: issue.url,
+									description: issue.description,
+									priority: issue.priority,
+								}
+							: null,
+						creator: creator
+							? {
+									id: creator.id,
+									name: creator.name,
+									email: creator.email,
+									displayName: creator.displayName,
+								}
+							: null,
+						appUser: appUser
+							? {
+									id: appUser.id,
+									name: appUser.name,
+								}
+							: null,
+						comment: comment
+							? {
+									id: comment.id,
+									body: comment.body,
+									createdAt: toIsoString(comment.createdAt),
+								}
+							: null,
+					},
+				});
+			} catch (error) {
+				return toolResult({
+					success: false,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		},
+	);
+
+	// log_failure_mode + OpenAI tools work identically regardless of backing.
+	if (options.failureModes) {
+		registerLogFailureModeTool(server, {
+			resolveSessionFromCwd: options.failureModes.resolveSessionFromCwd,
+			httpClient: options.failureModes.httpClient,
+			fallbackSessionId: options.parentSessionId,
+		});
+	}
+
+	const openaiApiKey = process.env.OPENAI_API_KEY;
+	if (openaiApiKey) {
+		const openaiClient = new OpenAI({
+			apiKey: openaiApiKey,
+			timeout: 600 * 1000, // 10 minutes
+		});
+		const outputDirectory = tmpdir();
+		registerImageTools(server, openaiClient, outputDirectory);
+		registerSoraTools(server, openaiClient, outputDirectory);
+	}
+
+	return server;
+}
+
+/**
+ * Register the client-agnostic `linear_agent_give_feedback` tool. It routes
+ * feedback to a parent session via `options.onFeedbackDelivery` and needs no
+ * Linear backing, so both the Linear-client and tracker paths reuse it.
+ */
+function registerGiveFeedbackTool(
+	server: McpServer,
+	options: CyrusToolsOptions,
+): void {
+	server.registerTool(
+		"linear_agent_give_feedback",
+		{
+			description:
+				"Provide feedback to a child agent session to continue its processing.",
+			inputSchema: {
+				agentSessionId: z
+					.string()
+					.describe("The ID of the child agent session to provide feedback to"),
+				message: z
+					.string()
+					.describe("The feedback message to send to the child agent session"),
+			},
+		},
+		async ({ agentSessionId, message }) => {
+			if (!agentSessionId) {
+				return toolResult({
+					success: false,
+					error: "agentSessionId is required",
+				});
+			}
+
+			if (!message) {
+				return toolResult({ success: false, error: "message is required" });
+			}
+
+			if (options.onFeedbackDelivery) {
+				try {
+					await options.onFeedbackDelivery(agentSessionId, message);
+				} catch (error) {
+					console.error("[CyrusTools] Failed to deliver feedback:", error);
+				}
+			}
+
+			return toolResult({ success: true });
+		},
+	);
 }

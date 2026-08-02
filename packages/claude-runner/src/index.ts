@@ -50,6 +50,7 @@ export type {
 	JsonSchema,
 	JsonSchemaOutputFormat,
 	McpServerConfig,
+	McpServerStatusReport,
 	OutputFormat,
 	OutputFormatConfig,
 	SandboxSettings,

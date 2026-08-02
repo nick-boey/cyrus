@@ -44,6 +44,19 @@ export class WorkerService {
 	}
 
 	/**
+	 * MCP connection-health lines for the startup banner — which MCP servers
+	 * connected, which are retrying/degraded/failed, and which were skipped
+	 * (e.g. `cyrus-docs` inside a headless container, where its interactive
+	 * OAuth flow can never complete).
+	 *
+	 * Empty until the EdgeWorker's background probe has recorded something, so
+	 * banner callers can splice it in unconditionally.
+	 */
+	getMcpHealthDiagnostics(): string[] {
+		return this.edgeWorker?.getMcpHealthDiagnostics() ?? [];
+	}
+
+	/**
 	 * Start setup waiting mode - server infrastructure only, no EdgeWorker
 	 * Used after initial authentication while waiting for server configuration
 	 */
@@ -246,6 +259,11 @@ export class WorkerService {
 			// User access control configuration
 			userAccessControl: edgeConfig.userAccessControl,
 			sandbox: edgeConfig.sandbox,
+			// Platform mode + router connection config. `cyrus connect` writes
+			// these to config.json; forward them so `cyrus start` doesn't drop
+			// them (Codex finding 5).
+			platform: edgeConfig.platform,
+			router: edgeConfig.router,
 			handlers: {
 				createWorkspace: async (
 					issue: Issue,
