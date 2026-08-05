@@ -32,11 +32,15 @@ RUN apt-get update \
 # from Microsoft's package feed, which auto-resolves the native runtime deps
 # (libicu, libssl, …) that node:22-slim does not ship. Pinned to the base
 # image's Debian release (12/bookworm) — update the feed URL if the base moves.
+# `powershell` (pwsh) comes from the same feed — repos that ship .ps1 build or
+# deploy scripts need it, and it publishes for both amd64 and arm64 on
+# bookworm, so no arch special-casing is required. Left unpinned like the SDK
+# above; `apt-get install powershell=<ver>` if you need a reproducible pin.
 RUN curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -o /tmp/packages-microsoft-prod.deb \
 	&& dpkg -i /tmp/packages-microsoft-prod.deb \
 	&& rm /tmp/packages-microsoft-prod.deb \
 	&& apt-get update \
-	&& apt-get install -y --no-install-recommends dotnet-sdk-10.0 \
+	&& apt-get install -y --no-install-recommends dotnet-sdk-10.0 powershell \
 	&& rm -rf /var/lib/apt/lists/*
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
 	DOTNET_NOLOGO=1 \
@@ -65,6 +69,29 @@ RUN set -eu; \
 	tar -xzf "${tarball}" actionlint; \
 	install -m 0755 actionlint /usr/local/bin/actionlint; \
 	rm -f "${tarball}" "actionlint_${ACTIONLINT_VERSION}_checksums.txt" actionlint
+# Agent CLIs on PATH: `codex` and `opencode`. Both npm packages resolve their
+# native binary through per-platform optionalDependencies, so `npm install -g`
+# picks the right linux-x64/linux-arm64 build without arch special-casing here.
+#
+# `codex` is deliberately installed a second time even though `@openai/codex`
+# already ships inside /app as a transitive dependency of cyrus-codex-runner:
+# CodexRunner resolves that copy through `require.resolve` from its own package
+# directory (see packages/codex-runner/src/backend/codexBinary.ts), and its
+# path inside a `pnpm deploy` tree is an implementation detail we don't want to
+# put on PATH. Keep CODEX_VERSION in step with the `@openai/codex` version
+# resolved in pnpm-lock.yaml so a session invoking `codex` directly gets the
+# same CLI Cyrus itself drives.
+#
+# Neither CLI is authenticated here — credentials are runtime concerns, and
+# baking them into a layer would leak them into the image. How `codex` should
+# get its credentials inside a worker container is still open; see NOR-290.
+# Until that lands, this image only puts the CLI on PATH.
+ARG CODEX_VERSION=0.144.6
+ARG OPENCODE_VERSION=1.18.13
+RUN npm install -g \
+		"@openai/codex@${CODEX_VERSION}" \
+		"opencode-ai@${OPENCODE_VERSION}" \
+	&& rm -rf /root/.npm
 RUN useradd --create-home --uid 1001 cyrus \
 	&& mkdir -p /workspaces /var/cache/repos \
 	&& chown -R cyrus:cyrus /workspaces /var/cache/repos \
