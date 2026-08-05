@@ -288,10 +288,6 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 					githubSlug: "ceedaragents/cyrus",
 					linearWorkspaceId: WORKSPACE,
 					baseBranch: "main",
-					// The registry-backed resolver (Task 9/10/11) needs a default to
-					// route unambiguously; this suite's fake tracker/webhooks carry
-					// no team/project facts that could otherwise match it.
-					isDefault: true,
 				},
 			],
 			secretsPath,
@@ -640,10 +636,6 @@ describe("a leaked affinity row no longer pins a parked container (real RouterSe
 					githubSlug: "ceedaragents/cyrus",
 					linearWorkspaceId: WORKSPACE,
 					baseBranch: "main",
-					// The registry-backed resolver (Task 9/10/11) needs a default to
-					// route unambiguously; this suite's fake tracker/webhooks carry
-					// no team/project facts that could otherwise match it.
-					isDefault: true,
 				},
 			],
 			secretsPath,

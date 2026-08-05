@@ -679,6 +679,45 @@ export class EventRouter {
 	}
 
 	/**
+	 * Is this creator a KNOWN enrolled physical-device user — as opposed to a
+	 * container-executor user, or a creator the router can't identify at all?
+	 *
+	 * Mirrors the exact check `resolveTarget`'s creator branch uses to make the
+	 * SAME distinction (`findUserForCreator` -> `executorFor`), just earlier —
+	 * before any container device is created — so router-side repository
+	 * pre-selection (`ensureRepositoryDecision`) can be skipped for physical-
+	 * device users while leaving it untouched for everyone else:
+	 *
+	 *   - container-executor user (`executorFor` returns a provider): `false`
+	 *     — run the resolver, exactly as before.
+	 *   - unrecognized creator (`findUserForCreator` finds no user, or there is
+	 *     no `containerTargets` at all): `false` — also run the resolver. This
+	 *     preserves the pre-existing, deliberate behaviour of asking an
+	 *     unenrolled creator before `resolveTargetOrInvalidKey` would otherwise
+	 *     tell them they're unenrolled (see `routeCreated`'s comment); it is
+	 *     harmless because nothing on their device will ever answer a second
+	 *     time, unlike a real enrolled physical device.
+	 *   - enrolled, but `executorFor` returns `undefined` (the historical
+	 *     meaning of "physical device", see `ContainerRoutingDeps`'s own doc
+	 *     comment): `true` — skip the resolver. This is the one case a mixed
+	 *     deployment (some container users, some physical-device users, both
+	 *     behind the same `containers`-configured router) needs distinguished:
+	 *     that user's own EdgeWorker already runs its own repository router,
+	 *     so asking here too would double-elicit them for the same issue.
+	 */
+	private isKnownPhysicalDeviceCreator(
+		creator: SessionEvent["agentSession"]["creator"] | undefined,
+	): boolean {
+		if (!creator || !this.containerTargets) return false;
+		const user = this.store.findUserForCreator({
+			id: creator.id,
+			email: creator.email,
+		});
+		if (!user) return false;
+		return this.containerTargets.executorFor(user.userId) === undefined;
+	}
+
+	/**
 	 * Ensures the issue has a repository decision before anything boots.
 	 *
 	 * Returns `"ready"` when routing may continue, and `"held"` when an
@@ -726,6 +765,32 @@ export class EventRouter {
 				fillTemplate(NO_REPOSITORIES_MESSAGE, { reason: outcome.reason }),
 			);
 			this.logger.warn(`Cannot route session ${sessionId}: ${outcome.reason}`);
+			// Stash the ORIGINAL `created` webhook rather than dropping it.
+			// "unavailable" covers two causes — a transient registry read
+			// failure (a first-boot Table race being the concrete case; the
+			// fire-and-forget registry seed from RouterServer's constructor can
+			// still be in flight when the very first webhook lands) and a
+			// workspace with nothing registered yet — and BOTH can resolve
+			// themselves with no further input from the user. Reusing
+			// `pending_repo_selections` with an empty `options` array puts this
+			// on the exact same recovery path `resumeHeldSelection` already has
+			// for a corrupt pending row: the next signal on this session (a
+			// follow-up prompt, or the delegator re-mentioning as the message
+			// above suggests) replays THIS SAME webhook through `routeCreated`,
+			// re-resolving against the then-current registry — instead of only
+			// the user's literal next words being routed with no repository
+			// decision at all, and the original delegation's own content lost.
+			// If nothing ever arrives, the existing TTL sweep still expires the
+			// row with an explicit "re-assign or mention me again" notice
+			// instead of leaving it silent forever.
+			this.store.createPendingRepoSelection({
+				agentSessionId: sessionId,
+				issueKey,
+				workspaceId,
+				options: [],
+				createdEvent: JSON.stringify(webhook),
+				createdMs: this.now(),
+			});
 			return "held";
 		}
 
@@ -818,8 +883,23 @@ export class EventRouter {
 		// answering the elicitation is harmless: `resumeHeldSelection`'s replay
 		// re-runs this same gate and then hits the identical unenrolled-creator
 		// path it would have hit originally.
+		//
+		// A KNOWN physical-device creator is different, and is excluded by
+		// `isKnownPhysicalDeviceCreator` below: their own EdgeWorker already
+		// runs its own `RepositoryRouter`/pending-selection flow (design doc
+		// §5), so asking here too would double-elicit them — once from the
+		// router, once from their device, for the same issue. `containers`
+		// being configured (which is what gates `this.repositoryResolver` being
+		// set at all — see RouterServer) only rules out deployments with NO
+		// container path whatsoever; it does nothing for a MIXED deployment
+		// that also has enrolled physical-device users, which is why this
+		// second, per-creator check is required on top of it.
 		const issueKey = extractIssueKey(webhook);
-		if (issueKey !== undefined && this.repositoryResolver) {
+		if (
+			issueKey !== undefined &&
+			this.repositoryResolver &&
+			!this.isKnownPhysicalDeviceCreator(creator)
+		) {
 			const gate = await this.ensureRepositoryDecision(
 				webhook,
 				issueKey,
@@ -1015,23 +1095,27 @@ export class EventRouter {
 		}
 
 		if (pending.options.length === 0) {
-			// `RouterStore.getPendingRepoSelection` degrades a corrupt
-			// `options_json` to an empty array rather than throwing — a real,
-			// documented state, not a hypothetical. We cannot honor an answer
-			// against options we can no longer identify, but the row still
-			// carries a readable `createdEvent`: replay it through the normal
-			// creation gate (which re-resolves, or re-asks, from the live
-			// registry) instead of silently discarding the delegation. Losing
-			// the held event here would strand the issue with no way back,
-			// which is worse than re-asking once more. The stale row is deleted
+			// Two DIFFERENT origins land here with the identical stored shape,
+			// and both get the identical recovery: (1) `RouterStore
+			// .getPendingRepoSelection` degrades a corrupt `options_json` to an
+			// empty array rather than throwing — a real, documented state, not a
+			// hypothetical; (2) `ensureRepositoryDecision`'s "unavailable"
+			// branch deliberately stores an empty-options row too, for a
+			// registry that was transiently unreadable or had nothing
+			// registered yet at `created` time. Neither case has options left to
+			// honor an answer against, but the row still carries a readable
+			// `createdEvent`: replay it through the normal creation gate (which
+			// re-resolves, or re-asks, from the live registry) instead of
+			// silently discarding the delegation. Losing the held event here
+			// would strand the issue with no way back, which is worse than
+			// re-asking (or re-attempting) once more. The stale row is deleted
 			// BEFORE the replay (unlike the normal path below) because
 			// `ensureRepositoryDecision` treats an existing pending row as "already
-			// asked, don't re-resolve" — leaving this corrupt one in place would
-			// make the replay a no-op and the issue would stay stuck behind it
-			// forever.
+			// asked, don't re-resolve" — leaving this one in place would make the
+			// replay a no-op and the issue would stay stuck behind it forever.
 			this.store.deletePendingRepoSelection(sessionId);
 			this.logger.warn(
-				`Pending repository selection for ${pending.issueKey} has no readable options (corrupt row); replaying the held event through normal resolution instead of guessing`,
+				`Pending repository selection for ${pending.issueKey} has no options to offer (registry was unavailable/empty at creation time, or the row is corrupt); replaying the held event through normal resolution instead of guessing`,
 			);
 			let held: SessionEvent | undefined;
 			try {

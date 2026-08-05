@@ -839,5 +839,140 @@ describe("ContainerTargetService", () => {
 			await vi.waitFor(() => expect(postActivity).toHaveBeenCalled());
 			expect(postActivity.mock.calls[0]?.[2]).toContain("No repositories");
 		});
+
+		/**
+		 * Important review finding: `RepositoryResolver.resolve` deliberately
+		 * catches a throwing `registry.list()` (the Table-backed production
+		 * registry throws on a transient 5xx/auth failure/exhausted retries),
+		 * but `reposForIssue` did not — before the registry existed,
+		 * `containersConfig.repositories` was a static array that could never
+		 * fail this way. A raw exception here must not escape `buildEnv`
+		 * unhandled; it must degrade the same way `resolve` does, with wording
+		 * that tells an operator this is worth retrying rather than reading like
+		 * "the registry is empty" below.
+		 */
+		it("fails the boot with a distinguishable, retry-worthy message when the registry read itself throws", async () => {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker");
+			const throwingRegistry: RepositoryRegistry = {
+				list: vi.fn(async () => {
+					throw new Error("Azure Table request failed: 503");
+				}),
+				put: vi.fn(async () => ({ version: "1" })),
+			};
+			const service = new ContainerTargetService({
+				store,
+				secrets,
+				executors: new Map([["docker", docker]]),
+				registry: throwingRegistry,
+				containersConfig: CONTAINERS_CONFIG,
+				postActivity,
+				logger,
+			});
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-1",
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(postActivity).toHaveBeenCalled());
+			expect(docker.ensureRunning).not.toHaveBeenCalled();
+			expect(postActivity.mock.calls[0]?.[2]).toContain("usually transient");
+			expect(postActivity.mock.calls[0]?.[2]).not.toContain(
+				"No repositories are registered",
+			);
+		});
+
+		/**
+		 * Minor review finding: the fallback log line said "No stored
+		 * repository decision" even when a decision DID exist but every
+		 * repository it named had since been deregistered — a different,
+		 * more surprising operational state (an operator deleted a repo out
+		 * from under a live issue) that deserves its own wording.
+		 */
+		it("distinguishes 'no decision was stored' from 'the decision's repositories were all deregistered' in the fallback log line", async () => {
+			const docker = fakeExecutor("docker");
+			const { service, deviceId } = seedUser(new Map([["docker", docker]]));
+			store.setIssueRepositories(
+				"NOR-1",
+				{
+					repoNames: ["deleted-repo-1", "deleted-repo-2"],
+					baseBranchOverrides: {},
+					method: "description-tag",
+				},
+				1,
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+			// Still falls back to the default, exactly as the "no decision"
+			// case does...
+			expect(
+				(JSON.parse(ctx.env.CYRUS_REPOS_JSON) as RegisteredRepository[]).map(
+					(r) => r.name,
+				),
+			).toEqual(["cyrus-web"]);
+			// ...but the log line names the actually-surprising condition.
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("has since been deregistered"),
+			);
+			expect(logger.warn).not.toHaveBeenCalledWith(
+				expect.stringContaining("No stored repository decision"),
+			);
+		});
+
+		/**
+		 * Minor review finding: the fallback picked a default across the WHOLE
+		 * registry, not scoped to the issue's own Linear workspace — in a
+		 * multi-workspace router, a missing decision could clone a repository
+		 * belonging to a DIFFERENT workspace than the issue's own. Mirrors
+		 * `RepositoryResolver.resolve`'s own workspace filter.
+		 */
+		it("scopes the no-decision fallback to the issue's own workspace, not the whole registry", async () => {
+			const scopedRegistry = stubRegistry([
+				{
+					name: "other-ws-default",
+					githubSlug: "acme/other-ws-default",
+					linearWorkspaceId: "ws-OTHER",
+					isDefault: true,
+				},
+				...REGISTERED,
+			]);
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker");
+			const service = new ContainerTargetService({
+				store,
+				secrets,
+				executors: new Map([["docker", docker]]),
+				registry: scopedRegistry,
+				containersConfig: CONTAINERS_CONFIG,
+				postActivity,
+				logger,
+			});
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-1",
+			);
+
+			// notify.workspaceId is "ws-1" — REGISTERED's workspace, not the
+			// "other-ws-default" repo's "ws-OTHER".
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+			expect(
+				(JSON.parse(ctx.env.CYRUS_REPOS_JSON) as RegisteredRepository[]).map(
+					(r) => r.name,
+				),
+			).toEqual(["cyrus-web"]);
+		});
 	});
 });

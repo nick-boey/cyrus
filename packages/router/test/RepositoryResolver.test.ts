@@ -121,6 +121,68 @@ describe("RepositoryResolver.resolve", () => {
 		});
 	});
 
+	/**
+	 * Regression for a Critical review finding: a single-repository deployment
+	 * (the common case) must never be asked to disambiguate, even when nothing
+	 * about the issue matches the repository's own criteria and it carries no
+	 * `isDefault`. The design doc's rollout guarantee is that one repository in
+	 * the registry behaves identically to the pre-registry
+	 * `containers.repositories` array — "one repository in, one repository
+	 * out, identical behaviour" — which `needs_selection` with a single
+	 * candidate would silently violate on every new issue.
+	 */
+	it("resolves the sole registered repository outright, without asking, when nothing matches", async () => {
+		const lonely: RegisteredRepository = {
+			name: "cyrus",
+			githubSlug: "acme/cyrus",
+			linearWorkspaceId: "ws-1",
+			// Deliberately no isDefault/teamKeys/projectKeys/routingLabels: this
+			// repository cannot win any tier of matchRepositories on its own
+			// criteria, so it is `matchRepositories`'s "unmatched" case that this
+			// test targets.
+		};
+		const outcome = await resolver([lonely], { teamKey: "UNRELATED" }).resolve({
+			workspaceId: "ws-1",
+			issueId: "issue-1",
+		});
+		expect(outcome).toEqual({
+			kind: "resolved",
+			decision: {
+				repositories: [lonely],
+				method: "single-repository",
+				baseBranchOverrides: {},
+			},
+		});
+	});
+
+	it("resolves the shortcut off the workspace-scoped candidate count, not the whole registry", async () => {
+		// Guards against the shortcut accidentally keying off `repositories.length`
+		// (the full registry, 2 here) instead of `scoped.length` (this
+		// workspace's slice, 1 here) — a registry with repositories from other
+		// workspaces must not disable the single-candidate shortcut for this one.
+		const lonely: RegisteredRepository = {
+			name: "cyrus",
+			githubSlug: "acme/cyrus",
+			linearWorkspaceId: "ws-1",
+		};
+		const otherWorkspace: RegisteredRepository = {
+			name: "cyrus-other",
+			githubSlug: "acme/cyrus-other",
+			linearWorkspaceId: "ws-2",
+		};
+		const outcome = await resolver([lonely, otherWorkspace], {
+			teamKey: "UNRELATED",
+		}).resolve({ workspaceId: "ws-1", issueId: "issue-1" });
+		expect(outcome).toEqual({
+			kind: "resolved",
+			decision: {
+				repositories: [lonely],
+				method: "single-repository",
+				baseBranchOverrides: {},
+			},
+		});
+	});
+
 	it("reports unavailable when the registry is empty", async () => {
 		const outcome = await resolver([], { teamKey: "NOR" }).resolve({
 			workspaceId: "ws-1",

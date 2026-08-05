@@ -8,7 +8,11 @@ import {
 /** What the router decided, in a form `ContainerTargets` can persist and replay. */
 export interface RepositoryDecision {
 	repositories: RegisteredRepository[];
-	/** A `RoutingMethod`, or `"user-selected"` / `"fallback-first"`. */
+	/**
+	 * A `RoutingMethod`, or `"user-selected"` / `"fallback-first"` /
+	 * `"single-repository"` (the sole candidate in scope, with nothing to
+	 * disambiguate — see `resolve`'s single-candidate shortcut).
+	 */
 	method: string;
 	/** Repository name -> base branch. Empty when there are no overrides. */
 	baseBranchOverrides: Record<string, string>;
@@ -124,6 +128,30 @@ export class RepositoryResolver {
 				kind: "needs_selection",
 				candidates: match.candidates.map((repo) => repo.source),
 				reason: "ambiguous",
+			};
+		}
+
+		// `match.kind === "unmatched"`. A single repository in scope for this
+		// workspace has nothing to disambiguate — asking "which repository?"
+		// when there is only one possible answer would elicit on every new issue
+		// for the (very common) single-repository deployment, contradicting the
+		// design's rollout guarantee that a single registered repository behaves
+		// identically to the pre-registry `containers.repositories` array
+		// (design doc: "one repository in, one repository out, identical
+		// behaviour"). Deliberately placed HERE, in the resolver, rather than as
+		// a catch-all tier in `matchRepositories`: the global constraint forbids
+		// widening that shared matcher, and doing it here also keeps the
+		// guarantee holding when the registry is populated or pruned through the
+		// setup UI without ever going through `containers.repositories` seeding.
+		const only = scoped.length === 1 ? scoped[0] : undefined;
+		if (only) {
+			return {
+				kind: "resolved",
+				decision: {
+					repositories: [only],
+					method: "single-repository",
+					baseBranchOverrides: {},
+				},
 			};
 		}
 

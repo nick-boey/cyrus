@@ -446,10 +446,6 @@ describe("RouterServer containers wiring", () => {
 				name: "cyrus",
 				githubSlug: "ceedaragents/cyrus",
 				linearWorkspaceId: "ws-1",
-				// The registry-backed resolver (Task 9/10/11) needs a default to
-				// route unambiguously; these tests' webhooks carry no team/project
-				// facts that could otherwise match it.
-				isDefault: true,
 			},
 		],
 		// `dbPath` below is ":memory:", whose `dirname` is ".". Without this

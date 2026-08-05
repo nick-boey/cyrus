@@ -48,6 +48,12 @@ const ALICE: Creator = {
 	email: "alice@example.com",
 	name: "Alice",
 };
+/** An enrolled PHYSICAL-device creator, distinct from ALICE's container executor. */
+const BOB: Creator = {
+	id: "user-2",
+	email: "bob@example.com",
+	name: "Bob",
+};
 
 /** Minimal object that satisfies isAgentSessionCreatedWebhook + fields we read. */
 function createdEvent(opts: {
@@ -157,6 +163,65 @@ describe("EventRouter repository selection", () => {
 		expect(postRepositorySelection).not.toHaveBeenCalled();
 	});
 
+	/**
+	 * Regression for a Critical review finding: gating router-side repository
+	 * pre-selection on `containers` being configured only rules out
+	 * deployments with NO container path at all. A router WITH `containers`
+	 * configured still hosts physical-device users (a NULL/absent
+	 * `executor_json`, per `ContainerRoutingDeps`'s own doc comment), and
+	 * `resolveTarget` routes them to their enrolled physical device exactly as
+	 * it always has. Before this fix, `ensureRepositoryDecision` ran for EVERY
+	 * creator on such a router, so a physical-device user got elicited by the
+	 * router AND (redundantly) by their own EdgeWorker's `RepositoryRouter` for
+	 * the same issue.
+	 */
+	it("gates router-side repository selection per creator: a container-backed creator still resolves, a physical-device creator on the same router is routed as before with no elicitation", async () => {
+		// A single repository (matching the "persists an unambiguous decision"
+		// test above) so ALICE's routing resolves outright rather than tying —
+		// this test is about the per-creator gate, not ambiguity handling.
+		const { router, created, resolveSpy } = harness([API], {
+			teamKey: "NOR",
+		});
+
+		// ALICE (from the harness) is a container-executor ("aca") user: the
+		// router resolves her repository as it always has.
+		await router.route(created);
+		expect(store.getIssueRepositories("NOR-1")).toMatchObject({
+			repoNames: ["cyrus-api"],
+			method: "team-based",
+		});
+		resolveSpy.mockClear();
+		postRepositorySelection.mockClear();
+		enqueued.length = 0;
+
+		// BOB is enrolled on the SAME router/store, but with NO container
+		// executor configured — the historical, unconditional meaning of
+		// "physical device" (see ContainerRoutingDeps's doc comment).
+		store.addUser({ email: BOB.email });
+		const code = store.mintEnrollmentCode(BOB.email, 1);
+		const bobDevice = store.redeemEnrollmentCode(code, 1);
+		if (!bobDevice) throw new Error("enrolling Bob's physical device failed");
+
+		const bobCreated = createdEvent({
+			sessionId: "sess-bob-1",
+			issueId: "issue-bob-1",
+			identifier: "NOR-2",
+			creator: BOB,
+		});
+		await router.route(bobCreated);
+
+		// Never gated: the resolver is not even consulted for Bob's creation.
+		expect(resolveSpy).not.toHaveBeenCalled();
+		expect(postRepositorySelection).not.toHaveBeenCalled();
+		expect(store.getIssueRepositories("NOR-2")).toBeUndefined();
+		expect(store.getPendingRepoSelection("sess-bob-1")).toBeUndefined();
+		// Routed to his physical device exactly as pre-Task-9/10/11 behaviour:
+		// no container device was minted for him.
+		expect(store.getContainerDeviceForIssue("NOR-2")).toBeUndefined();
+		expect(enqueued).toHaveLength(1);
+		expect(JSON.parse(enqueued[0] as string).action).toBe("created");
+	});
+
 	it("holds the created event and elicits when two repositories tie", async () => {
 		const { router, created } = harness([API, WEB], { teamKey: "NOR" });
 		await router.route(created);
@@ -246,6 +311,73 @@ describe("EventRouter repository selection", () => {
 			expect.stringContaining("No repositories are registered"),
 		);
 		expect(enqueued).toEqual([]);
+	});
+
+	/**
+	 * Important review finding: an "unavailable" outcome (empty registry, or a
+	 * registry read failure — a first-boot Table race being the concrete
+	 * case) posted a notice and returned "held" WITHOUT stashing the event or
+	 * creating a `pending_repo_selections` row, unlike the elicit path a few
+	 * lines below. Nothing then replayed it and the expiry sweep never saw it
+	 * — the delegation was lost outright. Chosen fix: stash the ORIGINAL
+	 * `created` webhook (not just tell the user to redo it) by reusing
+	 * `pending_repo_selections` with an empty `options` array, which puts it
+	 * on the exact same recovery path `resumeHeldSelection` already has for a
+	 * corrupt pending row.
+	 */
+	it("stashes the created event when nothing is registered yet, and a later prompt replays and resolves it once a repository exists", async () => {
+		const repositories: RegisteredRepository[] = [];
+		const { router, created, prompted, resolveSpy } = harness(repositories, {
+			teamKey: "NOR",
+		});
+
+		await router.route(created);
+
+		// Stashed, not dropped: a pending row exists with nothing to select
+		// from (distinct from the ambiguous/unmatched case, which offers real
+		// options).
+		expect(store.getPendingRepoSelection("sess-1")).toMatchObject({
+			issueKey: "NOR-1",
+			options: [],
+		});
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+		expect(enqueued).toEqual([]);
+		resolveSpy.mockClear();
+
+		// An operator registers a repository (equally models a transient
+		// registry read recovering) before the user's next message.
+		repositories.push(API);
+
+		await router.route(prompted("let's get started"));
+
+		// Replayed through normal resolution: the pending row is gone, a real
+		// decision now exists, and the ORIGINAL created event — not just the
+		// prompt — was delivered, in order.
+		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+		expect(store.getIssueRepositories("NOR-1")).toMatchObject({
+			repoNames: ["cyrus-api"],
+		});
+		expect(enqueued.map((raw) => JSON.parse(raw).action)).toEqual([
+			"created",
+			"prompted",
+		]);
+	});
+
+	it("expires a stashed created event past the TTL when the registry never recovers, posting an explicit re-delegate notice", async () => {
+		const { router, created, postActivity } = harness([], { teamKey: "NOR" });
+		await router.route(created);
+		expect(store.getPendingRepoSelection("sess-1")).toBeDefined();
+		postActivity.mockClear();
+
+		clock.value = 1000 + 60_000 + 1;
+		await router.sweepExpired();
+
+		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			REPOSITORY_SELECTION_EXPIRED_MESSAGE,
+		);
 	});
 
 	it("reports a distinct message when the registry read fails, not just an empty registry", async () => {
@@ -569,9 +701,15 @@ describe("EventRouter repository selection", () => {
 			executors: new Map([["aca", fakeExecutor("aca")]]),
 			// A separate stub from `registry` above: this file only exercises
 			// EventRouter's repository-selection gate (via `resolver`), never
-			// `ContainerTargets.buildEnv`/boot, so this registry is never read.
+			// `ContainerTargets.buildEnv`/boot. Throwing (rather than merely
+			// leaving it unread) turns that "never read" claim into something a
+			// test failure would actually catch if it stopped being true.
 			registry: {
-				list: vi.fn(async () => ({ repositories })),
+				list: vi.fn(async () => {
+					throw new Error(
+						"ContainerTargets.registry should never be read in this file",
+					);
+				}),
 				put: vi.fn(async () => ({ version: "1" })),
 			},
 			containersConfig: {

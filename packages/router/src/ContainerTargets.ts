@@ -405,7 +405,7 @@ export class ContainerTargetService {
 			if (!executor) {
 				throw new Error(`no executor configured for provider '${provider}'`);
 			}
-			const env = await this.buildEnv(userId, issueKey);
+			const env = await this.buildEnv(userId, issueKey, notify?.workspaceId);
 			// Both edges of the boot are logged deliberately. `ensureRunning`
 			// can take minutes (image pull, sandbox create), and for ACA it
 			// returning successfully only means the INFRASTRUCTURE came up — the
@@ -463,6 +463,14 @@ export class ContainerTargetService {
 	private async buildEnv(
 		userId: number,
 		issueKey: string,
+		/**
+		 * The Linear workspace this issue belongs to, when known. Set on every
+		 * normal `boot()` call (it comes from `deliverOrNotify`'s `notify`);
+		 * absent on a `bootForTeardown()` wake, which has no agent session to
+		 * derive it from. Only used to scope {@link reposForIssue}'s fallback —
+		 * see that method's doc comment.
+		 */
+		workspaceId?: string,
 	): Promise<Record<string, string>> {
 		const email = this.emailFor(userId);
 		// Additive: the container hard-requires the Claude token, so it is
@@ -486,7 +494,9 @@ export class ContainerTargetService {
 		const env: Record<string, string> = {
 			CYRUS_ROUTER_URL: this.deps.containersConfig.routerUrlForContainers,
 			CYRUS_ISSUE_KEY: issueKey,
-			CYRUS_REPOS_JSON: JSON.stringify(await this.reposForIssue(issueKey)),
+			CYRUS_REPOS_JSON: JSON.stringify(
+				await this.reposForIssue(issueKey, workspaceId),
+			),
 		};
 		// Spread the user's map, skipping reserved keys. `set` already rejects
 		// them; this is belt-and-braces against a hand-edited secrets file.
@@ -512,15 +522,48 @@ export class ContainerTargetService {
 	 * SQLite between Blob backups — degrades to the configured default rather
 	 * than to "clone everything", which is what the pre-registry code did and
 	 * what made a multi-repository deployment unusable.
+	 *
+	 * The fallback default is scoped to `workspaceId` when it's known (mirrors
+	 * `RepositoryResolver.resolve`'s own workspace filter): a router serving
+	 * multiple Linear workspaces must not fall back to some OTHER workspace's
+	 * default just because it sorts first in the registry. `workspaceId` is
+	 * unavailable only on a `bootForTeardown()` wake with no decision at all —
+	 * a narrow, already-degraded corner (see {@link buildEnv}) — where the
+	 * fallback widens back out to the whole registry rather than cloning
+	 * nothing.
 	 */
 	private async reposForIssue(
 		issueKey: string,
+		workspaceId?: string,
 	): Promise<RegisteredRepository[]> {
-		const { repositories } = await this.deps.registry.list();
+		let repositories: RegisteredRepository[];
+		try {
+			({ repositories } = await this.deps.registry.list());
+		} catch (error) {
+			// Mirrors `RepositoryResolver.resolve`'s identical catch: the
+			// Table-backed production registry throws on a transient 5xx, an
+			// auth failure, or exhausted retries — this is reachable, not
+			// hypothetical, and before the registry existed `containersConfig
+			// .repositories` was a static in-memory array that could never fail
+			// this way. Reported with wording distinguishable from "the registry
+			// is empty" below, so an operator sees "retry" rather than "go add a
+			// repository" for what is usually a transient condition.
+			this.deps.logger.warn(
+				`Could not read the repository registry while building the boot env for ${issueKey}: ${String(error)}`,
+			);
+			throw new Error(
+				`The repository registry could not be read, so there is nothing to clone for ${issueKey} yet. This is usually transient — the boot will succeed once the registry is reachable again.`,
+			);
+		}
 		const byName = new Map(repositories.map((repo) => [repo.name, repo]));
 		const decision = this.deps.store.getIssueRepositories(issueKey);
 
 		let chosen: RegisteredRepository[];
+		// Distinguishes "no decision was ever stored" from "a decision existed
+		// but every repository it named has since been deregistered" — both
+		// degrade to the same fallback, but they are different operational
+		// states and the log line said the former even when it was the latter.
+		let decidedRepositoriesAllDeregistered = false;
 		if (decision) {
 			const missing: string[] = [];
 			chosen = [];
@@ -542,21 +585,30 @@ export class ContainerTargetService {
 				const override = decision.baseBranchOverrides[repo.name];
 				return override ? { ...repo, baseBranch: override } : repo;
 			});
+			decidedRepositoriesAllDeregistered =
+				chosen.length === 0 && decision.repoNames.length > 0;
 		} else {
 			chosen = [];
 		}
 
 		if (chosen.length > 0) return chosen;
 
+		const inWorkspace = workspaceId
+			? repositories.filter((repo) => repo.linearWorkspaceId === workspaceId)
+			: repositories;
 		const fallback =
-			repositories.find((repo) => repo.isDefault === true) ?? repositories[0];
+			inWorkspace.find((repo) => repo.isDefault === true) ?? inWorkspace[0];
 		if (!fallback) {
 			throw new Error(
-				`No repositories are registered, so there is nothing to clone for ${issueKey}. Add one at /setup/repositories.`,
+				`No repositories are registered${
+					workspaceId ? ` for Linear workspace ${workspaceId}` : ""
+				}, so there is nothing to clone for ${issueKey}. Add one at /setup/repositories.`,
 			);
 		}
 		this.deps.logger.warn(
-			`No stored repository decision for ${issueKey}; falling back to ${fallback.name}`,
+			decidedRepositoriesAllDeregistered
+				? `Every repository issue ${issueKey} was routed to has since been deregistered; falling back to ${fallback.name}`
+				: `No stored repository decision for ${issueKey}; falling back to ${fallback.name}`,
 		);
 		return [fallback];
 	}
