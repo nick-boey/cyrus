@@ -81,6 +81,37 @@ describe("FileRepositoryRegistry", () => {
 		});
 	});
 
+	it("treats a parseable file with a malformed entry as empty rather than throwing", async () => {
+		const path = freshPath();
+		writeFileSync(
+			path,
+			JSON.stringify({
+				version: "3",
+				repositories: [
+					{ name: 123, githubSlug: true, linearWorkspaceId: "ws-1" },
+				],
+			}),
+		);
+		expect(await new FileRepositoryRegistry(path).list()).toEqual({
+			repositories: [],
+			version: "0",
+		});
+	});
+
+	it("treats a non-numeric version as empty rather than pinning at NaN", async () => {
+		const path = freshPath();
+		writeFileSync(
+			path,
+			JSON.stringify({ version: "not-a-number", repositories: [API] }),
+		);
+		const registry = new FileRepositoryRegistry(path);
+		expect(await registry.list()).toEqual({
+			repositories: [API],
+			version: "0",
+		});
+		expect(await registry.put([API], "0")).toEqual({ version: "1" });
+	});
+
 	it("validates every entry before writing anything", async () => {
 		const path = freshPath();
 		const registry = new FileRepositoryRegistry(path);

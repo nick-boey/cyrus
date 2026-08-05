@@ -135,10 +135,26 @@ export class FileRepositoryRegistry implements RepositoryRegistry {
 				return { version: "0", repositories: [] };
 			}
 			const file = parsed as RegistryFile;
-			return {
-				version: typeof file.version === "string" ? file.version : "0",
-				repositories: file.repositories,
-			};
+			// Every entry must be a well-formed RegisteredRepository, not just an
+			// array — a syntactically valid file with e.g. a numeric `name` would
+			// otherwise reach `toRoutable`/`matchRepositories` and throw at
+			// runtime. This is the same class of corruption as unparseable JSON,
+			// so it gets the same "reads as empty" treatment, per the class doc.
+			for (const repo of file.repositories) {
+				try {
+					validateRegisteredRepository(repo);
+				} catch {
+					return { version: "0", repositories: [] };
+				}
+			}
+			// A non-numeric version (tampered or legacy file) must not silently
+			// pin the registry at "NaN" on the next write.
+			const version =
+				typeof file.version === "string" &&
+				Number.isFinite(Number(file.version))
+					? file.version
+					: "0";
+			return { version, repositories: file.repositories };
 		} catch {
 			return { version: "0", repositories: [] };
 		}
