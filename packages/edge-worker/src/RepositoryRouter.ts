@@ -232,7 +232,7 @@ export class RepositoryRouter {
 			return {
 				type: "selected",
 				repositories: match.repositories,
-				...(match.baseBranchOverrides
+				...(match.baseBranchOverrides && match.baseBranchOverrides.size > 0
 					? { baseBranchOverrides: match.baseBranchOverrides }
 					: {}),
 				routingMethod: match.method,
@@ -246,27 +246,6 @@ export class RepositoryRouter {
 					.join(", ")}] - requesting user selection`,
 			);
 			return { type: "needs_selection", workspaceRepos: match.candidates };
-		}
-
-		// Deprecated implicit catch-all, kept so an existing self-hosted
-		// config.json that predates `isDefault` keeps working. Sits BELOW the
-		// matcher's `default` tier: an explicit isDefault always wins.
-		// TODO(CYPACK): remove once self-hosted configs have migrated to isDefault.
-		const catchAllRepo = workspaceRepos.find(
-			(repo) =>
-				(!repo.teamKeys || repo.teamKeys.length === 0) &&
-				(!repo.routingLabels || repo.routingLabels.length === 0) &&
-				(!repo.projectKeys || repo.projectKeys.length === 0),
-		);
-		if (catchAllRepo) {
-			this.logger.info(
-				`Repository selected: ${catchAllRepo.name} (workspace catch-all)`,
-			);
-			return {
-				type: "selected",
-				repositories: [catchAllRepo],
-				routingMethod: "catch-all",
-			};
 		}
 
 		// Try parsing issue identifier as fallback for team routing
@@ -288,6 +267,29 @@ export class RepositoryRouter {
 			}
 		}
 
+		// Deprecated implicit catch-all, kept so an existing self-hosted
+		// config.json that predates `isDefault` keeps working. Sits BELOW the
+		// matcher's `default` tier AND below team-prefix routing (this ordering
+		// is pre-refactor behaviour, not a design choice made here): an explicit
+		// isDefault or a team-prefix match always wins over an unconfigured repo.
+		// TODO(CYPACK): remove once self-hosted configs have migrated to isDefault.
+		const catchAllRepo = workspaceRepos.find(
+			(repo) =>
+				(!repo.teamKeys || repo.teamKeys.length === 0) &&
+				(!repo.routingLabels || repo.routingLabels.length === 0) &&
+				(!repo.projectKeys || repo.projectKeys.length === 0),
+		);
+		if (catchAllRepo) {
+			this.logger.info(
+				`Repository selected: ${catchAllRepo.name} (workspace catch-all)`,
+			);
+			return {
+				type: "selected",
+				repositories: [catchAllRepo],
+				routingMethod: "catch-all",
+			};
+		}
+
 		this.logger.info(
 			`No routing match for ${workspaceRepos.length} workspace repositories - requesting user selection`,
 		);
@@ -296,8 +298,11 @@ export class RepositoryRouter {
 
 	/**
 	 * Collects everything the matcher needs, tolerating a failure in any single
-	 * lookup. A failed description fetch must not suppress label routing, which
-	 * is why each source is guarded separately rather than in one try block.
+	 * lookup. A failed description fetch must not suppress label routing (and
+	 * vice versa), which is why the three sources are fetched concurrently via
+	 * `Promise.allSettled` rather than sequential awaits: each source is still
+	 * isolated from the others' failures, but the three round-trips overlap
+	 * instead of stacking their latency.
 	 */
 	private async gatherFacts(
 		issueId: string | undefined,
@@ -308,36 +313,56 @@ export class RepositoryRouter {
 		if (teamKey) facts.teamKey = teamKey;
 		if (!issueId) return facts;
 
-		try {
-			const description = await this.deps.fetchIssueDescription(
-				issueId,
-				workspaceId,
+		const [descriptionResult, labelsResult, projectResult] =
+			await Promise.allSettled([
+				this.deps.fetchIssueDescription(issueId, workspaceId),
+				this.deps.fetchIssueLabels(issueId, workspaceId),
+				this.fetchProjectName(issueId, workspaceId),
+			]);
+
+		if (descriptionResult.status === "fulfilled") {
+			if (descriptionResult.value) facts.description = descriptionResult.value;
+		} else {
+			this.logger.error(
+				`Failed to fetch description for routing:`,
+				descriptionResult.reason,
 			);
-			if (description) facts.description = description;
-		} catch (error) {
-			this.logger.error(`Failed to fetch description for routing:`, error);
 		}
 
-		try {
-			facts.labels = await this.deps.fetchIssueLabels(issueId, workspaceId);
-		} catch (error) {
-			this.logger.error(`Failed to fetch labels for routing:`, error);
+		if (labelsResult.status === "fulfilled") {
+			facts.labels = labelsResult.value;
+		} else {
+			this.logger.error(
+				`Failed to fetch labels for routing:`,
+				labelsResult.reason,
+			);
 		}
 
-		try {
-			const issueTracker = this.deps.getIssueTracker(workspaceId);
-			if (issueTracker) {
-				const fullIssue = await issueTracker.fetchIssue(issueId);
-				const project = await fullIssue?.project;
-				if (project?.name) facts.projectName = project.name;
-			} else {
-				this.logger.warn(`No issue tracker found for workspace ${workspaceId}`);
-			}
-		} catch (error) {
-			this.logger.debug(`Failed to fetch project for issue ${issueId}:`, error);
+		if (projectResult.status === "fulfilled") {
+			if (projectResult.value) facts.projectName = projectResult.value;
+		} else {
+			this.logger.debug(
+				`Failed to fetch project for issue ${issueId}:`,
+				projectResult.reason,
+			);
 		}
 
 		return facts;
+	}
+
+	/** Isolated so a missing issue tracker only affects the project fact. */
+	private async fetchProjectName(
+		issueId: string,
+		workspaceId: string,
+	): Promise<string | undefined> {
+		const issueTracker = this.deps.getIssueTracker(workspaceId);
+		if (!issueTracker) {
+			this.logger.warn(`No issue tracker found for workspace ${workspaceId}`);
+			return undefined;
+		}
+		const fullIssue = await issueTracker.fetchIssue(issueId);
+		const project = await fullIssue?.project;
+		return project?.name;
 	}
 
 	/**

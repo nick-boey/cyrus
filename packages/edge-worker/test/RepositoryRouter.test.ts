@@ -1270,6 +1270,42 @@ describe("RepositoryRouter", () => {
 				// Then: Should fallback to catch-all routing
 				expectRouting(result).shouldSelectRepositoryVia(repo2, "catch-all");
 			});
+
+			it("should prefer team-prefix routing over the deprecated implicit catch-all when team key is absent", async () => {
+				// Regression test: a workspace with both a catch-all-eligible repo
+				// AND a team-prefix-matchable repo must still resolve to the
+				// team-prefix match. Team-prefix routing must be checked before the
+				// deprecated implicit catch-all, mirroring the pre-refactor order.
+				const catchAllRepo = env
+					.repository("repo-catch", "Catch All Repo")
+					.asCatchAll()
+					.build();
+
+				const teamRepo = env
+					.repository("repo-abc", "ABC Team Repo")
+					.withTeams("ABC")
+					.build();
+
+				const webhook = env
+					.webhook()
+					.forIssue("issue-1", "ABC-123")
+					.inTeam("") // Empty team key
+					.build();
+				webhook.agentSession.issue.team.key = undefined as any;
+
+				// When: Determining repository
+				const result = await env.router.determineRepositoryForWebhook(webhook, [
+					catchAllRepo,
+					teamRepo,
+				]);
+
+				// Then: Should select team-matched repo via team-prefix routing,
+				// not the catch-all repo
+				expectRouting(result).shouldSelectRepositoryVia(
+					teamRepo,
+					"team-prefix",
+				);
+			});
 		});
 	});
 
