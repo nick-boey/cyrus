@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
 	RegisteredRepository,
+	RegistrySnapshot,
 	RepositoryRegistry,
 } from "../src/RepositoryRegistry.js";
 import { RouterStore } from "../src/RouterStore.js";
@@ -58,6 +59,7 @@ function build(registry: RepositoryRegistry, registered = [ALICE]) {
 	const store = new RouterStore(":memory:");
 	for (const email of registered) store.addUser({ email });
 	const fastify = Fastify();
+	const csrf = createCsrfTokens("test-secret");
 	registerRepositoryRoutes(fastify, {
 		registry,
 		workspaceIds: ["ws-1"],
@@ -69,11 +71,38 @@ function build(registry: RepositoryRegistry, registered = [ALICE]) {
 			autoProvisionUsers: false,
 			logger: { info: vi.fn(), warn: vi.fn() },
 		}),
-		csrf: createCsrfTokens("test-secret"),
+		csrf,
 		logger: { info: vi.fn(), warn: vi.fn() },
 	});
 	openApps.push(fastify);
-	return { fastify, store };
+	return { fastify, store, csrf };
+}
+
+/**
+ * A registry double that mirrors `TableRepositoryRegistry.list()`'s real
+ * behaviour on an empty/never-written registry: `version` is genuinely
+ * `undefined` (no `version` key at all), not `fakeRegistry`'s always-defined
+ * `"0"`. This is what the "empty registry permanently 409s" regression needs
+ * — `fakeRegistry` can never reproduce it because it always returns a version.
+ */
+function neverWrittenRegistry(): RepositoryRegistry & {
+	current: () => RegisteredRepository[];
+} {
+	let repositories: RegisteredRepository[] = [];
+	let version: string | undefined;
+	return {
+		current: () => repositories,
+		list: async (): Promise<RegistrySnapshot> => ({
+			repositories: [...repositories],
+			...(version !== undefined ? { version } : {}),
+		}),
+		put: async (next, ifMatch) => {
+			if (ifMatch !== version) throw new SetupConflictError();
+			repositories = [...next];
+			version = 'W/"v1"';
+			return { version };
+		},
+	};
 }
 
 afterEach(async () => {
@@ -253,6 +282,66 @@ describe("POST /setup/repositories", () => {
 		});
 		expect(registry.current()[0]?.baseBranch).toBe("main");
 	});
+
+	it("rejects a base branch that could reach a shell", async () => {
+		const registry = fakeRegistry();
+		const { fastify } = build(registry);
+		const csrf = await csrfFrom(fastify);
+		const response = await fastify.inject({
+			method: "POST",
+			url: "/setup/repositories",
+			headers: { "x-ms-client-principal-name": ALICE, "content-type": FORM },
+			payload: new URLSearchParams({
+				csrf,
+				name: "ok",
+				githubSlug: "acme/ok",
+				baseBranch: "$(rm -rf /)",
+				linearWorkspaceId: "ws-1",
+			}).toString(),
+		});
+		expect(response.statusCode).toBe(400);
+		expect(response.body).toContain("Base branch");
+		expect(registry.current()).toEqual([]);
+	});
+
+	it("rejects a Linear workspace id that isn't configured", async () => {
+		const registry = fakeRegistry();
+		const { fastify } = build(registry);
+		const csrf = await csrfFrom(fastify);
+		const response = await fastify.inject({
+			method: "POST",
+			url: "/setup/repositories",
+			headers: { "x-ms-client-principal-name": ALICE, "content-type": FORM },
+			payload: new URLSearchParams({
+				csrf,
+				name: "ok",
+				githubSlug: "acme/ok",
+				linearWorkspaceId: "ws-bogus",
+			}).toString(),
+		});
+		expect(response.statusCode).toBe(400);
+		expect(registry.current()).toEqual([]);
+	});
+
+	it("refuses an unregistered principal with 403 and writes nothing", async () => {
+		const registry = fakeRegistry([API]);
+		const { fastify, csrf } = build(registry);
+
+		const response = await fastify.inject({
+			method: "POST",
+			url: "/setup/repositories",
+			headers: { "x-ms-client-principal-name": BOB, "content-type": FORM },
+			payload: new URLSearchParams({
+				csrf: csrf.issue(BOB),
+				name: "unauthorized-repo",
+				githubSlug: "acme/unauthorized-repo",
+				linearWorkspaceId: "ws-1",
+			}).toString(),
+		});
+
+		expect(response.statusCode).toBe(403);
+		expect(registry.current()).toEqual([API]);
+	});
 });
 
 describe("POST /setup/repositories/save", () => {
@@ -301,8 +390,15 @@ describe("POST /setup/repositories/save", () => {
 		const registry = fakeRegistry([API]);
 		const { fastify } = build(registry);
 		const csrf = await csrfFrom(fastify);
+		// `stale` is the SIGNED token scraped from the render — that's what the
+		// HTTP save below resubmits. The direct `registry.put` call bypasses HTTP
+		// entirely to simulate an out-of-band write, so it needs the registry's
+		// actual raw version, not the opaque signed token wrapping it.
 		const stale = await versionFrom(fastify);
-		await registry.put([{ ...API, baseBranch: "develop" }], stale);
+		await registry.put(
+			[{ ...API, baseBranch: "develop" }],
+			(await registry.list()).version,
+		);
 
 		const response = await fastify.inject({
 			method: "POST",
@@ -320,6 +416,78 @@ describe("POST /setup/repositories/save", () => {
 
 		expect(response.statusCode).toBe(409);
 		expect(registry.current()[0]?.baseBranch).toBe("develop");
+	});
+
+	it("refuses a version token with a forged signature and writes nothing", async () => {
+		const registry = fakeRegistry([API]);
+		const putSpy = vi.spyOn(registry, "put");
+		const { fastify } = build(registry);
+		const csrf = await csrfFrom(fastify);
+		const version = await versionFrom(fastify);
+		putSpy.mockClear();
+		const separator = version.indexOf(".");
+		const tampered = `${version.slice(0, separator)}.not-the-real-signature`;
+
+		const response = await fastify.inject({
+			method: "POST",
+			url: "/setup/repositories/save",
+			headers: { "x-ms-client-principal-name": ALICE, "content-type": FORM },
+			payload: new URLSearchParams({
+				csrf,
+				version: tampered,
+				"repo:cyrus-api": "1",
+				"slug:cyrus-api": "acme/cyrus-api",
+				"branch:cyrus-api": "release",
+				"assoc:cyrus-api": "",
+			}).toString(),
+		});
+
+		expect(response.statusCode).toBe(409);
+		expect(putSpy).not.toHaveBeenCalled();
+		expect(registry.current()[0]?.baseBranch).toBe("main");
+	});
+
+	it('refuses a forged version="*" (unconditional-overwrite bypass) and writes nothing', async () => {
+		const registry = fakeRegistry([API]);
+		const putSpy = vi.spyOn(registry, "put");
+		const { fastify } = build(registry);
+		const csrf = await csrfFrom(fastify);
+		putSpy.mockClear();
+
+		const response = await fastify.inject({
+			method: "POST",
+			url: "/setup/repositories/save",
+			headers: { "x-ms-client-principal-name": ALICE, "content-type": FORM },
+			payload: new URLSearchParams({
+				csrf,
+				version: "*",
+				"repo:cyrus-api": "1",
+				"slug:cyrus-api": "acme/cyrus-api",
+				"branch:cyrus-api": "release",
+				"assoc:cyrus-api": "",
+			}).toString(),
+		});
+
+		expect(response.statusCode).toBe(409);
+		expect(putSpy).not.toHaveBeenCalled();
+		expect(registry.current()[0]?.baseBranch).toBe("main");
+	});
+
+	it("does not 409 forever when the registry has never been written", async () => {
+		const registry = neverWrittenRegistry();
+		const { fastify } = build(registry);
+		const csrf = await csrfFrom(fastify);
+		const version = await versionFrom(fastify);
+
+		const response = await fastify.inject({
+			method: "POST",
+			url: "/setup/repositories/save",
+			headers: { "x-ms-client-principal-name": ALICE, "content-type": FORM },
+			payload: new URLSearchParams({ csrf, version }).toString(),
+		});
+
+		expect(response.statusCode).toBe(200);
+		expect(response.body).toContain("No changes to save");
 	});
 
 	it("reports no changes without writing", async () => {
@@ -348,6 +516,31 @@ describe("POST /setup/repositories/save", () => {
 		expect(response.statusCode).toBe(200);
 		expect(response.body).toContain("No changes to save");
 		expect(putSpy).not.toHaveBeenCalled();
+	});
+
+	it("rejects a base branch that could reach a shell", async () => {
+		const registry = fakeRegistry([API]);
+		const { fastify } = build(registry);
+		const csrf = await csrfFrom(fastify);
+		const version = await versionFrom(fastify);
+
+		const response = await fastify.inject({
+			method: "POST",
+			url: "/setup/repositories/save",
+			headers: { "x-ms-client-principal-name": ALICE, "content-type": FORM },
+			payload: new URLSearchParams({
+				csrf,
+				version,
+				"repo:cyrus-api": "1",
+				"slug:cyrus-api": "acme/cyrus-api",
+				"branch:cyrus-api": "$(evil)",
+				"assoc:cyrus-api": "",
+			}).toString(),
+		});
+
+		expect(response.statusCode).toBe(400);
+		expect(response.body).toContain("Base branch");
+		expect(registry.current()[0]?.baseBranch).toBe("main");
 	});
 });
 
@@ -440,5 +633,29 @@ describe("applyRepositoryEdits", () => {
 			isDefault: ["cyrus-api"],
 		});
 		expect(result.next[0]?.projectKeys).toBeUndefined();
+	});
+
+	it("reports no change regardless of the stored entry's key order", () => {
+		// Same repository as API, field-for-field, but built with a different key
+		// order — e.g. what a registry seeded from `containers.repositories`
+		// (arbitrary JSON key order) could hand back. A naive
+		// `JSON.stringify(next) !== JSON.stringify(current)` is sensitive to this
+		// and would misreport "changed" on a save that changed nothing.
+		const reordered: RegisteredRepository = {
+			isDefault: true,
+			baseBranch: "main",
+			linearWorkspaceId: "ws-1",
+			githubSlug: "acme/cyrus-api",
+			projectKeys: ["Platform"],
+			name: "cyrus-api",
+		};
+		const result = applyRepositoryEdits([reordered], {
+			"repo:cyrus-api": ["1"],
+			"slug:cyrus-api": ["acme/cyrus-api"],
+			"branch:cyrus-api": ["main"],
+			"assoc:cyrus-api": ["p=Platform"],
+			isDefault: ["cyrus-api"],
+		});
+		expect(result.changed).toBe(false);
 	});
 });

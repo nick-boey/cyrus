@@ -64,6 +64,9 @@ const CSP = [
 	"base-uri 'none'",
 ].join("; ");
 
+/** Domain-separates the version token from the CSRF token (same signer). */
+const VERSION_SCOPE = "setup-repos-version";
+
 export interface RepositoryRouteDeps {
 	registry: RepositoryRegistry;
 	/** Workspace ids the router serves; one means the field is auto-filled. */
@@ -89,6 +92,37 @@ function fieldsOf(request: FastifyRequest): Record<string, unknown> {
 	const body = request.body;
 	if (typeof body !== "object" || body === null) return {};
 	return body as Record<string, unknown>;
+}
+
+/**
+ * Recursively sorts object keys (never array element order — associations and
+ * routing labels are ordered lists, and reordering them is a real edit) so two
+ * structurally identical `RegisteredRepository` values compare equal
+ * regardless of construction order.
+ */
+function canonicalize(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalize);
+	if (value !== null && typeof value === "object") {
+		const entries = Object.entries(value as Record<string, unknown>).sort(
+			([a], [b]) => (a < b ? -1 : a > b ? 1 : 0),
+		);
+		return Object.fromEntries(
+			entries.map(([key, entryValue]) => [key, canonicalize(entryValue)]),
+		);
+	}
+	return value;
+}
+
+/**
+ * Structural equality for the `changed` check below. A plain
+ * `JSON.stringify(a) !== JSON.stringify(b)` is key-order sensitive, so a
+ * registry seeded from `containers.repositories` (whose entries can be built
+ * in any key order) could report "Saved" on a save that changed nothing —
+ * `applyRepositoryEdits` itself always constructs rows in one fixed order, so
+ * this only bites a store whose stored order differs from that.
+ */
+function stableStringify(value: unknown): string {
+	return JSON.stringify(canonicalize(value));
 }
 
 function secureHtml(reply: FastifyReply): FastifyReply {
@@ -121,15 +155,71 @@ function toView(repo: RegisteredRepository): RepositoryView {
 }
 
 /**
- * Unlike `routes.ts`'s ETag, the version token here is the registry's raw
- * version string, unsigned. `RepositoryRegistry.put`'s own conditional-write
- * contract is already the source of truth for "did this change since it was
- * read" — a submitted version either matches the stored one (write proceeds)
- * or it does not (`SetupConflictError`, mapped to 409 below), and `undefined`
- * is itself safe: the contract treats it as a first-write that fails if a
- * registry already exists. There is nothing here that signing would protect
- * against tampering with, since the backend re-checks it unconditionally.
+ * Mints the opaque render-time version token (mirrors `routes.ts`'s ETag
+ * handling exactly). Shape: `<hex(version)>.<signed principal-bound token>`.
+ *
+ * This is signed, and deliberately not a raw passthrough of
+ * `RegistrySnapshot.version`: without a signature, a registered principal
+ * could submit `version=*` directly to `POST /setup/repositories/save`, which
+ * `TableRepositoryRegistry.put` would forward unfiltered into `If-Match: *` —
+ * the Table service's own escape hatch for "write unconditionally," which is
+ * exactly the last-writer-wins upsert the whole render-time-version design
+ * exists to prevent. `applyRepositoryEdits` drops every repository whose row
+ * was not submitted, so that single forged save can wipe the rest of the
+ * registry. Signing closes this off: `readVersionToken` below only accepts a
+ * token this same process issued for this exact principal, so a caller can
+ * never present a version the render never actually produced.
+ *
+ * Hex rather than base64 for the same reason `routes.ts` uses it: it survives
+ * `CsrfTokens`' principal-key lowercasing losslessly. `version: undefined`
+ * (no registry has ever been written — the Table backend returns no ETag on a
+ * 404) hex-encodes to `""`, which is what lets `readVersionToken` tell "no
+ * registry existed at render time" apart from "the field is missing/tampered"
+ * — the former is a legitimate first-write, the latter is refused.
  */
+function issueVersionToken(
+	deps: RepositoryRouteDeps,
+	email: string,
+	version: string | undefined,
+): string {
+	const payload = Buffer.from(version ?? "", "utf-8").toString("hex");
+	return `${payload}.${deps.csrf.issue(`${VERSION_SCOPE}|${email}|${payload}`)}`;
+}
+
+/**
+ * Recovers the version a render captured, or reports the token unusable.
+ *
+ * `version: undefined` with `ok: true` is a real, legitimate state — no
+ * registry existed when the page was rendered — and maps to
+ * `RepositoryRegistry.put`'s unconditional-FIRST-write semantics, never to an
+ * unconditional overwrite of an existing registry (which requires an actual
+ * matching version). Any token that doesn't verify — missing, malformed, or
+ * signed for a different principal or payload — reports `ok: false`, and the
+ * caller must treat that as a conflict rather than ever falling through to
+ * calling `registry.put` with a caller-supplied string.
+ */
+function readVersionToken(
+	deps: RepositoryRouteDeps,
+	email: string,
+	token: string | undefined,
+): { ok: true; version: string | undefined } | { ok: false } {
+	if (!token) return { ok: false };
+	const separator = token.indexOf(".");
+	if (separator < 0) return { ok: false };
+	const payload = token.slice(0, separator);
+	if (!/^(?:[0-9a-f]{2})*$/.test(payload)) return { ok: false };
+	if (
+		!deps.csrf.verify(
+			`${VERSION_SCOPE}|${email}|${payload}`,
+			token.slice(separator + 1),
+		)
+	) {
+		return { ok: false };
+	}
+	const version = Buffer.from(payload, "hex").toString("utf-8");
+	return { ok: true, version: version === "" ? undefined : version };
+}
+
 async function buildModel(
 	deps: RepositoryRouteDeps,
 	principal: SetupPrincipal,
@@ -143,7 +233,7 @@ async function buildModel(
 		workspaceIds: deps.workspaceIds,
 		ambiguities: findAmbiguities(views),
 		csrfToken: deps.csrf.issue(principal.email),
-		versionToken: version,
+		versionToken: issueVersionToken(deps, principal.email, version),
 		...(message ? { message } : {}),
 	};
 }
@@ -283,7 +373,7 @@ export function applyRepositoryEdits(
 
 	return {
 		next,
-		changed: JSON.stringify(next) !== JSON.stringify(current),
+		changed: stableStringify(next) !== stableStringify(current),
 	};
 }
 
@@ -357,6 +447,23 @@ export function registerRepositoryRoutes(
 			deps.workspaceIds[0] ??
 			"";
 
+		// Membership, not just non-empty: a submitted id outside the configured
+		// set can never route anything (`matchRepositories` only ever sees issues
+		// from a workspace this router serves), so accepting it just leaves dead
+		// configuration a direct POST can create with no corresponding UI to fix
+		// it. Skipped only if the router is (unusually) configured with no
+		// workspace ids at all, so this can never reject every submission on a
+		// router that hasn't told us what "valid" means.
+		if (
+			deps.workspaceIds.length > 0 &&
+			!deps.workspaceIds.includes(linearWorkspaceId)
+		) {
+			return respond(reply, deps, guard.principal, 400, {
+				kind: "error",
+				text: `Linear workspace ${JSON.stringify(linearWorkspaceId)} is not configured for this router.`,
+			});
+		}
+
 		let repo: RegisteredRepository;
 		try {
 			const parsed = parseAssociations(associations);
@@ -423,12 +530,16 @@ export function registerRepositoryRoutes(
 		// here would make the conditional write conditional on a value observed
 		// microseconds earlier, which no concurrent writer could realistically
 		// invalidate, so the conflict could never fire.
-		const version = lastValue(guard.fields.version);
-		if (version === undefined) {
-			// A missing field means a tampered or stale form. Never fall through to
-			// an unconditional write — `put(next, undefined)` means "first write"
-			// and would fail loudly on an existing registry, but silently
-			// succeeding on an empty one is still not what this page intended.
+		const token = readVersionToken(
+			deps,
+			guard.principal.email,
+			lastValue(guard.fields.version),
+		);
+		if (!token.ok) {
+			// Never fall through to an unconditional write — that is the fail-open
+			// upsert the signed version token exists to prevent. A missing,
+			// malformed, or forged token (e.g. a bare `version=*`) lands here, not
+			// in `registry.put`.
 			return respond(reply, deps, guard.principal, 409, {
 				kind: "conflict",
 				text: "This page is out of date. The current repositories are shown below — re-enter your changes and save again.",
@@ -455,7 +566,7 @@ export function registerRepositoryRoutes(
 		}
 
 		try {
-			await deps.registry.put(applied.next, version);
+			await deps.registry.put(applied.next, token.version);
 		} catch (error) {
 			if (error instanceof SetupConflictError) {
 				return respond(reply, deps, guard.principal, 409, {

@@ -175,6 +175,18 @@ export class TableRepositoryRegistry implements RepositoryRegistry {
 		repositories: RegisteredRepository[],
 		version?: string,
 	): Promise<{ version: string }> {
+		// Defence in depth, mirroring `TableSecretStore.putRecord`'s identical
+		// guard: the routes layer is the thing that is supposed to keep a caller
+		// from ever presenting `"*"` or `""` here (a signed, principal-bound
+		// version token that decodes to one of those could never be forged
+		// without the CSRF secret), but the store is the thing actually making
+		// the "conditional write only" guarantee this class's own doc comment
+		// promises, so it must not trust a caller to have upheld that.
+		if (version !== undefined && (version === "" || version === "*")) {
+			throw new Error(
+				`Refusing to write with If-Match: ${JSON.stringify(version)}. A missing or wildcard ETag turns a conditional update into a last-writer-wins upsert.`,
+			);
+		}
 		// Before any token acquisition or network use, so a malformed entry costs
 		// nothing and fails with a message the UI can render.
 		for (const repo of repositories) validateRegisteredRepository(repo);

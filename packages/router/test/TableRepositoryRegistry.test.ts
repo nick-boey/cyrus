@@ -126,6 +126,21 @@ describe("TableRepositoryRegistry", () => {
 		);
 	});
 
+	it("refuses to write with If-Match: * or an empty string, before any request", async () => {
+		const fetchFn = vi.fn(async () =>
+			reply(204, null, 'W/"v1"'),
+		) as unknown as typeof fetch;
+		const reg = registry(fetchFn);
+
+		await expect(reg.put([API], "*")).rejects.toThrow(
+			"Refusing to write with If-Match",
+		);
+		await expect(reg.put([API], "")).rejects.toThrow(
+			"Refusing to write with If-Match",
+		);
+		expect(fetchFn).not.toHaveBeenCalled();
+	});
+
 	it("refuses an invalid repository before making any request", async () => {
 		const fetchFn = vi.fn(async () =>
 			reply(204, null),

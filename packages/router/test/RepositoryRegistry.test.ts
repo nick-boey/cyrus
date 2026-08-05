@@ -159,6 +159,59 @@ describe("validateRegisteredRepository", () => {
 			validateRegisteredRepository({ ...API, linearWorkspaceId: "" }),
 		).toThrow("Linear workspace id is required");
 	});
+
+	it("accepts a base branch with a slash, e.g. release/1.2", () => {
+		expect(() =>
+			validateRegisteredRepository({ ...API, baseBranch: "release/1.2" }),
+		).not.toThrow();
+	});
+
+	it("accepts a repository with no base branch at all", () => {
+		const { baseBranch: _drop, ...withoutBranch } = API;
+		expect(() => validateRegisteredRepository(withoutBranch)).not.toThrow();
+	});
+
+	it("rejects a base branch that could reach a shell", () => {
+		expect(() =>
+			validateRegisteredRepository({ ...API, baseBranch: "$(rm -rf /)" }),
+		).toThrow('Base branch "$(rm -rf /)" is not valid');
+	});
+
+	it("rejects a base branch containing a backtick", () => {
+		expect(() =>
+			validateRegisteredRepository({ ...API, baseBranch: "main`whoami`" }),
+		).toThrow("Base branch");
+	});
+
+	it("rejects a base branch containing a double quote", () => {
+		expect(() =>
+			validateRegisteredRepository({
+				...API,
+				baseBranch: 'main" ; rm -rf / #',
+			}),
+		).toThrow("Base branch");
+	});
+
+	it("rejects a base branch starting with a dash (option injection)", () => {
+		expect(() =>
+			validateRegisteredRepository({
+				...API,
+				baseBranch: "--upload-pack=evil",
+			}),
+		).toThrow("Base branch");
+	});
+
+	it("rejects a base branch containing ..", () => {
+		expect(() =>
+			validateRegisteredRepository({ ...API, baseBranch: "foo..bar" }),
+		).toThrow("Base branch");
+	});
+
+	it("rejects a base branch containing whitespace", () => {
+		expect(() =>
+			validateRegisteredRepository({ ...API, baseBranch: "main branch" }),
+		).toThrow("Base branch");
+	});
 });
 
 describe("toRoutable", () => {

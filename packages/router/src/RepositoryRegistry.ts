@@ -70,6 +70,22 @@ export const REPOSITORY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 /** "owner/repo" — exactly one slash, no traversal on either side. */
 export const GITHUB_SLUG_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 
+/**
+ * `baseBranch` reaches a double-quoted shell interpolation in
+ * `GitService.ts` (`` execSync(`git ls-remote --heads origin "${baseBranch}"`) ``),
+ * run inside another user's worker container — so this is a conservative
+ * allowlist for the shell sink, not the full git-check-ref-format grammar.
+ * Only letters, digits, dot, underscore, slash, and hyphen are permitted, which
+ * excludes every shell metacharacter (`$`, backtick, backslash, quote,
+ * whitespace, `;`, `|`, `&`, …) that could break out of the double quotes or
+ * trigger command/variable substitution inside them. A leading `-` is refused
+ * separately: git (and many git-adjacent CLIs) treats a ref-shaped argument
+ * starting with `-` as an option, which is a second injection class
+ * independent of the shell. `..` is refused too, mirroring git's own ref-name
+ * rule and closing off path-traversal-flavoured values as a bonus.
+ */
+export const BASE_BRANCH_RE = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,200}$/;
+
 /** Throws with user-facing copy when an entry cannot be stored. */
 export function validateRegisteredRepository(repo: RegisteredRepository): void {
 	if (!REPOSITORY_NAME_RE.test(repo.name)) {
@@ -84,6 +100,11 @@ export function validateRegisteredRepository(repo: RegisteredRepository): void {
 	}
 	if (repo.linearWorkspaceId.trim() === "") {
 		throw new Error("Linear workspace id is required.");
+	}
+	if (repo.baseBranch !== undefined && !BASE_BRANCH_RE.test(repo.baseBranch)) {
+		throw new Error(
+			`Base branch ${JSON.stringify(repo.baseBranch)} is not valid. Use letters, digits, dots, dashes, underscores, or slashes; it cannot start with a dash or contain "..".`,
+		);
 	}
 }
 
