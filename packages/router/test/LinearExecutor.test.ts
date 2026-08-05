@@ -578,6 +578,24 @@ describe("LinearExecutor.fetchIssueFacts", () => {
 		});
 	});
 
+	it("degrades to the facts it did get when the team fetch throws", async () => {
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => ({
+				id: "issue-1",
+				description: "hello",
+				team: Promise.reject(new Error("team unavailable")),
+				project: Promise.resolve({ name: "Platform" }),
+				labels: async () => ({ nodes: [{ name: "bug" }] }),
+			})),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(await executor.fetchIssueFacts("ws-1", "issue-1")).toEqual({
+			projectName: "Platform",
+			description: "hello",
+			labels: ["bug"],
+		});
+	});
+
 	it("returns undefined when fetchIssue itself throws", async () => {
 		const executor = executorWithTracker("ws-1", {
 			fetchIssue: vi.fn(async () => {

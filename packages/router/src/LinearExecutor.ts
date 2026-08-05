@@ -224,11 +224,20 @@ export class LinearExecutor {
 	/**
 	 * Reads everything the repository matcher needs, in ONE `fetchIssue`.
 	 *
-	 * Each sub-read is guarded separately: a Linear hiccup fetching labels must
-	 * not suppress the team key we already have, because a partial fact set
-	 * still routes correctly far more often than no fact set does. A failure of
-	 * `fetchIssue` itself yields `undefined`, which the caller treats as "cannot
-	 * route yet" rather than as "no facts".
+	 * `team`, `project`, and `labels()` are each a separate Linear round-trip
+	 * (see {@link IIssueTrackerService}), so they are fetched concurrently via
+	 * `Promise.allSettled` rather than sequential awaits — mirroring the same
+	 * ruling already applied to `RepositoryRouter.gatherFacts`. Each source
+	 * stays isolated from the others' failures (a Linear hiccup fetching labels
+	 * must not suppress the team key we already have, because a partial fact
+	 * set still routes correctly far more often than no fact set does), but the
+	 * three round-trips overlap instead of stacking their latency — the whole
+	 * point of asking the routing question BEFORE a container boots is to ask
+	 * it fast. Each access is wrapped in an `async () => ...` IIFE so a
+	 * synchronously-throwing getter (not just a rejected promise) is also
+	 * captured as a settled rejection rather than escaping `Promise.allSettled`
+	 * itself. A failure of `fetchIssue` itself yields `undefined`, which the
+	 * caller treats as "cannot route yet" rather than as "no facts".
 	 */
 	async fetchIssueFacts(
 		workspaceId: string,
@@ -253,32 +262,36 @@ export class LinearExecutor {
 			facts.description = issue.description;
 		}
 
-		try {
-			const team = await issue.team;
-			if (team?.key) facts.teamKey = team.key;
-		} catch (error) {
+		const [teamResult, projectResult, labelsResult] = await Promise.allSettled([
+			(async () => issue.team)(),
+			(async () => issue.project)(),
+			(async () => issue.labels())(),
+		]);
+
+		if (teamResult.status === "fulfilled") {
+			if (teamResult.value?.key) facts.teamKey = teamResult.value.key;
+		} else {
 			this.logger.warn(
-				`Could not read the team of issue ${issueId} for routing: ${String(error)}`,
+				`Could not read the team of issue ${issueId} for routing: ${String(teamResult.reason)}`,
 			);
 		}
 
-		try {
-			const project = await issue.project;
-			if (project?.name) facts.projectName = project.name;
-		} catch (error) {
+		if (projectResult.status === "fulfilled") {
+			if (projectResult.value?.name)
+				facts.projectName = projectResult.value.name;
+		} else {
 			this.logger.warn(
-				`Could not read the project of issue ${issueId} for routing: ${String(error)}`,
+				`Could not read the project of issue ${issueId} for routing: ${String(projectResult.reason)}`,
 			);
 		}
 
-		try {
-			const labels = await issue.labels();
-			facts.labels = (labels?.nodes ?? [])
+		if (labelsResult.status === "fulfilled") {
+			facts.labels = (labelsResult.value?.nodes ?? [])
 				.map((label) => label.name)
 				.filter((name): name is string => typeof name === "string");
-		} catch (error) {
+		} else {
 			this.logger.warn(
-				`Could not read the labels of issue ${issueId} for routing: ${String(error)}`,
+				`Could not read the labels of issue ${issueId} for routing: ${String(labelsResult.reason)}`,
 			);
 			facts.labels = [];
 		}

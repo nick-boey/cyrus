@@ -413,6 +413,7 @@ export class RouterServer {
 			trackers: this.trackers,
 			store: this.store,
 			workspaceTokens,
+			logger: this.logger,
 		});
 
 		this.gateway = new DeviceGateway(this.store, {
