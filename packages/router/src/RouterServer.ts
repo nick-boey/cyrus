@@ -48,11 +48,13 @@ import { StateBackup } from "./StateBackup.js";
 import { SetupBootstrap } from "./setup/bootstrap.js";
 import { createCsrfTokens } from "./setup/csrf.js";
 import {
+	type SetupAuthConfig,
 	type SetupAuthMode,
 	type SetupIdTokenVerifier,
 	type SetupUiConfig,
 	validateSetupAuthConfig,
 } from "./setup/principal.js";
+import { registerRepositoryRoutes } from "./setup/repositoryRoutes.js";
 import { registerSetupRoutes } from "./setup/routes.js";
 import { TableSecretStore } from "./TableSecretStore.js";
 import {
@@ -504,51 +506,75 @@ export class RouterServer {
 					...(config.containers?.requiredSecretKeys ?? []),
 				]),
 			];
+			const setupAuthConfig: SetupAuthConfig = {
+				// validateSetupAuthConfig ran at the top of this constructor and
+				// throws when `auth` is unset, so this is proven non-null.
+				auth: config.setupUi.auth as SetupAuthMode,
+				...(config.setupUi.allowedDomain
+					? { allowedDomain: config.setupUi.allowedDomain }
+					: {}),
+			};
+			const setupBootstrap = new SetupBootstrap({
+				store: this.store,
+				secrets: built.secrets,
+				requiredKeys: setupRequiredKeys,
+				// Defaults TRUE. Self-registration is the intended posture for a
+				// single-organisation deployment: signing in creates a user row
+				// and an EMPTY secret record, nothing more. It grants no
+				// credentials — the user still has to supply their own Claude
+				// token — and nothing routes to them until they appear as the
+				// creator or assignee of a Linear issue
+				// (`EventRouter` → `RouterStore.findUserForCreator`), so Linear
+				// membership is the effective gate.
+				//
+				// Set it false where the Entra tenant is materially larger than
+				// the set of people who should be able to hold Cyrus
+				// credentials; `setupUi.allowedDomain` is the cheaper control
+				// for the common case of keeping guests out.
+				autoProvisionUsers: config.setupUi.autoProvisionUsers ?? true,
+				logger: this.logger,
+			});
+			// Per-process and in-memory on purpose. The router is single-replica,
+			// so a restart just invalidates outstanding tokens and the next action
+			// re-renders with a fresh one. Deliberately NOT sourced from config or
+			// shared with the webhook secret: a file-backed value survives restarts
+			// and would widen a config leak into CSRF forgery.
+			const setupCsrf = createCsrfTokens(randomBytes(32).toString("base64url"));
+			const setupIdTokenVerifier = config.setupIdTokenVerifier;
+
 			registerSetupRoutes(this.fastify, {
 				secrets: built.secrets,
 				requiredKeys: setupRequiredKeys,
-				auth: {
-					// validateSetupAuthConfig ran at the top of this constructor and
-					// throws when `auth` is unset, so this is proven non-null.
-					auth: config.setupUi.auth as SetupAuthMode,
-					...(config.setupUi.allowedDomain
-						? { allowedDomain: config.setupUi.allowedDomain }
-						: {}),
-				},
-				bootstrap: new SetupBootstrap({
-					store: this.store,
-					secrets: built.secrets,
-					requiredKeys: setupRequiredKeys,
-					// Defaults TRUE. Self-registration is the intended posture for a
-					// single-organisation deployment: signing in creates a user row
-					// and an EMPTY secret record, nothing more. It grants no
-					// credentials — the user still has to supply their own Claude
-					// token — and nothing routes to them until they appear as the
-					// creator or assignee of a Linear issue
-					// (`EventRouter` → `RouterStore.findUserForCreator`), so Linear
-					// membership is the effective gate.
-					//
-					// Set it false where the Entra tenant is materially larger than
-					// the set of people who should be able to hold Cyrus
-					// credentials; `setupUi.allowedDomain` is the cheaper control
-					// for the common case of keeping guests out.
-					autoProvisionUsers: config.setupUi.autoProvisionUsers ?? true,
-					logger: this.logger,
-				}),
-				// Per-process and in-memory on purpose. The router is single-replica,
-				// so a restart just invalidates outstanding tokens and the next action
-				// re-renders with a fresh one. Deliberately NOT sourced from config or
-				// shared with the webhook secret: a file-backed value survives restarts
-				// and would widen a config leak into CSRF forgery.
-				csrf: createCsrfTokens(randomBytes(32).toString("base64url")),
-				...(config.setupIdTokenVerifier
-					? { verifyIdToken: config.setupIdTokenVerifier }
+				auth: setupAuthConfig,
+				bootstrap: setupBootstrap,
+				csrf: setupCsrf,
+				...(setupIdTokenVerifier
+					? { verifyIdToken: setupIdTokenVerifier }
 					: {}),
 				logger: this.logger,
 			});
 			this.logger.info(
 				`Setup UI enabled at /setup (auth: ${config.setupUi.auth?.mode})`,
 			);
+
+			// The registry only exists when `containers` is configured; a
+			// device-only deployment has no repositories to register. Mounted on
+			// the same Fastify instance as registerSetupRoutes, which
+			// registerRepositoryRoutes relies on for its idempotent
+			// content-type-parser guard.
+			if (this.repositoryRegistry) {
+				registerRepositoryRoutes(this.fastify, {
+					registry: this.repositoryRegistry,
+					workspaceIds: Object.keys(this.config.workspaces),
+					auth: setupAuthConfig,
+					bootstrap: setupBootstrap,
+					csrf: setupCsrf,
+					...(setupIdTokenVerifier
+						? { verifyIdToken: setupIdTokenVerifier }
+						: {}),
+					logger: this.logger,
+				});
+			}
 		}
 
 		this.gateway.on("rpc", (deviceId: number, frame: RpcRequestFrame) => {

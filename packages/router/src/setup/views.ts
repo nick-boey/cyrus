@@ -254,7 +254,7 @@ export function renderPage(model: SetupPageModel): string {
 	<main>
 		<header>
 			<h1>Cyrus setup</h1>
-			<p>Signed in as <strong>${escapeHtml(model.email)}</strong> &middot; <a href="/.auth/logout">Sign out</a></p>
+			<p>Signed in as <strong>${escapeHtml(model.email)}</strong> &middot; <a href="/setup/repositories">Repositories</a> &middot; <a href="/.auth/logout">Sign out</a></p>
 		</header>
 		${renderMessage(model.message)}
 		<p><small>These environment variables are injected into the container that runs your Cyrus sessions. Stored values are never displayed — leave a field blank to keep the current value.</small></p>
