@@ -19,13 +19,19 @@ import {
 	fillTemplate,
 	INVALID_ISSUE_KEY_MESSAGE,
 	ISSUE_LOCKED_MESSAGE,
+	NO_REPOSITORIES_MESSAGE,
 	ORPHANED_LOCK_RECLAIMED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
 	PROMPT_UNROUTABLE_MESSAGE,
+	REPOSITORY_SELECTION_PROMPT,
 	UNENROLLED_CREATOR_MESSAGE,
 } from "./messages.js";
+import type {
+	RepositoryDecision,
+	RepositoryResolver,
+} from "./RepositoryResolver.js";
 import type { RouterStore } from "./RouterStore.js";
 import type {
 	TerminalTeardown,
@@ -86,6 +92,19 @@ export interface EventRouterOptions {
 	 * keeps every user on the physical-device path (today's behavior).
 	 */
 	containerTargets?: ContainerTargetService;
+	/**
+	 * Decides which repositories an issue routes to, before any container is
+	 * created. Optional: omitting it keeps every container booting with the whole
+	 * configured repository list (pre-registry behaviour).
+	 */
+	repositoryResolver?: RepositoryResolver;
+	/** `LinearExecutor.postRepositorySelection`. Required alongside the resolver. */
+	postRepositorySelection?: (
+		workspaceId: string,
+		agentSessionId: string,
+		body: string,
+		options: string[],
+	) => Promise<void>;
 	terminalTeardown?: TerminalTeardown;
 	config: {
 		eventTtlMs: number;
@@ -139,6 +158,10 @@ export class EventRouter {
 		| ((workspaceId: string, issueId: string) => Promise<string | undefined>)
 		| undefined;
 	private readonly containerTargets: ContainerTargetService | undefined;
+	private readonly repositoryResolver: RepositoryResolver | undefined;
+	private readonly postRepositorySelection:
+		| EventRouterOptions["postRepositorySelection"]
+		| undefined;
 	private readonly terminalTeardown: TerminalTeardown | undefined;
 	private readonly config: {
 		eventTtlMs: number;
@@ -186,6 +209,8 @@ export class EventRouter {
 		this.postActivity = opts.postActivity;
 		this.moveIssueToStartedState = opts.moveIssueToStartedState;
 		this.containerTargets = opts.containerTargets;
+		this.repositoryResolver = opts.repositoryResolver;
+		this.postRepositorySelection = opts.postRepositorySelection;
 		this.terminalTeardown = opts.terminalTeardown;
 		this.config = opts.config;
 		this.webhookClaimRetentionMs =
@@ -628,6 +653,133 @@ export class EventRouter {
 				`Swept ${claimsSwept} webhook idempotency claim(s) older than ${this.webhookClaimRetentionMs}ms`,
 			);
 		}
+
+		// 4. A selection nobody ever answered. `eventTtlMs` is the right bound: it
+		// is already how long a queued event may wait for its device.
+		const removed = this.store.sweepPendingRepoSelections(
+			now - this.config.eventTtlMs,
+		);
+		if (removed > 0) {
+			this.logger.info(
+				`Swept ${removed} unanswered repository selection(s) older than the event TTL`,
+			);
+		}
+	}
+
+	/**
+	 * Ensures the issue has a repository decision before anything boots.
+	 *
+	 * Returns `"ready"` when routing may continue, and `"held"` when an
+	 * elicitation was posted (or a blocking notice was) and this webhook must
+	 * NOT be delivered. A held event is stashed verbatim and replayed by
+	 * {@link resumeHeldSelection} once the user answers.
+	 *
+	 * Deliberately runs BEFORE `resolveTarget`: creating the container device
+	 * first would mint a device row — and boot a sandbox — for an issue whose
+	 * repository nobody has chosen yet. Waiting here costs nothing, which is the
+	 * whole point of asking on the router rather than inside a container.
+	 */
+	private async ensureRepositoryDecision(
+		webhook: SessionEvent,
+		issueKey: string,
+		workspaceId: string,
+		issueId: string | undefined,
+	): Promise<"ready" | "held"> {
+		const resolver = this.repositoryResolver;
+		if (!resolver) return "ready";
+		if (this.store.getIssueRepositories(issueKey)) return "ready";
+
+		const sessionId = webhook.agentSession.id;
+		if (this.store.getPendingRepoSelection(sessionId)) {
+			// A repeated `created` delivery for a session already waiting on an
+			// answer. Asking again would post a second elicitation and overwrite
+			// the held event with an identical one — silent, but noisy in Linear.
+			this.logger.info(
+				`Session ${sessionId} is already waiting on a repository selection; not asking again`,
+			);
+			return "held";
+		}
+
+		const outcome = await resolver.resolve({ workspaceId, issueId });
+
+		if (outcome.kind === "resolved") {
+			this.persistDecision(issueKey, outcome.decision);
+			return "ready";
+		}
+
+		if (outcome.kind === "unavailable") {
+			await this.postActivity(
+				workspaceId,
+				sessionId,
+				fillTemplate(NO_REPOSITORIES_MESSAGE, { reason: outcome.reason }),
+			);
+			this.logger.warn(`Cannot route session ${sessionId}: ${outcome.reason}`);
+			return "held";
+		}
+
+		const options = outcome.candidates.map((repo) => repo.name);
+		if (!this.postRepositorySelection) {
+			this.logger.warn(
+				`Repository selection needed for ${issueKey} but no elicitation transport is configured; routing to a fallback`,
+			);
+			const fallback = resolver.fallbackDecision(outcome.candidates);
+			if (!fallback) return "held";
+			this.persistDecision(issueKey, fallback);
+			return "ready";
+		}
+
+		try {
+			await this.postRepositorySelection(
+				workspaceId,
+				sessionId,
+				REPOSITORY_SELECTION_PROMPT,
+				options,
+			);
+		} catch (error) {
+			// Never stash a held event for an elicitation that was never posted:
+			// nothing would ever arrive to release it, and the issue would sit
+			// silently forever. Fall back instead, and say so.
+			this.logger.warn(
+				`Failed to post the repository selection for ${issueKey}: ${String(error)}; routing to a fallback`,
+			);
+			const fallback = resolver.fallbackDecision(outcome.candidates);
+			if (!fallback) return "held";
+			this.persistDecision(issueKey, fallback);
+			return "ready";
+		}
+
+		this.store.createPendingRepoSelection({
+			agentSessionId: sessionId,
+			issueKey,
+			workspaceId,
+			options,
+			createdEvent: JSON.stringify(webhook),
+			createdMs: this.now(),
+		});
+		this.logger.info(
+			`Posted a repository selection for ${issueKey} (${outcome.reason}) with options [${options.join(", ")}]; holding the created event`,
+		);
+		return "held";
+	}
+
+	private persistDecision(
+		issueKey: string,
+		decision: RepositoryDecision,
+	): void {
+		this.store.setIssueRepositories(
+			issueKey,
+			{
+				repoNames: decision.repositories.map((repo) => repo.name),
+				baseBranchOverrides: decision.baseBranchOverrides,
+				method: decision.method,
+			},
+			this.now(),
+		);
+		this.logger.info(
+			`Repositories for ${issueKey}: [${decision.repositories
+				.map((repo) => repo.name)
+				.join(", ")}] (${decision.method})`,
+		);
 	}
 
 	private async routeCreated(webhook: SessionEvent): Promise<void> {
@@ -638,6 +790,21 @@ export class EventRouter {
 			webhook.agentSession.issue?.id ??
 			undefined;
 		const creator = webhook.agentSession.creator ?? undefined;
+
+		// Repository selection happens here, on the router, before any container
+		// device exists. `extractIssueKey` is the same gate the container path
+		// uses; without a key there is no per-issue sandbox to route to and the
+		// existing invalid-key handling below reports it.
+		const issueKey = extractIssueKey(webhook);
+		if (issueKey !== undefined && this.repositoryResolver) {
+			const gate = await this.ensureRepositoryDecision(
+				webhook,
+				issueKey,
+				workspaceId,
+				issueId,
+			);
+			if (gate === "held") return;
+		}
 
 		const { target, invalidIssueKey } = this.resolveTargetOrInvalidKey(
 			webhook,
@@ -741,8 +908,121 @@ export class EventRouter {
 		}
 	}
 
+	/**
+	 * Consumes a prompt that answers a pending repository selection.
+	 *
+	 * Returns `true` when the prompt was the answer and this webhook has been
+	 * fully handled, `false` when there was no pending selection and normal
+	 * prompt routing should continue.
+	 *
+	 * Two shapes of answer, both terminal:
+	 *  - the body names an offered option -> that repository is the decision, and
+	 *    the HELD `created` event is replayed so the runner initialises from the
+	 *    delegation. The answer itself is consumed: delivering "cyrus-web" as a
+	 *    user prompt would start the session with a repository name as its task.
+	 *  - anything else -> the user ignored the question. Fall back, then deliver
+	 *    the held `created` event AND this prompt, which is the semantics device
+	 *    mode already has (see packages/CLAUDE.md).
+	 */
+	private async resumeHeldSelection(webhook: SessionEvent): Promise<boolean> {
+		const resolver = this.repositoryResolver;
+		if (!resolver) return false;
+		const sessionId = webhook.agentSession.id;
+		const pending = this.store.getPendingRepoSelection(sessionId);
+		if (!pending) return false;
+
+		if (pending.options.length === 0) {
+			// `RouterStore.getPendingRepoSelection` degrades a corrupt
+			// `options_json` to an empty array rather than throwing — a real,
+			// documented state, not a hypothetical. We cannot honor an answer
+			// against options we can no longer identify, but the row still
+			// carries a readable `createdEvent`: replay it through the normal
+			// creation gate (which re-resolves, or re-asks, from the live
+			// registry) instead of silently discarding the delegation. Losing
+			// the held event here would strand the issue with no way back,
+			// which is worse than re-asking once more.
+			this.store.deletePendingRepoSelection(sessionId);
+			this.logger.warn(
+				`Pending repository selection for ${pending.issueKey} has no readable options (corrupt row); replaying the held event through normal resolution instead of guessing`,
+			);
+			let held: SessionEvent | undefined;
+			try {
+				held = JSON.parse(pending.createdEvent) as SessionEvent;
+			} catch (error) {
+				this.logger.warn(
+					`Held created event for ${pending.issueKey} is ALSO unreadable: ${String(error)}; the delegation for this issue is lost`,
+				);
+			}
+			if (held) await this.routeCreated(held);
+			return false;
+		}
+
+		const { repositories } = await resolver
+			.resolve({ workspaceId: pending.workspaceId, issueId: undefined })
+			.then((outcome) =>
+				outcome.kind === "needs_selection"
+					? { repositories: outcome.candidates }
+					: { repositories: [] },
+			)
+			.catch(() => ({ repositories: [] }));
+
+		// Prefer the exact options that were offered; `repositories` is only a
+		// safety net for a registry that changed while the user was deciding.
+		const candidates =
+			repositories.length > 0
+				? repositories.filter((repo) => pending.options.includes(repo.name))
+				: [];
+		const offered =
+			candidates.length > 0
+				? candidates
+				: pending.options.map((name) => ({
+						name,
+						githubSlug: "",
+						linearWorkspaceId: pending.workspaceId,
+					}));
+
+		const body = webhook.agentActivity?.content?.body ?? "";
+		const selected = resolver.selectByOptionValue(body, offered);
+		const decision = selected ?? resolver.fallbackDecision(offered);
+
+		this.store.deletePendingRepoSelection(sessionId);
+
+		if (!decision) {
+			this.logger.warn(
+				`Pending repository selection for ${pending.issueKey} could not be resolved; dropping it`,
+			);
+			return false;
+		}
+		this.persistDecision(pending.issueKey, decision);
+
+		// Replay the held delegation first, so the container's first event is the
+		// one that starts a session.
+		let held: SessionEvent | undefined;
+		try {
+			held = JSON.parse(pending.createdEvent) as SessionEvent;
+		} catch (error) {
+			this.logger.warn(
+				`Held created event for ${pending.issueKey} is unreadable: ${String(error)}; routing the prompt alone`,
+			);
+		}
+		if (held) await this.routeCreated(held);
+
+		if (selected) {
+			this.logger.info(
+				`Session ${sessionId} selected repository ${decision.repositories[0]?.name}`,
+			);
+			return true;
+		}
+
+		this.logger.info(
+			`Session ${sessionId} answered the repository selection with an unrelated prompt; used ${decision.repositories[0]?.name} and forwarding the prompt`,
+		);
+		return false;
+	}
+
 	private async routePrompted(webhook: SessionEvent): Promise<void> {
 		const sessionId = webhook.agentSession.id;
+		if (await this.resumeHeldSelection(webhook)) return;
 		const workspaceId = webhook.organizationId;
 		const issueId =
 			webhook.agentSession.issueId ??

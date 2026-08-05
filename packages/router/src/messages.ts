@@ -96,6 +96,20 @@ export function containerBootFailedMessage(
 export const ORPHANED_LOCK_RECLAIMED_MESSAGE =
 	"Released this issue's lock: the agent's device no longer has this session (its state was lost on restart). Re-delegate the issue to start a fresh session.";
 
+/** Body of the repository-selection elicitation the router posts. */
+export const REPOSITORY_SELECTION_PROMPT =
+	"Which repository should I work in for this issue?";
+
+/**
+ * Posted when a `created` event cannot be routed to any repository because
+ * none are registered for the workspace, or the registry could not be read.
+ *
+ * Templated with `{{reason}}` — render with {@link fillTemplate} before posting.
+ */
+export const NO_REPOSITORIES_MESSAGE = `I can't start work on this issue yet: {{reason}}
+
+Once a repository is registered, re-assign this issue (or mention me again) and I'll pick it up.`;
+
 /**
  * Replaces `{{key}}` placeholders in `template` with the matching value from
  * `vars`. Unknown placeholders are left intact.
