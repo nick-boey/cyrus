@@ -481,8 +481,10 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      repository registry, and only when the registry is empty. After that the
      stored registry (Azure Table, or `repositories.json` beside the router db)
      is authoritative and the config array is inert — the router logs this on
-     every start. Editing `CYRUS_ROUTER_CONTAINERS_JSON` on a seeded deployment
-     changes nothing.
+     every start. Editing the `.repositories` field of
+     `CYRUS_ROUTER_CONTAINERS_JSON` on a seeded deployment changes nothing;
+     every other field on that env var (`image`, `routerUrlForContainers`,
+     `keyVaultUrl`, `aca`, `tableStore`, …) still takes effect on restart.
    - Azure Table partition keys are namespaced by their first character: `u` +
      sha256(email) for a user's secret record (`setupPartitionKey`), `g` + 64
      zeros for the global repository registry. The registry row is **plaintext

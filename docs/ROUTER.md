@@ -371,16 +371,24 @@ Cyrus picks a repository in this order, highest first:
 4. The issue's team key
 5. The repository marked **Default**
 
+Routing labels (tier 2) have no field in the setup UI — `p=`/`t=` only cover
+project and team. An existing `routingLabels` entry seeded from
+`containers.repositories` on first boot is preserved across edits, but the UI
+gives you no way to add or change one; that tier is otherwise unreachable for
+a router deployment.
+
 The decision is made **on the router**, before any sandbox starts, so each
 sandbox clones only the repository it needs. It is made once per issue and
 reused for every later session on that issue — a sandbox is per-issue and cannot
 change repository once cloned.
 
-When two repositories match at the same level — both claiming project
-`Platform`, say — or when nothing matches and no default is set, Cyrus posts a
-selection prompt in Linear and waits. **No container runs while it waits.** The
-setup UI warns about these collisions at configuration time so they can be fixed
-before they interrupt anyone.
+When two repositories match on the same project name, the same team key, or
+are both marked default, Cyrus posts a selection prompt in Linear and waits.
+**No container runs while it waits.** The setup UI warns about these
+collisions at configuration time so they can be fixed before they interrupt
+anyone. A workspace with exactly one repository in scope is never asked to
+choose, even with no default set and no match above it — the sole repository
+is used directly.
 
 ### Observed ACA behavior
 

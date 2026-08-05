@@ -664,9 +664,9 @@ The system evaluates routing methods in this strict priority order. The FIRST ma
 2. **Routing Labels (Priority 2)**: Apply a label configured to route to the target repository.
 3. **Project Assignment (Priority 3)**: Add the issue to a project whose name matches, case-insensitively, one of the repository's configured project names.
 4. **Team Selection (Priority 4)**: Create the issue in a Linear team whose key matches, case-insensitively, one of the repository's configured team keys.
-5. **Default Repository (Priority 5 - Lowest)**: If nothing above matches, the repository marked as the default for the workspace is used.
+5. **Default Repository (Priority 5)**: If nothing above matches, the repository marked as the default for the workspace is used.
 
-If two repositories match at the same priority level, Cyrus asks the user to choose rather than guessing.
+If two repositories match on the same project name, the same team key, or are both marked default, Cyrus asks the user to choose. Multiple description tags, or multiple repositories matching the same routing label, are a deliberate fan-out and route to all of them.
 
 For reliable cross-repository routing, prefer Description Tags as they are explicit and unambiguous.
 </description>
