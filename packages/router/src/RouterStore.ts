@@ -1510,10 +1510,22 @@ export class RouterStore {
 		try {
 			const repoNames = JSON.parse(row.repos_json) as unknown;
 			const overrides = JSON.parse(row.overrides_json) as unknown;
-			if (!Array.isArray(repoNames)) return undefined;
+			if (
+				!Array.isArray(repoNames) ||
+				!repoNames.every((name) => typeof name === "string")
+			) {
+				return undefined;
+			}
+			if (
+				typeof overrides !== "object" ||
+				overrides === null ||
+				Array.isArray(overrides)
+			) {
+				return undefined;
+			}
 			return {
-				repoNames: repoNames as string[],
-				baseBranchOverrides: (overrides ?? {}) as Record<string, string>,
+				repoNames,
+				baseBranchOverrides: overrides as Record<string, string>,
 				method: row.method,
 				decidedMs: row.decided_ms,
 			};

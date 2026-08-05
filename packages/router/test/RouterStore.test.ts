@@ -900,6 +900,40 @@ describe("repository decisions", () => {
 			.run("NOR-1");
 		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
 	});
+
+	it("treats valid-JSON-but-wrong-shape overrides_json as absent rather than returning a non-object", () => {
+		const store = new RouterStore(":memory:");
+		store.setIssueRepositories(
+			"NOR-1",
+			{ repoNames: ["a"], baseBranchOverrides: {}, method: "default" },
+			1,
+		);
+		// Syntactically valid JSON, but not an object — e.g. a hand-edited row.
+		store
+			.rawDbForTests()
+			.prepare(
+				'UPDATE issue_repositories SET overrides_json = \'["a","b"]\' WHERE issue_key = ?',
+			)
+			.run("NOR-1");
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+	});
+
+	it("treats valid-JSON-but-wrong-element-type repos_json as absent", () => {
+		const store = new RouterStore(":memory:");
+		store.setIssueRepositories(
+			"NOR-1",
+			{ repoNames: ["a"], baseBranchOverrides: {}, method: "default" },
+			1,
+		);
+		// An array, but of numbers rather than repo name strings.
+		store
+			.rawDbForTests()
+			.prepare(
+				"UPDATE issue_repositories SET repos_json = '[1,2,3]' WHERE issue_key = ?",
+			)
+			.run("NOR-1");
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+	});
 });
 
 describe("pending repository selections", () => {
@@ -921,6 +955,18 @@ describe("pending repository selections", () => {
 	it("returns undefined for an unknown session", () => {
 		const store = new RouterStore(":memory:");
 		expect(store.getPendingRepoSelection("nope")).toBeUndefined();
+	});
+
+	it("degrades a corrupt options_json to an empty options array rather than throwing", () => {
+		const store = new RouterStore(":memory:");
+		store.createPendingRepoSelection(row);
+		store
+			.rawDbForTests()
+			.prepare(
+				"UPDATE pending_repo_selections SET options_json = '{ broken' WHERE agent_session_id = ?",
+			)
+			.run("sess-1");
+		expect(store.getPendingRepoSelection("sess-1")?.options).toEqual([]);
 	});
 
 	it("deletes a pending selection", () => {
