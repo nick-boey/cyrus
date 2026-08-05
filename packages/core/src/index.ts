@@ -156,6 +156,7 @@ export type {
 	IssueWithChildren,
 	Label,
 	PaginationOptions,
+	Project,
 	Team,
 	User,
 	Webhook,
