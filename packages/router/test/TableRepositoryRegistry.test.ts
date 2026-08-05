@@ -145,4 +145,35 @@ describe("TableRepositoryRegistry", () => {
 			version: 'W/"v1"',
 		});
 	});
+
+	it("treats a well-formed JSON array with a malformed entry as empty rather than throwing", async () => {
+		const fetchFn = vi.fn(async () =>
+			reply(
+				200,
+				{
+					ReposJson: JSON.stringify([
+						{ name: 123, githubSlug: true, linearWorkspaceId: "ws-1" },
+					]),
+				},
+				'W/"v1"',
+			),
+		) as unknown as typeof fetch;
+		expect(await registry(fetchFn).list()).toEqual({
+			repositories: [],
+			version: 'W/"v1"',
+		});
+	});
+
+	it("permits an unconditional write only when nothing is stored yet", async () => {
+		let call = 0;
+		const fetchFn = vi.fn(async () => {
+			call++;
+			if (call === 1) return reply(204, null, 'W/"v1"');
+			return reply(409, { "odata.error": { code: "EntityAlreadyExists" } });
+		}) as unknown as typeof fetch;
+		const reg = registry(fetchFn);
+
+		await expect(reg.put([API])).resolves.toEqual({ version: 'W/"v1"' });
+		await expect(reg.put([API])).rejects.toBeInstanceOf(SetupConflictError);
+	});
 });

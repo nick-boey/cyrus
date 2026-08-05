@@ -41,11 +41,14 @@ export interface RegistrySnapshot {
 /**
  * Durable storage for the global repository registry.
  *
- * `put` is conditional: passing the `version` from a prior `list` makes the
- * write fail with {@link SetupConflictError} if anything changed in between,
- * which turns two concurrent setup-UI edits into a visible conflict rather than
- * a silent overwrite. `undefined` is an unconditional write, reserved for
- * first-run seeding.
+ * `put` is always conditional, never an unconditional overwrite. Passing the
+ * `version` from a prior `list` makes the write fail with
+ * {@link SetupConflictError} if anything changed in between, which turns two
+ * concurrent setup-UI edits into a visible conflict rather than a silent
+ * overwrite. Passing `undefined` is a *first* write: it succeeds only when no
+ * registry exists yet, and fails with {@link SetupConflictError} the same way
+ * if one is already stored — so seeding can never silently clobber a registry
+ * a concurrent writer already created.
  */
 export interface RepositoryRegistry {
 	list(): Promise<RegistrySnapshot>;
@@ -172,6 +175,17 @@ export class FileRepositoryRegistry implements RepositoryRegistry {
 		// Validate the whole batch before touching disk, so a bad entry never
 		// leaves the registry half-written.
 		for (const repo of repositories) validateRegisteredRepository(repo);
+
+		// An unversioned write is a *first* write, mirroring the Table backend's
+		// Insert-Entity POST: it must fail, not silently overwrite, when a
+		// registry is already on disk — checked against the file's existence
+		// rather than `current.version`, since a corrupt file also reads back as
+		// version "0" and is still a registry someone else created.
+		if (version === undefined && existsSync(this.path)) {
+			throw new SetupConflictError(
+				"the repository registry already exists; pass its version to overwrite it",
+			);
+		}
 
 		const current = this.read();
 		if (version !== undefined && version !== current.version) {

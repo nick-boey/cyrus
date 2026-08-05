@@ -61,6 +61,14 @@ describe("FileRepositoryRegistry", () => {
 		);
 	});
 
+	it("permits an unconditional write only when nothing is stored yet", async () => {
+		const registry = new FileRepositoryRegistry(freshPath());
+		await expect(registry.put([API])).resolves.toEqual({ version: "1" });
+		await expect(registry.put([API])).rejects.toBeInstanceOf(
+			SetupConflictError,
+		);
+	});
+
 	it("writes atomically at mode 0600", async () => {
 		const path = freshPath();
 		await new FileRepositoryRegistry(path).put([API]);

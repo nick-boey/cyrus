@@ -143,6 +143,13 @@ export class TableRepositoryRegistry implements RepositoryRegistry {
 	 * throw. Throwing would make every container boot fail on one corrupt row;
 	 * empty degrades to "no repositories configured", which the boot path
 	 * already reports with actionable copy, and the next save heals the row.
+	 *
+	 * Every entry must also be a well-formed `RegisteredRepository`, not just an
+	 * array — a syntactically valid `ReposJson` with e.g. a numeric `name` would
+	 * otherwise reach `toRoutable`/`matchRepositories` and throw at runtime. This
+	 * mirrors `FileRepositoryRegistry.read()`'s same check: a malformed entry is
+	 * the same class of corruption as unparseable JSON, so it gets the same
+	 * "reads as empty" treatment.
 	 */
 	private parseRepositories(
 		raw: unknown,
@@ -152,6 +159,9 @@ export class TableRepositoryRegistry implements RepositoryRegistry {
 		try {
 			const parsed = JSON.parse(raw) as unknown;
 			if (!Array.isArray(parsed)) throw new Error("not a JSON array");
+			for (const repo of parsed) {
+				validateRegisteredRepository(repo as RegisteredRepository);
+			}
 			return parsed as RegisteredRepository[];
 		} catch (error) {
 			this.policy.logger.warn(
@@ -196,7 +206,6 @@ export class TableRepositoryRegistry implements RepositoryRegistry {
 				tokenProvider: this.tokenProvider,
 				body: JSON.stringify(entity),
 				service: "Azure Table",
-				noRetryStatuses: [409],
 			},
 			this.policy,
 		);
