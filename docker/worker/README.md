@@ -380,6 +380,9 @@ see the behavior described above — update first.
 | `dotnet` (SDK 10.0) | Repos targeting .NET need it to build/test/restore and to run repo-local `dotnet tool`s. |
 | `fleece` (Fleece.Cli) | Fleece issue tracking. Installed via `dotnet tool install --tool-path /usr/local/dotnet-tools` — **not** `-g`, which would put it under build-time `/root` where the non-root `cyrus` user cannot reach it. Unpinned: rebuilding the image picks up the latest published `Fleece.Cli`. |
 | `actionlint` | GitHub Actions workflow linting. Pinned by the `ACTIONLINT_VERSION` build arg, checksum-verified, arch-resolved from `dpkg` so the same Dockerfile produces a working `amd64` (ACA) and `arm64` (local Apple Silicon) image. |
+| `pwsh` (PowerShell 7) | Repos that ship `.ps1` build or deploy scripts. From the same Microsoft feed as the .NET SDK, which publishes `powershell` for both `amd64` and `arm64` on bookworm — no arch special-casing. Unpinned, like the SDK. |
+| `codex` (`@openai/codex`) | The Codex agent CLI, on `PATH` for sessions. Pinned by the `CODEX_VERSION` build arg — keep it in step with the `@openai/codex` version resolved in `pnpm-lock.yaml`. Authentication is not set up yet; see the note below. |
+| `opencode` (`opencode-ai`) | The OpenCode agent CLI. Pinned by the `OPENCODE_VERSION` build arg. Like `codex`, it resolves its native binary through per-platform `optionalDependencies`, so `npm install -g` gets the right `linux-x64`/`linux-arm64` build. |
 | `playwright` + Chromium | Browser automation. Pinned by the `PLAYWRIGHT_VERSION` build arg; the browser lives at `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, owned by `cyrus`. See the caveats below. |
 
 Override a pinned version at build time without editing the Dockerfile:
@@ -387,9 +390,17 @@ Override a pinned version at build time without editing the Dockerfile:
 ```bash
 docker build -f docker/worker/Dockerfile \
   --build-arg ACTIONLINT_VERSION=1.7.12 \
+  --build-arg CODEX_VERSION=0.144.6 \
+  --build-arg OPENCODE_VERSION=1.18.13 \
   --build-arg PLAYWRIGHT_VERSION=1.62.0 \
   -t cyrus-worker:dev .
 ```
+
+> **`codex` is on `PATH` but not yet authenticated.** Nothing is authenticated
+> at build time — credentials are a runtime concern, and baking them into a
+> layer would leak them into the image. How Codex should get its credentials
+> inside a worker container is still being worked out (NOR-290), so this
+> runbook does not yet document a setup for it.
 
 ### Playwright caveats
 
@@ -438,7 +449,7 @@ there are three ways to get it there, in order of preference:
    ```dockerfile
    FROM cyrus-worker:dev
    USER root
-   RUN npm install -g @openai/codex   # example: add the Codex CLI
+   RUN npm install -g @google/gemini-cli   # example: add the Gemini CLI
    USER cyrus
    ```
 
