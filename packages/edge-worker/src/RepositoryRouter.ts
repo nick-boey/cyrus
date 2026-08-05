@@ -2,9 +2,13 @@ import {
 	AgentActivitySignal,
 	type AgentSessionCreatedWebhook,
 	type AgentSessionPromptedWebhook,
+	type RoutingMethod as CoreRoutingMethod,
 	createLogger,
 	type IIssueTrackerService,
 	type ILogger,
+	type IssueFacts,
+	matchRepositories,
+	parseRepoTags,
 	type RepositoryConfig,
 	type Webhook,
 } from "cyrus-core";
@@ -19,10 +23,7 @@ export type RepositoryRoutingResult =
 			/** Per-repo base branch overrides from [repo=name#branch] syntax */
 			baseBranchOverrides?: Map<string, string>;
 			routingMethod:
-				| "description-tag"
-				| "label-based"
-				| "project-based"
-				| "team-based"
+				| CoreRoutingMethod
 				| "team-prefix"
 				| "catch-all"
 				| "workspace-fallback";
@@ -158,10 +159,14 @@ export class RepositoryRouter {
 	 * Priority 2: Routing labels
 	 * Priority 3: Project-based routing
 	 * Priority 4: Team-based routing
-	 * Priority 5: Catch-all repositories
+	 * Priority 5: The configured isDefault repository
+	 * Priority 6: Deprecated implicit catch-all / team-prefix fallbacks
 	 *
-	 * Description-tag and label-based routing, when matched, skip lower-priority routing.
-	 * If no routing matches, returns needs_selection (no default assignment).
+	 * Priorities 1-5 are delegated to the shared `matchRepositories` matcher in
+	 * `cyrus-core` so the router and edge worker can never disagree about which
+	 * repository an issue belongs to. Description-tag and label-based routing,
+	 * when matched, skip lower-priority routing. If no routing matches, returns
+	 * needs_selection (no default assignment).
 	 */
 	async determineRepositoryForWebhook(
 		webhook: AgentSessionCreatedWebhook | AgentSessionPromptedWebhook,
@@ -209,20 +214,15 @@ export class RepositoryRouter {
 		);
 		if (workspaceRepos.length === 0) return { type: "none" };
 
-		// Priority 1: Check description tags [repo=...] (supports multiple, with optional #branch)
-		const descriptionTagResult = await this.findRepositoriesByDescriptionTag(
-			issueId,
-			workspaceRepos,
-			workspaceId,
-		);
-		if (descriptionTagResult.repositories.length > 0) {
+		const facts = await this.gatherFacts(issueId, workspaceId, teamKey);
+		const match = matchRepositories(facts, workspaceRepos);
+
+		if (match.kind === "matched") {
 			this.logger.info(
-				`Repositories selected: [${descriptionTagResult.repositories.map((r) => r.name).join(", ")}] (description-tag routing)`,
+				`Repositories selected: [${match.repositories.map((r) => r.name).join(", ")}] (${match.method} routing)`,
 			);
-			if (descriptionTagResult.baseBranchOverrides.size > 0) {
-				const overrideEntries = Array.from(
-					descriptionTagResult.baseBranchOverrides.entries(),
-				)
+			if (match.baseBranchOverrides && match.baseBranchOverrides.size > 0) {
+				const overrideEntries = Array.from(match.baseBranchOverrides.entries())
 					.map(([id, branch]) => `${id}→${branch}`)
 					.join(", ");
 				this.logger.info(
@@ -231,67 +231,42 @@ export class RepositoryRouter {
 			}
 			return {
 				type: "selected",
-				repositories: descriptionTagResult.repositories,
-				baseBranchOverrides:
-					descriptionTagResult.baseBranchOverrides.size > 0
-						? descriptionTagResult.baseBranchOverrides
-						: undefined,
-				routingMethod: "description-tag",
+				repositories: match.repositories,
+				...(match.baseBranchOverrides
+					? { baseBranchOverrides: match.baseBranchOverrides }
+					: {}),
+				routingMethod: match.method,
 			};
 		}
 
-		// Priority 2: Check routing labels
-		const labelMatchedRepos = await this.findRepositoriesByLabels(
-			issueId,
-			workspaceRepos,
-			workspaceId,
-		);
-		if (labelMatchedRepos.length > 0) {
+		if (match.kind === "ambiguous") {
 			this.logger.info(
-				`Repositories selected: [${labelMatchedRepos.map((r) => r.name).join(", ")}] (label-based routing)`,
+				`Ambiguous ${match.tier} routing across [${match.candidates
+					.map((r) => r.name)
+					.join(", ")}] - requesting user selection`,
+			);
+			return { type: "needs_selection", workspaceRepos: match.candidates };
+		}
+
+		// Deprecated implicit catch-all, kept so an existing self-hosted
+		// config.json that predates `isDefault` keeps working. Sits BELOW the
+		// matcher's `default` tier: an explicit isDefault always wins.
+		// TODO(CYPACK): remove once self-hosted configs have migrated to isDefault.
+		const catchAllRepo = workspaceRepos.find(
+			(repo) =>
+				(!repo.teamKeys || repo.teamKeys.length === 0) &&
+				(!repo.routingLabels || repo.routingLabels.length === 0) &&
+				(!repo.projectKeys || repo.projectKeys.length === 0),
+		);
+		if (catchAllRepo) {
+			this.logger.info(
+				`Repository selected: ${catchAllRepo.name} (workspace catch-all)`,
 			);
 			return {
 				type: "selected",
-				repositories: labelMatchedRepos,
-				routingMethod: "label-based",
+				repositories: [catchAllRepo],
+				routingMethod: "catch-all",
 			};
-		}
-
-		// Priority 3: Check project-based routing
-		if (issueId) {
-			const projectMatchedRepo = await this.findRepositoryByProject(
-				issueId,
-				workspaceRepos,
-				workspaceId,
-			);
-			if (projectMatchedRepo) {
-				this.logger.info(
-					`Repository selected: ${projectMatchedRepo.name} (project-based routing)`,
-				);
-				return {
-					type: "selected",
-					repositories: [projectMatchedRepo],
-					routingMethod: "project-based",
-				};
-			}
-		}
-
-		// Priority 4: Check team-based routing
-		if (teamKey) {
-			const teamMatchedRepo = this.findRepositoryByTeamKey(
-				teamKey,
-				workspaceRepos,
-			);
-			if (teamMatchedRepo) {
-				this.logger.info(
-					`Repository selected: ${teamMatchedRepo.name} (team-based routing)`,
-				);
-				return {
-					type: "selected",
-					repositories: [teamMatchedRepo],
-					routingMethod: "team-based",
-				};
-			}
 		}
 
 		// Try parsing issue identifier as fallback for team routing
@@ -299,7 +274,7 @@ export class RepositoryRouter {
 		if (issueIdentifier?.includes("-")) {
 			const prefix = issueIdentifier.split("-")[0];
 			if (prefix) {
-				const repo = this.findRepositoryByTeamKey(prefix, workspaceRepos);
+				const repo = workspaceRepos.find((r) => r.teamKeys?.includes(prefix));
 				if (repo) {
 					this.logger.info(
 						`Repository selected: ${repo.name} (team prefix routing)`,
@@ -313,27 +288,6 @@ export class RepositoryRouter {
 			}
 		}
 
-		// Priority 5: Find catch-all repository (no routing configuration)
-		// TODO: Remove catch-all routing - require explicit routing configuration for all repositories
-		const catchAllRepo = workspaceRepos.find(
-			(repo) =>
-				(!repo.teamKeys || repo.teamKeys.length === 0) &&
-				(!repo.routingLabels || repo.routingLabels.length === 0) &&
-				(!repo.projectKeys || repo.projectKeys.length === 0),
-		);
-
-		if (catchAllRepo) {
-			this.logger.info(
-				`Repository selected: ${catchAllRepo.name} (workspace catch-all)`,
-			);
-			return {
-				type: "selected",
-				repositories: [catchAllRepo],
-				routingMethod: "catch-all",
-			};
-		}
-
-		// No routing match - request user selection (no default assignment)
 		this.logger.info(
 			`No routing match for ${workspaceRepos.length} workspace repositories - requesting user selection`,
 		);
@@ -341,279 +295,59 @@ export class RepositoryRouter {
 	}
 
 	/**
-	 * Find all repositories matching routing labels
+	 * Collects everything the matcher needs, tolerating a failure in any single
+	 * lookup. A failed description fetch must not suppress label routing, which
+	 * is why each source is guarded separately rather than in one try block.
 	 */
-	private async findRepositoriesByLabels(
+	private async gatherFacts(
 		issueId: string | undefined,
-		repos: RepositoryConfig[],
 		workspaceId: string,
-	): Promise<RepositoryConfig[]> {
-		if (!issueId) return [];
-
-		const reposWithRoutingLabels = repos.filter(
-			(repo) => repo.routingLabels && repo.routingLabels.length > 0,
-		);
-
-		if (reposWithRoutingLabels.length === 0) return [];
-
-		try {
-			const labels = await this.deps.fetchIssueLabels(issueId, workspaceId);
-
-			const matched: RepositoryConfig[] = [];
-			for (const repo of reposWithRoutingLabels) {
-				if (
-					repo.routingLabels?.some((routingLabel: string) =>
-						labels.includes(routingLabel),
-					)
-				) {
-					matched.push(repo);
-				}
-			}
-			return matched;
-		} catch (error) {
-			this.logger.error(`Failed to fetch labels for routing:`, error);
-		}
-
-		return [];
-	}
-
-	/**
-	 * Find all repositories matching description tags
-	 *
-	 * Parses the issue description for repo tags and matches against:
-	 * - Repository GitHub URL (endsWith /repo-name)
-	 * - Repository name
-	 * - Repository ID
-	 *
-	 * Supported tag syntaxes:
-	 * - [repo=my-repo-name] or [repo=my-repo-name#branch]
-	 * - repo=frontend,backend#branch
-	 * - repos=frontend,backend
-	 */
-	private async findRepositoriesByDescriptionTag(
-		issueId: string | undefined,
-		repos: RepositoryConfig[],
-		workspaceId: string,
-	): Promise<{
-		repositories: RepositoryConfig[];
-		baseBranchOverrides: Map<string, string>;
-	}> {
-		if (!issueId) return { repositories: [], baseBranchOverrides: new Map() };
+		teamKey: string | undefined,
+	): Promise<IssueFacts> {
+		const facts: IssueFacts = {};
+		if (teamKey) facts.teamKey = teamKey;
+		if (!issueId) return facts;
 
 		try {
 			const description = await this.deps.fetchIssueDescription(
 				issueId,
 				workspaceId,
 			);
-			if (!description)
-				return { repositories: [], baseBranchOverrides: new Map() };
-
-			const repoTags = this.parseRepoTagsFromDescription(description);
-			if (repoTags.length === 0)
-				return { repositories: [], baseBranchOverrides: new Map() };
-
-			this.logger.info(
-				`Found repo tags in issue description: [${repoTags.map((t) => (t.branch ? `${t.repo}#${t.branch}` : t.repo)).join(", ")}]`,
-			);
-
-			const matched: RepositoryConfig[] = [];
-			const matchedIds = new Set<string>();
-			const baseBranchOverrides = new Map<string, string>();
-
-			for (const repoTag of repoTags) {
-				for (const repo of repos) {
-					if (matchedIds.has(repo.id)) continue;
-
-					let isMatch = false;
-
-					// Match by GitHub/GitLab URL path segment (e.g., "org/repo-name" or "repo-name")
-					// Use endsWith to avoid substring false positives (e.g., "cyrus" matching "cyrus-hosted")
-					if (
-						repo.githubUrl?.endsWith(`/${repoTag.repo}`) ||
-						repo.githubUrl?.endsWith(`/${repoTag.repo}.git`) ||
-						repo.gitlabUrl?.endsWith(`/${repoTag.repo}`) ||
-						repo.gitlabUrl?.endsWith(`/${repoTag.repo}.git`)
-					) {
-						this.logger.debug(
-							`Matched repo tag "${repoTag.repo}" to repository ${repo.name} via hosting URL`,
-						);
-						isMatch = true;
-					}
-
-					// Match by repository name (exact match, case-insensitive)
-					if (
-						!isMatch &&
-						repo.name.toLowerCase() === repoTag.repo.toLowerCase()
-					) {
-						this.logger.debug(
-							`Matched repo tag "${repoTag.repo}" to repository ${repo.name} via name`,
-						);
-						isMatch = true;
-					}
-
-					// Match by repository ID
-					if (!isMatch && repo.id === repoTag.repo) {
-						this.logger.debug(
-							`Matched repo tag "${repoTag.repo}" to repository ${repo.name} via ID`,
-						);
-						isMatch = true;
-					}
-
-					if (isMatch) {
-						matched.push(repo);
-						matchedIds.add(repo.id);
-						if (repoTag.branch) {
-							baseBranchOverrides.set(repo.id, repoTag.branch);
-							this.logger.debug(
-								`Base branch override for ${repo.name}: ${repoTag.branch}`,
-							);
-						}
-					}
-				}
-			}
-
-			if (matched.length === 0) {
-				this.logger.debug(
-					`No repositories matched [repo=...] tags: [${repoTags.map((t) => t.repo).join(", ")}]`,
-				);
-			}
-			return { repositories: matched, baseBranchOverrides };
+			if (description) facts.description = description;
 		} catch (error) {
 			this.logger.error(`Failed to fetch description for routing:`, error);
 		}
 
-		return { repositories: [], baseBranchOverrides: new Map() };
+		try {
+			facts.labels = await this.deps.fetchIssueLabels(issueId, workspaceId);
+		} catch (error) {
+			this.logger.error(`Failed to fetch labels for routing:`, error);
+		}
+
+		try {
+			const issueTracker = this.deps.getIssueTracker(workspaceId);
+			if (issueTracker) {
+				const fullIssue = await issueTracker.fetchIssue(issueId);
+				const project = await fullIssue?.project;
+				if (project?.name) facts.projectName = project.name;
+			} else {
+				this.logger.warn(`No issue tracker found for workspace ${workspaceId}`);
+			}
+		} catch (error) {
+			this.logger.debug(`Failed to fetch project for issue ${issueId}:`, error);
+		}
+
+		return facts;
 	}
 
 	/**
-	 * Parse repo tags from issue description
-	 *
-	 * Supported syntaxes:
-	 * - `[repo=name]` or `[repo=name#branch]` — bracketed, single repo per tag
-	 * - `repo=name,name2#branch` — unbracketed, comma-separated repos with optional branch
-	 * - `repos=name,name2#branch` — same as above with plural "repos"
-	 *
-	 * Also handles escaped brackets (\\[repo=...\\]) which Linear may produce.
-	 *
-	 * Returns array of parsed tags with optional branch overrides.
+	 * @deprecated Use `parseRepoTags` from `cyrus-core`. Retained as a thin
+	 * delegate because it is public API with an extensive test suite.
 	 */
 	parseRepoTagsFromDescription(
 		description: string,
 	): { repo: string; branch?: string }[] {
-		const tags: { repo: string; branch?: string }[] = [];
-
-		// Pattern 1: Bracketed [repo=...] (existing syntax)
-		// Matches: [repo=name], [repo=name#branch], \[repo=name\]
-		const bracketRegex = /\\?\[repo=([a-zA-Z0-9_\-/.#]+)\\?\]/g;
-		for (const match of description.matchAll(bracketRegex)) {
-			if (match[1]) {
-				tags.push(...this.parseRepoValue(match[1]));
-			}
-		}
-
-		// Pattern 2: Unbracketed repos?=... (new syntax)
-		// Matches: repo=name, repos=name,name2, repo=name,name2#branch
-		// Must be at start of line or after whitespace to avoid matching inside URLs/paths
-		const unbracketedRegex = /(?:^|[\s\n])repos?=([a-zA-Z0-9_\-/.#,]+)/gm;
-		for (const match of description.matchAll(unbracketedRegex)) {
-			if (match[1]) {
-				tags.push(...this.parseRepoValue(match[1]));
-			}
-		}
-
-		// Deduplicate by repo name (keep first occurrence)
-		const seen = new Set<string>();
-		return tags.filter((tag) => {
-			if (seen.has(tag.repo)) return false;
-			seen.add(tag.repo);
-			return true;
-		});
-	}
-
-	/**
-	 * Parse a repo value that may contain commas (multiple repos) and #branch.
-	 * The #branch suffix applies to all repos in a comma-separated list.
-	 */
-	private parseRepoValue(value: string): { repo: string; branch?: string }[] {
-		// Split branch from the end: everything after the last # that follows a repo name
-		const hashIndex = value.indexOf("#");
-		let reposPart: string;
-		let branch: string | undefined;
-
-		if (hashIndex !== -1) {
-			reposPart = value.slice(0, hashIndex);
-			branch = value.slice(hashIndex + 1);
-			if (!branch) branch = undefined;
-		} else {
-			reposPart = value;
-		}
-
-		// Split comma-separated repos
-		const repos = reposPart
-			.split(",")
-			.map((r) => r.trim())
-			.filter((r) => r.length > 0);
-
-		return repos.map((repo) => (branch ? { repo, branch } : { repo }));
-	}
-
-	/**
-	 * Find repository by team key
-	 */
-	private findRepositoryByTeamKey(
-		teamKey: string,
-		repos: RepositoryConfig[],
-	): RepositoryConfig | undefined {
-		return repos.find((r) => r.teamKeys?.includes(teamKey));
-	}
-
-	/**
-	 * Find repository by project name
-	 */
-	private async findRepositoryByProject(
-		issueId: string,
-		repos: RepositoryConfig[],
-		workspaceId: string,
-	): Promise<RepositoryConfig | null> {
-		// Try each repository that has projectKeys configured
-		for (const repo of repos) {
-			if (!repo.projectKeys || repo.projectKeys.length === 0) continue;
-
-			try {
-				const issueTracker = this.deps.getIssueTracker(workspaceId);
-				if (!issueTracker) {
-					this.logger.warn(
-						`No issue tracker found for workspace ${workspaceId}`,
-					);
-					continue;
-				}
-
-				const fullIssue = await issueTracker.fetchIssue(issueId);
-				const project = await fullIssue?.project;
-				if (!project?.name) {
-					this.logger.debug(
-						`No project name found for issue ${issueId} in repository ${repo.name}`,
-					);
-					continue;
-				}
-
-				const projectName = project.name;
-				if (repo.projectKeys.includes(projectName)) {
-					this.logger.debug(
-						`Matched issue ${issueId} to repository ${repo.name} via project: ${projectName}`,
-					);
-					return repo;
-				}
-			} catch (error) {
-				// Continue to next repository if this one fails
-				this.logger.debug(
-					`Failed to fetch project for issue ${issueId} from repository ${repo.name}:`,
-					error,
-				);
-			}
-		}
-
-		return null;
+		return parseRepoTags(description);
 	}
 
 	/**

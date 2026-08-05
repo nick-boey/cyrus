@@ -1337,6 +1337,60 @@ describe("RepositoryRouter", () => {
 	});
 
 	// ========================================================================
+	// Default Repository Routing
+	// ========================================================================
+
+	describe("Default repository routing", () => {
+		it("routes to the isDefault repository when nothing else matches", async () => {
+			const fallback = {
+				...env.repository("fallback", "fallback").build(),
+				isDefault: true,
+			};
+			const other = env.repository("other", "other").withTeams("OTHER").build();
+
+			const webhook = env
+				.webhook()
+				.forIssue("issue-1", "UNKNOWN-1")
+				.inTeam("UNKNOWN")
+				.build();
+
+			const result = await env.router.determineRepositoryForWebhook(webhook, [
+				other,
+				fallback,
+			]);
+
+			expectRouting(result).shouldSelectRepositoryVia(fallback, "default");
+		});
+
+		it("prefers isDefault over the deprecated implicit catch-all", async () => {
+			const implicitCatchAll = env
+				.repository("implicit", "implicit")
+				.asCatchAll()
+				.build();
+			const explicitDefault = {
+				...env.repository("explicit", "explicit").withTeams("X").build(),
+				isDefault: true,
+			};
+
+			const webhook = env
+				.webhook()
+				.forIssue("issue-1", "UNKNOWN-1")
+				.inTeam("UNKNOWN")
+				.build();
+
+			const result = await env.router.determineRepositoryForWebhook(webhook, [
+				implicitCatchAll,
+				explicitDefault,
+			]);
+
+			expectRouting(result).shouldSelectRepositoryVia(
+				explicitDefault,
+				"default",
+			);
+		});
+	});
+
+	// ========================================================================
 	// Workspace Fallback & Edge Cases
 	// ========================================================================
 
