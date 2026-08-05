@@ -68,17 +68,19 @@ describe("matchRepositories", () => {
 		const labelled = repo("cyrus-web", {
 			teamKeys: ["WEB"],
 			routingLabels: ["frontend"],
+			projectKeys: ["Frontend"],
 		});
 		const result = matchRepositories(
 			{
 				description: "[repo=cyrus-api]",
 				labels: ["frontend"],
-				projectKeys: undefined,
+				projectName: "Frontend",
 				teamKey: "WEB",
-			} as never,
+			},
 			[API, labelled],
 		);
 		expect(result).toMatchObject({ method: "description-tag" });
+		expect(result.kind === "matched" && result.repositories).toEqual([API]);
 	});
 
 	it("falls through to labels when no tag matches any repository", () => {
