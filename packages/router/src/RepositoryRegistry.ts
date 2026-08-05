@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import type { RoutableRepository } from "cyrus-core";
+import { TableRepositoryRegistry } from "./TableRepositoryRegistry.js";
 import { SetupConflictError } from "./TableSecretStore.js";
 
 /**
@@ -209,4 +210,75 @@ export class FileRepositoryRegistry implements RepositoryRegistry {
 		renameSync(tmpPath, this.path);
 		return { version: next.version };
 	}
+}
+
+/**
+ * Chooses the registry backend, mirroring how `SecretStoreBackend` already
+ * picks between Table and file. The Table backend needs no Key Vault key —
+ * unlike the secret store, the registry is plaintext.
+ */
+export function createRepositoryRegistry(options: {
+	tableStore?: { endpoint: string; tableName?: string };
+	filePath: string;
+}): RepositoryRegistry {
+	if (options.tableStore) {
+		return new TableRepositoryRegistry({
+			tableEndpoint: options.tableStore.endpoint,
+			...(options.tableStore.tableName
+				? { tableName: options.tableStore.tableName }
+				: {}),
+		});
+	}
+	return new FileRepositoryRegistry(options.filePath);
+}
+
+/**
+ * Writes `configured` into the registry the first time it is empty, and never
+ * again.
+ *
+ * Seed-once rather than merge is deliberate. `containers.repositories` reaches
+ * the router as the `CYRUS_ROUTER_CONTAINERS_JSON` environment variable, so a
+ * merge would let a redeploy silently overwrite edits made in the setup UI —
+ * exactly the surprise this design exists to remove. The log line on the
+ * already-seeded path is what tells an operator editing that variable and
+ * seeing nothing happen why it had no effect.
+ *
+ * An invalid configured entry is warned about and the whole seed is skipped:
+ * partially seeding would leave a registry that neither matches the config nor
+ * anything a human chose.
+ */
+export async function seedRepositoryRegistry(
+	registry: RepositoryRegistry,
+	configured: readonly RegisteredRepository[],
+	logger: { info(msg: string): void; warn(msg: string): void },
+): Promise<{ seeded: boolean; count: number }> {
+	const snapshot = await registry.list();
+	if (snapshot.repositories.length > 0) {
+		logger.info(
+			`Repository registry already holds ${snapshot.repositories.length} repositor${
+				snapshot.repositories.length === 1 ? "y" : "ies"
+			}; the stored registry is authoritative and containers.repositories in router-config.json is ignored. Edit repositories at /setup/repositories.`,
+		);
+		return { seeded: false, count: snapshot.repositories.length };
+	}
+	if (configured.length === 0) return { seeded: false, count: 0 };
+
+	for (const repo of configured) {
+		try {
+			validateRegisteredRepository(repo);
+		} catch (error) {
+			logger.warn(
+				`Not seeding the repository registry: ${(error as Error).message} Fix containers.repositories in router-config.json, or add repositories at /setup/repositories.`,
+			);
+			return { seeded: false, count: 0 };
+		}
+	}
+
+	await registry.put([...configured], snapshot.version);
+	logger.info(
+		`Seeded the repository registry with ${configured.length} repositor${
+			configured.length === 1 ? "y" : "ies"
+		} from containers.repositories. The stored registry is authoritative from now on.`,
+	);
+	return { seeded: true, count: configured.length };
 }

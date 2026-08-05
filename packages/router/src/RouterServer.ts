@@ -32,6 +32,11 @@ import {
 } from "./enrollment.js";
 import { KeyVaultSecretStore } from "./KeyVaultSecretStore.js";
 import { LinearExecutor } from "./LinearExecutor.js";
+import {
+	createRepositoryRegistry,
+	type RepositoryRegistry,
+	seedRepositoryRegistry,
+} from "./RepositoryRegistry.js";
 import { RouterStore } from "./RouterStore.js";
 import {
 	DEFAULT_REQUIRED_SECRET_KEYS,
@@ -107,6 +112,10 @@ export interface RouterContainersConfig {
 		githubSlug: string;
 		linearWorkspaceId: string;
 		baseBranch?: string;
+		teamKeys?: string[];
+		projectKeys?: string[];
+		routingLabels?: string[];
+		isDefault?: boolean;
 	}>;
 	/** Default `<dirname(dbPath)>/artifacts`. */
 	artifactsDir?: string;
@@ -320,6 +329,8 @@ export class RouterServer {
 	 * interval's `this.containerLifecycle?.sweep()` call is a no-op.
 	 */
 	containerLifecycle?: ContainerLifecycle;
+	/** Set only when `containers` is configured. Consumed by the setup UI. */
+	repositoryRegistry: RepositoryRegistry | undefined;
 	private terminalTeardown?: TerminalTeardown;
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;
@@ -763,6 +774,34 @@ export class RouterServer {
 				return map;
 			});
 		const executors = executorRegistryFactory(containers);
+
+		const repositoryRegistry = createRepositoryRegistry({
+			...(containers.tableStore
+				? {
+						tableStore: {
+							endpoint: containers.tableStore.endpoint,
+							...(containers.tableStore.tableName
+								? { tableName: containers.tableStore.tableName }
+								: {}),
+						},
+					}
+				: {}),
+			filePath: join(dirname(this.config.dbPath), "repositories.json"),
+		});
+		this.repositoryRegistry = repositoryRegistry;
+
+		// Seeding is fire-and-forget: it must not delay the listen(), and a
+		// transient Table error here is recoverable — the next start retries,
+		// and the setup UI can populate the registry by hand meanwhile.
+		void seedRepositoryRegistry(
+			repositoryRegistry,
+			containers.repositories,
+			this.logger,
+		).catch((error: unknown) => {
+			this.logger.warn(
+				`Could not seed the repository registry: ${String(error)}`,
+			);
+		});
 
 		const containerTargets = new ContainerTargetService({
 			store: this.store,

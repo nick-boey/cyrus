@@ -180,6 +180,13 @@ const RouterConfigFileSchema = z.object({
 					githubSlug: z.string(),
 					linearWorkspaceId: z.string(),
 					baseBranch: z.string().optional(),
+					// Routing metadata. Only ever used to SEED the registry on first
+					// start — after that the stored registry is authoritative and
+					// these are ignored. See seedRepositoryRegistry.
+					teamKeys: z.array(z.string()).optional(),
+					projectKeys: z.array(z.string()).optional(),
+					routingLabels: z.array(z.string()).optional(),
+					isDefault: z.boolean().optional(),
 				}),
 			),
 			artifactsDir: z.string().optional(),

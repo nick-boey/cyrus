@@ -1,10 +1,11 @@
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	FileRepositoryRegistry,
 	type RegisteredRepository,
+	seedRepositoryRegistry,
 	toRoutable,
 	validateRegisteredRepository,
 } from "../src/RepositoryRegistry.js";
@@ -181,5 +182,60 @@ describe("toRoutable", () => {
 		expect(routable.projectKeys).toBeUndefined();
 		expect(routable.routingLabels).toBeUndefined();
 		expect(routable.isDefault).toBeUndefined();
+	});
+});
+
+describe("seedRepositoryRegistry", () => {
+	const logger = () => ({ info: vi.fn(), warn: vi.fn() });
+
+	it("writes the configured repositories into an empty registry", async () => {
+		const registry = new FileRepositoryRegistry(freshPath());
+		const log = logger();
+		expect(await seedRepositoryRegistry(registry, [API], log)).toEqual({
+			seeded: true,
+			count: 1,
+		});
+		expect((await registry.list()).repositories).toEqual([API]);
+		expect(log.info).toHaveBeenCalledWith(
+			expect.stringContaining("Seeded the repository registry with 1"),
+		);
+	});
+
+	it("never overwrites a non-empty registry, and says so", async () => {
+		const registry = new FileRepositoryRegistry(freshPath());
+		await registry.put([{ ...API, name: "already-here" }]);
+		const log = logger();
+
+		expect(await seedRepositoryRegistry(registry, [API], log)).toEqual({
+			seeded: false,
+			count: 1,
+		});
+		expect((await registry.list()).repositories[0]?.name).toBe("already-here");
+		expect(log.info).toHaveBeenCalledWith(
+			expect.stringContaining("authoritative"),
+		);
+	});
+
+	it("is a no-op with no configured repositories and an empty registry", async () => {
+		const registry = new FileRepositoryRegistry(freshPath());
+		expect(await seedRepositoryRegistry(registry, [], logger())).toEqual({
+			seeded: false,
+			count: 0,
+		});
+	});
+
+	it("warns and continues when a configured entry is invalid", async () => {
+		const registry = new FileRepositoryRegistry(freshPath());
+		const log = logger();
+		const result = await seedRepositoryRegistry(
+			registry,
+			[API, { ...API, name: "../escape" }],
+			log,
+		);
+		expect(result).toEqual({ seeded: false, count: 0 });
+		expect(log.warn).toHaveBeenCalledWith(
+			expect.stringContaining("is not valid"),
+		);
+		expect((await registry.list()).repositories).toEqual([]);
 	});
 });
