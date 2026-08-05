@@ -286,6 +286,16 @@ export const RepositoryConfigSchema = z.object({
 	routingLabels: z.array(z.string()).optional(),
 	projectKeys: z.array(z.string()).optional(),
 
+	/**
+	 * Selected when no higher-priority routing method matches. At most one
+	 * repository per Linear workspace should set this.
+	 *
+	 * Replaces the implicit catch-all — "the first repository that happens to
+	 * have no routing configuration" — which silently switched off the moment
+	 * routing metadata was added to every repository.
+	 */
+	isDefault: z.boolean().optional(),
+
 	/** @deprecated Use EdgeConfig.linearWorkspaces[workspaceId].linearToken */
 	linearToken: z.string().optional(),
 	/** @deprecated Use EdgeConfig.linearWorkspaces[workspaceId].linearRefreshToken */

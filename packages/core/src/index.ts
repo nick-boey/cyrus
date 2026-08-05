@@ -288,6 +288,14 @@ export {
 	PERSISTENCE_VERSION,
 	PersistenceManager,
 } from "./PersistenceManager.js";
+// Repository routing — shared by the edge worker and the router so the two
+// can never disagree about which repository an issue belongs to.
+export type { RepositoryAssociations } from "./routing/index.js";
+export {
+	AssociationParseError,
+	formatAssociations,
+	parseAssociations,
+} from "./routing/index.js";
 export { StreamingPrompt } from "./StreamingPrompt.js";
 export type {
 	WebhookIpValidatorOptions,

@@ -42,6 +42,9 @@
 				"type": "string"
 			}
 		},
+		"isDefault": {
+			"type": "boolean"
+		},
 		"linearToken": {
 			"type": "string"
 		},
