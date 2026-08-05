@@ -45,6 +45,23 @@ function makeExecutor(): {
 	return { executor, store, tracker };
 }
 
+/**
+ * Builds a `LinearExecutor` whose only tracker is registered under
+ * `workspaceId`, backed by a real in-memory `RouterStore` (matching
+ * `makeExecutor`'s convention). `tracker` only needs to implement whichever
+ * `IIssueTrackerService` methods the test actually exercises.
+ */
+function executorWithTracker(
+	workspaceId: string,
+	tracker: Partial<IIssueTrackerService>,
+): LinearExecutor {
+	const store = new RouterStore(":memory:");
+	const trackers = new Map<string, IIssueTrackerService>([
+		[workspaceId, tracker as IIssueTrackerService],
+	]);
+	return new LinearExecutor({ trackers, store });
+}
+
 describe("LinearExecutor.dispatch", () => {
 	let executor: LinearExecutor;
 	let store: RouterStore;
@@ -452,5 +469,121 @@ describe("LinearExecutor.downloadAttachment (token host allowlist)", () => {
 			expect(res.error).toBe("invalid attachment url");
 		}
 		expect(fetchMock).not.toHaveBeenCalled();
+	});
+});
+
+describe("LinearExecutor.postRepositorySelection", () => {
+	it("posts an elicitation carrying a Select signal and the option list", async () => {
+		const createAgentActivity = vi.fn(async () => ({ success: true }));
+		const executor = executorWithTracker("ws-1", { createAgentActivity });
+
+		await executor.postRepositorySelection("ws-1", "sess-1", "Which repo?", [
+			"cyrus-api",
+			"cyrus-web",
+		]);
+
+		expect(createAgentActivity).toHaveBeenCalledWith({
+			agentSessionId: "sess-1",
+			content: { type: "elicitation", body: "Which repo?" },
+			signal: "select",
+			signalMetadata: {
+				options: [{ value: "cyrus-api" }, { value: "cyrus-web" }],
+			},
+		});
+	});
+
+	it("is a no-op when the workspace has no configured tracker", async () => {
+		const executor = executorWithTracker("ws-other", {
+			createAgentActivity: vi.fn(),
+		});
+		await expect(
+			executor.postRepositorySelection("ws-missing", "sess-1", "x", ["a"]),
+		).resolves.toBeUndefined();
+	});
+});
+
+describe("LinearExecutor.postActivity (options)", () => {
+	it("still posts a plain thought when no options are given", async () => {
+		const createAgentActivity = vi.fn(async () => ({ success: true }));
+		const executor = executorWithTracker("ws-1", { createAgentActivity });
+		await executor.postActivity("ws-1", "sess-1", "hello");
+		expect(createAgentActivity).toHaveBeenCalledWith({
+			agentSessionId: "sess-1",
+			content: { type: "thought", body: "hello" },
+		});
+	});
+});
+
+describe("LinearExecutor.fetchIssueFacts", () => {
+	it("collects team key, project name, labels, and description in one call", async () => {
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => ({
+				id: "issue-1",
+				description: "[repo=cyrus-api]",
+				team: Promise.resolve({ key: "NOR" }),
+				project: Promise.resolve({ name: "Platform" }),
+				labels: async () => ({ nodes: [{ name: "bug" }, { name: "urgent" }] }),
+			})),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(await executor.fetchIssueFacts("ws-1", "issue-1")).toEqual({
+			teamKey: "NOR",
+			projectName: "Platform",
+			labels: ["bug", "urgent"],
+			description: "[repo=cyrus-api]",
+		});
+	});
+
+	it("omits facts the issue does not carry rather than inventing them", async () => {
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => ({
+				id: "issue-1",
+				team: Promise.resolve(undefined),
+				project: Promise.resolve(undefined),
+				labels: async () => ({ nodes: [] }),
+			})),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(await executor.fetchIssueFacts("ws-1", "issue-1")).toEqual({
+			labels: [],
+		});
+	});
+
+	it("returns undefined when the workspace has no tracker", async () => {
+		const executor = executorWithTracker("ws-1", { fetchIssue: vi.fn() });
+		expect(
+			await executor.fetchIssueFacts("ws-missing", "issue-1"),
+		).toBeUndefined();
+	});
+
+	it("degrades to the facts it did get when a sub-fetch throws", async () => {
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => ({
+				id: "issue-1",
+				description: "hello",
+				team: Promise.resolve({ key: "NOR" }),
+				get project(): Promise<never> {
+					throw new Error("project unavailable");
+				},
+				labels: async () => {
+					throw new Error("labels unavailable");
+				},
+			})),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(await executor.fetchIssueFacts("ws-1", "issue-1")).toEqual({
+			teamKey: "NOR",
+			description: "hello",
+			labels: [],
+		});
+	});
+
+	it("returns undefined when fetchIssue itself throws", async () => {
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => {
+				throw new Error("Linear 500");
+			}),
+		});
+		expect(await executor.fetchIssueFacts("ws-1", "issue-1")).toBeUndefined();
 	});
 });
