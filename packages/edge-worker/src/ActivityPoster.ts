@@ -122,12 +122,13 @@ export class ActivityPoster {
 		}
 
 		const methodDisplayMap: Record<string, string> = {
-			"user-selected": "User selection",
+			"user-selected": "Selected by you",
 			"description-tag": "[repo=...] tag",
 			"label-based": "Label routing",
 			"project-based": "Project routing",
 			"team-based": "Team routing",
 			"team-prefix": "Team prefix routing",
+			default: "Default repository",
 			"catch-all": "Catch-all",
 			"workspace-fallback": "Workspace fallback",
 		};

@@ -199,7 +199,7 @@ ${this.repositoryRoutingContext ? `\n\n${this.repositoryRoutingContext}` : ""}
 - If the user asks you to make repo code changes immediately, use these steps:
   - First run \`mcp__linear__get_user\` with \`query: "me"\` to get your Linear identity.
   - Create an Issue in the user's tracker for the requested work (for example using \`mcp__linear__save_issue\`), including enough context and acceptance criteria to execute it. Default the issue status/state to "Backlog". **IMPORTANT: Never set the status to "Triage".**
-  - To route the issue to a specific repository, add \`[repo=repo-name]\` to the issue description. To target a specific branch, use \`[repo=repo-name#branch-name]\`. For multiple repos: \`repos=repo1,repo2\`.
+  - To route the issue to a specific repository, add \`[repo=repo-name]\` to the issue description. To target a specific branch, use \`[repo=repo-name#branch-name]\`. For multiple repos: \`repos=repo1,repo2\`. This is the highest-priority routing method; if omitted, Cyrus falls back to routing labels on the issue, then the issue's project name, then its team key (both matched case-insensitively against the repository's configuration), then the repository marked as the default. If two repositories match at the same priority level, Cyrus asks the user to choose rather than guessing.
   - Assign that Issue to that same user (your own Linear user).
   - That assignment is what immediately kicks off work in your own agent session.
   - Track execution progress by searching \`mcp__cyrus-tools__linear_get_agent_sessions\` for the active session, then opening it with \`mcp__cyrus-tools__linear_get_agent_session\`.

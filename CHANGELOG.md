@@ -26,6 +26,13 @@ All notable changes to this project will be documented in this file.
 - `cyrus router unlock` now accepts a Linear issue identifier (e.g. `cyrus router unlock PAR-169`) in addition to the raw issue GUID — no more hunting for the GUID to release a stuck lock. The identifier is resolved through Linear; passing the GUID still works with no Linear token needed.
 - Containers run the full hosted Linear MCP in their Claude session when a `LINEAR_API_TOKEN` secret is set for the user.
 - Operators can require extra credentials before a user's containers boot via `containers.requiredSecretKeys` in the router config (the Claude OAuth token is always required).
+- Router deployments can now register multiple repositories and manage them from the setup UI at `/setup/repositories`, including a default repository and associations to Linear project and team names (`p=Platform,t=NOR`).
+- When an issue's project or team matches a registered repository, Cyrus now clones only that repository — no more tagging every issue with `[repo=…]`.
+- When two repositories match equally, or nothing matches and no default is set, Cyrus asks in Linear which one to use. Nothing runs while it waits.
+
+### Changed
+- Router deployments with more than one repository previously always used the first one and cloned all of them into every workspace. They are now routed by project, team, or the configured default, and only the chosen repository is cloned. Single-repository deployments are unaffected.
+- Project and team routing now match names case-insensitively.
 
 ### Fixed
 - The `/setup` page can now save a credential it has never held before. Any required variable missing from your stored record showed an editable row that silently threw away whatever you typed, answering "No changes to save" — so a newly required credential could never be entered through the browser at all.
