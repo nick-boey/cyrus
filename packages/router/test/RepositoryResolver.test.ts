@@ -132,6 +132,34 @@ describe("RepositoryResolver.resolve", () => {
 		);
 	});
 
+	it("reports unavailable, distinctly from an empty registry, when the registry rejects", async () => {
+		const warn = vi.fn();
+		const registry: RepositoryRegistry = {
+			list: vi.fn(async () => {
+				throw new Error("Azure Table request failed: 503");
+			}),
+			put: vi.fn(async () => ({ version: "1" })),
+		};
+		const instance = new RepositoryResolver({
+			registry,
+			fetchIssueFacts: vi.fn(async () => undefined),
+			logger: { info: vi.fn(), warn },
+		});
+
+		const outcome = await instance.resolve({
+			workspaceId: "ws-1",
+			issueId: "issue-1",
+		});
+
+		expect(outcome).toMatchObject({ kind: "unavailable" });
+		expect(outcome.kind === "unavailable" && outcome.reason).not.toContain(
+			"No repositories are registered",
+		);
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining("Azure Table request failed: 503"),
+		);
+	});
+
 	it("routes on the registry alone when the issue has no id", async () => {
 		const outcome = await resolver([API, INFRA], undefined).resolve({
 			workspaceId: "ws-1",

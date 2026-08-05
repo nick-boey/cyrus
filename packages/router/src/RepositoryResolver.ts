@@ -50,7 +50,29 @@ export class RepositoryResolver {
 		workspaceId: string;
 		issueId: string | undefined;
 	}): Promise<ResolveOutcome> {
-		const { repositories } = await this.deps.registry.list();
+		// The registry is a durable store the resolver depends on through the
+		// `RepositoryRegistry` interface, not through one implementation: the
+		// Table-backed production registry (`TableRepositoryRegistry.list()`)
+		// throws on a transient 5xx, an auth failure, or exhausted retries, unlike
+		// `fetchIssueFacts`, which is contractually guaranteed to resolve to
+		// `undefined` rather than reject. Without this catch, a transient Table
+		// hiccup would turn `resolve()` from a total function returning
+		// `ResolveOutcome` into a rejected promise. `ResolveOutcome` already
+		// models exactly this state, so the resolver — the layer that knows what
+		// an unavailable registry means — reports it the same way as an empty
+		// registry, just with a distinguishable reason.
+		let repositories: RegisteredRepository[];
+		try {
+			({ repositories } = await this.deps.registry.list());
+		} catch (error) {
+			this.deps.logger.warn(
+				`Could not read the repository registry for Linear workspace ${opts.workspaceId}: ${String(error)}`,
+			);
+			return {
+				kind: "unavailable",
+				reason: `The repository registry could not be read. Try again shortly, or check /setup/repositories.`,
+			};
+		}
 		const scoped = repositories.filter(
 			(repo) => repo.linearWorkspaceId === opts.workspaceId,
 		);
