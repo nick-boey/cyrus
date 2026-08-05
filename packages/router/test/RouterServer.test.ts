@@ -448,6 +448,14 @@ describe("RouterServer containers wiring", () => {
 				linearWorkspaceId: "ws-1",
 			},
 		],
+		// `dbPath` below is ":memory:", whose `dirname` is ".". Without this
+		// override, seeding the registry (which runs unconditionally at
+		// construction whenever `repositories` is non-empty) would write
+		// `repositories.json` into the package directory instead of a temp one.
+		repositoriesPath: join(
+			mkdtempSync(join(tmpdir(), "rs-repositories-")),
+			"repositories.json",
+		),
 	};
 
 	/** Minimal object that satisfies isAgentSessionCreatedWebhook + the fields EventRouter reads. */

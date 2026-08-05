@@ -191,6 +191,9 @@ const RouterConfigFileSchema = z.object({
 			),
 			artifactsDir: z.string().optional(),
 			secretsPath: z.string().optional(),
+			// Default `<dirname(dbPath)>/repositories.json`; only the file-backed
+			// registry consults it — ignored once tableStore selects Table storage.
+			repositoriesPath: z.string().optional(),
 			keyVaultUrl: z.string().optional(),
 			// Azure Table backend for per-user secrets. Takes precedence over
 			// keyVaultUrl. Unmodelled fields are stripped on EVERY `router start`

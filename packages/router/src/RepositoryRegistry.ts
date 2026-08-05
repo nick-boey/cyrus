@@ -263,6 +263,13 @@ export async function seedRepositoryRegistry(
 	}
 	if (configured.length === 0) return { seeded: false, count: 0 };
 
+	// Validated here, ahead of `put()`, rather than relying on `put()`'s own
+	// pre-write validation (both backends already refuse to write an invalid
+	// batch): `put()` throws, and callers of `seedRepositoryRegistry` treat it
+	// as fire-and-forget (see RouterServer), so an uncaught throw would only
+	// ever surface as a generic "Could not seed the repository registry"
+	// warn. Catching it here instead produces the friendlier, actionable
+	// warning below, pointing at router-config.json and /setup/repositories.
 	for (const repo of configured) {
 		try {
 			validateRegisteredRepository(repo);

@@ -121,6 +121,15 @@ export interface RouterContainersConfig {
 	artifactsDir?: string;
 	/** Default `<dirname(dbPath)>/user-secrets.json`. */
 	secretsPath?: string;
+	/**
+	 * Default `<dirname(dbPath)>/repositories.json`. Only consulted for the
+	 * file-backed registry — ignored once `tableStore` selects the Table
+	 * backend. Overriding this is mainly for tests: it lets a suite using a
+	 * non-path `dbPath` sentinel (e.g. `":memory:"`, whose `dirname` is `"."`)
+	 * point the registry file at a temp directory instead of the package's
+	 * working directory.
+	 */
+	repositoriesPath?: string;
 	/** Selects Azure Key Vault instead of the local secrets file. */
 	keyVaultUrl?: string;
 	/**
@@ -786,7 +795,9 @@ export class RouterServer {
 						},
 					}
 				: {}),
-			filePath: join(dirname(this.config.dbPath), "repositories.json"),
+			filePath:
+				containers.repositoriesPath ??
+				join(dirname(this.config.dbPath), "repositories.json"),
 		});
 		this.repositoryRegistry = repositoryRegistry;
 
