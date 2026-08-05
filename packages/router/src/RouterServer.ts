@@ -37,6 +37,7 @@ import {
 	type RepositoryRegistry,
 	seedRepositoryRegistry,
 } from "./RepositoryRegistry.js";
+import { RepositoryResolver } from "./RepositoryResolver.js";
 import { RouterStore } from "./RouterStore.js";
 import {
 	DEFAULT_REQUIRED_SECRET_KEYS,
@@ -433,6 +434,8 @@ export class RouterServer {
 			this.logger.info(`Per-user secret backend: ${this.secretBackendKind}`);
 		}
 
+		const repositoryResolver = built?.repositoryResolver;
+
 		this.eventRouter = new EventRouter({
 			store: this.store,
 			gateway: this.gateway,
@@ -450,6 +453,23 @@ export class RouterServer {
 					config.containers?.affinityGraceMs ?? DEFAULT_AFFINITY_GRACE_MS,
 			},
 			logger: this.logger,
+			...(repositoryResolver
+				? {
+						repositoryResolver,
+						postRepositorySelection: (
+							workspaceId: string,
+							sessionId: string,
+							body: string,
+							options: string[],
+						) =>
+							this.executor.postRepositorySelection(
+								workspaceId,
+								sessionId,
+								body,
+								options,
+							),
+					}
+				: {}),
 		});
 
 		registerEnrollmentRoute(
@@ -714,6 +734,7 @@ export class RouterServer {
 				service: ContainerTargetService;
 				secrets: SecretStoreBackend;
 				kind: "file" | "keyvault" | "table";
+				repositoryResolver: RepositoryResolver;
 		  }
 		| undefined {
 		if (!containers) return undefined;
@@ -819,14 +840,27 @@ export class RouterServer {
 			store: this.store,
 			secrets,
 			executors,
+			registry: repositoryRegistry,
 			containersConfig: {
 				routerUrlForContainers: containers.routerUrlForContainers,
-				repositories: containers.repositories,
 				requiredSecretKeys: containers.requiredSecretKeys,
 				defaultExecutor: containers.defaultExecutor,
 			},
 			postActivity: (workspaceId, agentSessionId, body) =>
 				this.executor.postActivity(workspaceId, agentSessionId, body),
+			logger: this.logger,
+		});
+
+		// Router-side repository pre-selection (Task 9/10) covers container
+		// targets only (design doc §5): a physical-device user's own EdgeWorker
+		// already runs its own `RepositoryRouter` and pending-selection flow, so
+		// this must never be wired for a deployment with no `containers` block —
+		// returning it only from this containers-gated method is what guarantees
+		// that.
+		const repositoryResolver = new RepositoryResolver({
+			registry: repositoryRegistry,
+			fetchIssueFacts: (workspaceId, issueId) =>
+				this.executor.fetchIssueFacts(workspaceId, issueId),
 			logger: this.logger,
 		});
 
@@ -869,7 +903,7 @@ export class RouterServer {
 			this.terminalTeardown,
 		);
 
-		return { service: containerTargets, secrets, kind };
+		return { service: containerTargets, secrets, kind, repositoryResolver };
 	}
 
 	/**

@@ -1,5 +1,9 @@
 import type { ExecutorRegistry } from "cyrus-router-executors";
 import { containerBootFailedMessage } from "./messages.js";
+import type {
+	RegisteredRepository,
+	RepositoryRegistry,
+} from "./RepositoryRegistry.js";
 import type { RouterStore } from "./RouterStore.js";
 import {
 	DEFAULT_REQUIRED_SECRET_KEYS,
@@ -65,14 +69,14 @@ export interface ContainerRoutingDeps {
 	store: RouterStore;
 	secrets: SecretStoreBackend;
 	executors: ExecutorRegistry; // Map<providerName, ContainerExecutor>
+	/**
+	 * The live repository registry. Read per boot rather than captured at
+	 * construction, so a repository added in the setup UI is visible to the very
+	 * next container without restarting the router.
+	 */
+	registry: RepositoryRegistry;
 	containersConfig: {
 		routerUrlForContainers: string;
-		repositories: Array<{
-			name: string;
-			githubSlug: string; // "owner/repo"
-			linearWorkspaceId: string;
-			baseBranch?: string;
-		}>;
 		/**
 		 * Extra env-var names a user MUST have stored before any container
 		 * boots for them. The Claude token is always required on top of these
@@ -482,7 +486,7 @@ export class ContainerTargetService {
 		const env: Record<string, string> = {
 			CYRUS_ROUTER_URL: this.deps.containersConfig.routerUrlForContainers,
 			CYRUS_ISSUE_KEY: issueKey,
-			CYRUS_REPOS_JSON: JSON.stringify(this.deps.containersConfig.repositories),
+			CYRUS_REPOS_JSON: JSON.stringify(await this.reposForIssue(issueKey)),
 		};
 		// Spread the user's map, skipping reserved keys. `set` already rejects
 		// them; this is belt-and-braces against a hand-edited secrets file.
@@ -497,6 +501,64 @@ export class ContainerTargetService {
 			env[key] = value;
 		}
 		return env;
+	}
+
+	/**
+	 * The repositories THIS issue's sandbox should clone.
+	 *
+	 * The router decided this before the container existed and persisted it, so
+	 * a container destroyed and recreated clones the same repository rather than
+	 * silently switching. A missing decision — the router restarted and lost
+	 * SQLite between Blob backups — degrades to the configured default rather
+	 * than to "clone everything", which is what the pre-registry code did and
+	 * what made a multi-repository deployment unusable.
+	 */
+	private async reposForIssue(
+		issueKey: string,
+	): Promise<RegisteredRepository[]> {
+		const { repositories } = await this.deps.registry.list();
+		const byName = new Map(repositories.map((repo) => [repo.name, repo]));
+		const decision = this.deps.store.getIssueRepositories(issueKey);
+
+		let chosen: RegisteredRepository[];
+		if (decision) {
+			const missing: string[] = [];
+			chosen = [];
+			for (const name of decision.repoNames) {
+				const repo = byName.get(name);
+				if (repo) chosen.push(repo);
+				else missing.push(name);
+			}
+			if (missing.length > 0) {
+				this.deps.logger.warn(
+					`Issue ${issueKey} was routed to [${missing.join(", ")}], which ${
+						missing.length === 1 ? "is" : "are"
+					} no longer registered; booting without ${missing.length === 1 ? "it" : "them"}`,
+				);
+			}
+			// A `#branch` override from a description tag is applied here rather
+			// than stored on the registry entry, which is shared by every issue.
+			chosen = chosen.map((repo) => {
+				const override = decision.baseBranchOverrides[repo.name];
+				return override ? { ...repo, baseBranch: override } : repo;
+			});
+		} else {
+			chosen = [];
+		}
+
+		if (chosen.length > 0) return chosen;
+
+		const fallback =
+			repositories.find((repo) => repo.isDefault === true) ?? repositories[0];
+		if (!fallback) {
+			throw new Error(
+				`No repositories are registered, so there is nothing to clone for ${issueKey}. Add one at /setup/repositories.`,
+			);
+		}
+		this.deps.logger.warn(
+			`No stored repository decision for ${issueKey}; falling back to ${fallback.name}`,
+		);
+		return [fallback];
 	}
 
 	private emailFor(userId: number): string {

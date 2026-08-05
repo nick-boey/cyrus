@@ -364,6 +364,10 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 					githubSlug: "ceedaragents/cyrus",
 					linearWorkspaceId: WORKSPACE,
 					baseBranch: "main",
+					// The registry-backed resolver (Task 9/10/11) needs a default to
+					// route unambiguously; this suite's fake tracker/webhooks carry
+					// no team/project facts that could otherwise match it.
+					isDefault: true,
 				},
 			],
 			secretsPath,

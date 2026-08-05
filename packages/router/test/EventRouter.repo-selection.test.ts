@@ -567,9 +567,15 @@ describe("EventRouter repository selection", () => {
 			store,
 			secrets,
 			executors: new Map([["aca", fakeExecutor("aca")]]),
+			// A separate stub from `registry` above: this file only exercises
+			// EventRouter's repository-selection gate (via `resolver`), never
+			// `ContainerTargets.buildEnv`/boot, so this registry is never read.
+			registry: {
+				list: vi.fn(async () => ({ repositories })),
+				put: vi.fn(async () => ({ version: "1" })),
+			},
 			containersConfig: {
 				routerUrlForContainers: "wss://router.example.com",
-				repositories: [],
 			},
 			postActivity: async () => {},
 			logger: { info: vi.fn(), warn: vi.fn() },

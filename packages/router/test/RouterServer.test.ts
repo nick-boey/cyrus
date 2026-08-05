@@ -446,6 +446,10 @@ describe("RouterServer containers wiring", () => {
 				name: "cyrus",
 				githubSlug: "ceedaragents/cyrus",
 				linearWorkspaceId: "ws-1",
+				// The registry-backed resolver (Task 9/10/11) needs a default to
+				// route unambiguously; these tests' webhooks carry no team/project
+				// facts that could otherwise match it.
+				isDefault: true,
 			},
 		],
 		// `dbPath` below is ":memory:", whose `dirname` is ".". Without this
@@ -505,6 +509,19 @@ describe("RouterServer containers wiring", () => {
 			"docker-user@example.com",
 			'{"type":"docker"}',
 		);
+
+		// `seedRepositoryRegistry` runs fire-and-forget from the constructor (by
+		// design — see RouterServer's containers wiring), so a `route()` fired
+		// immediately after construction (this test never calls `start()`, which
+		// is what gives seeding a chance to complete in a real boot) can race
+		// ahead of it and see an empty registry. Wait for the seed to land
+		// before routing, mirroring the gap `start()` naturally papers over.
+		await vi.waitFor(async () => {
+			const { repositories } = (await server.repositoryRegistry?.list()) ?? {
+				repositories: [],
+			};
+			expect(repositories.length).toBeGreaterThan(0);
+		});
 
 		await server.eventRouter.route(
 			createdEvent({
