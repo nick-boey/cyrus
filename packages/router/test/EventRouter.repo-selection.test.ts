@@ -5,7 +5,11 @@ import type {
 } from "cyrus-router-executors";
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { ContainerTargetService } from "../src/ContainerTargets.js";
-import { EventRouter } from "../src/EventRouter.js";
+import { EventRouter, type EventRouterOptions } from "../src/EventRouter.js";
+import {
+	PROMPT_REJECTION_MESSAGE,
+	REPOSITORY_SELECTION_EXPIRED_MESSAGE,
+} from "../src/messages.js";
 import type { RegisteredRepository } from "../src/RepositoryRegistry.js";
 import { RepositoryResolver } from "../src/RepositoryResolver.js";
 import { RouterStore } from "../src/RouterStore.js";
@@ -68,11 +72,24 @@ function createdEvent(opts: {
 	} as unknown as AgentEvent;
 }
 
-/** Minimal object that satisfies isAgentSessionPromptedWebhook, carrying a body. */
+/**
+ * Minimal object that satisfies isAgentSessionPromptedWebhook, carrying a body.
+ * Mirrors the sibling `EventRouter.test.ts`'s `promptedEvent` shape (issue/
+ * issueId included, so it resolves via `ensureDevice` like a real prompt would)
+ * plus what this file additionally needs: a body, an optional `signal`, and an
+ * `actorId` distinct from the session's creator (real Linear webhooks always
+ * carry the ORIGINAL creator on `agentSession.creator`, regardless of who is
+ * actually sending this particular activity).
+ */
 function promptedEvent(opts: {
 	sessionId: string;
 	body: string;
 	creator?: Creator;
+	/** `agentActivity.userId` — who is actually sending this. Defaults to `creator.id`. */
+	actorId?: string;
+	signal?: string;
+	issueId?: string;
+	identifier?: string;
 	organizationId?: string;
 }): AgentEvent {
 	const org = opts.organizationId ?? "ws-1";
@@ -82,12 +99,17 @@ function promptedEvent(opts: {
 		organizationId: org,
 		agentActivity: {
 			id: "act-1",
-			userId: opts.creator?.id,
+			userId: opts.actorId ?? opts.creator?.id,
 			content: { body: opts.body },
+			...(opts.signal ? { signal: opts.signal } : {}),
 		},
 		agentSession: {
 			id: opts.sessionId,
 			organizationId: org,
+			issueId: opts.issueId,
+			issue: opts.issueId
+				? { id: opts.issueId, identifier: opts.identifier }
+				: undefined,
 			creator: opts.creator,
 		},
 	} as unknown as AgentEvent;
@@ -348,20 +370,179 @@ describe("EventRouter repository selection", () => {
 		]);
 	});
 
-	it("expires an unanswered pending selection past the event TTL", async () => {
-		const { router, created } = harness([API, WEB], { teamKey: "NOR" });
+	it("expires an unanswered pending selection past the event TTL, posting an expiry notice", async () => {
+		const { router, created, postActivity } = harness([API, WEB], {
+			teamKey: "NOR",
+		});
 		await router.route(created);
 		expect(store.getPendingRepoSelection("sess-1")).toBeDefined();
+		postActivity.mockClear();
 
 		clock.value = 1000 + 60_000 + 1;
 		await router.sweepExpired();
 
 		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+		// Mirrors pass 1's existing expiry notice (`expiredMessage`) instead of
+		// silently discarding a held delegation nobody ever answered.
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			REPOSITORY_SELECTION_EXPIRED_MESSAGE,
+		);
+	});
+
+	it("does not fall through to routing when a corrupt-row replay lands back in a held state", async () => {
+		// Regression for a review finding: unlike the "recovers instead of
+		// losing..." test above (which narrows the registry to one repo so the
+		// replay resolves outright), this one leaves the registry AMBIGUOUS, so
+		// `routeCreated(held)` re-ties and re-holds. The current prompt must be
+		// consumed rather than falling through to normal routing -- which would
+		// otherwise resolve a target and boot a container while a FRESH
+		// elicitation is sitting unanswered.
+		const { router, created, prompted } = harness([API, WEB], {
+			teamKey: "NOR",
+		});
+		await router.route(created);
+		postRepositorySelection.mockClear();
+
+		store
+			.rawDbForTests()
+			.prepare(
+				"UPDATE pending_repo_selections SET options_json = ? WHERE agent_session_id = ?",
+			)
+			.run("not-json", "sess-1");
+		expect(store.getPendingRepoSelection("sess-1")?.options).toEqual([]);
+
+		await router.route(prompted("cyrus-web"));
+
+		// A fresh elicitation was posted for the re-tied selection...
+		expect(postRepositorySelection).toHaveBeenCalledTimes(1);
+		expect(store.getPendingRepoSelection("sess-1")).toMatchObject({
+			issueKey: "NOR-1",
+			options: ["cyrus-api", "cyrus-web"],
+		});
+		// ...and nothing was delivered or minted while it sits unanswered.
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+		expect(store.getContainerDeviceForIssue("NOR-1")).toBeUndefined();
+		expect(enqueued).toEqual([]);
+	});
+
+	it("creator-only prompting: the creator's own answer still resolves the selection", async () => {
+		const { router, created, prompted } = harness(
+			[API, WEB],
+			{ teamKey: "NOR" },
+			{ creatorOnlyPrompting: true },
+		);
+		await router.route(created);
+
+		await router.route(prompted("cyrus-web", { actorId: ALICE.id }));
+
+		expect(store.getIssueRepositories("NOR-1")).toMatchObject({
+			repoNames: ["cyrus-web"],
+			method: "user-selected",
+		});
+		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+		expect(enqueued).toHaveLength(1);
+	});
+
+	it("creator-only prompting: a non-creator's answer is rejected, leaving the pending selection intact and minting no device", async () => {
+		const { router, created, prompted, postActivity } = harness(
+			[API, WEB],
+			{ teamKey: "NOR" },
+			{ creatorOnlyPrompting: true },
+		);
+		await router.route(created);
+		postActivity.mockClear();
+
+		await router.route(prompted("cyrus-web", { actorId: "user-bob" }));
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			PROMPT_REJECTION_MESSAGE,
+		);
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+		expect(store.getPendingRepoSelection("sess-1")).toMatchObject({
+			issueKey: "NOR-1",
+			options: ["cyrus-api", "cyrus-web"],
+		});
+		expect(store.getContainerDeviceForIssue("NOR-1")).toBeUndefined();
+		expect(enqueued).toEqual([]);
+	});
+
+	it("abandons a pending selection on a stop signal instead of booting the session it would have started", async () => {
+		const { router, created, prompted } = harness([API, WEB], {
+			teamKey: "NOR",
+		});
+		await router.route(created);
+
+		await router.route(prompted("stop", { signal: "stop" }));
+
+		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+		expect(store.getContainerDeviceForIssue("NOR-1")).toBeUndefined();
+		expect(enqueued).toEqual([]);
+	});
+
+	it("abandons a pending selection on a stop-shaped body even without an explicit signal", async () => {
+		// The device itself treats a literal "stop"/"stop working" body the same
+		// as a signal (EdgeWorker's `isTextStopRequest`); the router must too.
+		const { router, created, prompted } = harness([API, WEB], {
+			teamKey: "NOR",
+		});
+		await router.route(created);
+
+		await router.route(prompted("stop working"));
+
+		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+		expect(enqueued).toEqual([]);
+	});
+
+	it("persists a fallback decision and proceeds to route when no elicitation transport is configured", async () => {
+		const { router, created } = harness(
+			[API, WEB],
+			{ teamKey: "NOR" },
+			{ omitPostRepositorySelection: true },
+		);
+		await router.route(created);
+
+		expect(store.getIssueRepositories("NOR-1")).toMatchObject({
+			repoNames: ["cyrus-api"],
+			method: "fallback-first",
+		});
+		expect(enqueued).toHaveLength(1);
+		expect(postRepositorySelection).not.toHaveBeenCalled();
+	});
+
+	it("persists a fallback decision and proceeds to route when posting the elicitation throws", async () => {
+		const { router, created } = harness(
+			[API, WEB],
+			{ teamKey: "NOR" },
+			{
+				postRepositorySelectionImpl: async () => {
+					throw new Error("Linear 5xx");
+				},
+			},
+		);
+		await router.route(created);
+
+		expect(store.getIssueRepositories("NOR-1")).toMatchObject({
+			repoNames: ["cyrus-api"],
+			method: "fallback-first",
+		});
+		expect(enqueued).toHaveLength(1);
 	});
 
 	function harness(
 		repositories: RegisteredRepository[],
 		facts: Record<string, unknown> | undefined,
+		opts?: {
+			creatorOnlyPrompting?: boolean;
+			/** Omit `postRepositorySelection` entirely (no elicitation transport configured). */
+			omitPostRepositorySelection?: boolean;
+			/** Override the default resolved-void mock (e.g. to make it throw). */
+			postRepositorySelectionImpl?: EventRouterOptions["postRepositorySelection"];
+		},
 	) {
 		store.addUser({ email: "alice@example.com" });
 		store.setUserExecutor("alice@example.com", JSON.stringify({ type: "aca" }));
@@ -394,6 +575,10 @@ describe("EventRouter repository selection", () => {
 			logger: { info: vi.fn(), warn: vi.fn() },
 		});
 
+		if (opts?.postRepositorySelectionImpl) {
+			postRepositorySelection = vi.fn(opts.postRepositorySelectionImpl);
+		}
+
 		const postActivity = vi.fn(async () => {});
 		const router = new EventRouter({
 			store,
@@ -401,11 +586,11 @@ describe("EventRouter repository selection", () => {
 			postActivity,
 			containerTargets,
 			repositoryResolver: resolver,
-			postRepositorySelection,
+			...(opts?.omitPostRepositorySelection ? {} : { postRepositorySelection }),
 			config: {
 				eventTtlMs: 60_000,
 				issueLock: false,
-				creatorOnlyPrompting: false,
+				creatorOnlyPrompting: opts?.creatorOnlyPrompting ?? false,
 				affinityGraceMs: 600_000,
 			},
 			logger: { info: vi.fn(), warn: vi.fn() },
@@ -424,8 +609,19 @@ describe("EventRouter repository selection", () => {
 			identifier: "NOR-1",
 			creator: ALICE,
 		});
-		const prompted = (body: string) =>
-			promptedEvent({ sessionId: "sess-1", body, creator: ALICE });
+		const prompted = (
+			body: string,
+			promptOpts?: { actorId?: string; signal?: string },
+		) =>
+			promptedEvent({
+				sessionId: "sess-1",
+				body,
+				creator: ALICE,
+				issueId: "issue-1",
+				identifier: "NOR-1",
+				actorId: promptOpts?.actorId,
+				signal: promptOpts?.signal,
+			});
 
 		return { router, created, prompted, postActivity, resolveSpy };
 	}

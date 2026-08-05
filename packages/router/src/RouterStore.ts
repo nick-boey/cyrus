@@ -1635,11 +1635,37 @@ export class RouterStore {
 			.run(agentSessionId);
 	}
 
-	/** Drops selections created before `cutoffMs`. Returns how many were removed. */
-	sweepPendingRepoSelections(cutoffMs: number): number {
-		return this.db
-			.prepare("DELETE FROM pending_repo_selections WHERE created_ms < ?")
-			.run(cutoffMs).changes;
+	/**
+	 * Drops selections created before `cutoffMs`, returning the identity of each
+	 * one removed (not just a count): `EventRouter.sweepExpired` needs
+	 * `workspaceId`/`agentSessionId` to post an expiry notice per swept row,
+	 * mirroring how its queued-event expiry pass already does for pass 1. Select
+	 * then delete in one transaction so nothing can be enqueued against a row
+	 * between the two halves.
+	 */
+	sweepPendingRepoSelections(
+		cutoffMs: number,
+	): Array<{ agentSessionId: string; workspaceId: string; issueKey: string }> {
+		const txn = this.db.transaction(() => {
+			const rows = this.db
+				.prepare(
+					"SELECT agent_session_id, workspace_id, issue_key FROM pending_repo_selections WHERE created_ms < ?",
+				)
+				.all(cutoffMs) as Array<{
+				agent_session_id: string;
+				workspace_id: string;
+				issue_key: string;
+			}>;
+			this.db
+				.prepare("DELETE FROM pending_repo_selections WHERE created_ms < ?")
+				.run(cutoffMs);
+			return rows.map((row) => ({
+				agentSessionId: row.agent_session_id,
+				workspaceId: row.workspace_id,
+				issueKey: row.issue_key,
+			}));
+		});
+		return txn();
 	}
 
 	/** Test-only escape hatch for simulating hand-edited rows. */

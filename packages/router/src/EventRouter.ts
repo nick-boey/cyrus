@@ -25,6 +25,7 @@ import {
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
 	PROMPT_UNROUTABLE_MESSAGE,
+	REPOSITORY_SELECTION_EXPIRED_MESSAGE,
 	REPOSITORY_SELECTION_PROMPT,
 	UNENROLLED_CREATOR_MESSAGE,
 } from "./messages.js";
@@ -655,13 +656,24 @@ export class EventRouter {
 		}
 
 		// 4. A selection nobody ever answered. `eventTtlMs` is the right bound: it
-		// is already how long a queued event may wait for its device.
-		const removed = this.store.sweepPendingRepoSelections(
+		// is already how long a queued event may wait for its device. Pass 1
+		// above already tells the user when their queued event expires
+		// (`expiredMessage`); mirror that here so an abandoned repository
+		// question doesn't just vanish silently — a user answering days later
+		// would otherwise have their reply delivered as an ordinary prompt to a
+		// session that was never created. The row's own workspace/session ids
+		// are used rather than `sessionWorkspace` (that map is only populated
+		// once a session reaches affinity, which a held session never has).
+		for (const row of this.store.sweepPendingRepoSelections(
 			now - this.config.eventTtlMs,
-		);
-		if (removed > 0) {
+		)) {
+			await this.postActivity(
+				row.workspaceId,
+				row.agentSessionId,
+				REPOSITORY_SELECTION_EXPIRED_MESSAGE,
+			);
 			this.logger.info(
-				`Swept ${removed} unanswered repository selection(s) older than the event TTL`,
+				`Swept an unanswered repository selection for issue ${row.issueKey} (session ${row.agentSessionId}); posted an expiry notice`,
 			);
 		}
 	}
@@ -795,6 +807,17 @@ export class EventRouter {
 		// device exists. `extractIssueKey` is the same gate the container path
 		// uses; without a key there is no per-issue sandbox to route to and the
 		// existing invalid-key handling below reports it.
+		//
+		// This deliberately runs BEFORE routability is known at all: an
+		// unenrolled creator's issue gets asked "which repository?" before
+		// `resolveTargetOrInvalidKey` below would ever discover there's no
+		// device to route to and post `UNENROLLED_CREATOR_MESSAGE` instead. Do
+		// not "fix" this by moving the gate after target resolution — the whole
+		// point of asking here is to do it before ANY container-related work,
+		// and target resolution is downstream of that. An unenrolled creator
+		// answering the elicitation is harmless: `resumeHeldSelection`'s replay
+		// re-runs this same gate and then hits the identical unenrolled-creator
+		// path it would have hit originally.
 		const issueKey = extractIssueKey(webhook);
 		if (issueKey !== undefined && this.repositoryResolver) {
 			const gate = await this.ensureRepositoryDecision(
@@ -931,6 +954,66 @@ export class EventRouter {
 		const pending = this.store.getPendingRepoSelection(sessionId);
 		if (!pending) return false;
 
+		// Creator-only prompting MUST gate here, before this method does
+		// anything else — not only after, the way `routePrompted`'s own
+		// creator check runs today. Acting first (persisting a decision,
+		// replaying the held delegation, and booting a container) cannot be
+		// undone by a rejection that only fires afterward; by then a real
+		// session is already running on the CREATOR's device, started by
+		// someone else's message. This deviates from the brief's literal
+		// "first statement of routePrompted" ordering deliberately: the
+		// creator-only invariant wins. `agentSession.creator` is used (not the
+		// stored session-affinity creator `routePrompted` normally compares
+		// against) because a held session has never had affinity established —
+		// there is nothing stored yet to compare against — and
+		// `agentSession.creator` is always the session's ORIGINAL creator
+		// regardless of who is prompting now, exactly as `routePrompted`'s own
+		// comment on this documents. Answering is refused outright (rather than
+		// falling through to `routePrompted`'s normal target resolution, which
+		// would run first and could mint a container device as a side effect of
+		// `ensureDevice` even though the prompt is rejected a few lines later);
+		// the pending row is left completely untouched so the real creator can
+		// still answer it.
+		if (this.config.creatorOnlyPrompting) {
+			const creatorId = webhook.agentSession.creator?.id;
+			const actorId = webhook.agentActivity?.userId ?? undefined;
+			if (
+				creatorId !== undefined &&
+				(actorId === undefined || actorId !== creatorId)
+			) {
+				await this.postActivity(
+					webhook.organizationId,
+					sessionId,
+					PROMPT_REJECTION_MESSAGE,
+				);
+				this.logger.info(
+					`Rejected a non-creator's answer to the repository selection for session ${sessionId} (actor ${actorId ?? "unknown"} != creator ${creatorId}); the pending selection is untouched`,
+				);
+				return true;
+			}
+			// else: creatorId is unknown (no creator on the webhook at all) —
+			// nothing to compare against, so fall through exactly as
+			// `routePrompted`'s own gate does in that case.
+		}
+
+		// A stop signal (or the literal "stop"-shaped body the device itself
+		// treats the same way — see EdgeWorker's `isTextStopRequest` and
+		// packages/CLAUDE.md's "checked FIRST, before any routing work") means
+		// the user wants to abandon this delegation, not answer it. Nothing has
+		// booted yet — that is the entire point of holding — so there is no
+		// running session to stop. Treat it purely as an abandonment: drop the
+		// pending selection and boot nothing, rather than falling through to
+		// the unrelated-reply fallback below, which would persist a decision,
+		// replay the held `created` event, boot a container, and only then
+		// deliver a stop to a session that had just started.
+		if (isStopRequest(webhook)) {
+			this.store.deletePendingRepoSelection(sessionId);
+			this.logger.info(
+				`Session ${sessionId} was stopped while its repository selection was pending; abandoned the selection without booting`,
+			);
+			return true;
+		}
+
 		if (pending.options.length === 0) {
 			// `RouterStore.getPendingRepoSelection` degrades a corrupt
 			// `options_json` to an empty array rather than throwing — a real,
@@ -940,7 +1023,12 @@ export class EventRouter {
 			// creation gate (which re-resolves, or re-asks, from the live
 			// registry) instead of silently discarding the delegation. Losing
 			// the held event here would strand the issue with no way back,
-			// which is worse than re-asking once more.
+			// which is worse than re-asking once more. The stale row is deleted
+			// BEFORE the replay (unlike the normal path below) because
+			// `ensureRepositoryDecision` treats an existing pending row as "already
+			// asked, don't re-resolve" — leaving this corrupt one in place would
+			// make the replay a no-op and the issue would stay stuck behind it
+			// forever.
 			this.store.deletePendingRepoSelection(sessionId);
 			this.logger.warn(
 				`Pending repository selection for ${pending.issueKey} has no readable options (corrupt row); replaying the held event through normal resolution instead of guessing`,
@@ -953,7 +1041,23 @@ export class EventRouter {
 					`Held created event for ${pending.issueKey} is ALSO unreadable: ${String(error)}; the delegation for this issue is lost`,
 				);
 			}
-			if (held) await this.routeCreated(held);
+			if (held) {
+				await this.routeCreated(held);
+				// The replay may have landed back in a held state itself — tied
+				// again into a fresh elicitation, or blocked because nothing is
+				// registered for the workspace. Either way this session is STILL
+				// waiting on a repository choice, so the current prompt must not
+				// fall through to normal routing: that would resolve a target and
+				// boot a container while the question is still open, delivering a
+				// stale prompt to a sandbox that only just started (and, for a
+				// re-tied selection, would leave the user staring at a duplicate
+				// "which repository?" prompt on top of an already-running
+				// container). Consume it here instead.
+				const stillUnresolved =
+					this.store.getPendingRepoSelection(sessionId) !== undefined ||
+					this.store.getIssueRepositories(pending.issueKey) === undefined;
+				if (stillUnresolved) return true;
+			}
 			return false;
 		}
 
@@ -985,9 +1089,13 @@ export class EventRouter {
 		const selected = resolver.selectByOptionValue(body, offered);
 		const decision = selected ?? resolver.fallbackDecision(offered);
 
-		this.store.deletePendingRepoSelection(sessionId);
-
 		if (!decision) {
+			// Defensively unreachable: `offered` is guaranteed non-empty here
+			// (built from `pending.options`, already known non-empty above), so
+			// `fallbackDecision` can never return undefined. Kept anyway per this
+			// file's existing defensive style — and still cleans up the row
+			// rather than looping forever on something nothing can resolve.
+			this.store.deletePendingRepoSelection(sessionId);
 			this.logger.warn(
 				`Pending repository selection for ${pending.issueKey} could not be resolved; dropping it`,
 			);
@@ -1006,6 +1114,13 @@ export class EventRouter {
 			);
 		}
 		if (held) await this.routeCreated(held);
+
+		// Cleared only now, after the replay has actually gone through: if
+		// `routeCreated` threw, keeping the row (the decision persisted above is
+		// idempotent to re-derive) means a retry can still recover the held
+		// delegation instead of losing it — and the record that this was ever
+		// asked — with nothing left pointing back at it.
+		this.store.deletePendingRepoSelection(sessionId);
 
 		if (selected) {
 			this.logger.info(
@@ -1402,6 +1517,24 @@ export class EventRouter {
 		}
 		return undefined;
 	}
+}
+
+/**
+ * Same stop-shaped-body pattern `EdgeWorker.isTextStopRequest` uses on the
+ * device side, so a held session recognizes a stop exactly like a running one
+ * would.
+ */
+const STOP_BODY_RE = /^\s*stop(\s+session|\s+working)?[\s.!?]*$/i;
+
+/**
+ * Whether a `prompted` webhook is a stop request: either Linear's own `signal`
+ * field, or a literal stop-shaped body (the same fallback the device applies —
+ * see `EdgeWorker.handleUserPromptedAgentActivity`).
+ */
+function isStopRequest(webhook: SessionEvent): boolean {
+	if (webhook.agentActivity?.signal === "stop") return true;
+	const body = webhook.agentActivity?.content?.body;
+	return typeof body === "string" && STOP_BODY_RE.test(body);
 }
 
 /**

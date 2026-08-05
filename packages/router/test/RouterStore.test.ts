@@ -976,7 +976,7 @@ describe("pending repository selections", () => {
 		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
 	});
 
-	it("sweeps only selections older than the cutoff", () => {
+	it("sweeps only selections older than the cutoff, returning each swept row's identity", () => {
 		const store = new RouterStore(":memory:");
 		store.createPendingRepoSelection(row);
 		store.createPendingRepoSelection({
@@ -984,7 +984,9 @@ describe("pending repository selections", () => {
 			agentSessionId: "sess-2",
 			createdMs: 5000,
 		});
-		expect(store.sweepPendingRepoSelections(2000)).toBe(1);
+		expect(store.sweepPendingRepoSelections(2000)).toEqual([
+			{ agentSessionId: "sess-1", workspaceId: "ws-1", issueKey: "NOR-1" },
+		]);
 		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
 		expect(store.getPendingRepoSelection("sess-2")).toBeDefined();
 	});
