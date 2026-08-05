@@ -290,11 +290,21 @@ export {
 } from "./PersistenceManager.js";
 // Repository routing — shared by the edge worker and the router so the two
 // can never disagree about which repository an issue belongs to.
-export type { RepositoryAssociations } from "./routing/index.js";
+export type {
+	AmbiguousTier,
+	IssueFacts,
+	MatchResult,
+	RepositoryAssociations,
+	RepoTag,
+	RoutableRepository,
+	RoutingMethod,
+} from "./routing/index.js";
 export {
 	AssociationParseError,
 	formatAssociations,
+	matchRepositories,
 	parseAssociations,
+	parseRepoTags,
 } from "./routing/index.js";
 export { StreamingPrompt } from "./StreamingPrompt.js";
 export type {
