@@ -171,8 +171,9 @@ export class ContainerTargetService {
 			const old = this.deps.executors.get(staleProvider);
 			if (old) {
 				void old.destroy(issueKey).catch((err: unknown) => {
-					this.deps.logger.warn(
-						`destroy of ${staleProvider} container for ${issueKey} failed: ${String(err)}`,
+					this.deps.logger.error(
+						`Destroy of the stale ${staleProvider} container for ${issueKey} failed; it may keep running and accruing cost`,
+						err,
 					);
 				});
 			} else {
@@ -219,7 +220,8 @@ export class ContainerTargetService {
 			return (await executor.status(issueKey)) === "running";
 		} catch (err) {
 			this.deps.logger.warn(
-				`could not read container status for ${issueKey} after joining an in-flight boot: ${String(err)}`,
+				`Could not read container status for ${issueKey} after joining an in-flight boot`,
+				err,
 			);
 			return false;
 		}
@@ -281,8 +283,9 @@ export class ContainerTargetService {
 		notify: { workspaceId: string; sessionId: string },
 	): void {
 		void this.bootStart(deviceId, notify).catch((err: unknown) => {
-			this.deps.logger.warn(
-				`container boot for device ${deviceId} threw unexpectedly: ${String(err)}`,
+			this.deps.logger.error(
+				`Container boot for device ${deviceId} threw unexpectedly`,
+				err,
 			);
 		});
 	}
@@ -294,8 +297,9 @@ export class ContainerTargetService {
 	 */
 	bootForTeardown(deviceId: number): void {
 		void this.bootStart(deviceId).catch((err: unknown) => {
-			this.deps.logger.warn(
-				`terminal-teardown boot for device ${deviceId} threw unexpectedly: ${String(err)}`,
+			this.deps.logger.error(
+				`Terminal-teardown boot for device ${deviceId} threw unexpectedly`,
+				err,
 			);
 		});
 	}
@@ -316,8 +320,9 @@ export class ContainerTargetService {
 		try {
 			device = this.deps.store.getDeviceInfo(deviceId);
 		} catch (err) {
-			this.deps.logger.warn(
-				`failed to load device ${deviceId} info while booting: ${String(err)}`,
+			this.deps.logger.error(
+				`Failed to load device ${deviceId} info while booting`,
+				err,
 			);
 			return;
 		}
@@ -433,8 +438,9 @@ export class ContainerTargetService {
 			);
 			this.bootFailedNotified.delete(issueKey);
 		} catch (err) {
-			this.deps.logger.warn(
-				`container boot failed for ${issueKey}: ${String(err)}`,
+			this.deps.logger.error(
+				`Container boot failed for ${issueKey}`,
+				err,
 			);
 			if (notify && !this.bootFailedNotified.has(issueKey)) {
 				this.bootFailedNotified.add(issueKey);
@@ -454,7 +460,8 @@ export class ContainerTargetService {
 					// an acceptable degradation, an unhandled rejection
 					// crashing the router is not.
 					this.deps.logger.warn(
-						`failed to post boot-failure activity for ${issueKey}: ${String(postErr)}`,
+						`Failed to post the boot-failure activity for ${issueKey}`,
+						postErr,
 					);
 				}
 			}
@@ -549,8 +556,9 @@ export class ContainerTargetService {
 			// this way. Reported with wording distinguishable from "the registry
 			// is empty" below, so an operator sees "retry" rather than "go add a
 			// repository" for what is usually a transient condition.
-			this.deps.logger.warn(
-				`Could not read the repository registry while building the boot env for ${issueKey}: ${String(error)}`,
+			this.deps.logger.error(
+				`Could not read the repository registry while building the boot env for ${issueKey}`,
+				error,
 			);
 			throw new Error(
 				`The repository registry could not be read, so there is nothing to clone for ${issueKey} yet. This is usually transient — the boot will succeed once the registry is reachable again.`,

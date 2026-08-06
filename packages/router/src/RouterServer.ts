@@ -423,6 +423,7 @@ export class RouterServer {
 
 		this.gateway = new DeviceGateway(this.store, {
 			heartbeatMs: config.heartbeatMs,
+			logger: this.logger,
 		});
 
 		const artifactsDir =

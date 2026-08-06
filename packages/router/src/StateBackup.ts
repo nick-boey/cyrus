@@ -92,9 +92,12 @@ export class StateBackup {
 			return "restored";
 		} catch (error) {
 			await rm(tmp, { force: true });
-			throw new Error(
-				`router state restore is corrupt or unreadable: ${String(error)}`,
-			);
+			this.logger.error("Router state restore is corrupt or unreadable", error);
+			// Preserve the cause so the stack of the underlying failure survives
+			// into whatever catches this instead of being flattened to a string.
+			throw new Error("router state restore is corrupt or unreadable", {
+				cause: error,
+			});
 		}
 	}
 
@@ -108,7 +111,7 @@ export class StateBackup {
 	async flush(): Promise<void> {
 		if (this.inFlight) return this.inFlight;
 		this.inFlight = this.upload().catch((error: unknown) => {
-			this.logger.warn(`router state backup failed: ${String(error)}`);
+			this.logger.error("Router state backup failed", error);
 		});
 		try {
 			await this.inFlight;

@@ -147,7 +147,8 @@ export class TerminalTeardown {
 		} catch (error) {
 			// Bookkeeping only: a write failure must never stop a real teardown.
 			this.opts.logger.warn(
-				`Could not persist pending teardown state for ${entry.issueKey}: ${String(error)}`,
+				`Could not persist pending teardown state for ${entry.issueKey}`,
+				error,
 			);
 		}
 	}
@@ -157,7 +158,8 @@ export class TerminalTeardown {
 			this.opts.store.deletePendingTeardown(issueKey);
 		} catch (error) {
 			this.opts.logger.warn(
-				`Could not clear pending teardown state for ${issueKey}: ${String(error)}`,
+				`Could not clear pending teardown state for ${issueKey}`,
+				error,
 			);
 		}
 	}
@@ -212,7 +214,8 @@ export class TerminalTeardown {
 			}
 		} catch (error) {
 			this.opts.logger.warn(
-				`Could not record the teardown callback for ${issueKey}: ${String(error)}`,
+				`Could not record the teardown callback for ${issueKey}`,
+				error,
 			);
 		}
 		await this.complete(issueKey, deviceId, reason);
@@ -285,7 +288,8 @@ export class TerminalTeardown {
 				await this.deleteRetainedBundle(issueKey);
 			} catch (error) {
 				this.opts.logger.warn(
-					`Container for deleted issue ${issueKey} was destroyed, but its artifact bundle could not be removed: ${String(error)}`,
+					`Container for deleted issue ${issueKey} was destroyed, but its artifact bundle could not be removed`,
+					error,
 				);
 			}
 		}
@@ -299,8 +303,9 @@ export class TerminalTeardown {
 		reason: TeardownReason,
 		error: unknown,
 	): void {
-		this.opts.logger.warn(
-			`Terminal teardown destroy failed for ${entry.issueKey} after ${reason}; retaining device row and retrying in ${this.retryMs}ms: ${String(error)}`,
+		this.opts.logger.error(
+			`Terminal teardown destroy failed for ${entry.issueKey} after ${reason}; retaining device row and retrying in ${this.retryMs}ms`,
+			error,
 		);
 		if (this.stopped || this.pending.get(entry.issueKey) !== entry) return;
 		entry.timer = this.schedule(
@@ -315,8 +320,9 @@ export class TerminalTeardown {
 		reason: "grace expiry" | "retry",
 	): void {
 		void this.complete(issueKey, deviceId, reason).catch((error) => {
-			this.opts.logger.warn(
-				`Terminal teardown ${reason} handler failed for ${issueKey}: ${String(error)}`,
+			this.opts.logger.error(
+				`Terminal teardown ${reason} handler failed for ${issueKey}`,
+				error,
 			);
 		});
 	}

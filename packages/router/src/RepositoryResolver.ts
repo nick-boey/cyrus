@@ -69,8 +69,9 @@ export class RepositoryResolver {
 		try {
 			({ repositories } = await this.deps.registry.list());
 		} catch (error) {
-			this.deps.logger.warn(
-				`Could not read the repository registry for Linear workspace ${opts.workspaceId}: ${String(error)}`,
+			this.deps.logger.error(
+				`Could not read the repository registry for Linear workspace ${opts.workspaceId}`,
+				error,
 			);
 			return {
 				kind: "unavailable",

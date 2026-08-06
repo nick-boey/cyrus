@@ -8,6 +8,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { createLogger, type ILogger } from "cyrus-core";
 import {
 	type EventFrame,
 	HEARTBEAT_INTERVAL_MS,
@@ -73,6 +74,12 @@ export interface RouterConnectionOptions {
 	 * "unknown" and skips reconciliation for.
 	 */
 	getActiveSessions?: () => string[];
+	/**
+	 * Where connection lifecycle and durability warnings go. Defaults to a
+	 * "RouterConnection" component logger, which honours CYRUS_LOG_LEVEL and
+	 * CYRUS_LOG_FORMAT like the rest of the system.
+	 */
+	logger?: ILogger;
 }
 
 /**
@@ -200,6 +207,7 @@ export class RouterConnection extends EventEmitter {
 	private readonly rpcTimeoutMs: number;
 	private readonly getActiveSessions: (() => string[]) | undefined;
 	private readonly now: () => number;
+	private readonly logger: ILogger;
 
 	private readonly stateFile: string;
 	private readonly outboundFile: string;
@@ -237,6 +245,7 @@ export class RouterConnection extends EventEmitter {
 		// still drives the watchdog.
 		this.now = opts.now ?? (() => Date.now());
 		this.serverHeartbeatMs = opts.serverHeartbeatMs ?? HEARTBEAT_INTERVAL_MS;
+		this.logger = opts.logger ?? createLogger({ component: "RouterConnection" });
 
 		mkdirSync(opts.stateDir, { recursive: true });
 		this.stateFile = join(opts.stateDir, "router-connection.json");
@@ -505,8 +514,8 @@ export class RouterConnection extends EventEmitter {
 		if (this.stopped || !this._connected) return;
 		const silentMs = this.now() - this.lastServerActivityMs;
 		if (silentMs <= this.livenessTimeoutMs) return;
-		console.warn(
-			`[RouterConnection] no router activity for ${silentMs}ms (> ${this.livenessTimeoutMs}ms, ${MAX_MISSED_HEARTBEATS} heartbeats); terminating the stale socket and reconnecting`,
+		this.logger.warn(
+			`No router activity for ${silentMs}ms (> ${this.livenessTimeoutMs}ms, ${MAX_MISSED_HEARTBEATS} heartbeats); terminating the stale socket and reconnecting`,
 		);
 		this.stopLivenessWatchdog();
 		const ws = this.ws;
@@ -610,8 +619,9 @@ export class RouterConnection extends EventEmitter {
 		if (this.listenerCount("error") > 0) {
 			this.emit("error", error);
 		} else {
-			console.error(
-				`[RouterConnection] fatal (no error listener attached; not reconnecting): ${error.message}`,
+			this.logger.error(
+				"Fatal router connection error (no error listener attached; not reconnecting)",
+				error,
 			);
 		}
 	}
@@ -641,8 +651,8 @@ export class RouterConnection extends EventEmitter {
 			// Zero "event" listeners: do NOT mark processed — leave the entry on
 			// disk so it survives to the next startup/replay rather than being
 			// silently dropped (already acked, so the router won't resend it).
-			console.warn(
-				`[RouterConnection] inbox event seq=${frame.seq} had no consumer; kept on disk for replay`,
+			this.logger.warn(
+				`Inbox event seq=${frame.seq} had no consumer; kept on disk for replay`,
 			);
 		}
 	}
@@ -723,8 +733,8 @@ export class RouterConnection extends EventEmitter {
 			try {
 				this.removeOutboundEntry(entry.mutationId);
 			} catch (err) {
-				console.error(
-					`[RouterConnection] failed to remove replayed outbound entry ${entry.mutationId}:`,
+				this.logger.error(
+					`Failed to remove replayed outbound entry ${entry.mutationId}`,
 					err,
 				);
 			}
@@ -745,8 +755,8 @@ export class RouterConnection extends EventEmitter {
 				// it replays on the next startup rather than being silently dropped
 				// (e.g. the consumer attached its listener a tick late). We do NOT
 				// loop/retry here — the entry simply stays on disk for next time.
-				console.warn(
-					`[RouterConnection] inbox replay for seq=${entry.seq} had no consumer; kept on disk for next replay`,
+				this.logger.warn(
+					`Inbox replay for seq=${entry.seq} had no consumer; kept on disk for next replay`,
 				);
 			}
 		}
@@ -852,8 +862,8 @@ export class RouterConnection extends EventEmitter {
 		try {
 			this.rewriteJsonl(this.sessionStateFile, this.sessionStateEntries);
 		} catch (err) {
-			console.error(
-				`[RouterConnection] failed to compact superseded session_state entries for session ${entry.sessionId}:`,
+			this.logger.error(
+				`Failed to compact superseded session_state entries for session ${entry.sessionId}`,
 				err,
 			);
 		}
@@ -904,8 +914,8 @@ export class RouterConnection extends EventEmitter {
 		} catch (err) {
 			// The entry survives on disk and will replay — stale, but idempotent on
 			// the router. Surface it rather than failing silently.
-			console.error(
-				`[RouterConnection] failed to drop the stale session_state entry for resumed session ${sessionId}:`,
+			this.logger.error(
+				`Failed to drop the stale session_state entry for resumed session ${sessionId}`,
 				err,
 			);
 		}
@@ -923,8 +933,8 @@ export class RouterConnection extends EventEmitter {
 			// A failed rewrite would otherwise leave the entry on disk to be
 			// replayed forever. It is harmless (the release is idempotent), but
 			// surface it rather than failing silently.
-			console.error(
-				`[RouterConnection] failed to remove acked session_state entry ${id}:`,
+			this.logger.error(
+				`Failed to remove acked session_state entry ${id}`,
 				err,
 			);
 		}

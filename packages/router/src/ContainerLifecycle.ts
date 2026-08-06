@@ -147,8 +147,9 @@ export class ContainerLifecycle {
 			// >=15 default) crashes the router process for every teammate, not
 			// just container-executor users. Log and degrade to a no-op tick; the
 			// next interval retries.
-			this.logger.warn(
-				`lifecycle sweep failed to list container devices: ${String(err)}`,
+			this.logger.error(
+				"Lifecycle sweep failed to list container devices; skipping this tick",
+				err,
 			);
 			return;
 		}
@@ -215,8 +216,9 @@ export class ContainerLifecycle {
 					}
 				}
 			} catch (err) {
-				this.logger.warn(
-					`lifecycle sweep failed for ${row.issueKey}: ${String(err)}`,
+				this.logger.error(
+					`Lifecycle sweep failed for ${row.issueKey}`,
+					err,
 				);
 			}
 		}
@@ -244,8 +246,9 @@ export class ContainerLifecycle {
 					}
 				}
 			} catch (err) {
-				this.logger.warn(
-					`orphan GC failed for provider ${provider}: ${String(err)}`,
+				this.logger.error(
+					`Orphan GC failed for provider ${provider}; orphaned containers may keep accruing cost`,
+					err,
 				);
 			}
 		}

@@ -1,5 +1,10 @@
 // apps/f1/src/router/RouterRig.ts
-import { CLIIssueTrackerService, type IIssueTrackerService } from "cyrus-core";
+import {
+	CLIIssueTrackerService,
+	createNoopLogger,
+	type IIssueTrackerService,
+	type ILogger,
+} from "cyrus-core";
 import { RouterServer, SecretStore, type SetupUiConfig } from "cyrus-router";
 import type { ContainerExecutor } from "cyrus-router-executors";
 import { allocatePort } from "./allocatePort.js";
@@ -46,7 +51,8 @@ export interface RouterRigOptions {
 	 * `containers.requiredSecretKeys` on the RouterServer).
 	 */
 	requiredSecretKeys?: string[];
-	logger?: { info(m: string): void; warn(m: string): void };
+	/** Partial so drives can capture just the levels they assert on; the rest no-op. */
+	logger?: Partial<ILogger>;
 	/**
 	 * Overrides the rig's default single hardcoded "cyrus" repository. Lets a
 	 * drive seed a multi-repository registry (e.g. to exercise routing-priority
@@ -79,7 +85,7 @@ export async function createRouterRig(
 	opts: RouterRigOptions,
 ): Promise<RouterRig> {
 	const port = await allocatePort();
-	const logger = opts.logger ?? { info: () => {}, warn: () => {} };
+	const logger: ILogger = { ...createNoopLogger(), ...opts.logger };
 	const tracker = new CLIIssueTrackerService();
 	tracker.seedDefaultData();
 	const secrets = new SecretStore(opts.secretsPath);
