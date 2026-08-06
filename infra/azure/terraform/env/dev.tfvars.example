@@ -7,7 +7,7 @@
 # ---- Project / naming -------------------------------------------------------
 project     = "cyrus"
 environment = "dev"
-# resource_group_name = "rg-cyrus" # Optional exact override.
+# resource_group_name = "<resource-group>" # Optional exact override.
 tags = {
   owner       = "platform"
   cost-center = "research"

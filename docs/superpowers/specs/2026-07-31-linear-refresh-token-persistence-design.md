@@ -13,7 +13,7 @@ stack trace to show for it.
 
 ## Background — the observed failure
 
-Diagnosed on the `dit-development` / `rg-cyrus` deployment on 2026-07-30:
+Diagnosed on the `dit-development` / `<resource-group>` deployment on 2026-07-30:
 
 - Linear access tokens expire in **24 hours**, and Linear **rotates the refresh
   token on every use** — the old one dies immediately (30-minute replay grace for
@@ -188,7 +188,7 @@ remain in the once-only ERROR log.
 ## Infrastructure
 
 **No Terraform change required.** The router's user-assigned identity already
-holds `Key Vault Secrets Officer` on `kv-cyrus-dev` (verified via
+holds `Key Vault Secrets Officer` on `<key-vault-name>` (verified via
 `az role assignment list`), and the new secret is created at runtime so it never
 enters Terraform state — no drift, no `lifecycle.ignore_changes`.
 

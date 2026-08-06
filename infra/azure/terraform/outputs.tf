@@ -3,12 +3,12 @@
 ################################################################################
 
 output "router_fqdn" {
-  description = "Public ingress FQDN of the router Container App (e.g. 'app-cyrus-dev-router.kindocean-<hash>.australiaeast.azurecontainerapps.io'). Use this verbatim in your Linear webhook URL and as the public WSS host."
+  description = "Public ingress FQDN of the router Container App (e.g. '<app-name>.<env-hash>.<region>.azurecontainerapps.io'). Use this verbatim in your Linear webhook URL and as the public WSS host."
   value       = azurerm_container_app.router.ingress[0].fqdn
 }
 
 output "router_app_name" {
-  description = "Name of the router Container App (e.g. 'app-cyrus-dev-router'). Needed by the image-tag reconciliation runbook to read the image the live revision is actually serving (`az containerapp show … --query 'properties.template.containers[0].image'`) and to compare it against `var.router_image`. See README → 'Router image tag policy'."
+  description = "Name of the router Container App (e.g. 'app-<project>-<environment>-router'). Needed by the image-tag reconciliation runbook to read the image the live revision is actually serving (`az containerapp show … --query 'properties.template.containers[0].image'`) and to compare it against `var.router_image`. See README → 'Router image tag policy'."
   value       = azurerm_container_app.router.name
 }
 

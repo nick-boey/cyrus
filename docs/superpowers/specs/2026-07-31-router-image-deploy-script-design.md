@@ -13,7 +13,7 @@ digest out of the build output, pastes it into `dev.tfvars`, and runs
 ## Background — why this exists
 
 On 2026-07-31, immediately after landing the Key Vault token-persistence work,
-`terraform apply` was about to be run against `rg-cyrus` with
+`terraform apply` was about to be run against `<resource-group>` with
 `router_image` still pinned to `sha-0dc73a1` — a 27 July build containing none
 of the new code. The apply would have succeeded, restored Linear via the fresh
 credential, and then re-broken within 24h, burning the newly minted refresh
@@ -55,7 +55,7 @@ not hardcoded to the dev stack:
 
 | Variable | Default |
 | --- | --- |
-| `REGISTRY` | `acrcyrusdev` |
+| `REGISTRY` | `<acr-name>` |
 | `REPO` | `cyrus-router` |
 | `TFVARS` | `infra/azure/terraform/env/dev.tfvars` |
 | `TF_DIR` | `infra/azure/terraform` |
@@ -100,7 +100,7 @@ Flags are limited to `--allow-dirty` and `-h`/`--help`.
 5. **Rewrite `$TFVARS`.** Replace the assignment line with
    `"$REGISTRY.azurecr.io/$REPO@$DIGEST"`, **and** refresh the provenance comment
    above it, which currently reads
-   `# This digest is tagged sha-0dc73a1 in acrcyrusdev.` Leaving that comment
+   `# This digest is tagged sha-0dc73a1 in <acr-name>.` Leaving that comment
    stale would relocate the confusion rather than remove it.
 
    Matching is anchored to avoid collateral edits: the assignment is the line

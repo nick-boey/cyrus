@@ -56,7 +56,7 @@ export function setupPartitionKey(email: string): string {
 }
 
 export interface TableSecretStoreOptions {
-	/** e.g. "https://stcyrusdev.table.core.windows.net" — origin only. */
+	/** e.g. "https://stexample.table.core.windows.net" — origin only. */
 	tableEndpoint: string;
 	/** Default {@link DEFAULT_TABLE_NAME}. */
 	tableName?: string;
