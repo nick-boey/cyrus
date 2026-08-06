@@ -97,6 +97,67 @@ RUN useradd --create-home --uid 1001 cyrus \
 	&& chown -R cyrus:cyrus /workspaces /var/cache/repos \
 	&& printf '#!/bin/sh\nexec node /app/dist/src/app.js "$@"\n' > /usr/local/bin/cyrus \
 	&& chmod +x /usr/local/bin/cyrus
+# Rust toolchain: repos with Cargo crates need `cargo`/`rustc` to build and
+# test. Installed via rustup into shared paths under /usr/local rather than
+# rustup's default ~/.cargo, for the same reason the Fleece CLI is: $HOME is
+# /root at build time and this image runs as the non-root `cyrus` user, which
+# could never reach a /root install. Both trees are chowned to `cyrus` (hence
+# this block sitting after `useradd`) because they are not read-only at
+# runtime — cargo writes the registry index cache, crate downloads, and git
+# checkouts into CARGO_HOME, and rustup writes into RUSTUP_HOME whenever a
+# repo's rust-toolchain.toml pins a toolchain other than the one baked here.
+#
+# build-essential/pkg-config/libssl-dev are not optional extras. rustc shells
+# out to `cc` for the final link step, so without a C toolchain every
+# `cargo build` fails with "linker `cc` not found", and the `-sys` crates that
+# wrap C libraries (openssl-sys and friends) need pkg-config plus headers.
+#
+# rustup-init comes from the unversioned `dist` path (always the current
+# rustup) and is verified against the .sha256 published beside it. We compare
+# the hash field ourselves instead of piping to `sha256sum -c` because
+# rustup's checksum files have not been consistent about their filename
+# column, and `-c` fails on the format it does not expect.
+#
+# The toolchain is `stable` and left unpinned, like the .NET SDK above; build
+# with --build-arg RUST_TOOLCHAIN=1.89.0 for a reproducible pin. `--profile
+# minimal` keeps rust-docs (a few hundred MB of generated HTML no session
+# reads) out of the image; rustfmt and clippy are added back explicitly since
+# `cargo fmt --check` and `cargo clippy` are standard steps in the
+# verification commands Rust repos ship.
+ARG RUST_TOOLCHAIN=stable
+ENV RUSTUP_HOME=/usr/local/rustup \
+	CARGO_HOME=/usr/local/cargo \
+	PATH="/usr/local/cargo/bin:${PATH}"
+RUN set -eu; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends \
+		build-essential \
+		libssl-dev \
+		pkg-config; \
+	rm -rf /var/lib/apt/lists/*; \
+	arch="$(dpkg --print-architecture)"; \
+	case "${arch}" in \
+		amd64) triple='x86_64-unknown-linux-gnu' ;; \
+		arm64) triple='aarch64-unknown-linux-gnu' ;; \
+		*) echo "no rustup-init build for architecture ${arch}" >&2; exit 1 ;; \
+	esac; \
+	base="https://static.rust-lang.org/rustup/dist/${triple}"; \
+	cd /tmp; \
+	curl -fsSLO "${base}/rustup-init"; \
+	expected="$(curl -fsSL "${base}/rustup-init.sha256" | awk '{print $1}')"; \
+	actual="$(sha256sum rustup-init | awk '{print $1}')"; \
+	if [ -z "${expected}" ] || [ "${expected}" != "${actual}" ]; then \
+		echo "rustup-init checksum mismatch: expected '${expected}', got '${actual}'" >&2; \
+		exit 1; \
+	fi; \
+	chmod +x rustup-init; \
+	./rustup-init -y --no-modify-path --profile minimal \
+		--default-toolchain "${RUST_TOOLCHAIN}" \
+		--component rustfmt --component clippy; \
+	rm -f rustup-init; \
+	chown -R cyrus:cyrus "${RUSTUP_HOME}" "${CARGO_HOME}"; \
+	rustc --version; \
+	cargo --version
 # Chromium for Playwright. Baked in rather than fetched on demand: ACA
 # sandboxes run a Deny-by-default egress policy whose allowlist
 # (DEFAULT_EGRESS_HOSTS in cyrus-router-executors) has no Playwright CDN
