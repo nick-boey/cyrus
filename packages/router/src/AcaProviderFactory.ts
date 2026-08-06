@@ -1,3 +1,4 @@
+import type { ILogger } from "cyrus-core";
 import {
 	AcaSandboxClient,
 	AcaSandboxesProvider,
@@ -8,7 +9,7 @@ import type { RouterContainersConfig } from "./RouterServer.js";
 /** Build only the configured ACA provider, without starting a RouterServer. */
 export function createAcaSandboxesProvider(
 	containers: RouterContainersConfig,
-	logger?: { info(msg: string): void; warn(msg: string): void },
+	logger?: ILogger,
 	deviceConnectivity?: (deviceId: string) => {
 		connected: boolean;
 		disconnectedSinceMs: number;

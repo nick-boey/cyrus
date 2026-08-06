@@ -18,6 +18,7 @@ import type {
 } from "../src/RepositoryRegistry.js";
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
+import { testLogger } from "./helpers/logger.js";
 
 /** Minimal fake ContainerExecutor whose ensureRunning/destroy are inspectable mocks. */
 function fakeExecutor(
@@ -86,7 +87,7 @@ describe("ContainerTargetService", () => {
 		secretsFile = freshSecretsPath();
 		secrets = new SecretStore(secretsFile);
 		postActivity = vi.fn(async () => {});
-		logger = { info: vi.fn(), warn: vi.fn() };
+		logger = testLogger();
 	});
 
 	function makeService(
@@ -276,8 +277,9 @@ describe("ContainerTargetService", () => {
 
 		service.bootForTeardown(deviceId);
 		await vi.waitFor(() =>
-			expect(logger.warn).toHaveBeenCalledWith(
-				expect.stringContaining("wake failed"),
+			expect(logger.error).toHaveBeenCalledWith(
+				expect.stringContaining("Container boot failed"),
+				expect.objectContaining({ message: "wake failed" }),
 			),
 		);
 		expect(ensureRunning).toHaveBeenCalledTimes(1);
@@ -702,7 +704,8 @@ describe("ContainerTargetService", () => {
 
 			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(2));
 			expect(logger.warn).toHaveBeenCalledWith(
-				expect.stringContaining("could not read container status"),
+				expect.stringContaining("Could not read container status"),
+				expect.anything(),
 			);
 		});
 	});

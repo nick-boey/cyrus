@@ -14,6 +14,7 @@ import type { RegisteredRepository } from "../src/RepositoryRegistry.js";
 import { RepositoryResolver } from "../src/RepositoryResolver.js";
 import { RouterStore } from "../src/RouterStore.js";
 import type { SecretStoreBackend } from "../src/SecretStore.js";
+import { testLogger } from "./helpers/logger.js";
 
 /**
  * This file follows the conventions established in `EventRouter.test.ts`:
@@ -485,7 +486,7 @@ describe("EventRouter repository selection", () => {
 		const resolver = new RepositoryResolver({
 			registry,
 			fetchIssueFacts: vi.fn(async () => undefined),
-			logger: { info: vi.fn(), warn: vi.fn() },
+			logger: testLogger(),
 		});
 		const postActivity = vi.fn(async () => {});
 		const router = new EventRouter({
@@ -500,7 +501,7 @@ describe("EventRouter repository selection", () => {
 				creatorOnlyPrompting: false,
 				affinityGraceMs: 600_000,
 			},
-			logger: { info: vi.fn(), warn: vi.fn() },
+			logger: testLogger(),
 			now: () => clock.value,
 		});
 		vi.spyOn(store, "enqueueEvent").mockImplementation((_deviceId, payload) => {
@@ -777,7 +778,7 @@ describe("EventRouter repository selection", () => {
 		const resolver = new RepositoryResolver({
 			registry,
 			fetchIssueFacts: vi.fn(async () => facts as never),
-			logger: { info: vi.fn(), warn: vi.fn() },
+			logger: testLogger(),
 		});
 		const resolveSpy = vi.spyOn(resolver, "resolve");
 
@@ -811,7 +812,7 @@ describe("EventRouter repository selection", () => {
 				routerUrlForContainers: "wss://router.example.com",
 			},
 			postActivity: async () => {},
-			logger: { info: vi.fn(), warn: vi.fn() },
+			logger: testLogger(),
 		});
 
 		if (opts?.postRepositorySelectionImpl) {
@@ -832,7 +833,7 @@ describe("EventRouter repository selection", () => {
 				creatorOnlyPrompting: opts?.creatorOnlyPrompting ?? false,
 				affinityGraceMs: 600_000,
 			},
-			logger: { info: vi.fn(), warn: vi.fn() },
+			logger: testLogger(),
 			now: () => clock.value,
 		});
 

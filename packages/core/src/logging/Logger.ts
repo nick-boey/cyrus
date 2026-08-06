@@ -26,6 +26,27 @@ function formatContext(context: LogContext): string {
 	return parts.length > 0 ? ` {${parts.join(", ")}}` : "";
 }
 
+/**
+ * Wire format for a rendered log line.
+ *
+ * - `text` — the human-readable `<ts> [LEVEL] [component] {ctx} message` form.
+ *   This is the default and its output is byte-for-byte unchanged.
+ * - `json` — one JSON object per line, so log aggregators (Azure Log
+ *   Analytics, Loki, …) can index individual fields instead of regexing prose.
+ */
+export type LogFormat = "text" | "json";
+
+function parseFormatFromEnv(): LogFormat | undefined {
+	switch (process.env.CYRUS_LOG_FORMAT?.toLowerCase()) {
+		case "json":
+			return "json";
+		case "text":
+			return "text";
+		default:
+			return undefined;
+	}
+}
+
 function parseLevelFromEnv(): LogLevel | undefined {
 	const envLevel = process.env.CYRUS_LOG_LEVEL?.toUpperCase();
 	switch (envLevel) {
@@ -56,15 +77,27 @@ class Logger implements ILogger {
 	private level: LogLevel;
 	private component: string;
 	private context: LogContext;
+	private format: LogFormat | undefined;
 
 	constructor(options: {
 		component: string;
 		level?: LogLevel;
 		context?: LogContext;
+		format?: LogFormat;
 	}) {
 		this.component = options.component;
 		this.level = options.level ?? parseLevelFromEnv() ?? LogLevel.INFO;
 		this.context = options.context ?? {};
+		this.format = options.format;
+	}
+
+	/**
+	 * Resolved per call rather than cached at construction: several modules
+	 * create their logger at import time, so caching would freeze the format
+	 * before a host (or a test) had a chance to set CYRUS_LOG_FORMAT.
+	 */
+	private resolveFormat(): LogFormat {
+		return this.format ?? parseFormatFromEnv() ?? "text";
 	}
 
 	private formatPrefix(level: LogLevel): string {
@@ -75,9 +108,72 @@ class Logger implements ILogger {
 		return `${timestamp} [${padded}] [${this.component}]${ctx}`;
 	}
 
+	/**
+	 * Render one log line as a single JSON object. Keys are flat and stable so
+	 * they survive Log Analytics' dynamic-column projection: an operator can
+	 * write `where component == "EventRouter" and level == "error"` without
+	 * parsing the message. Trailing args are folded into `args`, and the first
+	 * Error found is hoisted to `error` with its stack intact.
+	 */
+	private formatJson(
+		level: LogLevel,
+		message: string,
+		args: unknown[],
+		extra?: Record<string, unknown>,
+	): string {
+		const record: Record<string, unknown> = {
+			timestamp: new Date().toISOString(),
+			level: LEVEL_LABELS[level].toLowerCase(),
+			component: this.component,
+			message,
+		};
+		if (this.context.sessionId) record.sessionId = this.context.sessionId;
+		if (this.context.platform) record.platform = this.context.platform;
+		if (this.context.issueIdentifier)
+			record.issueIdentifier = this.context.issueIdentifier;
+		if (this.context.repository) record.repository = this.context.repository;
+		if (extra) Object.assign(record, extra);
+
+		const error = extractError(args);
+		if (error) {
+			record.error = {
+				name: error.name,
+				message: error.message,
+				...(error.stack ? { stack: error.stack } : {}),
+			};
+		}
+		const rest = args.filter((arg) => arg !== error);
+		if (rest.length > 0) record.args = rest.map(toJsonSafe);
+
+		return safeStringify(record);
+	}
+
+	/**
+	 * Single console egress for every level. Text output is produced by exactly
+	 * the same expression as before so the default rendering is unchanged.
+	 */
+	private write(
+		level: LogLevel,
+		message: string,
+		args: unknown[],
+		extra?: Record<string, unknown>,
+	): void {
+		const sink =
+			level >= LogLevel.ERROR
+				? console.error
+				: level === LogLevel.WARN
+					? console.warn
+					: console.log;
+		if (this.resolveFormat() === "json") {
+			sink(this.formatJson(level, message, args, extra));
+			return;
+		}
+		sink(`${this.formatPrefix(level)} ${message}`, ...args);
+	}
+
 	debug(message: string, ...args: unknown[]): void {
 		if (this.level <= LogLevel.DEBUG) {
-			console.log(`${this.formatPrefix(LogLevel.DEBUG)} ${message}`, ...args);
+			this.write(LogLevel.DEBUG, message, args);
 		}
 		// debug/info are NOT forwarded to Sentry Logs — they're far too high-volume
 		// to ship unconditionally. Use {@link event} for major lifecycle events
@@ -86,14 +182,14 @@ class Logger implements ILogger {
 
 	info(message: string, ...args: unknown[]): void {
 		if (this.level <= LogLevel.INFO) {
-			console.log(`${this.formatPrefix(LogLevel.INFO)} ${message}`, ...args);
+			this.write(LogLevel.INFO, message, args);
 		}
 		// See debug() — info is local-only. Promote to event() if it must ship.
 	}
 
 	warn(message: string, ...args: unknown[]): void {
 		if (this.level <= LogLevel.WARN) {
-			console.warn(`${this.formatPrefix(LogLevel.WARN)} ${message}`, ...args);
+			this.write(LogLevel.WARN, message, args);
 		}
 		// All WARN logs forward to Sentry Logs unconditionally so operators see
 		// degraded-state signals even when running production at higher local
@@ -103,7 +199,7 @@ class Logger implements ILogger {
 
 	error(message: string, ...args: unknown[]): void {
 		if (this.level <= LogLevel.ERROR) {
-			console.error(`${this.formatPrefix(LogLevel.ERROR)} ${message}`, ...args);
+			this.write(LogLevel.ERROR, message, args);
 		}
 
 		// Forward to the process-wide error reporter so ad-hoc `logger.error(msg, err)`
@@ -118,13 +214,24 @@ class Logger implements ILogger {
 		// Mirror major events to the local console at INFO so operators reading
 		// terminal output see lifecycle transitions without reading Sentry.
 		if (this.level <= LogLevel.INFO) {
-			const suffix =
-				attributes && Object.keys(attributes).length > 0
-					? ` ${JSON.stringify(attributes)}`
-					: "";
-			console.log(
-				`${this.formatPrefix(LogLevel.INFO)} [event:${name}]${suffix}`,
-			);
+			if (this.resolveFormat() === "json") {
+				// Events keep the `event` key rather than burying the name in the
+				// message, so a KQL query can group on it directly.
+				console.log(
+					this.formatJson(LogLevel.INFO, `event:${name}`, [], {
+						event: name,
+						...(attributes ?? {}),
+					}),
+				);
+			} else {
+				const suffix =
+					attributes && Object.keys(attributes).length > 0
+						? ` ${JSON.stringify(attributes)}`
+						: "";
+				console.log(
+					`${this.formatPrefix(LogLevel.INFO)} [event:${name}]${suffix}`,
+				);
+			}
 		}
 		this.forwardEvent(name, attributes);
 	}
@@ -244,6 +351,7 @@ class Logger implements ILogger {
 			component: this.component,
 			level: this.level,
 			context: { ...this.context, ...context },
+			format: this.format,
 		});
 	}
 
@@ -260,8 +368,77 @@ export function createLogger(options: {
 	component: string;
 	level?: LogLevel;
 	context?: LogContext;
+	/** Overrides CYRUS_LOG_FORMAT for this logger. Defaults to the env value. */
+	format?: LogFormat;
 }): ILogger {
 	return new Logger(options);
+}
+
+/**
+ * An {@link ILogger} that discards everything, including the Sentry-forwarding
+ * side effects of warn/error. Use it as the default for an optional `logger`
+ * dependency so call sites can widen to the full interface without every
+ * caller having to construct a real logger.
+ */
+export function createNoopLogger(): ILogger {
+	const noop = (): void => {};
+	const logger: ILogger = {
+		debug: noop,
+		info: noop,
+		warn: noop,
+		error: noop,
+		event: noop,
+		withContext: () => logger,
+		getLevel: () => LogLevel.SILENT,
+		setLevel: noop,
+	};
+	return logger;
+}
+
+/**
+ * Convert an arbitrary log arg into something JSON.stringify won't mangle.
+ * Errors keep their stack, BigInt/undefined/functions degrade to strings, and
+ * everything else passes through for the stringifier to handle.
+ */
+function toJsonSafe(value: unknown): unknown {
+	if (value instanceof Error) {
+		return {
+			name: value.name,
+			message: value.message,
+			...(value.stack ? { stack: value.stack } : {}),
+		};
+	}
+	if (typeof value === "bigint") return value.toString();
+	if (typeof value === "function")
+		return `[Function ${value.name || "anonymous"}]`;
+	if (typeof value === "undefined") return null;
+	return value;
+}
+
+/**
+ * JSON.stringify that cannot throw. A log line must never be the thing that
+ * crashes the process, so circular references collapse to "[Circular]" and a
+ * total failure degrades to a minimal record rather than propagating.
+ */
+function safeStringify(record: Record<string, unknown>): string {
+	const seen = new WeakSet<object>();
+	try {
+		return JSON.stringify(record, (_key, value) => {
+			if (value && typeof value === "object") {
+				if (seen.has(value as object)) return "[Circular]";
+				seen.add(value as object);
+			}
+			return typeof value === "bigint" ? value.toString() : value;
+		});
+	} catch {
+		return JSON.stringify({
+			timestamp: record.timestamp,
+			level: record.level,
+			component: record.component,
+			message: record.message,
+			serializationError: true,
+		});
+	}
 }
 
 /**

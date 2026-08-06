@@ -5,6 +5,7 @@ import type {
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { ContainerLifecycle } from "../src/ContainerLifecycle.js";
 import { RouterStore } from "../src/RouterStore.js";
+import { type TestLogger, testLogger } from "./helpers/logger.js";
 
 /**
  * Fake ContainerExecutor with vi.fn() methods and a scripted `status`. When
@@ -46,12 +47,12 @@ function fakeExecutor(
 
 describe("ContainerLifecycle", () => {
 	let store: RouterStore;
-	let logger: { info: Mock; warn: Mock };
+	let logger: TestLogger;
 	let userId: number;
 
 	beforeEach(() => {
 		store = new RouterStore(":memory:");
-		logger = { info: vi.fn(), warn: vi.fn() };
+		logger = testLogger();
 		({ userId } = store.addUser({ email: "a@example.com" }));
 	});
 
@@ -368,8 +369,8 @@ describe("ContainerLifecycle", () => {
 
 		expect(goodDocker.stop).toHaveBeenCalledWith("CYPACK-GOOD");
 		expect(brokenDocker.stop).not.toHaveBeenCalled();
-		expect(logger.warn).toHaveBeenCalled();
-		expect(String(logger.warn.mock.calls[0]?.[0])).toContain("CYPACK-BROKEN");
+		expect(logger.error).toHaveBeenCalled();
+		expect(String(logger.error.mock.calls[0]?.[0])).toContain("CYPACK-BROKEN");
 		// The broken device's row survives — the error was skipped, not applied.
 		expect(store.getContainerDeviceForIssue("CYPACK-BROKEN")?.deviceId).toBe(
 			brokenDevice.deviceId,
@@ -425,8 +426,11 @@ describe("ContainerLifecycle", () => {
 
 		await expect(lifecycle.sweep()).resolves.toBeUndefined();
 
-		expect(logger.warn).toHaveBeenCalled();
-		expect(String(logger.warn.mock.calls[0]?.[0])).toContain("SQLITE_BUSY");
+		// The cause is now passed through as an Error arg rather than interpolated.
+		expect(logger.error).toHaveBeenCalledWith(
+			expect.stringContaining("failed to list container devices"),
+			expect.objectContaining({ message: "SQLITE_BUSY" }),
+		);
 	});
 
 	it("idle-stops off a stale lastRoutedMs even when lastSeenMs is fresh (idle-stop deliberately ignores lastSeenMs)", async () => {
@@ -513,7 +517,7 @@ describe("ContainerLifecycle", () => {
 		await expect(lifecycle.sweep()).resolves.toBeUndefined();
 
 		expect(goodDocker.destroy).toHaveBeenCalledWith("CYPACK-ORPHAN");
-		expect(logger.warn).toHaveBeenCalled();
+		expect(logger.error).toHaveBeenCalled();
 	});
 
 	// ── affinity reconciliation ────────────────────────────────────────────

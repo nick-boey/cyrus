@@ -226,6 +226,33 @@ runs — branch and `sha-*` tags (amd64 + arm64).
 | `CYRUS_ROUTER_ENTRA_AUDIENCE` | no | — | `entra.audience` Application ID URI (requires tenant) |
 | `CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN` | no | — | `entra.allowedDomain` exact email domain |
 | `CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL` | no | — | `linearTokenStore.keyVaultUrl` — durable store for rotated Linear OAuth tokens |
+| `CYRUS_LOG_LEVEL` | no | `INFO` | not config-backed — `DEBUG`, `INFO`, `WARN`, `ERROR`, or `SILENT` |
+| `CYRUS_LOG_FORMAT` | no | `text` | not config-backed — `json` emits one JSON object per log line for log aggregators |
+
+Set `CYRUS_LOG_FORMAT=json` when the router's stdout is collected by something
+that indexes fields (Azure Log Analytics, Loki, CloudWatch). Each line becomes a
+single object with `timestamp`, `level`, `component`, `message`, any session /
+issue / repository context, and — for a failure — an `error` object carrying the
+original stack:
+
+```json
+{"timestamp":"2026-08-06T04:15:10.398Z","level":"error","component":"ContainerTargets","message":"Container boot failed for NOR-278","error":{"name":"Error","message":"ACA sandbox create timed out","stack":"…"}}
+```
+
+In Log Analytics that makes the console stream queryable by field rather than by
+substring — for example, to see worker liveness for a cloud sandbox (ACA reports
+a sandbox as `Running` even when its entrypoint has exited, so device
+connect/disconnect is the more truthful signal):
+
+```kql
+ContainerAppConsoleLogs_CL
+| extend p = parse_json(Log_s)
+| where p.component == "DeviceGateway"
+| project TimeGenerated, level = tostring(p.level), message = tostring(p.message)
+| order by TimeGenerated desc
+```
+
+Leave it unset for local use; the default human-readable output is unchanged.
 
 On every start, if the required variables are set the entrypoint regenerates
 `/data/router-config.json` from them. With no config variables set, an existing

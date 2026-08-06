@@ -14,6 +14,7 @@ import {
 	registerRepositoryRoutes,
 } from "../src/setup/repositoryRoutes.js";
 import { SetupConflictError } from "../src/TableSecretStore.js";
+import { testLogger } from "./helpers/logger.js";
 
 const ALICE = "alice@example.com";
 const BOB = "bob@example.com";
@@ -69,10 +70,10 @@ function build(registry: RepositoryRegistry, registered = [ALICE]) {
 			secrets: { get: async () => ({}), set: async () => {} } as never,
 			requiredKeys: [],
 			autoProvisionUsers: false,
-			logger: { info: vi.fn(), warn: vi.fn() },
+			logger: testLogger(),
 		}),
 		csrf,
-		logger: { info: vi.fn(), warn: vi.fn() },
+		logger: testLogger(),
 	});
 	openApps.push(fastify);
 	return { fastify, store, csrf };

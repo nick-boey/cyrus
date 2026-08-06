@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { Server as HttpServer } from "node:http";
+import { createNoopLogger, type ILogger } from "cyrus-core";
 import {
 	type DeviceFrame,
 	HEARTBEAT_INTERVAL_MS,
@@ -38,6 +39,7 @@ interface SocketState {
 export class DeviceGateway extends EventEmitter {
 	private readonly store: RouterStore;
 	private readonly heartbeatMs: number;
+	private readonly logger: ILogger;
 	private readonly sockets = new Map<number, WebSocket>();
 	private readonly socketState = new WeakMap<WebSocket, SocketState>();
 	private readonly capabilities = new Map<number, Set<string>>();
@@ -48,18 +50,30 @@ export class DeviceGateway extends EventEmitter {
 	private wss: WebSocketServer | undefined;
 	private heartbeatInterval: NodeJS.Timeout | undefined;
 
-	constructor(store: RouterStore, opts?: { heartbeatMs?: number }) {
+	constructor(
+		store: RouterStore,
+		opts?: { heartbeatMs?: number; logger?: ILogger },
+	) {
 		super();
 		this.store = store;
 		this.heartbeatMs = opts?.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
+		this.logger = opts?.logger ?? createNoopLogger();
 	}
 
 	attach(httpServer: HttpServer, path: string): void {
 		const wss = new WebSocketServer({ server: httpServer, path });
 		this.wss = wss;
 
+		this.logger.info(
+			`Device gateway listening on ${path} (heartbeat ${this.heartbeatMs}ms)`,
+		);
+
 		wss.on("connection", (ws) => {
 			this.handleConnection(ws);
+		});
+
+		wss.on("error", (err) => {
+			this.logger.error("Device gateway WebSocket server error", err);
 		});
 
 		this.heartbeatInterval = setInterval(() => {
@@ -81,6 +95,11 @@ export class DeviceGateway extends EventEmitter {
 		// hasn't physically deleted the row yet. Delivering a stale prompt to
 		// a returning device is worse than failing, per the design spec.
 		const pending = this.store.pendingEvents(deviceId, 0, Date.now());
+		if (pending.length > 0) {
+			this.logger.info(
+				`Delivering ${pending.length} pending event(s) to device ${deviceId}`,
+			);
+		}
 		for (const { seq, payloadJson } of pending) {
 			ws.send(
 				JSON.stringify({
@@ -176,6 +195,9 @@ export class DeviceGateway extends EventEmitter {
 		this.socketState.set(ws, state);
 
 		state.helloTimer = setTimeout(() => {
+			this.logger.warn(
+				`Closing device socket: no hello within ${HELLO_TIMEOUT_MS}ms`,
+			);
 			ws.close(1002, "hello timeout");
 		}, HELLO_TIMEOUT_MS);
 
@@ -191,10 +213,19 @@ export class DeviceGateway extends EventEmitter {
 			this.handleMessage(ws, state, raw.toString());
 		});
 
-		ws.on("close", () => {
+		ws.on("close", (code, reason) => {
 			if (state.helloTimer) clearTimeout(state.helloTimer);
 			const deviceId = state.deviceId;
-			if (deviceId === undefined) return;
+			if (deviceId === undefined) {
+				// Never got past hello — worth a line, since a device stuck in a
+				// reconnect loop shows up here and nowhere else.
+				this.logger.info(
+					`Unauthenticated device socket closed (code ${code}${
+						reason.length > 0 ? `, ${reason.toString()}` : ""
+					})`,
+				);
+				return;
+			}
 			this.store.touchDevice(deviceId, Date.now());
 			// Only treat this as a real disconnect if this socket is still
 			// the one on record for the device — a newer connection may
@@ -204,12 +235,29 @@ export class DeviceGateway extends EventEmitter {
 			if (this.sockets.get(deviceId) === ws) {
 				this.sockets.delete(deviceId);
 				this.capabilities.delete(deviceId);
+				this.logger.info(
+					`Device ${deviceId} disconnected (code ${code}${
+						reason.length > 0 ? `, ${reason.toString()}` : ""
+					})`,
+				);
 				this.emit("deviceDisconnected", deviceId);
+			} else {
+				this.logger.info(
+					`Stale socket for device ${deviceId} closed (code ${code}); a newer connection already replaced it`,
+				);
 			}
 		});
 
-		ws.on("error", () => {
-			// Swallow — "close" will follow and handle cleanup.
+		ws.on("error", (err) => {
+			// "close" still follows and handles cleanup — but the error itself was
+			// previously swallowed entirely, which hid every transport-level
+			// failure behind an unexplained disconnect.
+			this.logger.warn(
+				`Device socket error${
+					state.deviceId !== undefined ? ` for device ${state.deviceId}` : ""
+				}`,
+				err,
+			);
 		});
 	}
 
@@ -217,7 +265,13 @@ export class DeviceGateway extends EventEmitter {
 		let frame: DeviceFrame;
 		try {
 			frame = parseDeviceFrame(raw);
-		} catch {
+		} catch (err) {
+			this.logger.warn(
+				`Closing device socket${
+					state.deviceId !== undefined ? ` for device ${state.deviceId}` : ""
+				}: unparseable frame`,
+				err,
+			);
 			ws.close(1002, "invalid frame");
 			return;
 		}
@@ -229,6 +283,9 @@ export class DeviceGateway extends EventEmitter {
 
 		// All other frame types require a prior successful hello.
 		if (state.deviceId === undefined) {
+			this.logger.warn(
+				`Closing device socket: received '${frame.type}' before hello`,
+			);
 			ws.close(1002, "hello required");
 			return;
 		}
@@ -272,6 +329,9 @@ export class DeviceGateway extends EventEmitter {
 		// rejection (the client treats hello_error as fatal and stops
 		// reconnecting) instead of an opaque frame-parse failure later on.
 		if (frame.protocolVersion !== PROTOCOL_VERSION) {
+			this.logger.error(
+				`Rejecting device hello: protocol version mismatch (server ${PROTOCOL_VERSION}, device ${frame.protocolVersion}). The device will stop reconnecting.`,
+			);
 			ws.send(
 				JSON.stringify({
 					type: "hello_error",
@@ -284,6 +344,9 @@ export class DeviceGateway extends EventEmitter {
 
 		const found = this.store.getDeviceByToken(frame.deviceToken);
 		if (!found) {
+			this.logger.error(
+				"Rejecting device hello: no device matches the presented token",
+			);
 			ws.send(JSON.stringify({ type: "hello_error", reason: "invalid token" }));
 			ws.close();
 			return;
@@ -295,6 +358,9 @@ export class DeviceGateway extends EventEmitter {
 		// this device before registering the new one.
 		const existing = this.sockets.get(deviceId);
 		if (existing && existing !== ws) {
+			this.logger.warn(
+				`Device ${deviceId} reconnected while an older socket was still open; terminating the older one`,
+			);
 			existing.terminate();
 		}
 
@@ -330,6 +396,19 @@ export class DeviceGateway extends EventEmitter {
 			this.store.ackEvent(deviceId, e.seq);
 		}
 
+		// The single most useful liveness line in the router: for a container
+		// target this is the first proof the sandbox's worker process actually
+		// came up, which ACA's "Running" infrastructure state does not tell us.
+		this.logger.info(
+			`Device ${deviceId} connected (user ${userId}, lastAckedSeq ${frame.lastAckedSeq}, ${
+				frame.activeSessions?.length ?? 0
+			} active session(s), capabilities: ${
+				state.capabilities && state.capabilities.size > 0
+					? [...state.capabilities].join(",")
+					: "none"
+			})`,
+		);
+
 		// Carry the device's declared active sessions so a listener can
 		// reconcile stale issue locks. Emitted after the lastAckedSeq purge
 		// above and before deliverPending, so a reconcile handler sees the true
@@ -346,9 +425,17 @@ export class DeviceGateway extends EventEmitter {
 			if (!state.isAlive) {
 				state.missedHeartbeats += 1;
 				if (state.missedHeartbeats >= MAX_MISSED_HEARTBEATS) {
+					this.logger.warn(
+						`Terminating device ${state.deviceId} socket: missed ${state.missedHeartbeats} consecutive heartbeats (${
+							state.missedHeartbeats * this.heartbeatMs
+						}ms of silence)`,
+					);
 					ws.terminate();
 					continue;
 				}
+				this.logger.debug(
+					`Device ${state.deviceId} missed heartbeat ${state.missedHeartbeats}/${MAX_MISSED_HEARTBEATS}`,
+				);
 			} else {
 				state.missedHeartbeats = 0;
 			}

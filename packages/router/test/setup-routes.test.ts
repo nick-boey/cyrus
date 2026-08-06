@@ -19,6 +19,7 @@ import type {
 } from "../src/setup/principal.js";
 import { applyEdits, registerSetupRoutes } from "../src/setup/routes.js";
 import { SetupConflictError } from "../src/TableSecretStore.js";
+import { testLogger } from "./helpers/logger.js";
 
 const REQUIRED = ["CLAUDE_CODE_OAUTH_TOKEN", "GIT_TOKEN"] as const;
 const ALICE = "alice@example.com";
@@ -170,7 +171,7 @@ async function harness(options: HarnessOptions = {}) {
 	openStores.push(store);
 	const secrets = options.secrets ?? new FileSecretStore(tempSecretsFile());
 	const requiredKeys = options.requiredKeys ?? REQUIRED;
-	const logger = { info: vi.fn(), warn: vi.fn() };
+	const logger = testLogger();
 	const bootstrap = new SetupBootstrap({
 		store,
 		secrets,

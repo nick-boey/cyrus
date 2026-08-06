@@ -5,10 +5,11 @@ import { describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { DeviceGateway } from "../src/DeviceGateway.js";
 import { RouterStore } from "../src/RouterStore.js";
+import { type TestLogger, testLogger } from "./helpers/logger.js";
 
 const NOW = 1_000_000;
 
-async function setup(opts?: { heartbeatMs?: number }) {
+async function setup(opts?: { heartbeatMs?: number; logger?: TestLogger }) {
 	const store = new RouterStore(":memory:");
 	store.addUser({ email: "alice@example.com" });
 	const code = store.mintEnrollmentCode("alice@example.com", NOW);
@@ -541,6 +542,71 @@ describe("DeviceGateway.querySessions", () => {
 		gateway.close();
 
 		await expect(pending).resolves.toBeUndefined();
+		httpServer.close();
+	});
+	// ── logging ─────────────────────────────────────────────────────────────
+	// Device connect/disconnect is the truest liveness signal the router has:
+	// for a container target it is the only proof the sandbox's worker process
+	// actually came up, since ACA reports "Running" for an exited entrypoint.
+	// Before NOR-278 this file emitted nothing at all.
+
+	it("logs a device connect with the identity and session count", async () => {
+		const logger = testLogger();
+		const { gateway, device, port, httpServer } = await setup({ logger });
+		await connectDevice(port, device.deviceToken);
+
+		const line = logger.info.mock.calls
+			.map((c) => String(c[0]))
+			.find((m) => m.includes(`Device ${device.deviceId} connected`));
+		expect(line).toBeDefined();
+		expect(line).toContain("0 active session(s)");
+
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("logs a device disconnect with the close code", async () => {
+		const logger = testLogger();
+		const { gateway, device, port, httpServer } = await setup({ logger });
+		const { ws } = await connectDevice(port, device.deviceToken);
+
+		const disconnected = new Promise<void>((r) =>
+			gateway.once("deviceDisconnected", () => r()),
+		);
+		ws.close(1000, "bye");
+		await disconnected;
+
+		expect(
+			logger.info.mock.calls
+				.map((c) => String(c[0]))
+				.some((m) => m.includes(`Device ${device.deviceId} disconnected`)),
+		).toBe(true);
+
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("logs a rejected hello at error level", async () => {
+		const logger = testLogger();
+		const { gateway, port, httpServer } = await setup({ logger });
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: "bad",
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+		await nextMessage();
+
+		expect(logger.error).toHaveBeenCalledWith(
+			expect.stringContaining("no device matches the presented token"),
+		);
+
+		gateway.close();
 		httpServer.close();
 	});
 });

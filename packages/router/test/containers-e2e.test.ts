@@ -43,6 +43,7 @@ import {
 	RouterServer,
 } from "../src/RouterServer.js";
 import { SecretStore } from "../src/SecretStore.js";
+import { silentLogger } from "./helpers/logger.js";
 
 const WORKSPACE = "ws-1";
 /** Small so scenario 2 can assert idle-stop without a real 15-minute wait —
@@ -383,7 +384,7 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 			webhook: { verificationMode: "direct", secret: "test-secret" },
 			trackerFactory: () => tracker,
 			heartbeatMs: 30_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			containers,
 			executorRegistryFactory: () =>
 				new Map<string, ContainerExecutor>([
@@ -529,7 +530,7 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
 			offlineAgeOutMs: 3_600_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			now: () => future,
 		});
 
