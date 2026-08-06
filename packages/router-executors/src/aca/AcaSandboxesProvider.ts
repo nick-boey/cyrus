@@ -46,7 +46,14 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	{ pattern: "proxy.golang.org", action: "Allow" },
 	{ pattern: "sum.golang.org", action: "Allow" },
 	{ pattern: "crates.io", action: "Allow" },
+	// Cargo's sparse registry protocol (the default since Rust 1.70) reads the
+	// index from index.crates.io, not crates.io — without it every `cargo
+	// build`/`cargo test` in a sandbox fails before it downloads a single
+	// crate. static.rust-lang.org is what rustup fetches toolchains from, which
+	// a repo pinning a version in rust-toolchain.toml needs.
+	{ pattern: "index.crates.io", action: "Allow" },
 	{ pattern: "static.crates.io", action: "Allow" },
+	{ pattern: "static.rust-lang.org", action: "Allow" },
 	{ pattern: "rubygems.org", action: "Allow" },
 	{ pattern: "repo.maven.apache.org", action: "Allow" },
 	{ pattern: "repo1.maven.org", action: "Allow" },

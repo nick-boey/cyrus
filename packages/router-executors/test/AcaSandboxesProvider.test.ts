@@ -1448,7 +1448,7 @@ describe("AcaSandboxesProvider", () => {
 	});
 
 	describe("D7 default egress allowlist", () => {
-		it("includes GitHub, Anthropic (api+console), Linear (mcp+api), pypi, and the router host from routerUrlForContainers", async () => {
+		it("includes GitHub, Anthropic (api+console), Linear (mcp+api), pypi, Rust (index.crates.io + static.rust-lang.org), and the router host from routerUrlForContainers", async () => {
 			const { client, calls } = fakeClient({
 				diskImages: [{ name: "disk-v1" }],
 			});
@@ -1470,6 +1470,10 @@ describe("AcaSandboxesProvider", () => {
 			expect(patterns).toContain("console.anthropic.com");
 			expect(patterns).toContain("mcp.linear.app");
 			expect(patterns).toContain("pypi.org");
+			// Cargo's sparse index host and rustup's toolchain host — a Rust
+			// repo cannot build without the former.
+			expect(patterns).toContain("index.crates.io");
+			expect(patterns).toContain("static.rust-lang.org");
 			expect(rules).toContainEqual({
 				pattern: "router.example.com",
 				action: "Allow",
