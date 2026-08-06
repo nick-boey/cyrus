@@ -2,6 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
+import { createNoopLogger, type ILogger } from "cyrus-core";
 
 const STORAGE_SCOPE = "https://storage.azure.com/.default";
 const DEFAULT_INTERVAL_MS = 300_000;
@@ -12,7 +13,7 @@ export interface StateBackupOptions {
 	intervalMs?: number;
 	tokenProvider?: () => Promise<string>;
 	fetchFn?: typeof fetch;
-	logger?: { info(msg: string): void; warn(msg: string): void };
+	logger?: ILogger;
 }
 
 export function createStorageTokenProvider(): () => Promise<string> {
@@ -38,7 +39,7 @@ export class StateBackup {
 	private readonly intervalMs: number;
 	private readonly tokenProvider: () => Promise<string>;
 	private readonly fetchFn: typeof fetch;
-	private readonly logger: { info(msg: string): void; warn(msg: string): void };
+	private readonly logger: ILogger;
 	private timer: NodeJS.Timeout | undefined;
 	private inFlight: Promise<void> | undefined;
 
@@ -48,7 +49,7 @@ export class StateBackup {
 		this.intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
 		this.tokenProvider = opts.tokenProvider ?? createStorageTokenProvider();
 		this.fetchFn = opts.fetchFn ?? fetch;
-		this.logger = opts.logger ?? { info: () => {}, warn: () => {} };
+		this.logger = opts.logger ?? createNoopLogger();
 	}
 
 	/** Must run before RouterStore opens the database. */
@@ -91,9 +92,12 @@ export class StateBackup {
 			return "restored";
 		} catch (error) {
 			await rm(tmp, { force: true });
-			throw new Error(
-				`router state restore is corrupt or unreadable: ${String(error)}`,
-			);
+			this.logger.error("Router state restore is corrupt or unreadable", error);
+			// Preserve the cause so the stack of the underlying failure survives
+			// into whatever catches this instead of being flattened to a string.
+			throw new Error("router state restore is corrupt or unreadable", {
+				cause: error,
+			});
 		}
 	}
 
@@ -107,7 +111,7 @@ export class StateBackup {
 	async flush(): Promise<void> {
 		if (this.inFlight) return this.inFlight;
 		this.inFlight = this.upload().catch((error: unknown) => {
-			this.logger.warn(`router state backup failed: ${String(error)}`);
+			this.logger.error("Router state backup failed", error);
 		});
 		try {
 			await this.inFlight;

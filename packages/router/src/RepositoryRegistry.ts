@@ -7,7 +7,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import type { RoutableRepository } from "cyrus-core";
+import type { ILogger, RoutableRepository } from "cyrus-core";
 import { TableRepositoryRegistry } from "./TableRepositoryRegistry.js";
 import { SetupConflictError } from "./TableSecretStore.js";
 
@@ -271,7 +271,7 @@ export function createRepositoryRegistry(options: {
 export async function seedRepositoryRegistry(
 	registry: RepositoryRegistry,
 	configured: readonly RegisteredRepository[],
-	logger: { info(msg: string): void; warn(msg: string): void },
+	logger: ILogger,
 ): Promise<{ seeded: boolean; count: number }> {
 	const snapshot = await registry.list();
 	if (snapshot.repositories.length > 0) {

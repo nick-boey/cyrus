@@ -45,6 +45,7 @@ import {
 	seedSession,
 	WORKSPACE,
 } from "./helpers/fixtures.js";
+import { silentLogger } from "./helpers/logger.js";
 
 // ESM has no `__dirname`; derive it the same way the rest of the monorepo
 // does (see e.g. packages/core/test/json-schema-export.test.ts).
@@ -122,7 +123,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
 				webhook: { verificationMode: "direct", secret: "s" },
 				trackerFactory: () => tracker,
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				containers,
 				// Scoped so BOTH the container-targets executor AND RouterServer's own
 				// internal periodic sweep (the `setInterval` in `start()` that calls
@@ -195,7 +196,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
 				offlineAgeOutMs: 3_600_000,
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				now: () => Date.now() + IDLE_STOP_MS + 5_000,
 			});
 			await lifecycle.sweep();
@@ -229,7 +230,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
 				offlineAgeOutMs: 3_600_000,
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				now: () => Date.now() + STALE_DESTROY_MS + 5_000,
 			});
 			await lifecycle.sweep();
@@ -271,7 +272,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 						idleStopMs: IDLE_STOP_MS,
 						staleDestroyMs: STALE_DESTROY_MS,
 						offlineAgeOutMs: 3_600_000,
-						logger: { info: () => {}, warn: () => {} },
+						logger: silentLogger(),
 						now: () => Date.now(),
 					});
 					await lifecycle.sweep();
@@ -349,7 +350,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				dbPath: ":memory:",
 				workspaces: {},
 				webhook: { verificationMode: "direct", secret: "s" },
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				containers,
 				// Scoped so BOTH the artifact-upload path AND RouterServer's own
 				// internal periodic sweep are bounded to this run's container — see
@@ -591,7 +592,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
 				webhook: { verificationMode: "direct", secret: "s" },
 				trackerFactory: () => tracker,
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				containers,
 				// Scoped so BOTH the container-targets executor AND RouterServer's
 				// own internal periodic sweep are bounded to this run's container —
@@ -746,7 +747,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
 				webhook: { verificationMode: "direct", secret: "s" },
 				trackerFactory: () => tracker,
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				containers: {
 					image: IMAGE,
 					routerUrlForContainers: `ws://${routerHost}:${port}`,
@@ -981,7 +982,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				workspaces: { [WORKSPACE]: { linearToken: "unused" } },
 				webhook: { verificationMode: "direct", secret: "s" },
 				trackerFactory: () => tracker,
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				containers: {
 					image: IMAGE,
 					routerUrlForContainers: `ws://${routerHost}:${port}`,
@@ -1154,7 +1155,7 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
 				offlineAgeOutMs: 3_600_000,
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				now: () => Date.now() + IDLE_STOP_MS + 5_000,
 			});
 			await lifecycle.sweep();

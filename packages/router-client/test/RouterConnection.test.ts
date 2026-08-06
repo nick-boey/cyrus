@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createNoopLogger, type ILogger } from "cyrus-core";
 import {
 	type DeviceFrame,
 	PROTOCOL_VERSION,
@@ -133,6 +134,7 @@ function makeConn(overrides?: {
 	url?: string;
 	reconnectBaseMs?: number;
 	getActiveSessions?: () => string[];
+	logger?: ILogger;
 }): RouterConnection {
 	return new RouterConnection({
 		url: overrides?.url ?? router.url,
@@ -141,6 +143,7 @@ function makeConn(overrides?: {
 		reconnectBaseMs: overrides?.reconnectBaseMs ?? 10,
 		rpcTimeoutMs: 1000,
 		getActiveSessions: overrides?.getActiveSessions,
+		logger: overrides?.logger,
 	});
 }
 
@@ -864,5 +867,29 @@ describe("RouterConnection", () => {
 		expect(buffered).toHaveLength(1);
 		expect(buffered[0]).toMatchObject({ sessionId: "sess-1", state: "active" });
 		conn.close();
+	});
+	it("(l) routes lifecycle warnings through the injected logger, not raw console", async () => {
+		// Before NOR-278 these lines were bare console.* calls, invisible to
+		// CYRUS_LOG_LEVEL/CYRUS_LOG_FORMAT and unqueryable once shipped.
+		writeFileSync(
+			join(stateDir, "inbox.jsonl"),
+			`${JSON.stringify({ seq: 7, event: { prompt: "hi" } })}\n`,
+		);
+		const warn = vi.fn();
+		const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const logger: ILogger = { ...createNoopLogger(), warn };
+
+		const conn = makeConn({ logger });
+		conn.connect();
+		await once(conn, "connected");
+		await new Promise((r) => setTimeout(r, 20));
+
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining("had no consumer"),
+		);
+		expect(consoleWarn).not.toHaveBeenCalled();
+
+		conn.close();
+		consoleWarn.mockRestore();
 	});
 });
