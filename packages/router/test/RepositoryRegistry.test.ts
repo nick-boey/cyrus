@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
 	FileRepositoryRegistry,
 	type RegisteredRepository,

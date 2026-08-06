@@ -69,7 +69,7 @@ describe("parseRequiredSecretKeys", () => {
 describe("router-server requiredSecretKeys passthrough (fake executor)", () => {
 	let handle: Awaited<ReturnType<typeof startRouterServer>>;
 	let dir: string;
-	const logger = { info: vi.fn(), warn: vi.fn() };
+	const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 
 	beforeAll(async () => {
 		dir = mkdtempSync(join(tmpdir(), "f1-router-server-gate-"));
@@ -117,8 +117,13 @@ describe("router-server requiredSecretKeys passthrough (fake executor)", () => {
 		});
 		expect(inject.status).toBe(200);
 		await vi.waitFor(() =>
-			expect(logger.warn).toHaveBeenCalledWith(
-				expect.stringContaining("missing LINEAR_API_TOKEN"),
+			// See router-rig.test.ts: the gate message is now the Error attached
+			// to a "Container boot failed" error log.
+			expect(logger.error).toHaveBeenCalledWith(
+				expect.stringContaining("Container boot failed"),
+				expect.objectContaining({
+					message: expect.stringContaining("missing LINEAR_API_TOKEN"),
+				}),
 			),
 		);
 	});

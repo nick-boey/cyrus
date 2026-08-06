@@ -90,7 +90,7 @@ describe("createRouterRig requiredSecretKeys gate (fake executor, no Docker)", (
 	let rig: RouterRig;
 	let dir: string;
 	const exec = new RecordingExecutor();
-	const logger = { info: vi.fn(), warn: vi.fn() };
+	const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 
 	beforeAll(async () => {
 		dir = mkdtempSync(join(tmpdir(), "f1-router-rig-gate-"));
@@ -125,8 +125,13 @@ describe("createRouterRig requiredSecretKeys gate (fake executor, no Docker)", (
 			}),
 		);
 		await vi.waitFor(() =>
-			expect(logger.warn).toHaveBeenCalledWith(
-				expect.stringContaining("missing LINEAR_API_TOKEN"),
+			// The boot gate's message now rides as the Error on a "Container boot
+			// failed" error log rather than being interpolated into a warn.
+			expect(logger.error).toHaveBeenCalledWith(
+				expect.stringContaining("Container boot failed"),
+				expect.objectContaining({
+					message: expect.stringContaining("missing LINEAR_API_TOKEN"),
+				}),
 			),
 		);
 		expect(exec.calls).not.toContain("CYGATE-1");
