@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Container sessions can now build and test Rust projects: `cargo`, `rustc`, `rustfmt`, and `clippy` are preinstalled, along with the C toolchain crates need to link. Cloud workers can also reach Cargo's crate index and rustup's toolchain downloads, so a repo that pins a Rust version in `rust-toolchain.toml` still works under deny-by-default network egress. ([#16](https://github.com/nick-boey/cyrus/pull/16))
 - Logs can now be emitted as one JSON object per line by setting `CYRUS_LOG_FORMAT=json`, so a log aggregator can filter on level, component, and issue rather than pattern-matching prose. The default output is unchanged. ([#15](https://github.com/nick-boey/cyrus/pull/15))
 - The router now logs when a device connects and disconnects, and why a handshake was rejected. For cloud workers this is the first sign the worker process actually started — the infrastructure can report a sandbox as "running" while nothing is listening inside it. ([#15](https://github.com/nick-boey/cyrus/pull/15))
 - Router hosts can now turn on a `/setup` page so teammates manage their own container credentials (Claude token, GitHub token, and so on) from a browser, instead of asking an admin to run `cyrus router secrets set` for them. It is off by default and an operator has to choose how sign-in is verified before it will start.

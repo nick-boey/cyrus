@@ -381,6 +381,8 @@ see the behavior described above — update first.
 | `fleece` (Fleece.Cli) | Fleece issue tracking. Installed via `dotnet tool install --tool-path /usr/local/dotnet-tools` — **not** `-g`, which would put it under build-time `/root` where the non-root `cyrus` user cannot reach it. Unpinned: rebuilding the image picks up the latest published `Fleece.Cli`. |
 | `actionlint` | GitHub Actions workflow linting. Pinned by the `ACTIONLINT_VERSION` build arg, checksum-verified, arch-resolved from `dpkg` so the same Dockerfile produces a working `amd64` (ACA) and `arm64` (local Apple Silicon) image. |
 | `pwsh` (PowerShell 7) | Repos that ship `.ps1` build or deploy scripts. From the same Microsoft feed as the .NET SDK, which publishes `powershell` for both `amd64` and `arm64` on bookworm — no arch special-casing. Unpinned, like the SDK. |
+| `cargo`, `rustc`, `rustfmt`, `clippy` | Repos with Cargo crates need them to build and test. Installed by rustup into `RUSTUP_HOME=/usr/local/rustup` and `CARGO_HOME=/usr/local/cargo` (shared, chowned to `cyrus`) rather than `~/.cargo`, for the same `$HOME`-is-`/root`-at-build-time reason as `fleece`. `--profile minimal` plus explicit `rustfmt`/`clippy` — no `rust-docs`. The toolchain is `stable` and unpinned, like the .NET SDK; set the `RUST_TOOLCHAIN` build arg to pin. See the caveats below. |
+| `build-essential`, `pkg-config`, `libssl-dev` | Pulled in by the Rust toolchain, but useful to any native build. `rustc` shells out to `cc` to link, so without them every `cargo build` fails with ``linker `cc` not found``; `-sys` crates that wrap C libraries also need `pkg-config` and headers. |
 | `codex` (`@openai/codex`) | The Codex agent CLI, on `PATH` for sessions. Pinned by the `CODEX_VERSION` build arg — keep it in step with the `@openai/codex` version resolved in `pnpm-lock.yaml`. Authentication is not set up yet; see the note below. |
 | `opencode` (`opencode-ai`) | The OpenCode agent CLI. Pinned by the `OPENCODE_VERSION` build arg. Like `codex`, it resolves its native binary through per-platform `optionalDependencies`, so `npm install -g` gets the right `linux-x64`/`linux-arm64` build. |
 | `playwright` + Chromium | Browser automation. Pinned by the `PLAYWRIGHT_VERSION` build arg; the browser lives at `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, owned by `cyrus`. See the caveats below. |
@@ -393,6 +395,7 @@ docker build -f docker/worker/Dockerfile \
   --build-arg CODEX_VERSION=0.144.6 \
   --build-arg OPENCODE_VERSION=1.18.13 \
   --build-arg PLAYWRIGHT_VERSION=1.62.0 \
+  --build-arg RUST_TOOLCHAIN=stable \
   -t cyrus-worker:dev .
 ```
 
@@ -434,6 +437,31 @@ docker build -f docker/worker/Dockerfile \
   browser and keeps the headless shell — at the cost of breaking any repo that
   uses Playwright's default (non-`chromium-headless-shell`) channel or runs
   headed.
+
+### Rust caveats
+
+- **Only the host target is installed.** `stable` for the image's own
+  architecture, nothing else. A repo that cross-compiles or builds for
+  `wasm32-unknown-unknown` needs a `rustup target add`, which works at runtime
+  (`RUSTUP_HOME` is writable by `cyrus` and `static.rust-lang.org` is on the
+  ACA egress allowlist) but costs time on every cold container. Bake it into
+  an overlay image if a repo needs it on every run.
+- **A `rust-toolchain.toml` pin is honoured, at a cost.** rustup will download
+  the pinned toolchain on first `cargo` invocation rather than use the baked
+  `stable`. That works — but it is a multi-hundred-MB download inside the
+  session, repeated per container. Pin the image instead with
+  `--build-arg RUST_TOOLCHAIN=<version>` if your fleet is single-repo.
+- **`cargo` needs `index.crates.io`, not just `crates.io`.** Cargo's sparse
+  registry protocol (the default since Rust 1.70) reads the index from a
+  separate host. Both are in `DEFAULT_EGRESS_HOSTS`
+  (`cyrus-router-executors`), along with `static.rust-lang.org`. A repo
+  pointing `[source]` at a private registry, or depending on a crate via a
+  `git@…:` URL, still will not resolve under ACA's `Full` inspection — use an
+  HTTPS git URL and add the registry host to the egress policy.
+- **`CARGO_HOME` is shared, not per-issue.** It lives at `/usr/local/cargo`,
+  outside the `/workspaces` volume, so the crate cache it accumulates is *not*
+  restored across containers — every fresh container re-downloads the crates
+  its build needs.
 
 ## Adding tools to the worker container
 
