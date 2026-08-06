@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { createNoopLogger, type ILogger } from "cyrus-core";
 import Database from "better-sqlite3";
 
 const STORAGE_SCOPE = "https://storage.azure.com/.default";
@@ -12,7 +13,7 @@ export interface StateBackupOptions {
 	intervalMs?: number;
 	tokenProvider?: () => Promise<string>;
 	fetchFn?: typeof fetch;
-	logger?: { info(msg: string): void; warn(msg: string): void };
+	logger?: ILogger;
 }
 
 export function createStorageTokenProvider(): () => Promise<string> {
@@ -38,7 +39,7 @@ export class StateBackup {
 	private readonly intervalMs: number;
 	private readonly tokenProvider: () => Promise<string>;
 	private readonly fetchFn: typeof fetch;
-	private readonly logger: { info(msg: string): void; warn(msg: string): void };
+	private readonly logger: ILogger;
 	private timer: NodeJS.Timeout | undefined;
 	private inFlight: Promise<void> | undefined;
 
@@ -48,7 +49,7 @@ export class StateBackup {
 		this.intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
 		this.tokenProvider = opts.tokenProvider ?? createStorageTokenProvider();
 		this.fetchFn = opts.fetchFn ?? fetch;
-		this.logger = opts.logger ?? { info: () => {}, warn: () => {} };
+		this.logger = opts.logger ?? createNoopLogger();
 	}
 
 	/** Must run before RouterStore opens the database. */

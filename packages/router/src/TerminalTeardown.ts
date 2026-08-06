@@ -1,5 +1,6 @@
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
+import type { ILogger } from "cyrus-core";
 import type { ExecutorRegistry } from "cyrus-router-executors";
 import { TEARDOWN_IDEMPOTENCY_HEADER } from "cyrus-workspace-sync";
 import type { FastifyInstance } from "fastify";
@@ -41,7 +42,7 @@ export interface TerminalTeardownOptions {
 	artifactsDir: string;
 	graceMs: number;
 	retryMs?: number;
-	logger: { info(msg: string): void; warn(msg: string): void };
+	logger: ILogger;
 	now?: () => number;
 	setTimeout?: (callback: () => void, delayMs: number) => unknown;
 	clearTimeout?: (timer: unknown) => void;

@@ -20,8 +20,9 @@ export type {
 	ILogger,
 	LogContext,
 	LogEventAttributes,
+	LogFormat,
 } from "./logging/index.js";
-export { createLogger, LogLevel } from "./logging/index.js";
+export { createLogger, createNoopLogger, LogLevel } from "./logging/index.js";
 
 // export { Session } from './Session.js'
 // export type { SessionOptions, , NarrativeItem } from './Session.js'

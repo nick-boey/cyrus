@@ -1,10 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
-import type {
-	AgentEvent,
-	IAgentEventTransport,
-	IIssueTrackerService,
+import {
+	type AgentEvent,
+	createNoopLogger,
+	type IAgentEventTransport,
+	type IIssueTrackerService,
+	type ILogger,
 } from "cyrus-core";
 import {
 	LinearIssueTrackerService,
@@ -267,7 +269,7 @@ export interface RouterServerConfig {
 	executorRegistryFactory?: (
 		containers: RouterContainersConfig,
 	) => ExecutorRegistry;
-	logger?: { info(msg: string): void; warn(msg: string): void };
+	logger?: ILogger;
 	/** Forwarded to {@link DeviceGateway} for heartbeat tuning in tests. */
 	heartbeatMs?: number;
 	/** Host to bind; defaults to 127.0.0.1. */
@@ -349,7 +351,7 @@ export class RouterServer {
 	private readonly gateway: DeviceGateway;
 	private readonly executor: LinearExecutor;
 	private readonly trackers: Map<string, IIssueTrackerService>;
-	private readonly logger: { info(msg: string): void; warn(msg: string): void };
+	private readonly logger: ILogger;
 	private transport: IAgentEventTransport | undefined;
 	private sweepInterval: NodeJS.Timeout | undefined;
 	private stateBackup: StateBackup | undefined;
@@ -385,7 +387,7 @@ export class RouterServer {
 			});
 		}
 		this.config = config;
-		this.logger = config.logger ?? { info: () => {}, warn: () => {} };
+		this.logger = config.logger ?? createNoopLogger();
 		this.store = new RouterStore(config.dbPath);
 		this.fastify = Fastify();
 

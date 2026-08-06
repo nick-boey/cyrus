@@ -1,3 +1,4 @@
+import type { ILogger } from "cyrus-core";
 import type { ExecutorRegistry } from "cyrus-router-executors";
 import type { ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
 
@@ -27,7 +28,7 @@ export interface ContainerLifecycleOptions {
 	offlineAgeOutMs: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
 	sessionReconciler?: SessionReconciler;
-	logger: { info(msg: string): void; warn(msg: string): void };
+	logger: ILogger;
 	/** Injectable clock (default `Date.now`) so time-based policy is deterministic in tests. */
 	now?: () => number;
 }
@@ -73,7 +74,7 @@ export class ContainerLifecycle {
 	private readonly sessionReconciler: SessionReconciler | undefined;
 	/** Devices already reported as pinned, so the 60s tick logs on transition only. */
 	private readonly pinnedDevices = new Set<number>();
-	private readonly logger: { info(msg: string): void; warn(msg: string): void };
+	private readonly logger: ILogger;
 	private readonly now: () => number;
 
 	constructor(opts: ContainerLifecycleOptions) {

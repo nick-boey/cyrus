@@ -1,4 +1,4 @@
-import { type IssueFacts, matchRepositories } from "cyrus-core";
+import { type ILogger, type IssueFacts, matchRepositories } from "cyrus-core";
 import {
 	type RegisteredRepository,
 	type RepositoryRegistry,
@@ -34,7 +34,7 @@ export interface RepositoryResolverDeps {
 		workspaceId: string,
 		issueId: string,
 	) => Promise<IssueFacts | undefined>;
-	logger: { info(msg: string): void; warn(msg: string): void };
+	logger: ILogger;
 }
 
 /**

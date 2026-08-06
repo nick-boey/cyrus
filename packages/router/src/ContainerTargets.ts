@@ -1,3 +1,4 @@
+import type { ILogger } from "cyrus-core";
 import type { ExecutorRegistry } from "cyrus-router-executors";
 import { containerBootFailedMessage } from "./messages.js";
 import type {
@@ -96,7 +97,7 @@ export interface ContainerRoutingDeps {
 		agentSessionId: string,
 		body: string,
 	) => Promise<void>;
-	logger: { info(msg: string): void; warn(msg: string): void };
+	logger: ILogger;
 	/** Injectable clock for the in-flight boot staleness window (tests). */
 	now?: () => number;
 }

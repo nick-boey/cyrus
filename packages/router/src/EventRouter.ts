@@ -4,6 +4,7 @@ import {
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isIssueDeletedWebhook,
+	type ILogger,
 	isIssueStateChangeWebhook,
 	type Webhook,
 } from "cyrus-core";
@@ -122,7 +123,7 @@ export interface EventRouterOptions {
 		 *  belong to a session the device was routed but has not started tracking. */
 		affinityGraceMs: number;
 	};
-	logger: { info(msg: string): void; warn(msg: string): void };
+	logger: ILogger;
 	/** Injectable clock (default `Date.now`) so TTL behavior is deterministic in tests. */
 	now?: () => number;
 }
@@ -174,7 +175,7 @@ export class EventRouter {
 		affinityGraceMs: number;
 	};
 	private readonly webhookClaimRetentionMs: number;
-	private readonly logger: { info(msg: string): void; warn(msg: string): void };
+	private readonly logger: ILogger;
 	private readonly now: () => number;
 
 	/** Sessions we've already posted an offline notice for (once-per-session). */

@@ -1,6 +1,7 @@
 import {
 	AssociationParseError,
 	formatAssociations,
+	type ILogger,
 	parseAssociations,
 } from "cyrus-core";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
@@ -75,7 +76,7 @@ export interface RepositoryRouteDeps {
 	bootstrap: SetupBootstrap;
 	csrf: CsrfTokens;
 	verifyIdToken?: SetupIdTokenVerifier;
-	logger: { info(msg: string): void; warn(msg: string): void };
+	logger: ILogger;
 	maxFormBodyBytes?: number;
 }
 
