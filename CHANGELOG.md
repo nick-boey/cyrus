@@ -33,6 +33,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Router deployments with more than one repository previously always used the first one and cloned all of them into every workspace. They are now routed by project, team, or the configured default, and only the chosen repository is cloned. Single-repository deployments are unaffected.
 - Project and team routing now match names case-insensitively.
+- `containers.repositories` entries now have their `baseBranch` validated before the repository registry is seeded (letters, digits, dots, dashes, underscores, and slashes only — no leading dash, no `..`). `main`, `master`, and version-style branches like `release/1.2.x` are unaffected. If any entry's `baseBranch` fails validation, the whole seed is skipped and the router reports "No repositories are registered" for every issue until it's fixed — the router logs exactly which repository and branch failed and why. Operators upgrading with an unusual branch name (containing `+`, `~`, `%`, `@`, `#`, or similar) in `containers.repositories` should check their logs after upgrading.
 
 ### Fixed
 - The `/setup` page can now save a credential it has never held before. Any required variable missing from your stored record showed an editable row that silently threw away whatever you typed, answering "No changes to save" — so a newly required credential could never be entered through the browser at all.

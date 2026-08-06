@@ -29,6 +29,7 @@ import {
 	REPOSITORY_SELECTION_PROMPT,
 	UNENROLLED_CREATOR_MESSAGE,
 } from "./messages.js";
+import { BASE_BRANCH_RE } from "./RepositoryRegistry.js";
 import type {
 	RepositoryDecision,
 	RepositoryResolver,
@@ -718,6 +719,62 @@ export class EventRouter {
 	}
 
 	/**
+	 * Is this webhook's TARGET — creator, or the issue itself via already
+	 * established affinity — a KNOWN physical-device recipient?
+	 *
+	 * `isKnownPhysicalDeviceCreator` above only mirrors `resolveTarget`'s
+	 * creator branch (`findUserForCreator` -> `executorFor`). `resolveTarget`
+	 * itself checks THREE further fallbacks before ever reaching the creator
+	 * branch or after it fails — session affinity, issue affinity, and
+	 * parent-issue affinity, each via `getDeviceInfo(...).kind` in that same
+	 * method below. An unenrolled creator, or an app/automation-attributed creator that
+	 * `findUserForCreator` cannot resolve to a user, both make
+	 * `isKnownPhysicalDeviceCreator` return `false` even when this SAME issue
+	 * already has affinity pointing at a physical device from an earlier,
+	 * properly-attributed webhook. Without this check, `routeCreated` would run
+	 * `ensureRepositoryDecision` (posting a router-side elicitation, or
+	 * auto-picking and persisting a decision) for an issue whose device is
+	 * about to receive the SAME webhook via `resolveTarget`'s affinity
+	 * fallback and elicit again through its own `RepositoryRouter` — the exact
+	 * double-elicitation this whole gate exists to prevent, just reached
+	 * through affinity instead of the creator field.
+	 *
+	 * Deliberately does NOT clear a dangling affinity row the way
+	 * `resolveTarget` does when it finds one: that mutation belongs to the
+	 * actual routing decision, which still runs after this predicate (whether
+	 * it returns `true` or `false`) and will clear it there. A dangling row
+	 * here simply reads back as `undefined` and this predicate falls through,
+	 * same as `resolveTarget` falling through after clearing.
+	 */
+	private isKnownPhysicalDeviceTarget(
+		webhook: SessionEvent,
+		issueId: string | undefined,
+		creator: SessionEvent["agentSession"]["creator"] | undefined,
+	): boolean {
+		if (this.isKnownPhysicalDeviceCreator(creator)) return true;
+
+		const isPhysicalDevice = (deviceId: number | undefined): boolean =>
+			deviceId !== undefined &&
+			this.store.getDeviceInfo(deviceId)?.kind === "device";
+
+		const sessionId = webhook.agentSession.id;
+		if (isPhysicalDevice(this.store.getSessionAffinity(sessionId))) return true;
+
+		if (issueId !== undefined) {
+			if (isPhysicalDevice(this.store.getIssueAffinity(issueId))) return true;
+		}
+
+		const parentIssueId = extractParentIssueId(webhook);
+		if (parentIssueId !== undefined) {
+			if (isPhysicalDevice(this.store.getIssueAffinity(parentIssueId))) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * Ensures the issue has a repository decision before anything boots.
 	 *
 	 * Returns `"ready"` when routing may continue, and `"held"` when an
@@ -839,6 +896,42 @@ export class EventRouter {
 		return "held";
 	}
 
+	/**
+	 * Drops any override that fails {@link BASE_BRANCH_RE} before it can ever be
+	 * stored.
+	 *
+	 * `decision.baseBranchOverrides` originates in an issue description's
+	 * `[repo=name#branch]` tag (`parseRepoTags`), not from the registry, so it
+	 * never passes through `validateRegisteredRepository` — the gate that was
+	 * added specifically for this shell sink. It is persisted here, read back
+	 * into `RepositoryConfig.baseBranch`, and interpolated into a double-quoted
+	 * shell string in `GitService.ts`
+	 * (`` execSync(`git ls-remote --heads origin "${baseBranch}"`) ``) inside a
+	 * user's worker container. `parseRepoTags`' charset has no shell
+	 * metacharacters and no `=`, so this is not a live shell-escape exploit, but
+	 * a leading `-` (git ref treated as an option) and `..` (path traversal in
+	 * the ref name) are both expressible through the tag syntax and are exactly
+	 * the two classes `BASE_BRANCH_RE` exists to exclude. Filtering here, at the
+	 * one place every decision is persisted, means nothing invalid ever reaches
+	 * `CYRUS_REPOS_JSON` — cheaper than validating again at every read site.
+	 */
+	private sanitizeBaseBranchOverrides(
+		issueKey: string,
+		overrides: Record<string, string>,
+	): Record<string, string> {
+		const sanitized: Record<string, string> = {};
+		for (const [repoName, branch] of Object.entries(overrides)) {
+			if (BASE_BRANCH_RE.test(branch)) {
+				sanitized[repoName] = branch;
+			} else {
+				this.logger.warn(
+					`Dropping invalid base branch override ${JSON.stringify(branch)} for ${repoName} on issue ${issueKey}: does not match ${BASE_BRANCH_RE}`,
+				);
+			}
+		}
+		return sanitized;
+	}
+
 	private persistDecision(
 		issueKey: string,
 		decision: RepositoryDecision,
@@ -847,7 +940,10 @@ export class EventRouter {
 			issueKey,
 			{
 				repoNames: decision.repositories.map((repo) => repo.name),
-				baseBranchOverrides: decision.baseBranchOverrides,
+				baseBranchOverrides: this.sanitizeBaseBranchOverrides(
+					issueKey,
+					decision.baseBranchOverrides,
+				),
 				method: decision.method,
 			},
 			this.now(),
@@ -884,8 +980,8 @@ export class EventRouter {
 		// re-runs this same gate and then hits the identical unenrolled-creator
 		// path it would have hit originally.
 		//
-		// A KNOWN physical-device creator is different, and is excluded by
-		// `isKnownPhysicalDeviceCreator` below: their own EdgeWorker already
+		// A KNOWN physical-device target is different, and is excluded by
+		// `isKnownPhysicalDeviceTarget` below: their own EdgeWorker already
 		// runs its own `RepositoryRouter`/pending-selection flow (design doc
 		// §5), so asking here too would double-elicit them — once from the
 		// router, once from their device, for the same issue. `containers`
@@ -893,12 +989,13 @@ export class EventRouter {
 		// set at all — see RouterServer) only rules out deployments with NO
 		// container path whatsoever; it does nothing for a MIXED deployment
 		// that also has enrolled physical-device users, which is why this
-		// second, per-creator check is required on top of it.
+		// second, per-creator (and per-affinity — see that method's doc
+		// comment) check is required on top of it.
 		const issueKey = extractIssueKey(webhook);
 		if (
 			issueKey !== undefined &&
 			this.repositoryResolver &&
-			!this.isKnownPhysicalDeviceCreator(creator)
+			!this.isKnownPhysicalDeviceTarget(webhook, issueId, creator)
 		) {
 			const gate = await this.ensureRepositoryDecision(
 				webhook,
@@ -1145,6 +1242,18 @@ export class EventRouter {
 			return false;
 		}
 
+		// Deleted synchronously here — before the first `await` below — rather
+		// than after the replay has gone through. Two distinct prompts answering
+		// the SAME held selection both call `getPendingRepoSelection` with no
+		// `await` in between (every check above this line is synchronous), so
+		// only the first to reach this statement still finds a row: the second's
+		// read (whether concurrent or merely reordered by the event loop once the
+		// first one awaits) sees it already gone and returns `false` at the top
+		// of this method instead of persisting a second decision and replaying
+		// the held `created` event a second time. Matches the precedent the
+		// empty-options branch above already set, for the identical reason.
+		this.store.deletePendingRepoSelection(sessionId);
+
 		const { repositories } = await resolver
 			.resolve({ workspaceId: pending.workspaceId, issueId: undefined })
 			.then((outcome) =>
@@ -1177,9 +1286,8 @@ export class EventRouter {
 			// Defensively unreachable: `offered` is guaranteed non-empty here
 			// (built from `pending.options`, already known non-empty above), so
 			// `fallbackDecision` can never return undefined. Kept anyway per this
-			// file's existing defensive style — and still cleans up the row
-			// rather than looping forever on something nothing can resolve.
-			this.store.deletePendingRepoSelection(sessionId);
+			// file's existing defensive style. The row was already deleted above,
+			// so there is nothing left to clean up here.
 			this.logger.warn(
 				`Pending repository selection for ${pending.issueKey} could not be resolved; dropping it`,
 			);
@@ -1193,18 +1301,54 @@ export class EventRouter {
 		try {
 			held = JSON.parse(pending.createdEvent) as SessionEvent;
 		} catch (error) {
+			// What happens to the CURRENT prompt from here depends on `selected`,
+			// computed above: a matched answer is consumed (the method returns
+			// `true` below and the prompt is never routed), so only the
+			// unrelated-reply case actually falls through to normal prompt
+			// routing. Say which one this is, rather than always claiming the
+			// prompt is routed.
 			this.logger.warn(
-				`Held created event for ${pending.issueKey} is unreadable: ${String(error)}; routing the prompt alone`,
+				`Held created event for ${pending.issueKey} is unreadable: ${String(error)}; ${
+					selected
+						? "the repository selection was still applied, but the delegation itself is lost"
+						: "routing the prompt alone"
+				}`,
 			);
 		}
-		if (held) await this.routeCreated(held);
-
-		// Cleared only now, after the replay has actually gone through: if
-		// `routeCreated` threw, keeping the row (the decision persisted above is
-		// idempotent to re-derive) means a retry can still recover the held
-		// delegation instead of losing it — and the record that this was ever
-		// asked — with nothing left pointing back at it.
-		this.store.deletePendingRepoSelection(sessionId);
+		if (held) {
+			try {
+				await this.routeCreated(held);
+			} catch (error) {
+				// The row was already deleted above (to close the concurrent-prompt
+				// race — see the comment there), so a failed replay can no longer
+				// lean on "the row is still there" the way the pre-fix code did to
+				// avoid stranding the delegation; moving the delete earlier without
+				// this catch would have silently reintroduced that exact loss.
+				// Re-stash the pending row verbatim (same options, same held event)
+				// instead, so the NEXT signal on this session replays it again
+				// through this same method — the identical recovery path
+				// `ensureRepositoryDecision`'s "unavailable" branch already uses for
+				// a registry that was unreadable at `created` time. Re-deriving the
+				// decision persisted just above on that retry is idempotent and
+				// harmless. The error is swallowed rather than rethrown: `route()`
+				// is invoked as `void route(event)` with no catch (see
+				// `claimWebhook`'s doc comment), so letting this escape would take
+				// the whole router process down for every teammate over one failed
+				// replay.
+				this.logger.warn(
+					`Failed to replay the held delegation for ${pending.issueKey} after a repository selection: ${String(error)}; re-stashing it for retry`,
+				);
+				this.store.createPendingRepoSelection({
+					agentSessionId: sessionId,
+					issueKey: pending.issueKey,
+					workspaceId: pending.workspaceId,
+					options: pending.options,
+					createdEvent: pending.createdEvent,
+					createdMs: pending.createdMs,
+				});
+				return true;
+			}
+		}
 
 		if (selected) {
 			this.logger.info(

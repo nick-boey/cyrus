@@ -350,7 +350,10 @@ provider needs a pre-registered worker disk image and these provider fields:
 starts with an empty one. After that the stored registry is authoritative and
 the config array is ignored — the router logs this on every start. Manage
 repositories at `https://<router-fqdn>/setup/repositories`, which any registered
-Cyrus user can edit.
+Cyrus user can edit. Seeding keys on the registry being empty, not on whether it
+was ever seeded before — so if every repository is later removed through the
+setup UI, the next router restart re-seeds it from `containers.repositories`
+rather than leaving it empty.
 
 Each repository may be associated with Linear project names and team keys. In
 the setup UI these are written as one string:

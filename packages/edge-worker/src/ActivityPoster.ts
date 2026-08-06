@@ -131,6 +131,7 @@ export class ActivityPoster {
 			default: "Default repository",
 			"catch-all": "Catch-all",
 			"workspace-fallback": "Workspace fallback",
+			"single-repository": "Single repository",
 		};
 		const methodDisplay = routingMethod
 			? (methodDisplayMap[routingMethod] ?? routingMethod)

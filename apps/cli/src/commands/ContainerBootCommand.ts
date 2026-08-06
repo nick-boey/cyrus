@@ -686,6 +686,14 @@ export class ContainerBootCommand implements ICommand {
 			repositoryPath: join(workspacesDir, "repos", repo.name),
 			workspaceBaseDir: workspacesDir,
 			baseBranch: repo.baseBranch ?? "main",
+			// Synthesised from `githubSlug`, exactly as the router's own
+			// `toRoutable()` does (`RepositoryRegistry.ts`), so a `[repo=…]`
+			// description tag matched by URL suffix on the router
+			// (`matchRepositories`' `tagMatches`) can also re-match here in the
+			// sandbox's `RepositoryRouter`. Without this, the sandbox has no
+			// `githubUrl` at all and a tag matched only by URL on the router
+			// falls through to `needs_selection`.
+			githubUrl: `https://github.com/${repo.githubSlug}`,
 			linearWorkspaceId: repo.linearWorkspaceId,
 			isActive: true,
 			// Spread conditionally: writing `teamKeys: undefined` would survive

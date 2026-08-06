@@ -26,7 +26,8 @@ export type RepositoryRoutingResult =
 				| CoreRoutingMethod
 				| "team-prefix"
 				| "catch-all"
-				| "workspace-fallback";
+				| "workspace-fallback"
+				| "single-repository";
 	  }
 	| { type: "needs_selection"; workspaceRepos: RepositoryConfig[] }
 	| { type: "none" };
@@ -161,12 +162,18 @@ export class RepositoryRouter {
 	 * Priority 4: Team-based routing
 	 * Priority 5: The configured isDefault repository
 	 * Priority 6: Deprecated implicit catch-all / team-prefix fallbacks
+	 * Priority 7: The sole repository in scope, when nothing above matched
 	 *
 	 * Priorities 1-5 are delegated to the shared `matchRepositories` matcher in
 	 * `cyrus-core` so the router and edge worker can never disagree about which
 	 * repository an issue belongs to. Description-tag and label-based routing,
-	 * when matched, skip lower-priority routing. If no routing matches, returns
-	 * needs_selection (no default assignment).
+	 * when matched, skip lower-priority routing. Priority 7 mirrors
+	 * `RepositoryResolver.resolve`'s single-candidate shortcut on the router
+	 * side: with exactly one repository in scope there is nothing to
+	 * disambiguate, regardless of whether that repository carries routing
+	 * metadata forwarded from the router that happens not to match this issue.
+	 * If still nothing matches (more than one repository in scope, none of them
+	 * selected), returns needs_selection (no default assignment).
 	 */
 	async determineRepositoryForWebhook(
 		webhook: AgentSessionCreatedWebhook | AgentSessionPromptedWebhook,
@@ -288,6 +295,37 @@ export class RepositoryRouter {
 				repositories: [catchAllRepo],
 				routingMethod: "catch-all",
 			};
+		}
+
+		// Deliberately the final rung before asking the user — mirrors
+		// `RepositoryResolver.resolve`'s identical shortcut on the router side.
+		// Router-forwarded routing metadata (teamKeys/projectKeys/routingLabels/
+		// isDefault — see `ContainerBootCommand.buildRepositoryConfig`) can
+		// defeat every tier above even for a workspace with exactly one
+		// repository in scope: e.g. a single repository whose `teamKeys`
+		// doesn't include this issue's team. A sole candidate has nothing left
+		// to disambiguate, so offering it as a single-option "which
+		// repository?" elicitation would violate the binding "single-repository
+		// deployments are unaffected" guarantee, and — when this repository was
+		// already chosen by the router's own single-candidate shortcut, or
+		// already picked by the user from a router-side elicitation — would ask
+		// the identical question a second time. This does NOT widen the shared
+		// `matchRepositories`: the no-catch-all-tier constraint on that matcher
+		// stands, and this shortcut is placed here, in the caller, for exactly
+		// the same reason the router placed its own copy in the caller rather
+		// than in the matcher.
+		if (workspaceRepos.length === 1) {
+			const only = workspaceRepos[0];
+			if (only) {
+				this.logger.info(
+					`Repository selected: ${only.name} (single repository in scope)`,
+				);
+				return {
+					type: "selected",
+					repositories: [only],
+					routingMethod: "single-repository",
+				};
+			}
 		}
 
 		this.logger.info(

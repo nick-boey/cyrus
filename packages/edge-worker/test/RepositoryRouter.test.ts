@@ -1432,7 +1432,19 @@ describe("RepositoryRouter", () => {
 
 	describe("Workspace Fallback & Edge Cases", () => {
 		describe("when single repository exists", () => {
-			it("should request user selection when single configured repository doesn't match routing", async () => {
+			// C-1 regression coverage: a sandbox handed exactly one repository must
+			// never elicit — even when that repository carries routing metadata
+			// (teamKeys/projectKeys/routingLabels/isDefault) forwarded from the
+			// router that happens not to match this issue. Before this fix, a
+			// non-matching-but-present teamKeys/etc. array defeated the deprecated
+			// implicit catch-all (which only fires when ALL of those are empty),
+			// so the sandbox fell through to `needs_selection` and posted a
+			// second "which repository?" elicitation for an issue the router had
+			// already routed — violating the "single-repository deployments are
+			// unaffected" guarantee and double-asking the user. See
+			// `RepositoryResolver.resolve`'s identical shortcut on the router
+			// side (`packages/router/src/RepositoryResolver.ts`).
+			it("should select the sole repository even when its associations don't match the issue", async () => {
 				// Given: Single repository with specific team configuration that doesn't match
 				const repo = env
 					.repository("repo-1", "Only Repo")
@@ -1450,8 +1462,55 @@ describe("RepositoryRouter", () => {
 					repo,
 				]);
 
-				// Then: No default assignment — request user selection
-				expectRouting(result).shouldNeedSelectionWithRepos(1);
+				// Then: The sole repository is selected, not elicited for
+				expectRouting(result).shouldSelectRepositoryVia(
+					repo,
+					"single-repository",
+				);
+			});
+
+			it("should select the sole repository when it has no routing metadata at all (unaffected by the fix)", async () => {
+				// Given: a single repository with no associations, matching the
+				// pre-registry (single-repository-deployment) baseline behaviour.
+				const repo = env.repository("repo-1", "Only Repo").asCatchAll().build();
+
+				const webhook = env
+					.webhook()
+					.forIssue("issue-1", "OTHER-123")
+					.inTeam("OTHER")
+					.build();
+
+				const result = await env.router.determineRepositoryForWebhook(webhook, [
+					repo,
+				]);
+
+				// Falls through the deprecated implicit catch-all before ever
+				// reaching the single-repository shortcut — either way, never
+				// needs_selection.
+				expectRouting(result).shouldSelectRepositoryVia(repo, "catch-all");
+			});
+
+			it("never returns needs_selection for a sole repository regardless of which routing tier is checked", async () => {
+				const repo = env
+					.repository("repo-1", "Only Repo")
+					.withProjects("SomeProject")
+					.build();
+
+				const webhook = env
+					.webhook()
+					.forIssue("issue-1", "OTHER-123")
+					.inTeam("OTHER")
+					.build();
+
+				const result = await env.router.determineRepositoryForWebhook(webhook, [
+					repo,
+				]);
+
+				expect(result.type).not.toBe("needs_selection");
+				expectRouting(result).shouldSelectRepositoryVia(
+					repo,
+					"single-repository",
+				);
 			});
 		});
 

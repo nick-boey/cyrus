@@ -54,6 +54,16 @@ const BOB: Creator = {
 	email: "bob@example.com",
 	name: "Bob",
 };
+/**
+ * NOT enrolled with any user (`findUserForCreator` finds nothing for it) —
+ * stands in for an app/automation-attributed creator, or a creator whose
+ * enrollment was revoked mid-issue. Used for the M-1 regression below.
+ */
+const UNKNOWN_CREATOR: Creator = {
+	id: "app-actor",
+	email: "automation@example.com",
+	name: "Some Automation",
+};
 
 /** Minimal object that satisfies isAgentSessionCreatedWebhook + fields we read. */
 function createdEvent(opts: {
@@ -164,6 +174,50 @@ describe("EventRouter repository selection", () => {
 	});
 
 	/**
+	 * Regression for Important review finding I-2: `baseBranchOverrides`
+	 * originates in an issue description's `[repo=name#branch]` tag
+	 * (`parseRepoTags`), never passes through `validateRegisteredRepository`
+	 * (the gate added for exactly this shell sink), and is persisted verbatim
+	 * into `RepositoryConfig.baseBranch`, which reaches a double-quoted shell
+	 * interpolation in `GitService.ts` inside a worker container.
+	 * `parseRepoTags`' charset allows both a leading `-` (git treats a
+	 * ref-shaped argument starting with `-` as an option) and `..`
+	 * (path-traversal-flavoured ref), which is exactly what `BASE_BRANCH_RE`
+	 * exists to exclude. `persistDecision` must drop an override that fails
+	 * that pattern rather than storing it, so nothing invalid ever reaches
+	 * `CYRUS_REPOS_JSON`.
+	 */
+	it("drops a base branch override from a [repo=...] tag that fails BASE_BRANCH_RE instead of persisting it", async () => {
+		const { router, created } = harness([API], {
+			description: "[repo=cyrus-api#-bad]",
+		});
+		await router.route(created);
+
+		const decision = store.getIssueRepositories("NOR-1");
+		expect(decision).toMatchObject({
+			repoNames: ["cyrus-api"],
+			method: "description-tag",
+		});
+		expect(decision?.baseBranchOverrides).toEqual({});
+	});
+
+	it("keeps a base branch override from a [repo=...] tag that passes BASE_BRANCH_RE", async () => {
+		const { router, created } = harness([API], {
+			description: "[repo=cyrus-api#release/1.2.x]",
+		});
+		await router.route(created);
+
+		const decision = store.getIssueRepositories("NOR-1");
+		expect(decision).toMatchObject({
+			repoNames: ["cyrus-api"],
+			method: "description-tag",
+		});
+		expect(decision?.baseBranchOverrides).toEqual({
+			"cyrus-api": "release/1.2.x",
+		});
+	});
+
+	/**
 	 * Regression for a Critical review finding: gating router-side repository
 	 * pre-selection on `containers` being configured only rules out
 	 * deployments with NO container path at all. A router WITH `containers`
@@ -218,6 +272,61 @@ describe("EventRouter repository selection", () => {
 		// Routed to his physical device exactly as pre-Task-9/10/11 behaviour:
 		// no container device was minted for him.
 		expect(store.getContainerDeviceForIssue("NOR-2")).toBeUndefined();
+		expect(enqueued).toHaveLength(1);
+		expect(JSON.parse(enqueued[0] as string).action).toBe("created");
+	});
+
+	/**
+	 * Regression for Minor review finding M-1: `isKnownPhysicalDeviceCreator`
+	 * only mirrors `resolveTarget`'s CREATOR branch, not its issue-affinity
+	 * fallback. An issue that already has affinity to a physical device (from
+	 * an earlier, properly-attributed webhook) must still skip the router-side
+	 * repository gate for a LATER webhook on that same issue whose creator the
+	 * router can't identify (an app/automation actor, or a revoked
+	 * enrollment) — otherwise the router elicits once, and the device's own
+	 * EdgeWorker elicits again for the same issue.
+	 */
+	it("skips the router-side repository gate for an unrecognized creator when the issue already has affinity to a physical device", async () => {
+		const { router, resolveSpy } = harness([API, WEB], { teamKey: "NOR" });
+
+		// Establish issue affinity to Bob's physical device via a normal,
+		// properly-attributed webhook first.
+		store.addUser({ email: BOB.email });
+		const code = store.mintEnrollmentCode(BOB.email, 1);
+		const bobDevice = store.redeemEnrollmentCode(code, 1);
+		if (!bobDevice) throw new Error("enrolling Bob's physical device failed");
+
+		const bobCreated = createdEvent({
+			sessionId: "sess-bob-1",
+			issueId: "issue-bob-1",
+			identifier: "NOR-2",
+			creator: BOB,
+		});
+		await router.route(bobCreated);
+		expect(store.getIssueAffinity("issue-bob-1")).toBe(bobDevice.deviceId);
+		resolveSpy.mockClear();
+		postRepositorySelection.mockClear();
+		enqueued.length = 0;
+
+		// A SECOND agent session on the SAME issue, but this time the creator
+		// is one the router cannot resolve to any enrolled user at all — e.g.
+		// an app/automation mention. `[API, WEB]` tie, so if the router-side
+		// gate ran here it would post a second "which repository?" elicitation
+		// on top of the one Bob's own device is about to post.
+		const secondCreated = createdEvent({
+			sessionId: "sess-bob-2",
+			issueId: "issue-bob-1",
+			identifier: "NOR-2",
+			creator: UNKNOWN_CREATOR,
+		});
+		await router.route(secondCreated);
+
+		expect(resolveSpy).not.toHaveBeenCalled();
+		expect(postRepositorySelection).not.toHaveBeenCalled();
+		expect(store.getIssueRepositories("NOR-2")).toBeUndefined();
+		expect(store.getPendingRepoSelection("sess-bob-2")).toBeUndefined();
+		// Routed straight to Bob's physical device via the pre-existing issue
+		// affinity, exactly like the first webhook.
 		expect(enqueued).toHaveLength(1);
 		expect(JSON.parse(enqueued[0] as string).action).toBe("created");
 	});
@@ -287,6 +396,53 @@ describe("EventRouter repository selection", () => {
 			"created",
 			"prompted",
 		]);
+	});
+
+	/**
+	 * Regression for Important review finding I-1: `route()` is invoked as
+	 * `void this.eventRouter.route(event)` with no per-session serialization
+	 * (`RouterServer`), and `claimWebhook` only dedups byte-identical
+	 * deliveries — these two prompts carry no `createdAt`, so they aren't
+	 * deduped that way either. Before the fix, `resumeHeldSelection`'s
+	 * non-empty-options branch read the pending row, then awaited
+	 * `resolver.resolve(...)` before ever deleting it, so two prompts
+	 * "arriving" close together both saw the same pending row, both
+	 * `persistDecision`d, and both replayed the held `created` event —
+	 * `routeCreated` is called directly, bypassing `claimWebhook`, so nothing
+	 * else stood in the way of delivering the delegation twice (and, in
+	 * production, booting a container twice). The fix deletes the row
+	 * synchronously before the first `await`, so only the first of the two
+	 * concurrent calls still finds it.
+	 */
+	it("concurrent prompts answering the same held selection replay the held created event only once", async () => {
+		const { router, created, prompted } = harness([API, WEB], {
+			teamKey: "NOR",
+		});
+		await router.route(created);
+		enqueued.length = 0;
+
+		// Two distinct prompts, "arriving" concurrently — i.e. neither is
+		// awaited before the other starts, mirroring how RouterServer fires
+		// `route()` for each inbound webhook with no serialization between them.
+		// Neither call may reject: `route()` is invoked as `void route(event)`
+		// with no catch in production, so a rejection here would mean the fix
+		// could take the whole router process down.
+		await Promise.all([
+			router.route(prompted("cyrus-web")),
+			router.route(prompted("cyrus-web")),
+		]);
+
+		// The decision was persisted exactly once (persisting is idempotent so
+		// this alone wouldn't catch a double-run, but combined with the enqueue
+		// count below it demonstrates the replay itself only happened once).
+		expect(store.getIssueRepositories("NOR-1")).toMatchObject({
+			repoNames: ["cyrus-web"],
+			method: "user-selected",
+		});
+		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+		// The held `created` event was replayed exactly once, not twice.
+		const actions = enqueued.map((raw) => JSON.parse(raw).action);
+		expect(actions.filter((action) => action === "created")).toHaveLength(1);
 	});
 
 	it("reuses a stored decision without re-resolving or re-asking", async () => {
@@ -699,17 +855,21 @@ describe("EventRouter repository selection", () => {
 			store,
 			secrets,
 			executors: new Map([["aca", fakeExecutor("aca")]]),
-			// A separate stub from `registry` above: this file only exercises
-			// EventRouter's repository-selection gate (via `resolver`), never
-			// `ContainerTargets.buildEnv`/boot. Throwing (rather than merely
-			// leaving it unread) turns that "never read" claim into something a
-			// test failure would actually catch if it stopped being true.
+			// A separate stub from `registry` above. This file's assertions are
+			// all about EventRouter's repository-selection gate (via `resolver`) —
+			// but this registry is NOT unreachable: `routeCreated` can still boot
+			// a container as a fire-and-forget side effect (`deliverOrNotify`'s
+			// `containerTargets.boot(...)`, never awaited), and `bootInner` reads
+			// this registry to build the container's `CYRUS_REPOS_JSON`. An
+			// earlier version of this stub threw here on the theory that would
+			// turn an accidental read into a visible test failure; it does not —
+			// `bootInner` has its own try/catch around exactly this read and only
+			// logs a warning, so a throwing stub is silently swallowed and proves
+			// nothing either way. Kept empty and non-throwing: it only needs to
+			// satisfy `ContainerTargetService`'s required `registry` dependency,
+			// and its content is irrelevant to what this file actually asserts.
 			registry: {
-				list: vi.fn(async () => {
-					throw new Error(
-						"ContainerTargets.registry should never be read in this file",
-					);
-				}),
+				list: vi.fn(async () => ({ repositories: [] })),
 				put: vi.fn(async () => ({ version: "1" })),
 			},
 			containersConfig: {
