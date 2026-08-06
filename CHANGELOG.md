@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- Container sessions can now build and test Rust projects: `cargo`, `rustc`, `rustfmt`, and `clippy` are preinstalled, along with the C toolchain crates need to link. Cloud workers can also reach Cargo's crate index and rustup's toolchain downloads, so a repo that pins a Rust version in `rust-toolchain.toml` still works under deny-by-default network egress.
+- Container sessions can now build and test Rust projects: `cargo`, `rustc`, `rustfmt`, and `clippy` are preinstalled, along with the C toolchain crates need to link. Cloud workers can also reach Cargo's crate index and rustup's toolchain downloads, so a repo that pins a Rust version in `rust-toolchain.toml` still works under deny-by-default network egress. ([#16](https://github.com/nick-boey/cyrus/pull/16))
 - Router hosts can now turn on a `/setup` page so teammates manage their own container credentials (Claude token, GitHub token, and so on) from a browser, instead of asking an admin to run `cyrus router secrets set` for them. It is off by default and an operator has to choose how sign-in is verified before it will start.
 - `cyrus router secrets migrate --from keyvault --to table [--dry-run]` moves a router's per-user secrets onto the new Table-backed storage option without ever printing a value, for operators who want its "someone else changed this while you were editing" protection.
 - Startup now reports the health of each MCP server — connected, degraded and retrying, or skipped — so a Linear or `cyrus-tools` server that fails to come up is visible instead of only showing up as tools mysteriously missing mid-session.
