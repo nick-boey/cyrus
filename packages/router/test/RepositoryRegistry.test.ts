@@ -240,7 +240,7 @@ describe("toRoutable", () => {
 });
 
 describe("seedRepositoryRegistry", () => {
-	const logger = () => (testLogger());
+	const logger = () => testLogger();
 
 	it("writes the configured repositories into an empty registry", async () => {
 		const registry = new FileRepositoryRegistry(freshPath());

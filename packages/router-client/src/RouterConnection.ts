@@ -245,7 +245,8 @@ export class RouterConnection extends EventEmitter {
 		// still drives the watchdog.
 		this.now = opts.now ?? (() => Date.now());
 		this.serverHeartbeatMs = opts.serverHeartbeatMs ?? HEARTBEAT_INTERVAL_MS;
-		this.logger = opts.logger ?? createLogger({ component: "RouterConnection" });
+		this.logger =
+			opts.logger ?? createLogger({ component: "RouterConnection" });
 
 		mkdirSync(opts.stateDir, { recursive: true });
 		this.stateFile = join(opts.stateDir, "router-connection.json");

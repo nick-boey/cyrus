@@ -426,10 +426,10 @@ describe("ContainerLifecycle", () => {
 
 		await expect(lifecycle.sweep()).resolves.toBeUndefined();
 
-		expect(logger.error).toHaveBeenCalled();
 		// The cause is now passed through as an Error arg rather than interpolated.
-		expect((logger.error.mock.calls[0]?.[1] as Error).message).toContain(
-			"SQLITE_BUSY",
+		expect(logger.error).toHaveBeenCalledWith(
+			expect.stringContaining("failed to list container devices"),
+			expect.objectContaining({ message: "SQLITE_BUSY" }),
 		);
 	});
 

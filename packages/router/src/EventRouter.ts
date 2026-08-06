@@ -1,10 +1,10 @@
 import {
 	type AgentEvent,
 	type AgentSessionCreatedWebhook,
+	type ILogger,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isIssueDeletedWebhook,
-	type ILogger,
 	isIssueStateChangeWebhook,
 	type Webhook,
 } from "cyrus-core";

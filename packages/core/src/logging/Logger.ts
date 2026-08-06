@@ -409,7 +409,8 @@ function toJsonSafe(value: unknown): unknown {
 		};
 	}
 	if (typeof value === "bigint") return value.toString();
-	if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`;
+	if (typeof value === "function")
+		return `[Function ${value.name || "anonymous"}]`;
 	if (typeof value === "undefined") return null;
 	return value;
 }

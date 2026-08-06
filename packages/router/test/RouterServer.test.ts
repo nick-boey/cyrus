@@ -578,8 +578,11 @@ describe("RouterServer containers wiring", () => {
 		);
 
 		await vi.waitFor(() =>
-			expect(logger.warn).toHaveBeenCalledWith(
-				expect.stringContaining("is not fully authenticated"),
+			expect(logger.error).toHaveBeenCalledWith(
+				expect.stringContaining("Container boot failed"),
+				expect.objectContaining({
+					message: expect.stringContaining("is not fully authenticated"),
+				}),
 			),
 		);
 		expect(docker.ensureRunning).not.toHaveBeenCalled();

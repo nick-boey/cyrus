@@ -438,10 +438,7 @@ export class ContainerTargetService {
 			);
 			this.bootFailedNotified.delete(issueKey);
 		} catch (err) {
-			this.deps.logger.error(
-				`Container boot failed for ${issueKey}`,
-				err,
-			);
+			this.deps.logger.error(`Container boot failed for ${issueKey}`, err);
 			if (notify && !this.bootFailedNotified.has(issueKey)) {
 				this.bootFailedNotified.add(issueKey);
 				try {

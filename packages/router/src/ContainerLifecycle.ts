@@ -216,10 +216,7 @@ export class ContainerLifecycle {
 					}
 				}
 			} catch (err) {
-				this.logger.error(
-					`Lifecycle sweep failed for ${row.issueKey}`,
-					err,
-				);
+				this.logger.error(`Lifecycle sweep failed for ${row.issueKey}`, err);
 			}
 		}
 
