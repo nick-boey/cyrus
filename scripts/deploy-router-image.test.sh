@@ -15,9 +15,9 @@ FAILURES=0
 ok()   { echo "ok   — $*"; }
 fail() { echo "FAIL — $*" >&2; FAILURES=$((FAILURES + 1)); }
 
-OLD_REF="acrcyrusdev.azurecr.io/cyrus-router@sha256:$(printf '3%.0s' {1..64})"
-NEW_REF="acrcyrusdev.azurecr.io/cyrus-router@sha256:$(printf 'a%.0s' {1..64})"
-NEW_COMMENT="# This digest is tagged sha-9f49d67 in acrcyrusdev."
+OLD_REF="acrexample.azurecr.io/cyrus-router@sha256:$(printf '3%.0s' {1..64})"
+NEW_REF="acrexample.azurecr.io/cyrus-router@sha256:$(printf 'a%.0s' {1..64})"
+NEW_COMMENT="# This digest is tagged sha-9f49d67 in acrexample."
 
 make_fixture() {
   cat >"$1" <<EOF
@@ -25,10 +25,10 @@ location = "australiaeast"
 
 # ---- Container images -------------------------------------------------------
 # Deployed by DIGEST (that is what the live Container App template holds).
-# This digest is tagged sha-0dc73a1 in acrcyrusdev.
+# This digest is tagged sha-0dc73a1 in acrexample.
 router_image = "${OLD_REF}"
 
-worker_image  = "acrcyrusdev.azurecr.io/cyrus-worker:sha-a5a9ffc"
+worker_image  = "acrexample.azurecr.io/cyrus-worker:sha-a5a9ffc"
 linear_client_secret = "SECRET_MUST_SURVIVE"
 EOF
   chmod 600 "$1"
@@ -113,15 +113,15 @@ fi
 # manual cross-check that caught the 2026-07-31 incident.
 j="$WORK/e.tfvars"
 cat >"$j" <<EOF
-# This digest is tagged sha-0dc73a1 in acrcyrusdev.
+# This digest is tagged sha-0dc73a1 in acrexample.
 router_image = "${OLD_REF}"
 
-# This digest is tagged sha-a5a9ffc in acrcyrusdev.
-worker_image = "acrcyrusdev.azurecr.io/cyrus-worker:sha-a5a9ffc"
+# This digest is tagged sha-a5a9ffc in acrexample.
+worker_image = "acrexample.azurecr.io/cyrus-worker:sha-a5a9ffc"
 EOF
 chmod 600 "$j"
 rewrite_router_image "$j" "$NEW_REF" "$NEW_COMMENT"
-if grep -qF '# This digest is tagged sha-a5a9ffc in acrcyrusdev.' "$j" \
+if grep -qF '# This digest is tagged sha-a5a9ffc in acrexample.' "$j" \
    && [[ "$(grep -cF "$NEW_COMMENT" "$j")" == "1" ]]; then
   ok "rewrites only router_image's provenance comment"
 else
@@ -144,7 +144,7 @@ before="$(cat "$k")"
 stub_dir="$WORK/stub-bin"; mkdir -p "$stub_dir"
 cat >"$stub_dir/awk" <<STUB
 #!/usr/bin/env bash
-printf '# This digest is tagged sha-9f49d67 in acrcyrusdev.\nrouter_image = "%s"\n' "\$REWRITE_REF"
+printf '# This digest is tagged sha-9f49d67 in acrexample.\nrouter_image = "%s"\n' "\$REWRITE_REF"
 exit 2
 STUB
 chmod +x "$stub_dir/awk"

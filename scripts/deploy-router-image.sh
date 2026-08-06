@@ -120,10 +120,19 @@ rewrite_router_image() {
   TMP_TFVARS=""
 }
 
-REGISTRY="${REGISTRY:-acrcyrusdev}"
 REPO="${REPO:-cyrus-router}"
 TF_DIR="${TF_DIR:-infra/azure/terraform}"
 TFVARS="${TFVARS:-infra/azure/terraform/env/dev.tfvars}"
+
+# The registry is deliberately NOT hard-coded: it names a specific deployment's
+# infrastructure, and this file is committed. It is read from the ACR host
+# already present in the tfvars' router_image (which is gitignored), so the
+# common zero-argument invocation still works, and can be overridden with
+# REGISTRY= for a different registry or a first-ever deploy whose tfvars has no
+# usable ref yet.
+if [[ -z "${REGISTRY:-}" && -f "$TFVARS" ]]; then
+  REGISTRY="$(sed -nE 's/^[[:space:]]*router_image[[:space:]]*=[[:space:]]*"([^."]+)\.azurecr\.io\/.*/\1/p' "$TFVARS" | head -1)"
+fi
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -158,6 +167,7 @@ main() {
   az account show >/dev/null 2>&1 || die "not logged in to Azure — run 'az login'"
   [[ -f "$TFVARS" ]] || die "tfvars not found: $TFVARS"
   [[ -d "$TF_DIR/.terraform" ]] || die "terraform not initialized in $TF_DIR — run 'terraform -chdir=$TF_DIR init'"
+  [[ -n "${REGISTRY:-}" ]] || die "could not determine the ACR name from router_image in ${TFVARS}; set REGISTRY=<acr-name>"
 
   # -chdir makes a relative -var-file resolve against TF_DIR rather than the
   # caller's cwd, which breaks silently the moment TFVARS is overridden.

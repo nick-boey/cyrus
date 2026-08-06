@@ -69,7 +69,7 @@ import {
 } from "../src/KeyVaultTokenStore.js";
 
 const VAULT = "https://example.vault.azure.net";
-const WS = "75294f85-72ad-42ef-b9d7-c6ded611fc42";
+const WS = "<linear-workspace-id>";
 
 const envelope = {
 	refreshToken: "rt-2",
@@ -717,11 +717,11 @@ Add a new test:
 test("maps CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL into linearTokenStore", () => {
 	const result = run({
 		CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL:
-			"https://kv-cyrus-dev.vault.azure.net/",
+			"https://<key-vault-name>.vault.azure.net/",
 	});
 	assert.equal(result.status, 0, result.stderr);
 	assert.deepEqual(result.config.linearTokenStore, {
-		keyVaultUrl: "https://kv-cyrus-dev.vault.azure.net/",
+		keyVaultUrl: "https://<key-vault-name>.vault.azure.net/",
 	});
 });
 ```
@@ -1369,8 +1369,8 @@ cyrus --env-file /secure/path/linear-app.env self-auth-linear
 # update linear_workspace_token + linear_workspace_refresh_token in tfvars,
 # then apply so the Key Vault secrets are updated:
 terraform -chdir=infra/azure/terraform apply -var-file=dev.tfvars
-az containerapp revision restart -g rg-cyrus -n app-cyrus-dev-router \
-  --revision "$(az containerapp show -g rg-cyrus -n app-cyrus-dev-router \
+az containerapp revision restart -g <resource-group> -n <router-app-name> \
+  --revision "$(az containerapp show -g <resource-group> -n <router-app-name> \
     --query properties.latestRevisionName -o tsv)"
 cyrus router linear status   # expect: ok
 ```
@@ -1426,7 +1426,7 @@ The unit tests cannot prove the Key Vault round-trip works against real Azure. A
 
 1. `cyrus router linear status` → every workspace `ok`, source `config` on the first start.
 2. Wait for one refresh (or force one), then confirm the secret exists:
-   `az keyvault secret show --vault-name kv-cyrus-dev --name cyrus-linear-refresh-<workspaceId> --query attributes.updated -o tsv`
+   `az keyvault secret show --vault-name <key-vault-name> --name cyrus-linear-refresh-<workspaceId> --query attributes.updated -o tsv`
 3. Restart the router revision. `cyrus router linear status` → source `keyvault`, status `ok`.
 4. Confirm no `Token refresh failed: 400` appears in Log Analytics in the following 48 hours.
 

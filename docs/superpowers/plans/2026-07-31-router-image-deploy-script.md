@@ -67,9 +67,9 @@ FAILURES=0
 ok()   { echo "ok   — $*"; }
 fail() { echo "FAIL — $*" >&2; FAILURES=$((FAILURES + 1)); }
 
-OLD_REF="acrcyrusdev.azurecr.io/cyrus-router@sha256:$(printf '3%.0s' {1..64})"
-NEW_REF="acrcyrusdev.azurecr.io/cyrus-router@sha256:$(printf 'a%.0s' {1..64})"
-NEW_COMMENT="# This digest is tagged sha-9f49d67 in acrcyrusdev."
+OLD_REF="<acr-name>.azurecr.io/cyrus-router@sha256:$(printf '3%.0s' {1..64})"
+NEW_REF="<acr-name>.azurecr.io/cyrus-router@sha256:$(printf 'a%.0s' {1..64})"
+NEW_COMMENT="# This digest is tagged sha-9f49d67 in <acr-name>."
 
 make_fixture() {
   cat >"$1" <<EOF
@@ -77,10 +77,10 @@ location = "australiaeast"
 
 # ---- Container images -------------------------------------------------------
 # Deployed by DIGEST (that is what the live Container App template holds).
-# This digest is tagged sha-0dc73a1 in acrcyrusdev.
+# This digest is tagged sha-0dc73a1 in <acr-name>.
 router_image = "${OLD_REF}"
 
-worker_image  = "acrcyrusdev.azurecr.io/cyrus-worker:sha-a5a9ffc"
+worker_image  = "<acr-name>.azurecr.io/cyrus-worker:sha-a5a9ffc"
 linear_client_secret = "SECRET_MUST_SURVIVE"
 EOF
   chmod 600 "$1"
@@ -290,7 +290,7 @@ fi
 with:
 
 ```bash
-REGISTRY="${REGISTRY:-acrcyrusdev}"
+REGISTRY="${REGISTRY:-<acr-name>}"
 REPO="${REPO:-cyrus-router}"
 TF_DIR="${TF_DIR:-infra/azure/terraform}"
 TFVARS="${TFVARS:-infra/azure/terraform/env/dev.tfvars}"
