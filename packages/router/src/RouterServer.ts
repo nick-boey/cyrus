@@ -624,8 +624,9 @@ export class RouterServer {
 				void this.eventRouter
 					.reconcileDeviceLocks(deviceId, activeSessions)
 					.catch((err: unknown) => {
-						this.logger.warn(
-							`reconcileDeviceLocks failed for device ${deviceId}: ${String(err)}`,
+						this.logger.error(
+							`reconcileDeviceLocks failed for device ${deviceId}`,
+							err,
 						);
 					});
 				// Affinity leaks independently of locks: routePrompted writes affinity
@@ -637,8 +638,9 @@ export class RouterServer {
 						Date.now(),
 					);
 				} catch (err: unknown) {
-					this.logger.warn(
-						`reconcileDeviceAffinity failed for device ${deviceId}: ${String(err)}`,
+					this.logger.error(
+						`reconcileDeviceAffinity failed for device ${deviceId}`,
+						err,
 					);
 				}
 			},
@@ -716,10 +718,10 @@ export class RouterServer {
 			// affected by the failure. Logging here lets the tick degrade to a
 			// warning and the next interval retry.
 			this.eventRouter.sweepExpired().catch((err: unknown) => {
-				this.logger.warn(`event sweep failed: ${String(err)}`);
+				this.logger.error("Event sweep failed", err);
 			});
 			this.containerLifecycle?.sweep().catch((err: unknown) => {
-				this.logger.warn(`container lifecycle sweep failed: ${String(err)}`);
+				this.logger.error("Container lifecycle sweep failed", err);
 			});
 		}, SWEEP_INTERVAL_MS);
 		this.stateBackup?.start();
@@ -860,9 +862,7 @@ export class RouterServer {
 			containers.repositories,
 			this.logger,
 		).catch((error: unknown) => {
-			this.logger.warn(
-				`Could not seed the repository registry: ${String(error)}`,
-			);
+			this.logger.error("Could not seed the repository registry", error);
 		});
 
 		const containerTargets = new ContainerTargetService({

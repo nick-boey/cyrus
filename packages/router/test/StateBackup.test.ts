@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RouterStore } from "../src/RouterStore.js";
 import { StateBackup } from "../src/StateBackup.js";
+import { testLogger } from "./helpers/logger.js";
 
 describe("StateBackup", () => {
 	afterEach(() => vi.useRealTimers());
@@ -107,7 +108,7 @@ describe("StateBackup", () => {
 	it("logs runtime failures and resolves so the next tick can retry", async () => {
 		const dbPath = path();
 		const store = new RouterStore(dbPath);
-		const logger = { info: vi.fn(), warn: vi.fn() };
+		const logger = testLogger();
 		const fetchFn = vi
 			.fn()
 			.mockResolvedValueOnce(new Response("no", { status: 500 }))
@@ -123,8 +124,9 @@ describe("StateBackup", () => {
 		await expect(backup.flush()).resolves.toBeUndefined();
 		await expect(backup.flush()).resolves.toBeUndefined();
 		expect(fetchFn).toHaveBeenCalledTimes(2);
-		expect(logger.warn).toHaveBeenCalledWith(
-			expect.stringContaining("router state backup failed"),
+		expect(logger.error).toHaveBeenCalledWith(
+			expect.stringContaining("Router state backup failed"),
+			expect.anything(),
 		);
 		store.close();
 	});

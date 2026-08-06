@@ -9,6 +9,7 @@ import {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
 } from "../src/TerminalTeardown.js";
+import { testLogger } from "./helpers/logger.js";
 
 function executor(destroy = vi.fn(async () => {})): ContainerExecutor {
 	return {
@@ -32,7 +33,7 @@ describe("TerminalTeardown", () => {
 	beforeEach(() => {
 		store = new RouterStore(":memory:");
 		artifactsDir = mkdtempSync(join(tmpdir(), "terminal-artifacts-"));
-		logger = { info: vi.fn(), warn: vi.fn() };
+		logger = testLogger();
 	});
 
 	function container(issueKey = "CYPACK-1") {

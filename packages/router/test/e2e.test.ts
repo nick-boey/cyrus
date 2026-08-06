@@ -48,6 +48,7 @@ import {
 	PROMPT_REJECTION_MESSAGE,
 } from "../src/messages.js";
 import { RouterServer } from "../src/RouterServer.js";
+import { silentLogger } from "./helpers/logger.js";
 
 const WORKSPACE = "ws-1";
 
@@ -249,7 +250,7 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 			trackerFactory: () => tracker,
 			// Large enough that no ping fires mid-test; server.stop() clears it.
 			heartbeatMs: 30_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 		});
 		await server.start();
 	});

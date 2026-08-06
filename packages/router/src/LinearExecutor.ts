@@ -164,6 +164,12 @@ export class LinearExecutor {
 
 			return response;
 		} catch (err) {
+			// The device only ever sees the flattened message in the rpc_response
+			// frame; without this line the stack never reaches the router's logs.
+			this.logger.error(
+				`RPC ${frame.method} from device ${deviceId} failed`,
+				err,
+			);
 			return fail(id, err instanceof Error ? err.message : String(err));
 		}
 	}
@@ -252,8 +258,9 @@ export class LinearExecutor {
 		try {
 			issue = await tracker.fetchIssue(issueId);
 		} catch (error) {
-			this.logger.warn(
-				`Could not fetch issue ${issueId} for repository routing: ${String(error)}`,
+			this.logger.error(
+				`Could not fetch issue ${issueId} for repository routing`,
+				error,
 			);
 			return undefined;
 		}

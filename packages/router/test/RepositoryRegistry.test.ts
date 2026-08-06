@@ -10,6 +10,7 @@ import {
 	validateRegisteredRepository,
 } from "../src/RepositoryRegistry.js";
 import { SetupConflictError } from "../src/TableSecretStore.js";
+import { testLogger } from "./helpers/logger.js";
 
 function freshPath(): string {
 	return join(
@@ -239,7 +240,7 @@ describe("toRoutable", () => {
 });
 
 describe("seedRepositoryRegistry", () => {
-	const logger = () => ({ info: vi.fn(), warn: vi.fn() });
+	const logger = () => (testLogger());
 
 	it("writes the configured repositories into an empty registry", async () => {
 		const registry = new FileRepositoryRegistry(freshPath());

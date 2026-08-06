@@ -296,10 +296,9 @@ export class EventRouter {
 		try {
 			claimed = this.store.claimWebhookEvent(key, this.now());
 		} catch (err) {
-			this.logger.warn(
-				`Could not claim idempotency key ${key} for webhook ${label}; routing it without duplicate protection: ${
-					err instanceof Error ? err.message : String(err)
-				}`,
+			this.logger.error(
+				`Could not claim idempotency key ${key} for webhook ${label}; routing it without duplicate protection`,
+				err,
 			);
 			return true;
 		}
@@ -350,7 +349,8 @@ export class EventRouter {
 					);
 				} catch (error) {
 					this.logger.warn(
-						`Could not remove retained artifact bundle for deleted issue ${issueRef}: ${String(error)}`,
+						`Could not remove retained artifact bundle for deleted issue ${issueRef}`,
+						error,
 					);
 				}
 			}
@@ -849,8 +849,9 @@ export class EventRouter {
 			// Never stash a held event for an elicitation that was never posted:
 			// nothing would ever arrive to release it, and the issue would sit
 			// silently forever. Fall back instead, and say so.
-			this.logger.warn(
-				`Failed to post the repository selection for ${issueKey}: ${String(error)}; routing to a fallback`,
+			this.logger.error(
+				`Failed to post the repository selection for ${issueKey}; routing to a fallback`,
+				error,
 			);
 			const fallback = resolver.fallbackDecision(outcome.candidates);
 			if (!fallback) return "held";
@@ -1079,9 +1080,8 @@ export class EventRouter {
 			}
 		} catch (err) {
 			this.logger.warn(
-				`Failed to move issue ${issueId} to a started state: ${
-					err instanceof Error ? err.message : String(err)
-				}`,
+				`Failed to move issue ${issueId} to a started state`,
+				err,
 			);
 		}
 	}
@@ -1196,8 +1196,9 @@ export class EventRouter {
 			try {
 				held = JSON.parse(pending.createdEvent) as SessionEvent;
 			} catch (error) {
-				this.logger.warn(
-					`Held created event for ${pending.issueKey} is ALSO unreadable: ${String(error)}; the delegation for this issue is lost`,
+				this.logger.error(
+					`Held created event for ${pending.issueKey} is ALSO unreadable; the delegation for this issue is lost`,
+					error,
 				);
 			}
 			if (held) {
@@ -1285,12 +1286,13 @@ export class EventRouter {
 			// unrelated-reply case actually falls through to normal prompt
 			// routing. Say which one this is, rather than always claiming the
 			// prompt is routed.
-			this.logger.warn(
-				`Held created event for ${pending.issueKey} is unreadable: ${String(error)}; ${
+			this.logger.error(
+				`Held created event for ${pending.issueKey} is unreadable; ${
 					selected
 						? "the repository selection was still applied, but the delegation itself is lost"
 						: "routing the prompt alone"
 				}`,
+				error,
 			);
 		}
 		if (held) {
@@ -1313,8 +1315,9 @@ export class EventRouter {
 				// `claimWebhook`'s doc comment), so letting this escape would take
 				// the whole router process down for every teammate over one failed
 				// replay.
-				this.logger.warn(
-					`Failed to replay the held delegation for ${pending.issueKey} after a repository selection: ${String(error)}; re-stashing it for retry`,
+				this.logger.error(
+					`Failed to replay the held delegation for ${pending.issueKey} after a repository selection; re-stashing it for retry`,
+					error,
 				);
 				this.store.createPendingRepoSelection({
 					agentSessionId: sessionId,
@@ -1565,10 +1568,9 @@ export class EventRouter {
 						// route this" message is a safer failure mode than either
 						// crashing the router or falling back silently to some other
 						// device.
-						this.logger.warn(
-							`Failed to resolve container device for ${user.email}: ${
-								err instanceof Error ? err.message : String(err)
-							}`,
+						this.logger.error(
+							`Failed to resolve container device for ${user.email}`,
+							err,
 						);
 						return undefined;
 					}

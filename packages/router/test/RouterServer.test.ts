@@ -18,6 +18,7 @@ import {
 	type RouterServerConfig,
 } from "../src/RouterServer.js";
 import { SecretStore } from "../src/SecretStore.js";
+import { testLogger } from "./helpers/logger.js";
 
 /**
  * Minimal fake ContainerExecutor whose ensureRunning is an inspectable mock
@@ -540,7 +541,7 @@ describe("RouterServer containers wiring", () => {
 			mkdtempSync(join(tmpdir(), "rs-secrets-")),
 			"s.json",
 		);
-		const logger = { info: vi.fn(), warn: vi.fn() };
+		const logger = testLogger();
 		server = new RouterServer({
 			port: 0,
 			dbPath: ":memory:",
