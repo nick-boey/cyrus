@@ -779,7 +779,7 @@ export class SetupBootstrap {
 ```ts
 /** Selects the Azure Table backend. Highest precedence; then keyVaultUrl; then the file store. */
 tableStore?: {
-	/** e.g. "https://stcyrusdev.table.core.windows.net" */
+	/** e.g. "https://<storage-account>.table.core.windows.net" */
 	endpoint: string;
 	/** Default "cyrussetup". */
 	tableName?: string;
@@ -2189,7 +2189,7 @@ export function setupPartitionKey(email: string): string {
 }
 
 export interface TableSecretStoreOptions {
-	/** e.g. "https://stcyrusdev.table.core.windows.net" */
+	/** e.g. "https://<storage-account>.table.core.windows.net" */
 	tableEndpoint: string;
 	tableName?: string;
 	/** Versioned Key Vault key id used as the KEK. */

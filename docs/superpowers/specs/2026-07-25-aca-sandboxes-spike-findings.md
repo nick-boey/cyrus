@@ -2,8 +2,8 @@
 
 > Companion to `docs/superpowers/plans/2026-07-25-container-executors-azure-aca-sandboxes.md`.
 > **Run date:** 2026-07-26
-> **Environment:** subscription `dit-development` (`1efb7cc3-4a62-4f9b-9c01-d9f532c0c526`),
-> tenant `c9857cc6-…` (Northrop), resource group `rg-cyrus-aca-spike`, region **australiaeast**,
+> **Environment:** subscription `dit-development` (`<subscription-id>`),
+> tenant `c9857cc6-…` (Northrop), resource group `<resource-group>-aca-spike`, region **australiaeast**,
 > sandbox group `cyrus-spike-grp`.
 > **Cost posture:** all sandboxes, snapshots and disk images created during the spike were
 > deleted at the end of the run. Only the (compute-free) sandbox group remains.
@@ -581,7 +581,7 @@ re-check the pricing page at GA.
 ## Reproduction
 
 ```bash
-SUB=1efb7cc3-4a62-4f9b-9c01-d9f532c0c526; RG=rg-cyrus-aca-spike; GRP=cyrus-spike-grp
+SUB=<subscription-id>; RG=<resource-group>-aca-spike; GRP=cyrus-spike-grp
 BASE=https://management.australiaeast.azuredevcompute.io; AV=2026-02-01-preview
 ROOT="/subscriptions/$SUB/resourceGroups/$RG/sandboxGroups/$GRP"
 TOK=$(az account get-access-token --resource https://dynamicsessions.io --query accessToken -o tsv)
@@ -598,7 +598,7 @@ from the wire (`autoSuspendPolicy`), so verify against live HTTP rather than tru
 ## Teardown
 
 ```bash
-az group delete -n rg-cyrus-aca-spike --subscription 1efb7cc3-4a62-4f9b-9c01-d9f532c0c526 --yes
+az group delete -n <resource-group>-aca-spike --subscription <subscription-id> --yes
 ```
 
 Sandboxes, snapshots and disk images were already deleted; only the empty sandbox group remains.

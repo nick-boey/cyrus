@@ -1478,14 +1478,14 @@ The stale `7b6ab935-c718-4f42-892b-f51f060e8a30` row for device 10 is deliberate
 
 ```bash
 # Should log: Reclaimed stale affinity for session 7b6ab935… on device 10
-az containerapp logs show -n app-cyrus-dev-router -g rg-cyrus --tail 300 --format text \
+az containerapp logs show -n <router-app-name> -g <resource-group> --tail 300 --format text \
   | grep -i "reclaimed stale affinity"
 ```
 
 Then confirm the store agrees, using the blob backup:
 
 ```bash
-az storage blob download --account-name stcyrusdev -c router-backups -n router.db \
+az storage blob download --account-name <storage-account> -c router-backups -n router.db \
   -f /tmp/router.db --overwrite --auth-mode login -o none
 sqlite3 -header -column /tmp/router.db "SELECT session_id, device_id FROM session_affinity;"
 # Expected: no row for 7b6ab935-c718-4f42-892b-f51f060e8a30

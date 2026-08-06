@@ -46,11 +46,11 @@ test("optional Azure env is absent by default", () => {
 test("maps CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL into linearTokenStore", () => {
 	const result = run({
 		CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL:
-			"https://kv-cyrus-dev.vault.azure.net/",
+			"https://kv-example.vault.azure.net/",
 	});
 	assert.equal(result.status, 0, result.stderr);
 	assert.deepEqual(result.config.linearTokenStore, {
-		keyVaultUrl: "https://kv-cyrus-dev.vault.azure.net/",
+		keyVaultUrl: "https://kv-example.vault.azure.net/",
 	});
 });
 

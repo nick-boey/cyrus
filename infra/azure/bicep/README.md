@@ -41,7 +41,7 @@ full spike record.
 ```bash
 cp sandbox-group.bicepparam.example sandbox-group.bicepparam
 az deployment group create \
-  -g rg-cyrus-dev \
+  -g <resource-group> \
   -f sandbox-group.bicep \
   -p sandbox-group.bicepparam
 ```
@@ -49,16 +49,16 @@ az deployment group create \
 Or inline parameters:
 
 ```bash
-az deployment group create -g rg-cyrus-dev -f sandbox-group.bicep \
-  -p name=cyrus-dev-sandbox-grp location=australiaeast
+az deployment group create -g <resource-group> -f sandbox-group.bicep \
+  -p name=<sandbox-group-name> location=<region>
 ```
 
 The role-assignment module deploys separately (it references the group
 `existing`):
 
 ```bash
-az deployment group create -g rg-cyrus-dev -f sandbox-group-rbac.bicep \
-  -p sandboxGroupName=cyrus-dev-sandbox-grp \
+az deployment group create -g <resource-group> -f sandbox-group-rbac.bicep \
+  -p sandboxGroupName=<sandbox-group-name> \
      principalId=<router-UAI-principal-id>
 ```
 

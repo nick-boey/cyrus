@@ -167,8 +167,8 @@ step 4, once there is a build to pin. Set:
 - `operator_principal_id` to `az ad signed-in-user show --query id -o tsv` for
   backup break-glass access.
 
-Use an exact resource group such as `rg-cyrus` by setting
-`resource_group_name`; otherwise it defaults to `rg-<project>-<environment>`.
+Use an exact resource group by setting `resource_group_name`; otherwise it
+defaults to `rg-<project>-<environment>`.
 
 ### 3. Initialize and create bootstrap resources
 
@@ -222,27 +222,46 @@ The manual steps below remain the reference for the **worker** image, which the
 script does not handle: the worker is registered out of band as an ACA disk
 (`aca sandboxgroup disk create`) and `aca_disk_name` must move with it.
 
+Build with **`az acr build`**, not local `docker buildx --push`:
+
 ```bash
 cd "$REPO_ROOT"
-az acr login --name <acr-name>
 # Same shape as the `sha-<short-sha>` tag docker-router.yml publishes to GHCR.
 TAG="sha-$(git rev-parse --short=7 HEAD)"   # or a release tag: TAG=v1.2.3
 
-docker buildx build --platform linux/amd64 \
-  --file docker/router/Dockerfile \
-  --tag <acr-name>.azurecr.io/cyrus-router:$TAG --push .
-docker buildx build --platform linux/amd64 \
-  --file docker/worker/Dockerfile \
-  --tag <acr-name>.azurecr.io/cyrus-worker:$TAG --push .
+az acr build --registry <acr-name> --image cyrus-worker:$TAG \
+  --platform linux/amd64 --file docker/worker/Dockerfile \
+  --no-logs --query 'outputImages[0].digest' -o tsv .
 ```
 
-Set `router_image` and `worker_image` in `dev.tfvars` to those exact refs. For
-the strongest pin, resolve the pushed digest and use that instead of the tag:
+> **Do not build the worker image with `docker buildx --push`.** Recent buildx
+> attaches provenance/SBOM attestations by default, which makes the push an OCI
+> **image index** (`application/vnd.oci.image.index.v1+json`) carrying the real
+> `linux/amd64` manifest plus an `unknown/unknown` attestation child. Every
+> worker disk that has ever imported successfully is a plain
+> `application/vnd.docker.distribution.manifest.v2+json`. `az acr build`
+> produces that shape, and as a server-side build it also runs natively on
+> amd64 instead of under emulation on an arm64 workstation — minutes rather
+> than tens of minutes.
+>
+> To check what you pushed:
+>
+> ```bash
+> az acr manifest show <acr-name>.azurecr.io/cyrus-worker:$TAG \
+>   --query mediaType -o tsv
+> ```
+>
+> If you must use buildx, disable the attestations
+> (`--provenance=false --sbom=false`) and confirm the media type before
+> registering the disk.
+
+Set `worker_image` in `dev.tfvars` to that exact ref. For the strongest pin,
+use the digest the build printed instead of the tag:
 
 ```bash
-az acr manifest show-metadata <acr-name>.azurecr.io/cyrus-router:$TAG \
+az acr manifest show-metadata <acr-name>.azurecr.io/cyrus-worker:$TAG \
   --query digest -o tsv
-# → router_image = "<acr-name>.azurecr.io/cyrus-router@sha256:<64 hex>"
+# → worker_image = "<acr-name>.azurecr.io/cyrus-worker@sha256:<64 hex>"
 ```
 
 Confirm the build actually contains the commit you intend to deploy before you
@@ -295,6 +314,34 @@ unset ACR_TOKEN
 
 aca sandboxgroup disk list --group "$SANDBOX_GROUP"
 ```
+
+**Gate on `disk list` showing `Ready`, not on the exit code.** `aca
+sandboxgroup disk create` piped into another command (`| tail`, `| grep`)
+reports the *pipeline's* status, so a failed import reads as exit 0. The
+authoritative check is the disk appearing in `aca sandboxgroup disk list` with
+state `Ready`.
+
+> **`Error: Network issue — retry policy expired`.** This message is emitted
+> for any transport-level failure of the `PUT …/diskimages` call and is
+> frequently *not* a network fault. Before treating it as one:
+>
+> - Re-run with `--verbose`. A genuine network problem shows a real HTTP status;
+>   a client-side timeout shows `failed to execute 'reqwest' request` with no
+>   status, retried once, failing at roughly 120 s total (two ~60 s attempts).
+> - Confirm the pushed image is a plain Docker v2 manifest, not an OCI index
+>   (see step 4) — the importer cannot consume an index.
+> - Check reachability independently. `curl` a GET *and* a PUT against the same
+>   `…/diskimages` URL: a 401 from both means the endpoint and method are fine
+>   and the problem is not your egress path.
+> - Run `aca doctor` to rule out auth, region, group, and the
+>   *SandboxGroup Data Owner* role assignment.
+>
+> If all of those pass and the PUT still times out with no HTTP status, the
+> preview data-plane service is the remaining suspect; retry later rather than
+> rebuilding images. A failed registration changes nothing, so it is safe to
+> deploy the router alone and register the disk afterwards — an older worker
+> parses `CYRUS_REPOS_JSON` with a non-strict schema and ignores fields it does
+> not know, and the router scopes that list before the worker ever sees it.
 
 Wait for the disk state to become `Ready`. Private disks are created by their
 server-assigned disk ID; the router resolves the configured operator name from
@@ -1061,14 +1108,18 @@ cyrus --env-file /secure/path/linear-app.env self-auth-linear
 # update linear_workspace_token + linear_workspace_refresh_token in tfvars,
 # then apply so the Key Vault secrets are updated:
 terraform -chdir=infra/azure/terraform apply -var-file=dev.tfvars
-az containerapp revision restart -g rg-cyrus -n app-cyrus-dev-router \
-  --revision "$(az containerapp show -g rg-cyrus -n app-cyrus-dev-router \
+
+RG=$(terraform -chdir=infra/azure/terraform output -raw resource_group_name)
+APP=$(terraform -chdir=infra/azure/terraform output -raw router_app_name)
+
+az containerapp revision restart -g "$RG" -n "$APP" \
+  --revision "$(az containerapp show -g "$RG" -n "$APP" \
     --query properties.latestRevisionName -o tsv)"
 
 # Verify INSIDE the replica. Run from a laptop, `cyrus router linear status`
 # reads the laptop's ~/.cyrus/router-config.json, not the replica's
 # /data/router-config.json — same constraint as `cyrus router secrets set`.
-az containerapp exec --name app-cyrus-dev-router --resource-group rg-cyrus
+az containerapp exec --name "$APP" --resource-group "$RG"
 # Inside the replica:
 cyrus router linear status   # expect: ACCESS TOKEN = ok
 ```

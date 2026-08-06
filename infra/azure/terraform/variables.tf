@@ -76,7 +76,7 @@ variable "allow_mutable_image_tags" {
 }
 
 variable "router_url_for_containers" {
-  description = "WSS URL containers dial to reach the router (e.g. 'wss://app-cyrus-dev-router.<hash>.australiaeast.azurecontainerapps.io'). The router Container App's real ingress FQDN (`latest_revision_fqdn`) is only known AFTER first apply, so embedding it in the router's own env creates a Terraform dependency cycle. TWO-APPLY FLOW: set null on first apply (router boots with a placeholder, containers won't connect yet), then `terraform output router_wss_url`, paste that value into this var, and re-apply. See README → 'routerUrlForContainers two-apply flow'."
+  description = "WSS URL containers dial to reach the router (e.g. 'wss://<app-name>.<env-hash>.<region>.azurecontainerapps.io'). The router Container App's real ingress FQDN (`latest_revision_fqdn`) is only known AFTER first apply, so embedding it in the router's own env creates a Terraform dependency cycle. TWO-APPLY FLOW: set null on first apply (router boots with a placeholder, containers won't connect yet), then `terraform output router_wss_url`, paste that value into this var, and re-apply. See README → 'routerUrlForContainers two-apply flow'."
   type        = string
   default     = null
 }

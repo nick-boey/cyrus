@@ -5,7 +5,7 @@ import {
 } from "../src/KeyVaultTokenStore.js";
 
 const VAULT = "https://example.vault.azure.net";
-const WS = "75294f85-72ad-42ef-b9d7-c6ded611fc42";
+const WS = "11111111-2222-3333-4444-555555555555";
 
 const envelope = {
 	refreshToken: "rt-2",

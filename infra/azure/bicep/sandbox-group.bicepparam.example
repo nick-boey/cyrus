@@ -1,7 +1,7 @@
 // Example parameter file for sandbox-group.bicep.
 // Copy to sandbox-group.bicepparam and adjust. Deploy standalone with:
 //   az deployment group create \
-//     -g rg-cyrus-dev \
+//     -g <resource-group> \
 //     -f infra/azure/bicep/sandbox-group.bicep \
 //     -p infra/azure/bicep/sandbox-group.bicepparam
 
@@ -9,7 +9,7 @@ using 'sandbox-group.bicep'
 
 // Sandbox group name. Keep stable — the router embeds this in
 // CYRUS_ROUTER_CONTAINERS_JSON; renaming once workers exist strands them.
-param name = 'cyrus-dev-sandbox-grp'
+param name = '<sandbox-group-name>'
 
 // Spike S7: 35 regions supported; australiaeast verified for this tenant.
 param location = 'australiaeast'
