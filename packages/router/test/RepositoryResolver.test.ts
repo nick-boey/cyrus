@@ -4,6 +4,7 @@ import type {
 	RepositoryRegistry,
 } from "../src/RepositoryRegistry.js";
 import { RepositoryResolver } from "../src/RepositoryResolver.js";
+import { testLogger } from "./helpers/logger.js";
 
 const API: RegisteredRepository = {
 	name: "cyrus-api",
@@ -36,7 +37,7 @@ function resolver(
 	return new RepositoryResolver({
 		registry,
 		fetchIssueFacts: vi.fn(async () => facts as never),
-		logger: { info: vi.fn(), warn: vi.fn() },
+		logger: testLogger(),
 	});
 }
 
@@ -195,7 +196,7 @@ describe("RepositoryResolver.resolve", () => {
 	});
 
 	it("reports unavailable, distinctly from an empty registry, when the registry rejects", async () => {
-		const warn = vi.fn();
+		const error = vi.fn();
 		const registry: RepositoryRegistry = {
 			list: vi.fn(async () => {
 				throw new Error("Azure Table request failed: 503");
@@ -205,7 +206,7 @@ describe("RepositoryResolver.resolve", () => {
 		const instance = new RepositoryResolver({
 			registry,
 			fetchIssueFacts: vi.fn(async () => undefined),
-			logger: { info: vi.fn(), warn },
+			logger: testLogger({ error }),
 		});
 
 		const outcome = await instance.resolve({
@@ -217,8 +218,12 @@ describe("RepositoryResolver.resolve", () => {
 		expect(outcome.kind === "unavailable" && outcome.reason).not.toContain(
 			"No repositories are registered",
 		);
-		expect(warn).toHaveBeenCalledWith(
-			expect.stringContaining("Azure Table request failed: 503"),
+		// The cause now rides as an Error arg rather than being interpolated.
+		expect(error).toHaveBeenCalledWith(
+			expect.stringContaining("Could not read the repository registry"),
+			expect.objectContaining({
+				message: "Azure Table request failed: 503",
+			}),
 		);
 	});
 

@@ -562,10 +562,7 @@ export class RouterCommand extends BaseCommand {
 			oauth: this.resolveOAuthCredentials(),
 			onTokenRefresh: (workspaceId, tokens) =>
 				this.persistRefreshedTokens(configPath, workspaceId, tokens),
-			logger: {
-				info: (msg: string) => this.logger.info(msg),
-				warn: (msg: string) => this.logger.warn(msg),
-			},
+			logger: this.logger,
 			// The recommended production mode for /setup verifies the ID token the
 			// ACA token store forwards, rather than trusting proxy-injected headers.
 			// It needs its own verifier: the enrollment one pins the `api://`
@@ -1510,10 +1507,7 @@ export class RouterCommand extends BaseCommand {
 		containers: RouterServerConfig["containers"],
 	): SnapshotGcProvider | undefined {
 		return containers
-			? createAcaSandboxesProvider(containers, {
-					info: (msg) => this.logger.info(msg),
-					warn: (msg) => this.logger.warn(msg),
-				})
+			? createAcaSandboxesProvider(containers, this.logger)
 			: undefined;
 	}
 

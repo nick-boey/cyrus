@@ -1,7 +1,9 @@
 import {
 	AgentActivityContentType,
 	AgentActivitySignal,
+	createNoopLogger,
 	type IIssueTrackerService,
+	type ILogger,
 	type IssueFacts,
 } from "cyrus-core";
 import {
@@ -47,7 +49,7 @@ export interface LinearExecutorOptions {
 	/** Reject attachment bodies larger than this. Defaults to 20 MiB. */
 	attachmentMaxBytes?: number;
 	/** Defaults to a no-op logger, matching the rest of the package. */
-	logger?: { info(msg: string): void; warn(msg: string): void };
+	logger?: ILogger;
 }
 
 /**
@@ -62,7 +64,7 @@ export class LinearExecutor {
 	private readonly store: RouterStore;
 	private readonly workspaceTokens: Map<string, string>;
 	private readonly attachmentMaxBytes: number;
-	private readonly logger: { info(msg: string): void; warn(msg: string): void };
+	private readonly logger: ILogger;
 
 	constructor(opts: LinearExecutorOptions) {
 		this.trackers = opts.trackers;
@@ -70,7 +72,7 @@ export class LinearExecutor {
 		this.workspaceTokens = opts.workspaceTokens ?? new Map();
 		this.attachmentMaxBytes =
 			opts.attachmentMaxBytes ?? DEFAULT_ATTACHMENT_MAX_BYTES;
-		this.logger = opts.logger ?? { info: () => {}, warn: () => {} };
+		this.logger = opts.logger ?? createNoopLogger();
 	}
 
 	async dispatch(
@@ -162,6 +164,12 @@ export class LinearExecutor {
 
 			return response;
 		} catch (err) {
+			// The device only ever sees the flattened message in the rpc_response
+			// frame; without this line the stack never reaches the router's logs.
+			this.logger.error(
+				`RPC ${frame.method} from device ${deviceId} failed`,
+				err,
+			);
 			return fail(id, err instanceof Error ? err.message : String(err));
 		}
 	}
@@ -250,8 +258,9 @@ export class LinearExecutor {
 		try {
 			issue = await tracker.fetchIssue(issueId);
 		} catch (error) {
-			this.logger.warn(
-				`Could not fetch issue ${issueId} for repository routing: ${String(error)}`,
+			this.logger.error(
+				`Could not fetch issue ${issueId} for repository routing`,
+				error,
 			);
 			return undefined;
 		}

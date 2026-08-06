@@ -9,6 +9,7 @@ import {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
 } from "../src/TerminalTeardown.js";
+import { type TestLogger, testLogger } from "./helpers/logger.js";
 
 function executor(destroy = vi.fn(async () => {})): ContainerExecutor {
 	return {
@@ -24,15 +25,12 @@ function executor(destroy = vi.fn(async () => {})): ContainerExecutor {
 describe("TerminalTeardown", () => {
 	let store: RouterStore;
 	let artifactsDir: string;
-	let logger: {
-		info: ReturnType<typeof vi.fn>;
-		warn: ReturnType<typeof vi.fn>;
-	};
+	let logger: TestLogger;
 
 	beforeEach(() => {
 		store = new RouterStore(":memory:");
 		artifactsDir = mkdtempSync(join(tmpdir(), "terminal-artifacts-"));
-		logger = { info: vi.fn(), warn: vi.fn() };
+		logger = testLogger();
 	});
 
 	function container(issueKey = "CYPACK-1") {
@@ -148,8 +146,9 @@ describe("TerminalTeardown", () => {
 		expect(store.getDeviceInfo(deviceId)).toBeDefined();
 		expect(teardown.has("CYPACK-1")).toBe(true);
 		expect(timers.delays).toEqual([600_000, 60_000]);
-		expect(logger.warn).toHaveBeenCalledWith(
+		expect(logger.error).toHaveBeenCalledWith(
 			expect.stringContaining("retrying in 60000ms"),
+			expect.anything(),
 		);
 		timers.callbacks[1]?.();
 		await vi.waitFor(() => expect(destroy).toHaveBeenCalledTimes(2));
@@ -415,12 +414,14 @@ describe("TerminalTeardown", () => {
 			expect(logger.info).toHaveBeenCalledWith(
 				expect.stringContaining("is a retry of callback cb-1 (delivery #2)"),
 			);
-			expect(logger.warn).toHaveBeenCalledWith(
+			expect(logger.error).toHaveBeenCalledWith(
 				expect.stringContaining("after callback retry"),
+				expect.anything(),
 			);
 			// Grace expiry says something different: no worker ever reported in.
-			expect(logger.warn).not.toHaveBeenCalledWith(
+			expect(logger.error).not.toHaveBeenCalledWith(
 				expect.stringContaining("Terminal teardown grace expired"),
+				expect.anything(),
 			);
 			expect(store.getPendingTeardown("CYPACK-1")?.callbackAttempts).toBe(2);
 		});

@@ -1,3 +1,4 @@
+import type { ILogger } from "cyrus-core";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
 	normalizeSecretKey,
@@ -115,7 +116,7 @@ export interface SetupRouteDeps {
 	csrf: CsrfTokens;
 	/** Required when `auth.auth.mode === "entra-token"`; ignored otherwise. */
 	verifyIdToken?: SetupIdTokenVerifier;
-	logger: { info(msg: string): void; warn(msg: string): void };
+	logger: ILogger;
 	/** Test seam. Default 64 KiB, matching {@link parseFormBody}. */
 	maxFormBodyBytes?: number;
 }

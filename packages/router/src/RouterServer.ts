@@ -1,10 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
-import type {
-	AgentEvent,
-	IAgentEventTransport,
-	IIssueTrackerService,
+import {
+	type AgentEvent,
+	createNoopLogger,
+	type IAgentEventTransport,
+	type IIssueTrackerService,
+	type ILogger,
 } from "cyrus-core";
 import {
 	LinearIssueTrackerService,
@@ -267,7 +269,7 @@ export interface RouterServerConfig {
 	executorRegistryFactory?: (
 		containers: RouterContainersConfig,
 	) => ExecutorRegistry;
-	logger?: { info(msg: string): void; warn(msg: string): void };
+	logger?: ILogger;
 	/** Forwarded to {@link DeviceGateway} for heartbeat tuning in tests. */
 	heartbeatMs?: number;
 	/** Host to bind; defaults to 127.0.0.1. */
@@ -349,7 +351,7 @@ export class RouterServer {
 	private readonly gateway: DeviceGateway;
 	private readonly executor: LinearExecutor;
 	private readonly trackers: Map<string, IIssueTrackerService>;
-	private readonly logger: { info(msg: string): void; warn(msg: string): void };
+	private readonly logger: ILogger;
 	private transport: IAgentEventTransport | undefined;
 	private sweepInterval: NodeJS.Timeout | undefined;
 	private stateBackup: StateBackup | undefined;
@@ -385,7 +387,7 @@ export class RouterServer {
 			});
 		}
 		this.config = config;
-		this.logger = config.logger ?? { info: () => {}, warn: () => {} };
+		this.logger = config.logger ?? createNoopLogger();
 		this.store = new RouterStore(config.dbPath);
 		this.fastify = Fastify();
 
@@ -421,6 +423,7 @@ export class RouterServer {
 
 		this.gateway = new DeviceGateway(this.store, {
 			heartbeatMs: config.heartbeatMs,
+			logger: this.logger,
 		});
 
 		const artifactsDir =
@@ -621,8 +624,9 @@ export class RouterServer {
 				void this.eventRouter
 					.reconcileDeviceLocks(deviceId, activeSessions)
 					.catch((err: unknown) => {
-						this.logger.warn(
-							`reconcileDeviceLocks failed for device ${deviceId}: ${String(err)}`,
+						this.logger.error(
+							`reconcileDeviceLocks failed for device ${deviceId}`,
+							err,
 						);
 					});
 				// Affinity leaks independently of locks: routePrompted writes affinity
@@ -634,8 +638,9 @@ export class RouterServer {
 						Date.now(),
 					);
 				} catch (err: unknown) {
-					this.logger.warn(
-						`reconcileDeviceAffinity failed for device ${deviceId}: ${String(err)}`,
+					this.logger.error(
+						`reconcileDeviceAffinity failed for device ${deviceId}`,
+						err,
 					);
 				}
 			},
@@ -713,10 +718,10 @@ export class RouterServer {
 			// affected by the failure. Logging here lets the tick degrade to a
 			// warning and the next interval retry.
 			this.eventRouter.sweepExpired().catch((err: unknown) => {
-				this.logger.warn(`event sweep failed: ${String(err)}`);
+				this.logger.error("Event sweep failed", err);
 			});
 			this.containerLifecycle?.sweep().catch((err: unknown) => {
-				this.logger.warn(`container lifecycle sweep failed: ${String(err)}`);
+				this.logger.error("Container lifecycle sweep failed", err);
 			});
 		}, SWEEP_INTERVAL_MS);
 		this.stateBackup?.start();
@@ -857,9 +862,7 @@ export class RouterServer {
 			containers.repositories,
 			this.logger,
 		).catch((error: unknown) => {
-			this.logger.warn(
-				`Could not seed the repository registry: ${String(error)}`,
-			);
+			this.logger.error("Could not seed the repository registry", error);
 		});
 
 		const containerTargets = new ContainerTargetService({

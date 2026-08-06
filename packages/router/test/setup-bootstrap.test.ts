@@ -15,6 +15,7 @@ import {
 } from "../src/setup/bootstrap.js";
 import { SetupAuthError } from "../src/setup/principal.js";
 import { SetupConflictError } from "../src/TableSecretStore.js";
+import { testLogger } from "./helpers/logger.js";
 
 const REQUIRED = ["CLAUDE_CODE_OAUTH_TOKEN", "GIT_TOKEN"] as const;
 
@@ -34,7 +35,7 @@ function harness(
 ) {
 	const store = options.store ?? new RouterStore(":memory:");
 	const secrets = options.secrets ?? new FileSecretStore(tempSecretsFile());
-	const logger = { info: vi.fn(), warn: vi.fn() };
+	const logger = testLogger();
 	const bootstrap = new SetupBootstrap({
 		store,
 		secrets,

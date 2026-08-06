@@ -37,6 +37,7 @@ import { webhookIdempotencyKey } from "../src/idempotency.js";
 import { LinearExecutor } from "../src/LinearExecutor.js";
 import { offlineWaitingMessage } from "../src/messages.js";
 import { RouterStore } from "../src/RouterStore.js";
+import { silentLogger } from "./helpers/logger.js";
 
 const WS = "ws-1";
 const ROUTE_NOW = 1_000_000;
@@ -293,7 +294,7 @@ describe("EventRouter webhook dedupe across two router replicas", () => {
 				issueLock: true,
 				creatorOnlyPrompting: false,
 			},
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			now: () => ROUTE_NOW,
 		});
 		const replica = { store, router, deliverPending };
@@ -465,7 +466,7 @@ describe("EventRouter webhook dedupe across two router replicas", () => {
 				creatorOnlyPrompting: false,
 				webhookClaimRetentionMs: retentionMs,
 			},
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			now: () => clock.value,
 		});
 

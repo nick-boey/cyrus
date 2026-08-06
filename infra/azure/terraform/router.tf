@@ -97,6 +97,13 @@ locals {
     LINEAR_WORKSPACE_ID          = var.linear_workspace_id
     CYRUS_ROUTER_CONTAINERS_JSON = jsonencode(local.router_containers_config)
     CYRUS_ROUTER_BACKUP_BLOB_URL = local.router_containers_config.backupBlobUrl
+    # Emit one JSON object per log line instead of interpolated prose. The
+    # Container Apps environment already ships the router's stdout to the Log
+    # Analytics workspace (main.tf); this is what makes those records
+    # queryable by field — `ContainerAppConsoleLogs_CL | extend p =
+    # parse_json(Log_s) | where p.component == "DeviceGateway"` — rather than
+    # only greppable as free text.
+    CYRUS_LOG_FORMAT = "json"
     # Durable store for rotated Linear OAuth tokens. `/data` is wiped on every
     # deploy, so without this the router replays the tfvars-seeded refresh token
     # after each restart — a token Linear has already consumed and rotated,
@@ -253,6 +260,10 @@ resource "azurerm_container_app" "router" {
       env {
         name  = "CYRUS_ROUTER_BACKUP_BLOB_URL"
         value = local.router_env_non_secret.CYRUS_ROUTER_BACKUP_BLOB_URL
+      }
+      env {
+        name  = "CYRUS_LOG_FORMAT"
+        value = local.router_env_non_secret.CYRUS_LOG_FORMAT
       }
       env {
         name  = "CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL"

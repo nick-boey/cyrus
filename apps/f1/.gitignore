@@ -4,3 +4,5 @@
 dist
 .cp-edge-config.json
 node_modules
+router.db
+repositories.json

@@ -16,6 +16,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ILogger } from "cyrus-core";
 import type {
 	ContainerExecutor,
 	ContainerStatus,
@@ -26,7 +27,7 @@ import {
 	startControlServer,
 } from "./src/router/ControlServer.js";
 import { createRouterRig, type RouterRig } from "./src/router/RouterRig.js";
-import { bold, cyan, green, success, yellow } from "./src/utils/colors.js";
+import { bold, cyan, green, red, success, yellow } from "./src/utils/colors.js";
 
 class NoopFakeExecutor implements ContainerExecutor {
 	readonly provider = "docker";
@@ -63,7 +64,7 @@ export async function startRouterServer(opts: {
 	controlPort?: number;
 	fakeExecutor?: boolean;
 	requiredSecretKeys?: string[];
-	logger?: { info(m: string): void; warn(m: string): void };
+	logger?: Partial<ILogger>;
 }): Promise<{ rig: RouterRig; control: ControlServer; stop(): Promise<void> }> {
 	const home = opts.home ?? join(tmpdir(), `cyrus-f1-router-${Date.now()}`);
 	for (const d of [home, join(home, "artifacts"), join(home, "state")]) {
@@ -113,12 +114,15 @@ if (import.meta.main) {
 			: undefined,
 		fakeExecutor: process.env.CYRUS_ROUTER_FAKE_EXECUTOR === "1",
 		requiredSecretKeys,
-		// Console-backed so drive operators SEE router warnings — above all the
-		// boot gate's "<email> is not fully authenticated: missing <KEYS>" —
-		// instead of the rig's silent default logger swallowing them.
+		// Console-backed so drive operators SEE router warnings and errors —
+		// above all the boot gate's "<email> is not fully authenticated: missing
+		// <KEYS>", which now surfaces at error level via "Container boot failed"
+		// — instead of the rig's silent default logger swallowing them.
 		logger: {
 			info: (m) => console.log(`  ${cyan("[router]")} ${m}`),
 			warn: (m) => console.warn(`  ${yellow("[router]")} ${m}`),
+			error: (m, ...args) =>
+				console.error(`  ${red("[router]")} ${m}`, ...args),
 		},
 	});
 	console.log(bold(green("  🚦 F1 Router-Mode Server")));

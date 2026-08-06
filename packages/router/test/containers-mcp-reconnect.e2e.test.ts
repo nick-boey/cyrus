@@ -60,6 +60,7 @@ import {
 	seedSession,
 	WORKSPACE,
 } from "./helpers/fixtures.js";
+import { silentLogger } from "./helpers/logger.js";
 
 const IDLE_STOP_MS = 60_000;
 const STALE_DESTROY_MS = 14 * 24 * 60 * 60_000;
@@ -307,7 +308,7 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			webhook: { verificationMode: "direct", secret: "test-secret" },
 			trackerFactory: () => tracker,
 			heartbeatMs: 30_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			containers,
 			executorRegistryFactory: () =>
 				new Map<string, ContainerExecutor>([["docker", executor]]),
@@ -396,7 +397,7 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
 			offlineAgeOutMs: 3_600_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			now: () => Date.now() + IDLE_STOP_MS + 5_000,
 		});
 		await lifecycle.sweep();
@@ -524,7 +525,7 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
 			offlineAgeOutMs: 3_600_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			now: () => parkedAtMs + IDLE_STOP_MS - 1,
 		});
 		await early.sweep();
@@ -539,7 +540,7 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
 			offlineAgeOutMs: 3_600_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			now: () => parkedAtMs + IDLE_STOP_MS + 1,
 		});
 		await late.sweep();
@@ -655,7 +656,7 @@ describe("a leaked affinity row no longer pins a parked container (real RouterSe
 			webhook: { verificationMode: "direct", secret: "test-secret" },
 			trackerFactory: () => tracker,
 			heartbeatMs: 30_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			containers,
 			executorRegistryFactory: () =>
 				new Map<string, ContainerExecutor>([["docker", executor]]),
@@ -733,7 +734,7 @@ describe("a leaked affinity row no longer pins a parked container (real RouterSe
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
 			offlineAgeOutMs: 3_600_000,
-			logger: { info: () => {}, warn: () => {} },
+			logger: silentLogger(),
 			now: () => parkedAtMs + IDLE_STOP_MS + 1,
 			sessionReconciler: {
 				isOnline: (deviceId) => server.isDeviceOnline(deviceId),

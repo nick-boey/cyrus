@@ -24,6 +24,7 @@ import {
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
 import { TerminalTeardown } from "../src/TerminalTeardown.js";
+import { silentLogger } from "./helpers/logger.js";
 
 const ROUTE_NOW = 1_000_000;
 const TTL_MS = 60_000;
@@ -119,7 +120,7 @@ function makeContainerTargets(
 			routerUrlForContainers: "wss://router.example.com",
 		},
 		postActivity,
-		logger: { info: () => {}, warn: () => {} },
+		logger: silentLogger(),
 	});
 	return { containerTargets, executor, secrets, postActivity };
 }
@@ -266,7 +267,7 @@ function makeRouter(
 			affinityGraceMs: 600_000,
 			...overrides?.config,
 		},
-		logger: overrides?.logger ?? { info: () => {}, warn: () => {} },
+		logger: overrides?.logger ?? silentLogger(),
 		now: () => clock.value,
 	});
 	return { router, postActivity, moveIssueToStartedState, gateway, clock };
@@ -1354,7 +1355,7 @@ describe("EventRouter issue promotion to a started state", () => {
 				]),
 				artifactsDir,
 				graceMs: 60_000,
-				logger: { info: () => {}, warn: () => {} },
+				logger: silentLogger(),
 				setTimeout: () => 1,
 				clearTimeout: () => {},
 			});

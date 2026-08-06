@@ -1,3 +1,4 @@
+import type { ILogger } from "cyrus-core";
 import type { ExecutorRegistry } from "cyrus-router-executors";
 import type { ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
 
@@ -27,7 +28,7 @@ export interface ContainerLifecycleOptions {
 	offlineAgeOutMs: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
 	sessionReconciler?: SessionReconciler;
-	logger: { info(msg: string): void; warn(msg: string): void };
+	logger: ILogger;
 	/** Injectable clock (default `Date.now`) so time-based policy is deterministic in tests. */
 	now?: () => number;
 }
@@ -73,7 +74,7 @@ export class ContainerLifecycle {
 	private readonly sessionReconciler: SessionReconciler | undefined;
 	/** Devices already reported as pinned, so the 60s tick logs on transition only. */
 	private readonly pinnedDevices = new Set<number>();
-	private readonly logger: { info(msg: string): void; warn(msg: string): void };
+	private readonly logger: ILogger;
 	private readonly now: () => number;
 
 	constructor(opts: ContainerLifecycleOptions) {
@@ -146,8 +147,9 @@ export class ContainerLifecycle {
 			// >=15 default) crashes the router process for every teammate, not
 			// just container-executor users. Log and degrade to a no-op tick; the
 			// next interval retries.
-			this.logger.warn(
-				`lifecycle sweep failed to list container devices: ${String(err)}`,
+			this.logger.error(
+				"Lifecycle sweep failed to list container devices; skipping this tick",
+				err,
 			);
 			return;
 		}
@@ -214,9 +216,7 @@ export class ContainerLifecycle {
 					}
 				}
 			} catch (err) {
-				this.logger.warn(
-					`lifecycle sweep failed for ${row.issueKey}: ${String(err)}`,
-				);
+				this.logger.error(`Lifecycle sweep failed for ${row.issueKey}`, err);
 			}
 		}
 
@@ -243,8 +243,9 @@ export class ContainerLifecycle {
 					}
 				}
 			} catch (err) {
-				this.logger.warn(
-					`orphan GC failed for provider ${provider}: ${String(err)}`,
+				this.logger.error(
+					`Orphan GC failed for provider ${provider}; orphaned containers may keep accruing cost`,
+					err,
 				);
 			}
 		}
