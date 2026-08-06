@@ -705,6 +705,37 @@ export class EventRouter {
 	 *     behind the same `containers`-configured router) needs distinguished:
 	 *     that user's own EdgeWorker already runs its own repository router,
 	 *     so asking here too would double-elicit them for the same issue.
+	 *
+	 * KNOWN GAP (Minor review finding M-1, deliberately left open): this only
+	 * mirrors `resolveTarget`'s CREATOR branch, not its three other
+	 * fallbacks — session affinity, issue affinity, and parent-issue
+	 * affinity — which `resolveTarget` itself checks in strict precedence
+	 * order (session affinity -> creator -> issue affinity -> parent
+	 * affinity). An unenrolled creator, or an app/automation-attributed
+	 * creator `findUserForCreator` cannot resolve to a user, makes this
+	 * return `false` even when the SAME issue already has affinity pointing
+	 * at a physical device from an earlier, properly-attributed webhook —
+	 * `routeCreated` then runs `ensureRepositoryDecision` for a webhook
+	 * `resolveTarget` is about to route to that device via its affinity
+	 * fallback, double-eliciting: once from the router, once from the
+	 * device's own `RepositoryRouter`.
+	 *
+	 * A same-issue-affinity-implies-physical-device shortcut was tried and
+	 * reverted: unlike this method, `resolveTarget` does NOT treat its four
+	 * branches as unordered alternatives, so a plain OR of "is the creator a
+	 * physical device" with "does the issue have affinity to a physical
+	 * device" disagrees with `resolveTarget` whenever a LATER webhook on the
+	 * SAME issue comes from a CONTAINER-executor creator: `resolveTarget`
+	 * still routes it to that creator's container (creator branch precedes
+	 * issue affinity), but the OR'd predicate returns `true` off the issue-
+	 * affinity branch and skips the gate anyway — for a webhook that WILL
+	 * boot a container. That is worse than the double-elicit this method
+	 * exists to prevent: no decision is persisted, and `ContainerTargets`'
+	 * repository fallback (`isDefault ?? the first repository in the
+	 * workspace`) silently picks a repository nobody chose, with no
+	 * elicitation even on a genuine tie. Closing this gap correctly requires
+	 * mirroring `resolveTarget`'s full ORDERED precedence, not OR-ing its
+	 * branches; that is deferred to a follow-up rather than attempted here.
 	 */
 	private isKnownPhysicalDeviceCreator(
 		creator: SessionEvent["agentSession"]["creator"] | undefined,
@@ -716,62 +747,6 @@ export class EventRouter {
 		});
 		if (!user) return false;
 		return this.containerTargets.executorFor(user.userId) === undefined;
-	}
-
-	/**
-	 * Is this webhook's TARGET — creator, or the issue itself via already
-	 * established affinity — a KNOWN physical-device recipient?
-	 *
-	 * `isKnownPhysicalDeviceCreator` above only mirrors `resolveTarget`'s
-	 * creator branch (`findUserForCreator` -> `executorFor`). `resolveTarget`
-	 * itself checks THREE further fallbacks before ever reaching the creator
-	 * branch or after it fails — session affinity, issue affinity, and
-	 * parent-issue affinity, each via `getDeviceInfo(...).kind` in that same
-	 * method below. An unenrolled creator, or an app/automation-attributed creator that
-	 * `findUserForCreator` cannot resolve to a user, both make
-	 * `isKnownPhysicalDeviceCreator` return `false` even when this SAME issue
-	 * already has affinity pointing at a physical device from an earlier,
-	 * properly-attributed webhook. Without this check, `routeCreated` would run
-	 * `ensureRepositoryDecision` (posting a router-side elicitation, or
-	 * auto-picking and persisting a decision) for an issue whose device is
-	 * about to receive the SAME webhook via `resolveTarget`'s affinity
-	 * fallback and elicit again through its own `RepositoryRouter` — the exact
-	 * double-elicitation this whole gate exists to prevent, just reached
-	 * through affinity instead of the creator field.
-	 *
-	 * Deliberately does NOT clear a dangling affinity row the way
-	 * `resolveTarget` does when it finds one: that mutation belongs to the
-	 * actual routing decision, which still runs after this predicate (whether
-	 * it returns `true` or `false`) and will clear it there. A dangling row
-	 * here simply reads back as `undefined` and this predicate falls through,
-	 * same as `resolveTarget` falling through after clearing.
-	 */
-	private isKnownPhysicalDeviceTarget(
-		webhook: SessionEvent,
-		issueId: string | undefined,
-		creator: SessionEvent["agentSession"]["creator"] | undefined,
-	): boolean {
-		if (this.isKnownPhysicalDeviceCreator(creator)) return true;
-
-		const isPhysicalDevice = (deviceId: number | undefined): boolean =>
-			deviceId !== undefined &&
-			this.store.getDeviceInfo(deviceId)?.kind === "device";
-
-		const sessionId = webhook.agentSession.id;
-		if (isPhysicalDevice(this.store.getSessionAffinity(sessionId))) return true;
-
-		if (issueId !== undefined) {
-			if (isPhysicalDevice(this.store.getIssueAffinity(issueId))) return true;
-		}
-
-		const parentIssueId = extractParentIssueId(webhook);
-		if (parentIssueId !== undefined) {
-			if (isPhysicalDevice(this.store.getIssueAffinity(parentIssueId))) {
-				return true;
-			}
-		}
-
-		return false;
 	}
 
 	/**
@@ -980,8 +955,8 @@ export class EventRouter {
 		// re-runs this same gate and then hits the identical unenrolled-creator
 		// path it would have hit originally.
 		//
-		// A KNOWN physical-device target is different, and is excluded by
-		// `isKnownPhysicalDeviceTarget` below: their own EdgeWorker already
+		// A KNOWN physical-device creator is different, and is excluded by
+		// `isKnownPhysicalDeviceCreator` below: their own EdgeWorker already
 		// runs its own `RepositoryRouter`/pending-selection flow (design doc
 		// §5), so asking here too would double-elicit them — once from the
 		// router, once from their device, for the same issue. `containers`
@@ -989,13 +964,15 @@ export class EventRouter {
 		// set at all — see RouterServer) only rules out deployments with NO
 		// container path whatsoever; it does nothing for a MIXED deployment
 		// that also has enrolled physical-device users, which is why this
-		// second, per-creator (and per-affinity — see that method's doc
-		// comment) check is required on top of it.
+		// second, per-creator check is required on top of it.
+		// `isKnownPhysicalDeviceCreator` only covers the CREATOR field, not
+		// affinity already established for this issue — see that method's doc
+		// comment for the precedence gap this leaves open (M-1, deferred).
 		const issueKey = extractIssueKey(webhook);
 		if (
 			issueKey !== undefined &&
 			this.repositoryResolver &&
-			!this.isKnownPhysicalDeviceTarget(webhook, issueId, creator)
+			!this.isKnownPhysicalDeviceCreator(creator)
 		) {
 			const gate = await this.ensureRepositoryDecision(
 				webhook,

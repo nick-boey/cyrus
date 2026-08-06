@@ -54,16 +54,6 @@ const BOB: Creator = {
 	email: "bob@example.com",
 	name: "Bob",
 };
-/**
- * NOT enrolled with any user (`findUserForCreator` finds nothing for it) —
- * stands in for an app/automation-attributed creator, or a creator whose
- * enrollment was revoked mid-issue. Used for the M-1 regression below.
- */
-const UNKNOWN_CREATOR: Creator = {
-	id: "app-actor",
-	email: "automation@example.com",
-	name: "Some Automation",
-};
 
 /** Minimal object that satisfies isAgentSessionCreatedWebhook + fields we read. */
 function createdEvent(opts: {
@@ -272,61 +262,6 @@ describe("EventRouter repository selection", () => {
 		// Routed to his physical device exactly as pre-Task-9/10/11 behaviour:
 		// no container device was minted for him.
 		expect(store.getContainerDeviceForIssue("NOR-2")).toBeUndefined();
-		expect(enqueued).toHaveLength(1);
-		expect(JSON.parse(enqueued[0] as string).action).toBe("created");
-	});
-
-	/**
-	 * Regression for Minor review finding M-1: `isKnownPhysicalDeviceCreator`
-	 * only mirrors `resolveTarget`'s CREATOR branch, not its issue-affinity
-	 * fallback. An issue that already has affinity to a physical device (from
-	 * an earlier, properly-attributed webhook) must still skip the router-side
-	 * repository gate for a LATER webhook on that same issue whose creator the
-	 * router can't identify (an app/automation actor, or a revoked
-	 * enrollment) — otherwise the router elicits once, and the device's own
-	 * EdgeWorker elicits again for the same issue.
-	 */
-	it("skips the router-side repository gate for an unrecognized creator when the issue already has affinity to a physical device", async () => {
-		const { router, resolveSpy } = harness([API, WEB], { teamKey: "NOR" });
-
-		// Establish issue affinity to Bob's physical device via a normal,
-		// properly-attributed webhook first.
-		store.addUser({ email: BOB.email });
-		const code = store.mintEnrollmentCode(BOB.email, 1);
-		const bobDevice = store.redeemEnrollmentCode(code, 1);
-		if (!bobDevice) throw new Error("enrolling Bob's physical device failed");
-
-		const bobCreated = createdEvent({
-			sessionId: "sess-bob-1",
-			issueId: "issue-bob-1",
-			identifier: "NOR-2",
-			creator: BOB,
-		});
-		await router.route(bobCreated);
-		expect(store.getIssueAffinity("issue-bob-1")).toBe(bobDevice.deviceId);
-		resolveSpy.mockClear();
-		postRepositorySelection.mockClear();
-		enqueued.length = 0;
-
-		// A SECOND agent session on the SAME issue, but this time the creator
-		// is one the router cannot resolve to any enrolled user at all — e.g.
-		// an app/automation mention. `[API, WEB]` tie, so if the router-side
-		// gate ran here it would post a second "which repository?" elicitation
-		// on top of the one Bob's own device is about to post.
-		const secondCreated = createdEvent({
-			sessionId: "sess-bob-2",
-			issueId: "issue-bob-1",
-			identifier: "NOR-2",
-			creator: UNKNOWN_CREATOR,
-		});
-		await router.route(secondCreated);
-
-		expect(resolveSpy).not.toHaveBeenCalled();
-		expect(postRepositorySelection).not.toHaveBeenCalled();
-		expect(store.getIssueRepositories("NOR-2")).toBeUndefined();
-		expect(store.getPendingRepoSelection("sess-bob-2")).toBeUndefined();
-		// Routed straight to Bob's physical device via the pre-existing issue
-		// affinity, exactly like the first webhook.
 		expect(enqueued).toHaveLength(1);
 		expect(JSON.parse(enqueued[0] as string).action).toBe("created");
 	});
