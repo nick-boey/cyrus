@@ -73,6 +73,7 @@ import type {
 	IssueWithChildren,
 	Label,
 	PaginationOptions,
+	Project,
 	Team,
 	User,
 	WorkflowState,
@@ -816,6 +817,13 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 	 */
 	async fetchTeam(idOrKey: string): Promise<Team> {
 		return await this.linearClient.team(idOrKey);
+	}
+
+	/**
+	 * Fetch a single project by ID.
+	 */
+	async fetchProject(id: string): Promise<Project> {
+		return await this.linearClient.project(id);
 	}
 
 	// ========================================================================

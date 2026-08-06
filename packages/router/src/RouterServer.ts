@@ -32,6 +32,12 @@ import {
 } from "./enrollment.js";
 import { KeyVaultSecretStore } from "./KeyVaultSecretStore.js";
 import { LinearExecutor } from "./LinearExecutor.js";
+import {
+	createRepositoryRegistry,
+	type RepositoryRegistry,
+	seedRepositoryRegistry,
+} from "./RepositoryRegistry.js";
+import { RepositoryResolver } from "./RepositoryResolver.js";
 import { RouterStore } from "./RouterStore.js";
 import {
 	DEFAULT_REQUIRED_SECRET_KEYS,
@@ -42,11 +48,13 @@ import { StateBackup } from "./StateBackup.js";
 import { SetupBootstrap } from "./setup/bootstrap.js";
 import { createCsrfTokens } from "./setup/csrf.js";
 import {
+	type SetupAuthConfig,
 	type SetupAuthMode,
 	type SetupIdTokenVerifier,
 	type SetupUiConfig,
 	validateSetupAuthConfig,
 } from "./setup/principal.js";
+import { registerRepositoryRoutes } from "./setup/repositoryRoutes.js";
 import { registerSetupRoutes } from "./setup/routes.js";
 import { TableSecretStore } from "./TableSecretStore.js";
 import {
@@ -107,11 +115,24 @@ export interface RouterContainersConfig {
 		githubSlug: string;
 		linearWorkspaceId: string;
 		baseBranch?: string;
+		teamKeys?: string[];
+		projectKeys?: string[];
+		routingLabels?: string[];
+		isDefault?: boolean;
 	}>;
 	/** Default `<dirname(dbPath)>/artifacts`. */
 	artifactsDir?: string;
 	/** Default `<dirname(dbPath)>/user-secrets.json`. */
 	secretsPath?: string;
+	/**
+	 * Default `<dirname(dbPath)>/repositories.json`. Only consulted for the
+	 * file-backed registry — ignored once `tableStore` selects the Table
+	 * backend. Overriding this is mainly for tests: it lets a suite using a
+	 * non-path `dbPath` sentinel (e.g. `":memory:"`, whose `dirname` is `"."`)
+	 * point the registry file at a temp directory instead of the package's
+	 * working directory.
+	 */
+	repositoriesPath?: string;
 	/** Selects Azure Key Vault instead of the local secrets file. */
 	keyVaultUrl?: string;
 	/**
@@ -320,6 +341,8 @@ export class RouterServer {
 	 * interval's `this.containerLifecycle?.sweep()` call is a no-op.
 	 */
 	containerLifecycle?: ContainerLifecycle;
+	/** Set only when `containers` is configured. Consumed by the setup UI. */
+	repositoryRegistry: RepositoryRegistry | undefined;
 	private terminalTeardown?: TerminalTeardown;
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;
@@ -393,6 +416,7 @@ export class RouterServer {
 			trackers: this.trackers,
 			store: this.store,
 			workspaceTokens,
+			logger: this.logger,
 		});
 
 		this.gateway = new DeviceGateway(this.store, {
@@ -412,6 +436,8 @@ export class RouterServer {
 			this.logger.info(`Per-user secret backend: ${this.secretBackendKind}`);
 		}
 
+		const repositoryResolver = built?.repositoryResolver;
+
 		this.eventRouter = new EventRouter({
 			store: this.store,
 			gateway: this.gateway,
@@ -429,6 +455,23 @@ export class RouterServer {
 					config.containers?.affinityGraceMs ?? DEFAULT_AFFINITY_GRACE_MS,
 			},
 			logger: this.logger,
+			...(repositoryResolver
+				? {
+						repositoryResolver,
+						postRepositorySelection: (
+							workspaceId: string,
+							sessionId: string,
+							body: string,
+							options: string[],
+						) =>
+							this.executor.postRepositorySelection(
+								workspaceId,
+								sessionId,
+								body,
+								options,
+							),
+					}
+				: {}),
 		});
 
 		registerEnrollmentRoute(
@@ -463,51 +506,75 @@ export class RouterServer {
 					...(config.containers?.requiredSecretKeys ?? []),
 				]),
 			];
+			const setupAuthConfig: SetupAuthConfig = {
+				// validateSetupAuthConfig ran at the top of this constructor and
+				// throws when `auth` is unset, so this is proven non-null.
+				auth: config.setupUi.auth as SetupAuthMode,
+				...(config.setupUi.allowedDomain
+					? { allowedDomain: config.setupUi.allowedDomain }
+					: {}),
+			};
+			const setupBootstrap = new SetupBootstrap({
+				store: this.store,
+				secrets: built.secrets,
+				requiredKeys: setupRequiredKeys,
+				// Defaults TRUE. Self-registration is the intended posture for a
+				// single-organisation deployment: signing in creates a user row
+				// and an EMPTY secret record, nothing more. It grants no
+				// credentials — the user still has to supply their own Claude
+				// token — and nothing routes to them until they appear as the
+				// creator or assignee of a Linear issue
+				// (`EventRouter` → `RouterStore.findUserForCreator`), so Linear
+				// membership is the effective gate.
+				//
+				// Set it false where the Entra tenant is materially larger than
+				// the set of people who should be able to hold Cyrus
+				// credentials; `setupUi.allowedDomain` is the cheaper control
+				// for the common case of keeping guests out.
+				autoProvisionUsers: config.setupUi.autoProvisionUsers ?? true,
+				logger: this.logger,
+			});
+			// Per-process and in-memory on purpose. The router is single-replica,
+			// so a restart just invalidates outstanding tokens and the next action
+			// re-renders with a fresh one. Deliberately NOT sourced from config or
+			// shared with the webhook secret: a file-backed value survives restarts
+			// and would widen a config leak into CSRF forgery.
+			const setupCsrf = createCsrfTokens(randomBytes(32).toString("base64url"));
+			const setupIdTokenVerifier = config.setupIdTokenVerifier;
+
 			registerSetupRoutes(this.fastify, {
 				secrets: built.secrets,
 				requiredKeys: setupRequiredKeys,
-				auth: {
-					// validateSetupAuthConfig ran at the top of this constructor and
-					// throws when `auth` is unset, so this is proven non-null.
-					auth: config.setupUi.auth as SetupAuthMode,
-					...(config.setupUi.allowedDomain
-						? { allowedDomain: config.setupUi.allowedDomain }
-						: {}),
-				},
-				bootstrap: new SetupBootstrap({
-					store: this.store,
-					secrets: built.secrets,
-					requiredKeys: setupRequiredKeys,
-					// Defaults TRUE. Self-registration is the intended posture for a
-					// single-organisation deployment: signing in creates a user row
-					// and an EMPTY secret record, nothing more. It grants no
-					// credentials — the user still has to supply their own Claude
-					// token — and nothing routes to them until they appear as the
-					// creator or assignee of a Linear issue
-					// (`EventRouter` → `RouterStore.findUserForCreator`), so Linear
-					// membership is the effective gate.
-					//
-					// Set it false where the Entra tenant is materially larger than
-					// the set of people who should be able to hold Cyrus
-					// credentials; `setupUi.allowedDomain` is the cheaper control
-					// for the common case of keeping guests out.
-					autoProvisionUsers: config.setupUi.autoProvisionUsers ?? true,
-					logger: this.logger,
-				}),
-				// Per-process and in-memory on purpose. The router is single-replica,
-				// so a restart just invalidates outstanding tokens and the next action
-				// re-renders with a fresh one. Deliberately NOT sourced from config or
-				// shared with the webhook secret: a file-backed value survives restarts
-				// and would widen a config leak into CSRF forgery.
-				csrf: createCsrfTokens(randomBytes(32).toString("base64url")),
-				...(config.setupIdTokenVerifier
-					? { verifyIdToken: config.setupIdTokenVerifier }
+				auth: setupAuthConfig,
+				bootstrap: setupBootstrap,
+				csrf: setupCsrf,
+				...(setupIdTokenVerifier
+					? { verifyIdToken: setupIdTokenVerifier }
 					: {}),
 				logger: this.logger,
 			});
 			this.logger.info(
 				`Setup UI enabled at /setup (auth: ${config.setupUi.auth?.mode})`,
 			);
+
+			// The registry only exists when `containers` is configured; a
+			// device-only deployment has no repositories to register. Mounted on
+			// the same Fastify instance as registerSetupRoutes, which
+			// registerRepositoryRoutes relies on for its idempotent
+			// content-type-parser guard.
+			if (this.repositoryRegistry) {
+				registerRepositoryRoutes(this.fastify, {
+					registry: this.repositoryRegistry,
+					workspaceIds: Object.keys(this.config.workspaces),
+					auth: setupAuthConfig,
+					bootstrap: setupBootstrap,
+					csrf: setupCsrf,
+					...(setupIdTokenVerifier
+						? { verifyIdToken: setupIdTokenVerifier }
+						: {}),
+					logger: this.logger,
+				});
+			}
 		}
 
 		this.gateway.on("rpc", (deviceId: number, frame: RpcRequestFrame) => {
@@ -693,6 +760,7 @@ export class RouterServer {
 				service: ContainerTargetService;
 				secrets: SecretStoreBackend;
 				kind: "file" | "keyvault" | "table";
+				repositoryResolver: RepositoryResolver;
 		  }
 		| undefined {
 		if (!containers) return undefined;
@@ -764,18 +832,61 @@ export class RouterServer {
 			});
 		const executors = executorRegistryFactory(containers);
 
+		const repositoryRegistry = createRepositoryRegistry({
+			...(containers.tableStore
+				? {
+						tableStore: {
+							endpoint: containers.tableStore.endpoint,
+							...(containers.tableStore.tableName
+								? { tableName: containers.tableStore.tableName }
+								: {}),
+						},
+					}
+				: {}),
+			filePath:
+				containers.repositoriesPath ??
+				join(dirname(this.config.dbPath), "repositories.json"),
+		});
+		this.repositoryRegistry = repositoryRegistry;
+
+		// Seeding is fire-and-forget: it must not delay the listen(), and a
+		// transient Table error here is recoverable — the next start retries,
+		// and the setup UI can populate the registry by hand meanwhile.
+		void seedRepositoryRegistry(
+			repositoryRegistry,
+			containers.repositories,
+			this.logger,
+		).catch((error: unknown) => {
+			this.logger.warn(
+				`Could not seed the repository registry: ${String(error)}`,
+			);
+		});
+
 		const containerTargets = new ContainerTargetService({
 			store: this.store,
 			secrets,
 			executors,
+			registry: repositoryRegistry,
 			containersConfig: {
 				routerUrlForContainers: containers.routerUrlForContainers,
-				repositories: containers.repositories,
 				requiredSecretKeys: containers.requiredSecretKeys,
 				defaultExecutor: containers.defaultExecutor,
 			},
 			postActivity: (workspaceId, agentSessionId, body) =>
 				this.executor.postActivity(workspaceId, agentSessionId, body),
+			logger: this.logger,
+		});
+
+		// Router-side repository pre-selection (Task 9/10) covers container
+		// targets only (design doc §5): a physical-device user's own EdgeWorker
+		// already runs its own `RepositoryRouter` and pending-selection flow, so
+		// this must never be wired for a deployment with no `containers` block —
+		// returning it only from this containers-gated method is what guarantees
+		// that.
+		const repositoryResolver = new RepositoryResolver({
+			registry: repositoryRegistry,
+			fetchIssueFacts: (workspaceId, issueId) =>
+				this.executor.fetchIssueFacts(workspaceId, issueId),
 			logger: this.logger,
 		});
 
@@ -818,7 +929,7 @@ export class RouterServer {
 			this.terminalTeardown,
 		);
 
-		return { service: containerTargets, secrets, kind };
+		return { service: containerTargets, secrets, kind, repositoryResolver };
 	}
 
 	/**

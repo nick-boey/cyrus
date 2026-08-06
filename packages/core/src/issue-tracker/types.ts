@@ -197,6 +197,16 @@ export type Team = Pick<
 };
 
 /**
+ * Project type — selects the properties routing and display need.
+ *
+ * @see {@link LinearSDK.Project} - Linear's complete Project type
+ */
+export type Project = Pick<
+	LinearSDK.Project,
+	"id" | "name" | "description" | "slugId"
+>;
+
+/**
  * User type - Selects properties used in the codebase.
  *
  * @see {@link LinearSDK.User} - Linear's complete User type

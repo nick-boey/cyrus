@@ -156,6 +156,41 @@ describe("parseReposJson", () => {
 	});
 });
 
+describe("parseReposJson — routing metadata", () => {
+	it("accepts routing fields in CYRUS_REPOS_JSON", () => {
+		const parsed = parseReposJson(
+			JSON.stringify([
+				{
+					name: "cyrus-api",
+					githubSlug: "acme/cyrus-api",
+					linearWorkspaceId: "ws-1",
+					baseBranch: "release",
+					teamKeys: ["NOR"],
+					projectKeys: ["Platform"],
+					routingLabels: ["backend"],
+					isDefault: true,
+				},
+			]),
+		);
+		expect(parsed[0]).toMatchObject({
+			teamKeys: ["NOR"],
+			projectKeys: ["Platform"],
+			routingLabels: ["backend"],
+			isDefault: true,
+		});
+	});
+
+	it("still accepts an entry with no routing fields", () => {
+		const parsed = parseReposJson(
+			JSON.stringify([
+				{ name: "bare", githubSlug: "acme/bare", linearWorkspaceId: "ws-1" },
+			]),
+		);
+		expect(parsed[0]?.teamKeys).toBeUndefined();
+		expect(parsed[0]?.isDefault).toBeUndefined();
+	});
+});
+
 describe("defaultExec", () => {
 	it("folds the underlying spawn error's message into stderr when the binary itself is missing (ENOENT)", async () => {
 		const result = await defaultExec(
@@ -739,6 +774,7 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 					repositoryPath: join(workspacesDir, "repos", "repo1"),
 					workspaceBaseDir: workspacesDir,
 					baseBranch: "main",
+					githubUrl: "https://github.com/org/repo1",
 					linearWorkspaceId: "ws-1",
 					isActive: true,
 				},
@@ -748,10 +784,41 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 					repositoryPath: join(workspacesDir, "repos", "repo2"),
 					workspaceBaseDir: workspacesDir,
 					baseBranch: "develop",
+					githubUrl: "https://github.com/org/repo2",
 					linearWorkspaceId: "ws-2",
 					isActive: true,
 				},
 			]);
+		});
+
+		it("derives githubUrl from githubSlug so a [repo=...] tag can re-match in the sandbox (C-1)", () => {
+			// The router matches a `[repo=...]` description tag by URL suffix
+			// (`matchRepositories`' `tagMatches`, via `RegisteredRepository
+			// .toRoutable`'s synthesised `https://github.com/<slug>` URL). Without
+			// forwarding the same URL here, the sandbox's own RepositoryRouter has
+			// no `githubUrl` to match against and a URL-only tag match falls
+			// through to needs_selection even though the router already resolved
+			// it.
+			const cmd = newCommand();
+
+			cmd.writeConfig({
+				workspacesDir,
+				routerUrl: "https://router.example.com",
+				deviceToken: "device-tok",
+				repos: [
+					{
+						name: "cyrus-api",
+						githubSlug: "acme/cyrus-api",
+						linearWorkspaceId: "ws-1",
+					},
+				],
+			});
+
+			const configPath = join(workspacesDir, ".cyrus", "config.json");
+			const written = JSON.parse(readFileSync(configPath, "utf-8"));
+			expect(written.repositories[0].githubUrl).toBe(
+				"https://github.com/acme/cyrus-api",
+			);
 		});
 
 		it("writes config.json at mode 0600", () => {
@@ -828,6 +895,59 @@ describe("ContainerBootCommand — steps 1-6 (fs/env logic)", () => {
 			const written = JSON.parse(readFileSync(configPath, "utf-8"));
 
 			expect(written.linearWorkspaces).toBeUndefined();
+		});
+
+		it("writes routing metadata into config.json so the in-sandbox router agrees", () => {
+			const cmd = newCommand();
+
+			cmd.writeConfig({
+				workspacesDir,
+				routerUrl: "https://router.example.com",
+				deviceToken: "device-tok",
+				repos: [
+					{
+						name: "cyrus-api",
+						githubSlug: "acme/cyrus-api",
+						linearWorkspaceId: "ws-1",
+						baseBranch: "release",
+						teamKeys: ["NOR"],
+						projectKeys: ["Platform"],
+						isDefault: true,
+					},
+				],
+			});
+
+			const configPath = join(workspacesDir, ".cyrus", "config.json");
+			const written = JSON.parse(readFileSync(configPath, "utf-8"));
+			expect(written.repositories[0]).toMatchObject({
+				id: "cyrus-api",
+				name: "cyrus-api",
+				baseBranch: "release",
+				teamKeys: ["NOR"],
+				projectKeys: ["Platform"],
+				isDefault: true,
+			});
+		});
+
+		it("omits absent routing fields rather than writing empty/undefined keys", () => {
+			const cmd = newCommand();
+
+			cmd.writeConfig({
+				workspacesDir,
+				routerUrl: "https://router.example.com",
+				deviceToken: "device-tok",
+				repos: [
+					{ name: "bare", githubSlug: "acme/bare", linearWorkspaceId: "ws-1" },
+				],
+			});
+
+			const configPath = join(workspacesDir, ".cyrus", "config.json");
+			const written = JSON.parse(readFileSync(configPath, "utf-8"));
+			expect(written.repositories[0]).not.toHaveProperty("teamKeys");
+			expect(written.repositories[0]).not.toHaveProperty("projectKeys");
+			expect(written.repositories[0]).not.toHaveProperty("routingLabels");
+			expect(written.repositories[0]).not.toHaveProperty("isDefault");
+			expect(written.repositories[0].baseBranch).toBe("main");
 		});
 	});
 

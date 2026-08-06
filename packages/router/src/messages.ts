@@ -96,6 +96,30 @@ export function containerBootFailedMessage(
 export const ORPHANED_LOCK_RECLAIMED_MESSAGE =
 	"Released this issue's lock: the agent's device no longer has this session (its state was lost on restart). Re-delegate the issue to start a fresh session.";
 
+/** Body of the repository-selection elicitation the router posts. */
+export const REPOSITORY_SELECTION_PROMPT =
+	"Which repository should I work in for this issue?";
+
+/**
+ * Posted when a `created` event cannot be routed to any repository because
+ * none are registered for the workspace, or the registry could not be read.
+ *
+ * Templated with `{{reason}}` — render with {@link fillTemplate} before posting.
+ */
+export const NO_REPOSITORIES_MESSAGE = `I can't start work on this issue yet: {{reason}}
+
+Once a repository is registered, re-assign this issue (or mention me again) and I'll pick it up.`;
+
+/**
+ * Posted when {@link EventRouter.sweepExpired}'s repository-selection pass
+ * gives up on a selection nobody ever answered (past `eventTtlMs`, same bound
+ * as the queued-event expiry pass). Without this the held delegation just
+ * vanishes with no notice — a user answering days later would have their
+ * reply delivered as an ordinary prompt to a session that was never created.
+ */
+export const REPOSITORY_SELECTION_EXPIRED_MESSAGE =
+	"I stopped waiting for a repository choice on this issue. Re-assign it (or mention me again) to pick a repository and start fresh.";
+
 /**
  * Replaces `{{key}}` placeholders in `template` with the matching value from
  * `vars`. Unknown placeholders are left intact.

@@ -47,6 +47,7 @@ import {
 	type IssueWithChildren,
 	type Label,
 	type PaginationOptions,
+	type Project,
 	type Team,
 	type User,
 	type WorkflowState,
@@ -631,6 +632,18 @@ export class CLIIssueTrackerService
 		}
 
 		return createCLITeam(teamData);
+	}
+
+	/**
+	 * Fetch a single project by id.
+	 *
+	 * The F1 test harness has no project data store — there is nothing to
+	 * seed and no test drive exercises project-based routing on this adapter
+	 * — so this always throws "not found", mirroring `fetchTeam`'s contract
+	 * for an id it can't resolve.
+	 */
+	async fetchProject(id: string): Promise<Project> {
+		throw new Error(`Project ${id} not found`);
 	}
 
 	// ========================================================================

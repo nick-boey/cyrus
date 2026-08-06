@@ -68,6 +68,14 @@ const RepoSpecSchema = z.object({
 	githubSlug: z.string().min(1),
 	linearWorkspaceId: z.string().min(1),
 	baseBranch: z.string().optional(),
+	// Routing metadata the ROUTER already used to pick this repository. It is
+	// forwarded so the in-sandbox RepositoryRouter reaches the same conclusion
+	// instead of falling into its catch-all — which, with more than one repo in
+	// the list, would silently pick the first.
+	teamKeys: z.array(z.string()).optional(),
+	projectKeys: z.array(z.string()).optional(),
+	routingLabels: z.array(z.string()).optional(),
+	isDefault: z.boolean().optional(),
 });
 export type RepoSpec = z.infer<typeof RepoSpecSchema>;
 
@@ -678,8 +686,23 @@ export class ContainerBootCommand implements ICommand {
 			repositoryPath: join(workspacesDir, "repos", repo.name),
 			workspaceBaseDir: workspacesDir,
 			baseBranch: repo.baseBranch ?? "main",
+			// Synthesised from `githubSlug`, exactly as the router's own
+			// `toRoutable()` does (`RepositoryRegistry.ts`), so a `[repo=…]`
+			// description tag matched by URL suffix on the router
+			// (`matchRepositories`' `tagMatches`) can also re-match here in the
+			// sandbox's `RepositoryRouter`. Without this, the sandbox has no
+			// `githubUrl` at all and a tag matched only by URL on the router
+			// falls through to `needs_selection`.
+			githubUrl: `https://github.com/${repo.githubSlug}`,
 			linearWorkspaceId: repo.linearWorkspaceId,
 			isActive: true,
+			// Spread conditionally: writing `teamKeys: undefined` would survive
+			// Zod but land in config.json as an explicit null-ish key, which is
+			// noise in a file an operator may read while debugging a boot.
+			...(repo.teamKeys ? { teamKeys: repo.teamKeys } : {}),
+			...(repo.projectKeys ? { projectKeys: repo.projectKeys } : {}),
+			...(repo.routingLabels ? { routingLabels: repo.routingLabels } : {}),
+			...(repo.isDefault !== undefined ? { isDefault: repo.isDefault } : {}),
 		};
 	}
 

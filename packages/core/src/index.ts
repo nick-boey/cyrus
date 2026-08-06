@@ -156,6 +156,7 @@ export type {
 	IssueWithChildren,
 	Label,
 	PaginationOptions,
+	Project,
 	Team,
 	User,
 	Webhook,
@@ -288,6 +289,24 @@ export {
 	PERSISTENCE_VERSION,
 	PersistenceManager,
 } from "./PersistenceManager.js";
+// Repository routing — shared by the edge worker and the router so the two
+// can never disagree about which repository an issue belongs to.
+export type {
+	AmbiguousTier,
+	IssueFacts,
+	MatchResult,
+	RepositoryAssociations,
+	RepoTag,
+	RoutableRepository,
+	RoutingMethod,
+} from "./routing/index.js";
+export {
+	AssociationParseError,
+	formatAssociations,
+	matchRepositories,
+	parseAssociations,
+	parseRepoTags,
+} from "./routing/index.js";
 export { StreamingPrompt } from "./StreamingPrompt.js";
 export type {
 	WebhookIpValidatorOptions,

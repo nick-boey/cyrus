@@ -26,6 +26,14 @@ All notable changes to this project will be documented in this file.
 - `cyrus router unlock` now accepts a Linear issue identifier (e.g. `cyrus router unlock PAR-169`) in addition to the raw issue GUID — no more hunting for the GUID to release a stuck lock. The identifier is resolved through Linear; passing the GUID still works with no Linear token needed.
 - Containers run the full hosted Linear MCP in their Claude session when a `LINEAR_API_TOKEN` secret is set for the user.
 - Operators can require extra credentials before a user's containers boot via `containers.requiredSecretKeys` in the router config (the Claude OAuth token is always required).
+- Router deployments can now register multiple repositories and manage them from the setup UI at `/setup/repositories`, including a default repository and associations to Linear project and team names (`p=Platform,t=NOR`). ([#13](https://github.com/nick-boey/cyrus/pull/13))
+- When an issue's project or team matches a registered repository, Cyrus now clones only that repository — no more tagging every issue with `[repo=…]`. ([#13](https://github.com/nick-boey/cyrus/pull/13))
+- When two repositories match equally, or nothing matches and no default is set, Cyrus asks in Linear which one to use. Nothing runs while it waits. ([#13](https://github.com/nick-boey/cyrus/pull/13))
+
+### Changed
+- Router deployments with more than one repository previously always used the first one and cloned all of them into every workspace. They are now routed by project, team, or the configured default, and only the chosen repository is cloned. Single-repository deployments are unaffected. ([#13](https://github.com/nick-boey/cyrus/pull/13))
+- Project and team routing now match names case-insensitively. ([#13](https://github.com/nick-boey/cyrus/pull/13))
+- `containers.repositories` entries now have their `baseBranch` validated before the repository registry is seeded (letters, digits, dots, dashes, underscores, and slashes only — no leading dash, no `..`). `main`, `master`, and version-style branches like `release/1.2.x` are unaffected. If any entry's `baseBranch` fails validation, the whole seed is skipped and the router reports "No repositories are registered" for every issue until it's fixed — the router logs exactly which repository and branch failed and why. Operators upgrading with an unusual branch name (containing `+`, `~`, `%`, `@`, `#`, or similar) in `containers.repositories` should check their logs after upgrading. ([#13](https://github.com/nick-boey/cyrus/pull/13))
 
 ### Security
 - Patched newly reported Cyrus CLI dependency advisories so `pnpm audit` reports no known vulnerabilities. ([CYPACK-1431](https://linear.app/ceedar/issue/CYPACK-1431/address-open-security-patches-for-cyrus-cli), [#1404](https://github.com/cyrusagents/cyrus/pull/1404))

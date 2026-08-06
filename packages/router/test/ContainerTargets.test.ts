@@ -12,6 +12,10 @@ import {
 	ContainerTargetService,
 } from "../src/ContainerTargets.js";
 import { containerBootFailedMessage } from "../src/messages.js";
+import type {
+	RegisteredRepository,
+	RepositoryRegistry,
+} from "../src/RepositoryRegistry.js";
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
 
@@ -43,15 +47,30 @@ function freshSecretsPath(): string {
 
 const CONTAINERS_CONFIG: ContainerRoutingDeps["containersConfig"] = {
 	routerUrlForContainers: "wss://router.example.com",
-	repositories: [
-		{
-			name: "cyrus",
-			githubSlug: "ceedaragents/cyrus",
-			linearWorkspaceId: "ws-1",
-			baseBranch: "main",
-		},
-	],
 };
+
+const REGISTERED: RegisteredRepository[] = [
+	{
+		name: "cyrus-api",
+		githubSlug: "acme/cyrus-api",
+		linearWorkspaceId: "ws-1",
+		baseBranch: "main",
+		teamKeys: ["NOR"],
+	},
+	{
+		name: "cyrus-web",
+		githubSlug: "acme/cyrus-web",
+		linearWorkspaceId: "ws-1",
+		isDefault: true,
+	},
+];
+
+function stubRegistry(repositories = REGISTERED): RepositoryRegistry {
+	return {
+		list: vi.fn(async () => ({ repositories })),
+		put: vi.fn(async () => ({ version: "1" })),
+	};
+}
 
 describe("ContainerTargetService", () => {
 	let store: RouterStore;
@@ -78,6 +97,7 @@ describe("ContainerTargetService", () => {
 			store,
 			secrets,
 			executors,
+			registry: stubRegistry(),
 			containersConfig: CONTAINERS_CONFIG,
 			postActivity,
 			logger,
@@ -163,7 +183,10 @@ describe("ContainerTargetService", () => {
 		expect(ctx.env).toMatchObject({
 			CYRUS_ROUTER_URL: "wss://router.example.com",
 			CYRUS_ISSUE_KEY: "CYPACK-1",
-			CYRUS_REPOS_JSON: JSON.stringify(CONTAINERS_CONFIG.repositories),
+			// No stored decision for CYPACK-1, so this falls back to the
+			// registry's default repository (see the "per-issue repository
+			// selection" describe block below for the decision-driven cases).
+			CYRUS_REPOS_JSON: JSON.stringify([REGISTERED[1]]),
 			CLAUDE_CODE_OAUTH_TOKEN: "claude-tok",
 			GIT_TOKEN: "gh-pat",
 			GIT_USER_NAME: "A Example",
@@ -436,6 +459,7 @@ describe("ContainerTargetService", () => {
 			store,
 			secrets,
 			executors: new Map([["fly", fly]]),
+			registry: stubRegistry(),
 			containersConfig: CONTAINERS_CONFIG,
 			postActivity,
 			logger,
@@ -511,6 +535,7 @@ describe("ContainerTargetService", () => {
 			store,
 			secrets,
 			executors: new Map([["docker", docker]]),
+			registry: stubRegistry(),
 			containersConfig: {
 				...CONTAINERS_CONFIG,
 				requiredSecretKeys: ["GIT_TOKEN"],
@@ -539,6 +564,7 @@ describe("ContainerTargetService", () => {
 			store,
 			secrets,
 			executors: new Map([["docker", docker]]),
+			registry: stubRegistry(),
 			containersConfig: {
 				...CONTAINERS_CONFIG,
 				requiredSecretKeys: ["GIT_TOKEN", "LINEAR_API_TOKEN"],
@@ -678,6 +704,275 @@ describe("ContainerTargetService", () => {
 			expect(logger.warn).toHaveBeenCalledWith(
 				expect.stringContaining("could not read container status"),
 			);
+		});
+	});
+
+	describe("per-issue repository selection in buildEnv", () => {
+		function seedUser(executors: ExecutorRegistry) {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const service = makeService(executors);
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-1",
+			);
+			return { service, deviceId };
+		}
+
+		it("emits only the repositories the router decided on", async () => {
+			const docker = fakeExecutor("docker");
+			const { service, deviceId } = seedUser(new Map([["docker", docker]]));
+			store.setIssueRepositories(
+				"NOR-1",
+				{
+					repoNames: ["cyrus-api"],
+					baseBranchOverrides: {},
+					method: "team-based",
+				},
+				1,
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+			expect(JSON.parse(ctx.env.CYRUS_REPOS_JSON)).toEqual([
+				{
+					name: "cyrus-api",
+					githubSlug: "acme/cyrus-api",
+					linearWorkspaceId: "ws-1",
+					baseBranch: "main",
+					teamKeys: ["NOR"],
+				},
+			]);
+		});
+
+		it("applies a base-branch override from the decision", async () => {
+			const docker = fakeExecutor("docker");
+			const { service, deviceId } = seedUser(new Map([["docker", docker]]));
+			store.setIssueRepositories(
+				"NOR-1",
+				{
+					repoNames: ["cyrus-api"],
+					baseBranchOverrides: { "cyrus-api": "release" },
+					method: "description-tag",
+				},
+				1,
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+			expect(JSON.parse(ctx.env.CYRUS_REPOS_JSON)[0].baseBranch).toBe(
+				"release",
+			);
+		});
+
+		it("falls back to the default repository when no decision was stored", async () => {
+			const docker = fakeExecutor("docker");
+			const { service, deviceId } = seedUser(new Map([["docker", docker]]));
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+			expect(
+				(JSON.parse(ctx.env.CYRUS_REPOS_JSON) as RegisteredRepository[]).map(
+					(r) => r.name,
+				),
+			).toEqual(["cyrus-web"]);
+		});
+
+		it("drops a decided repository that has since been removed from the registry", async () => {
+			const docker = fakeExecutor("docker");
+			const { service, deviceId } = seedUser(new Map([["docker", docker]]));
+			store.setIssueRepositories(
+				"NOR-1",
+				{
+					repoNames: ["cyrus-api", "deleted-repo"],
+					baseBranchOverrides: {},
+					method: "description-tag",
+				},
+				1,
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+			expect(
+				(JSON.parse(ctx.env.CYRUS_REPOS_JSON) as RegisteredRepository[]).map(
+					(r) => r.name,
+				),
+			).toEqual(["cyrus-api"]);
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("deleted-repo"),
+			);
+		});
+
+		it("fails the boot with an actionable message when nothing resolves", async () => {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker");
+			const emptyService = new ContainerTargetService({
+				store,
+				secrets,
+				executors: new Map([["docker", docker]]),
+				registry: stubRegistry([]),
+				containersConfig: CONTAINERS_CONFIG,
+				postActivity,
+				logger,
+			});
+			const { deviceId } = emptyService.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-1",
+			);
+
+			emptyService.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(postActivity).toHaveBeenCalled());
+			expect(postActivity.mock.calls[0]?.[2]).toContain("No repositories");
+		});
+
+		/**
+		 * Important review finding: `RepositoryResolver.resolve` deliberately
+		 * catches a throwing `registry.list()` (the Table-backed production
+		 * registry throws on a transient 5xx/auth failure/exhausted retries),
+		 * but `reposForIssue` did not — before the registry existed,
+		 * `containersConfig.repositories` was a static array that could never
+		 * fail this way. A raw exception here must not escape `buildEnv`
+		 * unhandled; it must degrade the same way `resolve` does, with wording
+		 * that tells an operator this is worth retrying rather than reading like
+		 * "the registry is empty" below.
+		 */
+		it("fails the boot with a distinguishable, retry-worthy message when the registry read itself throws", async () => {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker");
+			const throwingRegistry: RepositoryRegistry = {
+				list: vi.fn(async () => {
+					throw new Error("Azure Table request failed: 503");
+				}),
+				put: vi.fn(async () => ({ version: "1" })),
+			};
+			const service = new ContainerTargetService({
+				store,
+				secrets,
+				executors: new Map([["docker", docker]]),
+				registry: throwingRegistry,
+				containersConfig: CONTAINERS_CONFIG,
+				postActivity,
+				logger,
+			});
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-1",
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(postActivity).toHaveBeenCalled());
+			expect(docker.ensureRunning).not.toHaveBeenCalled();
+			expect(postActivity.mock.calls[0]?.[2]).toContain("usually transient");
+			expect(postActivity.mock.calls[0]?.[2]).not.toContain(
+				"No repositories are registered",
+			);
+		});
+
+		/**
+		 * Minor review finding: the fallback log line said "No stored
+		 * repository decision" even when a decision DID exist but every
+		 * repository it named had since been deregistered — a different,
+		 * more surprising operational state (an operator deleted a repo out
+		 * from under a live issue) that deserves its own wording.
+		 */
+		it("distinguishes 'no decision was stored' from 'the decision's repositories were all deregistered' in the fallback log line", async () => {
+			const docker = fakeExecutor("docker");
+			const { service, deviceId } = seedUser(new Map([["docker", docker]]));
+			store.setIssueRepositories(
+				"NOR-1",
+				{
+					repoNames: ["deleted-repo-1", "deleted-repo-2"],
+					baseBranchOverrides: {},
+					method: "description-tag",
+				},
+				1,
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+			// Still falls back to the default, exactly as the "no decision"
+			// case does...
+			expect(
+				(JSON.parse(ctx.env.CYRUS_REPOS_JSON) as RegisteredRepository[]).map(
+					(r) => r.name,
+				),
+			).toEqual(["cyrus-web"]);
+			// ...but the log line names the actually-surprising condition.
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("has since been deregistered"),
+			);
+			expect(logger.warn).not.toHaveBeenCalledWith(
+				expect.stringContaining("No stored repository decision"),
+			);
+		});
+
+		/**
+		 * Minor review finding: the fallback picked a default across the WHOLE
+		 * registry, not scoped to the issue's own Linear workspace — in a
+		 * multi-workspace router, a missing decision could clone a repository
+		 * belonging to a DIFFERENT workspace than the issue's own. Mirrors
+		 * `RepositoryResolver.resolve`'s own workspace filter.
+		 */
+		it("scopes the no-decision fallback to the issue's own workspace, not the whole registry", async () => {
+			const scopedRegistry = stubRegistry([
+				{
+					name: "other-ws-default",
+					githubSlug: "acme/other-ws-default",
+					linearWorkspaceId: "ws-OTHER",
+					isDefault: true,
+				},
+				...REGISTERED,
+			]);
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker");
+			const service = new ContainerTargetService({
+				store,
+				secrets,
+				executors: new Map([["docker", docker]]),
+				registry: scopedRegistry,
+				containersConfig: CONTAINERS_CONFIG,
+				postActivity,
+				logger,
+			});
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-1",
+			);
+
+			// notify.workspaceId is "ws-1" — REGISTERED's workspace, not the
+			// "other-ws-default" repo's "ws-OTHER".
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+			expect(
+				(JSON.parse(ctx.env.CYRUS_REPOS_JSON) as RegisteredRepository[]).map(
+					(r) => r.name,
+				),
+			).toEqual(["cyrus-web"]);
 		});
 	});
 });
