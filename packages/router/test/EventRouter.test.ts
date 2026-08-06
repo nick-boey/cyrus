@@ -98,9 +98,25 @@ function makeContainerTargets(
 		store,
 		secrets,
 		executors: new Map([["docker", executor]]),
+		// A single default repo, not empty: this file's boot-success tests
+		// assert `executor.ensureRunning` is actually called, which
+		// `ContainerTargets.buildEnv` never reaches when nothing in the
+		// registry resolves (it throws before calling the executor).
+		registry: {
+			list: vi.fn(async () => ({
+				repositories: [
+					{
+						name: "cyrus",
+						githubSlug: "ceedaragents/cyrus",
+						linearWorkspaceId: "ws-1",
+						isDefault: true,
+					},
+				],
+			})),
+			put: vi.fn(async () => ({ version: "1" })),
+		},
 		containersConfig: {
 			routerUrlForContainers: "wss://router.example.com",
-			repositories: [],
 		},
 		postActivity,
 		logger: { info: () => {}, warn: () => {} },

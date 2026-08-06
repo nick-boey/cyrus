@@ -62,17 +62,24 @@ Create sub-issues with:
 - **Cross-Repository Routing** (for multi-repo orchestration):
   When your task spans multiple repositories (e.g., frontend + backend changes), you can route sub-issues to different repositories using these methods:
 
-  1. **Description Tag (Recommended)**: Add `[repo=org/repo-name]` or `[repo=repo-name]` at the start of the sub-issue description:
+  1. **Description Tag (Recommended, Priority 1)**: Add `[repo=org/repo-name]` or `[repo=repo-name]` at the start of the sub-issue description:
      ```
      [repo=myorg/backend-api]
 
      Objective: Add new API endpoint for user preferences
      ...
      ```
+     Multiple tags route the same sub-issue to several repositories at once — this is a deliberate fan-out, not an ambiguity.
 
-  2. **Routing Labels**: Apply a label configured to route to the target repository (check `<repository_routing_context>` in your prompt for available routing labels)
+  2. **Routing Labels (Priority 2)**: Apply a label configured to route to the target repository (check `<repository_routing_context>` in your prompt for available routing labels). Multiple matching labels are also a deliberate fan-out.
 
-  3. **Team Selection**: Create the issue in a Linear team that routes to the target repository (use the `teamId` parameter when creating the issue)
+  3. **Project Assignment (Priority 3)**: Add the sub-issue to a Linear project whose name matches, case-insensitively, one of the target repository's configured project names.
+
+  4. **Team Selection (Priority 4)**: Create the issue in a Linear team whose key matches, case-insensitively, one of the target repository's configured team keys (use the `teamId` parameter when creating the issue).
+
+  5. **Default Repository (Priority 5)**: If nothing above matches, the repository marked as the default for the workspace is used automatically — no action needed from you.
+
+  If two repositories match on the same project name, the same team key, or are both marked default, Cyrus asks the user to choose rather than guessing.
 
   **IMPORTANT**: Check the `<repository_routing_context>` section in your prompt for:
   - List of available repositories in your workspace

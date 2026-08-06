@@ -180,10 +180,20 @@ const RouterConfigFileSchema = z.object({
 					githubSlug: z.string(),
 					linearWorkspaceId: z.string(),
 					baseBranch: z.string().optional(),
+					// Routing metadata. Only ever used to SEED the registry on first
+					// start — after that the stored registry is authoritative and
+					// these are ignored. See seedRepositoryRegistry.
+					teamKeys: z.array(z.string()).optional(),
+					projectKeys: z.array(z.string()).optional(),
+					routingLabels: z.array(z.string()).optional(),
+					isDefault: z.boolean().optional(),
 				}),
 			),
 			artifactsDir: z.string().optional(),
 			secretsPath: z.string().optional(),
+			// Default `<dirname(dbPath)>/repositories.json`; only the file-backed
+			// registry consults it — ignored once tableStore selects Table storage.
+			repositoriesPath: z.string().optional(),
 			keyVaultUrl: z.string().optional(),
 			// Azure Table backend for per-user secrets. Takes precedence over
 			// keyVaultUrl. Unmodelled fields are stripped on EVERY `router start`

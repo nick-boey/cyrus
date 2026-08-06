@@ -106,6 +106,10 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					},
 				],
 				secretsPath: join(dir, "secrets.json"),
+				// dbPath below is ":memory:" (dirname "."); without this override,
+				// seeding the registry at construction would write into the package
+				// directory instead of `dir`.
+				repositoriesPath: join(dir, "repositories.json"),
 				artifactsDir: join(dir, "artifacts"),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
@@ -330,6 +334,10 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					},
 				],
 				secretsPath: join(dir, "secrets.json"),
+				// dbPath below is ":memory:" (dirname "."); without this override,
+				// seeding the registry at construction would write into the package
+				// directory instead of `dir`.
+				repositoriesPath: join(dir, "repositories.json"),
 				artifactsDir: join(dir, "artifacts"),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
@@ -567,6 +575,10 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 					},
 				],
 				secretsPath: join(dir, "secrets.json"),
+				// dbPath below is ":memory:" (dirname "."); without this override,
+				// seeding the registry at construction would write into the package
+				// directory instead of `dir`.
+				repositoriesPath: join(dir, "repositories.json"),
 				artifactsDir: join(dir, "artifacts"),
 				idleStopMs: IDLE_STOP_MS,
 				staleDestroyMs: STALE_DESTROY_MS,
@@ -747,6 +759,10 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 						},
 					],
 					secretsPath: join(dir, "secrets.json"),
+					// dbPath below is ":memory:" (dirname "."); without this override,
+					// seeding the registry at construction would write into the package
+					// directory instead of `dir`.
+					repositoriesPath: join(dir, "repositories.json"),
 					artifactsDir: join(dir, "artifacts"),
 					idleStopMs: IDLE_STOP_MS,
 					staleDestroyMs: STALE_DESTROY_MS,
@@ -978,6 +994,10 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 						},
 					],
 					secretsPath: join(dir, "secrets.json"),
+					// dbPath below is ":memory:" (dirname "."); without this override,
+					// seeding the registry at construction would write into the package
+					// directory instead of `dir`.
+					repositoriesPath: join(dir, "repositories.json"),
 					artifactsDir: join(dir, "artifacts"),
 					// Deliberately huge: this suite drives idle-stop itself, with an
 					// injected clock, at the exact point it wants it. RouterServer's

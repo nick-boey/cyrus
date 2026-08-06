@@ -467,6 +467,29 @@ The agent automatically moves issues to the "started" state when assigned. Linea
    - The teardown callback is durable on both sides. Device: `TeardownCallbackQueue` records the intent (plus its idempotency key) to `~/.cyrus/router-client/teardown-callbacks.jsonl` **synchronously, before the first `await` of `handleIssueStateChangeMessage`** — that is what puts the write inside the window where `RouterConnection`'s inbox entry is still unprocessed, so a kill anywhere in the sequence replays instead of losing the callback. It replays on the connection's `"connected"` event and retries the same key with backoff. Router: `TerminalTeardown` mirrors each pending teardown into the `container_teardowns` table so the out-of-process `router containers list` can render its `TEARDOWN` column; that mirror is observability + retry accounting, NOT a restart journal, and is cleared on construction to match the coordinator's empty in-memory state. Re-delivered callbacks log as `callback retry`, distinct from `grace expiry`.
    - `ContainerTargets.inFlightBoots` joins a concurrent boot **only as a dedup of overlapping `ensureRunning`/`mintDeviceToken` work — never as evidence the container ended up running**. The joined attempt may predate the event the joiner is reacting to (classically: the idle sweep parked the container while it was still starting), so after joining, re-check `executor.status()` and boot for real if it is not running. Getting this wrong silently swallows a terminal-teardown wake, and only the grace deadline then reclaims the container. An attempt in flight past `BOOT_JOIN_TIMEOUT_MS` is abandoned rather than joined, so a hung provider call cannot permanently disable booting for a device. Every `AcaSandboxClient` request also carries a `requestTimeoutMs` deadline (default 120s) because Node's `fetch` has none, and an unbounded call blocks the provider mutex and the boot slot behind it.
    - Before Azure stack deletion, destroy managed sandboxes and sweep snapshots before destroying the sandbox group. Keep the operator Blob role for corrupt-backup break glass. See `infra/azure/README.md` and `docs/ROUTER.md`.
+   - Repository selection for **container** targets happens on the **router**,
+     in `EventRouter.routeCreated`, before any device row or sandbox exists.
+     The decision is persisted in `issue_repositories` and is what
+     `ContainerTargets.buildEnv` turns into `CYRUS_REPOS_JSON`, so a sandbox
+     clones only the repositories the issue needs and a destroyed-and-recreated
+     container clones the same ones. An ambiguous or unmatched issue with no
+     default gets a Linear elicitation posted by the router and its `created`
+     webhook is HELD in `pending_repo_selections` until the answer arrives —
+     nothing boots while the user decides. Physical-device targets still route
+     inside their own EdgeWorker.
+   - `containers.repositories` in `router-config.json` only **seeds** the
+     repository registry, and only when the registry is empty. After that the
+     stored registry (Azure Table, or `repositories.json` beside the router db)
+     is authoritative and the config array is inert — the router logs this on
+     every start. Editing the `.repositories` field of
+     `CYRUS_ROUTER_CONTAINERS_JSON` on a seeded deployment changes nothing;
+     every other field on that env var (`image`, `routerUrlForContainers`,
+     `keyVaultUrl`, `aca`, `tableStore`, …) still takes effect on restart.
+   - Azure Table partition keys are namespaced by their first character: `u` +
+     sha256(email) for a user's secret record (`setupPartitionKey`), `g` + 64
+     zeros for the global repository registry. The registry row is **plaintext
+     JSON**, deliberately not envelope-encrypted, so it works without the *Key
+     Vault Crypto User* role. Never store a credential on that row.
 
 ## Dependency Security Policy (MANDATE)
 

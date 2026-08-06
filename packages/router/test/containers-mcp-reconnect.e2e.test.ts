@@ -291,6 +291,10 @@ describe("container MCP calls survive an idle/reconnect cycle (real RouterServer
 				},
 			],
 			secretsPath,
+			// dbPath below is ":memory:" (dirname "."); without this override,
+			// seeding the registry at construction would write into the package
+			// directory instead of `stateDir`.
+			repositoriesPath: join(stateDir, "repositories.json"),
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
 			offlineAgeOutMs: 3_600_000,
@@ -635,6 +639,10 @@ describe("a leaked affinity row no longer pins a parked container (real RouterSe
 				},
 			],
 			secretsPath,
+			// dbPath below is ":memory:" (dirname "."); without this override,
+			// seeding the registry at construction would write into the package
+			// directory instead of `stateDir`.
+			repositoriesPath: join(stateDir, "repositories.json"),
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
 			offlineAgeOutMs: 3_600_000,

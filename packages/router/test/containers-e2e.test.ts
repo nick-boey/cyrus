@@ -367,6 +367,10 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 				},
 			],
 			secretsPath,
+			// dbPath below is ":memory:" (dirname "."); without this override,
+			// seeding the registry at construction would write into the package
+			// directory instead of `stateDir`.
+			repositoriesPath: join(stateDir, "repositories.json"),
 			idleStopMs: IDLE_STOP_MS,
 			staleDestroyMs: STALE_DESTROY_MS,
 			offlineAgeOutMs: 3_600_000,

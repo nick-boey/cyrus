@@ -270,6 +270,12 @@ describe("renderPage", () => {
 		expect(html).toContain("&lt;img");
 	});
 
+	it("links to the repositories page from the variables page", () => {
+		const html = renderPage(model);
+		expect(html).toContain('href="/setup/repositories"');
+		expect(html).toContain("Repositories");
+	});
+
 	it("references only same-origin assets", () => {
 		const html = renderPage(model);
 		expect(html).toContain("/setup/assets/pico.css");

@@ -15,6 +15,7 @@ export const RPC_METHODS = [
 	"createComment",
 	"fetchTeams",
 	"fetchTeam",
+	"fetchProject",
 	"fetchLabels",
 	"fetchLabel",
 	"getIssueLabels",

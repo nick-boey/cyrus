@@ -67,6 +67,21 @@ CREATE TABLE IF NOT EXISTS container_teardowns (
   callback_received_ms INTEGER,
   callback_attempts INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS issue_repositories (
+  issue_key TEXT PRIMARY KEY,
+  repos_json TEXT NOT NULL,
+  overrides_json TEXT NOT NULL,
+  method TEXT NOT NULL,
+  decided_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_repo_selections (
+  agent_session_id TEXT PRIMARY KEY,
+  issue_key TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  options_json TEXT NOT NULL,
+  created_event TEXT NOT NULL,
+  created_ms INTEGER NOT NULL
+);
 `;
 
 // A user may have at most one physical device row, and an issue may have at
@@ -297,6 +312,36 @@ interface IssueLockRow {
 	issue_id: string;
 	session_id: string;
 	device_id: number;
+}
+
+/**
+ * Which repositories an issue routes to, decided once by the router and reused
+ * for every later event on that issue.
+ *
+ * Persisted rather than recomputed so a container destroyed and recreated
+ * clones the SAME repository, and so a second agent session on the issue never
+ * re-asks — the sandbox is per-issue and cloned at boot, so its repository
+ * cannot change mid-issue.
+ */
+export interface StoredRepositoryDecision {
+	repoNames: string[];
+	/** Repository name -> base branch, from `#branch` in a description tag. */
+	baseBranchOverrides: Record<string, string>;
+	/** A `RoutingMethod`, kept as a string so the store stays schema-free. */
+	method: string;
+	decidedMs: number;
+}
+
+/** An elicitation posted, with the `created` webhook held until it is answered. */
+export interface PendingRepoSelection {
+	agentSessionId: string;
+	issueKey: string;
+	workspaceId: string;
+	/** The option values offered, in the order they were offered. */
+	options: string[];
+	/** The serialized `created` webhook, replayed once the answer arrives. */
+	createdEvent: string;
+	createdMs: number;
 }
 
 export class RouterStore {
@@ -1442,6 +1487,190 @@ export class RouterStore {
 			}));
 		});
 		return txn();
+	}
+
+	// ── Repository decisions ───────────────────────────────────────────────
+	// Owned by the resolver (Task 9); read by EventRouter for repeat events on
+	// an issue and by the sandbox boot path (Task 11) to build CYRUS_REPOS_JSON.
+
+	getIssueRepositories(issueKey: string): StoredRepositoryDecision | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT repos_json, overrides_json, method, decided_ms FROM issue_repositories WHERE issue_key = ?",
+			)
+			.get(issueKey) as
+			| {
+					repos_json: string;
+					overrides_json: string;
+					method: string;
+					decided_ms: number;
+			  }
+			| undefined;
+		if (!row) return undefined;
+		try {
+			const repoNames = JSON.parse(row.repos_json) as unknown;
+			const overrides = JSON.parse(row.overrides_json) as unknown;
+			if (
+				!Array.isArray(repoNames) ||
+				!repoNames.every((name) => typeof name === "string")
+			) {
+				return undefined;
+			}
+			if (
+				typeof overrides !== "object" ||
+				overrides === null ||
+				Array.isArray(overrides)
+			) {
+				return undefined;
+			}
+			return {
+				repoNames,
+				baseBranchOverrides: overrides as Record<string, string>,
+				method: row.method,
+				decidedMs: row.decided_ms,
+			};
+		} catch {
+			// A corrupt row reads as absent. The resolver then re-derives the
+			// decision from the registry, which is deterministic for every
+			// non-ambiguous case — strictly better than throwing on a boot path.
+			return undefined;
+		}
+	}
+
+	setIssueRepositories(
+		issueKey: string,
+		decision: Omit<StoredRepositoryDecision, "decidedMs">,
+		nowMs: number,
+	): void {
+		this.db
+			.prepare(
+				`INSERT INTO issue_repositories (issue_key, repos_json, overrides_json, method, decided_ms)
+				 VALUES (?, ?, ?, ?, ?)
+				 ON CONFLICT(issue_key) DO UPDATE SET
+				   repos_json = excluded.repos_json,
+				   overrides_json = excluded.overrides_json,
+				   method = excluded.method,
+				   decided_ms = excluded.decided_ms`,
+			)
+			.run(
+				issueKey,
+				JSON.stringify(decision.repoNames),
+				JSON.stringify(decision.baseBranchOverrides),
+				decision.method,
+				nowMs,
+			);
+	}
+
+	deleteIssueRepositories(issueKey: string): void {
+		this.db
+			.prepare("DELETE FROM issue_repositories WHERE issue_key = ?")
+			.run(issueKey);
+	}
+
+	// ── Pending repository selections ──────────────────────────────────────
+	// Owned by EventRouter (Task 10): a `created` webhook whose repository was
+	// ambiguous is held here, keyed by agentSessionId, until the user answers
+	// the elicitation posted for it.
+
+	createPendingRepoSelection(row: PendingRepoSelection): void {
+		this.db
+			.prepare(
+				`INSERT INTO pending_repo_selections
+				   (agent_session_id, issue_key, workspace_id, options_json, created_event, created_ms)
+				 VALUES (?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(agent_session_id) DO UPDATE SET
+				   issue_key = excluded.issue_key,
+				   workspace_id = excluded.workspace_id,
+				   options_json = excluded.options_json,
+				   created_event = excluded.created_event,
+				   created_ms = excluded.created_ms`,
+			)
+			.run(
+				row.agentSessionId,
+				row.issueKey,
+				row.workspaceId,
+				JSON.stringify(row.options),
+				row.createdEvent,
+				row.createdMs,
+			);
+	}
+
+	getPendingRepoSelection(
+		agentSessionId: string,
+	): PendingRepoSelection | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT issue_key, workspace_id, options_json, created_event, created_ms FROM pending_repo_selections WHERE agent_session_id = ?",
+			)
+			.get(agentSessionId) as
+			| {
+					issue_key: string;
+					workspace_id: string;
+					options_json: string;
+					created_event: string;
+					created_ms: number;
+			  }
+			| undefined;
+		if (!row) return undefined;
+		let options: string[];
+		try {
+			const parsed = JSON.parse(row.options_json) as unknown;
+			options = Array.isArray(parsed) ? (parsed as string[]) : [];
+		} catch {
+			options = [];
+		}
+		return {
+			agentSessionId,
+			issueKey: row.issue_key,
+			workspaceId: row.workspace_id,
+			options,
+			createdEvent: row.created_event,
+			createdMs: row.created_ms,
+		};
+	}
+
+	deletePendingRepoSelection(agentSessionId: string): void {
+		this.db
+			.prepare("DELETE FROM pending_repo_selections WHERE agent_session_id = ?")
+			.run(agentSessionId);
+	}
+
+	/**
+	 * Drops selections created before `cutoffMs`, returning the identity of each
+	 * one removed (not just a count): `EventRouter.sweepExpired` needs
+	 * `workspaceId`/`agentSessionId` to post an expiry notice per swept row,
+	 * mirroring how its queued-event expiry pass already does for pass 1. Select
+	 * then delete in one transaction so nothing can be enqueued against a row
+	 * between the two halves.
+	 */
+	sweepPendingRepoSelections(
+		cutoffMs: number,
+	): Array<{ agentSessionId: string; workspaceId: string; issueKey: string }> {
+		const txn = this.db.transaction(() => {
+			const rows = this.db
+				.prepare(
+					"SELECT agent_session_id, workspace_id, issue_key FROM pending_repo_selections WHERE created_ms < ?",
+				)
+				.all(cutoffMs) as Array<{
+				agent_session_id: string;
+				workspace_id: string;
+				issue_key: string;
+			}>;
+			this.db
+				.prepare("DELETE FROM pending_repo_selections WHERE created_ms < ?")
+				.run(cutoffMs);
+			return rows.map((row) => ({
+				agentSessionId: row.agent_session_id,
+				workspaceId: row.workspace_id,
+				issueKey: row.issue_key,
+			}));
+		});
+		return txn();
+	}
+
+	/** Test-only escape hatch for simulating hand-edited rows. */
+	rawDbForTests(): Database.Database {
+		return this.db;
 	}
 
 	close(): void {

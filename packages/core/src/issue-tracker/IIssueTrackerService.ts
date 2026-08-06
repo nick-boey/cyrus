@@ -32,6 +32,7 @@ import type {
 	IssueWithChildren,
 	Label,
 	PaginationOptions,
+	Project,
 	Team,
 	User,
 	WorkflowState,
@@ -458,6 +459,25 @@ export interface IIssueTrackerService {
 	 * **CLI Platform**: All properties are synchronous (no await needed).
 	 */
 	fetchTeam(idOrKey: string): Promise<Team>;
+
+	/**
+	 * Fetch a project by id.
+	 *
+	 * Exists so a router-mode device can resolve `issue.project` — the router
+	 * serializes issues over the wire and the SDK's project getter cannot
+	 * survive that, so project-based repository routing has no other source.
+	 *
+	 * @param id - Project ID
+	 * @returns Promise resolving to the project
+	 * @throws Error if the project is not found
+	 *
+	 * @example
+	 * ```typescript
+	 * const project = await service.fetchProject('proj-1');
+	 * console.log(project.name);
+	 * ```
+	 */
+	fetchProject(id: string): Promise<Project>;
 
 	// ========================================================================
 	// LABEL OPERATIONS

@@ -832,3 +832,162 @@ describe("container devices (schema v2)", () => {
 		});
 	});
 });
+
+describe("repository decisions", () => {
+	it("returns undefined for an issue with no decision", () => {
+		const store = new RouterStore(":memory:");
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+	});
+
+	it("round-trips a decision", () => {
+		const store = new RouterStore(":memory:");
+		store.setIssueRepositories(
+			"NOR-1",
+			{
+				repoNames: ["cyrus-api", "cyrus-web"],
+				baseBranchOverrides: { "cyrus-web": "release" },
+				method: "description-tag",
+			},
+			1000,
+		);
+		expect(store.getIssueRepositories("NOR-1")).toEqual({
+			repoNames: ["cyrus-api", "cyrus-web"],
+			baseBranchOverrides: { "cyrus-web": "release" },
+			method: "description-tag",
+			decidedMs: 1000,
+		});
+	});
+
+	it("replaces an existing decision for the same issue", () => {
+		const store = new RouterStore(":memory:");
+		store.setIssueRepositories(
+			"NOR-1",
+			{ repoNames: ["a"], baseBranchOverrides: {}, method: "default" },
+			1,
+		);
+		store.setIssueRepositories(
+			"NOR-1",
+			{ repoNames: ["b"], baseBranchOverrides: {}, method: "team-based" },
+			2,
+		);
+		expect(store.getIssueRepositories("NOR-1")?.repoNames).toEqual(["b"]);
+	});
+
+	it("deletes a decision", () => {
+		const store = new RouterStore(":memory:");
+		store.setIssueRepositories(
+			"NOR-1",
+			{ repoNames: ["a"], baseBranchOverrides: {}, method: "default" },
+			1,
+		);
+		store.deleteIssueRepositories("NOR-1");
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+	});
+
+	it("treats a corrupt stored row as absent rather than throwing", () => {
+		const store = new RouterStore(":memory:");
+		store.setIssueRepositories(
+			"NOR-1",
+			{ repoNames: ["a"], baseBranchOverrides: {}, method: "default" },
+			1,
+		);
+		// Simulate a hand-edited / truncated row.
+		store
+			.rawDbForTests()
+			.prepare(
+				"UPDATE issue_repositories SET repos_json = '{ broken' WHERE issue_key = ?",
+			)
+			.run("NOR-1");
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+	});
+
+	it("treats valid-JSON-but-wrong-shape overrides_json as absent rather than returning a non-object", () => {
+		const store = new RouterStore(":memory:");
+		store.setIssueRepositories(
+			"NOR-1",
+			{ repoNames: ["a"], baseBranchOverrides: {}, method: "default" },
+			1,
+		);
+		// Syntactically valid JSON, but not an object — e.g. a hand-edited row.
+		store
+			.rawDbForTests()
+			.prepare(
+				'UPDATE issue_repositories SET overrides_json = \'["a","b"]\' WHERE issue_key = ?',
+			)
+			.run("NOR-1");
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+	});
+
+	it("treats valid-JSON-but-wrong-element-type repos_json as absent", () => {
+		const store = new RouterStore(":memory:");
+		store.setIssueRepositories(
+			"NOR-1",
+			{ repoNames: ["a"], baseBranchOverrides: {}, method: "default" },
+			1,
+		);
+		// An array, but of numbers rather than repo name strings.
+		store
+			.rawDbForTests()
+			.prepare(
+				"UPDATE issue_repositories SET repos_json = '[1,2,3]' WHERE issue_key = ?",
+			)
+			.run("NOR-1");
+		expect(store.getIssueRepositories("NOR-1")).toBeUndefined();
+	});
+});
+
+describe("pending repository selections", () => {
+	const row = {
+		agentSessionId: "sess-1",
+		issueKey: "NOR-1",
+		workspaceId: "ws-1",
+		options: ["cyrus-api", "cyrus-web"],
+		createdEvent: '{"action":"created"}',
+		createdMs: 1000,
+	};
+
+	it("round-trips a pending selection", () => {
+		const store = new RouterStore(":memory:");
+		store.createPendingRepoSelection(row);
+		expect(store.getPendingRepoSelection("sess-1")).toEqual(row);
+	});
+
+	it("returns undefined for an unknown session", () => {
+		const store = new RouterStore(":memory:");
+		expect(store.getPendingRepoSelection("nope")).toBeUndefined();
+	});
+
+	it("degrades a corrupt options_json to an empty options array rather than throwing", () => {
+		const store = new RouterStore(":memory:");
+		store.createPendingRepoSelection(row);
+		store
+			.rawDbForTests()
+			.prepare(
+				"UPDATE pending_repo_selections SET options_json = '{ broken' WHERE agent_session_id = ?",
+			)
+			.run("sess-1");
+		expect(store.getPendingRepoSelection("sess-1")?.options).toEqual([]);
+	});
+
+	it("deletes a pending selection", () => {
+		const store = new RouterStore(":memory:");
+		store.createPendingRepoSelection(row);
+		store.deletePendingRepoSelection("sess-1");
+		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+	});
+
+	it("sweeps only selections older than the cutoff, returning each swept row's identity", () => {
+		const store = new RouterStore(":memory:");
+		store.createPendingRepoSelection(row);
+		store.createPendingRepoSelection({
+			...row,
+			agentSessionId: "sess-2",
+			createdMs: 5000,
+		});
+		expect(store.sweepPendingRepoSelections(2000)).toEqual([
+			{ agentSessionId: "sess-1", workspaceId: "ws-1", issueKey: "NOR-1" },
+		]);
+		expect(store.getPendingRepoSelection("sess-1")).toBeUndefined();
+		expect(store.getPendingRepoSelection("sess-2")).toBeDefined();
+	});
+});

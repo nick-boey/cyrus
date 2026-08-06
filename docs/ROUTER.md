@@ -310,10 +310,18 @@ provider needs a pre-registered worker disk image and these provider fields:
     "image": "ghcr.io/your-org/cyrus-worker:tag",
     "routerUrlForContainers": "wss://<router-fqdn>",
     "repositories": [{
-      "name": "repo",
-      "githubSlug": "org/repo",
+      "name": "cyrus-api",
+      "githubSlug": "org/cyrus-api",
       "linearWorkspaceId": "<workspace-id>",
-      "baseBranch": "main"
+      "baseBranch": "main",
+      "projectKeys": ["Platform"],
+      "teamKeys": ["NOR"]
+    }, {
+      "name": "cyrus-infra",
+      "githubSlug": "org/cyrus-infra",
+      "linearWorkspaceId": "<workspace-id>",
+      "baseBranch": "main",
+      "isDefault": true
     }],
     "keyVaultUrl": "https://<vault>.vault.azure.net",
     "aca": {
@@ -335,6 +343,55 @@ provider needs a pre-registered worker disk image and these provider fields:
   }
 }
 ```
+
+### The repository registry
+
+`containers.repositories` **seeds** the registry the first time the router
+starts with an empty one. After that the stored registry is authoritative and
+the config array is ignored — the router logs this on every start. Manage
+repositories at `https://<router-fqdn>/setup/repositories`, which any registered
+Cyrus user can edit. Seeding keys on the registry being empty, not on whether it
+was ever seeded before — so if every repository is later removed through the
+setup UI, the next router restart re-seeds it from `containers.repositories`
+rather than leaving it empty.
+
+Each repository may be associated with Linear project names and team keys. In
+the setup UI these are written as one string:
+
+```
+p=Platform,p=Billing,t=NOR
+```
+
+`p=` is a Linear **project name**, `t=` is a **team key**, both repeatable, both
+matched case-insensitively against the whole name. Quote a value that contains
+a comma: `p="Q3 Migration, Phase 2"`.
+
+Cyrus picks a repository in this order, highest first:
+
+1. `[repo=name]` / `[repo=name#branch]` in the issue description
+2. Routing labels on the issue
+3. The issue's project name
+4. The issue's team key
+5. The repository marked **Default**
+
+Routing labels (tier 2) have no field in the setup UI — `p=`/`t=` only cover
+project and team. An existing `routingLabels` entry seeded from
+`containers.repositories` on first boot is preserved across edits, but the UI
+gives you no way to add or change one; that tier is otherwise unreachable for
+a router deployment.
+
+The decision is made **on the router**, before any sandbox starts, so each
+sandbox clones only the repository it needs. It is made once per issue and
+reused for every later session on that issue — a sandbox is per-issue and cannot
+change repository once cloned.
+
+When two repositories match on the same project name, the same team key, or
+are both marked default, Cyrus posts a selection prompt in Linear and waits.
+**No container runs while it waits.** The setup UI warns about these
+collisions at configuration time so they can be fixed before they interrupt
+anyone. A workspace with exactly one repository in scope is never asked to
+choose, even with no default set and no match above it — the sole repository
+is used directly.
 
 ### Observed ACA behavior
 
@@ -705,6 +762,13 @@ interactive browser OAuth **now**, at connect time:
 Verify MCP auth health before relying on it; re-run the OAuth if it has expired.
 
 ### 3. Add repositories
+
+> This is your device's own routing config, separate from the router-wide
+> repository registry described under [The repository
+> registry](#the-repository-registry). Router-side repository selection is
+> skipped for physical-device targets, so it still routes locally from the
+> array below. Container-target sessions are routed by the registry instead —
+> manage those at `https://<router-fqdn>/setup/repositories`.
 
 Add each repo to the `repositories` array of your `config.json`. A router-mode
 entry carries **no** `linearToken` (the router holds it), but it does need

@@ -448,6 +448,14 @@ describe("RouterServer containers wiring", () => {
 				linearWorkspaceId: "ws-1",
 			},
 		],
+		// `dbPath` below is ":memory:", whose `dirname` is ".". Without this
+		// override, seeding the registry (which runs unconditionally at
+		// construction whenever `repositories` is non-empty) would write
+		// `repositories.json` into the package directory instead of a temp one.
+		repositoriesPath: join(
+			mkdtempSync(join(tmpdir(), "rs-repositories-")),
+			"repositories.json",
+		),
 	};
 
 	/** Minimal object that satisfies isAgentSessionCreatedWebhook + the fields EventRouter reads. */
@@ -497,6 +505,19 @@ describe("RouterServer containers wiring", () => {
 			"docker-user@example.com",
 			'{"type":"docker"}',
 		);
+
+		// `seedRepositoryRegistry` runs fire-and-forget from the constructor (by
+		// design — see RouterServer's containers wiring), so a `route()` fired
+		// immediately after construction (this test never calls `start()`, which
+		// is what gives seeding a chance to complete in a real boot) can race
+		// ahead of it and see an empty registry. Wait for the seed to land
+		// before routing, mirroring the gap `start()` naturally papers over.
+		await vi.waitFor(async () => {
+			const { repositories } = (await server.repositoryRegistry?.list()) ?? {
+				repositories: [],
+			};
+			expect(repositories.length).toBeGreaterThan(0);
+		});
 
 		await server.eventRouter.route(
 			createdEvent({

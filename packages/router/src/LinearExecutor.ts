@@ -1,6 +1,8 @@
 import {
 	AgentActivityContentType,
+	AgentActivitySignal,
 	type IIssueTrackerService,
+	type IssueFacts,
 } from "cyrus-core";
 import {
 	RPC_METHODS,
@@ -44,6 +46,8 @@ export interface LinearExecutorOptions {
 	workspaceTokens?: Map<string, string>;
 	/** Reject attachment bodies larger than this. Defaults to 20 MiB. */
 	attachmentMaxBytes?: number;
+	/** Defaults to a no-op logger, matching the rest of the package. */
+	logger?: { info(msg: string): void; warn(msg: string): void };
 }
 
 /**
@@ -58,6 +62,7 @@ export class LinearExecutor {
 	private readonly store: RouterStore;
 	private readonly workspaceTokens: Map<string, string>;
 	private readonly attachmentMaxBytes: number;
+	private readonly logger: { info(msg: string): void; warn(msg: string): void };
 
 	constructor(opts: LinearExecutorOptions) {
 		this.trackers = opts.trackers;
@@ -65,6 +70,7 @@ export class LinearExecutor {
 		this.workspaceTokens = opts.workspaceTokens ?? new Map();
 		this.attachmentMaxBytes =
 			opts.attachmentMaxBytes ?? DEFAULT_ATTACHMENT_MAX_BYTES;
+		this.logger = opts.logger ?? { info: () => {}, warn: () => {} };
 	}
 
 	async dispatch(
@@ -161,22 +167,136 @@ export class LinearExecutor {
 	}
 
 	/**
-	 * Posts a plain-text thought activity to a session (used by the
-	 * {@link EventRouter} for offline/expiry/enrollment notices). A no-op when the
-	 * workspace has no configured tracker (e.g. a router restart lost the
-	 * session→workspace hint used by the stale-lock sweep).
+	 * Posts an activity to a session. A no-op when the workspace has no
+	 * configured tracker (e.g. a router restart lost the session→workspace hint
+	 * used by the stale-lock sweep).
+	 *
+	 * `options` exists so the router can post an *elicitation* with a `select`
+	 * signal, not only the plain thoughts the offline/expiry/enrollment notices
+	 * use. Every existing three-argument call site is unaffected.
 	 */
 	async postActivity(
 		workspaceId: string,
 		agentSessionId: string,
 		body: string,
+		options?: {
+			contentType?: AgentActivityContentType;
+			signal?: AgentActivitySignal;
+			signalMetadata?: Record<string, unknown>;
+		},
 	): Promise<void> {
 		const tracker = this.trackers.get(workspaceId);
 		if (!tracker) return;
 		await tracker.createAgentActivity({
 			agentSessionId,
-			content: { type: AgentActivityContentType.Thought, body },
+			content: {
+				type: options?.contentType ?? AgentActivityContentType.Thought,
+				body,
+			},
+			...(options?.signal ? { signal: options.signal } : {}),
+			...(options?.signalMetadata
+				? { signalMetadata: options.signalMetadata }
+				: {}),
 		});
+	}
+
+	/**
+	 * Asks the user which repository an issue belongs to.
+	 *
+	 * This is the same Linear API `RepositoryRouter.elicitUserRepositorySelection`
+	 * uses on a device, moved to the router so the question can be asked BEFORE a
+	 * container exists — nothing runs, and nothing is billed, while the user
+	 * decides.
+	 */
+	async postRepositorySelection(
+		workspaceId: string,
+		agentSessionId: string,
+		body: string,
+		options: string[],
+	): Promise<void> {
+		await this.postActivity(workspaceId, agentSessionId, body, {
+			contentType: AgentActivityContentType.Elicitation,
+			signal: AgentActivitySignal.Select,
+			signalMetadata: { options: options.map((value) => ({ value })) },
+		});
+	}
+
+	/**
+	 * Reads everything the repository matcher needs, in ONE `fetchIssue`.
+	 *
+	 * `team`, `project`, and `labels()` are each a separate Linear round-trip
+	 * (see {@link IIssueTrackerService}), so they are fetched concurrently via
+	 * `Promise.allSettled` rather than sequential awaits — mirroring the same
+	 * ruling already applied to `RepositoryRouter.gatherFacts`. Each source
+	 * stays isolated from the others' failures (a Linear hiccup fetching labels
+	 * must not suppress the team key we already have, because a partial fact
+	 * set still routes correctly far more often than no fact set does), but the
+	 * three round-trips overlap instead of stacking their latency — the whole
+	 * point of asking the routing question BEFORE a container boots is to ask
+	 * it fast. Each access is wrapped in an `async () => ...` IIFE so a
+	 * synchronously-throwing getter (not just a rejected promise) is also
+	 * captured as a settled rejection rather than escaping `Promise.allSettled`
+	 * itself. A failure of `fetchIssue` itself yields `undefined`, which the
+	 * caller treats as "cannot route yet" rather than as "no facts".
+	 */
+	async fetchIssueFacts(
+		workspaceId: string,
+		issueId: string,
+	): Promise<IssueFacts | undefined> {
+		const tracker = this.trackers.get(workspaceId);
+		if (!tracker) return undefined;
+
+		let issue: Awaited<ReturnType<IIssueTrackerService["fetchIssue"]>>;
+		try {
+			issue = await tracker.fetchIssue(issueId);
+		} catch (error) {
+			this.logger.warn(
+				`Could not fetch issue ${issueId} for repository routing: ${String(error)}`,
+			);
+			return undefined;
+		}
+		if (!issue) return undefined;
+
+		const facts: IssueFacts = {};
+		if (typeof issue.description === "string" && issue.description !== "") {
+			facts.description = issue.description;
+		}
+
+		const [teamResult, projectResult, labelsResult] = await Promise.allSettled([
+			(async () => issue.team)(),
+			(async () => issue.project)(),
+			(async () => issue.labels())(),
+		]);
+
+		if (teamResult.status === "fulfilled") {
+			if (teamResult.value?.key) facts.teamKey = teamResult.value.key;
+		} else {
+			this.logger.warn(
+				`Could not read the team of issue ${issueId} for routing: ${String(teamResult.reason)}`,
+			);
+		}
+
+		if (projectResult.status === "fulfilled") {
+			if (projectResult.value?.name)
+				facts.projectName = projectResult.value.name;
+		} else {
+			this.logger.warn(
+				`Could not read the project of issue ${issueId} for routing: ${String(projectResult.reason)}`,
+			);
+		}
+
+		if (labelsResult.status === "fulfilled") {
+			facts.labels = (labelsResult.value?.nodes ?? [])
+				.map((label) => label.name)
+				.filter((name): name is string => typeof name === "string");
+		} else {
+			this.logger.warn(
+				`Could not read the labels of issue ${issueId} for routing: ${String(labelsResult.reason)}`,
+			);
+			facts.labels = [];
+		}
+
+		return facts;
 	}
 
 	/**

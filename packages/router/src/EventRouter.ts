@@ -19,13 +19,21 @@ import {
 	fillTemplate,
 	INVALID_ISSUE_KEY_MESSAGE,
 	ISSUE_LOCKED_MESSAGE,
+	NO_REPOSITORIES_MESSAGE,
 	ORPHANED_LOCK_RECLAIMED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
 	PROMPT_UNROUTABLE_MESSAGE,
+	REPOSITORY_SELECTION_EXPIRED_MESSAGE,
+	REPOSITORY_SELECTION_PROMPT,
 	UNENROLLED_CREATOR_MESSAGE,
 } from "./messages.js";
+import { BASE_BRANCH_RE } from "./RepositoryRegistry.js";
+import type {
+	RepositoryDecision,
+	RepositoryResolver,
+} from "./RepositoryResolver.js";
 import type { RouterStore } from "./RouterStore.js";
 import type {
 	TerminalTeardown,
@@ -86,6 +94,19 @@ export interface EventRouterOptions {
 	 * keeps every user on the physical-device path (today's behavior).
 	 */
 	containerTargets?: ContainerTargetService;
+	/**
+	 * Decides which repositories an issue routes to, before any container is
+	 * created. Optional: omitting it keeps every container booting with the whole
+	 * configured repository list (pre-registry behaviour).
+	 */
+	repositoryResolver?: RepositoryResolver;
+	/** `LinearExecutor.postRepositorySelection`. Required alongside the resolver. */
+	postRepositorySelection?: (
+		workspaceId: string,
+		agentSessionId: string,
+		body: string,
+		options: string[],
+	) => Promise<void>;
 	terminalTeardown?: TerminalTeardown;
 	config: {
 		eventTtlMs: number;
@@ -139,6 +160,10 @@ export class EventRouter {
 		| ((workspaceId: string, issueId: string) => Promise<string | undefined>)
 		| undefined;
 	private readonly containerTargets: ContainerTargetService | undefined;
+	private readonly repositoryResolver: RepositoryResolver | undefined;
+	private readonly postRepositorySelection:
+		| EventRouterOptions["postRepositorySelection"]
+		| undefined;
 	private readonly terminalTeardown: TerminalTeardown | undefined;
 	private readonly config: {
 		eventTtlMs: number;
@@ -186,6 +211,8 @@ export class EventRouter {
 		this.postActivity = opts.postActivity;
 		this.moveIssueToStartedState = opts.moveIssueToStartedState;
 		this.containerTargets = opts.containerTargets;
+		this.repositoryResolver = opts.repositoryResolver;
+		this.postRepositorySelection = opts.postRepositorySelection;
 		this.terminalTeardown = opts.terminalTeardown;
 		this.config = opts.config;
 		this.webhookClaimRetentionMs =
@@ -628,6 +655,279 @@ export class EventRouter {
 				`Swept ${claimsSwept} webhook idempotency claim(s) older than ${this.webhookClaimRetentionMs}ms`,
 			);
 		}
+
+		// 4. A selection nobody ever answered. `eventTtlMs` is the right bound: it
+		// is already how long a queued event may wait for its device. Pass 1
+		// above already tells the user when their queued event expires
+		// (`expiredMessage`); mirror that here so an abandoned repository
+		// question doesn't just vanish silently — a user answering days later
+		// would otherwise have their reply delivered as an ordinary prompt to a
+		// session that was never created. The row's own workspace/session ids
+		// are used rather than `sessionWorkspace` (that map is only populated
+		// once a session reaches affinity, which a held session never has).
+		for (const row of this.store.sweepPendingRepoSelections(
+			now - this.config.eventTtlMs,
+		)) {
+			await this.postActivity(
+				row.workspaceId,
+				row.agentSessionId,
+				REPOSITORY_SELECTION_EXPIRED_MESSAGE,
+			);
+			this.logger.info(
+				`Swept an unanswered repository selection for issue ${row.issueKey} (session ${row.agentSessionId}); posted an expiry notice`,
+			);
+		}
+	}
+
+	/**
+	 * Is this creator a KNOWN enrolled physical-device user — as opposed to a
+	 * container-executor user, or a creator the router can't identify at all?
+	 *
+	 * Mirrors the exact check `resolveTarget`'s creator branch uses to make the
+	 * SAME distinction (`findUserForCreator` -> `executorFor`), just earlier —
+	 * before any container device is created — so router-side repository
+	 * pre-selection (`ensureRepositoryDecision`) can be skipped for physical-
+	 * device users while leaving it untouched for everyone else:
+	 *
+	 *   - container-executor user (`executorFor` returns a provider): `false`
+	 *     — run the resolver, exactly as before.
+	 *   - unrecognized creator (`findUserForCreator` finds no user, or there is
+	 *     no `containerTargets` at all): `false` — also run the resolver. This
+	 *     preserves the pre-existing, deliberate behaviour of asking an
+	 *     unenrolled creator before `resolveTargetOrInvalidKey` would otherwise
+	 *     tell them they're unenrolled (see `routeCreated`'s comment); it is
+	 *     harmless because nothing on their device will ever answer a second
+	 *     time, unlike a real enrolled physical device.
+	 *   - enrolled, but `executorFor` returns `undefined` (the historical
+	 *     meaning of "physical device", see `ContainerRoutingDeps`'s own doc
+	 *     comment): `true` — skip the resolver. This is the one case a mixed
+	 *     deployment (some container users, some physical-device users, both
+	 *     behind the same `containers`-configured router) needs distinguished:
+	 *     that user's own EdgeWorker already runs its own repository router,
+	 *     so asking here too would double-elicit them for the same issue.
+	 *
+	 * KNOWN GAP (Minor review finding M-1, deliberately left open): this only
+	 * mirrors `resolveTarget`'s CREATOR branch, not its three other
+	 * fallbacks — session affinity, issue affinity, and parent-issue
+	 * affinity — which `resolveTarget` itself checks in strict precedence
+	 * order (session affinity -> creator -> issue affinity -> parent
+	 * affinity). An unenrolled creator, or an app/automation-attributed
+	 * creator `findUserForCreator` cannot resolve to a user, makes this
+	 * return `false` even when the SAME issue already has affinity pointing
+	 * at a physical device from an earlier, properly-attributed webhook —
+	 * `routeCreated` then runs `ensureRepositoryDecision` for a webhook
+	 * `resolveTarget` is about to route to that device via its affinity
+	 * fallback, double-eliciting: once from the router, once from the
+	 * device's own `RepositoryRouter`.
+	 *
+	 * A same-issue-affinity-implies-physical-device shortcut was tried and
+	 * reverted: unlike this method, `resolveTarget` does NOT treat its four
+	 * branches as unordered alternatives, so a plain OR of "is the creator a
+	 * physical device" with "does the issue have affinity to a physical
+	 * device" disagrees with `resolveTarget` whenever a LATER webhook on the
+	 * SAME issue comes from a CONTAINER-executor creator: `resolveTarget`
+	 * still routes it to that creator's container (creator branch precedes
+	 * issue affinity), but the OR'd predicate returns `true` off the issue-
+	 * affinity branch and skips the gate anyway — for a webhook that WILL
+	 * boot a container. That is worse than the double-elicit this method
+	 * exists to prevent: no decision is persisted, and `ContainerTargets`'
+	 * repository fallback (`isDefault ?? the first repository in the
+	 * workspace`) silently picks a repository nobody chose, with no
+	 * elicitation even on a genuine tie. Closing this gap correctly requires
+	 * mirroring `resolveTarget`'s full ORDERED precedence, not OR-ing its
+	 * branches; that is deferred to a follow-up rather than attempted here.
+	 */
+	private isKnownPhysicalDeviceCreator(
+		creator: SessionEvent["agentSession"]["creator"] | undefined,
+	): boolean {
+		if (!creator || !this.containerTargets) return false;
+		const user = this.store.findUserForCreator({
+			id: creator.id,
+			email: creator.email,
+		});
+		if (!user) return false;
+		return this.containerTargets.executorFor(user.userId) === undefined;
+	}
+
+	/**
+	 * Ensures the issue has a repository decision before anything boots.
+	 *
+	 * Returns `"ready"` when routing may continue, and `"held"` when an
+	 * elicitation was posted (or a blocking notice was) and this webhook must
+	 * NOT be delivered. A held event is stashed verbatim and replayed by
+	 * {@link resumeHeldSelection} once the user answers.
+	 *
+	 * Deliberately runs BEFORE `resolveTarget`: creating the container device
+	 * first would mint a device row — and boot a sandbox — for an issue whose
+	 * repository nobody has chosen yet. Waiting here costs nothing, which is the
+	 * whole point of asking on the router rather than inside a container.
+	 */
+	private async ensureRepositoryDecision(
+		webhook: SessionEvent,
+		issueKey: string,
+		workspaceId: string,
+		issueId: string | undefined,
+	): Promise<"ready" | "held"> {
+		const resolver = this.repositoryResolver;
+		if (!resolver) return "ready";
+		if (this.store.getIssueRepositories(issueKey)) return "ready";
+
+		const sessionId = webhook.agentSession.id;
+		if (this.store.getPendingRepoSelection(sessionId)) {
+			// A repeated `created` delivery for a session already waiting on an
+			// answer. Asking again would post a second elicitation and overwrite
+			// the held event with an identical one — silent, but noisy in Linear.
+			this.logger.info(
+				`Session ${sessionId} is already waiting on a repository selection; not asking again`,
+			);
+			return "held";
+		}
+
+		const outcome = await resolver.resolve({ workspaceId, issueId });
+
+		if (outcome.kind === "resolved") {
+			this.persistDecision(issueKey, outcome.decision);
+			return "ready";
+		}
+
+		if (outcome.kind === "unavailable") {
+			await this.postActivity(
+				workspaceId,
+				sessionId,
+				fillTemplate(NO_REPOSITORIES_MESSAGE, { reason: outcome.reason }),
+			);
+			this.logger.warn(`Cannot route session ${sessionId}: ${outcome.reason}`);
+			// Stash the ORIGINAL `created` webhook rather than dropping it.
+			// "unavailable" covers two causes — a transient registry read
+			// failure (a first-boot Table race being the concrete case; the
+			// fire-and-forget registry seed from RouterServer's constructor can
+			// still be in flight when the very first webhook lands) and a
+			// workspace with nothing registered yet — and BOTH can resolve
+			// themselves with no further input from the user. Reusing
+			// `pending_repo_selections` with an empty `options` array puts this
+			// on the exact same recovery path `resumeHeldSelection` already has
+			// for a corrupt pending row: the next signal on this session (a
+			// follow-up prompt, or the delegator re-mentioning as the message
+			// above suggests) replays THIS SAME webhook through `routeCreated`,
+			// re-resolving against the then-current registry — instead of only
+			// the user's literal next words being routed with no repository
+			// decision at all, and the original delegation's own content lost.
+			// If nothing ever arrives, the existing TTL sweep still expires the
+			// row with an explicit "re-assign or mention me again" notice
+			// instead of leaving it silent forever.
+			this.store.createPendingRepoSelection({
+				agentSessionId: sessionId,
+				issueKey,
+				workspaceId,
+				options: [],
+				createdEvent: JSON.stringify(webhook),
+				createdMs: this.now(),
+			});
+			return "held";
+		}
+
+		const options = outcome.candidates.map((repo) => repo.name);
+		if (!this.postRepositorySelection) {
+			this.logger.warn(
+				`Repository selection needed for ${issueKey} but no elicitation transport is configured; routing to a fallback`,
+			);
+			const fallback = resolver.fallbackDecision(outcome.candidates);
+			if (!fallback) return "held";
+			this.persistDecision(issueKey, fallback);
+			return "ready";
+		}
+
+		try {
+			await this.postRepositorySelection(
+				workspaceId,
+				sessionId,
+				REPOSITORY_SELECTION_PROMPT,
+				options,
+			);
+		} catch (error) {
+			// Never stash a held event for an elicitation that was never posted:
+			// nothing would ever arrive to release it, and the issue would sit
+			// silently forever. Fall back instead, and say so.
+			this.logger.warn(
+				`Failed to post the repository selection for ${issueKey}: ${String(error)}; routing to a fallback`,
+			);
+			const fallback = resolver.fallbackDecision(outcome.candidates);
+			if (!fallback) return "held";
+			this.persistDecision(issueKey, fallback);
+			return "ready";
+		}
+
+		this.store.createPendingRepoSelection({
+			agentSessionId: sessionId,
+			issueKey,
+			workspaceId,
+			options,
+			createdEvent: JSON.stringify(webhook),
+			createdMs: this.now(),
+		});
+		this.logger.info(
+			`Posted a repository selection for ${issueKey} (${outcome.reason}) with options [${options.join(", ")}]; holding the created event`,
+		);
+		return "held";
+	}
+
+	/**
+	 * Drops any override that fails {@link BASE_BRANCH_RE} before it can ever be
+	 * stored.
+	 *
+	 * `decision.baseBranchOverrides` originates in an issue description's
+	 * `[repo=name#branch]` tag (`parseRepoTags`), not from the registry, so it
+	 * never passes through `validateRegisteredRepository` — the gate that was
+	 * added specifically for this shell sink. It is persisted here, read back
+	 * into `RepositoryConfig.baseBranch`, and interpolated into a double-quoted
+	 * shell string in `GitService.ts`
+	 * (`` execSync(`git ls-remote --heads origin "${baseBranch}"`) ``) inside a
+	 * user's worker container. `parseRepoTags`' charset has no shell
+	 * metacharacters and no `=`, so this is not a live shell-escape exploit, but
+	 * a leading `-` (git ref treated as an option) and `..` (path traversal in
+	 * the ref name) are both expressible through the tag syntax and are exactly
+	 * the two classes `BASE_BRANCH_RE` exists to exclude. Filtering here, at the
+	 * one place every decision is persisted, means nothing invalid ever reaches
+	 * `CYRUS_REPOS_JSON` — cheaper than validating again at every read site.
+	 */
+	private sanitizeBaseBranchOverrides(
+		issueKey: string,
+		overrides: Record<string, string>,
+	): Record<string, string> {
+		const sanitized: Record<string, string> = {};
+		for (const [repoName, branch] of Object.entries(overrides)) {
+			if (BASE_BRANCH_RE.test(branch)) {
+				sanitized[repoName] = branch;
+			} else {
+				this.logger.warn(
+					`Dropping invalid base branch override ${JSON.stringify(branch)} for ${repoName} on issue ${issueKey}: does not match ${BASE_BRANCH_RE}`,
+				);
+			}
+		}
+		return sanitized;
+	}
+
+	private persistDecision(
+		issueKey: string,
+		decision: RepositoryDecision,
+	): void {
+		this.store.setIssueRepositories(
+			issueKey,
+			{
+				repoNames: decision.repositories.map((repo) => repo.name),
+				baseBranchOverrides: this.sanitizeBaseBranchOverrides(
+					issueKey,
+					decision.baseBranchOverrides,
+				),
+				method: decision.method,
+			},
+			this.now(),
+		);
+		this.logger.info(
+			`Repositories for ${issueKey}: [${decision.repositories
+				.map((repo) => repo.name)
+				.join(", ")}] (${decision.method})`,
+		);
 	}
 
 	private async routeCreated(webhook: SessionEvent): Promise<void> {
@@ -638,6 +938,50 @@ export class EventRouter {
 			webhook.agentSession.issue?.id ??
 			undefined;
 		const creator = webhook.agentSession.creator ?? undefined;
+
+		// Repository selection happens here, on the router, before any container
+		// device exists. `extractIssueKey` is the same gate the container path
+		// uses; without a key there is no per-issue sandbox to route to and the
+		// existing invalid-key handling below reports it.
+		//
+		// This deliberately runs BEFORE routability is known at all: an
+		// unenrolled creator's issue gets asked "which repository?" before
+		// `resolveTargetOrInvalidKey` below would ever discover there's no
+		// device to route to and post `UNENROLLED_CREATOR_MESSAGE` instead. Do
+		// not "fix" this by moving the gate after target resolution — the whole
+		// point of asking here is to do it before ANY container-related work,
+		// and target resolution is downstream of that. An unenrolled creator
+		// answering the elicitation is harmless: `resumeHeldSelection`'s replay
+		// re-runs this same gate and then hits the identical unenrolled-creator
+		// path it would have hit originally.
+		//
+		// A KNOWN physical-device creator is different, and is excluded by
+		// `isKnownPhysicalDeviceCreator` below: their own EdgeWorker already
+		// runs its own `RepositoryRouter`/pending-selection flow (design doc
+		// §5), so asking here too would double-elicit them — once from the
+		// router, once from their device, for the same issue. `containers`
+		// being configured (which is what gates `this.repositoryResolver` being
+		// set at all — see RouterServer) only rules out deployments with NO
+		// container path whatsoever; it does nothing for a MIXED deployment
+		// that also has enrolled physical-device users, which is why this
+		// second, per-creator check is required on top of it.
+		// `isKnownPhysicalDeviceCreator` only covers the CREATOR field, not
+		// affinity already established for this issue — see that method's doc
+		// comment for the precedence gap this leaves open (M-1, deferred).
+		const issueKey = extractIssueKey(webhook);
+		if (
+			issueKey !== undefined &&
+			this.repositoryResolver &&
+			!this.isKnownPhysicalDeviceCreator(creator)
+		) {
+			const gate = await this.ensureRepositoryDecision(
+				webhook,
+				issueKey,
+				workspaceId,
+				issueId,
+			);
+			if (gate === "held") return;
+		}
 
 		const { target, invalidIssueKey } = this.resolveTargetOrInvalidKey(
 			webhook,
@@ -741,8 +1085,264 @@ export class EventRouter {
 		}
 	}
 
+	/**
+	 * Consumes a prompt that answers a pending repository selection.
+	 *
+	 * Returns `true` when the prompt was the answer and this webhook has been
+	 * fully handled, `false` when there was no pending selection and normal
+	 * prompt routing should continue.
+	 *
+	 * Two shapes of answer, both terminal:
+	 *  - the body names an offered option -> that repository is the decision, and
+	 *    the HELD `created` event is replayed so the runner initialises from the
+	 *    delegation. The answer itself is consumed: delivering "cyrus-web" as a
+	 *    user prompt would start the session with a repository name as its task.
+	 *  - anything else -> the user ignored the question. Fall back, then deliver
+	 *    the held `created` event AND this prompt, which is the semantics device
+	 *    mode already has (see packages/CLAUDE.md).
+	 */
+	private async resumeHeldSelection(webhook: SessionEvent): Promise<boolean> {
+		const resolver = this.repositoryResolver;
+		if (!resolver) return false;
+		const sessionId = webhook.agentSession.id;
+		const pending = this.store.getPendingRepoSelection(sessionId);
+		if (!pending) return false;
+
+		// Creator-only prompting MUST gate here, before this method does
+		// anything else — not only after, the way `routePrompted`'s own
+		// creator check runs today. Acting first (persisting a decision,
+		// replaying the held delegation, and booting a container) cannot be
+		// undone by a rejection that only fires afterward; by then a real
+		// session is already running on the CREATOR's device, started by
+		// someone else's message. This deviates from the brief's literal
+		// "first statement of routePrompted" ordering deliberately: the
+		// creator-only invariant wins. `agentSession.creator` is used (not the
+		// stored session-affinity creator `routePrompted` normally compares
+		// against) because a held session has never had affinity established —
+		// there is nothing stored yet to compare against — and
+		// `agentSession.creator` is always the session's ORIGINAL creator
+		// regardless of who is prompting now, exactly as `routePrompted`'s own
+		// comment on this documents. Answering is refused outright (rather than
+		// falling through to `routePrompted`'s normal target resolution, which
+		// would run first and could mint a container device as a side effect of
+		// `ensureDevice` even though the prompt is rejected a few lines later);
+		// the pending row is left completely untouched so the real creator can
+		// still answer it.
+		if (this.config.creatorOnlyPrompting) {
+			const creatorId = webhook.agentSession.creator?.id;
+			const actorId = webhook.agentActivity?.userId ?? undefined;
+			if (
+				creatorId !== undefined &&
+				(actorId === undefined || actorId !== creatorId)
+			) {
+				await this.postActivity(
+					webhook.organizationId,
+					sessionId,
+					PROMPT_REJECTION_MESSAGE,
+				);
+				this.logger.info(
+					`Rejected a non-creator's answer to the repository selection for session ${sessionId} (actor ${actorId ?? "unknown"} != creator ${creatorId}); the pending selection is untouched`,
+				);
+				return true;
+			}
+			// else: creatorId is unknown (no creator on the webhook at all) —
+			// nothing to compare against, so fall through exactly as
+			// `routePrompted`'s own gate does in that case.
+		}
+
+		// A stop signal (or the literal "stop"-shaped body the device itself
+		// treats the same way — see EdgeWorker's `isTextStopRequest` and
+		// packages/CLAUDE.md's "checked FIRST, before any routing work") means
+		// the user wants to abandon this delegation, not answer it. Nothing has
+		// booted yet — that is the entire point of holding — so there is no
+		// running session to stop. Treat it purely as an abandonment: drop the
+		// pending selection and boot nothing, rather than falling through to
+		// the unrelated-reply fallback below, which would persist a decision,
+		// replay the held `created` event, boot a container, and only then
+		// deliver a stop to a session that had just started.
+		if (isStopRequest(webhook)) {
+			this.store.deletePendingRepoSelection(sessionId);
+			this.logger.info(
+				`Session ${sessionId} was stopped while its repository selection was pending; abandoned the selection without booting`,
+			);
+			return true;
+		}
+
+		if (pending.options.length === 0) {
+			// Two DIFFERENT origins land here with the identical stored shape,
+			// and both get the identical recovery: (1) `RouterStore
+			// .getPendingRepoSelection` degrades a corrupt `options_json` to an
+			// empty array rather than throwing — a real, documented state, not a
+			// hypothetical; (2) `ensureRepositoryDecision`'s "unavailable"
+			// branch deliberately stores an empty-options row too, for a
+			// registry that was transiently unreadable or had nothing
+			// registered yet at `created` time. Neither case has options left to
+			// honor an answer against, but the row still carries a readable
+			// `createdEvent`: replay it through the normal creation gate (which
+			// re-resolves, or re-asks, from the live registry) instead of
+			// silently discarding the delegation. Losing the held event here
+			// would strand the issue with no way back, which is worse than
+			// re-asking (or re-attempting) once more. The stale row is deleted
+			// BEFORE the replay (unlike the normal path below) because
+			// `ensureRepositoryDecision` treats an existing pending row as "already
+			// asked, don't re-resolve" — leaving this one in place would make the
+			// replay a no-op and the issue would stay stuck behind it forever.
+			this.store.deletePendingRepoSelection(sessionId);
+			this.logger.warn(
+				`Pending repository selection for ${pending.issueKey} has no options to offer (registry was unavailable/empty at creation time, or the row is corrupt); replaying the held event through normal resolution instead of guessing`,
+			);
+			let held: SessionEvent | undefined;
+			try {
+				held = JSON.parse(pending.createdEvent) as SessionEvent;
+			} catch (error) {
+				this.logger.warn(
+					`Held created event for ${pending.issueKey} is ALSO unreadable: ${String(error)}; the delegation for this issue is lost`,
+				);
+			}
+			if (held) {
+				await this.routeCreated(held);
+				// The replay may have landed back in a held state itself — tied
+				// again into a fresh elicitation, or blocked because nothing is
+				// registered for the workspace. Either way this session is STILL
+				// waiting on a repository choice, so the current prompt must not
+				// fall through to normal routing: that would resolve a target and
+				// boot a container while the question is still open, delivering a
+				// stale prompt to a sandbox that only just started (and, for a
+				// re-tied selection, would leave the user staring at a duplicate
+				// "which repository?" prompt on top of an already-running
+				// container). Consume it here instead.
+				const stillUnresolved =
+					this.store.getPendingRepoSelection(sessionId) !== undefined ||
+					this.store.getIssueRepositories(pending.issueKey) === undefined;
+				if (stillUnresolved) return true;
+			}
+			return false;
+		}
+
+		// Deleted synchronously here — before the first `await` below — rather
+		// than after the replay has gone through. Two distinct prompts answering
+		// the SAME held selection both call `getPendingRepoSelection` with no
+		// `await` in between (every check above this line is synchronous), so
+		// only the first to reach this statement still finds a row: the second's
+		// read (whether concurrent or merely reordered by the event loop once the
+		// first one awaits) sees it already gone and returns `false` at the top
+		// of this method instead of persisting a second decision and replaying
+		// the held `created` event a second time. Matches the precedent the
+		// empty-options branch above already set, for the identical reason.
+		this.store.deletePendingRepoSelection(sessionId);
+
+		const { repositories } = await resolver
+			.resolve({ workspaceId: pending.workspaceId, issueId: undefined })
+			.then((outcome) =>
+				outcome.kind === "needs_selection"
+					? { repositories: outcome.candidates }
+					: { repositories: [] },
+			)
+			.catch(() => ({ repositories: [] }));
+
+		// Prefer the exact options that were offered; `repositories` is only a
+		// safety net for a registry that changed while the user was deciding.
+		const candidates =
+			repositories.length > 0
+				? repositories.filter((repo) => pending.options.includes(repo.name))
+				: [];
+		const offered =
+			candidates.length > 0
+				? candidates
+				: pending.options.map((name) => ({
+						name,
+						githubSlug: "",
+						linearWorkspaceId: pending.workspaceId,
+					}));
+
+		const body = webhook.agentActivity?.content?.body ?? "";
+		const selected = resolver.selectByOptionValue(body, offered);
+		const decision = selected ?? resolver.fallbackDecision(offered);
+
+		if (!decision) {
+			// Defensively unreachable: `offered` is guaranteed non-empty here
+			// (built from `pending.options`, already known non-empty above), so
+			// `fallbackDecision` can never return undefined. Kept anyway per this
+			// file's existing defensive style. The row was already deleted above,
+			// so there is nothing left to clean up here.
+			this.logger.warn(
+				`Pending repository selection for ${pending.issueKey} could not be resolved; dropping it`,
+			);
+			return false;
+		}
+		this.persistDecision(pending.issueKey, decision);
+
+		// Replay the held delegation first, so the container's first event is the
+		// one that starts a session.
+		let held: SessionEvent | undefined;
+		try {
+			held = JSON.parse(pending.createdEvent) as SessionEvent;
+		} catch (error) {
+			// What happens to the CURRENT prompt from here depends on `selected`,
+			// computed above: a matched answer is consumed (the method returns
+			// `true` below and the prompt is never routed), so only the
+			// unrelated-reply case actually falls through to normal prompt
+			// routing. Say which one this is, rather than always claiming the
+			// prompt is routed.
+			this.logger.warn(
+				`Held created event for ${pending.issueKey} is unreadable: ${String(error)}; ${
+					selected
+						? "the repository selection was still applied, but the delegation itself is lost"
+						: "routing the prompt alone"
+				}`,
+			);
+		}
+		if (held) {
+			try {
+				await this.routeCreated(held);
+			} catch (error) {
+				// The row was already deleted above (to close the concurrent-prompt
+				// race — see the comment there), so a failed replay can no longer
+				// lean on "the row is still there" the way the pre-fix code did to
+				// avoid stranding the delegation; moving the delete earlier without
+				// this catch would have silently reintroduced that exact loss.
+				// Re-stash the pending row verbatim (same options, same held event)
+				// instead, so the NEXT signal on this session replays it again
+				// through this same method — the identical recovery path
+				// `ensureRepositoryDecision`'s "unavailable" branch already uses for
+				// a registry that was unreadable at `created` time. Re-deriving the
+				// decision persisted just above on that retry is idempotent and
+				// harmless. The error is swallowed rather than rethrown: `route()`
+				// is invoked as `void route(event)` with no catch (see
+				// `claimWebhook`'s doc comment), so letting this escape would take
+				// the whole router process down for every teammate over one failed
+				// replay.
+				this.logger.warn(
+					`Failed to replay the held delegation for ${pending.issueKey} after a repository selection: ${String(error)}; re-stashing it for retry`,
+				);
+				this.store.createPendingRepoSelection({
+					agentSessionId: sessionId,
+					issueKey: pending.issueKey,
+					workspaceId: pending.workspaceId,
+					options: pending.options,
+					createdEvent: pending.createdEvent,
+					createdMs: pending.createdMs,
+				});
+				return true;
+			}
+		}
+
+		if (selected) {
+			this.logger.info(
+				`Session ${sessionId} selected repository ${decision.repositories[0]?.name}`,
+			);
+			return true;
+		}
+
+		this.logger.info(
+			`Session ${sessionId} answered the repository selection with an unrelated prompt; used ${decision.repositories[0]?.name} and forwarding the prompt`,
+		);
+		return false;
+	}
+
 	private async routePrompted(webhook: SessionEvent): Promise<void> {
 		const sessionId = webhook.agentSession.id;
+		if (await this.resumeHeldSelection(webhook)) return;
 		const workspaceId = webhook.organizationId;
 		const issueId =
 			webhook.agentSession.issueId ??
@@ -1122,6 +1722,24 @@ export class EventRouter {
 		}
 		return undefined;
 	}
+}
+
+/**
+ * Same stop-shaped-body pattern `EdgeWorker.isTextStopRequest` uses on the
+ * device side, so a held session recognizes a stop exactly like a running one
+ * would.
+ */
+const STOP_BODY_RE = /^\s*stop(\s+session|\s+working)?[\s.!?]*$/i;
+
+/**
+ * Whether a `prompted` webhook is a stop request: either Linear's own `signal`
+ * field, or a literal stop-shaped body (the same fallback the device applies —
+ * see `EdgeWorker.handleUserPromptedAgentActivity`).
+ */
+function isStopRequest(webhook: SessionEvent): boolean {
+	if (webhook.agentActivity?.signal === "stop") return true;
+	const body = webhook.agentActivity?.content?.body;
+	return typeof body === "string" && STOP_BODY_RE.test(body);
 }
 
 /**

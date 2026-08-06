@@ -31,6 +31,7 @@ import type {
 	IssueWithChildren,
 	Label,
 	PaginationOptions,
+	Project,
 	Team,
 	User,
 	WorkflowState,
@@ -183,6 +184,7 @@ export class RouterIssueTrackerService implements IIssueTrackerService {
 		const assigneeId = relationId(raw.assigneeId, raw._assignee);
 		const teamId = relationId(raw.teamId, raw._team);
 		const parentId = relationId(raw.parentId, raw._parent);
+		const projectId = relationId(raw.projectId, raw._project);
 
 		// `Issue`'s getters are typed against the Linear SDK's own WorkflowState /
 		// User / Team / Issue classes, while these RPCs resolve `cyrus-core`'s
@@ -230,12 +232,20 @@ export class RouterIssueTrackerService implements IIssueTrackerService {
 			},
 
 			/**
-			 * No `fetchProject` RPC exists, so this stays `undefined` rather than
-			 * inventing one. `undefined` is a legal value for `Issue["project"]`
-			 * and matches what an issue with no project returns.
+			 * Resolved through the `fetchProject` RPC. The router serializes a
+			 * Linear SDK `Issue` with `JSON.stringify`, and `project` is a
+			 * prototype getter over a private `_project` field, so only
+			 * `projectId` survives the wire — this rebuilds the getter from it,
+			 * the same way `parent` is rebuilt from `parentId` above.
+			 *
+			 * `undefined` when the issue has no project, which is a legal value
+			 * for `Issue["project"]` and costs no round trip.
 			 */
 			get project(): Issue["project"] {
-				return undefined;
+				if (!projectId) return undefined;
+				return once("project", () =>
+					self.fetchProject(projectId),
+				) as unknown as Issue["project"];
 			},
 
 			/**
@@ -423,6 +433,13 @@ export class RouterIssueTrackerService implements IIssueTrackerService {
 			this.workspaceId,
 			idOrKey,
 		]) as Promise<Team>;
+	}
+
+	fetchProject(id: string): Promise<Project> {
+		return this.connection.rpc("fetchProject", [
+			this.workspaceId,
+			id,
+		]) as Promise<Project>;
 	}
 
 	// ========================================================================
