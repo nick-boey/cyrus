@@ -1,0 +1,11 @@
+{
+  "version": "1",
+  "repositories": [
+    {
+      "name": "cyrus",
+      "githubSlug": "octocat/Hello-World",
+      "linearWorkspaceId": "ws-1",
+      "baseBranch": "master"
+    }
+  ]
+}
