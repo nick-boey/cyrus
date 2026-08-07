@@ -21,8 +21,17 @@ export type {
 	LogContext,
 	LogEventAttributes,
 	LogFormat,
+	LogRecord,
+	LogSink,
 } from "./logging/index.js";
-export { createLogger, createNoopLogger, LogLevel } from "./logging/index.js";
+export {
+	createLogger,
+	createNoopLogger,
+	getGlobalLogSink,
+	LogLevel,
+	resetGlobalLogSink,
+	setGlobalLogSink,
+} from "./logging/index.js";
 
 // export { Session } from './Session.js'
 // export type { SessionOptions, , NarrativeItem } from './Session.js'

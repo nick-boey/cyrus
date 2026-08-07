@@ -1,7 +1,11 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { HEARTBEAT_INTERVAL_MS, PROTOCOL_VERSION } from "cyrus-router-protocol";
-import { describe, expect, it } from "vitest";
+import {
+	HEARTBEAT_INTERVAL_MS,
+	LOG_INGEST_CAPABILITY,
+	PROTOCOL_VERSION,
+} from "cyrus-router-protocol";
+import { describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { DeviceGateway } from "../src/DeviceGateway.js";
 import { RouterStore } from "../src/RouterStore.js";
@@ -148,6 +152,95 @@ describe("DeviceGateway", () => {
 
 		const helloAck = JSON.parse(await nextMessage());
 		expect(helloAck.heartbeatMs).toBe(HEARTBEAT_INTERVAL_MS);
+
+		gateway.close();
+		httpServer.close();
+	});
+
+	/**
+	 * The device only forwards logs after seeing this. Without the advertisement
+	 * a newer worker logging at an older router would be closed as "invalid
+	 * frame" on every line and reconnect straight back into the same loop.
+	 */
+	it("advertises log_ingest in hello_ack", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+
+		const helloAck = JSON.parse(await nextMessage());
+		expect(helloAck.capabilities).toContain(LOG_INGEST_CAPABILITY);
+
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("emits a log frame as a 'log' event and never acks it", async () => {
+		const { gateway, device, port, httpServer } = await setup();
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+		await nextMessage(); // hello_ack
+
+		const received: Array<[number, unknown]> = [];
+		gateway.on("log", (deviceId: number, frame: unknown) => {
+			received.push([deviceId, frame]);
+		});
+
+		const frame = {
+			type: "log",
+			ts: "2026-08-07T12:00:00.000Z",
+			level: "warn",
+			component: "EdgeWorker",
+			message: "something went sideways",
+			dropped: 3,
+		};
+		const closed = new Promise<number>((r) =>
+			ws.once("close", (code) => r(code)),
+		);
+		ws.send(JSON.stringify(frame));
+		await vi.waitFor(() => expect(received).toHaveLength(1));
+
+		expect(received[0]?.[0]).toBe(device.deviceId);
+		expect(received[0]?.[1]).toEqual(frame);
+
+		// Fire-and-forget: nothing comes back, and the socket stays up.
+		gateway.close();
+		httpServer.close();
+		await closed;
+	});
+
+	it("closes the socket on a log frame sent before hello", async () => {
+		const { gateway, port, httpServer } = await setup();
+		const ws = connect(port);
+		await new Promise((r) => ws.once("open", r));
+		const closed = new Promise<void>((r) => ws.once("close", () => r()));
+		ws.send(
+			JSON.stringify({
+				type: "log",
+				ts: "2026-08-07T12:00:00.000Z",
+				level: "error",
+				component: "x",
+				message: "unauthenticated",
+			}),
+		);
+		await closed;
 
 		gateway.close();
 		httpServer.close();

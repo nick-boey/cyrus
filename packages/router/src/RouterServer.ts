@@ -20,7 +20,11 @@ import {
 	type AcaEgressPolicy,
 	LocalDockerProvider,
 } from "cyrus-router-executors";
-import type { RpcRequestFrame, SessionStateFrame } from "cyrus-router-protocol";
+import type {
+	LogFrame,
+	RpcRequestFrame,
+	SessionStateFrame,
+} from "cyrus-router-protocol";
 import Fastify, { type FastifyInstance } from "fastify";
 import { createAcaSandboxesProvider } from "./AcaProviderFactory.js";
 import { registerArtifactsRoute } from "./artifacts.js";
@@ -41,6 +45,7 @@ import {
 } from "./RepositoryRegistry.js";
 import { RepositoryResolver } from "./RepositoryResolver.js";
 import { RouterStore } from "./RouterStore.js";
+import { SandboxLogRelay } from "./SandboxLogRelay.js";
 import {
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	SecretStore,
@@ -349,6 +354,8 @@ export class RouterServer {
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;
 	private readonly gateway: DeviceGateway;
+	/** Re-emits sandbox worker logs into the router's own (collected) stdout. */
+	private readonly sandboxLogRelay: SandboxLogRelay;
 	private readonly executor: LinearExecutor;
 	private readonly trackers: Map<string, IIssueTrackerService>;
 	private readonly logger: ILogger;
@@ -425,6 +432,7 @@ export class RouterServer {
 			heartbeatMs: config.heartbeatMs,
 			logger: this.logger,
 		});
+		this.sandboxLogRelay = new SandboxLogRelay({ logger: this.logger });
 
 		const artifactsDir =
 			config.containers?.artifactsDir ??
@@ -606,6 +614,18 @@ export class RouterServer {
 				this.gateway.sendSessionStateAck(deviceId, frame.id);
 			},
 		);
+		// Sandbox worker logs. Re-emitted through this process's own logger so
+		// they ride the router's existing path into Log Analytics — the ACA
+		// sandboxGroups resource has no log collection of its own. Attribution
+		// comes from the device row, never from the frame.
+		this.gateway.on("log", (deviceId: number, frame: LogFrame) => {
+			const info = this.store.getDeviceInfo(deviceId);
+			this.sandboxLogRelay.relay(frame, {
+				deviceId,
+				...(info?.issueKey ? { issueKey: info.issueKey } : {}),
+				...(info?.provider ? { provider: info.provider } : {}),
+			});
+		});
 		// NOTE: no "deviceConnected" → deliverPending wiring here. DeviceGateway
 		// already calls this.deliverPending() internally at the end of handleHello
 		// (right after emitting "deviceConnected"), so adding it here would deliver

@@ -228,6 +228,9 @@ runs — branch and `sha-*` tags (amd64 + arm64).
 | `CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL` | no | — | `linearTokenStore.keyVaultUrl` — durable store for rotated Linear OAuth tokens |
 | `CYRUS_LOG_LEVEL` | no | `INFO` | not config-backed — `DEBUG`, `INFO`, `WARN`, `ERROR`, or `SILENT` |
 | `CYRUS_LOG_FORMAT` | no | `text` | not config-backed — `json` emits one JSON object per log line for log aggregators |
+| `CYRUS_LOG_FORWARD_LEVEL` | no | `WARN` | worker-side only — minimum level a sandbox worker forwards to the router (see "Sandbox worker logs") |
+| `CYRUS_LOG_FORWARD_RATE` | no | `2` | worker-side only — sustained forwarded records/second |
+| `CYRUS_LOG_FORWARD_BURST` | no | `40` | worker-side only — forwarding burst capacity |
 
 Set `CYRUS_LOG_FORMAT=json` when the router's stdout is collected by something
 that indexes fields (Azure Log Analytics, Loki, CloudWatch). Each line becomes a
@@ -315,6 +318,81 @@ The Azure stack provisions this and several sibling queries as saved searches,
 plus alert rules for long-running sandboxes, boot failures, and a stalled sweep.
 See [`infra/azure/README.md`](../infra/azure/README.md) → "Monitoring and
 alerts".
+
+### Sandbox worker logs
+
+A cloud sandbox's worker process writes to a stdout that **nothing collects**.
+The ACA sandbox group is a separate ARM resource from the Container Apps
+environment, so the environment's Log Analytics wiring never reaches it, and the
+sandbox data-plane API has no logs endpoint at all — everything the worker
+printed died with the sandbox.
+
+Workers therefore forward their logs to the router over the WebSocket connection
+they already hold, as a `log` protocol frame, and the router re-emits each one
+through its own logger. That makes them inherit the router's existing path into
+`ContainerAppConsoleLogs_CL` with no exporter, **no change to the sandbox's
+deny-by-default egress allowlist** (the router's own host is already its one
+entry), and no Azure credential inside the sandbox.
+
+Relayed lines are tagged `source: "sandbox"` and their component is prefixed
+`sandbox/`, so one predicate separates them from the router's own output:
+
+```kql
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(1h)
+| extend p = parse_json(Log_s)
+| where tostring(p.source) == "sandbox"
+| project TimeGenerated, issue_key = tostring(p.issue_key),
+          device_id = toint(p.device_id), level = tostring(p.level),
+          component = tostring(p.component), message = tostring(p.message)
+| order by TimeGenerated desc
+```
+
+`issue_key`, `device_id` and `provider` come from the **device row the router
+authenticated**, not from the frame — a worker cannot label its logs with
+someone else's issue. If the worker's own view of the issue disagrees, it is
+recorded separately as `reported_issue_identifier` rather than silently
+resolved. `emitted_at` carries the device's clock alongside the router's own
+timestamp, so sandbox/router clock skew is visible.
+
+**Volume guard.** Piping full session stdout from every sandbox into a PerGB2018
+workspace is not cheap, so the device filters before forwarding:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CYRUS_LOG_FORWARD_LEVEL` | `WARN` | Minimum level forwarded. `SILENT` turns forwarding off without changing anything else. |
+| `CYRUS_LOG_FORWARD_RATE` | `2` | Sustained records/second (token-bucket refill). |
+| `CYRUS_LOG_FORWARD_BURST` | `40` | Bucket capacity — how large a burst passes untouched. |
+
+Two things ride *past* the level threshold by design: named `event()` records
+(the `sandbox_*` vocabulary above), because a lifecycle event is low-volume and
+always meant to reach the structured stream. They still pay a rate-limit token.
+
+Nothing is dropped silently. Records the guard discards — rate-limited, or
+emitted while the socket was down — are counted and the count rides the next
+frame that does get through, as a `dropped` attribute:
+
+```kql
+ContainerAppConsoleLogs_CL
+| extend p = parse_json(Log_s)
+| where tostring(p.source) == "sandbox"
+| summarize lost = sum(tolong(p.dropped)) by issue_key = tostring(p.issue_key)
+| where lost > 0
+```
+
+`log` frames are fire-and-forget: no ack, no durable buffer, no replay. Losing a
+log line costs visibility, whereas the disk writes that would make it durable
+cost more than the line is worth — and replaying a reconnecting worker's backlog
+would bill for stale lines exactly when an operator wants live ones.
+
+**Version skew is negotiated, not assumed.** The router advertises a
+`log_ingest` capability in `hello_ack`, and a device forwards nothing until it
+sees that. This is load-bearing: the gateway closes any socket that sends a frame
+it cannot parse, so a new worker logging at an old router would be disconnected
+on its first line and reconnect straight into the same loop. The protocol version
+is deliberately *not* bumped for this — a bump would reject every not-yet-updated
+worker outright, which is far worse than not shipping its logs. An old router
+simply never advertises, and an old worker never sends.
 
 `cyrus router containers list` renders the same three clocks locally, as
 elapsed durations:

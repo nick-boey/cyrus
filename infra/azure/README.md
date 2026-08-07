@@ -964,6 +964,19 @@ load-bearing one is `sandbox_gauge`: one sample per sandbox per 60-second
 lifecycle sweep, carrying the issue key, provider state, live session count, and
 both uptime clocks.
 
+The **workers themselves** reach the same workspace by the same route. A sandbox
+writes to a stdout nothing collects — the ACA sandbox group is a separate ARM
+resource from the Container Apps environment, so the environment's diagnostic
+wiring does not reach it, and the sandbox data-plane API has no logs endpoint.
+Workers therefore forward level-filtered logs to the router over their existing
+WebSocket, and the router re-emits them into the stream above, tagged
+`source: "sandbox"` and attributed to the device row it authenticated. That
+needs no widening of the sandbox egress allowlist and no workload credential
+inside the sandbox. See [`docs/ROUTER.md`](../../docs/ROUTER.md) → "Sandbox
+worker logs" for the queries and the `CYRUS_LOG_FORWARD_*` volume guard — the
+defaults (WARN and above, 2/sec sustained) exist because this workspace is
+PerGB2018 and unfiltered session stdout from every sandbox is not cheap.
+
 ### Saved searches (category "Cyrus Sandboxes")
 
 | Search | Answers |
