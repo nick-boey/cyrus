@@ -274,7 +274,7 @@ prefixed `sandbox_`, so a single predicate selects the whole family.
 | `sandbox_destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
 | `sandbox_teardown_completed` | a terminal teardown finished; carries `action` and whether the worker's callback or the grace deadline triggered it |
 | `sandbox_gauge` | once per sandbox per 60s lifecycle sweep — the point-in-time inventory |
-| `sandbox_sweep_completed` | once per sweep, unconditionally — the fleet rollup |
+| `sandbox_sweep_completed` | once per completed sweep, even with zero sandboxes — the fleet rollup. The sweep is non-reentrant, so a tick that fires while the previous one is still running is skipped and logs a warning instead |
 
 Two attributes on `sandbox_gauge` are easy to confuse and mean different things:
 

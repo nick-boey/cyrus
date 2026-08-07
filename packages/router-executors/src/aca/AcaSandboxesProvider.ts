@@ -700,23 +700,31 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 			for (const sandbox of running) {
 				const deviceId = sandbox.labels?.[LABEL_DEVICE_ID];
 				const disk = sandbox.labels?.[LABEL_DISK];
-				if (!deviceId || !disk) {
-					errors.push(
-						new Error(
-							`cannot snapshot ACA sandbox ${sandbox.id} for ${issueKey}: missing ${!deviceId ? LABEL_DEVICE_ID : LABEL_DISK} label`,
-						),
+				// The snapshot is a COLD-path optimisation, never a precondition of
+				// the suspend: a Suspended sandbox resumes from its own frozen
+				// memory, and `ensureRunning` reaches for a snapshot only when the
+				// sandbox is ABSENT. Letting a snapshot failure abort the suspend is
+				// therefore trading a slower restore for an unbounded bill — and it
+				// did: an 18.4 GB snapshot measured 3m52s against the client's 120s
+				// request deadline, so `stop()` threw before ever suspending and the
+				// 4 vCPU sandbox stayed Running while every 60s sweep tick re-failed
+				// the same way (WAG-10 / WAG-14, 2026-08-06). Park it regardless.
+				if (deviceId && disk) {
+					await this.client
+						.createSnapshot(sandbox.id, this.labels(issueKey, deviceId, disk))
+						.catch((error: unknown) => {
+							this.logger.warn(
+								`could not snapshot ACA sandbox ${sandbox.id} for ${issueKey}; suspending without one (a later cold start rebuilds from the artifact bundle): ${String(error)}`,
+							);
+						});
+				} else {
+					this.logger.warn(
+						`ACA sandbox ${sandbox.id} for ${issueKey} is missing its ${!deviceId ? LABEL_DEVICE_ID : LABEL_DISK} label; suspending without a snapshot`,
 					);
-					continue;
 				}
-				try {
-					await this.client.createSnapshot(
-						sandbox.id,
-						this.labels(issueKey, deviceId, disk),
-					);
-					await this.client.stopSandbox(sandbox.id);
-				} catch (error) {
+				await this.client.stopSandbox(sandbox.id).catch((error: unknown) => {
 					errors.push(error);
-				}
+				});
 			}
 			await this.pruneSnapshots(issueKey);
 			if (errors.length > 0) {
