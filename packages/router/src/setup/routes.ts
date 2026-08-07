@@ -20,6 +20,7 @@ import {
 	SetupAuthError,
 	type SetupIdTokenVerifier,
 	type SetupPrincipal,
+	shouldRedirectToSetup,
 } from "./principal.js";
 import { HTMX_JS } from "./vendor/htmx.js";
 import { PICO_CSS } from "./vendor/pico.js";
@@ -290,7 +291,7 @@ function secureHtml(reply: FastifyReply): FastifyReply {
 		.header("x-frame-options", "DENY");
 }
 
-function shell(title: string, body: string): string {
+function shell(title: string, body: string, head = ""): string {
 	return `<!doctype html>
 <html lang="en">
 <head>
@@ -298,7 +299,7 @@ function shell(title: string, body: string): string {
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<meta http-equiv="Content-Security-Policy" content="${STRICT_CSP}">
 	<title>${escapeHtml(title)}</title>
-	<link rel="stylesheet" href="/setup/assets/pico.css">
+	<link rel="stylesheet" href="/setup/assets/pico.css">${head}
 </head>
 <body><main>${body}</main></body>
 </html>`;
@@ -313,10 +314,31 @@ function renderError(error: SetupAuthError): string {
 }
 
 /**
- * The first-visit state (F18). Its only control is a CSRF-protected POST —
- * deliberately a plain `<form method="post">` rather than an htmx attribute,
- * so it works before any script has loaded and cannot be triggered by a
- * cross-site navigation.
+ * The first-visit state (F18). Its only control is a CSRF-protected POST, and
+ * it must not be reachable by cross-site navigation.
+ *
+ * **The submit is an htmx XHR, and that is load-bearing in front of Azure's
+ * EasyAuth sidecar — not a styling choice.** EasyAuth rejects a request with a
+ * bodyless 403 (substatus 60) before it reaches the router when ALL of:
+ *
+ *   1. it is a POST authenticated by the session cookie,
+ *   2. the User-Agent says a real browser sent it,
+ *   3. `Origin` *and* `Referer` are absent or not in `allowedExternalRedirectUrls`,
+ *   4. `Origin` is absent or not in the ingress CORS origin list.
+ *
+ * This form is 1 and 2 by construction. A plain same-origin `<form method=
+ * "post">` navigation sends NO `Origin` header in Chromium and WebKit, and
+ * `secureHtml` serves every /setup page with `Referrer-Policy: no-referrer`,
+ * so it sends no `Referer` either — making 3 and 4 unconditionally true. No
+ * value in either allowlist can fix that, because both conditions are
+ * satisfied by the headers being *absent*. Every plain-form provision attempt
+ * against the deployed router 403'd for exactly this reason.
+ *
+ * An XHR always carries `Origin`, which is why every other write on this UI
+ * (all htmx) works. Keeping `method`/`action` alongside `hx-post` leaves the
+ * native submit as a fallback if htmx fails to load — no worse than the
+ * current behaviour, and correct the moment scripts run.
+ * https://learn.microsoft.com/azure/app-service/overview-authentication-authorization
  */
 function renderProvisionPage(email: string, csrfToken: string): string {
 	return shell(
@@ -327,11 +349,12 @@ function renderProvisionPage(email: string, csrfToken: string): string {
 			<h2>Set up your account</h2>
 			<p>Your Cyrus account has not been created yet. Setting it up creates your
 			session environment so you can add the credentials your sessions need.</p>
-			<form method="post" action="/setup/provision">
+			<form method="post" action="/setup/provision" hx-post="/setup/provision">
 				<input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
 				<button type="submit">Set up your account</button>
 			</form>
 		</article>`,
+		'\n\t<script src="/setup/assets/htmx.js" defer></script>',
 	);
 }
 
@@ -372,7 +395,28 @@ function sendError(
 	deps.logger.warn(
 		`Setup request refused with ${error.status}: ${error.message}`,
 	);
+	// Logged first, always: the redirect must not cost an operator the diagnostic
+	// line that says which principal was refused and why.
+	if (shouldRedirectToSetup(error, reply.request.url)) {
+		return redirectToSetup(reply);
+	}
 	return secureHtml(reply).status(error.status).send(renderError(error));
+}
+
+/**
+ * Sends the caller to `/setup`, which renders whichever of sign-in or
+ * first-run provisioning they actually need.
+ *
+ * htmx follows a 3xx transparently and would swap a whole HTML document into
+ * whatever fragment slot issued the request, so an htmx caller gets
+ * `HX-Redirect` instead — which makes the browser navigate for real. 303 is
+ * used rather than 302 so a refused POST is re-issued as a GET.
+ */
+function redirectToSetup(reply: FastifyReply): FastifyReply {
+	if (reply.request.headers["hx-request"]) {
+		return reply.header("hx-redirect", "/setup").status(204).send();
+	}
+	return reply.redirect("/setup", 303);
 }
 
 /* ----------------------------------------------------------------- guard -- */
@@ -648,6 +692,16 @@ export function registerSetupRoutes(
 	fastify.get("/setup/variables", async (request, reply) => {
 		const auth = await authenticate(deps, request);
 		if ("error" in auth) return sendError(deps, reply, auth.error);
+		// The only /setup* route that read the secret store without first
+		// confirming the principal has a `users` row. Being read-only did not
+		// excuse it: `readState` still touches the backend on behalf of an
+		// unregistered address, and the caller has no page to be refreshing.
+		try {
+			deps.bootstrap.authorize(auth.principal);
+		} catch (error) {
+			if (error instanceof SetupAuthError) return sendError(deps, reply, error);
+			throw error;
+		}
 		const state = await readState(deps, auth.principal.email);
 		return secureHtml(reply).send(
 			renderVariablesTable(buildModel(deps, auth.principal, state)),
@@ -674,6 +728,14 @@ export function registerSetupRoutes(
 			// 403 and the exact command an administrator has to run.
 			if (error instanceof SetupAuthError) return sendError(deps, reply, error);
 			throw error;
+		}
+		// The htmx submit (see `renderProvisionPage`) expects a fragment, and the
+		// success body here is a whole document — swapping that into the page
+		// would nest a second <html>. Reload /setup instead: the account now
+		// exists, so it renders the real page. The non-htmx fallback keeps the
+		// inline render below, which is also what the tests drive.
+		if (request.headers["hx-request"]) {
+			return redirectToSetup(reply);
 		}
 		const state = await readState(deps, guard.principal.email);
 		return secureHtml(reply).send(

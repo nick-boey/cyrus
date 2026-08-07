@@ -24,6 +24,7 @@ import {
 	SetupAuthError,
 	type SetupIdTokenVerifier,
 	type SetupPrincipal,
+	shouldRedirectToSetup,
 } from "./principal.js";
 import {
 	findAmbiguities,
@@ -312,14 +313,25 @@ function sendError(
 	deps.logger.warn(
 		`Repository setup request refused with ${error.status}: ${error.message}`,
 	);
-	const body =
-		error.status === 401
-			? `<p>You are not signed in. <a href="/.auth/login/aad?post_login_redirect_uri=%2Fsetup%2Frepositories">Sign in</a>.</p>`
-			: `<p>${escapeHtml(error.message)}</p>`;
+	// Logged first, always: the redirect must not cost an operator the diagnostic
+	// line that says which principal was refused and why.
+	//
+	// Every route in this file lives under /setup/repositories, so this absorbs
+	// BOTH "not signed in" and "no user row yet" — the sign-in link this branch
+	// used to render is gone because it is now unreachable. That deep-link dead
+	// end is the whole point: a teammate who bookmarks the repositories page and
+	// has never opened /setup was told to ask an administrator to run a CLI
+	// command, on a deployment where clicking one button would have done it.
+	if (shouldRedirectToSetup(error, reply.request.url)) {
+		if (reply.request.headers["hx-request"]) {
+			return reply.header("hx-redirect", "/setup").status(204).send();
+		}
+		return reply.redirect("/setup", 303);
+	}
 	return secureHtml(reply)
 		.status(error.status)
 		.send(
-			`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Cyrus repositories</title></head><body><main><h1>Cyrus repositories</h1>${body}</main></body></html>`,
+			`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Cyrus repositories</title></head><body><main><h1>Cyrus repositories</h1><p>${escapeHtml(error.message)}</p></main></body></html>`,
 		);
 }
 

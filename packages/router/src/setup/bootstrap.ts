@@ -243,7 +243,9 @@ export class SetupBootstrap {
 			throw new SetupAuthError(401, "signed-in identity carries no email");
 		}
 		const existing = this.findUser(email);
-		if (!existing) throw new SetupAuthError(403, unregisteredMessage(email));
+		if (!existing) {
+			throw new SetupAuthError(403, unregisteredMessage(email), "unregistered");
+		}
 		return { userId: existing.userId, email };
 	}
 
@@ -296,6 +298,10 @@ export class SetupBootstrap {
 		if (existing) return { userId: existing.userId, createdUser: false };
 
 		if (!this.deps.autoProvisionUsers) {
+			// Deliberately NOT tagged "unregistered": this is the one refusal that
+			// `/setup` cannot resolve. Auto-provisioning is off, so bouncing the
+			// caller back there would hand them a provisioning button that is
+			// guaranteed to fail, instead of the administrator's command.
 			throw new SetupAuthError(403, unregisteredMessage(email));
 		}
 
