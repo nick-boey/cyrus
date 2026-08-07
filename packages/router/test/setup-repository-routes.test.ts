@@ -141,23 +141,43 @@ describe("GET /setup/repositories", () => {
 		expect(response.body).toContain('value="p=Platform"');
 	});
 
-	it("refuses an unregistered principal with 403", async () => {
+	// An unregistered principal deep-linking here used to get a dead-end 403
+	// telling them to ask an administrator to run `cyrus router users add` —
+	// wrong advice wherever autoProvisionUsers is on. /setup is the only route
+	// that can provision, so that is where they go.
+	it("sends an unregistered principal back to /setup", async () => {
 		const { fastify } = build(fakeRegistry([API]));
 		const response = await fastify.inject({
 			method: "GET",
 			url: "/setup/repositories",
 			headers: { "x-ms-client-principal-name": BOB },
 		});
-		expect(response.statusCode).toBe(403);
+		expect(response.statusCode).toBe(303);
+		expect(response.headers.location).toBe("/setup");
 		expect(response.body).not.toContain("cyrus-api");
 	});
 
-	it("refuses an unauthenticated request with 401", async () => {
+	it("sends an unauthenticated request back to /setup", async () => {
 		const { fastify } = build(fakeRegistry([API]));
-		expect(
-			(await fastify.inject({ method: "GET", url: "/setup/repositories" }))
-				.statusCode,
-		).toBe(401);
+		const response = await fastify.inject({
+			method: "GET",
+			url: "/setup/repositories",
+		});
+		expect(response.statusCode).toBe(303);
+		expect(response.headers.location).toBe("/setup");
+	});
+
+	// htmx follows a 3xx itself and would swap a whole document into the table
+	// slot; HX-Redirect makes the browser navigate instead.
+	it("uses HX-Redirect for an htmx caller", async () => {
+		const { fastify } = build(fakeRegistry([API]));
+		const response = await fastify.inject({
+			method: "GET",
+			url: "/setup/repositories/table",
+			headers: { "x-ms-client-principal-name": BOB, "hx-request": "true" },
+		});
+		expect(response.statusCode).toBe(204);
+		expect(response.headers["hx-redirect"]).toBe("/setup");
 	});
 });
 
@@ -324,7 +344,7 @@ describe("POST /setup/repositories", () => {
 		expect(registry.current()).toEqual([]);
 	});
 
-	it("refuses an unregistered principal with 403 and writes nothing", async () => {
+	it("sends an unregistered principal back to /setup and writes nothing", async () => {
 		const registry = fakeRegistry([API]);
 		const { fastify, csrf } = build(registry);
 
@@ -340,7 +360,9 @@ describe("POST /setup/repositories", () => {
 			}).toString(),
 		});
 
-		expect(response.statusCode).toBe(403);
+		// 303, not 302, so the browser re-issues this POST as a GET of /setup.
+		expect(response.statusCode).toBe(303);
+		expect(response.headers.location).toBe("/setup");
 		expect(registry.current()).toEqual([API]);
 	});
 });

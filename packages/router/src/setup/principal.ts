@@ -137,10 +137,51 @@ export class SetupAuthError extends Error {
 	constructor(
 		readonly status: 401 | 403,
 		message: string,
+		/**
+		 * Set only on "this principal has no `users` row". It is what separates
+		 * that refusal from every other 403 — see {@link shouldRedirectToSetup},
+		 * which is the sole consumer.
+		 */
+		readonly code?: "unregistered",
 	) {
 		super(message);
 		this.name = "SetupAuthError";
 	}
+}
+
+/** The one page that renders sign-in and first-run provisioning. */
+const SETUP_ROOT = "/setup";
+
+/**
+ * Whether a refusal should bounce the caller back to `/setup` instead of
+ * rendering a dead-end error page.
+ *
+ * Two refusals are not really errors — they are states `/setup` itself knows
+ * how to resolve:
+ *
+ * - **401, not signed in.** `/setup` renders the sign-in link.
+ * - **403 `unregistered`.** `/setup` renders the provisioning button, and
+ *   `POST /setup/provision` is the *only* route that auto-provisions. A
+ *   teammate who deep-links to `/setup/repositories` (a bookmark, a shared
+ *   link) would otherwise be told to ask an administrator to run `cyrus router
+ *   users add`, which is the wrong advice on a deployment where
+ *   `setupUi.autoProvisionUsers` is on and they could simply click a button.
+ *
+ * Every other refusal — an expired CSRF token, a disallowed domain, a changed
+ * Entra object id — is a genuine error whose message the caller has to read, so
+ * it stays where it is.
+ *
+ * `/setup` itself is excluded, or the redirect would loop: its own 401 is
+ * precisely what renders the sign-in link.
+ */
+export function shouldRedirectToSetup(
+	error: SetupAuthError,
+	url: string,
+): boolean {
+	if (error.status !== 401 && error.code !== "unregistered") return false;
+	// Compare the path alone: `/setup?foo=1` is still the root.
+	const path = url.split("?")[0] ?? url;
+	return path !== SETUP_ROOT && path !== `${SETUP_ROOT}/`;
 }
 
 /**
