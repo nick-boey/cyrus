@@ -172,11 +172,54 @@ defaults to `rg-<project>-<environment>`.
 
 ### 3. Initialize and create bootstrap resources
 
+#### Terraform state backend
+
+State lives in its own resource group, `rg-cyrus-tfstate`, which this stack does
+**not** manage. It cannot live in `azurerm_resource_group.this`: that group is
+created by the stack, so `terraform destroy` would delete the container holding
+the state file it is mid-write to, and on a first run the container would not
+exist at all.
+
+Run once per environment, with Owner (or Contributor + Role Based Access Control
+Administrator) on the subscription:
+
+```bash
+./scripts/bootstrap-tfstate.sh \
+  --state-account <globally-unique-name> \
+  --repo <owner>/<private-repo>
+```
+
+It creates the storage account (blob versioning on — state loss is the one
+unrecoverable failure in this stack), the `tfstate` container, and the
+user-assigned identity that GitHub Actions assumes over OIDC. The federated
+credential trusts exactly one branch of one private repo; no client secret is
+created, so there is nothing to store or rotate. The script prints the values
+for `env/backend.dev.hcl` and the three repository variables when it finishes.
+
+`versions.tf` declares `backend "azurerm" {}` with no settings — a backend block
+cannot interpolate variables, so naming the account there would both publish an
+environment identifier and hardcode one environment into a parameterised stack.
+Every setting is supplied at init time instead:
+
+```bash
+cp env/backend.dev.hcl.example env/backend.dev.hcl   # then fill it in
+terraform init -backend-config=env/backend.dev.hcl
+```
+
+Migrating an existing local state file up is `terraform init -migrate-state
+-backend-config=env/backend.dev.hcl`; answer `yes` to the copy prompt.
+
+> A plan that proposes creating every resource from scratch against a stack you
+> know exists means the `key` is wrong, not that the stack drifted. Check
+> `env/backend.dev.hcl` before applying.
+
+#### Bootstrap resources
+
 The router image cannot be created until ACR exists. Create only the resource
 group, vault, identities, sandbox group, and ACR first:
 
 ```bash
-terraform init
+terraform init -backend-config=env/backend.dev.hcl
 terraform fmt -check
 terraform validate
 terraform apply -var-file=dev.tfvars \
