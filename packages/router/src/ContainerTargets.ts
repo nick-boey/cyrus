@@ -7,6 +7,11 @@ import type {
 } from "./RepositoryRegistry.js";
 import type { RouterStore } from "./RouterStore.js";
 import {
+	emitSandboxEvent,
+	SANDBOX_EVENTS,
+	type SandboxDestroyReason,
+} from "./SandboxTelemetry.js";
+import {
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	isReservedEnvKey,
 	type SecretStoreBackend,
@@ -170,6 +175,12 @@ export class ContainerTargetService {
 			const staleDeviceId = existing.deviceId;
 			const old = this.deps.executors.get(staleProvider);
 			if (old) {
+				emitSandboxEvent(
+					this.deps.logger,
+					SANDBOX_EVENTS.destroyed,
+					{ issueKey, deviceId: staleDeviceId, provider: staleProvider },
+					{ reason: "provider_switch" satisfies SandboxDestroyReason },
+				);
 				void old.destroy(issueKey).catch((err: unknown) => {
 					this.deps.logger.error(
 						`Destroy of the stale ${staleProvider} container for ${issueKey} failed; it may keep running and accruing cost`,
@@ -422,6 +433,11 @@ export class ContainerTargetService {
 			this.deps.logger.info(
 				`booting ${provider} container for ${issueKey} (device ${deviceId})`,
 			);
+			emitSandboxEvent(this.deps.logger, SANDBOX_EVENTS.bootStarted, {
+				issueKey,
+				deviceId,
+				provider,
+			});
 			await executor.ensureRunning({
 				issueKey,
 				env,
@@ -436,9 +452,31 @@ export class ContainerTargetService {
 			this.deps.logger.info(
 				`${provider} container for ${issueKey} (device ${deviceId}) reported running; waiting for the worker to connect`,
 			);
+			// Starts the continuous-uptime clock, and only on the tick that
+			// actually transitioned this container to running — `ensureRunning`
+			// covers both a cold boot and a resume, and returns immediately for a
+			// container that was already up. `markDeviceRunning` is set-if-null
+			// for exactly that reason, so `resumed` here distinguishes a real
+			// transition from a no-op re-route.
+			const transitioned = this.deps.store.markDeviceRunning(
+				deviceId,
+				this.now(),
+			);
+			emitSandboxEvent(
+				this.deps.logger,
+				SANDBOX_EVENTS.running,
+				{ issueKey, deviceId, provider },
+				{ transitioned },
+			);
 			this.bootFailedNotified.delete(issueKey);
 		} catch (err) {
 			this.deps.logger.error(`Container boot failed for ${issueKey}`, err);
+			emitSandboxEvent(
+				this.deps.logger,
+				SANDBOX_EVENTS.bootFailed,
+				{ issueKey, deviceId, provider },
+				{ reason: err instanceof Error ? err.message : String(err) },
+			);
 			if (notify && !this.bootFailedNotified.has(issueKey)) {
 				this.bootFailedNotified.add(issueKey);
 				try {

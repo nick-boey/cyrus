@@ -6,6 +6,7 @@ import {
 	isAgentSessionPromptedWebhook,
 	isIssueDeletedWebhook,
 	isIssueStateChangeWebhook,
+	type LogEventAttributes,
 	type Webhook,
 } from "cyrus-core";
 import type { SessionStateFrame } from "cyrus-router-protocol";
@@ -36,6 +37,11 @@ import type {
 	RepositoryResolver,
 } from "./RepositoryResolver.js";
 import type { RouterStore } from "./RouterStore.js";
+import {
+	emitSandboxEvent,
+	SANDBOX_EVENTS,
+	type SandboxEventName,
+} from "./SandboxTelemetry.js";
 import type {
 	TerminalTeardown,
 	TerminalTeardownAction,
@@ -422,6 +428,46 @@ export class EventRouter {
 	 * All paths are idempotent: the device replays unacked frames on
 	 * reconnect, and the router acks only after applying.
 	 */
+	/**
+	 * Emit a sandbox lifecycle event for a device, if it is a container.
+	 *
+	 * `handleSessionState` is shared by physical devices and sandboxes, but the
+	 * `sandbox_*` vocabulary is only meaningful for the latter — a teammate's
+	 * laptop parking a session is not a fleet-cost signal. Silently skipping
+	 * non-container devices keeps the event stream something an operator can
+	 * count sandboxes from.
+	 *
+	 * Never throws: telemetry must not be able to fail a state transition the
+	 * store has already applied.
+	 */
+	private emitSandboxLifecycle(
+		deviceId: number,
+		name: SandboxEventName,
+		attributes?: LogEventAttributes,
+	): void {
+		try {
+			const device = this.store.getDeviceInfo(deviceId);
+			if (
+				device?.kind !== "container" ||
+				!device.issueKey ||
+				!device.provider
+			) {
+				return;
+			}
+			emitSandboxEvent(
+				this.logger,
+				name,
+				{ issueKey: device.issueKey, deviceId, provider: device.provider },
+				attributes,
+			);
+		} catch (err) {
+			this.logger.warn(
+				`Failed to emit ${name} telemetry for device ${deviceId}`,
+				err,
+			);
+		}
+	}
+
 	handleSessionState(deviceId: number, frame: SessionStateFrame): void {
 		if (frame.state === "parked") {
 			// Stashed, not dropped: `clearSessionAffinity` deletes the row that
@@ -440,6 +486,9 @@ export class EventRouter {
 			this.logger.info(
 				`Session ${frame.sessionId} parked on device ${deviceId}; released affinity, retained the issue lock`,
 			);
+			this.emitSandboxLifecycle(deviceId, SANDBOX_EVENTS.parked, {
+				session_id: frame.sessionId,
+			});
 			return;
 		}
 		if (frame.state === "active") {
@@ -458,6 +507,9 @@ export class EventRouter {
 			this.logger.info(
 				`Session ${frame.sessionId} unparked on device ${deviceId}; restored affinity and cleared the idle stamp`,
 			);
+			this.emitSandboxLifecycle(deviceId, SANDBOX_EVENTS.unparked, {
+				session_id: frame.sessionId,
+			});
 			return;
 		}
 		this.parkedSessionCreators.delete(frame.sessionId);

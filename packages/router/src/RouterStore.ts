@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS devices (
   next_seq INTEGER NOT NULL DEFAULT 1,
   last_seen_ms INTEGER,
   last_routed_ms INTEGER,
-  parked_at_ms INTEGER
+  parked_at_ms INTEGER,
+  running_since_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS enrollment_codes (
   code_hash TEXT PRIMARY KEY,
@@ -150,6 +151,7 @@ interface DeviceRow {
 	last_seen_ms: number | null;
 	last_routed_ms: number | null;
 	parked_at_ms: number | null;
+	running_since_ms: number | null;
 }
 
 interface ContainerDeviceRow {
@@ -161,6 +163,7 @@ interface ContainerDeviceRow {
 	last_seen_ms: number | null;
 	last_routed_ms: number | null;
 	parked_at_ms: number | null;
+	running_since_ms: number | null;
 }
 
 export interface ContainerDeviceInfo {
@@ -177,6 +180,21 @@ export interface ContainerDeviceInfo {
 	 * absent when no session is parked.
 	 */
 	parkedAtMs?: number;
+	/**
+	 * When the container most recently transitioned to running, and therefore
+	 * the base for CONTINUOUS uptime. Absent while it is stopped/parked.
+	 *
+	 * Distinct from {@link createdMs}, which is the device ROW's age: the row
+	 * survives every stop/resume cycle, so `createdMs` answers "how long has
+	 * this issue had a sandbox", never "how long has this sandbox been burning
+	 * 4 vCPU". Only this field can answer the latter, which is what the
+	 * long-running-sandbox alert is built on.
+	 *
+	 * Set-if-absent on boot (see {@link markDeviceRunning}) so a routed event
+	 * against an already-running container does not restart the clock, and
+	 * cleared on every transition out of running.
+	 */
+	runningSinceMs?: number;
 }
 
 interface ContainerTeardownRow {
@@ -278,6 +296,7 @@ function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
 		lastSeenMs: row.last_seen_ms ?? undefined,
 		lastRoutedMs: row.last_routed_ms ?? undefined,
 		parkedAtMs: row.parked_at_ms ?? undefined,
+		runningSinceMs: row.running_since_ms ?? undefined,
 	};
 }
 
@@ -437,6 +456,19 @@ export class RouterStore {
 			!deviceColsNow.some((c) => c.name === "parked_at_ms")
 		) {
 			this.db.exec("ALTER TABLE devices ADD COLUMN parked_at_ms INTEGER");
+		}
+
+		// Deliberately NOT backfilled. NULL means "not currently running", which
+		// is the honest answer for every pre-upgrade row: the router has no idea
+		// whether their containers are up, and inventing a start time would put
+		// fabricated uptimes straight into the long-running-sandbox alert.
+		// The lifecycle sweep reconciles each row against its provider's real
+		// state within one 60s tick, so the gap is bounded and self-healing.
+		if (
+			deviceColsNow.length > 0 &&
+			!deviceColsNow.some((c) => c.name === "running_since_ms")
+		) {
+			this.db.exec("ALTER TABLE devices ADD COLUMN running_since_ms INTEGER");
 		}
 
 		// Existing rows predate the column. Backfill them to migration time rather
@@ -738,7 +770,7 @@ export class RouterStore {
 	): ContainerDeviceInfo | undefined {
 		const row = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms
 				 FROM devices WHERE kind = 'container' AND issue_key = ?`,
 			)
 			.get(issueKey) as ContainerDeviceRow | undefined;
@@ -808,7 +840,7 @@ export class RouterStore {
 	listContainerDevices(): ContainerDeviceInfo[] {
 		const rows = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms
 				 FROM devices WHERE kind = 'container'`,
 			)
 			.all() as ContainerDeviceRow[];
@@ -834,6 +866,43 @@ export class RouterStore {
 		this.db
 			.prepare("UPDATE devices SET parked_at_ms = NULL WHERE device_id = ?")
 			.run(deviceId);
+	}
+
+	/**
+	 * Start this device's continuous-uptime clock, if it isn't already running.
+	 *
+	 * SET-IF-NULL is the whole point of the method. `boot()` runs on every
+	 * routed event, and `ensureRunning` is idempotent — for an already-running
+	 * container it returns immediately. An unconditional stamp would therefore
+	 * reset the clock every time a user sent a comment, and a sandbox that had
+	 * genuinely been pinned for eight hours would report an uptime of seconds,
+	 * which is precisely the case the 6-hour alert exists to catch.
+	 *
+	 * Returns true when this call actually started the clock, so callers can
+	 * emit the `running` transition event exactly once per running period
+	 * rather than once per routed webhook.
+	 */
+	markDeviceRunning(deviceId: number, nowMs: number): boolean {
+		const result = this.db
+			.prepare(
+				"UPDATE devices SET running_since_ms = ? WHERE device_id = ? AND running_since_ms IS NULL",
+			)
+			.run(nowMs, deviceId);
+		return result.changes > 0;
+	}
+
+	/**
+	 * Stop the continuous-uptime clock — the container is parked, stopped, or
+	 * gone. Idempotent; returns true only when a clock was actually running, so
+	 * the caller can emit a stop transition exactly once.
+	 */
+	clearDeviceRunningSince(deviceId: number): boolean {
+		const result = this.db
+			.prepare(
+				"UPDATE devices SET running_since_ms = NULL WHERE device_id = ? AND running_since_ms IS NOT NULL",
+			)
+			.run(deviceId);
+		return result.changes > 0;
 	}
 
 	// ── Terminal teardown bookkeeping ──────────────────────────────────────

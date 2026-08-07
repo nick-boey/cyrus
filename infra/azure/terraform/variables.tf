@@ -566,3 +566,30 @@ variable "router_default_executor" {
     error_message = "router_default_executor must be a container provider name ('aca' or 'docker'), or null to omit it. 'device' and 'default' are rejected: neither is a provider, and the router would degrade every affected user to a physical device with a warning."
   }
 }
+
+################################################################################
+# Monitoring (see monitoring.tf)
+################################################################################
+
+variable "enable_monitoring_alerts" {
+  description = "Create the Azure Monitor scheduled-query alert rules over the router's JSON log stream (long-running sandbox, stalled lifecycle sweep, sandbox boot failures). Defaults TRUE: unlike the router-config variables, these resources touch nothing the router reads, so enabling them cannot roll the single router replica — the only cost of the default is the per-rule Azure Monitor charge for three 15-minute log-query rules. The saved KQL searches are created regardless of this flag; they are free and evaluate nothing until an operator opens them."
+  type        = bool
+  default     = true
+}
+
+variable "alert_email_receivers" {
+  description = "Email addresses to notify when an alert rule fires. Empty (the default) still creates the alert rules and still records fired alerts in Azure Monitor — it just creates no action group, so nothing is emailed. Set this once you know where sandbox alerts should land."
+  type        = list(string)
+  default     = []
+}
+
+variable "sandbox_uptime_alert_hours" {
+  description = "Continuous-uptime threshold, in hours, for the long-running-sandbox alert. Measured from `devices.running_since_ms` (the current run), NOT from the device row's age, so a sandbox that has been idle-stopped and resumed repeatedly never accumulates toward it. The default of 6 is calibrated against `idleStopMs` (5 minutes): a sandbox only reaches six continuous hours by holding session affinity for essentially that whole period, which at 4 vCPU / 8 GiB is both a cost signal and a stuck-agent signal."
+  type        = number
+  default     = 6
+
+  validation {
+    condition     = var.sandbox_uptime_alert_hours > 0
+    error_message = "sandbox_uptime_alert_hours must be greater than zero."
+  }
+}

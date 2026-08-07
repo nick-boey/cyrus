@@ -155,6 +155,40 @@ describe("LocalDockerProvider", () => {
 		expect(await p.listManaged()).toEqual(["CYPACK-1", "CYPACK-2"]);
 	});
 
+	/**
+	 * The bulk-state seam the router's telemetry gauge reads: one `docker ps -a`
+	 * for the whole fleet's keys AND states, instead of one `docker inspect` per
+	 * container per sweep tick.
+	 */
+	it("lists key and state for every managed container in one ps call", async () => {
+		const { exec, calls } = fakeExec({
+			"ps -a": {
+				stdout: "CYPACK-1\trunning\nCYPACK-2\texited\nCYPACK-3\tcreated\n",
+			},
+		});
+		const p = new LocalDockerProvider({ image: "img:1", exec });
+
+		expect(await p.listStates()).toEqual([
+			{ issueKey: "CYPACK-1", status: "running", providerState: "running" },
+			// Everything that is not Docker's `running` is a container that exists
+			// but is not serving — which is exactly ContainerStatus's `stopped`.
+			{ issueKey: "CYPACK-2", status: "stopped", providerState: "exited" },
+			{ issueKey: "CYPACK-3", status: "stopped", providerState: "created" },
+		]);
+		expect(calls.filter((c) => c[1] === "ps")).toHaveLength(1);
+	});
+
+	it("skips blank lines rather than emitting a container with an empty issue key", async () => {
+		const { exec } = fakeExec({
+			"ps -a": { stdout: "\nCYPACK-1\trunning\n\n" },
+		});
+		const p = new LocalDockerProvider({ image: "img:1", exec });
+
+		expect(await p.listStates()).toEqual([
+			{ issueKey: "CYPACK-1", status: "running", providerState: "running" },
+		]);
+	});
+
 	it("maps status to absent and stopped", async () => {
 		const absent = fakeExec({ "inspect -f": { exitCode: 1 } });
 		const stopped = fakeExec({ "inspect -f": { stdout: "false\timg:1\n" } });
