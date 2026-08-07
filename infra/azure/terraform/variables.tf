@@ -30,9 +30,8 @@ variable "tags" {
 ################################################################################
 
 variable "location" {
-  description = "Azure region for every regional resource. ACA sandbox groups are supported in 35 regions (spike S7); the spike-verified default for this tenant is 'australiaeast'."
+  description = "Azure region for every regional resource. REQUIRED — deliberately has no default, so a stack cannot silently land in a region nobody chose. ACA sandbox groups are supported in 35 regions (spike S7) and 'australiaeast' is the spike-verified value for this tenant; an unsupported region fails at sandbox-group create, not at plan, so check the spike findings before picking a new one."
   type        = string
-  default     = "australiaeast"
 }
 
 ################################################################################

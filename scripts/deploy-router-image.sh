@@ -166,7 +166,7 @@ main() {
   done
   az account show >/dev/null 2>&1 || die "not logged in to Azure — run 'az login'"
   [[ -f "$TFVARS" ]] || die "tfvars not found: $TFVARS"
-  [[ -d "$TF_DIR/.terraform" ]] || die "terraform not initialized in $TF_DIR — run 'terraform -chdir=$TF_DIR init'"
+  [[ -d "$TF_DIR/.terraform" ]] || die "terraform not initialized in $TF_DIR — run 'terraform -chdir=$TF_DIR init -backend-config=env/backend.dev.hcl'"
   [[ -n "${REGISTRY:-}" ]] || die "could not determine the ACR name from router_image in ${TFVARS}; set REGISTRY=<acr-name>"
 
   # -chdir makes a relative -var-file resolve against TF_DIR rather than the
