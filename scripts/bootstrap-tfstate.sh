@@ -26,7 +26,7 @@ set -euo pipefail
 STATE_RG="rg-cyrus-tfstate"
 STATE_ACCOUNT=""
 CONTAINER="tfstate"
-LOCATION="australiaeast"
+LOCATION=""
 IDENTITY_NAME="id-cyrus-deploy"
 REPO=""
 BRANCH="deploy"
@@ -34,13 +34,21 @@ SUBSCRIPTION=""
 
 usage() {
   cat >&2 <<'EOF'
-usage: bootstrap-tfstate.sh --state-account <name> --repo <owner/repo> [options]
+usage: bootstrap-tfstate.sh --state-account <name> --repo <owner/repo>
+                            --location <region> [options]
 
 required:
   --state-account <name>   Storage account for state. 3-24 chars, lowercase
                            alphanumeric, globally unique across Azure.
   --repo <owner/repo>      PRIVATE repo whose deploy branch may assume the
-                           identity, e.g. nick-boey/cyrus-private.
+                           identity, e.g. Northrop-Digital/cyrus-deploy.
+  --location <region>      Azure region, e.g. australiaeast. No default, to
+                           match `var.location` in the stack — nothing here
+                           should silently place resources in a region nobody
+                           chose. This does NOT have to match the stack's
+                           region: it holds only blobs and an identity, neither
+                           of which carries the ACA sandbox-group region
+                           restriction.
 
 options:
   --branch <name>          Branch trusted by the federated credential.
@@ -48,7 +56,6 @@ options:
   --state-rg <name>        Resource group for state + identity.
                            (default: rg-cyrus-tfstate)
   --container <name>       Blob container name. (default: tfstate)
-  --location <region>      (default: australiaeast)
   --identity-name <name>   (default: id-cyrus-deploy)
   --subscription <id>      (default: the current az CLI subscription)
 EOF
@@ -72,6 +79,7 @@ done
 
 [[ -n "$STATE_ACCOUNT" ]] || { echo "error: --state-account is required" >&2; usage; }
 [[ -n "$REPO" ]] || { echo "error: --repo is required" >&2; usage; }
+[[ -n "$LOCATION" ]] || { echo "error: --location is required" >&2; usage; }
 
 # Azure rejects a bad storage account name several seconds into `create`, after
 # the resource group already exists. Fail here instead, where nothing has been

@@ -186,8 +186,14 @@ Administrator) on the subscription:
 ```bash
 ./scripts/bootstrap-tfstate.sh \
   --state-account <globally-unique-name> \
-  --repo <owner>/<private-repo>
+  --repo <owner>/<private-repo> \
+  --location <region>
 ```
+
+`--location` is required, matching `var.location` in the stack — neither has a
+default, so nothing lands in a region nobody chose. It need not match the
+stack's region: the state group holds only blobs and an identity, and carries
+none of the ACA sandbox-group region restrictions.
 
 It creates the storage account (blob versioning on — state loss is the one
 unrecoverable failure in this stack), the `tfstate` container, and the

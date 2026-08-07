@@ -13,7 +13,10 @@ tags = {
   cost-center = "research"
 }
 
-# ---- Location (spike S7: 35 regions supported; australiaeast verified) ------
+# ---- Location — REQUIRED, no default -----------------------------------------
+# Spike S7: ACA sandbox groups are supported in 35 regions; australiaeast is the
+# verified one for this tenant. An unsupported region fails at sandbox-group
+# create, not at plan.
 location = "australiaeast"
 
 # ---- Container images --------------------------------------------------------
