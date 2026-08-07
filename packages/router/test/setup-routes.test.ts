@@ -416,6 +416,33 @@ describe("GET /setup — read-only (F18)", () => {
 		expect(res.body).not.toContain("hx-get");
 	});
 
+	// Azure's EasyAuth sidecar answers a bodyless 403 (substatus 60) to a
+	// cookie-authenticated POST carrying neither `Origin` nor `Referer`. A plain
+	// same-origin form navigation sends no `Origin`, and every /setup page is
+	// served `Referrer-Policy: no-referrer`, so the native submit is rejected
+	// before the router ever sees it — which is what happened to every real
+	// provision attempt. An XHR always carries `Origin`, so the submit must go
+	// through htmx, and htmx must actually be on the page to intercept it.
+	it("submits the provision form as an htmx XHR, not a bare navigation", async () => {
+		const h = await harness();
+		const res = await get(h, "/setup", ALICE);
+		expect(res.body).toContain('hx-post="/setup/provision"');
+		expect(res.body).toContain('src="/setup/assets/htmx.js"');
+	});
+
+	it("allows that XHR under the page's own CSP", async () => {
+		const h = await harness();
+		const res = await get(h, "/setup", ALICE);
+		// htmx posts over XMLHttpRequest, which `connect-src` governs — NOT
+		// `form-action`. Both the header and the meta tag are enforced, so a
+		// missing directive in either one blocks the submit.
+		expect(res.headers["content-security-policy"]).toContain(
+			"connect-src 'self'",
+		);
+		expect(res.body).toContain("connect-src 'self'");
+		expect(res.body).toContain("script-src 'self'");
+	});
+
 	it("renders the variables page for a provisioned teammate", async () => {
 		const h = await provisioned(await harness());
 		const res = await get(h, "/setup", ALICE);
@@ -491,6 +518,26 @@ describe("POST /setup/provision", () => {
 			GIT_TOKEN: "",
 		});
 		expect(res.body).toContain('id="variables"');
+	});
+
+	// The real path, since the page submits via htmx. The success body is a
+	// whole document, so swapping it in would nest a second <html> inside the
+	// page — reload /setup instead, which now renders the variables page.
+	it("provisions and sends an htmx caller to /setup", async () => {
+		const h = await harness();
+		const res = await h.app.inject({
+			method: "POST",
+			url: "/setup/provision",
+			payload: form({ csrf: h.csrf.issue(ALICE) }),
+			headers: { ...formHeaders(ALICE), "hx-request": "true" },
+		});
+		expect(res.statusCode).toBe(204);
+		expect(res.headers["hx-redirect"]).toBe("/setup");
+		expect(h.store.listUsers().map((u) => u.email)).toContain(ALICE);
+		expect(await h.secrets.get(ALICE)).toEqual({
+			CLAUDE_CODE_OAUTH_TOKEN: "",
+			GIT_TOKEN: "",
+		});
 	});
 
 	it("refuses without a CSRF token and provisions nothing", async () => {
