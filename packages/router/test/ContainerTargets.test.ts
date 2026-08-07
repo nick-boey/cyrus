@@ -18,7 +18,7 @@ import type {
 } from "../src/RepositoryRegistry.js";
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
-import { testLogger } from "./helpers/logger.js";
+import { type TestLogger, testLogger } from "./helpers/logger.js";
 
 /** Minimal fake ContainerExecutor whose ensureRunning/destroy are inspectable mocks. */
 function fakeExecutor(
@@ -80,7 +80,7 @@ describe("ContainerTargetService", () => {
 	let postActivity: Mock<
 		(workspaceId: string, sessionId: string, body: string) => Promise<void>
 	>;
-	let logger: { info: Mock; warn: Mock };
+	let logger: TestLogger;
 
 	beforeEach(() => {
 		store = new RouterStore(":memory:");
@@ -230,6 +230,151 @@ describe("ContainerTargetService", () => {
 		// distinguishable from one that never started.
 		expect(logged).toMatch(/booting|boot start/i);
 		expect(logged).toMatch(/running|completed|ready/i);
+	});
+
+	describe("sandbox lifecycle telemetry", () => {
+		/** Every `logger.event(name, attrs)` recorded for one event name. */
+		const eventsNamed = (name: string) =>
+			logger.event.mock.calls
+				.filter(([emitted]) => emitted === name)
+				.map(([, attributes]) => (attributes ?? {}) as Record<string, unknown>);
+
+		async function bootOnce(now?: () => number): Promise<number> {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker");
+			const service = makeService(new Map([["docker", docker]]), now);
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-279",
+			);
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() =>
+				expect(docker.ensureRunning).toHaveBeenCalledTimes(1),
+			);
+			return deviceId;
+		}
+
+		it("emits both edges of a boot as events, not just log lines", async () => {
+			await bootOnce();
+
+			await vi.waitFor(() =>
+				expect(eventsNamed("sandbox_running")).toHaveLength(1),
+			);
+			expect(eventsNamed("sandbox_boot_started")[0]).toMatchObject({
+				issue_key: "NOR-279",
+				provider: "docker",
+			});
+			expect(eventsNamed("sandbox_running")[0]).toMatchObject({
+				issue_key: "NOR-279",
+				transitioned: true,
+			});
+		});
+
+		it("starts the uptime clock when a boot brings the container up", async () => {
+			const now = 1_700_000_000_000;
+			await bootOnce(() => now);
+
+			await vi.waitFor(() =>
+				expect(
+					store.getContainerDeviceForIssue("NOR-279")?.runningSinceMs,
+				).toBe(now),
+			);
+		});
+
+		/**
+		 * `ensureRunning` is idempotent and returns immediately for a container
+		 * that is already up, so a routed comment on a busy sandbox reaches this
+		 * path constantly. Restarting the clock there would make every uptime read
+		 * "seconds" and the long-running alert could never fire.
+		 */
+		it("does not restart the uptime clock when a re-route finds the container already up", async () => {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker");
+			let now = 1_000;
+			const service = makeService(new Map([["docker", docker]]), () => now);
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-279",
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() =>
+				expect(docker.ensureRunning).toHaveBeenCalledTimes(1),
+			);
+			now = 6 * 60 * 60_000;
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() =>
+				expect(docker.ensureRunning).toHaveBeenCalledTimes(2),
+			);
+
+			expect(store.getContainerDeviceForIssue("NOR-279")?.runningSinceMs).toBe(
+				1_000,
+			);
+			// The second `sandbox_running` says it changed nothing, so a query
+			// counting real transitions can filter on it.
+			expect(eventsNamed("sandbox_running").map((e) => e.transitioned)).toEqual(
+				[true, false],
+			);
+		});
+
+		it("emits a boot-failure event carrying the reason", async () => {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			const docker = fakeExecutor("docker", {
+				ensureRunning: vi.fn(async () => {
+					throw new Error("docker daemon unreachable");
+				}),
+			});
+			const service = makeService(new Map([["docker", docker]]));
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"NOR-279",
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+
+			await vi.waitFor(() =>
+				expect(eventsNamed("sandbox_boot_failed")).toHaveLength(1),
+			);
+			expect(eventsNamed("sandbox_boot_failed")[0]).toMatchObject({
+				issue_key: "NOR-279",
+				provider: "docker",
+				reason: "docker daemon unreachable",
+			});
+			// A failed boot leaves no uptime clock running.
+			expect(
+				store.getContainerDeviceForIssue("NOR-279")?.runningSinceMs,
+			).toBeUndefined();
+			expect(eventsNamed("sandbox_running")).toHaveLength(0);
+		});
+
+		it("emits a destroy event when a provider switch replaces the device", async () => {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			const docker = fakeExecutor("docker");
+			const fake2 = fakeExecutor("fake2");
+			const service = makeService(
+				new Map<string, ContainerExecutor>([
+					["docker", docker],
+					["fake2", fake2],
+				]),
+			);
+			service.ensureDevice({ userId, email: "a@example.com" }, "NOR-279");
+
+			store.setUserExecutor("a@example.com", '{"type":"fake2"}');
+			service.ensureDevice({ userId, email: "a@example.com" }, "NOR-279");
+
+			expect(eventsNamed("sandbox_destroyed")[0]).toMatchObject({
+				issue_key: "NOR-279",
+				provider: "docker",
+				reason: "provider_switch",
+			});
+		});
 	});
 
 	it("posts a boot-failure activity once when ensureRunning rejects", async () => {

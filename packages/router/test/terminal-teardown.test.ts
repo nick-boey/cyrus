@@ -61,6 +61,82 @@ describe("TerminalTeardown", () => {
 		});
 	}
 
+	describe("sandbox telemetry", () => {
+		const eventsNamed = (name: string) =>
+			logger.event.mock.calls
+				.filter(([emitted]) => emitted === name)
+				.map(([, attributes]) => (attributes ?? {}) as Record<string, unknown>);
+
+		/**
+		 * Two events, not one. `sandbox_destroyed` is what closes an issue out of
+		 * the sandbox-count series regardless of why it went away, while
+		 * `sandbox_teardown_completed` carries the teardown-specific dimensions.
+		 * Collapsing them would force every "how many sandboxes are open" query to
+		 * special-case teardowns.
+		 */
+		it("emits both a destroy and a teardown event when a teardown completes", async () => {
+			const { deviceId } = container();
+			const teardown = coordinator(executor());
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "closed" });
+
+			await teardown.handleCallback("CYPACK-1", deviceId, "cb-1");
+
+			expect(eventsNamed("sandbox_destroyed")[0]).toMatchObject({
+				issue_key: "CYPACK-1",
+				device_id: deviceId,
+				provider: "docker",
+				reason: "terminal_teardown",
+			});
+			expect(eventsNamed("sandbox_teardown_completed")[0]).toMatchObject({
+				issue_key: "CYPACK-1",
+				device_id: deviceId,
+				action: "closed",
+				trigger: "callback",
+			});
+		});
+
+		/**
+		 * The trigger distinguishes "the worker cleaned up and reported in" from
+		 * "no worker ever came back and the grace deadline forced the destroy" —
+		 * the same distinction the log lines already make, but queryable.
+		 */
+		it("names the grace deadline as the trigger when no worker reported in", async () => {
+			const { deviceId } = container();
+			const timers = {
+				callbacks: [] as Array<() => void>,
+				delays: [] as number[],
+			};
+			const teardown = coordinator(executor(), timers);
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "deleted" });
+
+			timers.callbacks[0]?.();
+			await vi.waitFor(() =>
+				expect(eventsNamed("sandbox_teardown_completed")).toHaveLength(1),
+			);
+
+			expect(eventsNamed("sandbox_teardown_completed")[0]).toMatchObject({
+				action: "deleted",
+				trigger: "grace expiry",
+			});
+		});
+
+		it("emits nothing when the destroy fails, so a retry is not counted as a completion", async () => {
+			const { deviceId } = container();
+			const destroy = vi.fn(async () => {
+				throw new Error("azure unavailable");
+			});
+			const teardown = coordinator(executor(destroy));
+			teardown.register({ issueKey: "CYPACK-1", deviceId, action: "closed" });
+
+			await expect(
+				teardown.handleCallback("CYPACK-1", deviceId, "cb-1"),
+			).rejects.toThrow("azure unavailable");
+
+			expect(eventsNamed("sandbox_destroyed")).toHaveLength(0);
+			expect(eventsNamed("sandbox_teardown_completed")).toHaveLength(0);
+		});
+	});
+
 	it("upgrades close to delete while otherwise keeping first-registration-wins", async () => {
 		const { deviceId } = container();
 		const bundle = join(artifactsDir, "CYPACK-1", "bundle.tar.gz");

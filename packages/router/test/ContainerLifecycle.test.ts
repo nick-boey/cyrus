@@ -1,6 +1,7 @@
 import type {
 	ContainerExecutor,
 	ContainerStatus,
+	ManagedContainerState,
 } from "cyrus-router-executors";
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { ContainerLifecycle } from "../src/ContainerLifecycle.js";
@@ -20,13 +21,26 @@ function fakeExecutor(
 		stopImpl?: Mock;
 		destroyImpl?: Mock;
 		listManagedImpl?: Mock;
+		/** Omitted leaves the executor WITHOUT the optional bulk-state seam, so
+		 *  the sweep falls back to `listManaged` and reports state as unknown. */
+		listStates?: ManagedContainerState[] | (() => ManagedContainerState[]);
+		listStatesImpl?: Mock;
 	},
 ): ContainerExecutor & {
 	stop: Mock;
 	destroy: Mock;
 	status: Mock;
 	listManaged: Mock;
+	listStates?: Mock;
 } {
+	const listStatesImpl =
+		opts?.listStatesImpl ??
+		(opts?.listStates
+			? vi.fn(async () => {
+					const states = opts.listStates ?? [];
+					return typeof states === "function" ? states() : states;
+				})
+			: undefined);
 	return {
 		provider,
 		ensureRunning: vi.fn(async () => {}),
@@ -42,7 +56,18 @@ function fakeExecutor(
 				const managed = opts?.listManaged ?? [];
 				return typeof managed === "function" ? managed() : managed;
 			}),
+		...(listStatesImpl ? { listStates: listStatesImpl } : {}),
 	};
+}
+
+/** Every `logger.event(name, attrs)` call recorded for one event name. */
+function eventsNamed(
+	logger: TestLogger,
+	name: string,
+): Array<Record<string, unknown>> {
+	return logger.event.mock.calls
+		.filter(([emitted]) => emitted === name)
+		.map(([, attributes]) => (attributes ?? {}) as Record<string, unknown>);
 }
 
 describe("ContainerLifecycle", () => {
@@ -703,5 +728,408 @@ describe("ContainerLifecycle", () => {
 				String(m).includes("no longer pinned"),
 			),
 		).toHaveLength(1);
+	});
+
+	describe("sandbox telemetry", () => {
+		/**
+		 * The gauge exists to answer "how many sandboxes are open, for which
+		 * issues, holding how many sessions". It must therefore sample EVERY
+		 * device row — including the pinned ones, which are precisely the
+		 * sandboxes actively burning 4 vCPU. An early `continue` on the pinned
+		 * branch would leave the gauge counting only idle sandboxes.
+		 */
+		it("emits one gauge sample per sandbox, including sandboxes pinned by a live session", async () => {
+			const pinned = makeContainerDevice("NOR-1", "aca");
+			const idle = makeContainerDevice("NOR-2", "aca");
+			store.setSessionAffinity(
+				"s-1",
+				pinned.deviceId,
+				undefined,
+				pinned.createdMs,
+			);
+
+			const aca = fakeExecutor("aca", {
+				listStates: [
+					{ issueKey: "NOR-1", status: "running", providerState: "Running" },
+					{ issueKey: "NOR-2", status: "stopped", providerState: "Suspended" },
+				],
+			});
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => pinned.createdMs + 60_000,
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+			});
+
+			await lifecycle.sweep();
+
+			const samples = eventsNamed(logger, "sandbox_gauge");
+			expect(samples).toHaveLength(2);
+			expect(samples.find((s) => s.issue_key === "NOR-1")).toMatchObject({
+				device_id: pinned.deviceId,
+				provider: "aca",
+				state: "running",
+				sessions: 1,
+				online: true,
+			});
+			expect(samples.find((s) => s.issue_key === "NOR-2")).toMatchObject({
+				device_id: idle.deviceId,
+				state: "stopped",
+				sessions: 0,
+			});
+		});
+
+		/**
+		 * The cost constraint the gauge was designed around: one bulk provider
+		 * call per tick, not one `status()` per sandbox. At ARM request rates a
+		 * per-row fan-out would throttle exactly when the fleet is largest.
+		 */
+		it("reads provider state with ONE bulk call for the whole fleet, not one status() per sandbox", async () => {
+			for (const key of ["NOR-1", "NOR-2", "NOR-3"]) {
+				makeContainerDevice(key, "aca");
+			}
+			const aca = fakeExecutor("aca", {
+				listStates: [
+					{ issueKey: "NOR-1", status: "running" },
+					{ issueKey: "NOR-2", status: "running" },
+					{ issueKey: "NOR-3", status: "running" },
+				],
+			});
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => Date.now(),
+			});
+
+			await lifecycle.sweep();
+
+			expect(aca.listStates).toHaveBeenCalledTimes(1);
+			expect(aca.status).not.toHaveBeenCalled();
+			// The same response feeds orphan GC, so the sweep does not list twice.
+			expect(aca.listManaged).not.toHaveBeenCalled();
+		});
+
+		it("starts the uptime clock when the provider reports a sandbox running", async () => {
+			const { createdMs } = makeContainerDevice("NOR-1", "aca");
+			const aca = fakeExecutor("aca", {
+				listStates: [{ issueKey: "NOR-1", status: "running" }],
+			});
+			const now = createdMs + 60_000;
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+			});
+
+			await lifecycle.sweep();
+
+			expect(store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs).toBe(
+				now,
+			);
+		});
+
+		/**
+		 * Uptime is CONTINUOUS running time, so the clock must survive repeated
+		 * sweeps. Re-stamping it every tick would cap every reported uptime at one
+		 * sweep interval and the 6-hour alert could never fire.
+		 */
+		it("does not restart the uptime clock on subsequent sweeps", async () => {
+			const { createdMs } = makeContainerDevice("NOR-1", "aca");
+			const aca = fakeExecutor("aca", {
+				listStates: [{ issueKey: "NOR-1", status: "running" }],
+			});
+			let now = createdMs + 60_000;
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 24 * 60 * 60_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+			});
+
+			await lifecycle.sweep();
+			const startedAt =
+				store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs;
+			now = createdMs + 6 * 60 * 60_000;
+			await lifecycle.sweep();
+
+			expect(store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs).toBe(
+				startedAt,
+			);
+			const latest = eventsNamed(logger, "sandbox_gauge").at(-1);
+			expect(latest?.uptime_ms).toBe(now - (startedAt ?? 0));
+		});
+
+		it("stops the uptime clock when the provider reports the sandbox no longer running", async () => {
+			const { createdMs } = makeContainerDevice("NOR-1", "aca");
+			let running = true;
+			const aca = fakeExecutor("aca", {
+				listStates: () => [
+					{ issueKey: "NOR-1", status: running ? "running" : "stopped" },
+				],
+			});
+			let now = createdMs + 60_000;
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 24 * 60 * 60_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+			});
+
+			await lifecycle.sweep();
+			running = false;
+			now += 60_000;
+			await lifecycle.sweep();
+
+			expect(
+				store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs,
+			).toBeUndefined();
+			expect(eventsNamed(logger, "sandbox_gauge").at(-1)?.uptime_ms).toBeNull();
+		});
+
+		/**
+		 * One throttled ARM call must not be able to silently reset every uptime
+		 * in the fleet — which is what would happen if an unreadable provider were
+		 * treated as "nothing is running".
+		 */
+		it("reports state as unknown and preserves the uptime clock when the provider cannot be listed", async () => {
+			const { createdMs } = makeContainerDevice("NOR-1", "aca");
+			let fail = false;
+			const aca = fakeExecutor("aca", {
+				listStatesImpl: vi.fn(async () => {
+					if (fail) throw new Error("ARM 429");
+					return [{ issueKey: "NOR-1", status: "running" as const }];
+				}),
+			});
+			let now = createdMs + 60_000;
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 24 * 60 * 60_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+			});
+
+			await lifecycle.sweep();
+			const startedAt =
+				store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs;
+			fail = true;
+			now += 60_000;
+			await lifecycle.sweep();
+
+			expect(store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs).toBe(
+				startedAt,
+			);
+			expect(eventsNamed(logger, "sandbox_gauge").at(-1)?.state).toBe(
+				"unknown",
+			);
+		});
+
+		it("reports state as unknown for a provider with no bulk-state seam rather than guessing", async () => {
+			makeContainerDevice("NOR-1", "legacy");
+			const legacy = fakeExecutor("legacy", { listManaged: ["NOR-1"] });
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["legacy", legacy]]),
+				idleStopMs: 24 * 60 * 60_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => Date.now(),
+			});
+
+			await lifecycle.sweep();
+
+			expect(legacy.listManaged).toHaveBeenCalledTimes(1);
+			expect(eventsNamed(logger, "sandbox_gauge").at(-1)?.state).toBe(
+				"unknown",
+			);
+		});
+
+		it("reports a device row whose provider no longer has the container as absent", async () => {
+			makeContainerDevice("NOR-1", "aca");
+			const aca = fakeExecutor("aca", { listStates: [] });
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 24 * 60 * 60_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => Date.now(),
+			});
+
+			await lifecycle.sweep();
+
+			expect(eventsNamed(logger, "sandbox_gauge").at(-1)?.state).toBe("absent");
+		});
+
+		/**
+		 * The rollup the "sweep stalled" alert keys on. It must be emitted on
+		 * EVERY tick, including a tick with no sandboxes at all — otherwise a
+		 * quiet fleet is indistinguishable from a router that stopped sweeping,
+		 * and every other sandbox alert is silently blind.
+		 */
+		it("emits the per-tick rollup even when no sandboxes exist", async () => {
+			const aca = fakeExecutor("aca", { listStates: [] });
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => Date.now(),
+			});
+
+			await lifecycle.sweep();
+
+			const rollups = eventsNamed(logger, "sandbox_sweep_completed");
+			expect(rollups).toHaveLength(1);
+			expect(rollups[0]).toMatchObject({
+				sandboxes: 0,
+				running: 0,
+				pinned: 0,
+			});
+		});
+
+		it("counts sandboxes by state and pinned-ness in the rollup", async () => {
+			const pinned = makeContainerDevice("NOR-1", "aca");
+			makeContainerDevice("NOR-2", "aca");
+			store.setSessionAffinity(
+				"s-1",
+				pinned.deviceId,
+				undefined,
+				pinned.createdMs,
+			);
+			const aca = fakeExecutor("aca", {
+				listStates: [
+					{ issueKey: "NOR-1", status: "running" },
+					{ issueKey: "NOR-2", status: "stopped" },
+				],
+			});
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => pinned.createdMs + 60_000,
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+			});
+
+			await lifecycle.sweep();
+
+			expect(eventsNamed(logger, "sandbox_sweep_completed")[0]).toMatchObject({
+				sandboxes: 2,
+				running: 1,
+				stopped: 1,
+				pinned: 1,
+			});
+		});
+
+		it("emits an idle-stop event carrying the uptime of the run it ends, and stops the clock", async () => {
+			const { createdMs } = makeContainerDevice("NOR-1", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "NOR-1", status: "running" }],
+			});
+			const idleStopMs = 300_000;
+			let now = createdMs + 1_000;
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+			});
+
+			// First tick starts the clock while the container is still young.
+			await lifecycle.sweep();
+			now = createdMs + idleStopMs + 1_000;
+			await lifecycle.sweep();
+
+			expect(aca.stop).toHaveBeenCalledWith("NOR-1");
+			const [idleStop] = eventsNamed(logger, "sandbox_idle_stopped");
+			expect(idleStop).toMatchObject({
+				issue_key: "NOR-1",
+				provider: "aca",
+				idle_stop_ms: idleStopMs,
+				uptime_ms: idleStopMs,
+			});
+			expect(
+				store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs,
+			).toBeUndefined();
+		});
+
+		it("emits a destroy event naming why the container was reclaimed", async () => {
+			const { createdMs } = makeContainerDevice("NOR-1", "aca");
+			const aca = fakeExecutor("aca", {
+				listStates: [{ issueKey: "NOR-1", status: "stopped" }],
+			});
+			const staleDestroyMs = 14 * 24 * 60 * 60_000;
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => createdMs + staleDestroyMs + 1_000,
+			});
+
+			await lifecycle.sweep();
+
+			expect(eventsNamed(logger, "sandbox_destroyed")[0]).toMatchObject({
+				issue_key: "NOR-1",
+				reason: "stale",
+			});
+		});
+
+		it("emits a destroy event with a null device id for an orphan container", async () => {
+			const aca = fakeExecutor("aca", {
+				listStates: [{ issueKey: "GHOST-1", status: "running" }],
+			});
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => Date.now(),
+			});
+
+			await lifecycle.sweep();
+
+			expect(aca.destroy).toHaveBeenCalledWith("GHOST-1");
+			expect(eventsNamed(logger, "sandbox_destroyed")[0]).toMatchObject({
+				issue_key: "GHOST-1",
+				device_id: null,
+				reason: "orphan",
+			});
+		});
 	});
 });

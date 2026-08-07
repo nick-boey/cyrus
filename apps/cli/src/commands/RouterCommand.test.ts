@@ -1375,6 +1375,55 @@ describe("RouterCommand", () => {
 			expect(row!.charAt(lastRoutedCol)).toBe("-");
 			expect(row!.charAt(lastSeenCol)).toBe("-");
 			expect(row!.charAt(header!.indexOf("TEARDOWN"))).toBe("-");
+			// A brand-new device has never run and is not parked.
+			expect(row!.charAt(header!.indexOf("UPTIME"))).toBe("-");
+			expect(row!.charAt(header!.indexOf("PARKED"))).toBe("-");
+		});
+
+		/**
+		 * `created_ms`, `running_since_ms` and `parked_at_ms` were all already
+		 * selected into `ContainerDeviceInfo` but never rendered, so the two
+		 * questions this table gets opened for — "how long has that been up?" and
+		 * "is it stuck waiting on someone?" — needed a sqlite3 shell to answer.
+		 *
+		 * AGE and UPTIME are separate columns because they measure different
+		 * things: AGE is the device ROW, which survives every stop/resume cycle,
+		 * while UPTIME is the current continuous run. This test pins that
+		 * distinction — an old row that has only just come up must read as old and
+		 * freshly-started, not one or the other.
+		 */
+		it("renders age, continuous uptime and park duration as elapsed times", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute(["users", "add", "omar@example.com"]);
+
+			const seedStore = new RouterStore(dbPath());
+			const user = seedStore.findUserForCreator({ email: "omar@example.com" });
+			const { deviceId } = seedStore.createContainerDevice(
+				user!.userId,
+				"CYPACK-30",
+				"aca",
+			);
+			const now = Date.now();
+			// Row created three days ago, but the current run started 6h13m ago and
+			// a session parked 45 minutes ago.
+			seedStore.markDeviceRunning(deviceId, now - (6 * 3600_000 + 13 * 60_000));
+			seedStore.setDeviceParkedAt(deviceId, now - 45 * 60_000);
+			seedStore.close();
+			consoleLogSpy.mockClear();
+
+			await command.execute(["containers", "list"]);
+
+			const [header, row] = printedStdout().split("\n");
+			expect(header).toContain("AGE");
+			expect(header).toContain("UPTIME");
+			expect(header).toContain("PARKED");
+			// Hours keep their minutes: telling 5h58m from 6h02m is the whole point
+			// of the column, since 6h is where the long-running alert fires.
+			expect(row).toMatch(/\b6h1[23]m\b/);
+			expect(row).toMatch(/\b4[45]m\b/);
+			// Columns still line up after the three additions.
+			expect(header!.indexOf("USER")).toBe(row!.indexOf("omar@example.com"));
 		});
 
 		/**

@@ -23,6 +23,19 @@ export interface IssueExecutionContext {
 
 export type ContainerStatus = "running" | "stopped" | "absent";
 
+/** One managed container's issue key and current state, from a bulk listing. */
+export interface ManagedContainerState {
+	issueKey: string;
+	status: ContainerStatus;
+	/**
+	 * The provider's own state string when it is richer than {@link status} —
+	 * e.g. ACA distinguishes `Suspended` from `Stopped` and has transitional
+	 * `Creating`/`Resuming`/`Deleting` states that all normalise to `stopped`.
+	 * Diagnostic only; never branch on it.
+	 */
+	providerState?: string;
+}
+
 export interface ContainerExecutor {
 	readonly provider: string;
 	/** Idempotent: boot or resume the issue's container. */
@@ -33,6 +46,20 @@ export interface ContainerExecutor {
 	status(issueKey: string): Promise<ContainerStatus>;
 	/** Issue keys of every container this provider currently manages (for orphan GC). */
 	listManaged(): Promise<string[]>;
+	/**
+	 * Every managed container's issue key AND state in ONE provider call.
+	 *
+	 * Exists so the 60-second lifecycle sweep can emit a per-sandbox telemetry
+	 * gauge without issuing N per-row {@link status} calls — at one ARM request
+	 * per sandbox per minute that would be the single most expensive thing the
+	 * router does. Where implemented this supersedes {@link listManaged} for the
+	 * sweep, which derives the orphan-GC key set from the same response rather
+	 * than listing twice.
+	 *
+	 * Optional: a provider that cannot answer in bulk omits it, and the gauge
+	 * degrades to `state: "unknown"` rather than falling back to N calls.
+	 */
+	listStates?(): Promise<ManagedContainerState[]>;
 }
 
 export type ExecutorRegistry = ReadonlyMap<string, ContainerExecutor>;

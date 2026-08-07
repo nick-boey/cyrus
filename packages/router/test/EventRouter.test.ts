@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentEvent } from "cyrus-core";
+import type { AgentEvent, ILogger } from "cyrus-core";
 import type {
 	ContainerExecutor,
 	IssueExecutionContext,
@@ -24,7 +24,7 @@ import {
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
 import { TerminalTeardown } from "../src/TerminalTeardown.js";
-import { silentLogger } from "./helpers/logger.js";
+import { silentLogger, testLogger } from "./helpers/logger.js";
 
 const ROUTE_NOW = 1_000_000;
 const TTL_MS = 60_000;
@@ -233,7 +233,7 @@ function makeRouter(
 		gateway?: Gateway;
 		containerTargets?: ContainerTargetService;
 		terminalTeardown?: TerminalTeardown;
-		logger?: { info(msg: string): void; warn(msg: string): void };
+		logger?: ILogger;
 		config?: Partial<{
 			eventTtlMs: number;
 			issueLock: boolean;
@@ -643,6 +643,65 @@ describe("EventRouter", () => {
 		});
 
 		expect(store.getContainerDeviceForIssue("PAR-146")?.parkedAtMs).toBe(5_000);
+	});
+
+	it("(e3a) emits sandbox park/unpark events for a container device", async () => {
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "PAR-146", "aca");
+		const logger = testLogger();
+		const { router } = makeRouter(store, { logger });
+		store.setSessionAffinity("sess-1", deviceId);
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "ss-2",
+			sessionId: "sess-1",
+			state: "active",
+		});
+
+		expect(logger.event).toHaveBeenCalledWith("sandbox_parked", {
+			issue_key: "PAR-146",
+			device_id: deviceId,
+			provider: "aca",
+			session_id: "sess-1",
+		});
+		expect(logger.event).toHaveBeenCalledWith("sandbox_unparked", {
+			issue_key: "PAR-146",
+			device_id: deviceId,
+			provider: "aca",
+			session_id: "sess-1",
+		});
+	});
+
+	/**
+	 * `handleSessionState` is shared by physical devices and sandboxes, but the
+	 * `sandbox_*` family has to stay countable as sandboxes — a teammate's laptop
+	 * parking a session is not a fleet-cost signal and must not appear in it.
+	 */
+	it("(e3b) emits no sandbox event when the parking device is a physical laptop", async () => {
+		const deviceId = enroll(store, "alice@example.com");
+		const logger = testLogger();
+		const { router } = makeRouter(store, { logger });
+		store.setSessionAffinity("sess-1", deviceId);
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+
+		expect(
+			logger.event.mock.calls.filter(([name]) =>
+				String(name).startsWith("sandbox_"),
+			),
+		).toHaveLength(0);
 	});
 
 	it("(e4) a prompt after parking re-establishes affinity and clears the stamp", async () => {

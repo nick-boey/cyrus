@@ -254,6 +254,80 @@ ContainerAppConsoleLogs_CL
 
 Leave it unset for local use; the default human-readable output is unchanged.
 
+### Sandbox lifecycle telemetry
+
+On top of the JSON lines above, the router emits a named **event** family for
+every ephemeral sandbox. Events go through the logger's `event()` channel rather
+than `info()` — `debug` and `info` are deliberately never forwarded to the
+structured stream, so anything an operator needs to query has to be an event.
+Each one carries `issue_key`, `device_id` and `provider`, and every name is
+prefixed `sandbox_`, so a single predicate selects the whole family.
+
+| Event | Emitted when |
+|-------|--------------|
+| `sandbox_boot_started` | the router asked a provider to boot or resume a sandbox |
+| `sandbox_running` | the provider reported it running (`transitioned` is false for a re-route that found it already up) |
+| `sandbox_boot_failed` | `ensureRunning` rejected; `reason` carries the message |
+| `sandbox_parked` | a session blocked on a user answer and released affinity |
+| `sandbox_unparked` | a park was reversed and the agent went back to work |
+| `sandbox_idle_stopped` | the lifecycle sweep parked an affinity-free sandbox past `idleStopMs` |
+| `sandbox_destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
+| `sandbox_teardown_completed` | a terminal teardown finished; carries `action` and whether the worker's callback or the grace deadline triggered it |
+| `sandbox_gauge` | once per sandbox per 60s lifecycle sweep — the point-in-time inventory |
+| `sandbox_sweep_completed` | once per sweep, unconditionally — the fleet rollup |
+
+Two attributes on `sandbox_gauge` are easy to confuse and mean different things:
+
+- **`age_ms`** is the device row's age (`devices.created_ms`). The row survives
+  every stop/resume cycle, so this answers "how long has this issue had a
+  sandbox", never "how long has it been burning 4 vCPU".
+- **`uptime_ms`** is CONTINUOUS running time (`devices.running_since_ms`),
+  stamped when a sandbox transitions to running and cleared on every transition
+  out. This is the one an uptime alert must key on. Null while stopped.
+
+`sandbox_gauge` also carries the router's own liveness view — `online` (a live
+WSS socket) and `last_seen_age_ms` (age of the last heartbeat pong) — alongside
+the provider's `state`. Both are needed: ACA reports a sandbox as `Running` even
+when its entrypoint has exited, so a query keyed on `state` alone will happily
+report a zombie as a healthy agent.
+
+Current open sandboxes, with issue keys and uptimes, in one query:
+
+```kql
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(15m)
+| extend p = parse_json(Log_s)
+| where tostring(p.event) == "sandbox_gauge"
+| extend issue_key = tostring(p.issue_key), device_id = tostring(p.device_id),
+         state = tostring(p.state), sessions = toint(p.sessions),
+         online = tobool(p.online), uptime_ms = tolong(p.uptime_ms),
+         last_seen_age_ms = tolong(p.last_seen_age_ms)
+| summarize arg_max(TimeGenerated, *) by device_id
+| where state == "running"
+| project issue_key, device_id, sessions, uptime = uptime_ms * 1ms,
+          worker = case(online and last_seen_age_ms < 180000, "live",
+                        isnull(last_seen_age_ms), "never-connected",
+                        "stale-heartbeat")
+| order by uptime desc
+```
+
+The Azure stack provisions this and several sibling queries as saved searches,
+plus alert rules for long-running sandboxes, boot failures, and a stalled sweep.
+See [`infra/azure/README.md`](../infra/azure/README.md) → "Monitoring and
+alerts".
+
+`cyrus router containers list` renders the same three clocks locally, as
+elapsed durations:
+
+```
+ISSUE KEY   PROVIDER  USER              LAST ROUTED  LAST SEEN  AGE   UPTIME  PARKED  TEARDOWN
+NOR-279     aca       alice@example.com 2026-08-…    2026-08-…  3d4h  6h13m   45m     -
+```
+
+`AGE 3d4h` with `UPTIME 6h13m` is a three-day-old issue whose sandbox has been
+up continuously for six hours — not a sandbox that has been running for
+three days.
+
 On every start, if the required variables are set the entrypoint regenerates
 `/data/router-config.json` from them. With no config variables set, an existing
 (e.g. bind-mounted) `router-config.json` is used as-is. Neither → the container
