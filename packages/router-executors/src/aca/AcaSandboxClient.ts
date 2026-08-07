@@ -188,6 +188,22 @@ const RBAC_403_RETRY_DELAY_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 
 /**
+ * Deadline for the calls that move the sandbox's whole memory + disk image
+ * around: snapshot, suspend, resume. These are NOT control-plane calls and the
+ * default deadline is far too tight for them — measured against a live 4 vCPU /
+ * 8 GiB sandbox with an 18.4 GB image on 2026-08-07, `snapshot` took 3m52s and
+ * `stop` took 4m09s, both returning 200.
+ *
+ * Under the old shared 120s deadline every one of those calls aborted mid-flight
+ * while ACA went on to complete the operation server-side, so `stop()` could
+ * never suspend a large sandbox: the 60s lifecycle sweep re-failed identically
+ * forever and 4 vCPU sandboxes stayed Running for hours (WAG-10 / WAG-14).
+ * Scaled to the observed worst case with headroom, while still bounding a truly
+ * blackholed request so the per-issue mutex is always released.
+ */
+const SLOW_OPERATION_TIMEOUT_MS = 900_000;
+
+/**
  * Create is synchronous (200 with `state: "Running"`) per the spike; this
  * loop is a defensive fallback the spike never exercised. Bounded tight.
  */
@@ -256,10 +272,11 @@ export class AcaSandboxClient {
 	 * capped. Omitted entirely when the timeout is disabled, so an injected
 	 * `fetchFn` in tests never sees a signal it didn't ask for.
 	 */
-	private timeoutSignal(): AbortSignal | undefined {
-		return this.requestTimeoutMs > 0
-			? AbortSignal.timeout(this.requestTimeoutMs)
-			: undefined;
+	private timeoutSignal(overrideMs?: number): AbortSignal | undefined {
+		// `0` disables timeouts wholesale (tests), so an override must not
+		// resurrect one.
+		if (this.requestTimeoutMs <= 0) return undefined;
+		return AbortSignal.timeout(overrideMs ?? this.requestTimeoutMs);
 	}
 
 	private get root(): string {
@@ -279,7 +296,12 @@ export class AcaSandboxClient {
 		method: string,
 		path: string,
 		body?: unknown,
-		opts?: { okOn404?: boolean; query?: Record<string, string> },
+		opts?: {
+			okOn404?: boolean;
+			query?: Record<string, string>;
+			/** Override the per-attempt deadline; see {@link SLOW_OPERATION_TIMEOUT_MS}. */
+			timeoutMs?: number;
+		},
 	): Promise<T | null> {
 		const token = await this.tokenProvider();
 		const url = this.buildUrl(path, opts?.query);
@@ -296,7 +318,7 @@ export class AcaSandboxClient {
 		let lastStatus = 0;
 		let lastBody: any;
 		for (let attempt = 0; attempt <= RBAC_403_RETRY_MAX; attempt++) {
-			const signal = this.timeoutSignal();
+			const signal = this.timeoutSignal(opts?.timeoutMs);
 			const r = await this.fetchFn(url, signal ? { ...init, signal } : init);
 			lastStatus = r.status;
 			const text = await r.text();
@@ -518,12 +540,22 @@ export class AcaSandboxClient {
 	 * `application/json` returns in ~6s. Same applies to /resume.
 	 */
 	async stopSandbox(id: string): Promise<void> {
-		await this.request("POST", `${this.root}/sandboxes/${id}/stop`, {});
+		await this.request(
+			"POST",
+			`${this.root}/sandboxes/${id}/stop`,
+			{},
+			{ timeoutMs: SLOW_OPERATION_TIMEOUT_MS },
+		);
 	}
 
 	/** C7: same body-required quirk as {@link stopSandbox}. */
 	async resumeSandbox(id: string): Promise<void> {
-		await this.request("POST", `${this.root}/sandboxes/${id}/resume`, {});
+		await this.request(
+			"POST",
+			`${this.root}/sandboxes/${id}/resume`,
+			{},
+			{ timeoutMs: SLOW_OPERATION_TIMEOUT_MS },
+		);
 	}
 
 	/**
@@ -559,6 +591,7 @@ export class AcaSandboxClient {
 			"POST",
 			`${this.root}/sandboxes/${sandboxId}/snapshot`,
 			body,
+			{ timeoutMs: SLOW_OPERATION_TIMEOUT_MS },
 		);
 		return r ?? ({} as AcaSnapshot);
 	}

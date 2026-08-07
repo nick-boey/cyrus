@@ -1155,13 +1155,19 @@ describe("AcaSandboxesProvider", () => {
 			expect(calls.stopSandbox).toEqual(["sb-CYPACK-1"]);
 		});
 
-		it("does not stop when explicit snapshot creation fails", async () => {
+		// WAG-10 / WAG-14 (2026-08-06): an 18.4 GB snapshot took 3m52s against the
+		// client's 120s deadline, so createSnapshot always threw and stop() gave up
+		// before suspending — leaving a 4 vCPU sandbox Running indefinitely while
+		// every 60s sweep tick re-failed identically. The snapshot is a cold-path
+		// optimisation, so it must never be able to veto the suspend.
+		it("still suspends when explicit snapshot creation fails", async () => {
 			const sandboxByIssue = new Map<string, AcaSandbox>([
 				[
 					"CYPACK-1",
 					sb("CYPACK-1", { labels: { "cyrus.device-id": "dev-1" } }),
 				],
 			]);
+			const warnings: string[] = [];
 			const { client, calls } = fakeClient({
 				sandboxByIssue,
 				failCreateSnapshot: true,
@@ -1170,9 +1176,48 @@ describe("AcaSandboxesProvider", () => {
 				client,
 				image: "img:1",
 				disk: "disk-v1",
+				logger: { info: () => {}, warn: (msg) => warnings.push(msg) },
 			});
-			await expect(p.stop("CYPACK-1")).rejects.toThrow("snapshot failed");
-			expect(calls.stopSandbox).toHaveLength(0);
+			await expect(p.stop("CYPACK-1")).resolves.toBeUndefined();
+			expect(calls.stopSandbox).toEqual(["sb-CYPACK-1"]);
+			expect(warnings.join("\n")).toContain("suspending without one");
+		});
+
+		it("still suspends a sandbox whose labels cannot produce a snapshot", async () => {
+			const sandboxByIssue = new Map<string, AcaSandbox>([
+				["CYPACK-1", sb("CYPACK-1", { labels: {} })],
+			]);
+			const warnings: string[] = [];
+			const { client, calls } = fakeClient({ sandboxByIssue });
+			const p = new AcaSandboxesProvider({
+				client,
+				image: "img:1",
+				disk: "disk-v1",
+				logger: { info: () => {}, warn: (msg) => warnings.push(msg) },
+			});
+			await expect(p.stop("CYPACK-1")).resolves.toBeUndefined();
+			expect(calls.createSnapshot).toHaveLength(0);
+			expect(calls.stopSandbox).toEqual(["sb-CYPACK-1"]);
+			expect(warnings.join("\n")).toContain("suspending without a snapshot");
+		});
+
+		it("still reports a suspend that genuinely failed", async () => {
+			const sandboxByIssue = new Map<string, AcaSandbox>([
+				[
+					"CYPACK-1",
+					sb("CYPACK-1", { labels: { "cyrus.device-id": "dev-1" } }),
+				],
+			]);
+			const { client } = fakeClient({ sandboxByIssue });
+			client.stopSandbox = async () => {
+				throw new Error("stop failed");
+			};
+			const p = new AcaSandboxesProvider({
+				client,
+				image: "img:1",
+				disk: "disk-v1",
+			});
+			await expect(p.stop("CYPACK-1")).rejects.toThrow("stop failed");
 		});
 
 		it("restores a stop-created snapshot without rotating the token", async () => {

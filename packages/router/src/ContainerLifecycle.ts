@@ -98,6 +98,8 @@ export class ContainerLifecycle {
 	private readonly pinnedDevices = new Set<number>();
 	private readonly logger: ILogger;
 	private readonly now: () => number;
+	/** Non-undefined while a tick is running; see {@link sweep}. */
+	private inFlight: Promise<void> | undefined;
 
 	constructor(opts: ContainerLifecycleOptions) {
 		this.store = opts.store;
@@ -267,7 +269,41 @@ export class ContainerLifecycle {
 		return gaugeState;
 	}
 
+	/**
+	 * One tick. Serialised against itself: a tick that is still running makes the
+	 * next one a no-op rather than a second concurrent pass.
+	 *
+	 * RouterServer fires this on a 60s interval, but a tick can easily outlive
+	 * that: the loop below is sequential and `executor.stop()` blocks on the
+	 * provider's per-issue lock for as long as its slowest control-plane call —
+	 * an ACA snapshot of a large, long-lived sandbox measured 3m52s against a
+	 * 120s client deadline. Overlapping ticks then queue ANOTHER stop() behind
+	 * that same per-issue lock every 60s, so the queue grows faster than it
+	 * drains, and `TerminalTeardown`'s destroy() — which takes the very same lock
+	 * — is starved behind it indefinitely.
+	 *
+	 * That is exactly how WAG-10 (2026-08-06) kept a 4 vCPU / 8 GiB sandbox
+	 * running for 1.5h after its issue went Done: its worker replayed the
+	 * teardown callback 144 times, each POST hanging until the 600s ingress
+	 * timeout, while the destroy never reached the front of the queue. The same
+	 * stalled sweep also stopped reclaiming every OTHER container behind it.
+	 */
 	async sweep(): Promise<void> {
+		if (this.inFlight) {
+			this.logger.warn(
+				"Container lifecycle sweep is still running; skipping this tick. " +
+					"A tick that outlives its interval means a provider call is slow — " +
+					"overlapping ticks would starve terminal teardown behind the same per-issue lock",
+			);
+			return;
+		}
+		this.inFlight = this.sweepOnce().finally(() => {
+			this.inFlight = undefined;
+		});
+		return this.inFlight;
+	}
+
+	private async sweepOnce(): Promise<void> {
 		const now = this.now();
 		let rows: ContainerDeviceInfo[];
 		try {

@@ -402,6 +402,57 @@ describe("ContainerLifecycle", () => {
 		);
 	});
 
+	it("skips a tick while the previous sweep is still running", async () => {
+		// WAG-10 (2026-08-06): a single stop() blocked on the ACA provider's
+		// per-issue lock for longer than the 60s sweep interval, so ticks
+		// overlapped and each one queued ANOTHER stop() behind that same lock.
+		// The queue then grew faster than it drained and TerminalTeardown's
+		// destroy() — which takes the same lock — never reached the front, leaving
+		// a 4 vCPU sandbox Running for hours after its issue went Done.
+		const { createdMs } = makeContainerDevice("CYPACK-SLOW", "docker");
+		const idleStopMs = 900_000;
+		let releaseStop!: () => void;
+		let firstStopSeen = false;
+		// Only the FIRST stop() blocks — that is the slow provider call. Later
+		// ones resolve so the "sweeping resumes" assertion below can be awaited.
+		const stopImpl = vi.fn(() => {
+			if (firstStopSeen) return Promise.resolve();
+			firstStopSeen = true;
+			return new Promise<void>((resolve) => {
+				releaseStop = resolve;
+			});
+		});
+		const docker = fakeExecutor("docker", { status: "running", stopImpl });
+		const lifecycle = new ContainerLifecycle({
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", docker]]),
+			idleStopMs,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
+			logger,
+			now: () => createdMs + idleStopMs + 1,
+		});
+
+		const first = lifecycle.sweep();
+		// Let the first tick get as far as the (never-resolving) stop().
+		await vi.waitFor(() => expect(stopImpl).toHaveBeenCalledTimes(1));
+
+		// Two more interval ticks land while the first is still blocked.
+		await lifecycle.sweep();
+		await lifecycle.sweep();
+		expect(stopImpl).toHaveBeenCalledTimes(1);
+		expect(
+			logger.warn.mock.calls.map((call) => String(call[0])).join("\n"),
+		).toContain("skipping this tick");
+
+		releaseStop();
+		await first;
+
+		// Once the slow tick finishes, sweeping resumes normally.
+		await lifecycle.sweep();
+		expect(stopImpl).toHaveBeenCalledTimes(2);
+	});
+
 	it("does not destroy an orphan whose device row was created concurrently mid-sweep (TOCTOU race)", async () => {
 		// Simulates the real race: sweep() snapshots `knownKeys` at the top
 		// (empty here — no device rows exist yet), then while the orphan-GC

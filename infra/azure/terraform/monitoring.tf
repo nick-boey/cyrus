@@ -341,8 +341,16 @@ resource "azurerm_monitor_scheduled_query_rules_alert_v2" "sandbox_long_running"
 # has been up too long". Alerting on the ABSENCE of the rollup event is what
 # turns that silent failure into a page.
 #
-# `sandbox_sweep_completed` is emitted once per tick unconditionally, including
-# when zero sandboxes exist, precisely so this rule can key on it.
+# `sandbox_sweep_completed` is emitted once per COMPLETED sweep, including when
+# zero sandboxes exist, precisely so this rule can key on it.
+#
+# `ContainerLifecycle.sweep()` is non-reentrant, so a tick that fires while the
+# previous one is still running is skipped and emits no rollup. That is
+# deliberate and makes this rule MORE truthful, not less: a sweep wedged on a
+# slow provider call is exactly the blind spot this alert exists to catch, and
+# before the guard the overlapping ticks kept emitting rollups that masked it.
+# A sweep that legitimately runs past the 15m window will page — treat that as
+# the signal it is, and look for the "skipping this tick" warning.
 resource "azurerm_monitor_scheduled_query_rules_alert_v2" "sandbox_sweep_stalled" {
   count                = var.enable_monitoring_alerts ? 1 : 0
   name                 = "alert-${local.name_prefix}-sandbox-sweep-stalled"
