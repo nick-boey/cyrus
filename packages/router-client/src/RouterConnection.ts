@@ -15,6 +15,8 @@ import {
 	type HelloAckFrame,
 	type HelloErrorFrame,
 	type HelloFrame,
+	LOG_INGEST_CAPABILITY,
+	type LogFrame,
 	MAX_MISSED_HEARTBEATS,
 	PROTOCOL_VERSION,
 	parseServerFrame,
@@ -223,6 +225,8 @@ export class RouterConnection extends EventEmitter {
 
 	/** Router ping cadence; replaced by the value `hello_ack` advertises. */
 	private serverHeartbeatMs: number;
+	/** Feature flags the router advertised in its last `hello_ack`. */
+	private serverCapabilities = new Set<string>();
 	/** Wall-clock stamp of the most recent inbound signal from the router. */
 	private lastServerActivityMs = 0;
 	private livenessTimer: NodeJS.Timeout | undefined;
@@ -360,6 +364,35 @@ export class RouterConnection extends EventEmitter {
 		const entry: SessionStateEntry = { id: randomUUID(), sessionId, state };
 		this.appendSessionStateEntry(entry);
 		this.trySendSessionState(entry);
+	}
+
+	/** True once the router has advertised that it accepts `log` frames. */
+	get acceptsLogs(): boolean {
+		return this.serverCapabilities.has(LOG_INGEST_CAPABILITY);
+	}
+
+	/**
+	 * Ships one worker log line to the router. Returns false when the frame was
+	 * not sent, so the caller can count it as dropped.
+	 *
+	 * Fire-and-forget by design: no ack, no durable buffer, no replay. A log line
+	 * is worth far less than the disk write that would make it durable, and
+	 * replaying a reconnecting worker's backlog would bill for stale lines at the
+	 * exact moment the operator wants to see live ones. Volume control is the
+	 * caller's job (see `RouterLogForwarder`); this method's only gates are
+	 * "connected" and "the router said it can parse this".
+	 */
+	sendLog(frame: LogFrame): boolean {
+		if (!this.acceptsLogs) return false;
+		if (!this.isOnline() || !this.ws) return false;
+		try {
+			this.ws.send(JSON.stringify(frame));
+			return true;
+		} catch {
+			// A send on a socket closing underneath us. Deliberately silent: this
+			// is called FROM the logger, so logging the failure would recurse.
+			return false;
+		}
 	}
 
 	/** Best-effort transmit; the durable entry survives until acked. */
@@ -591,6 +624,10 @@ export class RouterConnection extends EventEmitter {
 		if (frame.heartbeatMs !== undefined && frame.heartbeatMs > 0) {
 			this.serverHeartbeatMs = frame.heartbeatMs;
 		}
+		// Re-read on every hello_ack rather than once: a reconnect may land on a
+		// router that was rolled back, and continuing to send a frame it can no
+		// longer parse would get this socket closed on every log line.
+		this.serverCapabilities = new Set(frame.capabilities ?? []);
 		this.startLivenessWatchdog();
 		// Resend any terminal frames the router never acked. Done before the
 		// outbound replay so a stranded issue lock is released as early as

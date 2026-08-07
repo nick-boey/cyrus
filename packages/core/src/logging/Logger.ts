@@ -8,6 +8,7 @@ import {
 } from "../error-reporting/globalReporter.js";
 import type { ILogger, LogContext, LogEventAttributes } from "./ILogger.js";
 import { LogLevel } from "./ILogger.js";
+import { getGlobalLogSink } from "./LogSink.js";
 
 function formatContext(context: LogContext): string {
 	const parts: string[] = [];
@@ -22,6 +23,10 @@ function formatContext(context: LogContext): string {
 	}
 	if (context.repository) {
 		parts.push(`repo=${context.repository}`);
+	}
+	for (const [key, value] of Object.entries(context.attributes ?? {})) {
+		if (value === undefined) continue;
+		parts.push(`${key}=${String(value)}`);
 	}
 	return parts.length > 0 ? ` {${parts.join(", ")}}` : "";
 }
@@ -132,6 +137,9 @@ class Logger implements ILogger {
 		if (this.context.issueIdentifier)
 			record.issueIdentifier = this.context.issueIdentifier;
 		if (this.context.repository) record.repository = this.context.repository;
+		// Context attributes first so per-call `extra` (an event's own
+		// attributes) wins on a key collision.
+		if (this.context.attributes) Object.assign(record, this.context.attributes);
 		if (extra) Object.assign(record, extra);
 
 		const error = extractError(args);
@@ -171,10 +179,55 @@ class Logger implements ILogger {
 		sink(`${this.formatPrefix(level)} ${message}`, ...args);
 	}
 
+	/**
+	 * Offer one record to the process-wide {@link LogSink}.
+	 *
+	 * Independent of `this.level`: the local level governs what an operator sees
+	 * on the console, while the sink governs what leaves the process. A sandbox
+	 * worker running at INFO locally still forwards only WARN+ off the box, and
+	 * (equally) a sink can be asked for DEBUG without turning the container's
+	 * own stdout into a firehose.
+	 *
+	 * Never allowed to throw — a log line must not be the thing that breaks the
+	 * call it was describing.
+	 */
+	private forwardToSink(
+		level: LogLevel,
+		message: string,
+		args: unknown[],
+		options?: { event?: string; attributes?: LogEventAttributes },
+	): void {
+		const sink = getGlobalLogSink();
+		// `event()` bypasses the threshold — a named lifecycle event is
+		// low-volume and always meant to reach the structured stream.
+		if (options?.event === undefined && level < sink.minLevel) return;
+		const attributes = options?.attributes ?? this.context.attributes;
+		try {
+			sink.write({
+				timestampMs: Date.now(),
+				level,
+				component: this.component,
+				message,
+				context: this.context,
+				...(options?.event !== undefined ? { event: options.event } : {}),
+				...(attributes ? { attributes } : {}),
+				...(args.length > 0
+					? (() => {
+							const summary = summariseArgs(args);
+							return summary ? { args: summary } : {};
+						})()
+					: {}),
+			});
+		} catch {
+			// A broken sink must never take down the caller.
+		}
+	}
+
 	debug(message: string, ...args: unknown[]): void {
 		if (this.level <= LogLevel.DEBUG) {
 			this.write(LogLevel.DEBUG, message, args);
 		}
+		this.forwardToSink(LogLevel.DEBUG, message, args);
 		// debug/info are NOT forwarded to Sentry Logs — they're far too high-volume
 		// to ship unconditionally. Use {@link event} for major lifecycle events
 		// that should always reach Sentry; warn/error keep auto-forwarding.
@@ -185,12 +238,14 @@ class Logger implements ILogger {
 			this.write(LogLevel.INFO, message, args);
 		}
 		// See debug() — info is local-only. Promote to event() if it must ship.
+		this.forwardToSink(LogLevel.INFO, message, args);
 	}
 
 	warn(message: string, ...args: unknown[]): void {
 		if (this.level <= LogLevel.WARN) {
 			this.write(LogLevel.WARN, message, args);
 		}
+		this.forwardToSink(LogLevel.WARN, message, args);
 		// All WARN logs forward to Sentry Logs unconditionally so operators see
 		// degraded-state signals even when running production at higher local
 		// verbosity thresholds.
@@ -208,6 +263,7 @@ class Logger implements ILogger {
 		// reporter to be threaded through every constructor.
 		this.forwardToErrorReporter(message, args);
 		this.forwardLog("error", message, args);
+		this.forwardToSink(LogLevel.ERROR, message, args);
 	}
 
 	event(name: string, attributes?: LogEventAttributes): void {
@@ -234,6 +290,12 @@ class Logger implements ILogger {
 			}
 		}
 		this.forwardEvent(name, attributes);
+		// Events ride past the sink's level threshold on purpose — see
+		// forwardToSink. Context attributes merge underneath the event's own.
+		this.forwardToSink(LogLevel.INFO, `event:${name}`, [], {
+			event: name,
+			attributes: { ...this.context.attributes, ...(attributes ?? {}) },
+		});
 	}
 
 	/**
@@ -252,6 +314,7 @@ class Logger implements ILogger {
 		if (this.context.issueIdentifier)
 			attrs.issueIdentifier = this.context.issueIdentifier;
 		if (this.context.repository) attrs.repository = this.context.repository;
+		if (this.context.attributes) Object.assign(attrs, this.context.attributes);
 		return attrs;
 	}
 
