@@ -11,6 +11,17 @@ export interface LogContext {
 	platform?: string;
 	issueIdentifier?: string;
 	repository?: string;
+	/**
+	 * Extra flat attributes carried by every line this logger emits, spread
+	 * into the JSON record exactly like an `event()`'s attributes are.
+	 *
+	 * The named fields above cover what most call sites need; this is the escape
+	 * hatch for identifiers a specific host has and core does not model — the
+	 * router's `device_id` / `issue_key` when it re-emits a sandbox worker's log,
+	 * for instance. Keys are used verbatim, so use the same flat snake_case
+	 * convention as the event vocabulary if the value is meant to be queried.
+	 */
+	attributes?: LogEventAttributes;
 }
 
 /**

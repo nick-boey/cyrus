@@ -55,6 +55,43 @@ export const DEVICE_LIVENESS_TIMEOUT_MS =
  */
 export const SESSIONS_QUERY_CAPABILITY = "sessions_query";
 
+/**
+ * Advertised by the ROUTER in `hello_ack.capabilities` when it accepts `log`
+ * frames. A device forwards worker logs ONLY after seeing this.
+ *
+ * This gate is what keeps the `log` frame additive rather than a deploy-ordering
+ * hazard. `DeviceGateway.handleMessage` closes a socket on any frame it cannot
+ * parse (`ws.close(1002, "invalid frame")`), so a new worker logging at an old
+ * router would be disconnected on its first forwarded line and reconnect into
+ * the same loop. Negotiating the direction that matters — router first — means
+ * an old router simply never advertises, the worker never forwards, and nothing
+ * breaks. That is also why {@link PROTOCOL_VERSION} is deliberately NOT bumped:
+ * a bump would reject every not-yet-updated worker outright, which is a far
+ * worse failure than not shipping its logs.
+ */
+export const LOG_INGEST_CAPABILITY = "log_ingest";
+
+/**
+ * Log levels carried on a {@link LogFrame}. Mirrors `cyrus-core`'s `LogLevel`
+ * enum minus `SILENT` (never emitted) — spelled as strings so the wire format
+ * survives a renumbering of the enum, and so a router-side KQL predicate reads
+ * `level == "error"` rather than `level == 3`.
+ */
+export const LOG_FRAME_LEVELS = ["debug", "info", "warn", "error"] as const;
+export type LogFrameLevel = (typeof LOG_FRAME_LEVELS)[number];
+
+/**
+ * Attribute values a {@link LogFrame} may carry. Primitive-only, matching
+ * `cyrus-core`'s `LogEventAttributes`, so the router can spread them straight
+ * into a JSON log line and Log Analytics projects each into its own column.
+ */
+const logAttributeValue = z.union([
+	z.string(),
+	z.number(),
+	z.boolean(),
+	z.null(),
+]);
+
 const helloFrame = z.object({
 	type: z.literal("hello"),
 	deviceToken: z.string().min(1),
@@ -116,6 +153,64 @@ const sessionStateFrame = z.object({
 	// `parked`/`active` and would drop the device connection on receiving one.
 	state: z.enum(["complete", "error", "stopped", "parked", "active"]),
 });
+/**
+ * One worker log line, shipped device → router.
+ *
+ * A sandbox worker's stdout dies with the sandbox: the ACA `sandboxGroups`
+ * resource is separate from the Container Apps environment that has the Log
+ * Analytics wiring, and its data-plane API exposes no logs endpoint. So logs
+ * ride the WSS connection the worker already holds — the router's host is the
+ * one entry in the sandbox's deny-by-default egress allowlist, which means this
+ * needs no policy change and no Azure credential inside the sandbox.
+ *
+ * Emitted only after the router advertises {@link LOG_INGEST_CAPABILITY}, and
+ * only for records that clear the device-side level threshold and rate limit —
+ * a `log` frame is fire-and-forget with NO ack and NO durable buffer, unlike
+ * `session_state`. That is intentional: losing a log line costs visibility,
+ * whereas the disk writes and replay machinery that make a frame durable would
+ * cost far more than the line is worth, and replaying stale logs after a
+ * reconnect is actively unhelpful.
+ *
+ * Attribution (which issue, which device) is deliberately NOT on the frame. The
+ * router already knows both from the device row it authenticated, and taking
+ * them from there rather than from the device makes a worker unable to
+ * mis-attribute its logs to someone else's issue.
+ */
+const logFrame = z.object({
+	type: z.literal("log"),
+	/** ISO-8601 emission time, from the DEVICE's clock. */
+	ts: z.string().min(1),
+	level: z.enum(LOG_FRAME_LEVELS),
+	/** The emitting logger's component, e.g. "EdgeWorker", "ClaudeRunner". */
+	component: z.string().min(1),
+	message: z.string(),
+	/** Set when the line came from `ILogger.event` — the event name. */
+	event: z.string().optional(),
+	sessionId: z.string().optional(),
+	/** The device's own view of the issue. Advisory only — see the note above. */
+	issueIdentifier: z.string().optional(),
+	repository: z.string().optional(),
+	attributes: z.record(z.string(), logAttributeValue).optional(),
+	/** Summarised trailing `logger.x(msg, ...args)` arguments. */
+	args: z.string().optional(),
+	/**
+	 * How many records the device's volume guard dropped since the last frame it
+	 * managed to send. Carried inline rather than as its own periodic frame so a
+	 * truncated log stream is never silently truncated: a KQL
+	 * `summarize sum(dropped)` gives the real loss with no extra traffic.
+	 */
+	dropped: z.number().int().nonnegative().optional(),
+	/**
+	 * W3C Trace Context, reserved for Phase 5 (NOR-283). Present here from the
+	 * start so propagating a trace across the sandbox boundary is a matter of
+	 * populating a field rather than renegotiating the frame: the router will
+	 * read these to stitch a worker's log records onto the span that produced
+	 * them. Nothing writes them yet; both sides must tolerate their absence.
+	 */
+	traceparent: z.string().optional(),
+	tracestate: z.string().optional(),
+});
+
 const sessionStateAckFrame = z.object({
 	type: z.literal("session_state_ack"),
 	id: z.string().min(1),
@@ -146,6 +241,12 @@ const helloAckFrame = z.object({
 	// PROTOCOL_VERSION. An older router omits it and the device falls back to
 	// HEARTBEAT_INTERVAL_MS.
 	heartbeatMs: z.number().int().positive().optional(),
+	// Feature flags the ROUTER supports, e.g. LOG_INGEST_CAPABILITY. The mirror
+	// image of `hello.capabilities`, and the mechanism by which a device learns
+	// it is safe to send a frame type an older router would reject. Optional and
+	// additive: it does NOT bump PROTOCOL_VERSION, and an older router omitting
+	// it reads as "supports nothing new".
+	capabilities: z.array(z.string()).optional(),
 });
 const helloErrorFrame = z.object({
 	type: z.literal("hello_error"),
@@ -170,6 +271,7 @@ const deviceFrame = z.discriminatedUnion("type", [
 	rpcRequestFrame,
 	sessionStateFrame,
 	sessionsReportFrame,
+	logFrame,
 ]);
 const serverFrame = z.discriminatedUnion("type", [
 	helloAckFrame,
@@ -187,6 +289,7 @@ export type SessionStateFrame = z.infer<typeof sessionStateFrame>;
 export type SessionStateAckFrame = z.infer<typeof sessionStateAckFrame>;
 export type SessionsQueryFrame = z.infer<typeof sessionsQueryFrame>;
 export type SessionsReportFrame = z.infer<typeof sessionsReportFrame>;
+export type LogFrame = z.infer<typeof logFrame>;
 export type HelloAckFrame = z.infer<typeof helloAckFrame>;
 export type HelloErrorFrame = z.infer<typeof helloErrorFrame>;
 export type EventFrame = z.infer<typeof eventFrame>;

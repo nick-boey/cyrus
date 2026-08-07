@@ -40,6 +40,7 @@ import type {
 	IssueStateChangeMessage,
 	IssueUnassignedWebhook,
 	IssueUpdateWebhook,
+	LogSink,
 	RepositoryConfig,
 	RunnerType,
 	SerializableEdgeWorkerState,
@@ -77,7 +78,9 @@ import {
 	McpHealthRegistry,
 	PersistenceManager,
 	requireLinearWorkspaceId,
+	resetGlobalLogSink,
 	resolvePath,
+	setGlobalLogSink,
 	WebhookIpValidator,
 } from "cyrus-core";
 import { CursorRunner } from "cyrus-cursor-runner";
@@ -141,6 +144,7 @@ import {
 import {
 	RouterConnection,
 	RouterIssueTrackerService,
+	RouterLogForwarder,
 } from "cyrus-router-client";
 import {
 	SlackEventTransport,
@@ -240,6 +244,14 @@ export class EdgeWorker extends EventEmitter {
 	 * finished, so no queued prompt can race a terminal signal.
 	 */
 	private pendingRouterDial?: RouterConnection;
+	/**
+	 * Ships this worker's own logs to the router (router platform mode). Held so
+	 * `stop()` can uninstall it — after shutdown the connection is gone, and a
+	 * sink still pointing at it would silently count every remaining line as
+	 * dropped.
+	 */
+	private logForwarder?: RouterLogForwarder;
+	private previousLogSink?: LogSink;
 	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, opt-in via floorSync === true)
 	private teardownCallbacks?: TeardownCallbackQueue; // Durable, retrying "terminal cleanup is done" callback to the router (router platform mode)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
@@ -680,6 +692,21 @@ export class EdgeWorker extends EventEmitter {
 				// a previous process. See AgentSessionManager.getLiveSessionIds.
 				getActiveSessions: () => this.agentSessionManager.getLiveSessionIds(),
 			});
+
+			// Ship this process's own logs off the box over the connection we just
+			// built. A sandbox worker's stdout is collected by nothing and dies
+			// with the sandbox, so without this the only record of what a session
+			// did is whatever reached Linear. Installed process-wide (mirroring
+			// setGlobalErrorReporter) so every component's logger forwards without
+			// the sink being threaded through each constructor.
+			//
+			// Inert unless the router advertises `log_ingest` AND the record clears
+			// the forwarder's level threshold and rate limit, so a physical-device
+			// user who happens to run in router mode pays essentially nothing.
+			this.logForwarder = new RouterLogForwarder({
+				connection: this.routerConnection,
+			});
+			this.previousLogSink = setGlobalLogSink(this.logForwarder);
 
 			// Durable record of "I owe the router a teardown callback". Written
 			// before terminal cleanup starts and retried until the router accepts
@@ -3029,6 +3056,17 @@ ${taskSection}`;
 		// open on backoff sleeps. Anything still queued is on disk and replays
 		// on the next start (and the router's grace deadline covers the gap).
 		this.teardownCallbacks?.stop();
+
+		// Uninstall the log sink last: everything above still gets forwarded, and
+		// only now does the connection it writes to stop being useful. Restores
+		// whatever was installed before us rather than assuming it was the no-op,
+		// so a host that installed its own sink (Phase 3's OTel sink) gets it back.
+		if (this.logForwarder) {
+			if (this.previousLogSink) setGlobalLogSink(this.previousLogSink);
+			else resetGlobalLogSink();
+			this.logForwarder = undefined;
+			this.previousLogSink = undefined;
+		}
 	}
 
 	/**

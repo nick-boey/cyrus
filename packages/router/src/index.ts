@@ -62,6 +62,11 @@ export {
 	type SessionInfo,
 } from "./RouterStore.js";
 export {
+	SANDBOX_LOG_SOURCE,
+	type SandboxLogOrigin,
+	SandboxLogRelay,
+} from "./SandboxLogRelay.js";
+export {
 	emitSandboxEvent,
 	emitSandboxGauge,
 	SANDBOX_EVENTS,

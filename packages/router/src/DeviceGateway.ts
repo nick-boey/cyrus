@@ -6,6 +6,7 @@ import {
 	type DeviceFrame,
 	HEARTBEAT_INTERVAL_MS,
 	type HelloFrame,
+	LOG_INGEST_CAPABILITY,
 	MAX_MISSED_HEARTBEATS,
 	PROTOCOL_VERSION,
 	parseDeviceFrame,
@@ -35,6 +36,7 @@ interface SocketState {
  *  - "rpc"(deviceId: number, frame: RpcRequestFrame)
  *  - "sessionState"(deviceId: number, frame: SessionStateFrame)
  *  - "eventAck"(deviceId: number, seq: number)
+ *  - "log"(deviceId: number, frame: LogFrame)
  */
 export class DeviceGateway extends EventEmitter {
 	private readonly store: RouterStore;
@@ -302,6 +304,12 @@ export class DeviceGateway extends EventEmitter {
 			case "session_state":
 				this.emit("sessionState", deviceId, frame);
 				break;
+			case "log":
+				// Never logged or acked here — a device's log line must not be able
+				// to generate router log lines of its own, and there is nothing to
+				// confirm (see the `log` frame's fire-and-forget contract).
+				this.emit("log", deviceId, frame);
+				break;
 			case "sessions_report": {
 				const pending = this.pendingSessionQueries.get(frame.id);
 				if (!pending) break; // Late or unsolicited reply — the timeout already won.
@@ -378,6 +386,11 @@ export class DeviceGateway extends EventEmitter {
 				// watchdog terminates its socket at the same point we terminate
 				// ours, even when this router runs a non-default heartbeatMs.
 				heartbeatMs: this.heartbeatMs,
+				// Tell the device which newer frame types we can parse. Without
+				// this a worker that forwarded logs to an older router would have
+				// its socket closed as "invalid frame" on every log line — see
+				// LOG_INGEST_CAPABILITY.
+				capabilities: [LOG_INGEST_CAPABILITY],
 			}),
 		);
 
