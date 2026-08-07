@@ -282,12 +282,17 @@ describe("setup routes — authentication", () => {
 		expect(res.statusCode).toBe(403);
 	});
 
-	it("401s an unauthenticated GET /setup/variables", async () => {
+	// /setup renders the sign-in link, so every other route bounces there rather
+	// than rendering its own dead end. /setup itself must NOT redirect, or the
+	// bounce would loop — that is the test directly above.
+	it("sends an unauthenticated GET /setup/variables back to /setup", async () => {
 		const h = await harness();
-		expect((await get(h, "/setup/variables")).statusCode).toBe(401);
+		const res = await get(h, "/setup/variables");
+		expect(res.statusCode).toBe(303);
+		expect(res.headers.location).toBe("/setup");
 	});
 
-	it("401s every mutating route with no principal", async () => {
+	it("sends every mutating route with no principal back to /setup", async () => {
 		const h = await harness();
 		for (const url of ["/setup/provision", "/setup/variables", "/setup/save"]) {
 			const res = await h.app.inject({
@@ -296,7 +301,8 @@ describe("setup routes — authentication", () => {
 				payload: "csrf=whatever&name=FOO",
 				headers: { "content-type": FORM },
 			});
-			expect(res.statusCode, url).toBe(401);
+			expect(res.statusCode, url).toBe(303);
+			expect(res.headers.location, url).toBe("/setup");
 		}
 		const del = await h.app.inject({
 			method: "DELETE",
@@ -304,7 +310,53 @@ describe("setup routes — authentication", () => {
 			payload: "csrf=whatever",
 			headers: { "content-type": FORM },
 		});
-		expect(del.statusCode).toBe(401);
+		expect(del.statusCode).toBe(303);
+		expect(del.headers.location).toBe("/setup");
+	});
+
+	// The regression that started this: a signed-in teammate with no `users` row
+	// hit a route other than /setup and was told to ask an administrator to run
+	// `cyrus router users add`, on a deployment where auto-provisioning was on.
+	it("sends an unregistered principal back to /setup", async () => {
+		const h = await harness();
+		const res = await get(h, "/setup/variables", BOB);
+		expect(res.statusCode).toBe(303);
+		expect(res.headers.location).toBe("/setup");
+	});
+
+	it("reads no secret for an unregistered principal", async () => {
+		const secrets = new FileSecretStore(tempSecretsFile());
+		const read = vi.spyOn(secrets, "get");
+		const h = await harness({ secrets });
+		expect((await get(h, "/setup/variables", BOB)).statusCode).toBe(303);
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	// The carve-out. With auto-provisioning OFF, /setup can no longer resolve
+	// this — bouncing there would hand the caller a provisioning button that is
+	// guaranteed to fail instead of the command an administrator has to run.
+	it("keeps the 403 when auto-provisioning is off", async () => {
+		const h = await harness({ autoProvisionUsers: false });
+		const res = await post(
+			h,
+			"/setup/provision",
+			{ csrf: h.csrf.issue(BOB) },
+			BOB,
+		);
+		expect(res.statusCode).toBe(403);
+		expect(res.body).toContain("cyrus router users add");
+	});
+
+	// A registered user whose token went stale needs to READ the reason. Only
+	// "not signed in" and "not registered yet" are redirect-worthy.
+	it("does not redirect a stale CSRF token", async () => {
+		const h = await provisioned(await harness());
+		const res = await post(h, "/setup/variables", {
+			csrf: "stale",
+			name: "FOO",
+		});
+		expect(res.statusCode).toBe(403);
+		expect(res.body).toContain("expired");
 	});
 
 	it("ignores identity headers entirely in entra-token mode", async () => {
@@ -520,7 +572,11 @@ describe("shared mutation guard", () => {
 			payload: form({ name: "FOO", csrf: h.csrf.issue(ALICE) }),
 			headers: { "content-type": FORM },
 		});
-		expect(res.statusCode).toBe(401);
+		// Bounced to /setup to sign in — and, the point of this test, WITHOUT the
+		// "page expired" wording that would confirm the token was even examined.
+		expect(res.statusCode).toBe(303);
+		expect(res.headers.location).toBe("/setup");
+		expect(res.body).not.toContain("expired");
 	});
 
 	it("accepts the token from the X-CSRF-Token header", async () => {
@@ -612,7 +668,11 @@ describe("registration gate (R2-02)", () => {
 		expect(secrets.putRecordCalls).toEqual([]);
 	}
 
-	it("403s POST /setup/variables and writes nothing", async () => {
+	// The gate still refuses; only the SHAPE of the refusal changed. An
+	// unregistered principal is now bounced to /setup — the one route that can
+	// provision them — instead of being handed a CLI command. What matters here
+	// is unchanged and still asserted: the store is never touched.
+	it("bounces POST /setup/variables and writes nothing", async () => {
 		const g = await gate();
 		const res = await post(
 			g.h,
@@ -620,22 +680,22 @@ describe("registration gate (R2-02)", () => {
 			{ name: "FOO", csrf: g.h.csrf.issue(STRANGER) },
 			STRANGER,
 		);
-		expect(res.statusCode).toBe(403);
-		expect(res.body).toContain("cyrus router users add");
+		expect(res.statusCode).toBe(303);
+		expect(res.headers.location).toBe("/setup");
 		expectNoSecretAccess(g);
 		expect(await g.secrets.get(STRANGER)).toEqual({});
 		expect(g.h.store.listUsers().map((u) => u.email)).toEqual([ALICE]);
 	});
 
-	it("403s DELETE /setup/variables/:name and writes nothing", async () => {
+	it("bounces DELETE /setup/variables/:name and writes nothing", async () => {
 		const g = await gate();
 		const res = await del(g.h, "MY_TOOL_KEY", STRANGER);
-		expect(res.statusCode).toBe(403);
-		expect(res.body).toContain("cyrus router users add");
+		expect(res.statusCode).toBe(303);
+		expect(res.headers.location).toBe("/setup");
 		expectNoSecretAccess(g);
 	});
 
-	it("403s POST /setup/save and writes nothing", async () => {
+	it("bounces POST /setup/save and writes nothing", async () => {
 		const g = await gate();
 		const res = await post(
 			g.h,
@@ -646,7 +706,8 @@ describe("registration gate (R2-02)", () => {
 			},
 			STRANGER,
 		);
-		expect(res.statusCode).toBe(403);
+		expect(res.statusCode).toBe(303);
+		expect(res.headers.location).toBe("/setup");
 		expect(res.body).not.toContain("sk-ant-attacker");
 		expectNoSecretAccess(g);
 	});

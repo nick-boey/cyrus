@@ -20,6 +20,7 @@ import {
 	SetupAuthError,
 	type SetupIdTokenVerifier,
 	type SetupPrincipal,
+	shouldRedirectToSetup,
 } from "./principal.js";
 import { HTMX_JS } from "./vendor/htmx.js";
 import { PICO_CSS } from "./vendor/pico.js";
@@ -372,7 +373,28 @@ function sendError(
 	deps.logger.warn(
 		`Setup request refused with ${error.status}: ${error.message}`,
 	);
+	// Logged first, always: the redirect must not cost an operator the diagnostic
+	// line that says which principal was refused and why.
+	if (shouldRedirectToSetup(error, reply.request.url)) {
+		return redirectToSetup(reply);
+	}
 	return secureHtml(reply).status(error.status).send(renderError(error));
+}
+
+/**
+ * Sends the caller to `/setup`, which renders whichever of sign-in or
+ * first-run provisioning they actually need.
+ *
+ * htmx follows a 3xx transparently and would swap a whole HTML document into
+ * whatever fragment slot issued the request, so an htmx caller gets
+ * `HX-Redirect` instead — which makes the browser navigate for real. 303 is
+ * used rather than 302 so a refused POST is re-issued as a GET.
+ */
+function redirectToSetup(reply: FastifyReply): FastifyReply {
+	if (reply.request.headers["hx-request"]) {
+		return reply.header("hx-redirect", "/setup").status(204).send();
+	}
+	return reply.redirect("/setup", 303);
 }
 
 /* ----------------------------------------------------------------- guard -- */
@@ -648,6 +670,16 @@ export function registerSetupRoutes(
 	fastify.get("/setup/variables", async (request, reply) => {
 		const auth = await authenticate(deps, request);
 		if ("error" in auth) return sendError(deps, reply, auth.error);
+		// The only /setup* route that read the secret store without first
+		// confirming the principal has a `users` row. Being read-only did not
+		// excuse it: `readState` still touches the backend on behalf of an
+		// unregistered address, and the caller has no page to be refreshing.
+		try {
+			deps.bootstrap.authorize(auth.principal);
+		} catch (error) {
+			if (error instanceof SetupAuthError) return sendError(deps, reply, error);
+			throw error;
+		}
 		const state = await readState(deps, auth.principal.email);
 		return secureHtml(reply).send(
 			renderVariablesTable(buildModel(deps, auth.principal, state)),
