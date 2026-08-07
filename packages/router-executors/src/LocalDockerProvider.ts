@@ -3,6 +3,7 @@ import type {
 	ContainerExecutor,
 	ContainerStatus,
 	IssueExecutionContext,
+	ManagedContainerState,
 } from "./types.js";
 
 export type ExecFn = (
@@ -167,6 +168,39 @@ export class LocalDockerProvider implements ContainerExecutor {
 			.split("\n")
 			.map((l) => l.trim())
 			.filter(Boolean);
+	}
+
+	/**
+	 * One `docker ps -a` for every managed container's key AND state, so the
+	 * lifecycle sweep's gauge costs the same single exec as the orphan-GC
+	 * listing it replaces.
+	 *
+	 * Docker's `{{.State}}` is `running`, `exited`, `created`, `paused`,
+	 * `restarting`, `removing`, or `dead`. Only `running` maps to `running`;
+	 * everything else is a container that exists but isn't serving, which is
+	 * exactly {@link ContainerStatus}'s `stopped`. `absent` is unreachable here
+	 * — a container that doesn't exist doesn't appear in the listing at all.
+	 */
+	async listStates(): Promise<ManagedContainerState[]> {
+		const { stdout } = await this.exec("docker", [
+			"ps",
+			"-a",
+			"--filter",
+			"label=cyrus.issue",
+			"--format",
+			'{{.Label "cyrus.issue"}}\t{{.State}}',
+		]);
+		const states: ManagedContainerState[] = [];
+		for (const line of stdout.split("\n")) {
+			const [issueKey, state] = line.trim().split("\t");
+			if (!issueKey) continue;
+			states.push({
+				issueKey,
+				status: state === "running" ? "running" : "stopped",
+				...(state ? { providerState: state } : {}),
+			});
+		}
+		return states;
 	}
 
 	private async mustSucceed(cmd: string, args: string[]): Promise<void> {

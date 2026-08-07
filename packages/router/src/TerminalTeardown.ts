@@ -5,6 +5,11 @@ import type { ExecutorRegistry } from "cyrus-router-executors";
 import { TEARDOWN_IDEMPOTENCY_HEADER } from "cyrus-workspace-sync";
 import type { FastifyInstance } from "fastify";
 import type { RouterStore } from "./RouterStore.js";
+import {
+	emitSandboxEvent,
+	SANDBOX_EVENTS,
+	type SandboxDestroyReason,
+} from "./SandboxTelemetry.js";
 
 export type TerminalTeardownAction = "closed" | "deleted";
 /**
@@ -293,6 +298,33 @@ export class TerminalTeardown {
 				);
 			}
 		}
+		// Both events, not one: `destroyed` belongs to the sandbox-count series
+		// (it is what closes the gauge out for this issue), while
+		// `teardown_completed` carries the teardown-specific dimensions — which
+		// terminal action triggered it, and whether the worker's callback or the
+		// grace deadline got us here. Collapsing them would force any query that
+		// counts live sandboxes to special-case teardowns.
+		const identity = {
+			issueKey,
+			deviceId: entry.deviceId,
+			provider: current.provider,
+		};
+		emitSandboxEvent(this.opts.logger, SANDBOX_EVENTS.destroyed, identity, {
+			reason: "terminal_teardown" satisfies SandboxDestroyReason,
+		});
+		emitSandboxEvent(
+			this.opts.logger,
+			SANDBOX_EVENTS.teardownCompleted,
+			identity,
+			{
+				action: entry.action,
+				trigger: reason,
+				age_ms: this.now() - current.createdMs,
+				uptime_ms: current.runningSinceMs
+					? this.now() - current.runningSinceMs
+					: null,
+			},
+		);
 		this.opts.logger.info(
 			`Completed terminal teardown for ${issueKey} after ${reason}`,
 		);

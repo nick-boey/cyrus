@@ -1447,6 +1447,100 @@ describe("AcaSandboxesProvider", () => {
 		});
 	});
 
+	describe("listStates", () => {
+		/**
+		 * This is what makes the router's 60s telemetry gauge affordable: the
+		 * whole fleet's state for one ARM request, instead of one `status()` per
+		 * sandbox per minute.
+		 */
+		it("returns key AND state for every managed sandbox in ONE listSandboxes call", async () => {
+			const listSandboxesResult: AcaSandbox[] = [
+				sb("CYR-1", {
+					id: "a",
+					state: "Running",
+					labels: { "cyrus.issue": "CYR-1" },
+				}),
+				sb("CYR-2", {
+					id: "b",
+					state: "Suspended",
+					labels: { "cyrus.issue": "CYR-2" },
+				}),
+				sb("", { id: "c", labels: { "cyrus.managed": "true" } }), // no issue label
+			];
+			const { client, calls } = fakeClient({ listSandboxesResult });
+			const p = new AcaSandboxesProvider({
+				client,
+				image: "img:1",
+				disk: "disk-v1",
+			});
+
+			const states = await p.listStates();
+
+			expect(calls.listSandboxes).toHaveLength(1);
+			expect(calls.listSnapshots).toHaveLength(0);
+			expect(states).toEqual([
+				{ issueKey: "CYR-1", status: "running", providerState: "Running" },
+				{ issueKey: "CYR-2", status: "stopped", providerState: "Suspended" },
+			]);
+		});
+
+		/**
+		 * Mid-replacement an issue legitimately has more than one sandbox. The
+		 * gauge must report the one `ensureRunning` would retain, or the telemetry
+		 * disagrees with the router's own view of the same issue.
+		 */
+		it("collapses an issue's several sandboxes to the one ensureRunning would retain", async () => {
+			const listSandboxesResult: AcaSandbox[] = [
+				sb("CYR-1", {
+					id: "z-stale",
+					state: "Stopped",
+					labels: { "cyrus.issue": "CYR-1" },
+				}),
+				sb("CYR-1", {
+					id: "a-live",
+					state: "Running",
+					labels: { "cyrus.issue": "CYR-1" },
+				}),
+			];
+			const { client } = fakeClient({ listSandboxesResult });
+			const p = new AcaSandboxesProvider({
+				client,
+				image: "img:1",
+				disk: "disk-v1",
+			});
+
+			expect(await p.listStates()).toEqual([
+				{ issueKey: "CYR-1", status: "running", providerState: "Running" },
+			]);
+		});
+
+		/**
+		 * `Running` here is INFRASTRUCTURE state — an exited entrypoint leaves
+		 * `tini` alive and the sandbox Running. Every transitional state maps to
+		 * `stopped` so a caller cannot mistake "still creating" for "serving",
+		 * while `providerState` keeps the detail for diagnosis.
+		 */
+		it("normalises transitional states to stopped but preserves the provider's own string", async () => {
+			const listSandboxesResult: AcaSandbox[] = [
+				sb("CYR-1", {
+					id: "a",
+					state: "Creating",
+					labels: { "cyrus.issue": "CYR-1" },
+				}),
+			];
+			const { client } = fakeClient({ listSandboxesResult });
+			const p = new AcaSandboxesProvider({
+				client,
+				image: "img:1",
+				disk: "disk-v1",
+			});
+
+			expect(await p.listStates()).toEqual([
+				{ issueKey: "CYR-1", status: "stopped", providerState: "Creating" },
+			]);
+		});
+	});
+
 	describe("D7 default egress allowlist", () => {
 		it("includes GitHub, Anthropic (api+console), Linear (mcp+api), pypi, Rust (index.crates.io + static.rust-lang.org), and the router host from routerUrlForContainers", async () => {
 			const { client, calls } = fakeClient({

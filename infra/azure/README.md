@@ -901,6 +901,108 @@ router's job:
 - Rate-limit issue assignment (Linear automation) if you want a hard ceiling
   on concurrent workers — the platform will not enforce one.
 
+## Monitoring and alerts
+
+`monitoring.tf` provisions saved KQL searches and alert rules over the router's
+JSON log stream. No agent, no exporter, no OpenTelemetry dependency — the
+Container Apps environment already ships the router's stdout to the Log
+Analytics workspace created in `main.tf`, and the router already writes one flat
+JSON object per line (`CYRUS_LOG_FORMAT=json`, set in `router.tf`).
+
+The data comes from the `sandbox_*` event family documented in
+[`docs/ROUTER.md`](../../docs/ROUTER.md) → "Sandbox lifecycle telemetry". The
+load-bearing one is `sandbox_gauge`: one sample per sandbox per 60-second
+lifecycle sweep, carrying the issue key, provider state, live session count, and
+both uptime clocks.
+
+### Saved searches (category "Cyrus Sandboxes")
+
+| Search | Answers |
+|--------|---------|
+| Open sandboxes | how many sandboxes are open right now, for which issues, holding how many sessions, up for how long |
+| Sandbox fleet size over time | the same counts as a time series |
+| Sessions per issue | peak concurrent sessions and peak uptime per issue |
+| Sandbox lifecycle for one issue | every transition for one issue, in order (edit the issue key first) |
+| Sandbox boot outcomes | boots that failed, and boots that started but reached neither running nor failed |
+
+### Alert rules
+
+| Rule | Fires when | Severity |
+|------|-----------|----------|
+| `…-sandbox-long-running` | a sandbox has been running continuously for more than `var.sandbox_uptime_alert_hours` (default 6) | 2 |
+| `…-sandbox-sweep-stalled` | no lifecycle sweep has reported in for 15 minutes | 1 |
+| `…-sandbox-boot-failures` | any sandbox failed to boot | 2 |
+
+Two things about the long-running rule are worth understanding before tuning it.
+
+**Why six hours means something.** `idleStopMs` defaults to 5 minutes, so an
+affinity-free sandbox is parked within one sweep tick of going quiet. A sandbox
+only reaches six *continuous* hours by holding session affinity for essentially
+that entire period. At the ACA XL tier (4 vCPU / 8 GiB) that is simultaneously a
+real cost signal and a strong stuck-agent signal.
+
+**Why it does not key on ACA state alone.** ACA reports `Running` for a sandbox
+whose entrypoint has exited — `tini` keeps the container alive. An alert on
+state alone would fire on zombies and stay silent on hung workers. So the rule
+combines provider state with the router's heartbeat view and splits every fired
+alert by a `worker` dimension:
+
+- `live` — the worker is answering heartbeats. A genuinely long-running agent,
+  or one stuck in a loop. Investigate the session.
+- `stale-heartbeat` — `Running` but the worker stopped answering. Almost
+  certainly a zombie burning 4 vCPU; destroy it.
+- `never-connected` — reached `Running` but never dialled back at all. A boot or
+  egress-policy problem, not an agent problem.
+
+The sweep-stalled rule is what makes the other two trustworthy: every sandbox
+alert derives from the 60-second sweep, so if the sweep stops emitting they all
+go quietly blind and look exactly like "nothing is wrong". It keys on the
+absence of `sandbox_sweep_completed`, which is emitted on every tick including
+ticks with zero sandboxes, precisely so a quiet fleet stays distinguishable from
+a dead router.
+
+### Configuration
+
+```hcl
+# Where alerts land. Empty (the default) still creates the rules and still
+# records fired alerts in Azure Monitor — it just emails nobody.
+alert_email_receivers = ["oncall@example.com"]
+
+# Tune the uptime threshold, or turn the rules off entirely.
+sandbox_uptime_alert_hours = 6
+enable_monitoring_alerts   = true
+```
+
+The saved searches are created regardless of `enable_monitoring_alerts`; they
+are free and evaluate nothing until someone opens them. Setting the flag to
+false removes the three scheduled-query rules (and their Azure Monitor per-rule
+charge) while leaving the queries in place.
+
+### Verifying the long-running alert
+
+Synthetic test, no six-hour wait required — the rule reads `running_since_ms`
+from the router's SQLite, so backdate it:
+
+```bash
+# 1. Note the device id of a live container.
+az containerapp exec -n <router-app> -g <rg> --command \
+  "cyrus router containers list --cyrus-home /data"
+
+# 2. Backdate its uptime clock past the threshold.
+az containerapp exec -n <router-app> -g <rg> --command \
+  "sqlite3 /data/router/router.db \"UPDATE devices SET running_since_ms = \
+   (strftime('%s','now') - 25200) * 1000 WHERE device_id = <id>\""
+
+# 3. Wait one sweep tick (60s), then confirm the gauge reports it.
+#    In Log Analytics, run the 'Open sandboxes' saved search — the row should
+#    show an uptime of ~7h. The alert evaluates every 15 minutes after that.
+```
+
+Restore by letting the next idle-stop clear the clock, or set the column back to
+its real value. Note the sweep reconciles this column against real provider
+state each tick, so a backdated value on a sandbox that is genuinely running
+persists, while one on a stopped sandbox is cleared within a tick.
+
 ## Teardown (M5)
 
 Terraform tracks the **ARM group** but NOT its **data-plane children**
@@ -1205,6 +1307,7 @@ terraform/
   sandbox.tf      azapi_resource sandbox group + Data Owner RBAC + optional ACR
   setup_ui.tf     /setup: staged EasyAuth (authConfigs + token store) AND the
                   opt-in, then create-once Table/KEK/RBAC for per-user secrets — see §11
+  monitoring.tf   saved KQL searches + alert rules over the router's JSON logs
   outputs.tf      paste-ready outputs (N8)
   env/dev.tfvars.example  complete variable checklist
 bicep/

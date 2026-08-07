@@ -831,6 +831,101 @@ describe("container devices (schema v2)", () => {
 			store.close();
 		});
 	});
+
+	describe("running_since_ms", () => {
+		const makeContainerDevice = (store: RouterStore, issueKey: string) => {
+			const { userId } = store.addUser({ email: `${issueKey}@example.com` });
+			return store.createContainerDevice(userId, issueKey, "aca").deviceId;
+		};
+		const runningSinceFor = (store: RouterStore, deviceId: number) =>
+			store.listContainerDevices().find((d) => d.deviceId === deviceId)
+				?.runningSinceMs;
+
+		it("is undefined until the container is marked running", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-1");
+
+			expect(runningSinceFor(store, deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		it("round-trips through both container-device reads", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-2");
+
+			expect(store.markDeviceRunning(deviceId, 1_700_000_000_000)).toBe(true);
+
+			expect(runningSinceFor(store, deviceId)).toBe(1_700_000_000_000);
+			expect(store.getContainerDeviceForIssue("NOR-2")?.runningSinceMs).toBe(
+				1_700_000_000_000,
+			);
+			store.close();
+		});
+
+		/**
+		 * The whole reason `markDeviceRunning` is set-if-null. `boot()` runs on
+		 * every routed event and `ensureRunning` returns immediately for a
+		 * container that is already up, so an unconditional stamp would reset the
+		 * clock on every user comment — and a sandbox genuinely pinned for eight
+		 * hours would report an uptime of seconds, which is exactly the case the
+		 * long-running alert exists to catch.
+		 */
+		it("does not restart a clock that is already running", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-3");
+
+			store.markDeviceRunning(deviceId, 1_000);
+			expect(store.markDeviceRunning(deviceId, 9_999)).toBe(false);
+
+			expect(runningSinceFor(store, deviceId)).toBe(1_000);
+			store.close();
+		});
+
+		it("reports whether clearing actually stopped a running clock", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-4");
+
+			store.markDeviceRunning(deviceId, 1_000);
+
+			expect(store.clearDeviceRunningSince(deviceId)).toBe(true);
+			expect(runningSinceFor(store, deviceId)).toBeUndefined();
+			// Idempotent: a second clear is a no-op and says so, so callers can
+			// emit a stop transition exactly once.
+			expect(store.clearDeviceRunningSince(deviceId)).toBe(false);
+			store.close();
+		});
+
+		it("restarts the clock after a stop, so uptime measures the current run only", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-5");
+
+			store.markDeviceRunning(deviceId, 1_000);
+			store.clearDeviceRunningSince(deviceId);
+			store.markDeviceRunning(deviceId, 5_000);
+
+			expect(runningSinceFor(store, deviceId)).toBe(5_000);
+			store.close();
+		});
+
+		/**
+		 * `created_ms` is the device ROW's age and survives every stop/resume
+		 * cycle, which is why it cannot answer continuous uptime and why this
+		 * column had to exist at all.
+		 */
+		it("is independent of created_ms", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-6");
+			const createdMs = store.getContainerDeviceForIssue("NOR-6")?.createdMs;
+
+			store.markDeviceRunning(deviceId, (createdMs ?? 0) + 10_000);
+
+			expect(store.getContainerDeviceForIssue("NOR-6")?.createdMs).toBe(
+				createdMs,
+			);
+			expect(runningSinceFor(store, deviceId)).toBe((createdMs ?? 0) + 10_000);
+			store.close();
+		});
+	});
 });
 
 describe("repository decisions", () => {

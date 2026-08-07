@@ -1,6 +1,28 @@
 import type { ILogger } from "cyrus-core";
-import type { ExecutorRegistry } from "cyrus-router-executors";
+import type {
+	ExecutorRegistry,
+	ManagedContainerState,
+} from "cyrus-router-executors";
 import type { ContainerDeviceInfo, RouterStore } from "./RouterStore.js";
+import {
+	emitSandboxEvent,
+	emitSandboxGauge,
+	SANDBOX_EVENTS,
+	type SandboxDestroyReason,
+	type SandboxGaugeState,
+} from "./SandboxTelemetry.js";
+
+/**
+ * One provider's view of the containers it manages, taken once per sweep tick.
+ *
+ * `states` is absent (rather than empty) for a provider with no
+ * {@link ManagedContainerState} bulk seam: its listing proves the containers
+ * exist but says nothing about whether they are running.
+ */
+interface ProviderListing {
+	keys: Set<string>;
+	states?: Map<string, ManagedContainerState>;
+}
 
 /**
  * Lets the sweep re-derive a device's affinity from the device itself rather
@@ -135,6 +157,116 @@ export class ContainerLifecycle {
 		);
 	}
 
+	/**
+	 * One bulk state read per provider, for the whole tick.
+	 *
+	 * This is the telemetry gauge's entire provider cost: ONE call per provider
+	 * per 60s, not one per sandbox. At an ARM request per sandbox per minute a
+	 * per-row `status()` fan-out would quickly become the most expensive thing
+	 * the router does, and would throttle exactly when the fleet is largest —
+	 * i.e. when the numbers matter most.
+	 *
+	 * The result doubles as the orphan-GC listing, so adding the gauge costs
+	 * zero extra provider calls: {@link listStates} returns a superset of what
+	 * `listManaged()` did.
+	 *
+	 * A provider that fails to answer yields `undefined` rather than an empty
+	 * map. The distinction is load-bearing: an empty map means "this provider
+	 * manages nothing", which would make every one of its device rows look like
+	 * an orphan; `undefined` means "we could not tell", and the orphan sweep
+	 * skips the provider entirely for this tick.
+	 */
+	private async readProviderListings(): Promise<
+		Map<string, ProviderListing | undefined>
+	> {
+		const byProvider = new Map<string, ProviderListing | undefined>();
+		for (const [provider, executor] of this.executors) {
+			try {
+				if (executor.listStates) {
+					const states = await executor.listStates();
+					byProvider.set(provider, {
+						keys: new Set(states.map((s) => s.issueKey)),
+						states: new Map(states.map((s) => [s.issueKey, s])),
+					});
+				} else {
+					// A provider predating the bulk-state seam. Its listing proves
+					// existence and nothing more, so `states` stays absent and the
+					// gauge reports `unknown` rather than guessing at running.
+					byProvider.set(provider, {
+						keys: new Set(await executor.listManaged()),
+					});
+				}
+			} catch (err) {
+				this.logger.error(
+					`Could not list containers for provider ${provider}; skipping its orphan GC and reporting its sandboxes as state=unknown this tick`,
+					err,
+				);
+				byProvider.set(provider, undefined);
+			}
+		}
+		return byProvider;
+	}
+
+	/**
+	 * Emit the per-sandbox gauge sample and keep `running_since_ms` honest.
+	 *
+	 * Reconciliation lives here rather than only at the boot/stop call sites
+	 * because those cover the transitions the ROUTER drives. A sandbox can also
+	 * change state underneath us — ACA replaced it inside `ensureRunning`, an
+	 * operator stopped it by hand, the row predates the column's migration — and
+	 * without a periodic reconcile against real provider state the uptime the
+	 * 6-hour alert reads would drift and never self-correct.
+	 *
+	 * Skipped entirely when the state is `unknown`: a provider we could not read
+	 * must not be allowed to clear a running clock, or one throttled ARM call
+	 * would silently reset every uptime in the fleet.
+	 */
+	private sampleSandbox(
+		row: ContainerDeviceInfo,
+		listing: ProviderListing | undefined,
+		affinity: number,
+		now: number,
+	): SandboxGaugeState {
+		const state = listing?.states?.get(row.issueKey);
+		const gaugeState: SandboxGaugeState = !listing?.states
+			? "unknown"
+			: (state?.status ?? "absent");
+
+		let runningSinceMs = row.runningSinceMs;
+		if (gaugeState === "running" && runningSinceMs === undefined) {
+			if (this.store.markDeviceRunning(row.deviceId, now)) runningSinceMs = now;
+		} else if (
+			(gaugeState === "stopped" || gaugeState === "absent") &&
+			runningSinceMs !== undefined
+		) {
+			this.store.clearDeviceRunningSince(row.deviceId);
+			runningSinceMs = undefined;
+		}
+
+		emitSandboxGauge(this.logger, {
+			issueKey: row.issueKey,
+			deviceId: row.deviceId,
+			provider: row.provider,
+			state: gaugeState,
+			sessions: affinity,
+			online: this.sessionReconciler?.isOnline(row.deviceId) ?? false,
+			ageMs: now - row.createdMs,
+			...(runningSinceMs !== undefined
+				? { uptimeMs: now - runningSinceMs }
+				: {}),
+			...(row.lastSeenMs !== undefined
+				? { lastSeenAgeMs: now - row.lastSeenMs }
+				: {}),
+			...(row.parkedAtMs !== undefined
+				? { parkedForMs: now - row.parkedAtMs }
+				: {}),
+			...(row.lastRoutedMs !== undefined
+				? { lastRoutedAgeMs: now - row.lastRoutedMs }
+				: {}),
+		});
+		return gaugeState;
+	}
+
 	async sweep(): Promise<void> {
 		const now = this.now();
 		let rows: ContainerDeviceInfo[];
@@ -155,12 +287,34 @@ export class ContainerLifecycle {
 		}
 		const knownKeys = new Set(rows.map((r) => r.issueKey));
 
+		// Read every provider ONCE, up front, and reuse the answer for both the
+		// gauge and the orphan GC below. Listing before the per-row loop (rather
+		// than after it, as the orphan pass used to) also narrows the TOCTOU
+		// window it guards against: a container created while the loop runs can
+		// no longer appear in a listing taken before the loop started.
+		const listings = await this.readProviderListings();
+		const counts = { running: 0, stopped: 0, absent: 0, unknown: 0 };
+		let pinned = 0;
+
 		for (const row of rows) {
 			const executor = this.executors.get(row.provider);
 			if (!executor) continue;
 			try {
 				const affinity = await this.resolveAffinity(row.deviceId, now);
+				// Sampled for EVERY row, before the pinned early-return below.
+				// The pinned rows are the ones the operational questions are
+				// actually about — a sandbox held by session affinity is one that
+				// is burning 4 vCPU right now — so skipping them would leave the
+				// gauge counting only idle sandboxes.
+				const state = this.sampleSandbox(
+					row,
+					listings.get(row.provider),
+					affinity,
+					now,
+				);
+				counts[state] += 1;
 				if (affinity > 0) {
+					pinned += 1;
 					this.notePinned(row.deviceId, row.issueKey);
 					continue;
 				}
@@ -173,6 +327,21 @@ export class ContainerLifecycle {
 				if (now - lastTouch > this.staleDestroyMs) {
 					await executor.destroy(row.issueKey);
 					this.store.deleteContainerDevice(row.deviceId);
+					emitSandboxEvent(
+						this.logger,
+						SANDBOX_EVENTS.destroyed,
+						{
+							issueKey: row.issueKey,
+							deviceId: row.deviceId,
+							provider: row.provider,
+						},
+						{
+							reason: "stale" satisfies SandboxDestroyReason,
+							stale_for_ms: now - lastTouch,
+							stale_destroy_ms: this.staleDestroyMs,
+							age_ms: now - row.createdMs,
+						},
+					);
 					this.logger.info(
 						`Destroyed stale container for ${row.issueKey} ` +
 							`(device=${row.deviceId} affinity=${affinity} ` +
@@ -200,6 +369,29 @@ export class ContainerLifecycle {
 					const status = await executor.status(row.issueKey);
 					if (status === "running") {
 						await executor.stop(row.issueKey);
+						// The container is no longer running, so its continuous-uptime
+						// clock stops here. Read before clearing so the event can report
+						// how long the run it ends actually lasted — the single most
+						// useful number for tuning `idleStopMs`.
+						const uptimeMs = row.runningSinceMs
+							? now - row.runningSinceMs
+							: undefined;
+						this.store.clearDeviceRunningSince(row.deviceId);
+						emitSandboxEvent(
+							this.logger,
+							SANDBOX_EVENTS.idleStopped,
+							{
+								issueKey: row.issueKey,
+								deviceId: row.deviceId,
+								provider: row.provider,
+							},
+							{
+								idle_for_ms: idleForMs,
+								idle_stop_ms: this.idleStopMs,
+								uptime_ms: uptimeMs ?? null,
+								age_ms: now - row.createdMs,
+							},
+						);
 						// Every input behind the decision, so a stop that looks wrong
 						// (PAR-166: a live session parked mid-task) can be diagnosed
 						// from this line alone rather than reconstructed from a store
@@ -221,22 +413,35 @@ export class ContainerLifecycle {
 		}
 
 		for (const [provider, executor] of this.executors) {
+			const listing = listings.get(provider);
+			// `undefined` means the listing FAILED, not that the provider manages
+			// nothing. Treating it as empty would be harmless here (nothing to
+			// iterate) but the distinction is why `readProviderListings` returns
+			// undefined rather than an empty set — see its doc comment.
+			if (!listing) continue;
 			try {
-				for (const key of await executor.listManaged()) {
+				for (const key of listing.keys) {
 					// `knownKeys` is a snapshot taken before this loop's `await`s —
 					// it's a cheap pre-filter only, never the final say. A route
 					// landing mid-sweep (ContainerTargetService.ensureDevice writing
 					// the device row + boot() starting ensureRunning concurrently)
-					// can make a brand-new, still-booting container visible to
-					// listManaged() before it existed in that snapshot, which would
-					// otherwise misidentify it as an orphan and destroy() it — TOCTOU.
-					// Re-check the store immediately before each destroy() so a
-					// device row created after the snapshot still saves the container.
+					// can make a brand-new, still-booting container visible to the
+					// provider listing before it existed in that snapshot, which
+					// would otherwise misidentify it as an orphan and destroy() it —
+					// TOCTOU. Re-check the store immediately before each destroy()
+					// so a device row created after the snapshot still saves the
+					// container.
 					if (
 						!knownKeys.has(key) &&
 						!this.store.getContainerDeviceForIssue(key)
 					) {
 						await executor.destroy(key);
+						emitSandboxEvent(
+							this.logger,
+							SANDBOX_EVENTS.destroyed,
+							{ issueKey: key, provider },
+							{ reason: "orphan" satisfies SandboxDestroyReason },
+						);
 						this.logger.info(
 							`Destroyed orphan ${provider} container for ${key}`,
 						);
@@ -249,5 +454,18 @@ export class ContainerLifecycle {
 				);
 			}
 		}
+
+		// The rollup an operator actually asks for first ("how many sandboxes are
+		// open right now?"). Emitted even when zero, so a flat line is
+		// distinguishable from a router that stopped sweeping.
+		this.logger.event(SANDBOX_EVENTS.sweepCompleted, {
+			sandboxes: rows.length,
+			running: counts.running,
+			stopped: counts.stopped,
+			absent: counts.absent,
+			unknown: counts.unknown,
+			pinned,
+			duration_ms: this.now() - now,
+		});
 	}
 }

@@ -60,6 +60,26 @@ function isExecutorType(value: string): value is ExecutorType {
 }
 
 /**
+ * Render an elapsed duration in the most significant unit that fits the
+ * column: `45s`, `12m`, `6h13m`, `3d4h`.
+ *
+ * Hours keep their minutes because the whole point of the UPTIME column is
+ * telling `5h58m` from `6h02m` — the boundary the long-running-sandbox alert
+ * fires on. Days keep their hours for the same reason at the stale-destroy
+ * boundary. A negative input (a clock that moved backwards between the write
+ * and this read) clamps to `0s` rather than printing a nonsense duration.
+ */
+function formatElapsed(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const totalMinutes = Math.floor(totalSeconds / 60);
+	if (totalMinutes < 60) return `${totalMinutes}m`;
+	const totalHours = Math.floor(totalMinutes / 60);
+	if (totalHours < 24) return `${totalHours}h${totalMinutes % 60}m`;
+	return `${Math.floor(totalHours / 24)}d${totalHours % 24}h`;
+}
+
+/**
  * Column widths for `containers list`'s table, shared between the header
  * (see {@link RouterCommand.formatContainerDeviceHeader}) and each data row
  * (see {@link RouterCommand.formatContainerDeviceRow}) so the two can never
@@ -71,6 +91,9 @@ const CONTAINERS_TABLE_COLUMN_WIDTHS = {
 	email: 30,
 	lastRouted: 25,
 	lastSeen: 25,
+	age: 8,
+	uptime: 8,
+	parked: 8,
 } as const;
 
 /**
@@ -1583,7 +1606,7 @@ export class RouterCommand extends BaseCommand {
 	 */
 	private formatContainerDeviceHeader(): string {
 		const w = CONTAINERS_TABLE_COLUMN_WIDTHS;
-		return `${"ISSUE KEY".padEnd(w.issueKey)} ${"PROVIDER".padEnd(w.provider)} ${"USER".padEnd(w.email)} ${"LAST ROUTED".padEnd(w.lastRouted)} ${"LAST SEEN".padEnd(w.lastSeen)} TEARDOWN`;
+		return `${"ISSUE KEY".padEnd(w.issueKey)} ${"PROVIDER".padEnd(w.provider)} ${"USER".padEnd(w.email)} ${"LAST ROUTED".padEnd(w.lastRouted)} ${"LAST SEEN".padEnd(w.lastSeen)} ${"AGE".padEnd(w.age)} ${"UPTIME".padEnd(w.uptime)} ${"PARKED".padEnd(w.parked)} TEARDOWN`;
 	}
 
 	private formatContainerDeviceRow(
@@ -1591,6 +1614,7 @@ export class RouterCommand extends BaseCommand {
 		device: ContainerDeviceInfo,
 	): string {
 		const w = CONTAINERS_TABLE_COLUMN_WIDTHS;
+		const now = Date.now();
 		const email = store.getUserEmail(device.userId) ?? "(unknown)";
 		const lastRouted = device.lastRoutedMs
 			? new Date(device.lastRoutedMs).toISOString()
@@ -1598,10 +1622,29 @@ export class RouterCommand extends BaseCommand {
 		const lastSeen = device.lastSeenMs
 			? new Date(device.lastSeenMs).toISOString()
 			: "-";
+		// `createdMs` / `runningSinceMs` / `parkedAtMs` have always been selected
+		// into ContainerDeviceInfo but were never rendered, so the two questions
+		// this table gets opened for — "how long has that been up?" and "is it
+		// stuck waiting on someone?" — needed a sqlite3 shell to answer.
+		//
+		// Rendered as elapsed durations rather than ISO timestamps: three more
+		// 25-character columns would push the row past any terminal, and the
+		// answer is the elapsed time in every case anyway. AGE and UPTIME are
+		// deliberately separate columns because they measure different things —
+		// AGE is the device row (it survives every stop/resume), UPTIME is the
+		// current continuous run, so `AGE 3d / UPTIME 4m` is a healthy sandbox
+		// that has been idle-stopped and resumed many times.
+		const age = formatElapsed(now - device.createdMs);
+		const uptime = device.runningSinceMs
+			? formatElapsed(now - device.runningSinceMs)
+			: "-";
+		const parked = device.parkedAtMs
+			? formatElapsed(now - device.parkedAtMs)
+			: "-";
 		const teardown = this.formatTeardownState(
 			store.getPendingTeardown(device.issueKey),
 		);
-		return `${device.issueKey.padEnd(w.issueKey)} ${device.provider.padEnd(w.provider)} ${email.padEnd(w.email)} ${lastRouted.padEnd(w.lastRouted)} ${lastSeen.padEnd(w.lastSeen)} ${teardown}`;
+		return `${device.issueKey.padEnd(w.issueKey)} ${device.provider.padEnd(w.provider)} ${email.padEnd(w.email)} ${lastRouted.padEnd(w.lastRouted)} ${lastSeen.padEnd(w.lastSeen)} ${age.padEnd(w.age)} ${uptime.padEnd(w.uptime)} ${parked.padEnd(w.parked)} ${teardown}`;
 	}
 
 	/**

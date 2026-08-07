@@ -2,6 +2,7 @@ import type {
 	ContainerExecutor,
 	ContainerStatus,
 	IssueExecutionContext,
+	ManagedContainerState,
 } from "../types.js";
 import type {
 	AcaDiskImage,
@@ -787,6 +788,47 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 					.filter((k) => k.length > 0),
 			),
 		];
+	}
+
+	/**
+	 * Every managed sandbox's issue key AND state from the SAME single
+	 * label-filtered `listSandboxes` call {@link listManaged} makes.
+	 *
+	 * This is what lets the 60s lifecycle sweep emit a per-sandbox gauge for a
+	 * fleet of N sandboxes at a cost of one ARM request per tick instead of N.
+	 *
+	 * An issue with several sandboxes (mid-replacement, or a stale-disk sandbox
+	 * awaiting deletion) collapses to one row ranked exactly the way
+	 * {@link ensureRunningLocked} ranks them, so the gauge reports the sandbox
+	 * the router would actually retain. As in {@link status}, `Running` here is
+	 * INFRASTRUCTURE state — the caller must combine it with device
+	 * connectivity before concluding the worker is alive.
+	 */
+	async listStates(): Promise<ManagedContainerState[]> {
+		const list = await this.client.listSandboxes({ [LABEL_MANAGED]: "true" });
+		const byIssue = new Map<string, AcaSandbox[]>();
+		for (const sandbox of list) {
+			const issueKey = sandbox.labels?.[LABEL_ISSUE];
+			if (!issueKey) continue;
+			const group = byIssue.get(issueKey);
+			if (group) group.push(sandbox);
+			else byIssue.set(issueKey, [sandbox]);
+		}
+		return [...byIssue].map(([issueKey, group]) => {
+			// Same ordering `ensureRunningLocked` uses to pick which sandbox it
+			// retains, so the gauge reports the one the router considers current.
+			const [current] = group.sort(
+				(a, b) =>
+					this.sandboxRank(a) - this.sandboxRank(b) || a.id.localeCompare(b.id),
+			);
+			const state = current?.state ?? "";
+			return {
+				issueKey,
+				status:
+					state === "Running" ? ("running" as const) : ("stopped" as const),
+				providerState: state,
+			};
+		});
 	}
 
 	/**

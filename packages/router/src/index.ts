@@ -62,6 +62,16 @@ export {
 	type SessionInfo,
 } from "./RouterStore.js";
 export {
+	emitSandboxEvent,
+	emitSandboxGauge,
+	SANDBOX_EVENTS,
+	type SandboxDestroyReason,
+	type SandboxEventName,
+	type SandboxGaugeSample,
+	type SandboxGaugeState,
+	type SandboxIdentity,
+} from "./SandboxTelemetry.js";
+export {
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	FileSecretStore,
 	isReservedEnvKey,
