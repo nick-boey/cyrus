@@ -560,6 +560,50 @@ describe("AcaSandboxClient request deadline", () => {
 		expect(calls[0]?.init?.signal).toBeUndefined();
 	});
 
+	// WAG-10 / WAG-14 (2026-08-06): snapshot/suspend/resume move the sandbox's
+	// whole memory + disk image, not just control-plane metadata. Measured on a
+	// live 4 vCPU / 8 GiB sandbox with an 18.4 GB image: snapshot 3m52s, stop
+	// 4m09s, both 200. Under the shared 120s deadline both aborted mid-flight
+	// while ACA completed them anyway, so `stop()` could never suspend a large
+	// sandbox and the 60s sweep re-failed forever.
+	it.each([
+		[
+			"createSnapshot",
+			(c: ReturnType<typeof client>) => c.createSnapshot("sb-1"),
+		],
+		["stopSandbox", (c: ReturnType<typeof client>) => c.stopSandbox("sb-1")],
+		[
+			"resumeSandbox",
+			(c: ReturnType<typeof client>) => c.resumeSandbox("sb-1"),
+		],
+	] as const)(
+		"does not abort %s at the short control-plane deadline",
+		async (_name, call) => {
+			let seen: AbortSignal | undefined;
+			const slowFetch = (async (
+				_url: RequestInfo | URL,
+				init?: RequestInit,
+			) => {
+				seen = init?.signal ?? undefined;
+				// Well past the 120s control-plane deadline, well inside the slow one.
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				if (seen?.aborted) throw new Error("aborted too early");
+				return res(200, {}).clone();
+			}) as typeof fetch;
+			const c = client({ fetchFn: slowFetch, requestTimeoutMs: 10 });
+			await expect(call(c)).resolves.not.toThrow();
+			expect(seen).toBeInstanceOf(AbortSignal);
+			expect(seen?.aborted).toBe(false);
+		},
+	);
+
+	it("still honours a disabled deadline on the slow operations", async () => {
+		const { fetch, calls } = fakeFetch([res(200, {})]);
+		const c = client({ fetchFn: fetch, requestTimeoutMs: 0 });
+		await c.stopSandbox("sb-1");
+		expect(calls[0]?.init?.signal).toBeUndefined();
+	});
+
 	it("aborts a request that outlives its deadline", async () => {
 		// A genuinely hung data plane: the fetch only settles because the signal
 		// fires, which is the whole point.

@@ -460,6 +460,23 @@ The agent automatically moves issues to the "started" state when assigned. Linea
    - ACA sandboxes use server-assigned GUIDs; issue identity is labels-only (`cyrus.issue`, `cyrus.device-id`, `cyrus.disk`). The ARM sandbox-group body is `properties: {}` and has no `maxSandboxCount` or default CPU/memory/disk fields. Per-sandbox create config is the source of truth.
    - ACA `Running` is infrastructure state, not worker-process liveness: an exited entrypoint can leave `tini` and the sandbox Running. Reconciliation must include router device/WSS heartbeat state. This applies to `resumeSandbox` too — `AcaSandboxesProvider` polls the router's `deviceConnectivity` seam after a resume (`resumeConnectTimeoutMs`, default 90s) and replaces a sandbox whose worker never rejoins, rather than reporting success on infrastructure state alone.
    - Suspend delivers no SIGTERM. Keep ACA auto-suspend disabled and let the affinity-aware router idle sweep stop workers. Explicit snapshots preserve env/device tokens, require lineage checks, and are never garbage-collected by Azure.
+   - `ContainerLifecycle.sweep()` is **non-reentrant by contract** — a tick still
+     running makes the next one a logged no-op. `RouterServer` fires it on a bare
+     60s `setInterval` and the loop is sequential, so without that guard a single
+     slow `executor.stop()` makes ticks overlap, and each overlapping tick queues
+     another `stop()` on `AcaSandboxesProvider`'s unbounded per-issue FIFO lock.
+     The queue then grows faster than it drains and `TerminalTeardown`'s
+     `destroy()` — same lock — is starved indefinitely. Never "fix" a slow sweep
+     by letting ticks run concurrently.
+   - Snapshot/suspend/resume move the sandbox's whole memory + disk image and are
+     **not** control-plane calls: measured 3m52s (snapshot) and 4m09s (stop) on an
+     18.4 GB sandbox. They use `SLOW_OPERATION_TIMEOUT_MS`, not the 120s
+     `DEFAULT_REQUEST_TIMEOUT_MS`; a call that aborts client-side still completes
+     server-side, so a too-tight deadline yields permanent retry loops rather than
+     a clean failure. Relatedly, `stop()` treats the snapshot as **best-effort** —
+     it is a cold-path optimisation (a Suspended sandbox resumes from its own
+     frozen memory; a snapshot is only consulted when the sandbox is ABSENT), so
+     it must never be able to veto the suspend and leave a sandbox billing.
    - A memory suspend also **freezes every JavaScript timer** in the sandbox, so any device-side liveness check must compare **wall-clock** time (`Date.now()`), never accumulated timer ticks — a tick-counting check sees no gap after resume. `RouterConnection`'s watchdog terminates its socket after `MAX_MISSED_HEARTBEATS` × the router's advertised `heartbeatMs` of inbound silence (both constants live in `cyrus-router-protocol`; the router advertises its real cadence in `hello_ack`). Derive new liveness deadlines from those constants rather than hardcoding a number.
    - Azure router hosting must remain one replica. SQLite stays on ephemeral local storage and is periodically backed up to Blob; Azure Files is for artifact bundles, not SQLite WAL. Blob restores are at-least-once within the backup interval, and overlapping revision uploads can be out of order.
    - `containers.keyVaultUrl` selects the Key Vault secret backend. Rotated per-user values reach only create-from-image; destroy and re-prompt existing issues to apply them. Entra enrollment uses one app registration/audience per router deployment.
