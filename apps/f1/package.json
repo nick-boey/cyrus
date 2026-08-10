@@ -40,7 +40,7 @@
 		"cyrus-router": "workspace:*",
 		"cyrus-router-executors": "workspace:*",
 		"cyrus-slack-event-transport": "workspace:*",
-		"fastify": "^5.10.0"
+		"fastify": "^5.11.2"
 	},
 	"devDependencies": {
 		"@types/node": "^20.19.43",
