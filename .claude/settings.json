@@ -1,3 +1,6 @@
 {
-	"includeCoAuthoredBy": false
+	"includeCoAuthoredBy": false,
+	"enabledPlugins": {
+		"mattpocock-skills@claude-plugins-official": true
+	}
 }
