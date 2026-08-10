@@ -112,6 +112,39 @@ describe("GitService.captureWipSnapshot", () => {
 		);
 	});
 
+	it("captures on a machine with no git identity configured, stamping its own", async () => {
+		// Reproduces a fresh container (and every CI runner): no user.name or
+		// user.email anywhere. `git commit-tree` hard-fails on that unless the
+		// identity is supplied per-invocation, which would take the persistence
+		// floor down precisely where it holds the only copy of the work.
+		// Pointing the config paths at files that do not exist makes git read
+		// them as empty, without touching the developer's real config.
+		const { GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM } = process.env;
+		const noSuchConfig = join(tmpdir(), "cyrus-absent-gitconfig");
+		process.env.GIT_CONFIG_GLOBAL = noSuchConfig;
+		process.env.GIT_CONFIG_SYSTEM = noSuchConfig;
+		try {
+			const { origin, clone } = makeDirtyIssueWorkspace();
+			// Proves the neutralisation above actually took, so this test cannot
+			// quietly pass just because the developer's global config applied.
+			expect(
+				gitOut(clone, ["config", "--default", "", "--get", "user.email"]),
+			).toBe("");
+
+			const result = await newService().captureWipSnapshot(clone, BRANCH);
+
+			expect(result.status).toBe("captured");
+			const snapshot = gitOut(origin, `rev-parse ${wipSnapshotRef(BRANCH)}`);
+			expect(gitOut(origin, `log -1 --format=%an ${snapshot}`)).toBe("Cyrus");
+		} finally {
+			// Assigning `undefined` would set the literal string "undefined".
+			if (GIT_CONFIG_GLOBAL === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+			else process.env.GIT_CONFIG_GLOBAL = GIT_CONFIG_GLOBAL;
+			if (GIT_CONFIG_SYSTEM === undefined) delete process.env.GIT_CONFIG_SYSTEM;
+			else process.env.GIT_CONFIG_SYSTEM = GIT_CONFIG_SYSTEM;
+		}
+	});
+
 	it("excludes .gitignore'd files", async () => {
 		const { origin, clone } = makeDirtyIssueWorkspace();
 		await newService().captureWipSnapshot(clone, BRANCH);

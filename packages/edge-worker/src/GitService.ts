@@ -138,6 +138,26 @@ export function wipSnapshotRef(branchName: string): string {
  */
 const WIP_SNAPSHOT_MESSAGE = "cyrus: WIP snapshot";
 
+/**
+ * Identity stamped on snapshot commits, passed per-invocation rather than read
+ * from git config. Two reasons, and the first is the load-bearing one:
+ *
+ *  - `git commit-tree` hard-fails with "Author identity unknown" when neither
+ *    `user.name`/`user.email` nor the equivalent env vars are set. The floor
+ *    runs unattended in freshly-created containers, where nothing has
+ *    configured a git identity yet — so inheriting the ambient one makes the
+ *    persistence floor fail exactly where it is the only copy of the work.
+ *  - A snapshot is machine-authored and never merged. Attributing it to
+ *    whichever human the worktree happens to be configured as would be a lie
+ *    in `git log refs/cyrus-wip/<branch>`.
+ */
+const WIP_SNAPSHOT_IDENTITY = {
+	GIT_AUTHOR_NAME: "Cyrus",
+	GIT_AUTHOR_EMAIL: "cyrus@ceedar.ai",
+	GIT_COMMITTER_NAME: "Cyrus",
+	GIT_COMMITTER_EMAIL: "cyrus@ceedar.ai",
+};
+
 /** Outcome of {@link GitService.captureWipSnapshot}. */
 export type WipSnapshotCaptureResult =
 	| { status: "captured"; commit: string }
@@ -435,6 +455,7 @@ export class GitService {
 			await git(
 				["commit-tree", tree, "-p", head, "-m", WIP_SNAPSHOT_MESSAGE],
 				30_000,
+				WIP_SNAPSHOT_IDENTITY,
 			)
 		).stdout.trim();
 
