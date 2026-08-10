@@ -13,8 +13,9 @@ export const releasePackages = [
 		directory: "packages/cloudflare-tunnel-client",
 		name: "cyrus-cloudflare-tunnel-client",
 	},
-	{ directory: "packages/mcp-tools", name: "cyrus-mcp-tools" },
+	// core precedes mcp-tools: mcp-tools depends on it.
 	{ directory: "packages/core", name: "cyrus-core" },
+	{ directory: "packages/mcp-tools", name: "cyrus-mcp-tools" },
 	{ directory: "packages/claude-runner", name: "cyrus-claude-runner" },
 	{ directory: "packages/config-updater", name: "cyrus-config-updater" },
 	{
@@ -40,6 +41,14 @@ export const releasePackages = [
 	{ directory: "packages/codex-runner", name: "cyrus-codex-runner" },
 	{ directory: "packages/cursor-runner", name: "cyrus-cursor-runner" },
 	{ directory: "packages/gemini-runner", name: "cyrus-gemini-runner" },
+	// Router mode. Ordered among themselves as well as ahead of their
+	// consumers: edge-worker depends on router-client and workspace-sync, and
+	// apps/cli on router and workspace-sync.
+	{ directory: "packages/router-protocol", name: "cyrus-router-protocol" },
+	{ directory: "packages/router-executors", name: "cyrus-router-executors" },
+	{ directory: "packages/workspace-sync", name: "cyrus-workspace-sync" },
+	{ directory: "packages/router-client", name: "cyrus-router-client" },
+	{ directory: "packages/router", name: "cyrus-router" },
 	{ directory: "packages/edge-worker", name: "cyrus-edge-worker" },
 	{ directory: "apps/cli", name: "cyrus-ai" },
 ];
