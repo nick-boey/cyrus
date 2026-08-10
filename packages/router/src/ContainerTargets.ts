@@ -1,6 +1,10 @@
+import { createHash } from "node:crypto";
 import type { ILogger } from "cyrus-core";
 import type { ExecutorRegistry } from "cyrus-router-executors";
-import { containerBootFailedMessage } from "./messages.js";
+import {
+	containerBootFailedMessage,
+	containerSecretsRotatedMessage,
+} from "./messages.js";
 import type {
 	RegisteredRepository,
 	RepositoryRegistry,
@@ -39,6 +43,34 @@ const ISSUE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
  * that hangs cannot permanently disable booting for a device.
  */
 const BOOT_JOIN_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Length of the secret fingerprint, in hex characters. ACA caps a label value
+ * at 63 characters, and the fingerprint shares that budget with nothing else, so
+ * this is chosen for legibility in `az` output rather than out of necessity — 64
+ * bits is far past what a same-user collision needs, and a collision's only
+ * consequence is failing to notice one rotation.
+ */
+const SECRETS_FINGERPRINT_HEX_CHARS = 16;
+
+/**
+ * Fingerprint of the secret bundle a container is running with, used by the ACA
+ * provider to notice that a container holds credentials the user has since
+ * rotated (see ADR 0002).
+ *
+ * Keys are sorted so the value depends on the bundle's content and not on the
+ * backend's iteration order, and both key and value are length-prefixed so
+ * `{A: "xy"}` and `{Ax: "y"}` cannot fingerprint alike.
+ */
+export function fingerprintSecrets(entries: [string, string][]): string {
+	const hash = createHash("sha256");
+	for (const [key, value] of [...entries].sort(([a], [b]) =>
+		a < b ? -1 : a > b ? 1 : 0,
+	)) {
+		hash.update(`${key.length}:${key}=${value.length}:${value};`);
+	}
+	return hash.digest("hex").slice(0, SECRETS_FINGERPRINT_HEX_CHARS);
+}
 
 /**
  * How many times one `bootStart` will wait on someone else's attempt before
@@ -422,7 +454,15 @@ export class ContainerTargetService {
 			if (!executor) {
 				throw new Error(`no executor configured for provider '${provider}'`);
 			}
-			const env = await this.buildEnv(userId, issueKey, notify?.workspaceId);
+			const { env, secretsFingerprint } = await this.buildEnv(
+				userId,
+				issueKey,
+				notify?.workspaceId,
+			);
+			// Set by the provider when it replaced the container because the stored
+			// credentials had been rotated. Captured here and posted after the boot
+			// settles, since the callback is synchronous.
+			let replacedReason: string | undefined;
 			// Both edges of the boot are logged deliberately. `ensureRunning`
 			// can take minutes (image pull, sandbox create), and for ACA it
 			// returning successfully only means the INFRASTRUCTURE came up — the
@@ -448,10 +488,40 @@ export class ContainerTargetService {
 				// baked-in device token no longer matches this row. Docker/Fly
 				// ignore this field.
 				deviceId: String(deviceId),
+				// Only a boot that has a session to serve checks the fingerprint. A
+				// `bootForTeardown()` wake exists solely to deliver a terminal
+				// webhook, so rebuilding its container from scratch moments before
+				// destroying it would cost a cold clone and a workspace rebuild for
+				// nothing. See ADR 0002 for the interleaving this accepts.
+				...(notify
+					? {
+							secretsFingerprint,
+							onReplaced: (reason: string) => {
+								replacedReason = reason;
+							},
+						}
+					: {}),
 			});
 			this.deps.logger.info(
 				`${provider} container for ${issueKey} (device ${deviceId}) reported running; waiting for the worker to connect`,
 			);
+			if (replacedReason && notify) {
+				try {
+					await this.deps.postActivity(
+						notify.workspaceId,
+						notify.sessionId,
+						containerSecretsRotatedMessage(issueKey),
+					);
+				} catch (postErr) {
+					// Same posture as the boot-failure notice below: a Linear 5xx must
+					// never turn a successful boot into a failed one. The replacement
+					// is already logged by the provider.
+					this.deps.logger.warn(
+						`Failed to post the credential-rotation notice for ${issueKey}`,
+						postErr,
+					);
+				}
+			}
 			// Starts the continuous-uptime clock, and only on the tick that
 			// actually transitioned this container to running — `ensureRunning`
 			// covers both a cold boot and a resume, and returns immediately for a
@@ -514,7 +584,7 @@ export class ContainerTargetService {
 		 * see that method's doc comment.
 		 */
 		workspaceId?: string,
-	): Promise<Record<string, string>> {
+	): Promise<{ env: Record<string, string>; secretsFingerprint: string }> {
 		const email = this.emailFor(userId);
 		// Additive: the container hard-requires the Claude token, so it is
 		// always required regardless of config; requiredSecretKeys adds to it.
@@ -544,6 +614,7 @@ export class ContainerTargetService {
 		// Spread the user's map, skipping reserved keys. `set` already rejects
 		// them; this is belt-and-braces against a hand-edited secrets file.
 		const bundle = await this.deps.secrets.get(email);
+		const applied: [string, string][] = [];
 		for (const [key, value] of Object.entries(bundle)) {
 			if (isReservedEnvKey(key)) {
 				this.deps.logger.warn(
@@ -552,8 +623,9 @@ export class ContainerTargetService {
 				continue;
 			}
 			env[key] = value;
+			applied.push([key, value]);
 		}
-		return env;
+		return { env, secretsFingerprint: fingerprintSecrets(applied) };
 	}
 
 	/**

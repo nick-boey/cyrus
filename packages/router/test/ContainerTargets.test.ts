@@ -10,8 +10,12 @@ import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import {
 	type ContainerRoutingDeps,
 	ContainerTargetService,
+	fingerprintSecrets,
 } from "../src/ContainerTargets.js";
-import { containerBootFailedMessage } from "../src/messages.js";
+import {
+	containerBootFailedMessage,
+	containerSecretsRotatedMessage,
+} from "../src/messages.js";
 import type {
 	RegisteredRepository,
 	RepositoryRegistry,
@@ -1121,6 +1125,156 @@ describe("ContainerTargetService", () => {
 					(r) => r.name,
 				),
 			).toEqual(["cyrus-web"]);
+		});
+	});
+
+	/** ADR 0002 — credential rotation replaces the container. */
+	describe("secrets fingerprint", () => {
+		function seedUser(): { userId: number; email: string } {
+			const email = "a@example.com";
+			const { userId } = store.addUser({ email });
+			store.setUserExecutor(email, '{"type":"docker"}');
+			secrets.set(email, "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			return { userId, email };
+		}
+
+		async function bootAndReadCtx(
+			service: ContainerTargetService,
+			docker: ReturnType<typeof fakeExecutor>,
+			deviceId: number,
+		): Promise<IssueExecutionContext> {
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() =>
+				expect(docker.ensureRunning).toHaveBeenCalledTimes(1),
+			);
+			return docker.ensureRunning.mock.calls[0]?.[0] as IssueExecutionContext;
+		}
+
+		it("changes the fingerprint it boots with when a stored secret is rotated", async () => {
+			const user = seedUser();
+			const docker1 = fakeExecutor("docker");
+			const svc1 = makeService(new Map([["docker", docker1]]));
+			const { deviceId } = svc1.ensureDevice(user, "CYPACK-1");
+			const before = await bootAndReadCtx(svc1, docker1, deviceId);
+
+			secrets.set(user.email, "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok-rotated");
+			const docker2 = fakeExecutor("docker");
+			const svc2 = makeService(new Map([["docker", docker2]]));
+			const after = await bootAndReadCtx(svc2, docker2, deviceId);
+
+			expect(before.secretsFingerprint).toBeTruthy();
+			expect(after.secretsFingerprint).toBeTruthy();
+			expect(after.secretsFingerprint).not.toBe(before.secretsFingerprint);
+		});
+
+		it("does not change the fingerprint when only the repository decision changes", async () => {
+			const user = seedUser();
+			const docker1 = fakeExecutor("docker");
+			const svc1 = makeService(new Map([["docker", docker1]]));
+			const { deviceId } = svc1.ensureDevice(user, "CYPACK-1");
+			const before = await bootAndReadCtx(svc1, docker1, deviceId);
+
+			// Repository routing lives in CYRUS_REPOS_JSON, deliberately outside the
+			// fingerprint: a registry edit must never start deleting live containers.
+			store.setIssueRepositories(
+				"CYPACK-1",
+				{
+					repoNames: ["cyrus-api"],
+					baseBranchOverrides: {},
+					method: "team-based",
+				},
+				1,
+			);
+			const docker2 = fakeExecutor("docker");
+			const svc2 = makeService(new Map([["docker", docker2]]));
+			const after = await bootAndReadCtx(svc2, docker2, deviceId);
+
+			expect(after.env.CYRUS_REPOS_JSON).not.toBe(before.env.CYRUS_REPOS_JSON);
+			expect(after.secretsFingerprint).toBe(before.secretsFingerprint);
+		});
+
+		it("sends no fingerprint on a teardown wake, so nothing is rebuilt to be destroyed", async () => {
+			const user = seedUser();
+			const docker = fakeExecutor("docker");
+			const service = makeService(new Map([["docker", docker]]));
+			const { deviceId } = service.ensureDevice(user, "CYPACK-1");
+
+			service.bootForTeardown(deviceId);
+			await vi.waitFor(() =>
+				expect(docker.ensureRunning).toHaveBeenCalledTimes(1),
+			);
+			const ctx = docker.ensureRunning.mock
+				.calls[0]?.[0] as IssueExecutionContext;
+
+			expect(ctx.secretsFingerprint).toBeUndefined();
+			expect(ctx.onReplaced).toBeUndefined();
+		});
+
+		it("tells the session when the provider rebuilt the container for a rotation", async () => {
+			const user = seedUser();
+			const docker = fakeExecutor("docker", {
+				ensureRunning: vi.fn(async (ctx: IssueExecutionContext) => {
+					ctx.onReplaced?.("secrets-rotated");
+				}),
+			});
+			const service = makeService(new Map([["docker", docker]]));
+			const { deviceId } = service.ensureDevice(user, "CYPACK-1");
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(postActivity).toHaveBeenCalledTimes(1));
+
+			expect(postActivity).toHaveBeenCalledWith(
+				"ws-1",
+				"sess-1",
+				containerSecretsRotatedMessage("CYPACK-1"),
+			);
+		});
+
+		it("posts nothing when the container was reused", async () => {
+			const user = seedUser();
+			const docker = fakeExecutor("docker");
+			const service = makeService(new Map([["docker", docker]]));
+			const { deviceId } = service.ensureDevice(user, "CYPACK-1");
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() =>
+				expect(docker.ensureRunning).toHaveBeenCalledTimes(1),
+			);
+
+			expect(postActivity).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("fingerprintSecrets", () => {
+		it("ignores key order", () => {
+			expect(
+				fingerprintSecrets([
+					["B", "2"],
+					["A", "1"],
+				]),
+			).toBe(
+				fingerprintSecrets([
+					["A", "1"],
+					["B", "2"],
+				]),
+			);
+		});
+
+		it("distinguishes a boundary shift between key and value", () => {
+			expect(fingerprintSecrets([["A", "xy"]])).not.toBe(
+				fingerprintSecrets([["Ax", "y"]]),
+			);
+		});
+
+		it("distinguishes an added key and a removed key", () => {
+			const one = fingerprintSecrets([["A", "1"]]);
+			expect(one).not.toBe(
+				fingerprintSecrets([
+					["A", "1"],
+					["B", "2"],
+				]),
+			);
+			expect(one).not.toBe(fingerprintSecrets([]));
 		});
 	});
 });

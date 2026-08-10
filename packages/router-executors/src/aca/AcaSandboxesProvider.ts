@@ -67,6 +67,16 @@ const LABEL_MANAGED = "cyrus.managed";
 const LABEL_ISSUE = "cyrus.issue";
 const LABEL_DISK = "cyrus.disk";
 const LABEL_DEVICE_ID = "cyrus.device-id";
+/**
+ * Fingerprint of the secret bundle a sandbox was created with — the second
+ * staleness key, alongside {@link LABEL_DISK}. A sandbox (or snapshot) whose
+ * value doesn't match the caller's `secretsFingerprint` was built with
+ * credentials the user has since rotated and is replaced rather than reused.
+ *
+ * Deliberately named `secrets`, not `env`: only the user's stored bundle is
+ * covered, never the router-controlled `CYRUS_*` vars. See ADR 0002.
+ */
+const LABEL_SECRETS = "cyrus.secrets";
 
 export interface AcaSnapshotGcItem {
 	id: string;
@@ -269,10 +279,12 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 		issueKey: string,
 		deviceId: string | undefined,
 		disk = this.disk,
+		secrets?: string,
 	): Record<string, string> {
 		validateLabelValue(LABEL_ISSUE, issueKey);
 		if (deviceId !== undefined) validateLabelValue(LABEL_DEVICE_ID, deviceId);
 		validateLabelValue(LABEL_DISK, disk);
+		if (secrets !== undefined) validateLabelValue(LABEL_SECRETS, secrets);
 		const labels: Record<string, string> = {
 			[LABEL_MANAGED]: "true",
 			[LABEL_ISSUE]: issueKey,
@@ -281,7 +293,25 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 		if (deviceId !== undefined) {
 			labels[LABEL_DEVICE_ID] = deviceId;
 		}
+		if (secrets !== undefined) {
+			labels[LABEL_SECRETS] = secrets;
+		}
 		return labels;
+	}
+
+	/**
+	 * Does this sandbox/snapshot's secret fingerprint still match what the
+	 * caller wants to run? An absent `secretsFingerprint` means the caller
+	 * opted out of the check (see {@link IssueExecutionContext}), so everything
+	 * matches. A sandbox with NO label — every sandbox predating this check —
+	 * matches nothing, exactly as a missing {@link LABEL_DISK} already behaves.
+	 */
+	private secretsMatch(
+		resource: { labels?: Record<string, string> },
+		secretsFingerprint: string | undefined,
+	): boolean {
+		if (secretsFingerprint === undefined) return true;
+		return (resource.labels?.[LABEL_SECRETS] ?? "") === secretsFingerprint;
 	}
 
 	/**
@@ -331,19 +361,36 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 	private async ensureRunningLocked(ctx: IssueExecutionContext): Promise<void> {
 		const deviceId = ctx.deviceId;
 		const existing = await this.listByIssue(ctx.issueKey);
+		const diskMatches = (sandbox: AcaSandbox) =>
+			(sandbox.labels?.[LABEL_DISK] ?? "") === this.disk;
 		const valid = existing
-			.filter((sandbox) => (sandbox.labels?.[LABEL_DISK] ?? "") === this.disk)
+			.filter(
+				(sandbox) =>
+					diskMatches(sandbox) &&
+					this.secretsMatch(sandbox, ctx.secretsFingerprint),
+			)
 			.sort(
 				(a, b) =>
 					this.sandboxRank(a) - this.sandboxRank(b) || a.id.localeCompare(b.id),
 			);
 		const retained = valid[0];
 		if (existing.length > 0) {
+			// A sandbox on the CURRENT disk image that still failed the filter can
+			// only have failed on its secret fingerprint — the user rotated a
+			// credential. Distinguished from a stale-image replacement because the
+			// router posts a Linear notice for this one and not for that one.
+			const staleSecrets = !retained && existing.some(diskMatches);
 			const replaceAll =
 				!retained ||
 				(retained.state === "Running" &&
 					this.shouldRecreateDisconnected(deviceId));
 			if (replaceAll) {
+				if (staleSecrets) {
+					this.logger.info(
+						`Replacing the ACA sandbox for ${ctx.issueKey}: it was created with credentials that have since been rotated`,
+					);
+					ctx.onReplaced?.("secrets-rotated");
+				}
 				await this.replaceSandboxes(ctx.issueKey, existing);
 			} else {
 				const current = retained;
@@ -376,12 +423,28 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 		const snap =
 			deviceId === undefined
 				? undefined
-				: await this.pickLineageSnapshot(ctx.issueKey, deviceId);
+				: await this.pickLineageSnapshot(
+						ctx.issueKey,
+						deviceId,
+						ctx.secretsFingerprint,
+					);
 		if (snap) {
 			await this.client.createSandbox({
 				snapshotId: snap.id,
 				lifecycle: this.lifecyclePolicy(),
-				labels: this.labels(ctx.issueKey, deviceId),
+				// The fingerprint is carried from the SNAPSHOT, not from `ctx`. The
+				// restored memory image holds the env the snapshot was taken with, so
+				// that is what the new sandbox is actually running; and a caller that
+				// opted out of the check (a teardown wake, `secretsFingerprint`
+				// undefined) must not erase a label the snapshot does carry, or the
+				// next ordinary boot would read the unlabelled sandbox as stale and
+				// replace it for nothing.
+				labels: this.labels(
+					ctx.issueKey,
+					deviceId,
+					this.disk,
+					snap.labels?.[LABEL_SECRETS] ?? ctx.secretsFingerprint,
+				),
 			});
 			// No re-mint: env/token inherited (spike S3b), AND the device-id
 			// label matches the live row (lineage filter above).
@@ -396,7 +459,12 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 				environment: { ...ctx.env, CYRUS_DEVICE_TOKEN: deviceToken },
 				resources: this.resources(),
 				lifecycle: this.lifecyclePolicy(),
-				labels: this.labels(ctx.issueKey, deviceId),
+				labels: this.labels(
+					ctx.issueKey,
+					deviceId,
+					this.disk,
+					ctx.secretsFingerprint,
+				),
 				egressPolicy: this.egressPolicy,
 			});
 		}
@@ -523,10 +591,16 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 	 * `cyrus.disk` label matches the current disk image. Returns
 	 * `undefined` when none matches — caller then creates-from-image and
 	 * re-mints. Only called when `ctx.deviceId` is defined (F2 guard).
+	 *
+	 * A snapshot restores the env it was taken with, so `secretsFingerprint`
+	 * filters here too: without it, deleting a sandbox by hand after rotating a
+	 * credential would put the superseded credential straight back from the
+	 * snapshot taken when the sandbox parked. That was the original bug.
 	 */
 	private async pickLineageSnapshot(
 		issueKey: string,
 		deviceId: string,
+		secretsFingerprint?: string,
 	): Promise<AcaSnapshot | undefined> {
 		const snaps = await this.client.listSnapshots({
 			[LABEL_MANAGED]: "true",
@@ -534,7 +608,9 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 			[LABEL_DEVICE_ID]: deviceId,
 		});
 		const matching = snaps.filter(
-			(s) => (s.labels?.[LABEL_DISK] ?? "") === this.disk,
+			(s) =>
+				(s.labels?.[LABEL_DISK] ?? "") === this.disk &&
+				this.secretsMatch(s, secretsFingerprint),
 		);
 		if (matching.length === 0) return undefined;
 		// Newest by createdAtUtc; a missing createdAtUtc falls back to `now`
@@ -700,6 +776,12 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 			for (const sandbox of running) {
 				const deviceId = sandbox.labels?.[LABEL_DEVICE_ID];
 				const disk = sandbox.labels?.[LABEL_DISK];
+				// Read off the SANDBOX, never recomputed: `stop()` takes only an
+				// issue key and has no access to the user's current bundle, and the
+				// snapshot captures a memory image holding the env this sandbox was
+				// created with. Stamping anything else would mint a snapshot that
+				// lies about which credentials it restores.
+				const secrets = sandbox.labels?.[LABEL_SECRETS];
 				// The snapshot is a COLD-path optimisation, never a precondition of
 				// the suspend: a Suspended sandbox resumes from its own frozen
 				// memory, and `ensureRunning` reaches for a snapshot only when the
@@ -709,17 +791,28 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 				// request deadline, so `stop()` threw before ever suspending and the
 				// 4 vCPU sandbox stayed Running while every 60s sweep tick re-failed
 				// the same way (WAG-10 / WAG-14, 2026-08-06). Park it regardless.
-				if (deviceId && disk) {
+				if (deviceId && disk && secrets) {
 					await this.client
-						.createSnapshot(sandbox.id, this.labels(issueKey, deviceId, disk))
+						.createSnapshot(
+							sandbox.id,
+							this.labels(issueKey, deviceId, disk, secrets),
+						)
 						.catch((error: unknown) => {
 							this.logger.warn(
 								`could not snapshot ACA sandbox ${sandbox.id} for ${issueKey}; suspending without one (a later cold start rebuilds from the artifact bundle): ${String(error)}`,
 							);
 						});
 				} else {
+					// A sandbox predating the secrets label parks without a snapshot
+					// rather than minting an unlabelled one, which the lineage filter
+					// would reject anyway.
+					const missing = !deviceId
+						? LABEL_DEVICE_ID
+						: !disk
+							? LABEL_DISK
+							: LABEL_SECRETS;
 					this.logger.warn(
-						`ACA sandbox ${sandbox.id} for ${issueKey} is missing its ${!deviceId ? LABEL_DEVICE_ID : LABEL_DISK} label; suspending without a snapshot`,
+						`ACA sandbox ${sandbox.id} for ${issueKey} is missing its ${missing} label; suspending without a snapshot`,
 					);
 				}
 				await this.client.stopSandbox(sandbox.id).catch((error: unknown) => {

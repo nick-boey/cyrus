@@ -88,6 +88,22 @@ export function containerBootFailedMessage(
 }
 
 /**
+ * Posted when a container was rebuilt because the credentials it was created
+ * with have since been rotated (ADR 0002). Azure Container Apps cannot change a
+ * live sandbox's environment, so a rotation can only take effect by replacing
+ * the container — which is silent from the issue's point of view unless we say
+ * so, since the visible symptom is a session that suddenly took minutes to start.
+ *
+ * Templated with `{{issueKey}}` — render with {@link fillTemplate}.
+ */
+export const CONTAINER_SECRETS_ROTATED_MESSAGE =
+	"Your stored credentials changed since this issue's container was built, so I rebuilt it to pick them up. Uncommitted work was restored from {{issueKey}}'s WIP snapshot, so nothing is lost — this session just took longer to start than usual.";
+
+export function containerSecretsRotatedMessage(issueKey: string): string {
+	return fillTemplate(CONTAINER_SECRETS_ROTATED_MESSAGE, { issueKey });
+}
+
+/**
  * Posted when a device reconnects and no longer tracks a session whose issue
  * lock it still held — i.e. the device lost the session (typically to a
  * corrupted state file) and can never report it terminal. Releasing the lock

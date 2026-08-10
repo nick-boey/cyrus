@@ -127,12 +127,21 @@ interface SnapshotGcItem {
 	createdAtUtc?: string;
 }
 
-interface SnapshotGcProvider {
+/**
+ * The slice of the ACA provider the out-of-process CLI drives directly: snapshot
+ * GC, and the real resource teardown behind `containers destroy`.
+ *
+ * `destroy` is optional so a test double supplying only the GC methods still
+ * satisfies it; callers check for it before use, the same way
+ * {@link RouterCommand.containersGcSnapshots} checks `gcOrphanSnapshots`.
+ */
+interface AcaMaintenanceProvider {
 	planOrphanSnapshots(activeIssueKeys: string[]): Promise<SnapshotGcItem[]>;
 	gcOrphanSnapshots(
 		activeIssueKeys: string[],
 		printedPlan?: SnapshotGcItem[],
 	): Promise<SnapshotGcItem[]>;
+	destroy?(issueKey: string): Promise<void>;
 }
 
 /**
@@ -1526,9 +1535,14 @@ export class RouterCommand extends BaseCommand {
 		}
 	}
 
+	/**
+	 * Name kept for the snapshot-GC path that first needed it; this is also the
+	 * seam `containers destroy` uses to reach the real provider. Overridden in
+	 * tests, so renaming it would silently send them at live Azure.
+	 */
 	protected createAcaSnapshotGcProvider(
 		containers: RouterServerConfig["containers"],
-	): SnapshotGcProvider | undefined {
+	): AcaMaintenanceProvider | undefined {
 		return containers
 			? createAcaSandboxesProvider(containers, this.logger)
 			: undefined;
@@ -1681,7 +1695,21 @@ export class RouterCommand extends BaseCommand {
 	 * running router, the next time it runs, since this CLI process doesn't
 	 * hold a reference to the executor that created it.
 	 */
-	private containersDestroy(issueKey: string | undefined): void {
+	/**
+	 * Destroys the issue's container FOR REAL — provider resources first, then the
+	 * device row.
+	 *
+	 * The ordering is load-bearing. This used to delete only the row and promise
+	 * that "provider resources will be garbage-collected as orphans on the
+	 * router's next sweep", which made it useless as the manual escape hatch it
+	 * looks like: the sandbox survived, and because sandboxes are found by their
+	 * `cyrus.issue` label rather than by device id, the next routed event adopted
+	 * the orphan — still holding whatever credentials it was created with. That is
+	 * the operator-facing half of the bug ADR 0002 fixes. Deleting the row only
+	 * after the provider call succeeds keeps the row as the retry handle when the
+	 * call fails, matching `AcaSandboxesProvider.destroy`'s own posture.
+	 */
+	private async containersDestroy(issueKey: string | undefined): Promise<void> {
 		if (!issueKey) {
 			this.exitWithError("Usage: cyrus router containers destroy <issueKey>");
 		}
@@ -1691,11 +1719,28 @@ export class RouterCommand extends BaseCommand {
 			if (!device) {
 				this.exitWithError(`No container device for issue ${issueKey}`);
 			}
+			if (device.provider === "aca") {
+				const provider = this.createAcaSnapshotGcProvider(
+					this.readRouterConfig()?.containers,
+				);
+				if (!provider || typeof provider.destroy !== "function") {
+					this.exitWithError(
+						`Cannot destroy ${issueKey}'s sandbox: containers.aca is missing from router-config.json. Add it, or delete the sandbox and its snapshots in Azure before removing the device row.`,
+					);
+				}
+				await provider.destroy(issueKey);
+				this.logSuccess(
+					`Destroyed the ACA sandbox and its snapshots for ${issueKey}.`,
+				);
+			} else {
+				// Docker/Fly are not reachable from this process; be explicit rather
+				// than implying the row deletion cleaned them up.
+				this.logger.warn(
+					`Provider '${device.provider}' resources are not destroyed by this command. The router's lifecycle sweep will reap them as orphans once the device row is gone.`,
+				);
+			}
 			store.deleteContainerDevice(device.deviceId);
 			this.logSuccess(`Destroyed container device for ${issueKey}.`);
-			this.logger.raw(
-				"Provider resources will be garbage-collected as orphans on the router's next sweep.",
-			);
 		} finally {
 			store.close();
 		}

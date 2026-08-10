@@ -75,11 +75,17 @@ class StubSnapshotGcRouterCommand extends RouterCommand {
 			{ id: "snap-orphan", issueKey: "OLD-1", deviceId: "device-old" },
 		],
 	);
+	/** Set to reject to exercise `containers destroy`'s retry-handle posture. */
+	public destroyError: unknown;
+	public readonly destroy = vi.fn(async (_issueKey: string) => {
+		if (this.destroyError) throw this.destroyError;
+	});
 	protected createAcaSnapshotGcProvider(containers: unknown) {
 		this.containersConfig = containers;
 		return {
 			planOrphanSnapshots: this.plan,
 			gcOrphanSnapshots: this.gc,
+			destroy: this.destroy,
 		};
 	}
 }
@@ -1480,7 +1486,7 @@ describe("RouterCommand", () => {
 	});
 
 	describe("containers destroy", () => {
-		it("deletes the device row and prints the orphan-GC reminder", async () => {
+		it("says plainly that a docker container is left to the orphan sweep", async () => {
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);
 			await command.execute(["users", "add", "kate@example.com"]);
@@ -1492,8 +1498,11 @@ describe("RouterCommand", () => {
 
 			await command.execute(["containers", "destroy", "CYPACK-10"]);
 
-			expect(printedStdout()).toContain(
-				"Provider resources will be garbage-collected as orphans on the router's next sweep.",
+			const warnings = (app.logger.warn as ReturnType<typeof vi.fn>).mock.calls
+				.map((call) => String(call[0]))
+				.join("\n");
+			expect(warnings).toContain(
+				"Provider 'docker' resources are not destroyed by this command",
 			);
 
 			const verifyStore = new RouterStore(dbPath());
@@ -1501,6 +1510,59 @@ describe("RouterCommand", () => {
 				expect(
 					verifyStore.getContainerDeviceForIssue("CYPACK-10"),
 				).toBeUndefined();
+			} finally {
+				verifyStore.close();
+			}
+		});
+
+		// Before ADR 0002 this command deleted only the device row, leaving the
+		// sandbox running. Because sandboxes are found by their `cyrus.issue` label,
+		// the next routed event then adopted the orphan — still holding the
+		// credentials it was created with, which is exactly what made rotating a
+		// token by hand appear to do nothing.
+		it("destroys the ACA sandbox and its snapshots before dropping the row", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new StubSnapshotGcRouterCommand(app as any);
+			await command.execute(["users", "add", "kate@example.com"]);
+
+			const seedStore = new RouterStore(dbPath());
+			const user = seedStore.findUserForCreator({ email: "kate@example.com" });
+			seedStore.createContainerDevice(user!.userId, "CYPACK-12", "aca");
+			seedStore.close();
+
+			await command.execute(["containers", "destroy", "CYPACK-12"]);
+
+			expect(command.destroy).toHaveBeenCalledWith("CYPACK-12");
+			const verifyStore = new RouterStore(dbPath());
+			try {
+				expect(
+					verifyStore.getContainerDeviceForIssue("CYPACK-12"),
+				).toBeUndefined();
+			} finally {
+				verifyStore.close();
+			}
+		});
+
+		it("keeps the device row when the provider teardown fails, as the retry handle", async () => {
+			const app = createMockApp(cyrusHome);
+			const command = new StubSnapshotGcRouterCommand(app as any);
+			command.destroyError = new Error("ARM 503");
+			await command.execute(["users", "add", "kate@example.com"]);
+
+			const seedStore = new RouterStore(dbPath());
+			const user = seedStore.findUserForCreator({ email: "kate@example.com" });
+			seedStore.createContainerDevice(user!.userId, "CYPACK-13", "aca");
+			seedStore.close();
+
+			await expect(
+				command.execute(["containers", "destroy", "CYPACK-13"]),
+			).rejects.toThrow("ARM 503");
+
+			const verifyStore = new RouterStore(dbPath());
+			try {
+				expect(
+					verifyStore.getContainerDeviceForIssue("CYPACK-13"),
+				).toBeDefined();
 			} finally {
 				verifyStore.close();
 			}

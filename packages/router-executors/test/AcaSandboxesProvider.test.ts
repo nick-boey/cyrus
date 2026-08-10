@@ -215,12 +215,16 @@ function ctx(
 		env: Record<string, string>;
 		mintDeviceToken: () => string;
 		deviceId: string | undefined;
+		secretsFingerprint: string | undefined;
+		onReplaced: (reason: string) => void;
 	}> = {},
 ): {
 	issueKey: string;
 	env: Record<string, string>;
 	mintDeviceToken: () => string;
 	deviceId?: string;
+	secretsFingerprint?: string;
+	onReplaced?: (reason: string) => void;
 } {
 	let mintCount = 0;
 	return {
@@ -233,6 +237,8 @@ function ctx(
 				return `tok-${mintCount}`;
 			}),
 		deviceId: overrides.deviceId,
+		secretsFingerprint: overrides.secretsFingerprint,
+		onReplaced: overrides.onReplaced,
 	};
 }
 
@@ -248,6 +254,10 @@ function sb(
 			"cyrus.managed": "true",
 			"cyrus.issue": issueKey,
 			"cyrus.disk": "disk-v1",
+			// Every sandbox created since ADR 0002 carries a secrets fingerprint, so
+			// it belongs in the default fixture. Tests about a sandbox that PREDATES
+			// the label build their fixture inline rather than through this helper.
+			"cyrus.secrets": "fp1",
 			...(overLabels ?? {}),
 		},
 		...rest,
@@ -1149,6 +1159,7 @@ describe("AcaSandboxesProvider", () => {
 						"cyrus.issue": "CYPACK-1",
 						"cyrus.disk": "disk-v1",
 						"cyrus.device-id": "dev-1",
+						"cyrus.secrets": "fp1",
 					},
 				},
 			]);
@@ -1706,6 +1717,244 @@ describe("AcaSandboxesProvider", () => {
 				p.ensureRunning(ctx({ issueKey: longKey, deviceId: "dev-1" })),
 			).rejects.toThrow("cyrus.issue must be at most 63 characters");
 			expect(calls.listSandboxes).toHaveLength(0);
+		});
+	});
+
+	/**
+	 * ADR 0002. ACA cannot change a live sandbox's environment, so a rotated
+	 * credential only reaches a container by replacing it. Every one of these
+	 * cases was a path that previously resurrected the superseded credential.
+	 */
+	describe("secrets fingerprint staleness", () => {
+		const provider = (client: AcaSandboxClient) =>
+			new AcaSandboxesProvider({ client, image: "img:1", disk: "disk-v1" });
+
+		it("replaces a Running sandbox whose fingerprint no longer matches, and reports why", async () => {
+			const { client, calls } = fakeClient({
+				sandboxByIssue: new Map([
+					[
+						"CYPACK-1",
+						sb("CYPACK-1", {
+							id: "sb-old",
+							state: "Running",
+							labels: { "cyrus.device-id": "dev-1", "cyrus.secrets": "oldfp" },
+						}),
+					],
+				]),
+				diskImages: [{ name: "disk-v1" }],
+			});
+			const reasons: string[] = [];
+			await provider(client).ensureRunning(
+				ctx({
+					deviceId: "dev-1",
+					secretsFingerprint: "newfp",
+					env: { CLAUDE_CODE_OAUTH_TOKEN: "rotated" },
+					onReplaced: (reason) => reasons.push(reason),
+				}),
+			);
+
+			expect(reasons).toEqual(["secrets-rotated"]);
+			expect(calls.deleteSandbox).toContain("sb-old");
+			expect(calls.createSandbox).toHaveLength(1);
+			expect(calls.createSandbox[0]?.diskImageName).toBe("disk-v1");
+			expect(calls.createSandbox[0]?.environment?.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+				"rotated",
+			);
+			expect(calls.createSandbox[0]?.labels?.["cyrus.secrets"]).toBe("newfp");
+		});
+
+		it("replaces a Suspended sandbox rather than resuming it into the old env", async () => {
+			const { client, calls } = fakeClient({
+				sandboxByIssue: new Map([
+					[
+						"CYPACK-1",
+						sb("CYPACK-1", {
+							id: "sb-old",
+							state: "Suspended",
+							labels: { "cyrus.device-id": "dev-1", "cyrus.secrets": "oldfp" },
+						}),
+					],
+				]),
+				diskImages: [{ name: "disk-v1" }],
+			});
+			await provider(client).ensureRunning(
+				ctx({ deviceId: "dev-1", secretsFingerprint: "newfp" }),
+			);
+
+			expect(calls.resumeSandbox).toHaveLength(0);
+			expect(calls.deleteSandbox).toContain("sb-old");
+			expect(calls.createSandbox).toHaveLength(1);
+			expect(calls.createSandbox[0]?.snapshotId).toBeUndefined();
+		});
+
+		it("refuses a lineage snapshot carrying superseded credentials — the reported bug", async () => {
+			const { client, calls } = fakeClient({
+				snapshotsByLabels: [
+					snap({ id: "snap-old", labels: { "cyrus.secrets": "oldfp" } }),
+				],
+				diskImages: [{ name: "disk-v1" }],
+			});
+			const reasons: string[] = [];
+			await provider(client).ensureRunning(
+				ctx({
+					deviceId: "dev-1",
+					secretsFingerprint: "newfp",
+					env: { CLAUDE_CODE_OAUTH_TOKEN: "rotated" },
+					onReplaced: (reason) => reasons.push(reason),
+				}),
+			);
+
+			expect(calls.createSandbox).toHaveLength(1);
+			expect(calls.createSandbox[0]?.snapshotId).toBeUndefined();
+			expect(calls.createSandbox[0]?.diskImageName).toBe("disk-v1");
+			expect(calls.createSandbox[0]?.environment?.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+				"rotated",
+			);
+			expect(calls.deleteSnapshot).toContain("snap-old");
+			// No sandbox existed, so nothing was "replaced" from the user's view.
+			expect(reasons).toEqual([]);
+		});
+
+		it("treats a sandbox with no fingerprint label as stale", async () => {
+			const { client, calls } = fakeClient({
+				sandboxByIssue: new Map([
+					[
+						"CYPACK-1",
+						// Built inline, not via sb(): this is a sandbox from BEFORE the
+						// label existed, which is what every sandbox alive at rollout was.
+						{
+							id: "sb-unlabelled",
+							state: "Running",
+							labels: {
+								"cyrus.managed": "true",
+								"cyrus.issue": "CYPACK-1",
+								"cyrus.disk": "disk-v1",
+								"cyrus.device-id": "dev-1",
+							},
+						},
+					],
+				]),
+				diskImages: [{ name: "disk-v1" }],
+			});
+			const reasons: string[] = [];
+			await provider(client).ensureRunning(
+				ctx({
+					deviceId: "dev-1",
+					secretsFingerprint: "newfp",
+					onReplaced: (reason) => reasons.push(reason),
+				}),
+			);
+
+			expect(reasons).toEqual(["secrets-rotated"]);
+			expect(calls.deleteSandbox).toContain("sb-unlabelled");
+		});
+
+		it("leaves a matching sandbox alone — the resume path is untouched", async () => {
+			const { client, calls } = fakeClient({
+				sandboxByIssue: new Map([
+					[
+						"CYPACK-1",
+						sb("CYPACK-1", {
+							id: "sb-warm",
+							state: "Suspended",
+							labels: { "cyrus.device-id": "dev-1", "cyrus.secrets": "fp1" },
+						}),
+					],
+				]),
+			});
+			const reasons: string[] = [];
+			await provider(client).ensureRunning(
+				ctx({
+					deviceId: "dev-1",
+					secretsFingerprint: "fp1",
+					onReplaced: (reason) => reasons.push(reason),
+				}),
+			);
+
+			expect(calls.resumeSandbox).toEqual(["sb-warm"]);
+			expect(calls.deleteSandbox).toHaveLength(0);
+			expect(calls.createSandbox).toHaveLength(0);
+			expect(reasons).toEqual([]);
+		});
+
+		it("skips the check entirely when no fingerprint is supplied (teardown wake)", async () => {
+			const { client, calls } = fakeClient({
+				sandboxByIssue: new Map([
+					[
+						"CYPACK-1",
+						sb("CYPACK-1", {
+							id: "sb-old",
+							state: "Running",
+							labels: { "cyrus.device-id": "dev-1", "cyrus.secrets": "oldfp" },
+						}),
+					],
+				]),
+			});
+			await provider(client).ensureRunning(ctx({ deviceId: "dev-1" }));
+
+			expect(calls.deleteSandbox).toHaveLength(0);
+			expect(calls.createSandbox).toHaveLength(0);
+		});
+
+		it("carries the snapshot's own fingerprint onto a restored sandbox, even with no fingerprint supplied", async () => {
+			const { client, calls } = fakeClient({
+				snapshotsByLabels: [
+					snap({ id: "snap-warm", labels: { "cyrus.secrets": "fp1" } }),
+				],
+			});
+			await provider(client).ensureRunning(ctx({ deviceId: "dev-1" }));
+
+			expect(calls.createSandbox).toHaveLength(1);
+			expect(calls.createSandbox[0]?.snapshotId).toBe("snap-warm");
+			// Erasing it here would make the NEXT ordinary boot read the restored
+			// sandbox as unlabelled, hence stale, and replace it for nothing.
+			expect(calls.createSandbox[0]?.labels?.["cyrus.secrets"]).toBe("fp1");
+		});
+
+		it("stamps the sandbox's own fingerprint on the snapshot taken when parking it", async () => {
+			const { client, calls } = fakeClient({
+				sandboxByIssue: new Map([
+					[
+						"CYPACK-1",
+						sb("CYPACK-1", {
+							id: "sb-warm",
+							state: "Running",
+							labels: { "cyrus.device-id": "dev-1", "cyrus.secrets": "fp1" },
+						}),
+					],
+				]),
+			});
+			await provider(client).stop("CYPACK-1");
+
+			expect(calls.createSnapshot).toHaveLength(1);
+			expect(calls.createSnapshot[0]?.labels?.["cyrus.secrets"]).toBe("fp1");
+			expect(calls.stopSandbox).toEqual(["sb-warm"]);
+		});
+
+		it("parks a sandbox with no fingerprint label without snapshotting it", async () => {
+			const { client, calls } = fakeClient({
+				sandboxByIssue: new Map([
+					[
+						"CYPACK-1",
+						// Pre-ADR-0002 sandbox; see the inline fixture note above.
+						{
+							id: "sb-legacy",
+							state: "Running",
+							labels: {
+								"cyrus.managed": "true",
+								"cyrus.issue": "CYPACK-1",
+								"cyrus.disk": "disk-v1",
+								"cyrus.device-id": "dev-1",
+							},
+						},
+					],
+				]),
+			});
+			await provider(client).stop("CYPACK-1");
+
+			expect(calls.createSnapshot).toHaveLength(0);
+			// The suspend itself must still happen, or the sandbox keeps billing.
+			expect(calls.stopSandbox).toEqual(["sb-legacy"]);
 		});
 	});
 });
