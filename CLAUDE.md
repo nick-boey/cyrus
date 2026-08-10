@@ -650,3 +650,13 @@ For detailed information about Gemini CLI configuration options (settings.json s
 - **Official Documentation**: https://github.com/google-gemini/gemini-cli/blob/main/docs/get-started/configuration.md
 
 The GeminiRunner automatically generates a `~/.gemini/settings.json` file with single-turn model aliases and preview features enabled if one doesn't already exist.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues (github.com/nick-boey/cyrus) via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context layout — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
