@@ -872,16 +872,16 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
  * The "floor upload round-trip" block above proves the transport and the
  * artifact endpoint, but it builds and PUTs the bundle from the test process:
  * nothing in it runs `WorkspaceSyncService` inside a container, so the
- * trigger → `pushWipIfDirty` → `buildBundle` → `uploadBundle` chain is not what
+ * trigger → `captureWipSnapshot` → `buildBundle` → `uploadBundle` chain is not what
  * it exercises. Here the bundle that lands at `/artifacts` is produced by the
  * in-container EdgeWorker's own floor, from a real worktree it created itself,
  * and the fresh-container restore reads back that container-produced bundle.
  *
  * No Claude token is needed: `WorkspaceSyncService` is constructed and
  * `touch()`ed at the top of `initializeAgentRunner` (EdgeWorker.ts) — i.e.
- * before the runner is ever built — and the WIP push's failure (no GitHub
- * credential for octocat/Hello-World) is swallowed and logged by design so the
- * bundle upload still proceeds; see `pushWipSafely` in
+ * before the runner is ever built — and the snapshot capture's failure (no
+ * GitHub credential for octocat/Hello-World) is isolated to that repository by
+ * design so the bundle upload still proceeds; see `captureSnapshotSafely` in
  * packages/edge-worker/src/WorkspaceSyncService.ts.
  *
  * WHICH trigger fires is deliberately not pinned, because with a deliberately

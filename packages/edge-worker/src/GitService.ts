@@ -1,4 +1,5 @@
 import { execFile, execSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -7,7 +8,7 @@ import {
 	rmSync,
 	statSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve as pathResolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -16,6 +17,7 @@ import type {
 	Issue,
 	RepoSetupHookEventHandler,
 	RepositoryConfig,
+	WipRestoreOutcome,
 	Workspace,
 } from "cyrus-core";
 import { createLogger, getDefaultWorktreesDir, type ILogger } from "cyrus-core";
@@ -92,8 +94,9 @@ function isNodeExecError(value: unknown): value is NodeExecError {
 }
 
 /**
- * Promisified `execFile` for the WIP-push path ({@link GitService.pushWipIfDirty}).
- * Deliberately NOT `execSync`: that hot path now runs on every persistence-floor
+ * Promisified `execFile` for the WIP-snapshot path
+ * ({@link GitService.captureWipSnapshot} and friends).
+ * Deliberately NOT `execSync`: that hot path runs on every persistence-floor
  * timer tick (every 5 minutes, per issue, per repo) while the agent may be
  * concurrently running its own git commands in the same worktree — an
  * `execSync` call blocks the entire Node event loop (webhook handling,
@@ -106,43 +109,54 @@ function isNodeExecError(value: unknown): value is NodeExecError {
  */
 const execFileAsync = promisify(execFile);
 
-interface GitExecError extends Error {
-	stdout?: string;
-	stderr?: string;
-	code?: number | string | null;
-	signal?: string | null;
+/**
+ * The ref a branch's WIP snapshot is pushed to.
+ *
+ * Deliberately outside `refs/heads` — and outside every other namespace git
+ * or a forge fetches by default. A ref here is not cloned, not fetched, not
+ * listed by `git branch -a`, not walked by `git log --all`, and (decisively)
+ * fires no `push` webhook and triggers no Actions run. A real branch under a
+ * conventionally-ignored prefix would have done all of those, at roughly
+ * twelve CI builds an hour per issue.
+ *
+ * Keyed on the branch rather than the issue because restore keys on the
+ * branch. In a multi-repository workspace the branch name is shared, so the
+ * same ref name is used in each repository — capture, existence checks,
+ * restore and deletion are all per-repository operations.
+ *
+ * Note the two path components after `refs/`: refs with only one are rejected
+ * over the wire.
+ */
+export function wipSnapshotRef(branchName: string): string {
+	return `refs/cyrus-wip/${branchName}`;
 }
 
 /**
- * True when a git invocation failed because `.git/index.lock` (or the
- * worktree-specific equivalent) is already held by another git process —
- * i.e. genuine contention with a concurrently-running `git` command (the
- * agent's own tooling, or another sync cycle that hasn't finished), not a
- * real error. Detected from git's own stderr message rather than by
- * computing the lock path ourselves, since the exact location varies between
- * a plain repo and a linked worktree.
+ * Commit message on a snapshot commit. Never seen by a reviewer — snapshot
+ * commits are not reachable from any branch — so it exists only to make
+ * `git log refs/cyrus-wip/<branch>` legible to an operator debugging by hand.
  */
-function isIndexLockError(error: unknown): boolean {
-	const stderr = (error as GitExecError | undefined)?.stderr;
-	return typeof stderr === "string" && /index\.lock/.test(stderr);
-}
+const WIP_SNAPSHOT_MESSAGE = "cyrus: WIP snapshot";
 
-/**
- * True when a `git rev-list`/`rev-parse`-style invocation failed because the
- * revision it referenced (typically a remote-tracking ref like
- * `origin/<branch>`) doesn't exist locally, as opposed to some other git
- * failure. Used by {@link GitService.pushWipIfDirty}'s unpushed-commit
- * check: a branch that has never been pushed (no `origin/<branch>` ref
- * fetched/created locally yet) has everything unpushed, by definition,
- * rather than nothing to retry.
- */
-function isUnknownRevisionError(error: unknown): boolean {
-	const stderr = (error as GitExecError | undefined)?.stderr;
-	return (
-		typeof stderr === "string" &&
-		/unknown revision|bad revision|ambiguous argument/i.test(stderr)
-	);
-}
+/** Outcome of {@link GitService.captureWipSnapshot}. */
+export type WipSnapshotCaptureResult =
+	| { status: "captured"; commit: string }
+	/** Nothing changed since the last snapshot; no network call was made. */
+	| { status: "unchanged" }
+	/** No `HEAD` to parent a snapshot on (unborn branch / not a repository). */
+	| { status: "skipped"; reason: string };
+
+/** Outcome of {@link GitService.restoreWipSnapshot}. */
+export type WipSnapshotRestoreResult =
+	/** No snapshot on the remote for this branch. */
+	| { status: "absent" }
+	| { status: "applied"; commit: string }
+	/**
+	 * A snapshot exists but was NOT applied because the remote issue branch
+	 * has moved on past it — applying it would revert pushed work. The
+	 * snapshot is left on the remote for manual recovery.
+	 */
+	| { status: "stale"; commit: string };
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -322,136 +336,309 @@ export class GitService {
 		}
 	}
 
+	/** True when origin carries a WIP snapshot for this branch. */
+	wipSnapshotExists(repoPath: string, branchName: string): boolean {
+		try {
+			// `git ls-remote` exits 0 even when nothing matches, so the exit
+			// code proves nothing — this check decides whether an agent's only
+			// copy of its uncommitted work gets restored, and a silent false
+			// positive strands it. Test the output.
+			const out = execSync(
+				`git ls-remote origin ${JSON.stringify(wipSnapshotRef(branchName))}`,
+				{ cwd: repoPath, encoding: "utf-8", timeout: 30_000 },
+			);
+			return out.trim().length > 0;
+		} catch {
+			return false;
+		}
+	}
+
 	/**
-	 * Commit-and-push dirty worktree state so another device can resume this
-	 * issue via {@link remoteBranchExists}. Returns true when a WIP commit
-	 * and/or push actually happened; false when there was nothing to do
-	 * (clean tree, nothing unpushed), or when the commit had to be skipped
-	 * because another git process holds the index lock.
+	 * Capture everything in `worktreePath` that is not yet on the issue branch
+	 * — uncommitted edits, deletions, new files, and any commits the agent has
+	 * made but not pushed — as a **WIP snapshot** on
+	 * {@link wipSnapshotRef}`(branchName)`.
 	 *
-	 * This runs on every session end AND every persistence-floor timer tick
-	 * (`WorkspaceSyncService`, every 5 minutes) — concurrently with whatever
-	 * git commands the agent itself is running in the same worktree. Several
-	 * things follow from that:
+	 * This is the git half of the persistence floor, and it runs on every
+	 * periodic tick (every 5 minutes, per issue, per repository) as well as
+	 * immediately before a workspace is torn down. Several invariants follow:
 	 *
-	 *  - Every step uses `execFile` (async, non-blocking), not `execSync`: an
-	 *    unbounded synchronous call here would stall the whole edge worker's
-	 *    event loop for as long as git takes, and would make the outer
-	 *    shutdown cap in `WorkspaceSyncService.stop()` inert (it races via
-	 *    `setTimeout`, which can't fire while the loop is blocked). See
-	 *    {@link execFileAsync}.
-	 *  - Both the commit AND the push use `--no-verify`: this is a
-	 *    safety-net operation, not a real one, and must never run the
-	 *    repository's pre-commit/pre-push hooks (which would otherwise fire
-	 *    ~12x/hour inside the user's own worktree and can get SIGTERM'd by
-	 *    this method's own timeout). The floor must be invisible.
-	 *  - If `.git/index.lock` is already held (the agent's own git command is
-	 *    mid-flight), this backs off rather than racing or forcing past it:
-	 *    the lock file is never deleted or overridden, and the failure is
-	 *    logged at debug (expected contention, not an error) so it doesn't
-	 *    spam warnings every tick. The next periodic tick tries again.
-	 *  - A **clean** working tree is NOT sufficient grounds to skip: a prior
-	 *    cycle may have committed successfully and then failed to push
-	 *    (network blip, router/GitHub unreachable, auth hiccup) —
-	 *    `pushWipSafely` in `WorkspaceSyncService` swallows that error and
-	 *    logs it, so without a further check the commit would sit
-	 *    local-only forever, silently lost the moment the container is
-	 *    destroyed. So when the tree is clean, this still checks whether
-	 *    `HEAD` has commits `origin/<branchName>` doesn't (via
-	 *    {@link hasUnpushedCommits}) and retries the push alone if so.
-	 *
-	 * WIP commits always land on the issue's own branch (`branchName`), the
-	 * same branch the `git-gh` subroutine's own commit lands on — so even if
-	 * this pre-empts that subroutine's commit (it finds a clean tree and
-	 * commits nothing further), no work is lost either way.
+	 *  - **It never writes the issue branch.** The issue branch is written by
+	 *    the agent and by nobody else. That includes the case where the tree
+	 *    is clean but carries unpushed commits — those go into the snapshot
+	 *    too. Publishing them would also let a later rebase turn the agent's
+	 *    own push into a rejected non-fast-forward.
+	 *  - **It never touches `HEAD`, the index or the working tree.** Not
+	 *    merely tidiness: if the capture advanced the local branch, the
+	 *    agent's own `git push` would carry every snapshot commit to the
+	 *    remote and the pull request would be polluted identically. So this
+	 *    builds the tree in a *throwaway index* via plumbing rather than
+	 *    porcelain. That also means it succeeds while the real index lock is
+	 *    held — which matters, because a hook stages intent-to-add entries on
+	 *    a hot path during live sessions.
+	 *  - `git read-tree <HEAD>` before `git add -A` is not optional: seeding
+	 *    an empty index makes a sparse checkout record phantom deletions for
+	 *    every path it doesn't have on disk.
+	 *  - `git stash create` is **not** a substitute. It has no
+	 *    `--include-untracked` option — the flag is silently swallowed as the
+	 *    commit message — so every new file the agent created would be
+	 *    dropped.
+	 *  - Every step uses `execFile` (async), never `execSync`: a synchronous
+	 *    call here would stall the whole edge worker's event loop for as long
+	 *    as git takes, and would make `WorkspaceSyncService.stop()`'s
+	 *    `setTimeout`-based shutdown cap inert. See {@link execFileAsync}.
+	 *  - The push uses `--no-verify`: the floor must never run the
+	 *    repository's own pre-push hook ~12x/hour inside the user's worktree.
 	 */
-	async pushWipIfDirty(
+	async captureWipSnapshot(
 		worktreePath: string,
 		branchName: string,
-	): Promise<boolean> {
-		const git = (args: string[], timeoutMs: number) =>
-			execFileAsync("git", args, {
-				cwd: worktreePath,
-				encoding: "utf-8",
-				timeout: timeoutMs,
-			});
+	): Promise<WipSnapshotCaptureResult> {
+		const git = this.gitRunner(worktreePath);
+		const ref = wipSnapshotRef(branchName);
 
-		let status: { stdout: string };
+		let head: string;
 		try {
-			status = await git(["status", "--porcelain"], 30_000);
-		} catch (error) {
-			if (isIndexLockError(error)) {
-				this.logger.debug(
-					`pushWipIfDirty: index is locked in ${worktreePath} (another git process is running); skipping this sync cycle`,
-				);
-				return false;
-			}
-			throw error;
-		}
-
-		if (status.stdout.trim().length === 0) {
-			// Clean tree — but that alone doesn't mean there's nothing to do.
-			// See the "clean working tree is NOT sufficient" doc note above.
-			const hasUnpushedCommits = await this.hasUnpushedCommits(git, branchName);
-			if (!hasUnpushedCommits) return false;
-			await git(
-				["push", "--no-verify", "origin", `HEAD:${branchName}`],
-				60_000,
+			head = (
+				await git(["rev-parse", "--verify", "HEAD"], 30_000)
+			).stdout.trim();
+		} catch {
+			// An unborn branch (or not a repository at all) has nothing to
+			// parent a snapshot on. Nothing to protect either.
+			this.logger.debug(
+				`captureWipSnapshot: no resolvable HEAD in ${worktreePath}; nothing to capture`,
 			);
-			return true;
+			return { status: "skipped", reason: "no-head" };
 		}
 
+		const indexFile = join(
+			tmpdir(),
+			`cyrus-wip-index-${randomUUID().replace(/-/g, "")}`,
+		);
+		let tree: string;
 		try {
-			await git(["add", "-A"], 30_000);
+			const withIndex = { GIT_INDEX_FILE: indexFile };
+			await git(["read-tree", head], 60_000, withIndex);
+			await git(["add", "-A"], 120_000, withIndex);
+			tree = (await git(["write-tree"], 60_000, withIndex)).stdout.trim();
+		} finally {
+			rmSync(indexFile, { force: true });
+		}
+
+		if (await this.wipSnapshotIsCurrent(git, ref, tree, head)) {
+			// Nothing has changed since the snapshot we last pushed, so an
+			// idle session stops generating network traffic every 5 minutes.
+			return { status: "unchanged" };
+		}
+
+		const commit = (
+			await git(
+				["commit-tree", tree, "-p", head, "-m", WIP_SNAPSHOT_MESSAGE],
+				30_000,
+			)
+		).stdout.trim();
+
+		// Forced, deliberately. Snapshots are parented on HEAD and are
+		// therefore siblings of one another, never descendants — every push
+		// after the first is non-fast-forward by construction. The ref holds a
+		// snapshot rather than accumulated history, so last-writer-wins is the
+		// intent; `--force-with-lease` would make the floor fail in precisely
+		// the situations where it most needs to succeed.
+		await git(["push", "--no-verify", "origin", `+${commit}:${ref}`], 300_000);
+
+		// Only after the push succeeds — this local ref is the record of what
+		// is actually on the remote, and is what the no-op check above reads.
+		await git(["update-ref", ref, commit], 30_000);
+		return { status: "captured", commit };
+	}
+
+	/**
+	 * Restore the WIP snapshot for `branchName` into `worktreePath`, leaving
+	 * the workspace exactly as the agent left it: the agent's real `HEAD`
+	 * (including commits it made but never pushed) with the snapshot's content
+	 * as *uncommitted* changes — modifications, deletions and untracked files
+	 * all reproduced.
+	 *
+	 * Fails safe toward pushed work. Applying a snapshot writes its whole
+	 * tree, not a patch, so a stale one would revert commits pushed since it
+	 * was taken. A snapshot is therefore applied only when the remote issue
+	 * branch is an ancestor of the snapshot's parent; otherwise the branch is
+	 * left as published and `"stale"` is reported, with the snapshot left on
+	 * the remote so the work can still be recovered by hand.
+	 */
+	async restoreWipSnapshot(
+		worktreePath: string,
+		branchName: string,
+	): Promise<WipSnapshotRestoreResult> {
+		const git = this.gitRunner(worktreePath);
+		const ref = wipSnapshotRef(branchName);
+
+		if (!(await this.lsRemote(git, ref))) return { status: "absent" };
+
+		await git(["fetch", "origin", `+${ref}:${ref}`], 300_000);
+		const snapshot = (
+			await git(["rev-parse", `${ref}^{commit}`], 30_000)
+		).stdout.trim();
+
+		let base: string;
+		try {
+			base = (await git(["rev-parse", `${snapshot}^`], 30_000)).stdout.trim();
+		} catch {
+			// A parentless snapshot has no workspace state to rebuild onto.
+			this.logger.warn(
+				`restoreWipSnapshot: snapshot ${snapshot} for ${branchName} has no parent; ignoring it`,
+			);
+			return { status: "absent" };
+		}
+
+		if (await this.lsRemote(git, `refs/heads/${branchName}`)) {
 			await git(
 				[
-					"-c",
-					"user.email=cyrus@localhost",
-					"-c",
-					"user.name=Cyrus WIP",
-					"commit",
-					"--no-verify",
-					"-m",
-					"wip: auto-saved by cyrus before session end",
+					"fetch",
+					"origin",
+					`+refs/heads/${branchName}:refs/remotes/origin/${branchName}`,
 				],
-				30_000,
+				300_000,
 			);
-		} catch (error) {
-			if (isIndexLockError(error)) {
-				this.logger.debug(
-					`pushWipIfDirty: index is locked in ${worktreePath} (another git process is running); skipping this sync cycle`,
+			const published = (
+				await git(["rev-parse", `origin/${branchName}`], 30_000)
+			).stdout.trim();
+			if (!(await this.isAncestor(git, published, base))) {
+				this.logger.warn(
+					`restoreWipSnapshot: snapshot ${snapshot} for ${branchName} predates origin/${branchName}; leaving the published branch alone`,
 				);
-				return false;
+				return { status: "stale", commit: snapshot };
 			}
-			throw error;
 		}
 
-		await git(["push", "--no-verify", "origin", `HEAD:${branchName}`], 60_000);
+		// Land on the snapshot's parent (the agent's real HEAD), lay the
+		// snapshot's tree over the working tree, then rewind the index — so
+		// the difference between the two shows up exactly as the agent left
+		// it: unstaged, and untracked where it was untracked.
+		await git(["checkout", "-B", branchName, base], 120_000);
+		await git(["read-tree", "-m", "-u", "HEAD", snapshot], 120_000);
+		await git(["reset", "--mixed", base], 60_000);
+		return { status: "applied", commit: snapshot };
+	}
+
+	/**
+	 * Delete a branch's WIP snapshot from origin (and locally). Returns true
+	 * when a ref was actually removed.
+	 *
+	 * Refs are advertised on every clone and fetch, repository-wide, and count
+	 * toward the repository's size limit — so unlike the floor bundle (which
+	 * is retained so a reopened issue can be rebuilt from it), these are
+	 * pruned at any terminal state. A reopened issue rebuilds from the issue
+	 * branch instead.
+	 */
+	async deleteWipSnapshot(
+		repoPath: string,
+		branchName: string,
+	): Promise<boolean> {
+		const git = this.gitRunner(repoPath);
+		const ref = wipSnapshotRef(branchName);
+
+		// Local first, and unconditionally: it is cheap, cannot fail the
+		// remote deletion, and leaving it behind would make a later capture
+		// think the remote is already up to date.
+		await git(["update-ref", "-d", ref], 30_000).catch(() => undefined);
+
+		if (!(await this.lsRemote(git, ref))) return false;
+		await git(["push", "--no-verify", "origin", `:${ref}`], 300_000);
 		return true;
 	}
 
 	/**
-	 * True when `HEAD` has commits that `origin/<branchName>` does not — the
-	 * clean-tree counterpart to a dirty-tree check, so
-	 * {@link pushWipIfDirty} can retry a push that failed after its commit
-	 * already succeeded (see that method's doc). When `origin/<branchName>`
-	 * doesn't exist as a local remote-tracking ref (branch never pushed, or
-	 * this worktree has never fetched/pushed it), there's no known basis for
-	 * "already pushed" — the whole local branch counts as unpushed.
+	 * {@link restoreWipSnapshot} for the worktree-creation path: reports the
+	 * outcome when there was something to restore, and never lets a restore
+	 * failure abort workspace creation. A workspace that came up without its
+	 * snapshot is recoverable — the ref is still on the remote — whereas a
+	 * session with no workspace at all is not.
 	 */
-	private async hasUnpushedCommits(
-		git: (args: string[], timeoutMs: number) => Promise<{ stdout: string }>,
+	private async restoreWipSnapshotSafely(
+		worktreePath: string,
 		branchName: string,
+	): Promise<WipRestoreOutcome | undefined> {
+		try {
+			const result = await this.restoreWipSnapshot(worktreePath, branchName);
+			if (result.status === "absent") return undefined;
+			if (result.status === "stale") {
+				this.logger.warn(
+					`A WIP snapshot exists for ${branchName} but was not applied: the published branch has moved on past it. The snapshot is still on the remote at ${wipSnapshotRef(branchName)}.`,
+				);
+				return "stale";
+			}
+			this.logger.info(
+				`Restored uncommitted work for ${branchName} from its WIP snapshot`,
+			);
+			return "applied";
+		} catch (error) {
+			this.logger.error(
+				`Failed to restore the WIP snapshot for ${branchName}: ${(error as Error).message}`,
+			);
+			return undefined;
+		}
+	}
+
+	/** `execFile`-backed git runner bound to one repository. */
+	private gitRunner(cwd: string) {
+		return (args: string[], timeoutMs: number, env?: Record<string, string>) =>
+			execFileAsync("git", args, {
+				cwd,
+				encoding: "utf-8",
+				timeout: timeoutMs,
+				...(env ? { env: { ...process.env, ...env } } : {}),
+			});
+	}
+
+	private async lsRemote(
+		git: ReturnType<GitService["gitRunner"]>,
+		ref: string,
+	): Promise<string | null> {
+		const out = (await git(["ls-remote", "origin", ref], 60_000)).stdout.trim();
+		return out ? (out.split(/\s+/)[0] ?? null) : null;
+	}
+
+	private async isAncestor(
+		git: ReturnType<GitService["gitRunner"]>,
+		maybeAncestor: string,
+		descendant: string,
 	): Promise<boolean> {
 		try {
-			const result = await git(
-				["rev-list", "--count", `origin/${branchName}..HEAD`],
+			await git(
+				["merge-base", "--is-ancestor", maybeAncestor, descendant],
 				30_000,
 			);
-			return Number.parseInt(result.stdout.trim(), 10) > 0;
-		} catch (error) {
-			if (isUnknownRevisionError(error)) return true;
-			throw error;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * True when the snapshot we last successfully pushed already records this
+	 * exact state. Both halves matter: the same tree on a *different* parent
+	 * means the agent committed since, and that new parent has to be captured
+	 * or restore would rewind past the commit.
+	 */
+	private async wipSnapshotIsCurrent(
+		git: ReturnType<GitService["gitRunner"]>,
+		ref: string,
+		tree: string,
+		head: string,
+	): Promise<boolean> {
+		try {
+			const [lastTree, lastParent] = await Promise.all([
+				git(["rev-parse", `${ref}^{tree}`], 30_000),
+				git(["rev-parse", `${ref}^`], 30_000),
+			]);
+			return (
+				lastTree.stdout.trim() === tree && lastParent.stdout.trim() === head
+			);
+		} catch {
+			// No local record of a pushed snapshot (fresh workspace, or the
+			// ref was deleted) — capture.
+			return false;
 		}
 	}
 
@@ -873,6 +1060,9 @@ export class GitService {
 
 		const repoPaths: Record<string, string> = {};
 		const resolvedBaseBranches: Record<string, BaseBranchResolution> = {};
+		// Each repository carries its own snapshot under the same ref name, so
+		// one repository failing to restore costs the operator only that one.
+		const wipRestores: Record<string, WipRestoreOutcome> = {};
 
 		for (const repository of repositories) {
 			const repoSubPath = join(parentPath, repository.name);
@@ -896,6 +1086,9 @@ export class GitService {
 						repoWorkspace.resolvedBaseBranches,
 					);
 				}
+				if (repoWorkspace.wipRestores) {
+					Object.assign(wipRestores, repoWorkspace.wipRestores);
+				}
 			} catch (error) {
 				this.logger.error(
 					`Failed to create worktree for repo '${repository.name}': ${(error as Error).message}`,
@@ -911,6 +1104,7 @@ export class GitService {
 			isGitWorktree: true,
 			repoPaths,
 			resolvedBaseBranches,
+			...(Object.keys(wipRestores).length > 0 ? { wipRestores } : {}),
 		};
 	}
 
@@ -1072,12 +1266,20 @@ export class GitService {
 			let worktreeCmd: string;
 			if (createBranch) {
 				// Worktree continuity: if this issue's own branch was already
-				// pushed to origin by a previous device/session, and no explicit
-				// base-branch override was requested, resume from it directly
-				// instead of branching from the resolved base branch. An
-				// explicit override always wins over this preference.
+				// pushed to origin by a previous device/session, resume from it
+				// directly instead of branching from the resolved base branch.
+				//
+				// This deliberately wins over an explicit base-branch override.
+				// The override decides where the issue branch *starts*, and it
+				// already did its job when the branch was first created; a
+				// session with a `[repo=name#branch]` selector persists that
+				// resolution and passes it back on every workspace recreation
+				// (see `EdgeWorker.ensureSessionWorkspaceExists`). Letting the
+				// override win a second time would rebranch from base and throw
+				// away everything published since — a silent data-loss path,
+				// and the one case where the persistence floor's durability
+				// promise could not honestly be made.
 				if (
-					!baseBranchOverride &&
 					hasRemote &&
 					this.remoteBranchExists(repository.repositoryPath, branchName)
 				) {
@@ -1160,6 +1362,18 @@ export class GitService {
 				stdio: "pipe",
 			});
 
+			// Rebuild whatever the agent had not published when its last
+			// workspace went away: uncommitted edits, deletions, new files, and
+			// commits it made but never pushed. Runs on the bare worktree,
+			// before `.worktreeinclude` copies anything in and before any setup
+			// script runs — `read-tree -m -u` refuses to clobber untracked
+			// files, and setup scripts should see the restored state, not the
+			// pristine one. A brand-new issue simply has no snapshot.
+			const wipRestore = await this.restoreWipSnapshotSafely(
+				workspacePath,
+				branchName,
+			);
+
 			// Copy files specified in .worktreeinclude that are also in .gitignore
 			// This runs before setup scripts so they can access these files
 			await this.worktreeIncludeService.copyIgnoredFiles(
@@ -1189,6 +1403,7 @@ export class GitService {
 				path: workspacePath,
 				isGitWorktree: true,
 				resolvedBaseBranches: { [repository.id]: resolution },
+				...(wipRestore ? { wipRestores: { [repository.id]: wipRestore } } : {}),
 			};
 		} catch (error) {
 			const errorMessage = (error as Error).message;

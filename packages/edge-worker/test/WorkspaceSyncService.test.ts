@@ -14,7 +14,7 @@ import { WorkspaceSyncService } from "../src/WorkspaceSyncService.js";
 
 /**
  * Task 10 — WorkspaceSyncService is the client side of the persistence
- * floor: it WIP-pushes any dirty worktree(s) for an issue and uploads a
+ * floor: it captures a WIP snapshot of each of an issue's worktrees and uploads a
  * bundle of the Claude transcripts + session state to the router, so a
  * fresh container (or another device) can resume the issue after this one
  * dies. `buildBundle`/`uploadBundle` are the real implementations from
@@ -87,25 +87,28 @@ afterEach(() => {
 });
 
 describe("WorkspaceSyncService.syncIssue", () => {
-	it("WIP-pushes the single-repo workspace and uploads a bundle", async () => {
+	it("captures a WIP snapshot of the single-repo workspace and uploads a bundle", async () => {
 		const cyrusHome = mkCyrusHome();
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const deriveWorktreeBranchName = vi.fn(() => "cypack-9-branch");
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
-			gitService: { pushWipIfDirty, deriveWorktreeBranchName },
+			gitService: { captureWipSnapshot, deriveWorktreeBranchName },
 			logger: makeLogger(),
 		});
 
 		await service.syncIssue("CYPACK-9");
 
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(1);
-		expect(pushWipIfDirty).toHaveBeenCalledWith(
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(1);
+		expect(captureWipSnapshot).toHaveBeenCalledWith(
 			workspacePath,
 			"cypack-9-branch",
 		);
@@ -132,25 +135,35 @@ describe("WorkspaceSyncService.syncIssue", () => {
 		mkdirSync(notARepo, { recursive: true });
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", root) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(
+			async (_path: string, _branch: string) => ({
+				status: "captured" as const,
+				commit: "deadbeef",
+			}),
+		);
 		const deriveWorktreeBranchName = vi.fn(() => "cypack-9-branch");
 		stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
-			gitService: { pushWipIfDirty, deriveWorktreeBranchName },
+			gitService: { captureWipSnapshot, deriveWorktreeBranchName },
 			logger: makeLogger(),
 		});
 
 		await service.syncIssue("CYPACK-9");
 
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(2);
-		const calledPaths = pushWipIfDirty.mock.calls.map((call) => call[0]).sort();
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(2);
+		const calledPaths = captureWipSnapshot.mock.calls
+			.map((call) => call[0])
+			.sort();
 		expect(calledPaths).toEqual([repoA, repoB].sort());
 		// The root itself (not a repo) and the non-repo subdirectory must never
-		// be passed to pushWipIfDirty.
-		expect(pushWipIfDirty).not.toHaveBeenCalledWith(root, expect.anything());
-		expect(pushWipIfDirty).not.toHaveBeenCalledWith(
+		// be passed to captureWipSnapshot.
+		expect(captureWipSnapshot).not.toHaveBeenCalledWith(
+			root,
+			expect.anything(),
+		);
+		expect(captureWipSnapshot).not.toHaveBeenCalledWith(
 			notARepo,
 			expect.anything(),
 		);
@@ -161,13 +174,16 @@ describe("WorkspaceSyncService.syncIssue", () => {
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -175,7 +191,7 @@ describe("WorkspaceSyncService.syncIssue", () => {
 
 		await service.syncIssue("OTHER-1");
 
-		expect(pushWipIfDirty).not.toHaveBeenCalled();
+		expect(captureWipSnapshot).not.toHaveBeenCalled();
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(existsSync(join(cyrusHome, "sync", "OTHER-1.tar.gz"))).toBe(false);
 	});
@@ -189,11 +205,11 @@ describe("WorkspaceSyncService.syncIssue", () => {
 		mkdirSync(join(repoB, ".git"), { recursive: true });
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", root) });
 
-		const pushWipIfDirty = vi.fn(async (path: string) => {
+		const captureWipSnapshot = vi.fn(async (path: string) => {
 			if (path === repoA) {
 				throw new Error("git push failed: network unreachable");
 			}
-			return true;
+			return { status: "captured" as const, commit: "deadbeef" };
 		});
 		const fetchMock = stubFetchOk();
 		const logger = makeLogger();
@@ -201,20 +217,91 @@ describe("WorkspaceSyncService.syncIssue", () => {
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger,
 		});
 
-		// A per-workspace push failure is caught and logged internally — it
+		// A per-repository capture failure is caught and reported internally — it
 		// does not fail the overall sync, so this resolves `true`.
 		await expect(service.syncIssue("CYPACK-9")).resolves.toBe(true);
 
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(2);
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(2);
 		expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("repo-a"));
 		// The failure on repo-a must not have aborted the upload.
 		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	/**
+	 * The issue branch used to be the fallback for a failed floor push, so
+	 * logging the failure was enough. It isn't any more: a failed capture means
+	 * the only copy of the agent's uncommitted work never left this machine,
+	 * and whoever can act on that is watching the issue, not the logs.
+	 */
+	it("surfaces a capture failure onto the issue timeline", async () => {
+		const cyrusHome = mkCyrusHome();
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+		stubFetchOk();
+		const onCaptureFailure = vi.fn();
+
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService: {
+				captureWipSnapshot: vi.fn(async () => {
+					throw new Error("push declined: file size rule");
+				}),
+				deriveWorktreeBranchName: vi.fn(() => "branch"),
+			},
+			logger: makeLogger(),
+			onCaptureFailure,
+		});
+
+		await service.syncIssue("CYPACK-9");
+
+		expect(onCaptureFailure).toHaveBeenCalledTimes(1);
+		expect(onCaptureFailure).toHaveBeenCalledWith(
+			"CYPACK-9",
+			expect.stringContaining("file size rule"),
+		);
+	});
+
+	it("coalesces repeated failures for the same issue, and re-arms once a capture succeeds", async () => {
+		const cyrusHome = mkCyrusHome();
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+		stubFetchOk();
+		const onCaptureFailure = vi.fn();
+		let failing = true;
+
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService: {
+				captureWipSnapshot: vi.fn(async () => {
+					if (failing) throw new Error("remote unreachable");
+					return { status: "captured" as const, commit: "deadbeef" };
+				}),
+				deriveWorktreeBranchName: vi.fn(() => "branch"),
+			},
+			logger: makeLogger(),
+			onCaptureFailure,
+		});
+
+		// An unreachable remote stays unreachable for many ticks; the operator
+		// must be told once, not every five minutes.
+		await service.syncIssue("CYPACK-9");
+		await service.syncIssue("CYPACK-9");
+		await service.syncIssue("CYPACK-9");
+		expect(onCaptureFailure).toHaveBeenCalledTimes(1);
+
+		// Recovery re-arms the report, so the NEXT outage is surfaced too
+		// rather than being silently swallowed as "already reported".
+		failing = false;
+		await service.syncIssue("CYPACK-9");
+		failing = true;
+		await service.syncIssue("CYPACK-9");
+		expect(onCaptureFailure).toHaveBeenCalledTimes(2);
 	});
 
 	it("resolves false (not success) when the state file is missing, so a racing terminal sync doesn't drop protection", async () => {
@@ -224,7 +311,7 @@ describe("WorkspaceSyncService.syncIssue", () => {
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty: vi.fn(),
+				captureWipSnapshot: vi.fn(),
 				deriveWorktreeBranchName: vi.fn(),
 			},
 			logger: makeLogger(),
@@ -245,7 +332,10 @@ describe("WorkspaceSyncService.syncIssue", () => {
 		const cyrusHome = mkCyrusHome();
 		const fetchMock = stubFetchOk();
 		const gitService = {
-			pushWipIfDirty: vi.fn(async () => true),
+			captureWipSnapshot: vi.fn(async () => ({
+				status: "captured" as const,
+				commit: "deadbeef",
+			})),
 			deriveWorktreeBranchName: vi.fn(() => "branch"),
 		};
 
@@ -285,7 +375,10 @@ describe("WorkspaceSyncService.syncIssue", () => {
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty: vi.fn(async () => true),
+				captureWipSnapshot: vi.fn(async () => ({
+					status: "captured" as const,
+					commit: "deadbeef",
+				})),
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger,
@@ -309,16 +402,16 @@ describe("WorkspaceSyncService concurrency", () => {
 		const pushGate = new Promise<void>((resolve) => {
 			releasePush = resolve;
 		});
-		const pushWipIfDirty = vi.fn(async () => {
+		const captureWipSnapshot = vi.fn(async () => {
 			await pushGate;
-			return true;
+			return { status: "captured" as const, commit: "deadbeef" };
 		});
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -337,7 +430,7 @@ describe("WorkspaceSyncService concurrency", () => {
 		releasePush?.();
 		await Promise.all([p1, p2]);
 
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(1);
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(1);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
@@ -349,13 +442,16 @@ describe("WorkspaceSyncService concurrency", () => {
 			"sess-1": makeSession("CYPACK-1", wsA),
 			"sess-2": makeSession("CYPACK-2", wsB),
 		});
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -365,7 +461,7 @@ describe("WorkspaceSyncService concurrency", () => {
 		const p2 = service.syncIssue("CYPACK-2");
 		expect(p1).not.toBe(p2);
 		await Promise.all([p1, p2]);
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(2);
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(2);
 	});
 
 	it("a forced sync waits for an in-flight sync and then performs a fresh pass", async () => {
@@ -376,28 +472,28 @@ describe("WorkspaceSyncService concurrency", () => {
 		const gate = new Promise<void>((resolve) => {
 			releaseFirst = resolve;
 		});
-		const pushWipIfDirty = vi.fn(async () => {
-			if (pushWipIfDirty.mock.calls.length === 1) await gate;
-			return true;
+		const captureWipSnapshot = vi.fn(async () => {
+			if (captureWipSnapshot.mock.calls.length === 1) await gate;
+			return { status: "captured" as const, commit: "deadbeef" };
 		});
 		const fetchMock = stubFetchOk();
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
 		});
 
 		const ordinary = service.syncIssue("CYPACK-9");
-		await vi.waitFor(() => expect(pushWipIfDirty).toHaveBeenCalledTimes(1));
+		await vi.waitFor(() => expect(captureWipSnapshot).toHaveBeenCalledTimes(1));
 		const forced = service.syncIssue("CYPACK-9", { force: true });
 		expect(fetchMock).not.toHaveBeenCalled();
 		releaseFirst?.();
 		await Promise.all([ordinary, forced]);
 
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(2);
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(2);
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
 });
@@ -411,13 +507,16 @@ describe("WorkspaceSyncService.stop", () => {
 			"sess-1": makeSession("CYPACK-1", wsA),
 			"sess-2": makeSession("CYPACK-2", wsB),
 		});
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -429,7 +528,7 @@ describe("WorkspaceSyncService.stop", () => {
 
 		await service.stop();
 
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(2);
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(2);
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
 
@@ -438,7 +537,7 @@ describe("WorkspaceSyncService.stop", () => {
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty: vi.fn(),
+				captureWipSnapshot: vi.fn(),
 				deriveWorktreeBranchName: vi.fn(),
 			},
 			logger: makeLogger(),
@@ -468,13 +567,16 @@ describe("WorkspaceSyncService — protects a live (un-ended) session", () => {
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -491,9 +593,9 @@ describe("WorkspaceSyncService — protects a live (un-ended) session", () => {
 
 			// Wait for the first tick to sync the still-running session.
 			await vi.waitFor(() => {
-				expect(pushWipIfDirty.mock.calls.length).toBeGreaterThanOrEqual(1);
+				expect(captureWipSnapshot.mock.calls.length).toBeGreaterThanOrEqual(1);
 			});
-			const afterFirstTick = pushWipIfDirty.mock.calls.length;
+			const afterFirstTick = captureWipSnapshot.mock.calls.length;
 
 			// Wait for at least one MORE tick, still with no termination: this
 			// is exactly the regression this fix guards against. Before the
@@ -502,7 +604,7 @@ describe("WorkspaceSyncService — protects a live (un-ended) session", () => {
 			// never be synced again — the count would freeze at
 			// `afterFirstTick` forever instead of continuing to climb.
 			await vi.waitFor(() => {
-				expect(pushWipIfDirty.mock.calls.length).toBeGreaterThan(
+				expect(captureWipSnapshot.mock.calls.length).toBeGreaterThan(
 					afterFirstTick,
 				);
 			});
@@ -517,13 +619,16 @@ describe("WorkspaceSyncService — protects a live (un-ended) session", () => {
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -535,7 +640,7 @@ describe("WorkspaceSyncService — protects a live (un-ended) session", () => {
 
 		await service.stop();
 
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(1);
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(1);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 });
@@ -546,13 +651,16 @@ describe("WorkspaceSyncService.syncIssueOnTermination", () => {
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -560,13 +668,13 @@ describe("WorkspaceSyncService.syncIssueOnTermination", () => {
 
 		service.touch("CYPACK-9", "sess-a"); // session start
 		await service.syncIssueOnTermination("CYPACK-9", "sess-a"); // session end, sync succeeds
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(1);
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(1);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 
 		// A later flush (e.g. a shutdown moments afterward) must not re-sync
 		// an issue whose session already ended and was synced successfully.
 		await service.stop();
-		expect(pushWipIfDirty).toHaveBeenCalledTimes(1);
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(1);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
@@ -575,7 +683,10 @@ describe("WorkspaceSyncService.syncIssueOnTermination", () => {
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		let uploadAttempts = 0;
 		vi.stubGlobal(
 			"fetch",
@@ -593,7 +704,7 @@ describe("WorkspaceSyncService.syncIssueOnTermination", () => {
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger,
@@ -636,14 +747,17 @@ describe("WorkspaceSyncService — touched-set convergence", () => {
 			"sess-1": makeSession("CYPACK-9", missingWorkspacePath),
 		});
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const fetchMock = stubFetchOk();
 		const logger = makeLogger();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger,
@@ -655,7 +769,7 @@ describe("WorkspaceSyncService — touched-set convergence", () => {
 		// No git push was attempted against the missing path, and no warning
 		// was logged for it (this is an expected, one-time condition, not a
 		// recurring error).
-		expect(pushWipIfDirty).not.toHaveBeenCalled();
+		expect(captureWipSnapshot).not.toHaveBeenCalled();
 		expect(logger.warn).not.toHaveBeenCalled();
 
 		// The issue must be gone from the touched set now — a later flush
@@ -670,13 +784,16 @@ describe("WorkspaceSyncService — touched-set convergence", () => {
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -727,13 +844,16 @@ describe("WorkspaceSyncService — documented gap: a crashed session never conve
 		const workspacePath = mkGitRepo();
 		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
 
-		const pushWipIfDirty = vi.fn(async () => true);
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
 		const fetchMock = stubFetchOk();
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -765,10 +885,12 @@ describe("WorkspaceSyncService — documented gap: a crashed session never conve
  * Writes a fake `git` executable that sleeps for `delayMs` before responding
  * to any invocation, and returns the directory it lives in (prepend this to
  * `PATH` so `execFile("git", ...)` resolves to it instead of the real git).
- * Reports a dirty tree for `status --porcelain` so the real
- * `GitService.pushWipIfDirty` proceeds through add/commit/push, each of
- * which also pays the `delayMs` cost — letting a test assert real wall-clock
- * behavior without touching an actual repo or network.
+ *
+ * `write-tree` reports a different object id from everything else, so the real
+ * `GitService.captureWipSnapshot` sees a tree that differs from the last
+ * snapshot's and proceeds all the way through commit-tree/push/update-ref —
+ * each step paying the `delayMs` cost, which is what lets a test assert real
+ * wall-clock behavior without touching an actual repo or network.
  */
 function makeSlowGitBinary(delayMs: number): string {
 	const dir = mkdtempSync(join(tmpdir(), "cyrus-slow-git-"));
@@ -780,11 +902,12 @@ function makeSlowGitBinary(delayMs: number): string {
 			"#!/bin/sh",
 			`sleep ${delaySeconds}`,
 			'for arg in "$@"; do',
-			'  if [ "$arg" = "status" ]; then',
-			'    echo " M file.txt"',
+			'  if [ "$arg" = "write-tree" ]; then',
+			"    echo 1111111111111111111111111111111111111111",
 			"    exit 0",
 			"  fi",
 			"done",
+			"echo 2222222222222222222222222222222222222222",
 			"exit 0",
 			"",
 		].join("\n"),
@@ -804,12 +927,12 @@ describe("WorkspaceSyncService.stop bounded flush", () => {
 		// hang mode (async work that genuinely never settles), distinct from
 		// the synchronous-blocking mode covered by the real-subprocess test
 		// below.
-		const pushWipIfDirty = vi.fn(() => new Promise<boolean>(() => {}));
+		const captureWipSnapshot = vi.fn(() => new Promise<never>(() => {}));
 
 		const service = new WorkspaceSyncService({
 			...baseOpts(cyrusHome),
 			gitService: {
-				pushWipIfDirty,
+				captureWipSnapshot,
 				deriveWorktreeBranchName: vi.fn(() => "branch"),
 			},
 			logger: makeLogger(),
@@ -828,16 +951,16 @@ describe("WorkspaceSyncService.stop bounded flush", () => {
 	});
 
 	/**
-	 * Task 10 fix pass 2 — Finding 3. The test above mocks `pushWipIfDirty`
+	 * Task 10 fix pass 2 — Finding 3. The test above mocks `captureWipSnapshot`
 	 * as a promise that never resolves, which `Promise.race` always wins
 	 * against regardless of whether the *real* implementation blocks the
 	 * event loop — so it gave false confidence about the actual regression
-	 * (`GitService.pushWipIfDirty` used `execSync`, which blocks the whole
+	 * (`GitService.captureWipSnapshot` used `execSync`, which blocks the whole
 	 * JS thread for as long as git takes; while blocked, the `setTimeout`
 	 * backing `stopFlushTimeout()` cannot fire no matter how small
 	 * `stopFlushTimeoutMs` is, so the cap was inert against that hang mode).
 	 *
-	 * This test drives the REAL (unmocked) `GitService.pushWipIfDirty`
+	 * This test drives the REAL (unmocked) `GitService.captureWipSnapshot`
 	 * against a real, slow child process — a fake `git` binary — so it would
 	 * fail against the old `execSync`-based implementation (stop() would
 	 * take at least `delayMs` per git invocation to return, since the whole
@@ -879,8 +1002,9 @@ describe("WorkspaceSyncService.stop bounded flush", () => {
 			await service.stop();
 			const elapsed = Date.now() - start;
 
-			// The full status+add+commit chain against the fake git would take
-			// at least ~900ms (3 x 300ms) if awaited to completion. Returning
+			// The full rev-parse/read-tree/add/write-tree/commit-tree/push
+			// chain against the fake git would take at least ~900ms if awaited
+			// to completion (six invocations at 300ms each). Returning
 			// well under that — close to stopFlushTimeoutMs — proves the cap
 			// preempted a real, slow subprocess rather than blocking on it.
 			expect(elapsed).toBeLessThan(700);

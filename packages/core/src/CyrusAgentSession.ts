@@ -43,6 +43,15 @@ export interface BaseBranchResolution {
 	detail?: string;
 }
 
+/**
+ * What happened to a repository's WIP snapshot when its workspace was built.
+ * `"applied"` — the agent's uncommitted work was rebuilt into the workspace.
+ * `"stale"` — a snapshot existed but the published issue branch had moved on
+ * past it, so it was deliberately left alone rather than reverting pushed work.
+ * Absent means there was no snapshot, which is the normal case for a new issue.
+ */
+export type WipRestoreOutcome = "applied" | "stale";
+
 export interface Workspace {
 	path: string;
 	isGitWorktree: boolean;
@@ -51,6 +60,14 @@ export interface Workspace {
 	repoPaths?: Record<string, string>;
 	/** Maps repositoryId to resolved base branch with source info */
 	resolvedBaseBranches?: Record<string, BaseBranchResolution>;
+	/**
+	 * Maps repositoryId to the WIP snapshot outcome for this workspace, for
+	 * repositories where anything happened at all. Read by
+	 * `EdgeWorker.resumeAgentSession` so an agent that wakes with no memory of
+	 * work it appears to have done is told where that work came from, rather
+	 * than "tidying up" unexplained changes by reverting them.
+	 */
+	wipRestores?: Record<string, WipRestoreOutcome>;
 }
 
 /**

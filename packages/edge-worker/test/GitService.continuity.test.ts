@@ -5,19 +5,10 @@ import { join } from "node:path";
 import type { Issue, RepositoryConfig } from "cyrus-core";
 import { describe, expect, it } from "vitest";
 import { GitService } from "../src/GitService.js";
-
-function makeOriginAndClone() {
-	const dir = mkdtempSync(join(tmpdir(), "cyrus-git-"));
-	const origin = join(dir, "origin.git");
-	const clone = join(dir, "clone");
-	execSync(`git init --bare ${origin} -b main`);
-	execSync(`git clone ${origin} ${clone}`);
-	execSync(
-		`git -C ${clone} -c user.email=t@t -c user.name=t commit --allow-empty -m init`,
-	);
-	execSync(`git -C ${clone} push origin main`);
-	return { origin, clone };
-}
+import {
+	makeOriginAndClone,
+	pushBranchOnlyToRemote,
+} from "./helpers/git-fixtures.js";
 
 /**
  * Minimal but structurally-real Issue fixture for driving the actual
@@ -62,29 +53,6 @@ function makeIssue(overrides: {
 	} as unknown as Issue;
 }
 
-/**
- * Checks out a new branch in `clone` from the current HEAD, adds a uniquely
- * identifiable commit, pushes it to origin, then returns to `main` and
- * deletes the local branch — so the branch exists ONLY on origin (matching
- * the real-world "pushed from another device" scenario `remoteBranchExists`
- * is meant to detect) while the clone used as `repository.repositoryPath`
- * still resolves `git rev-parse --verify <branchName>` to nothing locally.
- * Returns the pushed branch's tip commit SHA for direct HEAD comparison.
- */
-function pushBranchOnlyToRemote(clone: string, branchName: string): string {
-	execSync(`git -C ${clone} checkout -b ${branchName}`);
-	execSync(`echo ${branchName} > ${join(clone, `${branchName}.marker`)}`);
-	execSync(`git -C ${clone} add ${branchName}.marker`);
-	execSync(
-		`git -C ${clone} -c user.email=t@t -c user.name=t commit -m "wip on ${branchName}"`,
-	);
-	execSync(`git -C ${clone} push origin ${branchName}`);
-	const tip = execSync(`git -C ${clone} rev-parse HEAD`).toString().trim();
-	execSync(`git -C ${clone} checkout main`);
-	execSync(`git -C ${clone} branch -D ${branchName}`);
-	return tip;
-}
-
 function makeRepository(
 	repositoryPath: string,
 	workspaceBaseDir: string,
@@ -109,71 +77,9 @@ describe("worktree continuity", () => {
 		expect(svc.remoteBranchExists(clone, "nope-branch")).toBe(false);
 	});
 
-	it("pushWipIfDirty commits and pushes dirty state to the branch", async () => {
-		const { origin, clone } = makeOriginAndClone();
-		execSync(`git -C ${clone} checkout -b ISS-1`);
-		execSync(`echo wip > ${join(clone, "file.txt")}`);
-		const svc = new GitService(undefined, console as never);
-		expect(await svc.pushWipIfDirty(clone, "ISS-1")).toBe(true);
-		const remoteBranches = execSync(`git -C ${origin} branch`).toString();
-		expect(remoteBranches).toContain("ISS-1");
-	});
-
-	it("pushWipIfDirty is a no-op on a clean tree", async () => {
-		const { clone } = makeOriginAndClone();
-		const svc = new GitService(undefined, console as never);
-		expect(await svc.pushWipIfDirty(clone, "main")).toBe(false);
-	});
-
-	/**
-	 * Task 10 fix pass 3 — Finding 1 regression guard.
-	 *
-	 * Reproduces the exact failure sequence from the finding: a sync cycle's
-	 * `add`+`commit` succeed (leaving the tree clean) but its `push` fails
-	 * (here: a broken remote URL standing in for a network blip / router or
-	 * GitHub unreachable). Before this fix, `pushWipIfDirty` early-returned
-	 * `false` on ANY clean tree without checking whether the commit it just
-	 * made had actually reached the remote — so the very next call (also a
-	 * clean tree, since nothing new happened) skipped the retry forever,
-	 * stranding the commit local-only. A container destroyed at that point
-	 * loses the work even though the "sync" reported no error.
-	 *
-	 * This test drives the real (non-mocked) `pushWipIfDirty` against a real
-	 * git remote, so it fails against the pre-fix clean-tree early-return
-	 * and passes once the clean-tree path also checks for unpushed commits.
-	 */
-	it("retries the push on a later call after a commit succeeded but the push failed (clean tree must not skip the retry)", async () => {
-		const { origin, clone } = makeOriginAndClone();
-		execSync(`git -C ${clone} checkout -b ISS-2`);
-		execSync(`echo wip > ${join(clone, "file.txt")}`);
-
-		// Break the remote so this call's commit succeeds but its push fails —
-		// standing in for "network blip / router / GitHub unreachable" without
-		// needing real network flakiness. A bogus local path fails fast (no
-		// hang) rather than timing out.
-		const brokenUrl = join(tmpdir(), `no-such-remote-${Date.now()}`);
-		execSync(`git -C ${clone} remote set-url origin ${brokenUrl}`);
-
-		const svc = new GitService(undefined, console as never);
-		await expect(svc.pushWipIfDirty(clone, "ISS-2")).rejects.toThrow();
-
-		// The commit landed locally even though the push failed — the tree is
-		// now clean, exactly the state that used to cause the early return.
-		const statusAfterFailedPush = execSync(
-			`git -C ${clone} status --porcelain`,
-		).toString();
-		expect(statusAfterFailedPush.trim()).toBe("");
-
-		// The remote recovers (router/GitHub reachable again on the next tick).
-		execSync(`git -C ${clone} remote set-url origin ${origin}`);
-
-		// A later call, now with a clean tree, must still retry the push
-		// instead of silently no-op'ing — this is exactly the regression
-		// Finding 1 guards against.
-		expect(await svc.pushWipIfDirty(clone, "ISS-2")).toBe(true);
-		const remoteBranches = execSync(`git -C ${origin} branch`).toString();
-		expect(remoteBranches).toContain("ISS-2");
-	});
+	// The WIP capture/restore mechanics themselves live in
+	// `GitService.wip-snapshot.test.ts` — this file covers only which start
+	// point a worktree is built from.
 });
 
 describe("worktree continuity — createSingleRepoWorktree wiring", () => {
@@ -222,7 +128,19 @@ describe("worktree continuity — createSingleRepoWorktree wiring", () => {
 		expect(upstream).toBe(`origin/${branchName}`);
 	});
 
-	it("uses the explicit baseBranchOverride instead of the pushed issue branch (override wins)", async () => {
+	/**
+	 * Published work beats an explicit base-branch override.
+	 *
+	 * This used to go the other way, and that was a live data-loss path. A
+	 * session created with a `[repo=name#branch]` selector persists that
+	 * resolution and passes it back on EVERY workspace recreation (see
+	 * `EdgeWorker.ensureSessionWorkspaceExists`), so letting the override win a
+	 * second time meant a destroyed-and-recreated container silently rebranched
+	 * from base and discarded everything published since. The override still
+	 * decides where the issue branch starts — it just doesn't get to decide
+	 * twice. See the test below for that case.
+	 */
+	it("resumes the pushed issue branch even when a baseBranchOverride is given (published work wins)", async () => {
 		const { origin, clone } = makeOriginAndClone();
 		const branchName = "wt-cont-override";
 		const issueBranchTip = pushBranchOnlyToRemote(clone, branchName);
@@ -247,11 +165,38 @@ describe("worktree continuity — createSingleRepoWorktree wiring", () => {
 		const worktreeHead = execSync(`git -C ${result.path} rev-parse HEAD`)
 			.toString()
 			.trim();
-		// Proves the override suppressed the continuity preference: HEAD
-		// matches the override target's tip, not the (also-pushed) issue
-		// branch's tip.
+		// HEAD is the work that was already published on the issue branch, not
+		// the override target — nothing was discarded.
+		expect(worktreeHead).toBe(issueBranchTip);
+		expect(worktreeHead).not.toBe(overrideTip);
+	});
+
+	it("uses the baseBranchOverride when the issue branch has never been published (nothing to continue from)", async () => {
+		const { origin, clone } = makeOriginAndClone();
+		const branchName = "wt-cont-override-fresh"; // deliberately never pushed
+		const overrideBranch = "override-target-fresh";
+		const overrideTip = pushBranchOnlyToRemote(clone, overrideBranch);
+		const mainTip = execSync(`git -C ${origin} rev-parse main`)
+			.toString()
+			.trim();
+		expect(overrideTip).not.toBe(mainTip);
+
+		const workspaceBaseDir = mkdtempSync(join(tmpdir(), "cyrus-wt-"));
+		const repository = makeRepository(clone, workspaceBaseDir);
+		const issue = makeIssue({ identifier: "CONT-B2", branchName });
+		const svc = new GitService(undefined, console as never);
+
+		const result = await svc.createGitWorktree(issue, [repository], {
+			baseBranchOverrides: new Map([[repository.id, overrideBranch]]),
+		});
+
+		const worktreeHead = execSync(`git -C ${result.path} rev-parse HEAD`)
+			.toString()
+			.trim();
+		// The override still does its job on a first creation: HEAD is the
+		// override target, not the repository's default base branch.
 		expect(worktreeHead).toBe(overrideTip);
-		expect(worktreeHead).not.toBe(issueBranchTip);
+		expect(worktreeHead).not.toBe(mainTip);
 	});
 
 	it("falls back to the repository's default base branch when the issue branch does not exist on remote", async () => {

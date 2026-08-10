@@ -194,6 +194,7 @@ import { TeardownCallbackQueue } from "./TeardownCallbackQueue.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
 import type { AgentSessionData, EdgeWorkerEvents } from "./types.js";
 import { UserAccessControl } from "./UserAccessControl.js";
+import { WipSnapshotReaper } from "./WipSnapshotReaper.js";
 import { WorkspaceSyncService } from "./WorkspaceSyncService.js";
 
 export declare interface EdgeWorker {
@@ -252,7 +253,8 @@ export class EdgeWorker extends EventEmitter {
 	 */
 	private logForwarder?: RouterLogForwarder;
 	private previousLogSink?: LogSink;
-	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP branches + state bundles to the router (router platform mode, opt-in via floorSync === true)
+	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP snapshots + state bundles to the router (router platform mode, opt-in via floorSync === true)
+	private readonly wipSnapshotReaper: WipSnapshotReaper; // Deletes WIP snapshot refs at terminal teardown, and retries the ones whose deletion failed
 	private teardownCallbacks?: TeardownCallbackQueue; // Durable, retrying "terminal cleanup is done" callback to the router (router platform mode)
 	private configUpdater: ConfigUpdater | null = null; // Single config updater for configuration updates
 	private persistenceManager: PersistenceManager;
@@ -471,6 +473,16 @@ export class EdgeWorker extends EventEmitter {
 		this.repositoryRouter = new RepositoryRouter(repositoryRouterDeps);
 		this.gitService = new GitService({ cyrusHome: this.cyrusHome });
 
+		this.wipSnapshotReaper = new WipSnapshotReaper({
+			stateFile: join(this.cyrusHome, "state", "wip-snapshot-deletions.json"),
+			deleteSnapshot: (repoPath, branch) =>
+				this.gitService.deleteWipSnapshot(repoPath, branch),
+			logger: {
+				info: (msg) => this.logger.info(msg),
+				warn: (msg) => this.logger.warn(msg),
+			},
+		});
+
 		// Initialize AskUserQuestion handler for elicitation via Linear select signal
 		this.askUserQuestionHandler = new AskUserQuestionHandler({
 			getIssueTracker: (linearWorkspaceId: string) => {
@@ -624,7 +636,7 @@ export class EdgeWorker extends EventEmitter {
 					);
 				}
 
-				// Persistence floor: WIP-push + bundle-upload this issue now that a
+				// Persistence floor: snapshot + bundle-upload this issue now that a
 				// session on it just ended. syncIssueOnTermination() is independent
 				// of the sendSessionState try/catch above — a router-lock signalling
 				// failure must not skip the floor sync, and vice versa. It removes
@@ -726,22 +738,15 @@ export class EdgeWorker extends EventEmitter {
 				},
 			});
 
-			// Persistence floor: WIP-push + bundle-upload sync so container death
-			// (idle-stop, crash, host loss, executor switch) never loses work.
-			// Opt-IN via `router.floorSync: true` — defaults OFF so this is a
-			// no-op for every router-platform device that hasn't asked for it.
-			// Before this feature, a WIP push only ran on worktree teardown; this
-			// service additionally runs on every session end and on a 5-minute
-			// timer, which would otherwise push `wip: auto-saved by cyrus…`
-			// commits onto a teammate's issue branches (including open PRs)
-			// roughly 12x/hour with no opt-in on their part — a real behavior
-			// change for existing router+physical-device deployments, which the
-			// container-executors design explicitly promised would be
-			// unaffected. `ContainerBootCommand.writeConfig` sets `floorSync:
-			// true` for every container it boots (that's what makes the
-			// container restore ladder work); a physical-device user who wants
-			// the floor too (e.g. to enable device -> container migration) opts
-			// in the same way, by setting `floorSync: true` themselves.
+			// Persistence floor: WIP snapshot + bundle-upload sync so container
+			// death (idle-stop, crash, host loss, executor switch) never loses
+			// work. Opt-IN via `router.floorSync: true` — defaults OFF so this
+			// is a no-op for every router-platform device that hasn't asked for
+			// it. `ContainerBootCommand.writeConfig` sets `floorSync: true` for
+			// every container it boots (that's what makes the container restore
+			// ladder work); a physical-device user who wants the floor too (e.g.
+			// to enable device -> container migration) opts in the same way, by
+			// setting `floorSync: true` themselves.
 			if (config.router.floorSync === true) {
 				this.workspaceSync = new WorkspaceSyncService({
 					cyrusHome: this.cyrusHome,
@@ -749,6 +754,8 @@ export class EdgeWorker extends EventEmitter {
 					deviceToken: config.router.deviceToken,
 					gitService: this.gitService,
 					logger: this.logger,
+					onCaptureFailure: (issueKey, detail) =>
+						this.reportWipSnapshotFailure(issueKey, detail),
 				});
 				this.workspaceSync.start();
 			}
@@ -901,6 +908,16 @@ export class EdgeWorker extends EventEmitter {
 
 		// Load persisted state for each repository
 		await this.loadPersistedState();
+
+		// Retry any WIP snapshot ref whose deletion failed before this process
+		// last exited. Backgrounded: it makes network calls per leaked ref, and
+		// nothing about startup depends on it. Once an issue is closed and its
+		// worktree gone, nothing else in the system remembers the ref should be
+		// deleted, so this is the only thing standing between a badly-timed
+		// outage and a ref that lives in the repository forever.
+		this.wipSnapshotReaper.sweep().catch((err) => {
+			this.logger.warn("WIP snapshot sweep failed (non-fatal):", err);
+		});
 
 		// Pre-warm the 30 most recent Claude sessions in the background
 		// so their first query after restart has near-zero cold-start latency.
@@ -3904,18 +3921,22 @@ ${taskSection}`;
 			if (repo) teardownRepositories.push(repo);
 		}
 
-		// Push any uncommitted WIP to origin before teardown scripts run and
-		// worktrees are removed, so a session on another device can resume this
-		// issue via GitService.remoteBranchExists (worktree continuity). A push
-		// failure must never block cleanup — log a warning and continue.
+		// The issue is over, so its WIP snapshots are deleted rather than
+		// refreshed: refs are advertised on every clone and fetch,
+		// repository-wide, and count toward the repository's size limit, so
+		// leaving them behind would tax every contributor's fetch forever. A
+		// reopened issue rebuilds from the issue branch instead. Deletion is a
+		// network call and can fail; `WipSnapshotReaper` records the ones that
+		// do and retries them on the next teardown and on the next start, so
+		// failure never blocks cleanup and never leaks a ref permanently.
 		if (teardownRepositories.length > 0) {
 			// A session's `issue.branchName` can be empty even when an issue is
 			// attached (Linear doesn't always suggest one) — GitService's own
 			// worktree creation falls back to a derived name in that case
 			// (see createSingleRepoWorktree), so mirror that fallback here via
 			// deriveWorktreeBranchName rather than requiring a truthy
-			// branchName, which would otherwise silently skip this push for any
-			// issue Linear didn't suggest a branch name for.
+			// branchName, which would otherwise silently skip the deletion for
+			// any issue Linear didn't suggest a branch name for.
 			const sessionWithIssue = sessions.find((session) => session.issue);
 			if (sessionWithIssue?.issue) {
 				// deriveWorktreeBranchName already returns a sanitized branch
@@ -3927,6 +3948,8 @@ ${taskSection}`;
 				// Mirrors the worktree layout GitService.deleteWorktree resolves
 				// internally: single repo -> workspace root IS the worktree;
 				// multi-repo -> each repo's worktree is a named subdirectory.
+				// Each repository carries its own snapshot under the same ref
+				// name, so every one of them has to be deleted.
 				const workspacePath = join(
 					getDefaultWorktreesDir(this.cyrusHome),
 					message.workItemIdentifier,
@@ -3936,22 +3959,19 @@ ${taskSection}`;
 						? teardownRepositories.map((repo) => join(workspacePath, repo.name))
 						: [workspacePath];
 				for (const worktreePath of worktreePaths) {
-					try {
-						await this.gitService.pushWipIfDirty(worktreePath, branchName);
-					} catch (error) {
-						this.logger.warn(
-							`Failed to push WIP for ${message.workItemIdentifier} at ${worktreePath} before teardown: ${(error as Error).message}`,
-						);
-					}
+					await this.wipSnapshotReaper.reap(worktreePath, branchName);
 				}
+				// Same trip, same remotes: retry anything a previous teardown
+				// failed to delete, so one unreachable remote at the wrong
+				// moment doesn't leak a ref permanently.
+				await this.wipSnapshotReaper.sweep();
 			} else {
 				// No session carries any issue data at all (e.g. only
 				// standalone/no-issue sessions were found for this issueId) —
-				// there is no branch name to derive from, so the push is
-				// genuinely un-performable. Warn rather than silently
-				// stranding any uncommitted WIP.
+				// there is no branch name to derive from, so there is no ref to
+				// delete. Warn rather than silently leaking one.
 				this.logger.warn(
-					`Skipping pre-teardown WIP push for ${message.workItemIdentifier}: no session has issue data to derive a branch name from`,
+					`Skipping WIP snapshot deletion for ${message.workItemIdentifier}: no session has issue data to derive a branch name from`,
 				);
 			}
 		}
@@ -7949,6 +7969,46 @@ ${input.userComment}
 	}
 
 	/**
+	 * Surface a failed WIP snapshot capture onto the issue itself.
+	 *
+	 * The issue branch used to be the fallback for a failed floor push, so
+	 * logging it was enough. It isn't any more: a failed capture means the only
+	 * copy of the agent's uncommitted work never left this machine, and whoever
+	 * can act on that is watching the issue, not the logs. Repository push
+	 * rules (file size, path, extension) apply to every push regardless of ref,
+	 * so a snapshot really can be rejected on an otherwise healthy remote.
+	 *
+	 * `WorkspaceSyncService` already coalesces repeated failures for the same
+	 * issue, so this posts once per unbroken run rather than every five minutes.
+	 */
+	private async reportWipSnapshotFailure(
+		issueKey: string,
+		detail: string,
+	): Promise<void> {
+		const sessions = this.agentSessionManager
+			.getAllSessions()
+			.filter((session) => session.issue?.identifier === issueKey);
+
+		for (const session of sessions) {
+			const repoId = this.sessionRepositories.get(session.id);
+			const workspaceId = repoId
+				? this.repositories.get(repoId)?.linearWorkspaceId
+				: undefined;
+			if (!workspaceId) continue;
+			await this.activityPoster.postThoughtActivity(
+				session.id,
+				workspaceId,
+				`⚠️ I could not save a snapshot of my uncommitted work for ${issueKey}. Until this succeeds, that work only exists on the machine I'm running on and would be lost if it goes away.\n\n\`\`\`\n${detail}\n\`\`\``,
+			);
+			return;
+		}
+
+		this.logger.warn(
+			`Could not surface the WIP snapshot failure for ${issueKey}: no session with a resolvable workspace`,
+		);
+	}
+
+	/**
 	 * Restore-ladder gap-closer: re-creates a session's git-worktree workspace
 	 * if it no longer exists (or was reduced to an empty/invalid directory)
 	 * before a resume attempts to use it as the runner's cwd.
@@ -7960,8 +8020,8 @@ ${input.userComment}
 	 * Without it, a destroyed-and-recreated container (or a worktree deleted by
 	 * hand on a physical device) would resume the Claude transcript into a
 	 * directory `ClaudeRunner`'s own `mkdirSync(cwd, { recursive: true })`
-	 * silently manufactures empty — no repo, no `.git`, and no visibility of
-	 * any WIP commits the persistence floor already pushed to origin.
+	 * silently manufactures empty — no repo, no `.git`, and no sight of the
+	 * work the persistence floor saved.
 	 *
 	 * A no-op on the happy path: `GitService.isWorkspaceValid` is a cheap
 	 * filesystem check, and plain (non-git) workspaces always report valid
@@ -8008,17 +8068,14 @@ ${input.userComment}
 		// `createCyrusAgentSession` itself passes through — instead of
 		// re-deriving from scratch.
 		//
-		// Only repos whose `baseBranchSource === "commit-ish"` are pinned
-		// this way. Passing an override unconditionally would also disable
-		// worktree continuity (`createSingleRepoWorktree`'s check for an
-		// already-pushed `origin/<issueBranch>`, which only runs when NO
-		// override is given) for the common case where `baseBranchName` is
-		// just an ordinary "default"/graphite/parent-issue resolution rather
-		// than a real user-specified override — silently discarding any WIP
-		// already pushed to the issue's own branch by the persistence floor
-		// and rebranching fresh from the base instead. Leaving those repos
-		// out of the map lets `determineBaseBranch` recompute exactly as it
-		// would for a brand-new session, so continuity keeps working.
+		// Only repos whose `baseBranchSource === "commit-ish"` are pinned this
+		// way; leaving the rest out lets `determineBaseBranch` recompute
+		// exactly as it would for a brand-new session. Note that an override
+		// passed here no longer suppresses worktree continuity — published
+		// work on the issue branch wins over it, precisely because this method
+		// re-passes the original selector on every recreation and letting it
+		// win twice would discard everything published since. See
+		// `createSingleRepoWorktree`.
 		const baseBranchOverrides = new Map<string, string>();
 		for (const ctx of session.repositories) {
 			if (ctx.baseBranchName && ctx.baseBranchSource === "commit-ish") {
@@ -8261,15 +8318,19 @@ ${input.userComment}
 		await this.savePersistedState();
 
 		// Prepare the full prompt
-		const fullPrompt = await this.buildSessionPrompt(
-			isNewSession,
+		const fullPrompt = this.withRestoredWorkPreamble(
+			await this.buildSessionPrompt(
+				isNewSession,
+				session,
+				fullIssue,
+				repository,
+				promptBody,
+				attachmentManifest,
+				commentAuthor,
+				commentTimestamp,
+			),
 			session,
-			fullIssue,
-			repository,
-			promptBody,
-			attachmentManifest,
-			commentAuthor,
-			commentTimestamp,
+			needsNewSession,
 		);
 
 		// Start session - use streaming mode if supported for ability to add messages later
@@ -8283,6 +8344,50 @@ ${input.userComment}
 			log.error(`Failed to start streaming session for ${sessionId}:`, error);
 			throw error;
 		}
+	}
+
+	/**
+	 * Prefix `prompt` with a short note when this session woke into a
+	 * workspace whose uncommitted work was rebuilt from a WIP snapshot AND its
+	 * own transcript could not be resumed.
+	 *
+	 * That combination is the only one that needs explaining. An agent that
+	 * resumed its transcript remembers doing the work; an agent starting fresh
+	 * does not, and finds a workspace full of changes with no record of making
+	 * them. The likely failure mode without this is the agent "tidying up"
+	 * unexplained changes by reverting them — throwing away exactly what the
+	 * persistence floor just saved.
+	 *
+	 * Says what happened, not how the floor works. A stale snapshot that was
+	 * deliberately NOT applied gets its own note, because work exists that the
+	 * agent cannot see and may need to recover by hand.
+	 */
+	private withRestoredWorkPreamble(
+		prompt: string,
+		session: CyrusAgentSession,
+		needsNewSession: boolean,
+	): string {
+		if (!needsNewSession) return prompt;
+		const outcomes = Object.values(session.workspace?.wipRestores ?? {});
+		if (outcomes.length === 0) return prompt;
+
+		// One-shot: the note describes what happened when this workspace was
+		// last built. Leaving the marker in place would repeat it on every
+		// future un-resumable turn, long after the agent has been told.
+		session.workspace.wipRestores = undefined;
+
+		const notes: string[] = [];
+		if (outcomes.includes("applied")) {
+			notes.push(
+				"Uncommitted changes already in this workspace were restored from a previous run on this issue. They are your own earlier work, not someone else's — review them and carry on rather than reverting them.",
+			);
+		}
+		if (outcomes.includes("stale")) {
+			notes.push(
+				"Earlier uncommitted work on this issue was found but deliberately not restored, because the branch has been updated since it was saved. Nothing has been lost, but that work is not in this workspace — say so if it looks like something is missing.",
+			);
+		}
+		return `${notes.join("\n\n")}\n\n${prompt}`;
 	}
 
 	/**

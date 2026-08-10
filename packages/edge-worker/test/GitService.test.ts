@@ -14,11 +14,26 @@ import { GitService } from "../src/GitService.js";
 vi.mock("node:child_process", () => ({
 	execSync: vi.fn(),
 	spawn: vi.fn(),
-	// Not exercised by this file's tests (pushWipIfDirty is covered in
-	// GitService.continuity.test.ts against a real repo) — only needed so
-	// GitService.ts's module-level `promisify(execFile)` doesn't blow up on
-	// an undefined import when this mock replaces the whole module.
-	execFile: vi.fn(),
+	// The WIP snapshot path is covered against real repositories in
+	// `GitService.wip-snapshot.test.ts`; here it only needs to not hang.
+	// `GitService` promisifies this, and `worktree creation` calls into it to
+	// look for a snapshot to restore — a `vi.fn()` that never invokes its
+	// callback would leave that promise pending forever and time out every
+	// worktree-creation test in this file. Failing fast makes the restore the
+	// logged no-op these tests expect.
+	execFile: vi.fn(
+		(
+			_cmd: string,
+			_args: string[],
+			_opts: unknown,
+			callback?: (error: Error) => void,
+		) => {
+			const done = typeof _opts === "function" ? _opts : callback;
+			(done as ((error: Error) => void) | undefined)?.(
+				new Error("execFile is not stubbed in this suite"),
+			);
+		},
+	),
 }));
 
 vi.mock("node:fs", () => ({
