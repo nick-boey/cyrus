@@ -81,6 +81,7 @@ export type {
 	IssueMinimal,
 	RepositoryContext,
 	SessionCreator,
+	WipRestoreOutcome,
 	Workspace,
 } from "./CyrusAgentSession.js";
 // Configuration types

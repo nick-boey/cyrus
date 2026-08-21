@@ -9,6 +9,7 @@ import {
 	buildStopHook,
 	inspectGitGuardrail,
 } from "../src/RunnerConfigBuilder.js";
+import { makeBareRemote } from "./helpers/git-fixtures.js";
 
 const silentLogger: ILogger = {
 	debug: () => {},
@@ -78,9 +79,8 @@ describe("buildStopHook", () => {
 
 	it("allows the stop through when the working tree is clean", async () => {
 		// Set up a clean repo synced with its upstream.
-		const remote = mkdtempSync(join(tmpdir(), "cyrus-stop-hook-remote-"));
+		const remote = makeBareRemote("cyrus-stop-hook-remote-");
 		try {
-			execSync(`git init --bare`, { cwd: remote, stdio: "ignore" });
 			git(workdir, "init -b main");
 			git(workdir, `remote add origin ${remote}`);
 			writeFileSync(join(workdir, "README.md"), "hello\n");
@@ -171,9 +171,8 @@ describe("inspectGitGuardrail", () => {
 	});
 
 	it("returns null on a clean repo with no commits ahead of upstream", () => {
-		const remote = mkdtempSync(join(tmpdir(), "cyrus-stop-hook-remote-"));
+		const remote = makeBareRemote("cyrus-stop-hook-remote-");
 		try {
-			execSync(`git init --bare`, { cwd: remote, stdio: "ignore" });
 			git(workdir, "init -b main");
 			git(workdir, `remote add origin ${remote}`);
 			writeFileSync(join(workdir, "README.md"), "hello\n");
@@ -229,9 +228,8 @@ describe("inspectGitGuardrail", () => {
 	});
 
 	it("counts commits ahead of upstream as unshipped work", () => {
-		const remote = mkdtempSync(join(tmpdir(), "cyrus-stop-hook-remote-"));
+		const remote = makeBareRemote("cyrus-stop-hook-remote-");
 		try {
-			execSync(`git init --bare`, { cwd: remote, stdio: "ignore" });
 			git(workdir, "init -b main");
 			git(workdir, `remote add origin ${remote}`);
 			writeFileSync(join(workdir, "README.md"), "hello\n");

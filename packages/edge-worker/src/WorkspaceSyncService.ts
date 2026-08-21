@@ -16,7 +16,7 @@ const DEFAULT_INTERVAL_MS = 5 * 60_000;
  * Upper bound on how long {@link WorkspaceSyncService.stop} will wait for the
  * final flush before giving up and letting shutdown proceed. Individual git
  * operations and the bundle upload each have their own timeouts (see
- * `GitService.pushWipIfDirty` and `cyrus-workspace-sync`'s `uploadBundle`) —
+ * `GitService.captureWipSnapshot` and `cyrus-workspace-sync`'s `uploadBundle`) —
  * this is a second, outer cap so that even several touched issues fanned out
  * together can't collectively stall shutdown far beyond that. A best-effort
  * flush that gives up is strictly better than a shutdown that never
@@ -29,7 +29,10 @@ export interface WorkspaceSyncServiceOptions {
 	cyrusHome: string;
 	routerUrl: string;
 	deviceToken: string;
-	gitService: Pick<GitService, "pushWipIfDirty" | "deriveWorktreeBranchName">;
+	gitService: Pick<
+		GitService,
+		"captureWipSnapshot" | "deriveWorktreeBranchName"
+	>;
 	logger: { info(msg: string): void; warn(msg: string): void };
 	/** How often the periodic flush runs. Default 5 minutes. */
 	intervalMs?: number;
@@ -40,6 +43,13 @@ export interface WorkspaceSyncServiceOptions {
 	 * {@link DEFAULT_STOP_FLUSH_TIMEOUT_MS}.
 	 */
 	stopFlushTimeoutMs?: number;
+	/**
+	 * Called when a WIP snapshot could not be captured for an issue, so the
+	 * failure reaches a human instead of only a log file. Invoked at most once
+	 * per unbroken run of failures per issue (see
+	 * {@link WorkspaceSyncService.captureSnapshotSafely}). Must not throw.
+	 */
+	onCaptureFailure?: (issueKey: string, detail: string) => void | Promise<void>;
 }
 
 function sessionsForIssue(
@@ -82,8 +92,9 @@ interface SyncOutcome {
  * switching executors); this is what guarantees nothing is lost when that
  * happens. On session end, on shutdown, and on a timer, it:
  *
- *  1. Pushes any uncommitted worktree changes for the issue to its git
- *     branch as WIP commits ({@link GitService.pushWipIfDirty}).
+ *  1. Captures a WIP snapshot of each of the issue's worktrees onto a hidden
+ *     ref ({@link GitService.captureWipSnapshot}). The issue branch is never
+ *     written — it belongs to the agent.
  *  2. Bundles the Claude session transcripts + session metadata and
  *     uploads them to the router ({@link buildBundle} / {@link uploadBundle}).
  *
@@ -139,7 +150,7 @@ interface SyncOutcome {
  * not to be rehydrated, i.e. after a restart, not while the same process
  * keeps running with a stale runner reference). So `liveSessions.size` for
  * that issue can never reach 0 on account of that one session, and the
- * issue keeps being WIP-pushed and re-bundled every periodic tick for the
+ * issue keeps being snapshotted and re-bundled every periodic tick for the
  * remainder of the process's life — exactly as originally reported. This
  * is wasted work, not lost work (the floor's operations are idempotent
  * no-ops once nothing has changed), and it is bounded: it ends when either
@@ -163,12 +174,15 @@ export class WorkspaceSyncService {
 	private readonly deviceToken: string;
 	private readonly gitService: Pick<
 		GitService,
-		"pushWipIfDirty" | "deriveWorktreeBranchName"
+		"captureWipSnapshot" | "deriveWorktreeBranchName"
 	>;
 	private readonly logger: { info(msg: string): void; warn(msg: string): void };
 	private readonly intervalMs: number;
 	private readonly claudeProjectsDir: string;
 	private readonly stopFlushTimeoutMs: number;
+	private readonly onCaptureFailure?: WorkspaceSyncServiceOptions["onCaptureFailure"];
+	/** Issues whose current run of capture failures has already been reported. */
+	private readonly reportedCaptureFailures = new Set<string>();
 	private readonly touchedIssues = new Set<string>();
 	/** Refcount of live sessions per issue — see the class doc's "Touched-set lifecycle" section. */
 	private readonly liveSessionsByIssue = new Map<string, Set<string>>();
@@ -186,6 +200,7 @@ export class WorkspaceSyncService {
 			opts.claudeProjectsDir ?? join(homedir(), ".claude", "projects");
 		this.stopFlushTimeoutMs =
 			opts.stopFlushTimeoutMs ?? DEFAULT_STOP_FLUSH_TIMEOUT_MS;
+		this.onCaptureFailure = opts.onCaptureFailure;
 	}
 
 	/**
@@ -283,7 +298,7 @@ export class WorkspaceSyncService {
 	}
 
 	/**
-	 * WIP-push + bundle + upload for one issue. Serialized per issue; never
+	 * Snapshot capture + bundle + upload for one issue. Serialized per issue; never
 	 * throws. Resolves `true` on success, `false` on failure (the failure is
 	 * already logged).
 	 *
@@ -349,14 +364,14 @@ export class WorkspaceSyncService {
 					// The worktree was torn down through some path other than
 					// syncIssueOnTermination (issue reached a terminal state via a
 					// different code path, or the session died without ever
-					// reaching its termination hook). Pushing WIP here would just
+					// reaching its termination hook). Capturing here would just
 					// hit ENOENT — and would keep hitting it every tick forever —
 					// so skip it. `workspaceGone` below drops the issue from the
 					// touched set entirely once every workspace path is confirmed
 					// missing, so this is a one-time skip, not a recurring one.
 					missingWorkspaces++;
 					this.logger.info(
-						`WorkspaceSyncService: workspace ${workspacePath} for issue ${issueKey} no longer exists on disk; skipping WIP push for it`,
+						`WorkspaceSyncService: workspace ${workspacePath} for issue ${issueKey} no longer exists on disk; skipping the WIP snapshot for it`,
 					);
 					continue;
 				}
@@ -365,7 +380,11 @@ export class WorkspaceSyncService {
 				);
 				if (!session) continue;
 				const branch = this.gitService.deriveWorktreeBranchName(session.issue);
-				await this.pushWipForWorkspace(workspacePath, branch, issueKey);
+				await this.captureSnapshotsForWorkspace(
+					workspacePath,
+					branch,
+					issueKey,
+				);
 			}
 			const workspaceGone =
 				workspacePaths.length > 0 &&
@@ -403,19 +422,19 @@ export class WorkspaceSyncService {
 	}
 
 	/**
-	 * Pushes WIP for a single-repo workspace, or — when `workspacePath` isn't
-	 * itself a git repo (the multi-repo layout root) — fans out to each
-	 * immediate subdirectory that contains a `.git` entry. Errors are logged
-	 * per-workspace and never propagate, so one bad repo can't block the
-	 * others or abort the bundle upload.
+	 * Captures a WIP snapshot for a single-repo workspace, or — when
+	 * `workspacePath` isn't itself a git repo (the multi-repo layout root) —
+	 * fans out to each immediate subdirectory that contains a `.git` entry.
+	 * Errors are handled per-repository and never propagate, so one repository
+	 * failing can't cost the operator the others or abort the bundle upload.
 	 */
-	private async pushWipForWorkspace(
+	private async captureSnapshotsForWorkspace(
 		workspacePath: string,
 		branch: string,
 		issueKey: string,
 	): Promise<void> {
 		if (existsSync(join(workspacePath, ".git"))) {
-			await this.pushWipSafely(workspacePath, branch, issueKey);
+			await this.captureSnapshotSafely(workspacePath, branch, issueKey);
 			return;
 		}
 
@@ -431,22 +450,48 @@ export class WorkspaceSyncService {
 		for (const entry of entries) {
 			const subdir = join(workspacePath, entry);
 			if (existsSync(join(subdir, ".git"))) {
-				await this.pushWipSafely(subdir, branch, issueKey);
+				await this.captureSnapshotSafely(subdir, branch, issueKey);
 			}
 		}
 	}
 
-	private async pushWipSafely(
+	/**
+	 * One repository's snapshot capture. Failures stay isolated to this
+	 * repository — but they are no longer merely logged.
+	 *
+	 * The issue branch used to be a fallback: a swallowed push failure still
+	 * left the work somewhere a human could find it. It isn't any more, so a
+	 * failed capture means the only copy of the agent's uncommitted work never
+	 * left this machine, and somebody has to be told while they can still act
+	 * on it. Repository push rules (file size, path, extension) apply to every
+	 * push regardless of ref, so this is a live scenario, not a theoretical one.
+	 *
+	 * Reported at most once per unbroken run of failures for an issue, so a
+	 * remote that stays unreachable doesn't post every five minutes and drown
+	 * the timeline it is trying to warn on. A successful capture re-arms the
+	 * report.
+	 */
+	private async captureSnapshotSafely(
 		repoPath: string,
 		branch: string,
 		issueKey: string,
 	): Promise<void> {
 		try {
-			await this.gitService.pushWipIfDirty(repoPath, branch);
+			await this.gitService.captureWipSnapshot(repoPath, branch);
+			this.reportedCaptureFailures.delete(issueKey);
 		} catch (error) {
 			this.logger.warn(
-				`WorkspaceSyncService: WIP push failed for issue ${issueKey} at ${repoPath}: ${String(error)}`,
+				`WorkspaceSyncService: WIP snapshot failed for issue ${issueKey} at ${repoPath}: ${String(error)}`,
 			);
+			if (this.reportedCaptureFailures.has(issueKey)) return;
+			this.reportedCaptureFailures.add(issueKey);
+			try {
+				await this.onCaptureFailure?.(issueKey, String(error));
+			} catch (reportError) {
+				this.logger.warn(
+					`WorkspaceSyncService: could not report the snapshot failure for ${issueKey}: ${String(reportError)}`,
+				);
+			}
 		}
 	}
 

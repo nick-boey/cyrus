@@ -15,6 +15,10 @@ import { AgentSessionManager } from "../src/AgentSessionManager.js";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 import { SharedApplicationServer } from "../src/SharedApplicationServer.js";
 import type { EdgeWorkerConfig, RepositoryConfig } from "../src/types.js";
+import {
+	makeOriginAndClone,
+	pushBranchOnlyToRemote,
+} from "./helpers/git-fixtures.js";
 import { TEST_CYRUS_HOME } from "./test-dirs.js";
 
 /**
@@ -68,38 +72,14 @@ vi.mock("cyrus-core", async (importOriginal) => {
 });
 vi.mock("file-type");
 
-/** Bare origin + a clone that can push to it. */
-function makeOriginAndClone() {
-	const dir = mkdtempSync(join(tmpdir(), "cyrus-resume-git-"));
-	const origin = join(dir, "origin.git");
-	const clone = join(dir, "clone");
-	execSync(`git init --bare ${origin} -b main`);
-	execSync(`git clone ${origin} ${clone}`);
-	execSync(
-		`git -C ${clone} -c user.email=t@t -c user.name=t commit --allow-empty -m init`,
-	);
-	execSync(`git -C ${clone} push origin main`);
-	return { origin, clone };
-}
-
 /**
- * Pushes a WIP commit to `origin/<branchName>` without ever checking the
- * branch out anywhere durable — standing in for the persistence floor's
- * `pushWipIfDirty` from a container that has since been destroyed. Returns
- * the pushed commit's SHA for a direct HEAD comparison later.
+ * Pushes a commit to `origin/<branchName>` without ever checking the branch
+ * out anywhere durable — standing in for work published from a container that
+ * has since been destroyed. Returns the pushed commit's SHA for a direct HEAD
+ * comparison later.
  */
 function pushWipOnlyToRemote(clone: string, branchName: string): string {
-	execSync(`git -C ${clone} checkout -b ${branchName}`);
-	execSync(`echo wip > ${join(clone, "wip.txt")}`);
-	execSync(`git -C ${clone} add wip.txt`);
-	execSync(
-		`git -C ${clone} -c user.email=t@t -c user.name=t commit -m "wip on ${branchName}"`,
-	);
-	execSync(`git -C ${clone} push origin ${branchName}`);
-	const tip = execSync(`git -C ${clone} rev-parse HEAD`).toString().trim();
-	execSync(`git -C ${clone} checkout main`);
-	execSync(`git -C ${clone} branch -D ${branchName}`);
-	return tip;
+	return pushBranchOnlyToRemote(clone, branchName, "wip.txt");
 }
 
 /**
@@ -493,5 +473,154 @@ Issue: {{issue_identifier}}`;
 		expect(existsSync(join(missingWorkspacePath, "release-marker.txt"))).toBe(
 			true,
 		);
+	});
+
+	/**
+	 * The commit-ish data-loss path. A session created with a
+	 * `[repo=name#branch]` selector re-passes that override on EVERY workspace
+	 * recreation, so while the override suppressed worktree continuity, a
+	 * destroyed-and-recreated container silently rebranched from the override
+	 * target and discarded everything already published on the issue branch.
+	 * Published work must win.
+	 */
+	it("recovers published work for a repository with a commit-ish base instead of discarding it", async () => {
+		const { clone } = makeOriginAndClone();
+		const branchName = "RESTORE-4-commit-ish-recovery";
+
+		// The override target, diverged from main.
+		execSync(`git -C ${clone} checkout -b release/3.0`);
+		execSync(`echo release > ${join(clone, "release-marker.txt")}`);
+		execSync(`git -C ${clone} add release-marker.txt`);
+		execSync(
+			`git -C ${clone} -c user.email=t@t -c user.name=t commit -m "release 3.0 marker"`,
+		);
+		execSync(`git -C ${clone} push origin release/3.0`);
+		execSync(`git -C ${clone} checkout main`);
+
+		// Work the agent already published on the issue branch, from a
+		// container that has since been destroyed.
+		const publishedTip = pushWipOnlyToRemote(clone, branchName);
+
+		const workspaceBaseDir = mkdtempSync(join(tmpdir(), "cyrus-resume-ws-"));
+		const missingWorkspacePath = join(workspaceBaseDir, "RESTORE-4");
+
+		const mockRepository: RepositoryConfig = {
+			id: "repo-1",
+			name: "test-repo",
+			repositoryPath: clone,
+			workspaceBaseDir,
+			baseBranch: "main",
+			linearWorkspaceId: "test-workspace",
+			isActive: true,
+		} as RepositoryConfig;
+
+		const edgeWorker = buildEdgeWorker(
+			mockRepository,
+			makeIssueFixture({ identifier: "RESTORE-4", branchName }),
+		);
+
+		const session: any = {
+			id: "agent-session-4",
+			issueId: "issue-RESTORE-4",
+			issueContext: {
+				trackerId: "linear",
+				issueId: "issue-RESTORE-4",
+				issueIdentifier: "RESTORE-4",
+			},
+			issue: {
+				id: "issue-RESTORE-4",
+				identifier: "RESTORE-4",
+				title: "Commit-ish recovery test issue",
+				branchName,
+			},
+			repositories: [
+				{
+					repositoryId: "repo-1",
+					branchName,
+					baseBranchName: "release/3.0",
+					baseBranchSource: "commit-ish",
+				},
+			],
+			workspace: { path: missingWorkspacePath, isGitWorktree: true },
+			claudeSessionId: "prior-claude-session-commit-ish",
+		};
+
+		await (edgeWorker as any).resumeAgentSession(
+			session,
+			mockRepository,
+			"agent-session-4",
+			mockAgentSessionManager,
+			"please continue",
+		);
+
+		// HEAD is the published issue-branch commit, not the override target —
+		// the work survived the missing -> recreated round trip.
+		const headAfterResume = execSync(
+			`git -C ${missingWorkspacePath} rev-parse HEAD`,
+		)
+			.toString()
+			.trim();
+		expect(headAfterResume).toBe(publishedTip);
+		expect(existsSync(join(missingWorkspacePath, "wip.txt"))).toBe(true);
+	});
+});
+
+/**
+ * When a snapshot is applied AND the agent's transcript could not be resumed,
+ * the agent wakes with no memory of work it appears to have done. Without a
+ * word of explanation the likely failure mode is that it "tidies up" the
+ * unexplained changes by reverting them — throwing away exactly what the
+ * persistence floor just saved. A resuming agent needs no such explanation.
+ */
+describe("EdgeWorker - restored-work preamble", () => {
+	function preambleFor(
+		wipRestores: Record<string, "applied" | "stale"> | undefined,
+		needsNewSession: boolean,
+	): string {
+		const worker = Object.create(EdgeWorker.prototype) as unknown as EdgeWorker;
+		const session = {
+			workspace: { path: "/tmp/ws", isGitWorktree: true, wipRestores },
+		} as any;
+		return (worker as any).withRestoredWorkPreamble(
+			"ORIGINAL PROMPT",
+			session,
+			needsNewSession,
+		);
+	}
+
+	it("explains restored work to an agent that could not resume its transcript", () => {
+		const prompt = preambleFor({ "repo-1": "applied" }, true);
+		expect(prompt).toContain("restored from a previous run");
+		expect(prompt).toContain("rather than reverting them");
+		expect(prompt.endsWith("ORIGINAL PROMPT")).toBe(true);
+	});
+
+	it("says nothing to an agent that did resume its transcript", () => {
+		expect(preambleFor({ "repo-1": "applied" }, false)).toBe("ORIGINAL PROMPT");
+	});
+
+	it("says nothing when there was no snapshot to restore", () => {
+		expect(preambleFor(undefined, true)).toBe("ORIGINAL PROMPT");
+	});
+
+	it("tells the agent when work was found but deliberately not applied", () => {
+		const prompt = preambleFor({ "repo-1": "stale" }, true);
+		expect(prompt).toContain("deliberately not restored");
+		expect(prompt).toContain("ORIGINAL PROMPT");
+	});
+
+	it("only says it once — a later un-resumable turn is not re-explained", () => {
+		const worker = Object.create(EdgeWorker.prototype) as unknown as EdgeWorker;
+		const session = {
+			workspace: {
+				path: "/tmp/ws",
+				isGitWorktree: true,
+				wipRestores: { "repo-1": "applied" as const },
+			},
+		} as any;
+		const first = (worker as any).withRestoredWorkPreamble("P", session, true);
+		const second = (worker as any).withRestoredWorkPreamble("P", session, true);
+		expect(first).not.toBe("P");
+		expect(second).toBe("P");
 	});
 });
