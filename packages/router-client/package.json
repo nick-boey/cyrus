@@ -2,6 +2,11 @@
 	"name": "cyrus-router-client",
 	"version": "0.2.66",
 	"description": "Device-side WebSocket client for the Cyrus Router: dial, reconnect, RPC, acks, and durable offline buffer/inbox",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/cyrusagents/cyrus.git",
+		"directory": "packages/router-client"
+	},
 	"type": "module",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",

@@ -2,6 +2,11 @@
 	"name": "cyrus-router",
 	"version": "0.2.66",
 	"description": "SQLite-backed device registry, event queue, and RPC router for Cyrus per-user device routing",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/cyrusagents/cyrus.git",
+		"directory": "packages/router"
+	},
 	"type": "module",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",

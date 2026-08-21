@@ -2,6 +2,11 @@
 	"name": "cyrus-router-protocol",
 	"version": "0.2.66",
 	"description": "Wire frame schemas and RPC method allowlist for Cyrus Router per-user device routing",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/cyrusagents/cyrus.git",
+		"directory": "packages/router-protocol"
+	},
 	"type": "module",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
