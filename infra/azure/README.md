@@ -1243,6 +1243,51 @@ Running sandbox that does not connect is not healthy and must be recreated.
 Suspend sends no SIGTERM. The measured memory-mode resume was **0.52 s**;
 suspend took 6.47 s. Do not assume a shutdown hook runs at park time.
 
+#### Diagnosing a sandbox that boots but never connects
+
+The failure above — `Running`, no device connection — is almost always
+`container-boot` dying before it reaches `launch()`. Read its log:
+
+```bash
+aca sandbox list --selector 'cyrus.issue=<ISSUE-KEY>'
+aca sandbox exec --id <sandbox-id> -c 'cat ~/cyrus-boot.log'
+```
+
+`~/cyrus-boot.log` is written by `container-boot` itself and holds every step
+plus the fatal error and its stack. It exists because the Phase 2 log relay
+cannot help here: `SandboxLogRelay` forwards only after the router advertises
+`log_ingest` in `hello_ack`, so a boot that fails *before* connecting produces
+nothing on the WSS and its stdout is collected by nothing. The file is on the
+sandbox disk, so it survives for the sandbox's lifetime but dies with it —
+read it before destroying the container.
+
+It is written to `$HOME` rather than `/var/log` because the worker image runs
+as the unprivileged `cyrus` user (uid 1001) and `/var/log` is root-owned.
+
+To confirm a process-level diagnosis rather than infer it:
+
+```bash
+aca sandbox exec --id <sandbox-id> \
+  -c 'for p in /proc/[0-9]*; do tr "\0" " " < $p/cmdline; echo; done'
+```
+
+A healthy worker shows `node /app/dist/src/app.js --cyrus-home /workspaces/.cyrus start`.
+Only `tini -- sleep infinity` and `sleep infinity` means the workload exited
+(`ps` is not installed in the image).
+
+The most common cause is an expired GitHub credential. `container-boot`
+preflights it and fails with `GH_TOKEN was rejected by GitHub (HTTP 401)`;
+classic PATs (`ghp_…`) expire on a schedule. Verify and rotate:
+
+```bash
+aca sandbox exec --id <sandbox-id> \
+  -c 'curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user'
+```
+
+Rotate the secret (`/setup`, or `cyrus router secrets set` via `az containerapp
+exec`), then **destroy the container and re-prompt** — a rotated per-user secret
+reaches only a create-from-image, never a resume or a create-from-snapshot.
+
 ### Secret rotation (N4)
 
 The Linear app and workspace secrets in Key Vault are **seeded from Terraform vars on first

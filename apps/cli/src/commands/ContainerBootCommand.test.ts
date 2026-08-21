@@ -10,13 +10,15 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { EdgeConfigSchema, RepositoryConfigSchema } from "cyrus-core";
 import { sanitizeCwdForClaudeProjects } from "cyrus-workspace-sync";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	BOOT_LOG_PATH,
 	ContainerBootCommand,
+	createBootLogger,
 	defaultExec,
 	type ExecFn,
 	findMissingEnvVars,
@@ -71,6 +73,13 @@ function makeFakeExec(
 function silentLogger() {
 	return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
+
+/** A GitHub credential probe that reports a healthy, `repo`-scoped classic PAT. */
+const okProbe = async () => ({
+	ok: true,
+	status: 200,
+	scopeHeader: "repo, read:org",
+});
 
 describe("findMissingEnvVars", () => {
 	it("returns an empty array when every required var is present", () => {
@@ -1301,6 +1310,7 @@ describe("ContainerBootCommand.execute — full fresh-start orchestration", () =
 			restoreBundleFn,
 			appPath: "/app/dist/src/app.js",
 			logger: silentLogger(),
+			probeGitHubTokenFn: okProbe,
 		});
 
 		await cmd.execute([]);
@@ -1421,5 +1431,153 @@ describe("ContainerBootCommand.execute — --restore-only", () => {
 		expect(spawnFn).not.toHaveBeenCalled();
 
 		onSpy.mockRestore();
+	});
+});
+
+describe("ContainerBootCommand.verifyGitHubToken", () => {
+	it("fails the boot with a credential-shaped message when GitHub 401s the token", async () => {
+		const probeGitHubTokenFn = vi.fn().mockResolvedValue({
+			ok: false,
+			status: 401,
+			scopeHeader: null,
+			error: "GitHub returned HTTP 401",
+		});
+		const cmd = new ContainerBootCommand({
+			env: baseEnv({ GH_TOKEN: "ghp_dead" }),
+			logger: silentLogger(),
+			probeGitHubTokenFn,
+		});
+
+		await expect(cmd.verifyGitHubToken()).rejects.toThrow(
+			/GH_TOKEN was rejected by GitHub \(HTTP 401\)/,
+		);
+		// The remedy names the issue, because a rotated secret only reaches a
+		// create-from-image — an existing container keeps its baked env.
+		await expect(cmd.verifyGitHubToken()).rejects.toThrow(
+			/cyrus router containers destroy CYPACK-11/,
+		);
+		// The token value itself must never reach the message.
+		await expect(cmd.verifyGitHubToken()).rejects.not.toThrow(/ghp_dead/);
+	});
+
+	it("prefers GH_TOKEN over the legacy GIT_TOKEN", async () => {
+		const probeGitHubTokenFn = vi.fn().mockResolvedValue(await okProbe());
+		const cmd = new ContainerBootCommand({
+			env: baseEnv({ GH_TOKEN: "gh-tok", GIT_TOKEN: "git-tok" }),
+			logger: silentLogger(),
+			probeGitHubTokenFn,
+		});
+
+		await cmd.verifyGitHubToken();
+
+		expect(probeGitHubTokenFn).toHaveBeenCalledWith("gh-tok");
+	});
+
+	it("warns but continues when the probe fails for any reason other than 401", async () => {
+		// 403 is GitHub's rate-limit status and a network error may be a blip;
+		// neither is evidence the credential is dead, so neither may block a boot.
+		for (const probe of [
+			{ ok: false, status: 403, scopeHeader: null, error: "HTTP 403" },
+			{ ok: false, scopeHeader: null, error: "fetch failed" },
+		]) {
+			const logger = silentLogger();
+			const cmd = new ContainerBootCommand({
+				env: baseEnv({ GH_TOKEN: "gh-tok" }),
+				logger,
+				probeGitHubTokenFn: vi.fn().mockResolvedValue(probe),
+			});
+
+			await expect(cmd.verifyGitHubToken()).resolves.toBeUndefined();
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("Could not verify GH_TOKEN"),
+			);
+		}
+	});
+
+	it("is a no-op when no GitHub credential is configured", async () => {
+		const probeGitHubTokenFn = vi.fn();
+		const cmd = new ContainerBootCommand({
+			env: baseEnv(),
+			logger: silentLogger(),
+			probeGitHubTokenFn,
+		});
+
+		await cmd.verifyGitHubToken();
+
+		expect(probeGitHubTokenFn).not.toHaveBeenCalled();
+	});
+});
+
+describe("createBootLogger", () => {
+	let dir: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "cyrus-boot-log-"));
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("appends every level to the log file so a failed boot leaves evidence on disk", () => {
+		const logPath = join(dir, "boot.log");
+		const logger = createBootLogger(logPath);
+
+		logger.info("cloning");
+		logger.warn("slow");
+		logger.error("Boot failed: Error: git clone failed");
+
+		const contents = readFileSync(logPath, "utf-8");
+		expect(contents).toContain("info cloning");
+		expect(contents).toContain("warn slow");
+		expect(contents).toContain("error Boot failed: Error: git clone failed");
+		// Appends, never truncates: a container that reboots keeps the earlier
+		// attempt's evidence.
+		expect(contents.trimEnd().split("\n")).toHaveLength(3);
+	});
+
+	it("defaults to a path the unprivileged container user can actually write", () => {
+		// The worker image runs as `cyrus` (uid 1001) and /var/log is root-owned,
+		// so a default under /var/log would EACCES — and because persistence is
+		// best-effort, that failure is swallowed and the log silently never
+		// exists. $HOME is the one directory guaranteed writable this early.
+		expect(BOOT_LOG_PATH.startsWith(homedir())).toBe(true);
+		expect(BOOT_LOG_PATH.startsWith("/var/log")).toBe(false);
+	});
+
+	it("degrades to console-only when the log path is unwritable", () => {
+		// A missing directory must not abort a boot that would otherwise succeed.
+		const logger = createBootLogger(join(dir, "no-such-dir", "boot.log"));
+
+		expect(() => logger.error("still runs")).not.toThrow();
+	});
+});
+
+describe("ContainerBootCommand.execute — boot failure diagnostics", () => {
+	it("logs the failure before rethrowing, since nothing collects stdout pre-connect", async () => {
+		const logger = silentLogger();
+		const cmd = new ContainerBootCommand({
+			env: baseEnv({
+				GH_TOKEN: "ghp_dead",
+				CYRUS_WORKSPACES_DIR: mkdtempSync(
+					join(tmpdir(), "cyrus-boot-fail-ws-"),
+				),
+			}),
+			logger,
+			homeDir: mkdtempSync(join(tmpdir(), "cyrus-boot-fail-home-")),
+			downloadBundleFn: vi.fn().mockResolvedValue(false),
+			restoreBundleFn: vi.fn(),
+			probeGitHubTokenFn: vi.fn().mockResolvedValue({
+				ok: false,
+				status: 401,
+				scopeHeader: null,
+				error: "GitHub returned HTTP 401",
+			}),
+		});
+
+		await expect(cmd.execute([])).rejects.toThrow(/HTTP 401/);
+		expect(logger.error).toHaveBeenCalledWith(
+			expect.stringContaining("Boot failed:"),
+		);
 	});
 });

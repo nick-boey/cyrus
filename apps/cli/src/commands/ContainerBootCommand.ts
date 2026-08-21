@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import {
+	appendFileSync,
 	chmodSync,
 	cpSync,
 	existsSync,
@@ -15,6 +16,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { EdgeConfigSchema, RepositoryConfigSchema } from "cyrus-core";
+import { GITHUB_TOKEN_SECRET_KEYS, probeGitHubTokenScopes } from "cyrus-router";
 import {
 	downloadBundle as defaultDownloadBundle,
 	restoreBundle as defaultRestoreBundle,
@@ -158,11 +160,66 @@ export interface ContainerBootLogger {
 	error(message: string): void;
 }
 
-const defaultLogger: ContainerBootLogger = {
-	info: (m) => console.log(`[container-boot] ${m}`),
-	warn: (m) => console.warn(`[container-boot] ${m}`),
-	error: (m) => console.error(`[container-boot] ${m}`),
-};
+/**
+ * Where boot output is persisted inside the container, in addition to stdout.
+ *
+ * Nothing collects a sandbox worker's stdout. The Phase 2 log relay
+ * (`SandboxLogRelay`) ships records over the router WSS, but only once the
+ * router has advertised `log_ingest` in `hello_ack` — so every line printed
+ * *before* `launch()` connects dies with the sandbox. That is exactly the
+ * window in which boot failures happen (bad credential, unclonable repo,
+ * malformed config), which made them invisible in every log an operator has.
+ *
+ * A plain file on the sandbox disk closes that window: `aca sandbox exec
+ * --id <id> -c 'cat ~/cyrus-boot.log'` retrieves the failure without having to
+ * re-run `container-boot` by hand to reproduce it.
+ *
+ * Lives in `$HOME`, not `/var/log`: the worker image runs as the unprivileged
+ * `cyrus` user (uid 1001) and `/var/log` is root-owned, so writes there fail
+ * with EACCES — and since persistence is best-effort by design, that failure
+ * would be swallowed and the log would silently never exist. `$HOME` is the
+ * one directory guaranteed writable this early, before `$CYRUS_WORKSPACES_DIR`
+ * has been validated or its volume confirmed mounted.
+ */
+export const BOOT_LOG_PATH = join(homedir(), "cyrus-boot.log");
+
+/**
+ * Console logger that also appends to {@link BOOT_LOG_PATH}. Appends (never
+ * truncates) so a container that reboots keeps the earlier attempt's evidence.
+ *
+ * File writes are best-effort: a read-only or missing log directory must
+ * degrade to console-only, never abort a boot that would otherwise succeed.
+ */
+export function createBootLogger(
+	logPath: string = BOOT_LOG_PATH,
+): ContainerBootLogger {
+	const persist = (level: string, message: string): void => {
+		try {
+			appendFileSync(
+				logPath,
+				`${new Date().toISOString()} ${level} ${message}\n`,
+			);
+		} catch {
+			// Console output already happened; losing the file copy is not fatal.
+		}
+	};
+	return {
+		info: (m) => {
+			console.log(`[container-boot] ${m}`);
+			persist("info", m);
+		},
+		warn: (m) => {
+			console.warn(`[container-boot] ${m}`);
+			persist("warn", m);
+		},
+		error: (m) => {
+			console.error(`[container-boot] ${m}`);
+			persist("error", m);
+		},
+	};
+}
+
+const defaultLogger: ContainerBootLogger = createBootLogger();
 
 export interface ContainerBootDeps {
 	env?: NodeJS.ProcessEnv;
@@ -175,6 +232,8 @@ export interface ContainerBootDeps {
 	appPath?: string;
 	downloadBundleFn?: typeof defaultDownloadBundle;
 	restoreBundleFn?: typeof defaultRestoreBundle;
+	/** Overrides the GitHub credential preflight — see {@link ContainerBootCommand.verifyGitHubToken}. */
+	probeGitHubTokenFn?: typeof probeGitHubTokenScopes;
 }
 
 /**
@@ -203,6 +262,7 @@ export class ContainerBootCommand implements ICommand {
 	private readonly appPath: string;
 	private readonly downloadBundleFn: typeof defaultDownloadBundle;
 	private readonly restoreBundleFn: typeof defaultRestoreBundle;
+	private readonly probeGitHubTokenFn: typeof probeGitHubTokenScopes;
 
 	constructor(deps: ContainerBootDeps = {}) {
 		this.env = deps.env ?? process.env;
@@ -213,9 +273,29 @@ export class ContainerBootCommand implements ICommand {
 		this.appPath = deps.appPath ?? process.argv[1] ?? "";
 		this.downloadBundleFn = deps.downloadBundleFn ?? defaultDownloadBundle;
 		this.restoreBundleFn = deps.restoreBundleFn ?? defaultRestoreBundle;
+		this.probeGitHubTokenFn = deps.probeGitHubTokenFn ?? probeGitHubTokenScopes;
 	}
 
-	async execute(_args: string[]): Promise<void> {
+	/**
+	 * Runs {@link boot} and makes sure a failure leaves a durable trace.
+	 *
+	 * The error is re-thrown unchanged so `app.ts` still reports and exits;
+	 * this only guarantees the stack reaches {@link BOOT_LOG_PATH} first. Left
+	 * to `app.ts` alone it would go to a stdout nothing collects, because the
+	 * boot dies before the router connection the log relay rides on exists.
+	 */
+	async execute(args: string[]): Promise<void> {
+		try {
+			await this.boot(args);
+		} catch (error) {
+			this.logger.error(
+				`Boot failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+			);
+			throw error;
+		}
+	}
+
+	private async boot(_args: string[]): Promise<void> {
 		const missing = findMissingEnvVars(this.env);
 		if (missing.length > 0) {
 			this.logger.error(
@@ -276,6 +356,10 @@ export class ContainerBootCommand implements ICommand {
 			return;
 		}
 
+		// Preflight the GitHub credential before anything tries to use it, so a
+		// dead token is reported as a dead token rather than as a clone failure.
+		await this.verifyGitHubToken();
+
 		// configureGit MUST run before cloneRepos: it installs the credential
 		// helper that authenticates the clone, so the clone URL itself never
 		// needs (and never gets) GIT_TOKEN embedded in it. That keeps the
@@ -296,6 +380,43 @@ export class ContainerBootCommand implements ICommand {
 
 	private cyrusHomeFor(workspacesDir: string): string {
 		return join(workspacesDir, ".cyrus");
+	}
+
+	/**
+	 * Fails the boot when GitHub rejects the container's credential outright.
+	 *
+	 * Without this, an expired token first surfaces as `git clone`'s
+	 * `fatal: Authentication failed for '<repo url>'`, which reads as a
+	 * repository problem — wrong slug, missing access, private repo — and sends
+	 * the operator looking in the wrong place. Classic PATs expire on a
+	 * schedule, so this is the routine failure, not the exotic one.
+	 *
+	 * Only HTTP 401 is fatal: it is the single status that means "this
+	 * credential is dead". A 403 is GitHub's rate-limit status, and a network
+	 * error may be a blip or an egress-allowlist gap — neither is evidence the
+	 * token is bad, so both warn and let the clone speak for itself.
+	 */
+	async verifyGitHubToken(): Promise<void> {
+		// Same precedence ContainerBootCommand uses everywhere else: GH_TOKEN
+		// is canonical, GIT_TOKEN the legacy git-only fallback.
+		const key = GITHUB_TOKEN_SECRET_KEYS.find((k) => this.env[k]);
+		if (!key) return;
+		const token = this.env[key] as string;
+
+		const probe = await this.probeGitHubTokenFn(token);
+		if (probe.status === 401) {
+			throw new Error(
+				`${key} was rejected by GitHub (HTTP 401) — the token is expired or revoked. ` +
+					"Rotate it, then destroy this issue's container so the new value is baked " +
+					"into a fresh boot (a rotated secret reaches only create-from-image): " +
+					`cyrus router containers destroy ${this.env.CYRUS_ISSUE_KEY}`,
+			);
+		}
+		if (!probe.ok) {
+			this.logger.warn(
+				`Could not verify ${key} before cloning (${probe.error ?? `HTTP ${probe.status}`}) — continuing anyway.`,
+			);
+		}
 	}
 
 	/** Redacts a secret from a string before it can reach a log line or thrown error. */
