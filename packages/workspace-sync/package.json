@@ -2,6 +2,11 @@
 	"name": "cyrus-workspace-sync",
 	"version": "0.2.66",
 	"description": "Bundle build/restore and HTTP transport for syncing ephemeral container workspace state via the Cyrus Router",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/cyrusagents/cyrus.git",
+		"directory": "packages/workspace-sync"
+	},
 	"type": "module",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
