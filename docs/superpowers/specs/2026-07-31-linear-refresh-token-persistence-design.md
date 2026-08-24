@@ -13,7 +13,7 @@ stack trace to show for it.
 
 ## Background — the observed failure
 
-Diagnosed on the `dit-development` / `<resource-group>` deployment on 2026-07-30:
+Diagnosed on the `<subscription>` / `<resource-group>` deployment on 2026-07-30:
 
 - Linear access tokens expire in **24 hours**, and Linear **rotates the refresh
   token on every use** — the old one dies immediately (30-minute replay grace for

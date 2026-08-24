@@ -105,7 +105,7 @@ Neither warning caused a passing gate to fail.
 
 Safe prerequisite checks found:
 
-- Azure CLI authentication is present for subscription `dit-development` (`<subscription-id>`) and tenant `c9857cc6-342b-4bb3-b831-2899b80237dd`.
+- Azure CLI authentication is present for subscription `<subscription>` (`<subscription-id>`) and tenant `<tenant-id>`.
 - Azure Bicep CLI is available through `az bicep` (v0.44.1).
 
 Exact blockers:
