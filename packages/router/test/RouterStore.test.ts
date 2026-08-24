@@ -122,6 +122,120 @@ describe("RouterStore", () => {
 		expect(s2).toBe(s1 + 1); // a MAX(seq)-based counter would reuse s1 here and the client would drop the event
 	});
 
+	/**
+	 * NOR-263. A restore from a stale state backup rolls `next_seq` back while
+	 * the device's `lastAckedSeq` survives in its floor bundle; from then on
+	 * every event we issue carries a seq the device discards as a duplicate.
+	 *
+	 * A freshly enrolled device has `next_seq = 1`, so a device reporting any
+	 * `lastAckedSeq >= 1` against it is exactly the post-restore state: the
+	 * router's counter sitting at or below the device's high-water mark.
+	 */
+	describe("event sequence regression repair (reconcileDeviceSeq)", () => {
+		it("leaves a healthy counter untouched when the device is behind the router", () => {
+			const { store, device } = storeWithDevice();
+			const result = store.reconcileDeviceSeq(device.deviceId, 0, NOW);
+			expect(result).toEqual({
+				repaired: false,
+				previousNextSeq: 1,
+				nextSeq: 1,
+				resequenced: 0,
+			});
+			// The healthy path must not perturb allocation.
+			expect(store.enqueueEvent(device.deviceId, "{}", NOW, 60_000)).toBe(1);
+		});
+
+		it("fast-forwards next_seq past a device that has overtaken it", () => {
+			const { store, device } = storeWithDevice();
+			const result = store.reconcileDeviceSeq(device.deviceId, 7, NOW);
+			expect(result).toMatchObject({
+				repaired: true,
+				previousNextSeq: 1,
+				nextSeq: 8,
+			});
+			// The point of the whole exercise: the next event carries a seq the
+			// device will accept rather than discard as a duplicate.
+			expect(store.enqueueEvent(device.deviceId, "{}", NOW, 60_000)).toBe(8);
+		});
+
+		it("treats next_seq == lastAckedSeq as a regression (the device drops seq <= its mark)", () => {
+			const { store, device } = storeWithDevice();
+			// Six events issued and acked leaves next_seq at 7.
+			for (let i = 0; i < 6; i++) {
+				store.enqueueEvent(device.deviceId, "{}", NOW, 60_000);
+			}
+			store.ackEvent(device.deviceId, 6);
+
+			const result = store.reconcileDeviceSeq(device.deviceId, 7, NOW);
+			expect(result).toMatchObject({ repaired: true, previousNextSeq: 7 });
+			// Not 7: RouterConnection.onEvent discards `seq <= lastAckedSeq`, so
+			// an off-by-one here would leave exactly the observed NOR-263 state.
+			expect(store.enqueueEvent(device.deviceId, "{}", NOW, 60_000)).toBe(8);
+		});
+
+		it("resequences stranded events above the mark instead of leaving them to be purged as duplicates", () => {
+			const { store, device } = storeWithDevice();
+			// Enqueued at rolled-back seqs 1 and 2 — e.g. webhooks that landed
+			// between the restore and the device's reconnect. The device is at 7
+			// and would discard both.
+			store.enqueueEvent(device.deviceId, '{"n":1}', NOW, 60_000);
+			store.enqueueEvent(device.deviceId, '{"n":2}', NOW, 60_000);
+
+			const result = store.reconcileDeviceSeq(device.deviceId, 7, NOW);
+			expect(result).toMatchObject({
+				repaired: true,
+				nextSeq: 10,
+				resequenced: 2,
+			});
+			// Same payloads, same order, new seqs above the device's mark.
+			expect(store.pendingEvents(device.deviceId, 0, NOW)).toEqual([
+				{ seq: 8, payloadJson: '{"n":1}' },
+				{ seq: 9, payloadJson: '{"n":2}' },
+			]);
+			expect(store.enqueueEvent(device.deviceId, "{}", NOW, 60_000)).toBe(10);
+		});
+
+		it("preserves the original TTL when resequencing, so an aged-out prompt is not resurrected", () => {
+			const { store, device } = storeWithDevice();
+			store.enqueueEvent(device.deviceId, '{"n":"stale"}', NOW, 1_000);
+			// Already expired at reconcile time: left in place for the periodic
+			// expireEvents sweep rather than moved.
+			const result = store.reconcileDeviceSeq(device.deviceId, 7, NOW + 5_000);
+			expect(result).toMatchObject({ repaired: true, resequenced: 0 });
+			expect(store.pendingEvents(device.deviceId, 0, NOW + 5_000)).toEqual([]);
+
+			// A live event keeps its own deadline across the move. Reconciled on
+			// the same NOW + 5_000 clock, so the aged-out row above stays
+			// expired and only the live one is carried over.
+			store.enqueueEvent(device.deviceId, '{"n":"live"}', NOW, 60_000);
+			store.reconcileDeviceSeq(device.deviceId, 20, NOW + 5_000);
+			expect(store.pendingEvents(device.deviceId, 0, NOW + 30_000)).toEqual([
+				{ seq: 21, payloadJson: '{"n":"live"}' },
+			]);
+			expect(store.pendingEvents(device.deviceId, 0, NOW + 90_000)).toEqual([]);
+		});
+
+		it("is idempotent across repeated hellos from the same device", () => {
+			const { store, device } = storeWithDevice();
+			const first = store.reconcileDeviceSeq(device.deviceId, 7, NOW);
+			const second = store.reconcileDeviceSeq(device.deviceId, 7, NOW);
+			expect(first.repaired).toBe(true);
+			expect(second).toEqual({
+				repaired: false,
+				previousNextSeq: 8,
+				nextSeq: 8,
+				resequenced: 0,
+			});
+		});
+
+		it("throws for an unknown device rather than silently inventing a counter", () => {
+			const { store } = storeWithDevice();
+			expect(() => store.reconcileDeviceSeq(9999, 3, NOW)).toThrow(
+				/Unknown device/,
+			);
+		});
+	});
+
 	it("records and replays mutation responses idempotently", () => {
 		const { store, device } = storeWithDevice();
 		expect(store.getMutation(device.deviceId, "m-1")).toBeUndefined();

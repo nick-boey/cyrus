@@ -396,6 +396,33 @@ export class DeviceGateway extends EventEmitter {
 
 		this.store.touchDevice(deviceId, Date.now());
 
+		// Detect and repair a regressed event-sequence counter BEFORE the purge
+		// below, which would otherwise delete the very events the regression
+		// stranded. A device whose lastAckedSeq has overtaken our next_seq
+		// discards everything we send it as a duplicate, forever and silently
+		// — this is the only point at which the two numbers are ever in the
+		// same place, so it is the only place the skew can be caught. See
+		// NOR-263 and RouterStore.reconcileDeviceSeq.
+		const seqRepair = this.store.reconcileDeviceSeq(
+			deviceId,
+			frame.lastAckedSeq,
+			Date.now(),
+		);
+		if (seqRepair.repaired) {
+			// ERROR, not WARN: this is router-side data loss, and because a
+			// dropped event's row is deleted by the device's re-ack, this line
+			// is the only durable trace the skew ever existed.
+			this.logger.error(
+				`Device ${deviceId} event sequence regressed: stored next_seq ${seqRepair.previousNextSeq} <= device lastAckedSeq ${frame.lastAckedSeq}. ` +
+					`Every event issued to this device would have been discarded as a duplicate. ` +
+					`Fast-forwarded next_seq to ${seqRepair.nextSeq}` +
+					(seqRepair.resequenced > 0
+						? ` and resequenced ${seqRepair.resequenced} queued event(s) above the device's mark.`
+						: ".") +
+					` Likely cause: the router restored SQLite from a stale state backup (see StateBackup).`,
+			);
+		}
+
 		// Ack everything <= lastAckedSeq the client already has. Uses the
 		// same real-clock nowMs as deliverPending for consistency; an
 		// already-expired row simply won't be returned here and is left for

@@ -479,6 +479,21 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      it must never be able to veto the suspend and leave a sandbox billing.
    - A memory suspend also **freezes every JavaScript timer** in the sandbox, so any device-side liveness check must compare **wall-clock** time (`Date.now()`), never accumulated timer ticks — a tick-counting check sees no gap after resume. `RouterConnection`'s watchdog terminates its socket after `MAX_MISSED_HEARTBEATS` × the router's advertised `heartbeatMs` of inbound silence (both constants live in `cyrus-router-protocol`; the router advertises its real cadence in `hello_ack`). Derive new liveness deadlines from those constants rather than hardcoding a number.
    - Azure router hosting must remain one replica. SQLite stays on ephemeral local storage and is periodically backed up to Blob; Azure Files is for artifact bundles, not SQLite WAL. Blob restores are at-least-once within the backup interval, and overlapping revision uploads can be out of order.
+   - **A stale restore can roll `devices.next_seq` backwards while the device's
+     `lastAckedSeq` survives in its floor bundle.** Once `next_seq <=
+     lastAckedSeq`, `RouterConnection.onEvent` discards every event we issue as
+     a duplicate — permanently, and with no signal on either side (NOR-263).
+     `hello` is the ONLY point where the two numbers are ever in the same
+     process, so `DeviceGateway.handleHello` calls
+     `RouterStore.reconcileDeviceSeq` there to fast-forward past the device's
+     mark and log at ERROR. Two rules for anything touching that path: the
+     reconcile must stay **ahead of the already-acked purge** — the purge
+     deletes exactly the rows the regression stranded — and under detected skew
+     queued events are **resequenced above the mark, not treated as
+     duplicates**, because re-delivering a genuine replay is recoverable while
+     dropping a user's prompt is the bug. Neither the ERROR log nor the repair
+     removes the root cause; the 5-minute snapshot on ephemeral disk still
+     produces the skew, and this only bounds the damage.
    - `containers.keyVaultUrl` selects the Key Vault secret backend. Rotated per-user values reach only create-from-image; destroy and re-prompt existing issues to apply them. Entra enrollment uses one app registration/audience per router deployment.
    - Terminal teardown order is force floor flush, WIP/teardown/worktree removal, authenticated callback, provider destroy (including snapshots), then device-row deletion; only deleted issues lose their floor bundle. Self-actored closes and Linear's `duplicate` state miss `issueStatusChanged` and rely on stale GC/manual cleanup.
    - The teardown callback is durable on both sides. Device: `TeardownCallbackQueue` records the intent (plus its idempotency key) to `~/.cyrus/router-client/teardown-callbacks.jsonl` **synchronously, before the first `await` of `handleIssueStateChangeMessage`** — that is what puts the write inside the window where `RouterConnection`'s inbox entry is still unprocessed, so a kill anywhere in the sequence replays instead of losing the callback. It replays on the connection's `"connected"` event and retries the same key with backoff. Router: `TerminalTeardown` mirrors each pending teardown into the `container_teardowns` table so the out-of-process `router containers list` can render its `TEARDOWN` column; that mirror is observability + retry accounting, NOT a restart journal, and is cleared on construction to match the coordinator's empty in-memory state. Re-delivered callbacks log as `callback retry`, distinct from `grace expiry`.

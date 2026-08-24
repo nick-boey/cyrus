@@ -381,6 +381,137 @@ describe("DeviceGateway", () => {
 		httpServer.close();
 	});
 
+	/**
+	 * NOR-263. `hello` is the only moment the router's `next_seq` and the
+	 * device's `lastAckedSeq` are ever in the same place, so it is the only
+	 * place a counter regression (stale state-backup restore onto ephemeral
+	 * /data) can be caught. Left undetected, every event issued to the device
+	 * is discarded by `RouterConnection.onEvent` as a duplicate — silently,
+	 * forever.
+	 *
+	 * A freshly enrolled device has next_seq = 1, so a hello claiming
+	 * lastAckedSeq = 7 reproduces the post-restore state exactly.
+	 */
+	describe("event sequence regression (NOR-263)", () => {
+		it("fast-forwards past a device whose lastAckedSeq has overtaken the router, and logs it at ERROR", async () => {
+			const logger = testLogger();
+			const { store, gateway, device, port, httpServer } = await setup({
+				logger,
+			});
+			const ws = connect(port);
+			const nextMessage = messageReader(ws);
+			await new Promise((r) => ws.once("open", r));
+			ws.send(
+				JSON.stringify({
+					type: "hello",
+					deviceToken: device.deviceToken,
+					protocolVersion: PROTOCOL_VERSION,
+					lastAckedSeq: 7,
+				}),
+			);
+			expect(JSON.parse(await nextMessage()).type).toBe("hello_ack");
+
+			// The re-ack of a dropped event deletes its row, so this log line is
+			// the only durable trace the skew ever existed. It must be ERROR.
+			const errors = logger.error.mock.calls.map((c) => String(c[0]));
+			expect(
+				errors.some(
+					(m) =>
+						/sequence regressed/i.test(m) &&
+						m.includes(`Device ${device.deviceId}`) &&
+						m.includes("lastAckedSeq 7"),
+				),
+			).toBe(true);
+
+			// A prompt arriving after the repair reaches the device instead of
+			// being discarded: seq 8 > the device's mark of 7.
+			store.enqueueEvent(device.deviceId, '{"n":"prompt"}', Date.now(), 60_000);
+			gateway.deliverPending(device.deviceId);
+			const event = JSON.parse(await nextMessage());
+			expect(event.type).toBe("event");
+			expect(event.seq).toBeGreaterThan(7);
+			expect(event.event).toEqual({ n: "prompt" });
+
+			gateway.close();
+			httpServer.close();
+		});
+
+		it("delivers an event stranded at a rolled-back seq instead of purging it as an already-acked duplicate", async () => {
+			const { store, gateway, device, port, httpServer } = await setup();
+			// A webhook that landed between the restore and the device's
+			// reconnect, enqueued at rolled-back seq 1. The device is at 7, so
+			// the already-acked purge in handleHello would delete this row
+			// undelivered — the second silent-drop path in this bug.
+			store.enqueueEvent(
+				device.deviceId,
+				'{"n":"stranded"}',
+				Date.now(),
+				60_000,
+			);
+
+			const ws = connect(port);
+			const nextMessage = messageReader(ws);
+			await new Promise((r) => ws.once("open", r));
+			ws.send(
+				JSON.stringify({
+					type: "hello",
+					deviceToken: device.deviceToken,
+					protocolVersion: PROTOCOL_VERSION,
+					lastAckedSeq: 7,
+				}),
+			);
+			expect(JSON.parse(await nextMessage()).type).toBe("hello_ack");
+
+			const event = JSON.parse(await nextMessage());
+			expect(event.type).toBe("event");
+			expect(event.event).toEqual({ n: "stranded" });
+			expect(event.seq).toBeGreaterThan(7);
+
+			gateway.close();
+			httpServer.close();
+		});
+
+		it("leaves a healthy device alone: no ERROR, and already-acked events are still purged", async () => {
+			const logger = testLogger();
+			const { store, gateway, device, port, httpServer } = await setup({
+				logger,
+			});
+			const now = Date.now();
+			store.enqueueEvent(device.deviceId, '{"n":1}', now, 60_000); // seq 1
+			store.enqueueEvent(device.deviceId, '{"n":2}', now, 60_000); // seq 2
+
+			const ws = connect(port);
+			const nextMessage = messageReader(ws);
+			await new Promise((r) => ws.once("open", r));
+			ws.send(
+				JSON.stringify({
+					type: "hello",
+					deviceToken: device.deviceToken,
+					protocolVersion: PROTOCOL_VERSION,
+					// next_seq is 3 here, comfortably ahead of the mark.
+					lastAckedSeq: 1,
+				}),
+			);
+			expect(JSON.parse(await nextMessage()).type).toBe("hello_ack");
+
+			expect(
+				logger.error.mock.calls.filter((c) =>
+					/sequence regressed/i.test(String(c[0])),
+				),
+			).toHaveLength(0);
+
+			// seq 1 purged as a genuine duplicate; only seq 2 delivered.
+			const event = JSON.parse(await nextMessage());
+			expect(event.seq).toBe(2);
+			expect(
+				store.pendingEvents(device.deviceId, 0, Date.now()).map((e) => e.seq),
+			).toEqual([2]);
+
+			gateway.close();
+			httpServer.close();
+		});
+	});
+
 	it("second connection wins: replaces the first socket without a spurious disconnect", async () => {
 		const { gateway, device, port, httpServer } = await setup();
 
