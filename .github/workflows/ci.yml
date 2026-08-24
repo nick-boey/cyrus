@@ -39,7 +39,9 @@ jobs:
     # secret and both OAuth tokens — would rot unnoticed, along with the
     # image-pin allowlist it also covers.
     - name: Test deploy scripts
-      run: bash scripts/deploy-router-image.test.sh
+      run: |
+        bash scripts/deploy-router-image.test.sh
+        bash scripts/bootstrap-azure-role-assignments.test.sh
 
   test:
     runs-on: ubuntu-latest

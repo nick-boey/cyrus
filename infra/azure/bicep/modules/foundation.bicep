@@ -4,8 +4,9 @@
 // Mirrors what main.tf plus the storage half of setup_ui.tf used to hold:
 // Log Analytics, Key Vault (RBAC mode) and its opt-in secret writes, the router
 // user-assigned identity, the storage account and its three children, the
-// Container Apps environment and its Azure Files link, the optional ACR, every
-// role assignment, and the opt-in per-user secret store (Table + KEK).
+// Container Apps environment and its Azure Files link, the optional ACR, and the
+// opt-in per-user secret store (Table + KEK). RBAC lives in the dedicated deep
+// role-assignments module so a Contributor-only routine deploy can omit it.
 
 @description('Resource name root, <project>-<environment>.')
 @minLength(4)
@@ -18,11 +19,8 @@ param flatNamePrefix string
 param location string
 param tags object
 
-@description('Provision an Azure Container Registry and grant the router identity AcrPull on it.')
+@description('Provision an Azure Container Registry.')
 param enableAcr bool
-
-@description('Optional Entra principal id granted break-glass Storage Blob Data Contributor on the router-backups container. Empty to skip.')
-param operatorPrincipalId string
 
 param linearWorkspaceId string
 
@@ -56,26 +54,8 @@ param setupUiClientSecret string
 param setupUiTokenStoreSasStart string
 param setupUiTokenStoreSasExpiry string
 
-@description('Create the Azure Table, the envelope-encryption KEK, and the router\'s two additional role assignments.')
+@description('Create the Azure Table and the envelope-encryption KEK.')
 param enableSetupSecretStore bool
-
-////////////////////////////////////////////////////////////////////////////////
-// Built-in role definition ids
-//
-// Built-in roles carry the same GUID in every tenant, which is why they are
-// written as constants here. Bicep has no equivalent of Terraform's
-// `data.azurerm_role_definition` name lookup. Verify any of them with:
-//   az role definition list --name "<display name>" --query "[].name" -o tsv
-////////////////////////////////////////////////////////////////////////////////
-
-var roleIds = {
-  keyVaultSecretsUser: '4633458b-17de-408a-b874-0445c86b69e6'
-  keyVaultSecretsOfficer: 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
-  keyVaultCryptoUser: '12338af0-0e69-4776-bea7-57ae8d297424'
-  storageBlobDataContributor: 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
-  storageTableDataContributor: '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
-  acrPull: '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-}
 
 // Fixed names. Both are referenced by the rendered router config and by the
 // decommissioning runbook, so they are constants rather than parameters:
@@ -398,95 +378,6 @@ resource setupKek 'Microsoft.KeyVault/vaults/keys@2023-07-01' = if (enableSetupS
       'wrapKey'
       'unwrapKey'
     ]
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// RBAC
-////////////////////////////////////////////////////////////////////////////////
-
-resource routerKvSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, routerIdentity.id, roleIds.keyVaultSecretsUser)
-  scope: keyVault
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleIds.keyVaultSecretsUser)
-    principalId: routerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Secrets Officer as well as Secrets User: the router WRITES
-// `cyrus-linear-refresh-<workspaceId>` when Linear rotates a refresh token, and
-// (on the Key Vault secret backend) each user's per-user secret record.
-resource routerKvSecretsOfficer 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, routerIdentity.id, roleIds.keyVaultSecretsOfficer)
-  scope: keyVault
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleIds.keyVaultSecretsOfficer)
-    principalId: routerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Container-scoped, not account-scoped.
-resource routerBackupsBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(routerBackups.id, routerIdentity.id, roleIds.storageBlobDataContributor)
-  scope: routerBackups
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleIds.storageBlobDataContributor)
-    principalId: routerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Operator break-glass (M2). WITHOUT this, an operator cannot delete a corrupt
-// `router.db` blob to unwedge a fatal-restore CrashLoopBackOff.
-//
-// principalType is omitted here on purpose: the operator principal may be a
-// user, a group, or a service principal, and asserting the wrong one makes the
-// assignment fail. Omitting it costs a small chance of a replication race on a
-// brand-new principal, which a redeploy fixes.
-resource operatorBackupsBreakglass 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(operatorPrincipalId)) {
-  name: guid(routerBackups.id, operatorPrincipalId, roleIds.storageBlobDataContributor)
-  scope: routerBackups
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleIds.storageBlobDataContributor)
-    principalId: operatorPrincipalId
-  }
-}
-
-resource routerAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableAcr) {
-  name: guid(acr.id, routerIdentity.id, roleIds.acrPull)
-  scope: acr
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleIds.acrPull)
-    principalId: routerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Table-scoped, not account-scoped: this grant must not reach the
-// router-backups blob container or the artifacts share.
-resource routerTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableSetupSecretStore) {
-  name: guid(setupTable.id, routerIdentity.id, roleIds.storageTableDataContributor)
-  scope: setupTable
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleIds.storageTableDataContributor)
-    principalId: routerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Vault-scoped. "Key Vault Crypto User" grants wrapKey/unwrapKey and is a
-// DIFFERENT role from the Secrets User + Secrets Officer assignments above,
-// neither of which permits any key operation.
-resource routerKvCryptoUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableSetupSecretStore) {
-  name: guid(keyVault.id, routerIdentity.id, roleIds.keyVaultCryptoUser)
-  scope: keyVault
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleIds.keyVaultCryptoUser)
-    principalId: routerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
   }
 }
 
