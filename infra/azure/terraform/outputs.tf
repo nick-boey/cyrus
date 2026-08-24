@@ -105,3 +105,24 @@ output "setup_kek_versioned_key_id" {
   description = "VERSIONED Key Vault key id of the envelope-encryption KEK, exactly as rendered into `containers.tableStore.keyId`. NULL unless `enable_setup_secret_store` is true. Not a secret — it names a public key handle, and every wrap/unwrap URL is rebuilt from this configured value rather than from anything a stored record supplies. Records pin the version segment they were wrapped with, so old versions must stay ENABLED until a re-wrap pass has run."
   value       = one(azurerm_key_vault_key.setup_kek[*].id)
 }
+
+output "otel_logs_app_insights_name" {
+  description = "Name of the workspace-based Application Insights component the router exports OTLP logs to. NULL unless `enable_otel_logs` is true. Purely an OTLP endpoint — it stores nothing of its own; every record lands in the same Log Analytics workspace the Container Apps environment already ships router stdout to (see `log_analytics_workspace_name`)."
+  value       = one(azurerm_application_insights.otel[*].name)
+}
+
+output "log_analytics_workspace_name" {
+  description = "The single Log Analytics workspace behind every query in monitoring.tf. Both log paths land here: the router's stdout as ContainerAppConsoleLogs_CL (via the Container Apps environment) and, when `enable_otel_logs` is set, its OTLP records as AppTraces (via Application Insights)."
+  value       = azurerm_log_analytics_workspace.this.name
+}
+
+output "otel_logs_query" {
+  description = "Paste-ready KQL for the router's OTLP log stream. NULL unless `enable_otel_logs` is true. Note the table: OTLP records land in AppTraces, NOT the ContainerAppConsoleLogs_CL that every saved search in monitoring.tf reads — those queries are unaffected by this feature and do not see these records."
+  value = var.enable_otel_logs ? join("\n", [
+    "AppTraces",
+    "| where AppRoleName == \"${local.router_app_name}\" or AppRoleName == \"cyrus-router\"",
+    "| extend component = tostring(Properties.component), event = tostring(Properties.event)",
+    "| project TimeGenerated, SeverityLevel, component, event, Message, Properties",
+    "| order by TimeGenerated desc",
+  ]) : null
+}

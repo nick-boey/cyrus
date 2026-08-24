@@ -1,4 +1,5 @@
 import type { SDKSystemMessage } from "cyrus-claude-runner";
+import { installRecordingLogSink, LogLevel } from "cyrus-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
 import type { IActivitySink } from "../src/sinks/IActivitySink";
@@ -119,10 +120,9 @@ describe("AgentSessionManager - Model Notification", () => {
 		// Mock postActivity to throw
 		postActivitySpy.mockRejectedValueOnce(new Error("Failed to post"));
 
-		// Spy on console.error
-		const consoleErrorSpy = vi
-			.spyOn(console, "error")
-			.mockImplementation(() => {});
+		// Record structured records rather than console lines: the claim is that
+		// the failure was logged at ERROR with the underlying Error attached.
+		const recorder = installRecordingLogSink();
 
 		// Create a system init message with model information
 		const systemMessage: SDKSystemMessage = {
@@ -139,12 +139,15 @@ describe("AgentSessionManager - Model Notification", () => {
 		await manager.handleClaudeMessage(sessionId, systemMessage);
 
 		// Verify error was logged
-		expect(consoleErrorSpy).toHaveBeenCalledWith(
-			expect.stringContaining("Error creating model notification:"),
-			expect.any(Error),
-		);
-
-		// Clean up
-		consoleErrorSpy.mockRestore();
+		try {
+			expect(
+				recorder.sink.find({
+					message: "Error creating model notification:",
+					level: LogLevel.ERROR,
+				}),
+			).toMatchObject({ args: "Error: Failed to post" });
+		} finally {
+			recorder.restore();
+		}
 	});
 });

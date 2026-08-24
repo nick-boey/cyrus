@@ -11,3 +11,9 @@ export {
 	resetGlobalLogSink,
 	setGlobalLogSink,
 } from "./LogSink.js";
+export {
+	type InstalledRecordingLogSink,
+	installRecordingLogSink,
+	type LogRecordQuery,
+	RecordingLogSink,
+} from "./RecordingLogSink.js";

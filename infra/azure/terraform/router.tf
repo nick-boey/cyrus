@@ -126,6 +126,27 @@ locals {
     CYRUS_ROUTER_SETUP_UI_AUTO_PROVISION    = tostring(var.setup_ui_auto_provision_users)
     # CYRUS_ROUTER_SETUP_UI_VERIFIED_HEADER_STRIP is intentionally absent: it is
     # only meaningful for `easyauth-headers`, which this stack refuses (R2-01).
+
+    # NOR-281 / Phase 3: back ILogger with the OpenTelemetry Logs API in
+    # addition to (never instead of) the JSON stdout stream above.
+    #
+    # `CYRUS_OTEL_LOGS_ENABLED` is the router's own master switch and is checked
+    # before anything else — with it false, `startRouterOtelLogging` returns
+    # undefined, no exporter is constructed, and the console sink is untouched.
+    # So flipping `enable_otel_logs` off is a complete rollback; it does not
+    # merely stop the export.
+    #
+    # The connection string is a `secret` block below rather than a value here:
+    # it embeds the instrumentation key.
+    CYRUS_OTEL_LOGS_ENABLED = tostring(var.enable_otel_logs)
+    CYRUS_OTEL_LOGS_LEVEL   = var.otel_logs_level
+    # Resource semconv the platform cannot tell the router itself.
+    # `service.name`/`service.instance.id`/`service.version` are derived at
+    # runtime from CONTAINER_APP_NAME / CONTAINER_APP_REPLICA_NAME / the CLI
+    # build version, and `cloud.provider`/`cloud.platform` are constants in the
+    # router package — so only these two need supplying.
+    CYRUS_OTEL_DEPLOYMENT_ENV = var.environment
+    CYRUS_OTEL_CLOUD_REGION   = var.location
   }
 
   entra_enabled = var.entra_tenant_id != null && var.entra_audience != null
@@ -195,6 +216,23 @@ resource "azurerm_container_app" "router" {
     name                = "linear-client-secret"
     identity            = azurerm_user_assigned_identity.router.id
     key_vault_secret_id = azurerm_key_vault_secret.linear_client_secret.versionless_id
+  }
+
+  # An inline value rather than a Key Vault reference like the Linear secrets
+  # above, because unlike those this is not an operator-supplied credential —
+  # Terraform computes it from a resource it manages in this same stack. Routing
+  # it through Key Vault would add a write, a read role, and a rotation story for
+  # a value that is regenerated from the component on every apply anyway.
+  #
+  # Still a `secret` block, not an `env { value = ... }`: the connection string
+  # embeds the instrumentation key, and ACA secrets are what keep it out of
+  # `az containerapp show` output and the revision's plain env listing.
+  dynamic "secret" {
+    for_each = var.enable_otel_logs ? [1] : []
+    content {
+      name  = "appinsights-connection-string"
+      value = azurerm_application_insights.otel[0].connection_string
+    }
   }
 
   # STAGE 1 of D7. Both secrets are consumed by the EasyAuth SIDECAR, not by the
@@ -272,6 +310,32 @@ resource "azurerm_container_app" "router" {
       env {
         name  = "AZURE_CLIENT_ID"
         value = azurerm_user_assigned_identity.router.client_id
+      }
+      env {
+        name  = "CYRUS_OTEL_LOGS_ENABLED"
+        value = local.router_env_non_secret.CYRUS_OTEL_LOGS_ENABLED
+      }
+      env {
+        name  = "CYRUS_OTEL_LOGS_LEVEL"
+        value = local.router_env_non_secret.CYRUS_OTEL_LOGS_LEVEL
+      }
+      env {
+        name  = "CYRUS_OTEL_DEPLOYMENT_ENV"
+        value = local.router_env_non_secret.CYRUS_OTEL_DEPLOYMENT_ENV
+      }
+      env {
+        name  = "CYRUS_OTEL_CLOUD_REGION"
+        value = local.router_env_non_secret.CYRUS_OTEL_CLOUD_REGION
+      }
+      # Absent entirely when disabled, so the router's own "enabled but not
+      # configured" warning can never fire from this stack: either both the flag
+      # and the connection string are present, or neither is.
+      dynamic "env" {
+        for_each = var.enable_otel_logs ? [1] : []
+        content {
+          name        = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+          secret_name = "appinsights-connection-string"
+        }
       }
 
       # Entra env is optional and uses the canonical entrypoint/Zod names.

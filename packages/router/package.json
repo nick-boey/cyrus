@@ -22,10 +22,12 @@
 	},
 	"dependencies": {
 		"@azure/identity": "^4.11.1",
+		"@azure/monitor-opentelemetry-exporter": "1.0.0-beta.32",
 		"@linear/sdk": "^64.0.0",
 		"better-sqlite3": "^12.11.1",
 		"cyrus-core": "workspace:*",
 		"cyrus-linear-event-transport": "workspace:*",
+		"cyrus-otel-logs": "workspace:*",
 		"cyrus-router-executors": "workspace:*",
 		"cyrus-router-protocol": "workspace:*",
 		"cyrus-workspace-sync": "workspace:*",
@@ -35,6 +37,7 @@
 		"zod": "4.3.6"
 	},
 	"devDependencies": {
+		"@opentelemetry/sdk-logs": "^0.221.0",
 		"@types/better-sqlite3": "^7.6.13",
 		"@types/node": "^20.19.43",
 		"@types/ws": "^8.18.1",

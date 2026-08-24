@@ -446,3 +446,46 @@ resource "azurerm_monitor_scheduled_query_rules_alert_v2" "sandbox_boot_failures
     action_groups = local.monitoring_action_group_ids
   }
 }
+
+################################################################################
+# OpenTelemetry logs (NOR-281 / Phase 3): an OTLP endpoint into the SAME workspace
+#
+# Everything above this block reads `ContainerAppConsoleLogs_CL` — the router's
+# stdout, collected by the Container Apps environment. That path is unchanged and
+# remains the default; the OTLP sink is ADDITIVE.
+#
+# Why Application Insights at all, in a vendor-neutral phase: it is the only
+# first-party OTLP ingestion endpoint Azure Monitor offers. A workspace-based
+# component (`workspace_id` below, not the deprecated classic mode) stores
+# nothing of its own — every record lands in `azurerm_log_analytics_workspace.this`,
+# under the workspace's own retention. So this is an ENDPOINT, not a second
+# monitoring product, and the instrumentation in `cyrus-otel-logs` has no Azure
+# dependency whatsoever.
+#
+# ── WHICH TABLE ──
+# OTLP log records land in `AppTraces`, NOT `ContainerAppConsoleLogs_CL`. That is
+# the one thing to know before writing a query against them:
+#
+#   AppTraces
+#   | where AppRoleName == "cyrus-router"
+#   | extend component = tostring(Properties.component)
+#   | where SeverityLevel >= 2                      // WARN and above
+#
+# Resource semconv arrives as: `service.name` -> AppRoleName,
+# `service.instance.id` -> AppRoleInstance, and the rest (cloud.*,
+# deployment.environment.name) as keys inside `Properties`.
+################################################################################
+
+resource "azurerm_application_insights" "otel" {
+  count = var.enable_otel_logs ? 1 : 0
+
+  name                = "appi-${local.name_prefix}"
+  resource_group_name = azurerm_resource_group.this.name
+  location            = azurerm_resource_group.this.location
+  # Workspace-based. Without this the component is created in the retired
+  # classic mode, which keeps its own store and would put router logs somewhere
+  # the existing saved searches and alert rules cannot reach.
+  workspace_id     = azurerm_log_analytics_workspace.this.id
+  application_type = "web"
+  tags             = local.default_tags
+}
