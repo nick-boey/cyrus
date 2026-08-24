@@ -31,6 +31,12 @@ const DEFAULT_BURST = 40;
 const MAX_MESSAGE_CHARS = 4_000;
 const MAX_ARGS_CHARS = 2_000;
 const MAX_ATTRIBUTES = 32;
+/**
+ * Stacktraces get a larger cap than a plain attribute: the stack (plus any
+ * `Caused by:` chain) is the payload an operator opens a sandbox error to read,
+ * and clipping it at the message cap loses the frames in our own code.
+ */
+const MAX_STACKTRACE_CHARS = 8_000;
 
 const LEVEL_NAMES: Record<number, LogFrameLevel> = {
 	[LogLevel.DEBUG]: "debug",
@@ -238,6 +244,22 @@ export class RouterLogForwarder implements LogSink {
 				? { attributes: boundAttributes(record.attributes) }
 				: {}),
 			...(record.args ? { args: truncate(record.args, MAX_ARGS_CHARS) } : {}),
+			...(record.exception
+				? {
+						exception: {
+							type: truncate(record.exception.type, 256),
+							message: truncate(record.exception.message, MAX_MESSAGE_CHARS),
+							...(record.exception.stacktrace !== undefined
+								? {
+										stacktrace: truncate(
+											record.exception.stacktrace,
+											MAX_STACKTRACE_CHARS,
+										),
+									}
+								: {}),
+						},
+					}
+				: {}),
 			...(this.dropped > 0 ? { dropped: this.dropped } : {}),
 		};
 	}

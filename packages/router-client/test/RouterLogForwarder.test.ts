@@ -99,19 +99,62 @@ describe("RouterLogForwarder", () => {
 
 	it("forwards an event even when it is below the threshold", () => {
 		// ILogger.event promises a named event always reaches the structured
-		// stream — the Phase 1 sandbox_* vocabulary depends on this.
+		// stream — the Phase 1 sandbox.* vocabulary depends on this.
 		forwarder.write(
 			record({
 				level: LogLevel.INFO,
-				message: "event:sandbox_gauge",
-				event: "sandbox_gauge",
-				attributes: { issue_key: "NOR-280", sessions: 2 },
+				message: "event:sandbox.gauge",
+				event: "sandbox.gauge",
+				attributes: { "cyrus.issue_key": "NOR-280", "cyrus.sessions": 2 },
 			}),
 		);
 		expect(connection.sent[0]).toMatchObject({
-			event: "sandbox_gauge",
-			attributes: { issue_key: "NOR-280", sessions: 2 },
+			event: "sandbox.gauge",
+			attributes: { "cyrus.issue_key": "NOR-280", "cyrus.sessions": 2 },
 		});
+	});
+
+	it("carries an exception across the wire so the router can re-stamp it", () => {
+		// `args` is a lossy one-line summary. A stack trace flattened into it is
+		// the one thing an operator opening a sandbox error is looking for, so the
+		// exception travels as its own structured field.
+		forwarder.write(
+			record({
+				level: LogLevel.ERROR,
+				message: "session error",
+				exception: {
+					type: "TypeError",
+					message: "cannot read properties of undefined",
+					stacktrace: "TypeError: cannot read…\n    at worker.ts:12:3",
+				},
+			}),
+		);
+		expect(connection.sent[0]?.exception).toEqual({
+			type: "TypeError",
+			message: "cannot read properties of undefined",
+			stacktrace: "TypeError: cannot read…\n    at worker.ts:12:3",
+		});
+	});
+
+	it("bounds an oversized stacktrace before it reaches the socket", () => {
+		forwarder.write(
+			record({
+				level: LogLevel.ERROR,
+				exception: {
+					type: "Error",
+					message: "deep",
+					stacktrace: "x".repeat(20_000),
+				},
+			}),
+		);
+		expect(connection.sent[0]?.exception?.stacktrace).toHaveLength(
+			8_000 + "…[truncated]".length,
+		);
+	});
+
+	it("omits the exception field for a record that carried none", () => {
+		forwarder.write(record({ level: LogLevel.ERROR }));
+		expect(connection.sent[0]).not.toHaveProperty("exception");
 	});
 
 	it("sends nothing when the router has not advertised log_ingest", () => {

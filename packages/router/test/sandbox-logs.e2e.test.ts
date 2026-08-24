@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createLogger,
+	cyrusAttributes,
 	LogLevel,
 	resetGlobalLogSink,
 	setGlobalLogSink,
@@ -41,12 +42,13 @@ describe("sandbox worker logs, device → router → stdout", () => {
 		relayed = [];
 		allLines = [];
 		// Device and router share this process, so both write to the same console.
-		// The relay stamps `source: "sandbox"`, which is exactly how an operator
-		// tells the two apart in KQL — so the test separates them the same way.
+		// The relay stamps `cyrus.source: "sandbox"`, which is exactly how an
+		// operator tells the two apart in KQL — so the test separates them the
+		// same way.
 		const capture = (line: unknown) => {
 			const record = JSON.parse(String(line)) as Record<string, unknown>;
 			allLines.push(record);
-			if (record.source === SANDBOX_LOG_SOURCE) relayed.push(record);
+			if (record["cyrus.source"] === SANDBOX_LOG_SOURCE) relayed.push(record);
 		};
 		vi.spyOn(console, "warn").mockImplementation(capture);
 		vi.spyOn(console, "log").mockImplementation(capture);
@@ -116,36 +118,37 @@ describe("sandbox worker logs, device → router → stdout", () => {
 		expect(line).toMatchObject({
 			level: "warn",
 			component: "sandbox/EdgeWorker",
-			source: "sandbox",
-			issue_key: "NOR-280",
-			provider: "aca",
+			"cyrus.source": "sandbox",
+			"cyrus.issue_key": "NOR-280",
+			"cyrus.provider": "aca",
 			sessionId: "sess-1",
 		});
-		expect(typeof line?.device_id).toBe("number");
+		expect(typeof line?.["cyrus.device_id"]).toBe("number");
 		// Emitted at SILENT locally: the worker's own console said nothing, and
 		// the line still reached the router. The local level governs the console,
 		// the sink governs what leaves the process — that separation is the point.
 		expect(
 			allLines.filter(
-				(r) => r.message === "git push failed" && r.source === undefined,
+				(r) =>
+					r.message === "git push failed" && r["cyrus.source"] === undefined,
 			),
 		).toEqual([]);
 	});
 
 	it("ships a named lifecycle event even though it is below the WARN threshold", async () => {
-		createLogger({ component: "ContainerLifecycle" }).event("sandbox_gauge", {
-			sessions: 2,
-			online: true,
-		});
+		createLogger({ component: "ContainerLifecycle" }).event(
+			"sandbox.gauge",
+			cyrusAttributes({ sessions: 2, online: true }),
+		);
 
 		await vi.waitFor(() =>
-			expect(relayed.some((r) => r.event === "sandbox_gauge")).toBe(true),
+			expect(relayed.some((r) => r.event === "sandbox.gauge")).toBe(true),
 		);
-		expect(relayed.find((r) => r.event === "sandbox_gauge")).toMatchObject({
-			source: "sandbox",
-			issue_key: "NOR-280",
-			sessions: 2,
-			online: true,
+		expect(relayed.find((r) => r.event === "sandbox.gauge")).toMatchObject({
+			"cyrus.source": "sandbox",
+			"cyrus.issue_key": "NOR-280",
+			"cyrus.sessions": 2,
+			"cyrus.online": true,
 			component: "sandbox/ContainerLifecycle",
 		});
 	});

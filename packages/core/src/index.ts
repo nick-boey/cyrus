@@ -17,18 +17,27 @@ export {
 	setGlobalErrorTags,
 } from "./error-reporting/index.js";
 export type {
+	CyrusEventName,
 	ILogger,
 	InstalledRecordingLogSink,
 	LogContext,
 	LogEventAttributes,
+	LogException,
 	LogFormat,
 	LogRecord,
 	LogRecordQuery,
 	LogSink,
 } from "./logging/index.js";
 export {
+	CYRUS_ATTRIBUTE_NAMESPACE,
+	CYRUS_EVENTS,
 	createLogger,
 	createNoopLogger,
+	cyrusAttributes,
+	describeException,
+	describeExceptionFromArgs,
+	exceptionAttributes,
+	extractError,
 	getGlobalLogSink,
 	installRecordingLogSink,
 	LogLevel,

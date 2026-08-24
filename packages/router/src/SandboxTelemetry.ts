@@ -1,18 +1,25 @@
-import type { ILogger, LogEventAttributes } from "cyrus-core";
+import {
+	cyrusAttributes,
+	type ILogger,
+	type LogEventAttributes,
+} from "cyrus-core";
 
 /**
  * The sandbox lifecycle event vocabulary.
  *
- * Modelled on the events that already exist elsewhere in the codebase
- * (`webhook_received`, `session_started`, `session_completed`,
- * `message_emitted`, …): flat snake_case names, emitted through
- * {@link ILogger.event} so they reach the structured stream. `debug`/`info` are
- * deliberately never forwarded (see `Logger.debug`'s comment), so anything an
- * operator needs to query — in particular the per-tick gauge — MUST go through
- * `event()`.
+ * Shares the naming scheme of the cross-package vocabulary in
+ * `cyrus-core`'s `CYRUS_EVENTS` (`webhook.received`, `session.started`, …):
+ * dotted lowercase, domain segment first, emitted through {@link ILogger.event}
+ * so they reach the structured stream. `debug`/`info` are deliberately never
+ * forwarded (see `Logger.debug`'s comment), so anything an operator needs to
+ * query — in particular the per-tick gauge — MUST go through `event()`.
  *
- * Every name is prefixed `sandbox_` so one KQL predicate
- * (`event startswith "sandbox_"`) selects the whole family.
+ * Lives here rather than in `CYRUS_EVENTS` because nothing outside the router
+ * can emit one: a sandbox is a router-side concept and `packages/core` is
+ * depended on by every runner and the CLI.
+ *
+ * Every name is prefixed `sandbox.` so one KQL predicate
+ * (`event startswith "sandbox."`) selects the whole family.
  *
  * The lifecycle these names describe:
  *
@@ -29,27 +36,27 @@ import type { ILogger, LogEventAttributes } from "cyrus-core";
  */
 export const SANDBOX_EVENTS = {
 	/** The router asked a provider to boot or resume an issue's sandbox. */
-	bootStarted: "sandbox_boot_started",
+	bootStarted: "sandbox.boot_started",
 	/** The provider reported the sandbox running. INFRASTRUCTURE state only —
 	 *  the worker process still has to dial back over WSS. */
-	running: "sandbox_running",
+	running: "sandbox.running",
 	/** `ensureRunning` rejected. Pairs with `bootStarted`: a `bootStarted` with
 	 *  neither a `running` nor a `boot_failed` is a provider call that hung. */
-	bootFailed: "sandbox_boot_failed",
+	bootFailed: "sandbox.boot_failed",
 	/** A session on the sandbox blocked on a user answer; affinity released. */
-	parked: "sandbox_parked",
+	parked: "sandbox.parked",
 	/** A park was reversed — the agent went back to work; affinity restored. */
-	unparked: "sandbox_unparked",
+	unparked: "sandbox.unparked",
 	/** The lifecycle sweep stopped an affinity-free sandbox past `idleStopMs`. */
-	idleStopped: "sandbox_idle_stopped",
+	idleStopped: "sandbox.idle_stopped",
 	/** The sandbox (and its disk/volume) was destroyed. `reason` says why. */
-	destroyed: "sandbox_destroyed",
+	destroyed: "sandbox.destroyed",
 	/** A terminal teardown finished: worker cleaned up and the row was deleted. */
-	teardownCompleted: "sandbox_teardown_completed",
+	teardownCompleted: "sandbox.teardown_completed",
 	/** Per-sandbox gauge sample, one per sandbox per lifecycle sweep tick. */
-	gauge: "sandbox_gauge",
+	gauge: "sandbox.gauge",
 	/** Per-tick rollup of the gauge samples: how many sandboxes are open. */
-	sweepCompleted: "sandbox_sweep_completed",
+	sweepCompleted: "sandbox.sweep_completed",
 } as const;
 
 export type SandboxEventName =
@@ -90,10 +97,10 @@ function identityAttributes(id: SandboxIdentity): LogEventAttributes {
 /**
  * Emit one sandbox lifecycle event.
  *
- * Attribute keys are flat snake_case for the same reason the Phase 0 JSON
- * renderer keeps its keys flat: Log Analytics projects each into its own
- * dynamic column, so `where issue_key == "NOR-279"` works without parsing the
- * message.
+ * Attribute keys stay flat (Log Analytics projects each into its own dynamic
+ * column) but live under the `cyrus.*` namespace, so a query reads
+ * `where p["cyrus.issue_key"] == "NOR-279"` without parsing the message and
+ * without risking a collision with a future OTel standard attribute.
  */
 export function emitSandboxEvent(
 	logger: ILogger,
@@ -101,7 +108,10 @@ export function emitSandboxEvent(
 	identity: SandboxIdentity,
 	attributes?: LogEventAttributes,
 ): void {
-	logger.event(name, { ...identityAttributes(identity), ...attributes });
+	logger.event(
+		name,
+		cyrusAttributes({ ...identityAttributes(identity), ...attributes }),
+	);
 }
 
 /**

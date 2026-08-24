@@ -1,3 +1,4 @@
+import type { LogException } from "./exception.js";
 import type { LogContext, LogEventAttributes } from "./ILogger.js";
 import { LogLevel } from "./ILogger.js";
 
@@ -32,6 +33,16 @@ export interface LogRecord {
 	 * no trailing args.
 	 */
 	args?: string;
+	/**
+	 * The Error the call site passed, if any, shaped for OTel exception semconv.
+	 *
+	 * Kept structured rather than folded into {@link args} because this is the
+	 * one part of the payload operators query by field: `exception.type` groups
+	 * failures, and `exception.stacktrace` is the whole reason to open the record.
+	 * Set on any level — `logger.warn("retrying", err)` carries an exception just
+	 * as much as `logger.error` does.
+	 */
+	exception?: LogException;
 }
 
 /**

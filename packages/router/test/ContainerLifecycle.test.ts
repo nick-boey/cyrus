@@ -6,7 +6,7 @@ import type {
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { ContainerLifecycle } from "../src/ContainerLifecycle.js";
 import { RouterStore } from "../src/RouterStore.js";
-import { type TestLogger, testLogger } from "./helpers/logger.js";
+import { eventsNamed, type TestLogger, testLogger } from "./helpers/logger.js";
 
 /**
  * Fake ContainerExecutor with vi.fn() methods and a scripted `status`. When
@@ -58,16 +58,6 @@ function fakeExecutor(
 			}),
 		...(listStatesImpl ? { listStates: listStatesImpl } : {}),
 	};
-}
-
-/** Every `logger.event(name, attrs)` call recorded for one event name. */
-function eventsNamed(
-	logger: TestLogger,
-	name: string,
-): Array<Record<string, unknown>> {
-	return logger.event.mock.calls
-		.filter(([emitted]) => emitted === name)
-		.map(([, attributes]) => (attributes ?? {}) as Record<string, unknown>);
 }
 
 describe("ContainerLifecycle", () => {
@@ -818,7 +808,7 @@ describe("ContainerLifecycle", () => {
 
 			await lifecycle.sweep();
 
-			const samples = eventsNamed(logger, "sandbox_gauge");
+			const samples = eventsNamed(logger, "sandbox.gauge");
 			expect(samples).toHaveLength(2);
 			expect(samples.find((s) => s.issue_key === "NOR-1")).toMatchObject({
 				device_id: pinned.deviceId,
@@ -921,7 +911,7 @@ describe("ContainerLifecycle", () => {
 			expect(store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs).toBe(
 				startedAt,
 			);
-			const latest = eventsNamed(logger, "sandbox_gauge").at(-1);
+			const latest = eventsNamed(logger, "sandbox.gauge").at(-1);
 			expect(latest?.uptime_ms).toBe(now - (startedAt ?? 0));
 		});
 
@@ -952,7 +942,7 @@ describe("ContainerLifecycle", () => {
 			expect(
 				store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs,
 			).toBeUndefined();
-			expect(eventsNamed(logger, "sandbox_gauge").at(-1)?.uptime_ms).toBeNull();
+			expect(eventsNamed(logger, "sandbox.gauge").at(-1)?.uptime_ms).toBeNull();
 		});
 
 		/**
@@ -990,7 +980,7 @@ describe("ContainerLifecycle", () => {
 			expect(store.getContainerDeviceForIssue("NOR-1")?.runningSinceMs).toBe(
 				startedAt,
 			);
-			expect(eventsNamed(logger, "sandbox_gauge").at(-1)?.state).toBe(
+			expect(eventsNamed(logger, "sandbox.gauge").at(-1)?.state).toBe(
 				"unknown",
 			);
 		});
@@ -1011,7 +1001,7 @@ describe("ContainerLifecycle", () => {
 			await lifecycle.sweep();
 
 			expect(legacy.listManaged).toHaveBeenCalledTimes(1);
-			expect(eventsNamed(logger, "sandbox_gauge").at(-1)?.state).toBe(
+			expect(eventsNamed(logger, "sandbox.gauge").at(-1)?.state).toBe(
 				"unknown",
 			);
 		});
@@ -1031,7 +1021,7 @@ describe("ContainerLifecycle", () => {
 
 			await lifecycle.sweep();
 
-			expect(eventsNamed(logger, "sandbox_gauge").at(-1)?.state).toBe("absent");
+			expect(eventsNamed(logger, "sandbox.gauge").at(-1)?.state).toBe("absent");
 		});
 
 		/**
@@ -1054,7 +1044,7 @@ describe("ContainerLifecycle", () => {
 
 			await lifecycle.sweep();
 
-			const rollups = eventsNamed(logger, "sandbox_sweep_completed");
+			const rollups = eventsNamed(logger, "sandbox.sweep_completed");
 			expect(rollups).toHaveLength(1);
 			expect(rollups[0]).toMatchObject({
 				sandboxes: 0,
@@ -1091,7 +1081,7 @@ describe("ContainerLifecycle", () => {
 
 			await lifecycle.sweep();
 
-			expect(eventsNamed(logger, "sandbox_sweep_completed")[0]).toMatchObject({
+			expect(eventsNamed(logger, "sandbox.sweep_completed")[0]).toMatchObject({
 				sandboxes: 2,
 				running: 1,
 				stopped: 1,
@@ -1123,7 +1113,7 @@ describe("ContainerLifecycle", () => {
 			await lifecycle.sweep();
 
 			expect(aca.stop).toHaveBeenCalledWith("NOR-1");
-			const [idleStop] = eventsNamed(logger, "sandbox_idle_stopped");
+			const [idleStop] = eventsNamed(logger, "sandbox.idle_stopped");
 			expect(idleStop).toMatchObject({
 				issue_key: "NOR-1",
 				provider: "aca",
@@ -1153,7 +1143,7 @@ describe("ContainerLifecycle", () => {
 
 			await lifecycle.sweep();
 
-			expect(eventsNamed(logger, "sandbox_destroyed")[0]).toMatchObject({
+			expect(eventsNamed(logger, "sandbox.destroyed")[0]).toMatchObject({
 				issue_key: "NOR-1",
 				reason: "stale",
 			});
@@ -1176,7 +1166,7 @@ describe("ContainerLifecycle", () => {
 			await lifecycle.sweep();
 
 			expect(aca.destroy).toHaveBeenCalledWith("GHOST-1");
-			expect(eventsNamed(logger, "sandbox_destroyed")[0]).toMatchObject({
+			expect(eventsNamed(logger, "sandbox.destroyed")[0]).toMatchObject({
 				issue_key: "GHOST-1",
 				device_id: null,
 				reason: "orphan",

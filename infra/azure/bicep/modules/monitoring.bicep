@@ -3,8 +3,16 @@
 // Everything here reads `ContainerAppConsoleLogs_CL`, the table the Container
 // Apps environment already ships the router's stdout to. The router app sets
 // CYRUS_LOG_FORMAT=json, so each line in `Log_s` is one flat JSON object, and
-// the `sandbox_*` event family sits on top of that. Nothing here requires an
+// the `sandbox.*` event family sits on top of that. Nothing here requires an
 // agent, an exporter, or an OpenTelemetry dependency.
+//
+// NAMING (Phase 4 / NOR-282): event names are dotted lowercase
+// (`sandbox.gauge`), and every Cyrus-specific attribute lives under `cyrus.*`.
+// A dotted key is NOT reachable with dot syntax in KQL — `p.cyrus.issue_key`
+// parses as a nested lookup and silently returns null — so every one of them is
+// read with bracket syntax: `p["cyrus.issue_key"]`. The structural keys the
+// renderer owns (`event`, `component`, `level`, `message`, `timestamp`, `args`)
+// deliberately keep their bare Phase 0 names and their dot syntax.
 //
 // The two facts every query below is built on, both easy to get wrong:
 //
@@ -76,18 +84,18 @@ var gaugePrologue = [
   'ContainerAppConsoleLogs_CL'
   appFilter
   '| extend p = parse_json(Log_s)'
-  '| where tostring(p.event) == "sandbox_gauge"'
+  '| where tostring(p.event) == "sandbox.gauge"'
   '| extend'
-  '    issue_key        = tostring(p.issue_key),'
-  '    device_id        = tostring(p.device_id),'
-  '    provider         = tostring(p.provider),'
-  '    state            = tostring(p.state),'
-  '    sessions         = toint(p.sessions),'
-  '    online           = tobool(p.online),'
-  '    age_ms           = tolong(p.age_ms),'
-  '    uptime_ms        = tolong(p.uptime_ms),'
-  '    last_seen_age_ms = tolong(p.last_seen_age_ms),'
-  '    parked_for_ms    = tolong(p.parked_for_ms)'
+  '    issue_key        = tostring(p["cyrus.issue_key"]),'
+  '    device_id        = tostring(p["cyrus.device_id"]),'
+  '    provider         = tostring(p["cyrus.provider"]),'
+  '    state            = tostring(p["cyrus.state"]),'
+  '    sessions         = toint(p["cyrus.sessions"]),'
+  '    online           = tobool(p["cyrus.online"]),'
+  '    age_ms           = tolong(p["cyrus.age_ms"]),'
+  '    uptime_ms        = tolong(p["cyrus.uptime_ms"]),'
+  '    last_seen_age_ms = tolong(p["cyrus.last_seen_age_ms"]),'
+  '    parked_for_ms    = tolong(p["cyrus.parked_for_ms"])'
 ]
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -145,13 +153,13 @@ resource sandboxesOverTime 'Microsoft.OperationalInsights/workspaces/savedSearch
         'ContainerAppConsoleLogs_CL'
         appFilter
         '| extend p = parse_json(Log_s)'
-        '| where tostring(p.event) == "sandbox_sweep_completed"'
+        '| where tostring(p.event) == "sandbox.sweep_completed"'
         '| extend'
-        '    sandboxes = toint(p.sandboxes),'
-        '    running   = toint(p.running),'
-        '    stopped   = toint(p.stopped),'
-        '    pinned    = toint(p.pinned),'
-        '    unknown   = toint(p.unknown)'
+        '    sandboxes = toint(p["cyrus.sandboxes"]),'
+        '    running   = toint(p["cyrus.running"]),'
+        '    stopped   = toint(p["cyrus.stopped"]),'
+        '    pinned    = toint(p["cyrus.pinned"]),'
+        '    unknown   = toint(p["cyrus.unknown"])'
         '| summarize'
         '    sandboxes = max(sandboxes),'
         '    running   = max(running),'
@@ -206,14 +214,14 @@ resource sandboxLifecycle 'Microsoft.OperationalInsights/workspaces/savedSearche
         appFilter
         '| extend p = parse_json(Log_s)'
         '| extend event = tostring(p.event)'
-        '| where event startswith "sandbox_" and event != "sandbox_gauge"'
-        '| where tostring(p.issue_key) == target_issue'
+        '| where event startswith "sandbox." and event != "sandbox.gauge"'
+        '| where tostring(p["cyrus.issue_key"]) == target_issue'
         '| project'
         '    TimeGenerated,'
         '    event,'
-        '    device_id = tostring(p.device_id),'
-        '    provider  = tostring(p.provider),'
-        '    detail    = bag_remove_keys(p, dynamic(["event", "issue_key", "device_id", "provider", "component", "level", "message", "timestamp"]))'
+        '    device_id = tostring(p["cyrus.device_id"]),'
+        '    provider  = tostring(p["cyrus.provider"]),'
+        '    detail    = bag_remove_keys(p, dynamic(["event", "cyrus.issue_key", "cyrus.device_id", "cyrus.provider", "component", "level", "message", "timestamp"]))'
         '| order by TimeGenerated asc'
       ],
       '\n'
@@ -222,8 +230,8 @@ resource sandboxLifecycle 'Microsoft.OperationalInsights/workspaces/savedSearche
 }
 
 // Boots that never reached running, and boots that failed outright. A
-// `sandbox_boot_started` with neither a `sandbox_running` nor a
-// `sandbox_boot_failed` inside the window is a provider call that hung — the
+// `sandbox.boot_started` with neither a `sandbox.running` nor a
+// `sandbox.boot_failed` inside the window is a provider call that hung — the
 // case that looks identical to "still booting" from the router's console.
 resource sandboxBootHealth 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
   parent: logAnalytics
@@ -237,13 +245,13 @@ resource sandboxBootHealth 'Microsoft.OperationalInsights/workspaces/savedSearch
         appFilter
         '| extend p = parse_json(Log_s)'
         '| extend event = tostring(p.event)'
-        '| where event in ("sandbox_boot_started", "sandbox_running", "sandbox_boot_failed")'
+        '| where event in ("sandbox.boot_started", "sandbox.running", "sandbox.boot_failed")'
         '| summarize'
-        '    started   = countif(event == "sandbox_boot_started"),'
-        '    reached_running = countif(event == "sandbox_running"),'
-        '    failed    = countif(event == "sandbox_boot_failed"),'
-        '    last_error = anyif(tostring(p.reason), event == "sandbox_boot_failed")'
-        '  by issue_key = tostring(p.issue_key), provider = tostring(p.provider)'
+        '    started   = countif(event == "sandbox.boot_started"),'
+        '    reached_running = countif(event == "sandbox.running"),'
+        '    failed    = countif(event == "sandbox.boot_failed"),'
+        '    last_error = anyif(tostring(p["cyrus.reason"]), event == "sandbox.boot_failed")'
+        '  by issue_key = tostring(p["cyrus.issue_key"]), provider = tostring(p["cyrus.provider"])'
         '| extend unresolved = started - reached_running - failed'
         '| where failed > 0 or unresolved > 0'
         '| order by unresolved desc, failed desc'
@@ -386,7 +394,7 @@ resource sandboxLongRunning 'Microsoft.Insights/scheduledQueryRules@2023-03-15-p
 // has been up too long". Alerting on the ABSENCE of the rollup event is what
 // turns that silent failure into a page.
 //
-// `sandbox_sweep_completed` is emitted once per COMPLETED sweep, including when
+// `sandbox.sweep_completed` is emitted once per COMPLETED sweep, including when
 // zero sandboxes exist, precisely so this rule can key on it.
 //
 // `ContainerLifecycle.sweep()` is non-reentrant, so a tick that fires while the
@@ -402,7 +410,7 @@ resource sandboxSweepStalled 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
   tags: tags
   properties: {
     displayName: 'alert-${namePrefix}-sandbox-sweep-stalled'
-    description: 'The router\'s 60s container lifecycle sweep has emitted no sandbox_sweep_completed event in 15 minutes. Every other sandbox alert is derived from that sweep, so while this is firing they are all blind.'
+    description: 'The router\'s 60s container lifecycle sweep has emitted no sandbox.sweep_completed event in 15 minutes. Every other sandbox alert is derived from that sweep, so while this is firing they are all blind.'
     severity: 1
     enabled: true
     evaluationFrequency: 'PT15M'
@@ -424,7 +432,7 @@ resource sandboxSweepStalled 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
               'ContainerAppConsoleLogs_CL'
               appFilter
               '| extend p = parse_json(Log_s)'
-              '| where tostring(p.event) == "sandbox_sweep_completed"'
+              '| where tostring(p.event) == "sandbox.sweep_completed"'
               '| summarize sweeps = count()'
             ],
             '\n'
@@ -455,7 +463,7 @@ resource sandboxBootFailures 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
   tags: tags
   properties: {
     displayName: 'alert-${namePrefix}-sandbox-boot-failures'
-    description: 'Cyrus sandboxes failed to boot. Each failure is one Linear issue that got no agent. Check the "reason" attribute on the sandbox_boot_failed events.'
+    description: 'Cyrus sandboxes failed to boot. Each failure is one Linear issue that got no agent. Check the "cyrus.reason" attribute on the sandbox.boot_failed events.'
     severity: 2
     enabled: true
     evaluationFrequency: 'PT15M'
@@ -472,8 +480,8 @@ resource sandboxBootFailures 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
               'ContainerAppConsoleLogs_CL'
               appFilter
               '| extend p = parse_json(Log_s)'
-              '| where tostring(p.event) == "sandbox_boot_failed"'
-              '| summarize failures = count() by issue_key = tostring(p.issue_key), provider = tostring(p.provider)'
+              '| where tostring(p.event) == "sandbox.boot_failed"'
+              '| summarize failures = count() by issue_key = tostring(p["cyrus.issue_key"]), provider = tostring(p["cyrus.provider"])'
             ],
             '\n'
           )

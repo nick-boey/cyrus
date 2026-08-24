@@ -36,3 +36,34 @@ export function testLogger(overrides?: Partial<ILogger>): TestLogger {
 export function silentLogger(overrides?: Partial<ILogger>): ILogger {
 	return { ...createNoopLogger(), ...overrides };
 }
+
+/**
+ * Every `logger.event(name, attrs)` call recorded for one event name, with the
+ * `cyrus.` attribute namespace stripped.
+ *
+ * De-namespacing on the way out is deliberate. These call sites are asserting
+ * LIFECYCLE BEHAVIOUR — "the idle stop carried the uptime of the run it ended" —
+ * and spelling `"cyrus.uptime_ms"` in each of them would couple every one of
+ * those claims to the wire format, so a future namespace change would break
+ * thirty behavioural tests that are not about naming at all. The naming contract
+ * itself (dotted event names, `cyrus.*` attributes) is owned by
+ * `SandboxTelemetry.test.ts`, which asserts the emitted keys verbatim.
+ */
+export function eventsNamed(
+	logger: TestLogger,
+	name: string,
+): Array<Record<string, unknown>> {
+	return logger.event.mock.calls
+		.filter(([emitted]) => emitted === name)
+		.map(([, attributes]) => stripCyrusNamespace(attributes));
+}
+
+function stripCyrusNamespace(attributes: unknown): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(
+		(attributes ?? {}) as Record<string, unknown>,
+	)) {
+		out[key.startsWith("cyrus.") ? key.slice("cyrus.".length) : key] = value;
+	}
+	return out;
+}

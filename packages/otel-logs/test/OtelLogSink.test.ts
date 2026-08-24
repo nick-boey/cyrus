@@ -99,6 +99,68 @@ describe("OtelLogSink", () => {
 		});
 	});
 
+	describe("exception semconv", () => {
+		/**
+		 * The one place this sink speaks OTel semconv rather than Cyrus-native
+		 * names. `exception.*` is STABLE, describes nothing Cyrus-specific, and is
+		 * what makes a backend render the record as an exception rather than a
+		 * line of text.
+		 */
+		it("emits the three stable exception attributes", () => {
+			sink.write(
+				record({
+					level: LogLevel.ERROR,
+					message: "session error",
+					exception: {
+						type: "TypeError",
+						message: "cannot read properties of undefined",
+						stacktrace: "TypeError: cannot read…\n    at ClaudeRunner.ts:12",
+					},
+				}),
+			);
+			expect(logger.emitted[0]?.attributes).toMatchObject({
+				"exception.type": "TypeError",
+				"exception.message": "cannot read properties of undefined",
+				"exception.stacktrace":
+					"TypeError: cannot read…\n    at ClaudeRunner.ts:12",
+			});
+		});
+
+		it("omits exception.stacktrace when the record carried none", () => {
+			sink.write(
+				record({ exception: { type: "Error", message: "no frames" } }),
+			);
+			expect(logger.emitted[0]?.attributes).not.toHaveProperty(
+				"exception.stacktrace",
+			);
+		});
+
+		it("gives the stacktrace a larger cap than a plain attribute", () => {
+			// The generic 1 KB attribute cap cuts a Node stack (plus any
+			// `Caused by:` chain) off around the tenth frame — usually before it
+			// reaches our own code, which is the only part worth reading.
+			sink.write(
+				record({
+					exception: {
+						type: "Error",
+						message: "deep",
+						stacktrace: "x".repeat(20_000),
+					},
+				}),
+			);
+			expect(
+				String(logger.emitted[0]?.attributes?.["exception.stacktrace"]),
+			).toHaveLength(8_000 + "…[truncated]".length);
+		});
+
+		it("adds nothing when the record has no exception", () => {
+			sink.write(record());
+			expect(Object.keys(logger.emitted[0]?.attributes ?? {})).not.toContain(
+				"exception.type",
+			);
+		});
+	});
+
 	it("preserves a null attribute rather than dropping it", () => {
 		// `null` is a meaningful value in the Phase 1/2 event vocabulary — e.g.
 		// `issue_key: null` for a line with no issue — and distinct from absent.

@@ -1,6 +1,6 @@
 import type { LogAttributes, Logger } from "@opentelemetry/api-logs";
 import type { LogRecord, LogSink } from "cyrus-core";
-import { LogLevel } from "cyrus-core";
+import { exceptionAttributes, LogLevel } from "cyrus-core";
 import { severityFor, severityTextFor } from "./severity.js";
 
 /**
@@ -13,6 +13,13 @@ const MAX_BODY_CHARS = 8_000;
 const MAX_ARGS_CHARS = 2_000;
 const MAX_ATTRIBUTE_CHARS = 1_000;
 const MAX_ATTRIBUTES = 64;
+/**
+ * Stacktraces get their own, larger cap. `exception.stacktrace` is the reason an
+ * operator opens the record at all, and the generic 1 KB attribute cap cuts a
+ * Node stack (plus any `Caused by:` chain) off around the tenth frame — usually
+ * before it reaches our own code.
+ */
+const MAX_STACKTRACE_CHARS = 8_000;
 
 export interface OtelLogSinkOptions {
 	/** The OTel API logger to emit through. */
@@ -42,6 +49,12 @@ export interface OtelLogSinkOptions {
  * Two reasons: OTel defines no semconv for any of them, and operators already
  * have Phase 0/2 queries written against those names. A rename would silently
  * break every saved query for no gain.
+ *
+ * The exception is `exception.*` (Phase 4 / NOR-282): those three attributes ARE
+ * stable semconv, describe nothing Cyrus-specific, and are what makes a backend
+ * render the record as an exception rather than a line of text. Event attributes
+ * carry their own `cyrus.*` namespace, applied at the call site — see
+ * `cyrusAttributes` in `cyrus-core`.
  *
  * ── RE-ENTRANCY ──
  * Like `RouterLogForwarder`, this sink is called FROM the logger, and the
@@ -118,6 +131,22 @@ export class OtelLogSink implements LogSink {
 		if (record.event !== undefined) attributes.event = record.event;
 		if (record.args !== undefined) {
 			attributes.args = truncate(record.args, MAX_ARGS_CHARS);
+		}
+		if (record.exception !== undefined) {
+			// The one place this sink speaks OTel semconv rather than Cyrus-native
+			// names: `exception.*` is STABLE, universally understood by backends
+			// (Application Insights renders it as a first-class exception), and
+			// nothing about it is Cyrus-specific.
+			for (const [key, value] of Object.entries(
+				exceptionAttributes(record.exception),
+			)) {
+				attributes[key] = truncate(
+					value,
+					key === "exception.stacktrace"
+						? MAX_STACKTRACE_CHARS
+						: MAX_ATTRIBUTE_CHARS,
+				);
+			}
 		}
 
 		// Call-site attributes come last so they win a collision with the context

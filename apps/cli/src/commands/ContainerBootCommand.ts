@@ -15,7 +15,11 @@ import {
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { EdgeConfigSchema, RepositoryConfigSchema } from "cyrus-core";
+import {
+	createLogger,
+	EdgeConfigSchema,
+	RepositoryConfigSchema,
+} from "cyrus-core";
 import { GITHUB_TOKEN_SECRET_KEYS, probeGitHubTokenScopes } from "cyrus-router";
 import {
 	downloadBundle as defaultDownloadBundle,
@@ -184,15 +188,25 @@ export interface ContainerBootLogger {
 export const BOOT_LOG_PATH = join(homedir(), "cyrus-boot.log");
 
 /**
- * Console logger that also appends to {@link BOOT_LOG_PATH}. Appends (never
- * truncates) so a container that reboots keeps the earlier attempt's evidence.
+ * Boot logger that emits through `ILogger` and also appends to
+ * {@link BOOT_LOG_PATH}. Appends (never truncates) so a container that reboots
+ * keeps the earlier attempt's evidence.
  *
- * File writes are best-effort: a read-only or missing log directory must
+ * Going through `ILogger` rather than bare `console.*` is what puts boot output
+ * on the structured path: with `CYRUS_LOG_FORMAT=json` each line becomes a
+ * queryable record with `component == "container-boot"`, and any installed
+ * `LogSink` (the OTLP exporter, the router forwarder) sees it. Bare `console.*`
+ * reached the container's stdout and nothing else — which is the wrong trade for
+ * the one phase of the process where a failure means the issue gets no agent
+ * at all.
+ *
+ * File writes stay best-effort: a read-only or missing log directory must
  * degrade to console-only, never abort a boot that would otherwise succeed.
  */
 export function createBootLogger(
 	logPath: string = BOOT_LOG_PATH,
 ): ContainerBootLogger {
+	const logger = createLogger({ component: "container-boot" });
 	const persist = (level: string, message: string): void => {
 		try {
 			appendFileSync(
@@ -200,20 +214,20 @@ export function createBootLogger(
 				`${new Date().toISOString()} ${level} ${message}\n`,
 			);
 		} catch {
-			// Console output already happened; losing the file copy is not fatal.
+			// The log line already went out; losing the file copy is not fatal.
 		}
 	};
 	return {
 		info: (m) => {
-			console.log(`[container-boot] ${m}`);
+			logger.info(m);
 			persist("info", m);
 		},
 		warn: (m) => {
-			console.warn(`[container-boot] ${m}`);
+			logger.warn(m);
 			persist("warn", m);
 		},
 		error: (m) => {
-			console.error(`[container-boot] ${m}`);
+			logger.error(m);
 			persist("error", m);
 		},
 	};

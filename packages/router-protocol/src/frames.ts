@@ -194,6 +194,24 @@ const logFrame = z.object({
 	/** Summarised trailing `logger.x(msg, ...args)` arguments. */
 	args: z.string().optional(),
 	/**
+	 * OTel exception semconv for the Error the worker's call site passed, if any.
+	 *
+	 * Carried structured rather than left inside `args` so a sandbox error keeps
+	 * its type and stack when the router re-emits it: `args` is a lossy one-line
+	 * summary, and a stack trace flattened into it is the one thing an operator
+	 * opening a sandbox error is actually looking for.
+	 *
+	 * Optional and additive — it does NOT bump PROTOCOL_VERSION. An older device
+	 * omits it and the router simply has no exception to re-stamp.
+	 */
+	exception: z
+		.object({
+			type: z.string(),
+			message: z.string(),
+			stacktrace: z.string().optional(),
+		})
+		.optional(),
+	/**
 	 * How many records the device's volume guard dropped since the last frame it
 	 * managed to send. Carried inline rather than as its own periodic frame so a
 	 * truncated log stream is never silently truncated: a KQL
