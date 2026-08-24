@@ -442,7 +442,12 @@ describe("DeviceGateway", () => {
 			// reconnect, enqueued at rolled-back seq 1. The device is at 7, so
 			// the already-acked purge in handleHello would delete this row
 			// undelivered — the second silent-drop path in this bug.
-			store.enqueueEvent(device.deviceId, '{"n":"stranded"}', Date.now(), 60_000);
+			store.enqueueEvent(
+				device.deviceId,
+				'{"n":"stranded"}',
+				Date.now(),
+				60_000,
+			);
 
 			const ws = connect(port);
 			const nextMessage = messageReader(ws);
