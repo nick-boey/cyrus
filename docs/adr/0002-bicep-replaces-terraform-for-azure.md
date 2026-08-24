@@ -63,7 +63,7 @@ unreviewable at this size.
 
 ## Consequences
 
-Two guarantees could not be expressed in the template and moved into
+Three guarantees could not be expressed completely in the template and moved into
 `scripts/deploy-azure.sh`. This is the real cost of the change and is stated
 plainly rather than glossed.
 
@@ -94,6 +94,21 @@ repo's own workflow only publishes `sha-<sha>` and `v<semver>`, so nothing in
 practice regresses, and narrowing a positive allowlist is safe in the direction
 that matters.
 
+**Secret writes require independent consent.** Routine deployments must neither
+receive Linear or `/setup` secret values nor restore stale values over versions
+rotated directly in Key Vault. `writeLinearSecrets` and
+`writeSetupAuthSecrets` default to `false`; when false, the Bicep modules omit
+the corresponding Key Vault child resources. Incremental mode preserves the
+existing versions and the router continues to use their fixed, versionless
+URIs. Validation also requires every value field to be empty when its write flag
+is false, preventing routine CD from transmitting stale bootstrap inputs to ARM.
+A deliberate bootstrap or rotation must both enable the relevant template flag
+and invoke the deploy script with `--allow-secret-writes`. The template
+flag determines the ARM shape, while the independent command-line switch makes
+the exceptional operation visible at the deployment boundary. As with the two
+checks above, calling `az deployment` directly bypasses the script half of the
+guard.
+
 Cross-parameter invariants — `enableSetupTableBackend` requires
 `enableSetupSecretStore`, `setupUiAutoProvisionUsers` requires a membership gate,
 and so on — did stay in the template. Bicep's decorators cover only
@@ -113,12 +128,13 @@ flag and the README says so in three places, but a hand-run `az deployment` can
 still reach it — which is the same shape of exposure as the two gates above, and
 the same mitigation: use the script.
 
-Two smaller behavioural differences are worth knowing. Seeding a Key Vault secret
-is now a management-plane write (`Microsoft.KeyVault/vaults/secrets`), so the
-deploying principal no longer needs *Key Vault Secrets Officer*, and creating the
-`/setup` KEK no longer needs *Key Vault Crypto Officer*; Contributor covers both.
-Every secret parameter is `@secure()` so its value is not persisted into ARM
-deployment history. And Bicep cannot resolve a role definition by display name
+Two smaller behavioural differences are worth knowing. An explicitly enabled
+Key Vault secret write is now a management-plane write
+(`Microsoft.KeyVault/vaults/secrets`), so the deploying principal no longer
+needs *Key Vault Secrets Officer*, and creating the `/setup` KEK no longer needs
+*Key Vault Crypto Officer*; Contributor covers both. Every optional secret
+parameter is `@secure()` so its value is not persisted into ARM deployment
+history. And Bicep cannot resolve a role definition by display name
 the way `data.azurerm_role_definition` did, so built-in role GUIDs are constants
 in `modules/foundation.bicep` — safe, since built-in roles carry the same GUID in
 every tenant, with the preview *Container Apps SandboxGroup Data Owner* role kept

@@ -1,7 +1,9 @@
 ////////////////////////////////////////////////////////////////////////////////
 // main.bicepparam.example — copy to main.bicepparam and fill in.
-// NEVER commit main.bicepparam: it holds the Linear client secret and both OAuth
-// tokens. `.gitignore` covers `*.bicepparam` and un-ignores `*.bicepparam.example`.
+// A routine deployment keeps every secret value empty. Bootstrap/rotation may
+// temporarily put Linear or /setup secrets here; never commit that populated
+// file to the public repository. `.gitignore` covers `*.bicepparam` and
+// un-ignores `*.bicepparam.example`.
 //
 // Every parameter is documented on its @description in main.bicep; this file
 // lists each one with a sample or placeholder so a fresh operator has a complete
@@ -97,18 +99,26 @@ param acaKeepSnapshots = 2
 // ensureRunning replaces it.
 param acaDisconnectedRecreateMs = 120000
 
-// ---- Linear secrets (seeded into Key Vault; rotate after first deploy) ------
+// ---- Linear secret bootstrap/rotation ---------------------------------------
 // Real organization UUID from `cyrus self-auth-linear`; do not use the slug.
 param linearWorkspaceId = '00000000-0000-0000-0000-000000000000'
 
-// All five below are SENSITIVE — pull from your password manager, not from git.
-param linearWorkspaceToken = '<linear-workspace-api-token>'
-param linearWorkspaceRefreshToken = '<linear-workspace-refresh-token>'
+// STEADY STATE: leave the write flag false and all five values empty. The router
+// references existing versionless Key Vault secrets; routine deployments never
+// receive or overwrite their values.
+//
+// FIRST BOOTSTRAP / COORDINATED ROTATION ONLY: set writeLinearSecrets=true,
+// populate all five values from your password manager, and invoke
+// `scripts/deploy-azure.sh --allow-secret-writes`. Immediately restore false and
+// clear the values after the successful write.
+param writeLinearSecrets = false
+param linearWorkspaceToken = '' // '<linear-workspace-api-token>'
+param linearWorkspaceRefreshToken = '' // '<linear-workspace-refresh-token>'
 // HMAC secret — generate with `openssl rand -hex 32` and paste the SAME value
 // into Linear's webhook subscription UI.
-param linearWebhookSecret = '<openssl-rand-hex-32>'
-param linearClientId = '<linear-oauth-client-id>'
-param linearClientSecret = '<linear-oauth-client-secret>'
+param linearWebhookSecret = '' // '<openssl-rand-hex-32>'
+param linearClientId = '' // '<linear-oauth-client-id>'
+param linearClientSecret = '' // '<linear-oauth-client-secret>'
 
 // ---- RBAC -------------------------------------------------------------------
 // Bicep cannot resolve a role definition by display name, so the GUID is the
@@ -170,12 +180,17 @@ param enableSetupUi = false
 // Required when enableSetupAuth = true. Reuse the EXISTING router app
 // registration — one app registration/audience per router deployment.
 param setupUiClientId = '' // bare client-id GUID
+
+// STEADY STATE: leave this write flag false and the three values below empty.
+// STAGE-1 BOOTSTRAP / COORDINATED RENEWAL ONLY: set it true, populate the client
+// secret and static SAS window, then pass --allow-secret-writes. Restore false
+// and clear the values immediately afterwards.
+param writeSetupAuthSecrets = false
 param setupUiClientSecret = '' // SENSITIVE — `az ad app credential reset`, shown once
 
-// Required when enableSetupAuth = true. Static RFC 3339 window for the ACA
-// token-store SAS. Do NOT derive from utcNow(): that re-evaluates on every
-// deployment and rolls a new router revision each time. EXPIRY IS A LIVE FAILURE
-// DEADLINE — past it, sign-in breaks. Diarise the renewal.
+// Required only when writeSetupAuthSecrets=true. Static RFC 3339 window for the
+// ACA token-store SAS. EXPIRY IS A LIVE FAILURE DEADLINE — diarise the protected
+// manual renewal.
 param setupUiTokenStoreSasStart = '' // '2026-01-01T00:00:00Z'
 param setupUiTokenStoreSasExpiry = '' // '2027-01-01T00:00:00Z'
 

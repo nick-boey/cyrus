@@ -2,7 +2,7 @@
 // router Container App, its auth child, and monitoring.
 //
 // Mirrors what main.tf plus the storage half of setup_ui.tf used to hold:
-// Log Analytics, Key Vault (RBAC mode) and its seeded secrets, the router
+// Log Analytics, Key Vault (RBAC mode) and its opt-in secret writes, the router
 // user-assigned identity, the storage account and its three children, the
 // Container Apps environment and its Azure Files link, the optional ACR, every
 // role assignment, and the opt-in per-user secret store (Table + KEK).
@@ -26,6 +26,9 @@ param operatorPrincipalId string
 
 param linearWorkspaceId string
 
+@description('Write all five Linear bootstrap secrets during this deployment. False for steady state.')
+param writeLinearSecrets bool
+
 @secure()
 param linearWorkspaceToken string
 
@@ -41,8 +44,11 @@ param linearClientId string
 @secure()
 param linearClientSecret string
 
-@description('Stage 1 of the /setup rollout: seed the Entra client secret and create the token-store container and its SAS secret.')
+@description('Stage 1 of the /setup rollout: create the token-store container and retain the existing Key Vault secret references.')
 param enableSetupAuth bool
+
+@description('Write the setup UI client secret and token-store SAS during this deployment. False for steady state.')
+param writeSetupAuthSecrets bool
 
 @secure()
 param setupUiClientSecret string
@@ -262,18 +268,20 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = if (enableAcr
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Key Vault seed secrets
+// Key Vault bootstrap/rotation secret writes
 //
-// Seeded on first deploy and operator-owned thereafter — re-deploying with a
-// stale parameter value OVERWRITES an operator rotation. Rotate via
-// `az keyvault secret set` and update the parameter file in the same change.
+// Every write is explicitly opt-in. In steady state these resources are omitted,
+// ARM Incremental mode leaves their existing versions untouched, and the router
+// keeps referencing their stable versionless URLs. Re-enable a write flag only
+// for first bootstrap or a coordinated manual rotation; deploy-azure.sh requires
+// separate --allow-secret-writes consent before it will invoke ARM in that mode.
 //
 // No expiry is set on any of them: an expiry derived from utcNow() would
 // re-evaluate on every deployment and produce a new secret version — and
 // therefore a new router revision — each time.
 ////////////////////////////////////////////////////////////////////////////////
 
-resource linearWorkspaceTokenSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource linearWorkspaceTokenSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (writeLinearSecrets) {
   parent: keyVault
   name: 'linear-workspace-token'
   tags: tags
@@ -282,7 +290,7 @@ resource linearWorkspaceTokenSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-0
   }
 }
 
-resource linearWorkspacesJsonSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource linearWorkspacesJsonSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (writeLinearSecrets) {
   parent: keyVault
   name: 'linear-workspaces-json'
   tags: tags
@@ -296,7 +304,7 @@ resource linearWorkspacesJsonSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-0
   }
 }
 
-resource linearWebhookSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource linearWebhookSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (writeLinearSecrets) {
   parent: keyVault
   name: 'linear-webhook-secret'
   tags: tags
@@ -305,7 +313,7 @@ resource linearWebhookSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01
   }
 }
 
-resource linearClientIdSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource linearClientIdSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (writeLinearSecrets) {
   parent: keyVault
   name: 'linear-client-id'
   tags: tags
@@ -314,7 +322,7 @@ resource linearClientIdSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   }
 }
 
-resource linearClientSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource linearClientSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (writeLinearSecrets) {
   parent: keyVault
   name: 'linear-client-secret'
   tags: tags
@@ -326,9 +334,10 @@ resource linearClientSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01'
 // STAGE 1 — the two secrets the EasyAuth SIDECAR consumes. Neither is exposed to
 // the router container as an env var; `authConfigs` resolves
 // clientSecretSettingName / sasUrlSettingName against the Container App's
-// `secrets` collection by name, which is why the matching secret entries in
-// router-app.bicep are gated on the same flag.
-resource setupUiClientSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (enableSetupAuth) {
+// `secrets` collection by name. router-app.bicep keeps those versionless
+// references whenever auth is enabled; this separate flag controls only whether
+// this deployment writes new Key Vault secret versions behind the references.
+resource setupUiClientSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (writeSetupAuthSecrets) {
   parent: keyVault
   name: 'setup-ui-client-secret'
   tags: tags
@@ -346,7 +355,7 @@ resource setupUiClientSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01
 // `listServiceSas` is deterministic for a fixed window and account key, so this
 // secret does not churn between deployments — which is exactly why the window is
 // explicit operator input rather than something derived from utcNow().
-var tokenStoreSasToken = enableSetupAuth
+var tokenStoreSasToken = writeSetupAuthSecrets
   ? storage.listServiceSas('2023-05-01', {
       canonicalizedResource: '/blob/${storage.name}/${tokenStoreContainerName}'
       signedResource: 'c'
@@ -358,7 +367,7 @@ var tokenStoreSasToken = enableSetupAuth
     }).serviceSasToken
   : ''
 
-resource setupUiTokenStoreSasSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (enableSetupAuth) {
+resource setupUiTokenStoreSasSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (writeSetupAuthSecrets) {
   parent: keyVault
   name: 'setup-ui-token-store-sas'
   tags: tags

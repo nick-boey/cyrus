@@ -151,32 +151,35 @@ param acaKeepSnapshots int = 2
 param acaDisconnectedRecreateMs int = 120000
 
 ////////////////////////////////////////////////////////////////////////////////
-// Linear integration secrets (seeded into Key Vault)
+// Linear integration secrets (explicit bootstrap/rotation writes only)
 ////////////////////////////////////////////////////////////////////////////////
 
 @description('Linear organization UUID returned by OAuth workspace discovery. Use the UUID, not the workspace slug. NOT secret; shipped as a plain env var to the router.')
 @minLength(1)
 param linearWorkspaceId string
 
-@description('Linear workspace API token used by the router to read/mutate issues. Seeded into Key Vault secret \'linear-workspace-token\'. Rotate via Key Vault after first deploy — re-deploying with the old parameter value overwrites an operator rotation.')
-@secure()
-param linearWorkspaceToken string
+@description('Explicitly write the five Linear bootstrap secrets into Key Vault during this deployment. Default FALSE: steady-state deployments reference the existing versionless secrets and must not overwrite operator/runtime rotations. Set true only for first bootstrap or a coordinated manual rotation, and invoke scripts/deploy-azure.sh with --allow-secret-writes.')
+param writeLinearSecrets bool = false
 
-@description('Linear OAuth refresh token used to rotate the workspace access token. Seeded into the \'linear-workspaces-json\' secret.')
+@description('Linear workspace API token used only when writeLinearSecrets is true. Leave empty for steady-state deployments.')
 @secure()
-param linearWorkspaceRefreshToken string
+param linearWorkspaceToken string = ''
 
-@description('HMAC secret shared between Linear and the router for verifying webhook signatures. Seeded into Key Vault secret \'linear-webhook-secret\'.')
+@description('Linear OAuth refresh token used only when writeLinearSecrets is true. Leave empty for steady-state deployments.')
 @secure()
-param linearWebhookSecret string
+param linearWorkspaceRefreshToken string = ''
 
-@description('Linear OAuth client id (router-mode OAuth app). Seeded into Key Vault secret \'linear-client-id\'.')
+@description('HMAC secret shared between Linear and the router, used only when writeLinearSecrets is true. Leave empty for steady-state deployments.')
 @secure()
-param linearClientId string
+param linearWebhookSecret string = ''
 
-@description('Linear OAuth client secret. Seeded into Key Vault secret \'linear-client-secret\'.')
+@description('Linear OAuth client id, used only when writeLinearSecrets is true. Leave empty for steady-state deployments.')
 @secure()
-param linearClientSecret string
+param linearClientId string = ''
+
+@description('Linear OAuth client secret, used only when writeLinearSecrets is true. Leave empty for steady-state deployments.')
+@secure()
+param linearClientSecret string = ''
 
 ////////////////////////////////////////////////////////////////////////////////
 // RBAC
@@ -255,20 +258,23 @@ param entraAllowedDomain string = ''
 // 404s, and only then clear enableSetupAuth.
 ////////////////////////////////////////////////////////////////////////////////
 
-@description('STAGE 1 of the staged /setup rollout. Attaches the ACA built-in auth (EasyAuth) sidecar to the router Container App: seeds the Entra client secret into Key Vault, creates the token-store blob container + SAS, and creates the authConfigs child. Does NOT enable any /setup route — that is enableSetupUi, deployed separately AFTER the live verification gate. Deploy this ALONE first.')
+@description('STAGE 1 of the staged /setup rollout. Attaches the ACA built-in auth (EasyAuth) sidecar to the router Container App: creates the token-store blob container and authConfigs child, referencing existing versionless Key Vault secrets. A first bootstrap writes those secrets separately with writeSetupAuthSecrets. Does NOT enable any /setup route — that is enableSetupUi, deployed separately AFTER the live verification gate. Deploy this ALONE first.')
 param enableSetupAuth bool = false
 
 @description('Client id (bare GUID) of the EXISTING router Entra app registration, reused by the auth sidecar. Required when enableSetupAuth is true. This is also the audience of the ID token the sidecar forwards — distinct from entraAudience, which is the api://<client-id> Application ID URI carried by ACCESS tokens on /enroll.')
 param setupUiClientId string = ''
 
-@description('Client secret for setupUiClientId, generated with `az ad app credential reset`. Seeded into Key Vault secret \'setup-ui-client-secret\' and referenced by the Container App as a secret; never emitted as an output. Rotate in Entra first, then `az keyvault secret set` — the Container App references it by versionless URI, so a rotation reaches the sidecar on the next revision without a deployment.')
+@description('Explicitly write the setup UI client secret and token-store SAS into Key Vault during this deployment. Default FALSE: steady-state deployments reference the existing versionless secrets. Set true only for stage-1 bootstrap or a coordinated client-secret/SAS renewal, and invoke scripts/deploy-azure.sh with --allow-secret-writes.')
+param writeSetupAuthSecrets bool = false
+
+@description('Client secret for setupUiClientId, used only when writeSetupAuthSecrets is true. Rotate in Entra first, then either set the Key Vault secret directly or perform a coordinated opt-in write.')
 @secure()
 param setupUiClientSecret string = ''
 
-@description('RFC 3339 UTC start of the token-store SAS window (for example \'2026-01-01T00:00:00Z\'). Required when enableSetupAuth is true. Static by design: a value derived from utcNow() would produce a different SAS — and therefore a new Key Vault secret version and a new router revision — on every deployment.')
+@description('RFC 3339 UTC start of the token-store SAS window. Required only when writeSetupAuthSecrets is true. Static by design: a value derived from utcNow() would produce a different SAS on every deployment.')
 param setupUiTokenStoreSasStart string = ''
 
-@description('RFC 3339 UTC expiry of the token-store SAS window (for example \'2027-01-01T00:00:00Z\'). Required when enableSetupAuth is true. EXPIRY IS A LIVE FAILURE: once past, the sidecar can no longer persist sessions and sign-in breaks. Diarise the renewal — bump this value and deploy.')
+@description('RFC 3339 UTC expiry of the token-store SAS window. Required only when writeSetupAuthSecrets is true. EXPIRY IS A LIVE FAILURE: once past, the sidecar can no longer persist sessions and sign-in breaks. Diarise a protected manual renewal.')
 param setupUiTokenStoreSasExpiry string = ''
 
 @description('Entra GROUP object ids allowed to authenticate to the app, rendered into authConfigs defaultAuthorizationPolicy.allowedPrincipals.groups. Empty (the default) sends no policy at all — an empty policy is not the same as an absent one, so do not read [] as "deny everyone".')
@@ -443,9 +449,13 @@ var parameterViolations = concat(
   allowMutableImageTags || routerImageIsImmutable ? [] : ['routerImage must be pinned to an immutable reference: a digest (repo@sha256:<64 hex>), a release tag (repo:v1.2.3), or a git-SHA tag (repo:sha-a1b2c3d). Mutable tags such as :latest, :deploy, or a branch/hotfix tag let the next deployment silently change the deployed build. Build and push an immutable tag first (README step 4), or set allowMutableImageTags=true for a throwaway stack.'],
   allowMutableImageTags || workerImageIsImmutable ? [] : ['workerImage must be pinned to an immutable reference: a digest, a release tag, or a sha- git-SHA tag. Mutable tags make the registered ACA disk image untraceable to a build.'],
   (empty(entraTenantId) && empty(entraAudience) && empty(entraAllowedDomain)) || (!empty(entraTenantId) && !empty(entraAudience)) ? [] : ['entraTenantId and entraAudience must both be set to enable Entra enrollment, and entraAllowedDomain may only be set when they are.'],
-  !enableSetupAuth || (!empty(setupUiClientId) && !empty(setupUiClientSecret)) ? [] : ['enableSetupAuth requires setupUiClientId and setupUiClientSecret. Create them on the EXISTING router app registration (README section 11 step 2) rather than minting a second one — one app registration/audience per router deployment is a standing invariant.'],
+  !writeLinearSecrets || (!empty(linearWorkspaceToken) && !empty(linearWorkspaceRefreshToken) && !empty(linearWebhookSecret) && !empty(linearClientId) && !empty(linearClientSecret)) ? [] : ['writeLinearSecrets=true requires all five Linear secret parameters. Leave the flag false and the values empty for steady-state deployments.'],
+  writeLinearSecrets || (empty(linearWorkspaceToken) && empty(linearWorkspaceRefreshToken) && empty(linearWebhookSecret) && empty(linearClientId) && empty(linearClientSecret)) ? [] : ['writeLinearSecrets=false requires all five Linear secret parameters to be empty. Remove stale bootstrap values before a steady-state deployment so routine CD does not transmit them to ARM.'],
+  !enableSetupAuth || !empty(setupUiClientId) ? [] : ['enableSetupAuth requires setupUiClientId. Create it on the EXISTING router app registration (README section 11 step 2) rather than minting a second one — one app registration/audience per router deployment is a standing invariant.'],
+  !writeSetupAuthSecrets || enableSetupAuth ? [] : ['writeSetupAuthSecrets=true requires enableSetupAuth=true because the client secret and token-store SAS belong to that auth sidecar.'],
+  !writeSetupAuthSecrets || (!empty(setupUiClientSecret) && !empty(setupUiTokenStoreSasStart) && !empty(setupUiTokenStoreSasExpiry)) ? [] : ['writeSetupAuthSecrets=true requires setupUiClientSecret, setupUiTokenStoreSasStart, and setupUiTokenStoreSasExpiry. Leave the flag false and the values empty for steady-state deployments.'],
+  writeSetupAuthSecrets || (empty(setupUiClientSecret) && empty(setupUiTokenStoreSasStart) && empty(setupUiTokenStoreSasExpiry)) ? [] : ['writeSetupAuthSecrets=false requires setupUiClientSecret, setupUiTokenStoreSasStart, and setupUiTokenStoreSasExpiry to be empty. Remove stale bootstrap values before a steady-state deployment so routine CD does not transmit them to ARM.'],
   !enableSetupAuth || !empty(entraTenantId) ? [] : ['enableSetupAuth requires entraTenantId: the sidecar openIdIssuer is the tenant\'s v2.0 OIDC endpoint on the cloud login authority. Setting entraTenantId also requires entraAudience, which is intended — the same app registration serves both /enroll access tokens and /setup sign-in.'],
-  !enableSetupAuth || (!empty(setupUiTokenStoreSasStart) && !empty(setupUiTokenStoreSasExpiry)) ? [] : ['enableSetupAuth requires setupUiTokenStoreSasStart and setupUiTokenStoreSasExpiry. Microsoft.App/containerApps/authConfigs@2024-03-01 models the token store as a SAS URL only, so the SAS window is explicit operator input.'],
   !enableSetupUi || enableSetupAuth ? [] : ['enableSetupUi requires enableSetupAuth. Enabling the routes without the auth sidecar publishes an unauthenticated /setup.'],
   !enableSetupUi || setupAuthStage1Verified ? [] : ['enableSetupUi requires setupAuthStage1Verified=true. Stage 1 must be deployed on its own and verified live (README section 11 step 5) BEFORE the routes exist.'],
   !enableSetupUi || setupUiAuthMode != 'entra-token' || !empty(setupUiIdTokenAudience) || !empty(setupUiClientId) ? [] : ['setupUiAuthMode=entra-token needs an ID token audience: set setupUiClientId (the audience defaults to it) or override setupUiIdTokenAudience explicitly.'],
@@ -476,7 +486,7 @@ resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Foundation: Log Analytics, Key Vault + seed secrets, identity, storage,
+// Foundation: Log Analytics, Key Vault + opt-in secret writes, identity, storage,
 // Container Apps environment, optional ACR, RBAC, optional per-user secret store
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -491,12 +501,14 @@ module foundation 'modules/foundation.bicep' = {
     enableAcr: enableAcr
     operatorPrincipalId: operatorPrincipalId
     linearWorkspaceId: linearWorkspaceId
+    writeLinearSecrets: writeLinearSecrets
     linearWorkspaceToken: linearWorkspaceToken
     linearWorkspaceRefreshToken: linearWorkspaceRefreshToken
     linearWebhookSecret: linearWebhookSecret
     linearClientId: linearClientId
     linearClientSecret: linearClientSecret
     enableSetupAuth: enableSetupAuth
+    writeSetupAuthSecrets: writeSetupAuthSecrets
     setupUiClientSecret: setupUiClientSecret
     setupUiTokenStoreSasStart: setupUiTokenStoreSasStart
     setupUiTokenStoreSasExpiry: setupUiTokenStoreSasExpiry

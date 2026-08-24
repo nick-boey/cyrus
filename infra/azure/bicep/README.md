@@ -16,7 +16,7 @@ main.bicep                        subscription scope: parameters, validation,
                                   resource group, module orchestration, outputs
 main.bicepparam.example           complete operator checklist — copy, fill, chmod 600
 modules/
-  foundation.bicep                Log Analytics, Key Vault + seeded secrets,
+  foundation.bicep                Log Analytics, Key Vault + opt-in secret writes,
                                   router identity, storage + Files share + blob
                                   containers + optional Table/KEK, Container Apps
                                   environment + Files link, optional ACR, all RBAC
@@ -32,13 +32,28 @@ modules/
 
 ```bash
 cp infra/azure/bicep/main.bicepparam.example infra/azure/bicep/main.bicepparam
-chmod 600 infra/azure/bicep/main.bicepparam   # it holds the Linear secrets
-# fill it in, then:
+chmod 600 infra/azure/bicep/main.bicepparam
+# fill in the environment identifiers and immutable images, then:
 ./scripts/deploy-azure.sh            # what-if preview
 ./scripts/deploy-azure.sh --apply    # deploy
 ```
 
-`scripts/deploy-azure.sh` is the documented entry point and does two things the
+The steady-state parameter file contains no secret values. A first deployment or
+deliberate rotation temporarily sets `writeLinearSecrets = true`, supplies all
+five Linear values, and adds `--allow-secret-writes` to both commands. Clear the
+values and restore the flag to `false` immediately afterwards.
+
+Private deployment automation can keep its environment file outside this public
+checkout and select the public build without rewriting either file:
+
+```bash
+./scripts/deploy-azure.sh \
+  --params /private/deploy/main.bicepparam \
+  --router-image ghcr.io/cyrusagents/cyrus@sha256:<64-hex-digest> \
+  --apply
+```
+
+`scripts/deploy-azure.sh` is the documented entry point and does three things the
 template cannot — see [Where enforcement lives](#where-enforcement-lives).
 
 Compile everything locally before pushing:
@@ -76,8 +91,8 @@ per-user secret. `scripts/deploy-azure.sh` does not offer it.
 
 ## Where enforcement lives
 
-Terraform expressed two guarantees in ways Bicep cannot. Both moved, and it is
-worth knowing exactly where, because the trust basis changed slightly.
+Three guarantees need help outside Bicep. The deploy script supplies that help,
+and it is worth knowing exactly where, because the trust basis changed slightly.
 
 ### The image tag policy
 
@@ -117,6 +132,29 @@ ARM about real remote state, not a boolean an operator typed — but it can be
 bypassed by invoking `az deployment sub create` directly. Don't. The full
 runbook, including the behavioural checks that no automated read can perform, is
 [`../README.md` §11](../README.md#11-optional-the-setup-management-ui-setup).
+
+### Secret writes require two keys
+
+Routine deployments must not need secret values and must not overwrite a secret
+rotated directly in Key Vault. The five Linear secrets and the two `/setup`
+secrets are therefore omitted from the ARM template unless their corresponding
+`writeLinearSecrets` or `writeSetupAuthSecrets` parameter is `true`. Because the
+deployment is Incremental, omitting those child resources preserves the existing
+secret versions. The router continues to use fixed, versionless Key Vault URIs.
+Both the template validation and deploy script also reject populated secret
+fields while the corresponding write flag is false, so routine CD does not even
+transmit stale bootstrap values to ARM.
+
+A write also requires the independent `--allow-secret-writes` command-line
+switch. The Bicep flag makes the intended resource part of the template; the
+script switch proves that the operator knowingly entered a bootstrap or rotation
+operation. Either control alone is insufficient when using the documented deploy
+path. Calling `az deployment` directly bypasses the script half of this guard.
+
+This is also the private-CD seam: its routine job needs Azure identity,
+environment parameters, and immutable image refs, but receives no Linear or
+`/setup` secret values. Seed or rotate those values in a separately authorized
+manual operation.
 
 ### Cross-parameter invariants
 

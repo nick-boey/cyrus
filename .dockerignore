@@ -31,13 +31,14 @@ apps/*/test
 # to the registry, honouring this file (azure-cli
 # command_modules/acr/_archive_utils.py: _pack_source_code -> _load_dockerignore_file).
 # Without these entries every deploy would ship, off this machine:
-#   infra/azure/bicep/main.bicepparam   mode 600 — Linear client secret + both live OAuth tokens
+#   infra/azure/bicep/main.bicepparam   mode 600 — may temporarily hold bootstrap/rotation secrets
 # It is not needed by docker/router/Dockerfile, which builds only the pnpm
 # workspace — pnpm-workspace.yaml is `packages/*` + `apps/*`, so infra/ is not a member.
 #
 # The Terraform state and provider-cache rules that used to live here are gone
 # with the Terraform stack: the deployment is Bicep and holds no state locally.
-# The parameter file is the one remaining plaintext credential on disk.
+# A populated bootstrap/rotation parameter file is the one remaining plaintext
+# credential bundle on disk; the steady-state file is intentionally secretless.
 #
 # Both the bare and the `**/` form of each rule are required. ACR compiles
 # `**/x` to `^.*/x$` (needs at least one separator, so it misses a root-level

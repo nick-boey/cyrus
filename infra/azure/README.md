@@ -89,19 +89,21 @@ sandbox group** that the router spins per-issue workers up inside.
   *Container Apps SandboxGroup Data Owner* role to the caller unless
   `--skip-role-check` is passed — so if you create the group via the CLI
   instead of via this template you may already have it.
-- **Key Vault is RBAC-only** (`enableRbacAuthorization: true`). The stack seeds
-  the Linear app/workspace secrets from parameters on first deploy.
+- **Key Vault is RBAC-only** (`enableRbacAuthorization: true`). The stack uses
+  fixed, versionless references to the Linear app/workspace secrets. Their
+  values are written only during an explicitly enabled bootstrap or rotation.
 
 ### Key Vault permissions: what changed
 
 Under Terraform, seeding a secret was a **data-plane** write, so the deploying
 principal needed **Key Vault Secrets Officer**, and creating the `/setup` KEK
-needed **Key Vault Crypto Officer**. Neither is required now: Bicep declares
+needed **Key Vault Crypto Officer**. Neither is required for the Bicep path:
+when deliberately enabled, Bicep declares
 `Microsoft.KeyVault/vaults/secrets` and `Microsoft.KeyVault/vaults/keys` as ARM
-child resources, which are **management-plane** writes covered by Contributor (or
-Key Vault Contributor) on the vault. You still need Secrets Officer to rotate a
-secret afterwards with `az keyvault secret set`, which is the documented rotation
-path.
+child resources, which are **management-plane** writes covered by Contributor
+(or Key Vault Contributor) on the vault. A routine deployment omits the secret
+children entirely and cannot overwrite an operator rotation. You still need
+Secrets Officer to rotate a secret directly with `az keyvault secret set`.
 
 Every secret parameter is marked `@secure()`. That is not cosmetic: a secure
 parameter's value is not persisted into ARM deployment history, which is the one
@@ -119,8 +121,10 @@ converge.
 ## End-to-end deployment
 
 The sequence below covers a fresh private-ACR deployment through its first ACA
-user. Keep `main.bicepparam`, OAuth tokens, and user credentials out of git —
-`.gitignore` covers `*.bicepparam` and un-ignores only `*.bicepparam.example`.
+user. A bootstrap parameter file temporarily contains OAuth values; keep it and
+all user credentials out of the public repository. `.gitignore` covers
+`*.bicepparam` and un-ignores only `*.bicepparam.example`. Private CD should use
+a secretless environment parameter file and pass it with `--params`.
 
 > **There is no state to bootstrap.** ARM incremental deployments also *adopt*
 > resources that already exist with a matching name and type, so there is no
@@ -175,7 +179,8 @@ cp infra/azure/bicep/main.bicepparam.example infra/azure/bicep/main.bicepparam
 chmod 600 infra/azure/bicep/main.bicepparam
 ```
 
-Fill every placeholder. For a private registry set `enableAcr = true` and point
+Fill the non-secret environment placeholders. For a private registry set
+`enableAcr = true` and point
 `routerImage`/`workerImage` at the ACR login server that the naming convention
 will create. Both image refs must be immutable — the template rejects `:latest`,
 `:deploy`, and other floating tags; see
@@ -184,13 +189,20 @@ step 4, once there is a build to pin; the example's placeholders are deliberatel
 shape-valid so the earlier steps pass validation. Set:
 
 - `linearWorkspaceId` to the organization UUID from step 1.
-- `linearWorkspaceToken` and `linearWorkspaceRefreshToken` to the OAuth pair
-  saved by `self-auth-linear`.
-- `linearClientId`, `linearClientSecret`, and `linearWebhookSecret` to the same
-  app's values.
 - Each `cyrusRepositories[*].linearWorkspaceId` to the same UUID.
 - `operatorPrincipalId` to `az ad signed-in-user show --query id -o tsv` for
   backup break-glass access.
+
+For the first bootstrap only, also set `writeLinearSecrets = true` and supply
+`linearWorkspaceToken`, `linearWorkspaceRefreshToken`, `linearClientId`,
+`linearClientSecret`, and `linearWebhookSecret`. The deploy script additionally
+requires `--allow-secret-writes`; this two-key guard prevents a routine CD run
+from restoring stale parameter values over a direct Key Vault rotation.
+
+If this environment was already deployed with the earlier PR 29 Bicep shape,
+the secrets already exist. Do **not** bootstrap them again: add both write flags
+as `false` and clear the five Linear plus three setup-auth value fields before
+the next deployment. Incremental mode retains the existing Key Vault versions.
 
 Leave `routerUrlForContainers` empty. Unlike the Terraform stack, the router's
 WSS URL is derived from the Container Apps environment's `defaultDomain` — a
@@ -310,17 +322,49 @@ pin it — a tag is only as trustworthy as the commit it was cut from.
 ### 5. Deploy the stack
 
 ```bash
-./scripts/deploy-azure.sh            # what-if: read the change list
-./scripts/deploy-azure.sh --apply
+# Bootstrap only: the parameter file has writeLinearSecrets=true and all five
+# values. Routine deployments omit --allow-secret-writes.
+./scripts/deploy-azure.sh --allow-secret-writes            # what-if: read it
+./scripts/deploy-azure.sh --allow-secret-writes --apply
 ```
 
 The script checks the image pins at full fidelity and the `/setup` staging gate
-before it calls `az`, then prints the deployment outputs when it finishes. Read
-them straight back at any time with:
+before it calls `az`. It also refuses either secret-write parameter unless the
+independent `--allow-secret-writes` switch is present. It prints the deployment
+outputs when it finishes. Read them straight back at any time with:
 
 ```bash
 az deployment sub show --name cyrus-cyrus-dev --query 'properties.outputs' -o json
 ```
+
+Immediately after a successful bootstrap, set `writeLinearSecrets = false` and
+clear all five secret values. Every later deployment is then secretless:
+
+```bash
+./scripts/deploy-azure.sh
+./scripts/deploy-azure.sh --apply
+```
+
+The omitted Key Vault child resources remain in place under Incremental mode,
+and the router keeps reading their latest versions through versionless URIs.
+
+For the private deployment repository, check out a reviewed public Cyrus commit
+and invoke this same entry point; do not copy the Bicep modules into the private
+repository. Keep its secretless environment parameters separately and override
+the newly published immutable router image at invocation time:
+
+```bash
+./scripts/deploy-azure.sh \
+  --params /private/deploy/environments/dev.bicepparam \
+  --router-image "$PINNED_ROUTER_IMAGE" \
+  --apply
+```
+
+The private workflow owns Azure OIDC, approval/environment policy, and the
+choice of public commit and image digest. The public repository owns the Bicep
+implementation, validation, and deployment contract. A separate manual
+bootstrap/rotation operation may use `--allow-secret-writes`; the routine CD job
+must not receive those secret values.
 
 If Container Apps cannot resolve a new Key Vault reference, wait for RBAC
 propagation and deploy again. The router can start before the worker disk is
@@ -548,7 +592,7 @@ So the flags are split, and the deploy script refuses to let you collapse them:
 
 | Parameter | Deployment | Effect |
 | --- | --- | --- |
-| `enableSetupAuth` | **first, alone** | Entra client secret, token store, `authConfigs`. `/setup` still 404s. |
+| `enableSetupAuth` | **first, alone** | Token store infrastructure and `authConfigs`. A bootstrap also writes its two secrets with `writeSetupAuthSecrets`. `/setup` still 404s. |
 | — | **verification gate** | Steps 5a–5c below. Recorded in `setupAuthStage1Verified`. **Ordering is enforced against Azure, not by that flag** — see below. |
 | `enableSetupUi` | **second, separate deployment** | Sets `CYRUS_ROUTER_SETUP_UI_*`, which is what registers the routes. |
 
@@ -627,10 +671,12 @@ az ad app credential reset --id "$APP_ID" \
   --display-name "cyrus-router-easyauth" --years 2 --query password -o tsv
 ```
 
-Record both values in your gitignored parameter file:
+Record the client id and, temporarily, the generated secret and SAS window in
+your gitignored bootstrap parameter file:
 
 ```bicep
 param setupUiClientId = '<APP_ID>'
+param writeSetupAuthSecrets = true
 param setupUiClientSecret = '<the password printed above>'
 
 // Static SAS window for the ACA token store. Must NOT be derived from
@@ -712,18 +758,25 @@ param setupUiAutoProvisionUsers = true
 
 ```bicep
 param enableSetupAuth = true
+param writeSetupAuthSecrets = true
 // enableSetupUi stays FALSE. Do not set it in this edit.
 ```
 
 ```bash
-./scripts/deploy-azure.sh            # read the what-if
-./scripts/deploy-azure.sh --apply
+./scripts/deploy-azure.sh --allow-secret-writes            # read the what-if
+./scripts/deploy-azure.sh --allow-secret-writes --apply
 ```
 
 Expected change list: one Key Vault secret for the client secret, one blob
 container + one Key Vault secret for the token-store SAS, two new `secrets`
 entries on the Container App (so a new revision), and the `authConfigs` child. No
 `/setup` route is created.
+
+Immediately set `writeSetupAuthSecrets = false` and clear
+`setupUiClientSecret`, `setupUiTokenStoreSasStart`, and
+`setupUiTokenStoreSasExpiry`. Leave `enableSetupAuth = true`. The stage-2 and
+all routine deployments now need no setup secret values and cannot overwrite a
+direct rotation.
 
 #### Step 5 — THE GATE
 
@@ -868,12 +921,16 @@ reverse export that does not exist yet — do not assume it is a flag flip.
   (`az ad app credential reset --id "$APP_ID" --display-name cyrus-router-easyauth`),
   then `az keyvault secret set --vault-name <vault> --name setup-ui-client-secret
   --value <new>`. The Container App references it by *versionless* URI, so the
-  sidecar picks it up on the next revision without a deployment. Update
-  `setupUiClientSecret` in the parameter file in the same change or the next
-  deployment will overwrite the rotation.
+  sidecar picks it up on the next revision. Leave `writeSetupAuthSecrets = false`;
+  routine deployments omit the secret resource and cannot overwrite the new
+  version.
 - **Token-store SAS.** `setupUiTokenStoreSasExpiry` is a **live failure
   deadline**: past it, the sidecar can no longer persist sessions and sign-in
-  breaks. Bump both window parameters and deploy.
+  breaks. Renew the two setup-auth credentials as a coordinated pair: create a
+  new Entra client secret first, temporarily set `writeSetupAuthSecrets = true`,
+  supply that new client secret plus a new SAS start and expiry, deploy with
+  `--allow-secret-writes`, then restore the flag to `false` and clear all three
+  values.
   `Microsoft.App/containerApps/authConfigs@2024-03-01` models the token store as
   `sasUrlSettingName` only — there is no managed-identity token store on any
   shipped Microsoft.App auth API version — so a SAS is the only available shape,
@@ -1361,11 +1418,19 @@ reaches only a create-from-image, never a resume or a create-from-snapshot.
 
 ### Secret rotation (N4)
 
-The Linear app and workspace secrets in Key Vault are **seeded from deployment
-parameters on first deploy and then operator-owned** — re-deploying with a stale
-parameter value may overwrite operator rotations. After first deploy, rotate via
-`az keyvault secret set` (or `az containerapp exec` into the replica and
-`cyrus router secrets set …`), and update the parameter file in the same change.
+The Linear app and workspace secrets in Key Vault are **seeded once and then
+operator-owned**. Keep `writeLinearSecrets = false` and all five secret
+parameters empty during routine deployments. Bicep then omits those secret child
+resources, Incremental mode preserves their existing versions, and a stale
+parameter file cannot revert a rotation. The router references fixed secret
+names through versionless Key Vault URIs.
+
+Rotate directly with `az keyvault secret set`. If a controlled bootstrap job
+must perform the write through Bicep instead, temporarily supply all five values,
+set `writeLinearSecrets = true`, and deploy with `--allow-secret-writes`. Restore
+the flag to `false` and clear the values immediately afterwards. Both controls
+are required so a routine CD identity never receives or rewrites secrets by
+accident.
 
 **Propagation limit:** a rotated per-user secret is picked up only by the next
 **create-from-image**. Resume and create-from-snapshot keep their baked env
@@ -1386,9 +1451,11 @@ proxies through the router.
 
 ```bash
 cyrus --env-file /secure/path/linear-app.env self-auth-linear
-# update linearWorkspaceToken + linearWorkspaceRefreshToken in main.bicepparam,
-# then deploy so the Key Vault secrets are updated:
-./scripts/deploy-azure.sh --apply
+# Deliberate Bicep rotation path: update all five Linear values in the protected
+# parameter file, temporarily set writeLinearSecrets=true, then:
+./scripts/deploy-azure.sh --allow-secret-writes
+./scripts/deploy-azure.sh --allow-secret-writes --apply
+# Immediately restore writeLinearSecrets=false and clear all five values.
 
 OUT=$(az deployment sub show --name cyrus-cyrus-dev --query 'properties.outputs' -o json)
 RG=$(echo "$OUT" | jq -r .resourceGroupName.value)
@@ -1416,8 +1483,8 @@ dead.
 The router stores each rotated token in the runtime-created Key Vault secret
 `cyrus-linear-refresh-<workspaceId>`. That secret is **not** declared by the
 template, so a deployment never reverts it. Changing the seed in the parameter
-file is what tells the router to abandon the stored chain and adopt the new
-credential.
+file during an explicitly authorized write is what tells the router to abandon
+the stored chain and adopt the new credential.
 
 ### Entra enrollment
 
@@ -1499,7 +1566,7 @@ bicep/
                                   validation, RG, module orchestration, outputs
   main.bicepparam.example         complete parameter checklist
   modules/
-    foundation.bicep              Log Analytics, Key Vault + seeded secrets,
+    foundation.bicep              Log Analytics, Key Vault + opt-in secret writes,
                                   router identity, storage + Files share + blob
                                   containers + optional Table/KEK, Container Apps
                                   environment + Files link, optional ACR, all RBAC
@@ -1515,7 +1582,7 @@ bicep/
 Deploy and check scripts:
 
 ```
-scripts/deploy-azure.sh           what-if / deploy, image-pin and stage-2 gates
+scripts/deploy-azure.sh           what-if / deploy, image-pin, secret-write and stage-2 gates
 scripts/deploy-router-image.sh    build router image into ACR, repin, what-if
 scripts/deploy-router-image.test.sh   covers the repin rewrite and the pin gate
 scripts/check-bicep.sh            compile every template; warnings are failures

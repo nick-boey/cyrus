@@ -50,17 +50,17 @@ CLAUDE.local.md
 
 docker/router/.env
 
-# Bicep parameter files. These hold the Linear client secret and both OAuth
-# tokens in plaintext, exactly as the Terraform tfvars they replace did. Only the
-# committed `.example` checklist is tracked.
+# Bicep parameter files. Steady-state files are designed to be secretless, but
+# the same path may temporarily hold bootstrap/rotation values when an explicit
+# write flag is enabled. Only the committed `.example` checklist is tracked.
 *.bicepparam
 !*.bicepparam.example
 # scripts/deploy-router-image.sh stages its rewrite in a mode-600 temp file
 # beside main.bicepparam. `*.bicepparam` above does not match a name with a
 # suffix after `.bicepparam`, and BSD mktemp only substitutes a TRAILING run of
 # X's, so the temp name cannot both be unique and end in `.bicepparam`. Ignore
-# the prefix instead: a SIGKILL mid-rewrite leaves behind the client secret and
-# both OAuth tokens.
+# the prefix instead: a SIGKILL during bootstrap/rotation may leave secrets in
+# that copy.
 *.bicepparam.tmp.*
 # Compiled ARM output. `bicep build` writes <name>.json beside the template by
 # default; it embeds nothing secret, but it is a build artifact and a committed

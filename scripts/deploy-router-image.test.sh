@@ -4,8 +4,8 @@
 #
 # The rewrite is the only part of deploy-router-image.sh with branching logic, and
 # the only part that can corrupt infra/azure/bicep/main.bicepparam — a gitignored,
-# mode-600 file holding the Linear client secret and both OAuth tokens, with no
-# git copy to restore from. Everything else in that script is a single shell-out.
+# mode-600 file that may temporarily hold bootstrap/rotation secrets, with no git
+# copy to restore from. Everything else in that script is a single shell-out.
 #
 # is_immutable_ref is the full-fidelity half of the image tag policy: main.bicep
 # can only check ref SHAPES, so this function is what actually rejects a hex-ish
@@ -213,8 +213,9 @@ fi
 
 # 10. temp residue would be gitignored
 #
-# The temp file is a mode-600 copy of the secrets. If a SIGKILL outruns the EXIT
-# trap, the residue must not be one `git add -A` from being committed.
+# The temp file may be a mode-600 copy of bootstrap/rotation secrets. If a
+# SIGKILL outruns the EXIT trap, the residue must not be one `git add -A` from
+# being committed.
 probe="$(cd "$SCRIPT_DIR/.." && git check-ignore -q "infra/azure/bicep/.main.bicepparam.tmp.aB12cD" && echo ignored || echo NOT_IGNORED)"
 if [[ "$probe" == "ignored" ]]; then
   ok "temp file name is gitignored"
@@ -227,7 +228,7 @@ probe="$(cd "$SCRIPT_DIR/.." && git check-ignore -q "infra/azure/bicep/main.bice
 if [[ "$probe" == "ignored" ]]; then
   ok "main.bicepparam is gitignored"
 else
-  fail "main.bicepparam is NOT gitignored — the secrets file is committable"
+  fail "main.bicepparam is NOT gitignored — a populated parameter file is committable"
 fi
 probe="$(cd "$SCRIPT_DIR/.." && git check-ignore -q "infra/azure/bicep/main.bicepparam.example" && echo ignored || echo NOT_IGNORED)"
 if [[ "$probe" == "NOT_IGNORED" ]]; then
@@ -318,6 +319,105 @@ if ( check_image_pins >/dev/null 2>&1 ); then
   fail "check_image_pins accepted a mutable workerImage"
 else
   ok "check_image_pins refuses a mutable workerImage"
+fi
+
+# 17. an immutable CLI override replaces routerImage for validation without
+# rewriting the environment's tracked/sanitized parameter file.
+PARAMS="$WORK/i.bicepparam"
+cat >"$PARAMS" <<EOF
+param allowMutableImageTags = false
+param routerImage = 'ghcr.io/ceedaragents/cyrus-router:deploy'
+param workerImage = 'ghcr.io/ceedaragents/cyrus-worker:sha-a1b2c3d'
+param writeLinearSecrets = false
+param writeSetupAuthSecrets = false
+EOF
+if check_image_pins "ghcr.io/ceedaragents/cyrus-router:sha-deadbee" >/dev/null 2>&1; then
+  ok "check_image_pins validates the immutable router-image override"
+else
+  fail "check_image_pins ignored or rejected the immutable router-image override"
+fi
+
+# 18. steady-state parameter files need no secret-write consent.
+if check_secret_write_mode 0 >/dev/null 2>&1; then
+  ok "steady-state deployment needs no secret-write consent"
+else
+  fail "steady-state deployment was incorrectly treated as a secret write"
+fi
+
+# 19. stale bootstrap values are refused even with writes disabled. Avoiding the
+# Key Vault resource is insufficient if routine CD still transmits the value.
+printf '%s\n' "param linearClientSecret = 'stale-bootstrap-value'" >>"$PARAMS"
+if ( check_secret_write_mode 0 >/dev/null 2>&1 ); then
+  fail "steady-state deployment accepted a populated secret parameter"
+else
+  ok "steady-state deployment refuses stale secret values"
+fi
+sed -i.bak "/linearClientSecret/d" "$PARAMS"
+
+# 20. routine CD cannot pre-wire the exceptional consent switch. This keeps the
+# second key independent from a later parameter-file change.
+if ( check_secret_write_mode 1 >/dev/null 2>&1 ); then
+  fail "unused --allow-secret-writes consent was accepted"
+else
+  ok "secret-write consent is refused outside an active write operation"
+fi
+
+# 21. one Bicep write flag is not enough: the script refuses without the
+# separate CLI consent, so a stale bootstrap file cannot poison scheduled CD.
+sed -i.bak 's/writeLinearSecrets = false/writeLinearSecrets = true/' "$PARAMS"
+if ( check_secret_write_mode 0 >/dev/null 2>&1 ); then
+  fail "secret write was accepted without --allow-secret-writes consent"
+else
+  ok "secret write requires separate CLI consent"
+fi
+
+# 22. intentional bootstrap/rotation passes once both keys are present.
+if check_secret_write_mode 1 >/dev/null 2>&1; then
+  ok "secret write proceeds with explicit CLI consent"
+else
+  fail "explicitly consented secret write was refused"
+fi
+
+# 23. the CLI accepts an external environment file and forwards the immutable
+# router pin as a later Azure parameter override. This is the private-CD seam:
+# source/template and image share one pinned commit without rewriting the
+# environment repository's tracked parameter file.
+PARAMS="$WORK/j.bicepparam"
+cat >"$PARAMS" <<EOF
+param project = 'cyrus'
+param environment = 'dev'
+param resourceGroupName = 'rg-cyrus'
+param location = 'australiaeast'
+param allowMutableImageTags = false
+param routerImage = 'ghcr.io/ceedaragents/cyrus-router:deploy'
+param workerImage = 'ghcr.io/ceedaragents/cyrus-worker:sha-a1b2c3d'
+param writeLinearSecrets = false
+param writeSetupAuthSecrets = false
+param enableSetupUi = false
+EOF
+
+az_stub_dir="$WORK/az-stub-bin"
+mkdir -p "$az_stub_dir"
+az_calls="$WORK/az-calls"
+cat >"$az_stub_dir/az" <<'STUB'
+#!/usr/bin/env bash
+{
+  printf '%s\n' '--- call ---'
+  printf '%s\n' "$@"
+} >>"$AZ_CALLS"
+exit 0
+STUB
+chmod +x "$az_stub_dir/az"
+
+override='ghcr.io/ceedaragents/cyrus-router:sha-deadbee'
+if PATH="$az_stub_dir:$PATH" AZ_CALLS="$az_calls" \
+   "$SCRIPT_DIR/deploy-azure.sh" --params "$PARAMS" \
+     --router-image "$override" --name cyrus-ci-test >/dev/null 2>&1 \
+   && grep -qFx "$PARAMS" "$az_calls" \
+   && grep -qFx "routerImage=$override" "$az_calls"; then
+  ok "deploy CLI forwards external params and the router-image override"
+else
+  fail "deploy CLI did not forward external params and router-image override"
 fi
 
 if [[ "$FAILURES" -gt 0 ]]; then

@@ -26,10 +26,10 @@ cleanup_tmp_params() {
 # "This digest is tagged … in …" comment with <provenance_comment>, leaving every
 # other line byte-identical.
 #
-# The target is gitignored, mode 600, and holds the Linear client secret and both
-# OAuth tokens — there is no git copy to restore from. So the new content is
-# built in a mode-600 temp file beside it, verified, and only then moved into
-# place. Any failure leaves the original untouched.
+# The target is gitignored, mode 600, and may temporarily hold bootstrap/rotation
+# secrets — there is no git copy to restore from. So the new content is built in
+# a mode-600 temp file beside it, verified, and only then moved into place. Any
+# failure leaves the original untouched.
 rewrite_router_image() {
   local params="$1" new_ref="$2" comment="$3"
   local count
