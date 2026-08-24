@@ -1,0 +1,519 @@
+// Monitoring: saved KQL queries + alert rules over the router's JSON log stream.
+//
+// Everything here reads `ContainerAppConsoleLogs_CL`, the table the Container
+// Apps environment already ships the router's stdout to. The router app sets
+// CYRUS_LOG_FORMAT=json, so each line in `Log_s` is one flat JSON object, and
+// the `sandbox_*` event family sits on top of that. Nothing here requires an
+// agent, an exporter, or an OpenTelemetry dependency.
+//
+// The two facts every query below is built on, both easy to get wrong:
+//
+//  1. `uptime_ms` comes from `devices.running_since_ms`, which is CONTINUOUS
+//     running time. It is NOT `age_ms` (`devices.created_ms`), the device row's
+//     age, which survives every stop/resume cycle. A sandbox can be three days
+//     old and four minutes up.
+//
+//  2. ACA `Running` is INFRASTRUCTURE state, not worker-process liveness — an
+//     exited entrypoint leaves `tini` alive and the sandbox `Running`. So no
+//     alert here keys on `state` alone. Each gauge sample also carries the
+//     router's own liveness view (`online`, a live WSS socket, and
+//     `last_seen_age_ms`, the age of the last heartbeat pong), and the
+//     long-running rule classifies every hit by which of the two disagree.
+//
+// KQL is assembled with join(..., '\n') rather than a Bicep multi-line string,
+// because `'''…'''` does not interpolate and every query needs the app name (and
+// some need the thresholds) substituted in.
+
+param namePrefix string
+param flatNamePrefix string
+param location string
+param tags object
+
+param logAnalyticsWorkspaceName string
+
+@description('Router Container App name. Scopes every query to the router app, so a future second app in the same Container Apps environment cannot pollute the sandbox series.')
+param routerAppName string
+
+param enableAlerts bool
+param alertEmailReceivers array
+param sandboxUptimeAlertHours int
+param enableOtelLogs bool
+
+resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
+  name: logAnalyticsWorkspaceName
+}
+
+// Application Insights is only the first-party OTLP ingestion endpoint. It is
+// workspace-based, so records land in this same Log Analytics workspace under
+// AppTraces; it does not introduce a second data store or retention policy.
+resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = if (enableOtelLogs) {
+  name: 'appi-${namePrefix}'
+  location: location
+  kind: 'web'
+  tags: tags
+  properties: {
+    Application_Type: 'web'
+    WorkspaceResourceId: logAnalytics.id
+  }
+}
+
+var appFilter = '| where ContainerAppName_s == "${routerAppName}"'
+var sandboxUptimeAlertMs = sandboxUptimeAlertHours * 3600000
+
+// A heartbeat older than this means the worker process is not answering the
+// router's pings. Derived from the protocol's own liveness policy rather than
+// picked: HEARTBEAT_INTERVAL_MS (30s) x MAX_MISSED_HEARTBEATS (2) is when the
+// router itself gives up on a socket, and 3x that leaves room for one reconnect
+// cycle before we call a worker dead. Both constants live in
+// packages/router-protocol/src/frames.ts; if they change, change this.
+var workerHeartbeatStaleMs = 180000
+
+var workerLivenessCase = 'case(online and last_seen_age_ms < ${workerHeartbeatStaleMs}, "live", isnull(last_seen_age_ms), "never-connected", "stale-heartbeat")'
+
+// Shared prologue: narrow to the router app, parse the JSON line, and project
+// every gauge attribute into a typed column.
+var gaugePrologue = [
+  'ContainerAppConsoleLogs_CL'
+  appFilter
+  '| extend p = parse_json(Log_s)'
+  '| where tostring(p.event) == "sandbox_gauge"'
+  '| extend'
+  '    issue_key        = tostring(p.issue_key),'
+  '    device_id        = tostring(p.device_id),'
+  '    provider         = tostring(p.provider),'
+  '    state            = tostring(p.state),'
+  '    sessions         = toint(p.sessions),'
+  '    online           = tobool(p.online),'
+  '    age_ms           = tolong(p.age_ms),'
+  '    uptime_ms        = tolong(p.uptime_ms),'
+  '    last_seen_age_ms = tolong(p.last_seen_age_ms),'
+  '    parked_for_ms    = tolong(p.parked_for_ms)'
+]
+
+////////////////////////////////////////////////////////////////////////////////
+// Saved searches — the queries an operator opens the workspace to run
+////////////////////////////////////////////////////////////////////////////////
+
+// Current open sandboxes, with their issue keys and uptimes, from a single
+// query.
+//
+// `arg_max` collapses the ~15 samples a 15-minute window holds for each sandbox
+// down to the newest one, which is what makes this a point-in-time inventory
+// rather than a time series. The window has to comfortably exceed the 60s sweep
+// interval (SWEEP_INTERVAL_MS in RouterServer.ts) so a slow tick cannot make a
+// live sandbox vanish from the list.
+resource sandboxesOpen 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sandboxes-Open'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Open sandboxes (issue, sessions, uptime)'
+    query: join(
+      concat(gaugePrologue, [
+        '| where TimeGenerated > ago(15m)'
+        '| summarize arg_max(TimeGenerated, *) by device_id'
+        '| where state == "running"'
+        '| project'
+        '    issue_key,'
+        '    device_id,'
+        '    provider,'
+        '    sessions,'
+        '    worker = ${workerLivenessCase},'
+        '    uptime = uptime_ms * 1ms,'
+        '    age    = age_ms * 1ms,'
+        '    parked = iff(isnull(parked_for_ms), timespan(null), parked_for_ms * 1ms),'
+        '    sampled_at = TimeGenerated'
+        '| order by uptime desc'
+      ]),
+      '\n'
+    )
+  }
+}
+
+// The rollup, as a time series: how many sandboxes were open, and how many were
+// pinned by a live session, over time. Emitted once per sweep whether or not any
+// sandboxes exist, so a flat line at zero is distinguishable from a router that
+// stopped sweeping (which the "sweep stalled" alert below is the guard for).
+resource sandboxesOverTime 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sandboxes-Over-Time'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Sandbox fleet size over time'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "sandbox_sweep_completed"'
+        '| extend'
+        '    sandboxes = toint(p.sandboxes),'
+        '    running   = toint(p.running),'
+        '    stopped   = toint(p.stopped),'
+        '    pinned    = toint(p.pinned),'
+        '    unknown   = toint(p.unknown)'
+        '| summarize'
+        '    sandboxes = max(sandboxes),'
+        '    running   = max(running),'
+        '    pinned    = max(pinned),'
+        '    unknown   = max(unknown)'
+        '  by bin(TimeGenerated, 5m)'
+        '| order by TimeGenerated asc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// "How many sessions per issue" — session affinity is per-sandbox, and the gauge
+// carries the reconciled count, so the answer is the max concurrent affinity
+// each issue held over the window.
+resource sessionsPerIssue 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sessions-Per-Issue'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Sessions per issue'
+    query: join(
+      concat(gaugePrologue, [
+        '| summarize'
+        '    peak_sessions = max(sessions),'
+        '    peak_uptime   = max(uptime_ms) * 1ms,'
+        '    samples       = count(),'
+        '    last_seen     = max(TimeGenerated)'
+        '  by issue_key, provider'
+        '| order by peak_sessions desc, peak_uptime desc'
+      ]),
+      '\n'
+    )
+  }
+}
+
+// The full lifecycle of one issue's sandbox, in order. This is the query to open
+// when a specific issue misbehaved: it interleaves every transition
+// (boot/running/park/unpark/idle-stop/destroy/teardown) with nothing else in the
+// way. Replace the issue key before running.
+resource sandboxLifecycle 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sandbox-Lifecycle'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Sandbox lifecycle for one issue (edit the issue key)'
+    query: join(
+      [
+        'let target_issue = "REPLACE-ME";'
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| extend event = tostring(p.event)'
+        '| where event startswith "sandbox_" and event != "sandbox_gauge"'
+        '| where tostring(p.issue_key) == target_issue'
+        '| project'
+        '    TimeGenerated,'
+        '    event,'
+        '    device_id = tostring(p.device_id),'
+        '    provider  = tostring(p.provider),'
+        '    detail    = bag_remove_keys(p, dynamic(["event", "issue_key", "device_id", "provider", "component", "level", "message", "timestamp"]))'
+        '| order by TimeGenerated asc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// Boots that never reached running, and boots that failed outright. A
+// `sandbox_boot_started` with neither a `sandbox_running` nor a
+// `sandbox_boot_failed` inside the window is a provider call that hung — the
+// case that looks identical to "still booting" from the router's console.
+resource sandboxBootHealth 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sandbox-Boot-Health'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Sandbox boot outcomes (started vs running vs failed)'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| extend event = tostring(p.event)'
+        '| where event in ("sandbox_boot_started", "sandbox_running", "sandbox_boot_failed")'
+        '| summarize'
+        '    started   = countif(event == "sandbox_boot_started"),'
+        '    reached_running = countif(event == "sandbox_running"),'
+        '    failed    = countif(event == "sandbox_boot_failed"),'
+        '    last_error = anyif(tostring(p.reason), event == "sandbox_boot_failed")'
+        '  by issue_key = tostring(p.issue_key), provider = tostring(p.provider)'
+        '| extend unresolved = started - reached_running - failed'
+        '| where failed > 0 or unresolved > 0'
+        '| order by unresolved desc, failed desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Alert rules
+////////////////////////////////////////////////////////////////////////////////
+
+// Optional. With no receivers configured the rules below still evaluate and
+// still show up in Azure Monitor's fired-alerts list — they just page nobody.
+// That is a deliberate default: it keeps the stack self-contained for an operator
+// who has not yet decided where alerts should land, without silently creating an
+// email destination nobody asked for.
+resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = if (enableAlerts && !empty(alertEmailReceivers)) {
+  name: 'ag-${namePrefix}'
+  location: 'global'
+  tags: tags
+  properties: {
+    // Azure caps groupShortName at 12 characters. `take` truncates rather than
+    // erroring on a short input, which is the trap the Terraform version had to
+    // guard against with min(): its substr() ERRORS when offset+length runs past
+    // the end of the string.
+    groupShortName: take(flatNamePrefix, 12)
+    enabled: true
+    emailReceivers: [
+      for (receiver, i) in alertEmailReceivers: {
+        name: 'email-${i}'
+        emailAddress: receiver
+        useCommonAlertSchema: true
+      }
+    ]
+  }
+}
+
+var actionGroupIds = enableAlerts && !empty(alertEmailReceivers) ? [actionGroup.id] : []
+
+// THE alert this stack exists for: a sandbox that has been running continuously
+// for more than sandboxUptimeAlertHours.
+//
+// Why that number means something: idleStopMs defaults to 5 minutes, so an
+// affinity-free sandbox is parked within one sweep tick of going quiet. A sandbox
+// that reaches six continuous hours therefore held session affinity for
+// essentially that entire period. At the ACA XL tier (4 vCPU / 8 GiB) that is
+// simultaneously a real cost signal and a strong stuck-agent signal.
+//
+// The `worker` dimension is the part that must not be dropped. Alerting on ACA
+// state alone would fire on a zombie (entrypoint exited, `tini` keeps the sandbox
+// Running) and would say nothing about a hung-but-connected worker. Splitting the
+// fired alert by worker liveness tells the responder which investigation they are
+// starting:
+//
+//   live            — worker is answering heartbeats. A genuinely long-running
+//                     agent, or one stuck in a loop. Look at the session.
+//   stale-heartbeat — sandbox is Running but the worker stopped answering.
+//                     Almost certainly a zombie burning 4 vCPU; destroy it.
+//   never-connected — reached Running but never dialled back at all. A boot or
+//                     egress-policy problem, not an agent problem.
+resource sandboxLongRunning 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = if (enableAlerts) {
+  name: 'alert-${namePrefix}-sandbox-long-running'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'alert-${namePrefix}-sandbox-long-running'
+    description: 'A Cyrus sandbox has been running continuously for more than ${sandboxUptimeAlertHours}h. Split by worker liveness: "live" is a long/stuck agent, "stale-heartbeat" is a zombie sandbox, "never-connected" is a boot failure that reached Running.'
+    severity: 2
+    enabled: true
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    scopes: [
+      logAnalytics.id
+    ]
+    autoMitigate: true
+    criteria: {
+      allOf: [
+        {
+          // Newest sample per sandbox inside the window, then the uptime gate.
+          // The threshold is expressed BOTH in the query and in the criteria on
+          // purpose: the query filter is what keeps the result set (and so the
+          // alert dimensions) to just the offenders, while `threshold` is what an
+          // operator sees and tunes in the portal.
+          query: join(
+            concat(gaugePrologue, [
+              '| summarize arg_max(TimeGenerated, *) by device_id'
+              '| where state == "running" and uptime_ms >= ${sandboxUptimeAlertMs}'
+              '| extend worker = ${workerLivenessCase}'
+              '| project issue_key, provider, worker, uptime_hours = round(uptime_ms / 3600000.0, 2)'
+            ]),
+            '\n'
+          )
+          timeAggregation: 'Maximum'
+          metricMeasureColumn: 'uptime_hours'
+          threshold: sandboxUptimeAlertHours
+          operator: 'GreaterThanOrEqual'
+          dimensions: [
+            {
+              name: 'issue_key'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+            {
+              name: 'worker'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+            {
+              name: 'provider'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+          ]
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: actionGroupIds
+    }
+  }
+}
+
+// The guard that makes the rule above trustworthy.
+//
+// Every sandbox alert is derived from the 60-second lifecycle sweep's gauge. If
+// the sweep stops emitting — the router crashed, wedged, or was scaled to zero —
+// the long-running rule quietly stops firing and looks exactly like "no sandbox
+// has been up too long". Alerting on the ABSENCE of the rollup event is what
+// turns that silent failure into a page.
+//
+// `sandbox_sweep_completed` is emitted once per COMPLETED sweep, including when
+// zero sandboxes exist, precisely so this rule can key on it.
+//
+// `ContainerLifecycle.sweep()` is non-reentrant, so a tick that fires while the
+// previous one is still running is skipped and emits no rollup. That is
+// deliberate and makes this rule MORE truthful, not less: a sweep wedged on a
+// slow provider call is exactly the blind spot this alert exists to catch, and
+// before the guard the overlapping ticks kept emitting rollups that masked it. A
+// sweep that legitimately runs past the 15m window will page — treat that as the
+// signal it is, and look for the "skipping this tick" warning.
+resource sandboxSweepStalled 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = if (enableAlerts) {
+  name: 'alert-${namePrefix}-sandbox-sweep-stalled'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'alert-${namePrefix}-sandbox-sweep-stalled'
+    description: 'The router\'s 60s container lifecycle sweep has emitted no sandbox_sweep_completed event in 15 minutes. Every other sandbox alert is derived from that sweep, so while this is firing they are all blind.'
+    severity: 1
+    enabled: true
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    scopes: [
+      logAnalytics.id
+    ]
+    autoMitigate: true
+    criteria: {
+      allOf: [
+        {
+          // `summarize` with no `by` always returns exactly one row, including
+          // for an empty input — that is what lets a COUNT OF ZERO be alertable
+          // at all. A bare `| where sweeps < 1` would filter that row away and
+          // the rule would never fire, which is the classic way this alert gets
+          // written wrong.
+          query: join(
+            [
+              'ContainerAppConsoleLogs_CL'
+              appFilter
+              '| extend p = parse_json(Log_s)'
+              '| where tostring(p.event) == "sandbox_sweep_completed"'
+              '| summarize sweeps = count()'
+            ],
+            '\n'
+          )
+          timeAggregation: 'Total'
+          metricMeasureColumn: 'sweeps'
+          threshold: 1
+          operator: 'LessThan'
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: actionGroupIds
+    }
+  }
+}
+
+// Boot failures. Distinct from the uptime rule because it is the opposite
+// failure — nothing is running and nothing is costing money, but nothing is
+// working either, and from Linear it looks like Cyrus simply ignored the issue.
+resource sandboxBootFailures 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = if (enableAlerts) {
+  name: 'alert-${namePrefix}-sandbox-boot-failures'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'alert-${namePrefix}-sandbox-boot-failures'
+    description: 'Cyrus sandboxes failed to boot. Each failure is one Linear issue that got no agent. Check the "reason" attribute on the sandbox_boot_failed events.'
+    severity: 2
+    enabled: true
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    scopes: [
+      logAnalytics.id
+    ]
+    autoMitigate: true
+    criteria: {
+      allOf: [
+        {
+          query: join(
+            [
+              'ContainerAppConsoleLogs_CL'
+              appFilter
+              '| extend p = parse_json(Log_s)'
+              '| where tostring(p.event) == "sandbox_boot_failed"'
+              '| summarize failures = count() by issue_key = tostring(p.issue_key), provider = tostring(p.provider)'
+            ],
+            '\n'
+          )
+          timeAggregation: 'Total'
+          metricMeasureColumn: 'failures'
+          threshold: 0
+          operator: 'GreaterThan'
+          dimensions: [
+            {
+              name: 'issue_key'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+            {
+              name: 'provider'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+          ]
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: actionGroupIds
+    }
+  }
+}
+
+output applicationInsightsName string = enableOtelLogs ? applicationInsights.name : ''
+
+@secure()
+// The ternary is guarded by the same flag as the resource, and ARM's if()
+// evaluates only the selected branch. BCP318 cannot prove that relationship.
+#disable-next-line BCP318
+output applicationInsightsConnectionString string = enableOtelLogs ? applicationInsights.properties.ConnectionString : ''

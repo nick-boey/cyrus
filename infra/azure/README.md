@@ -4,11 +4,16 @@ This directory provisions the Azure footprint that runs a **Cyrus router** as a
 single-replica Azure Container App and creates an **Azure Container Apps
 sandbox group** that the router spins per-issue workers up inside.
 
-> **Terraform is the deploy path.** A Bicep reference shape lives under
-> `bicep/` and is kept property-for-property in sync with the AzAPI body in
-> `terraform/sandbox.tf` by `scripts/check-aca-arm-parity.sh` (M5). Do not
-> deploy from Bicep in production. The spike findings that override the
-> original plan live in
+> **Bicep is the deploy path**, and the only one. Everything lives under
+> [`bicep/`](bicep/README.md); `scripts/deploy-azure.sh` is the entry point. The
+> Terraform stack that used to live in `terraform/` has been deleted, along with
+> its state storage account, its state resource group, `bootstrap-tfstate.sh`,
+> `backend.dev.hcl`, and the ARM-parity gate that existed only to keep two copies
+> of the sandbox-group shape in step. **The deployment is now stateless:** ARM
+> holds the state and `az deployment sub what-if` reads the real resources
+> instead of a recorded belief about them.
+>
+> The spike findings that override the original plan live in
 > `docs/superpowers/specs/2026-07-25-aca-sandboxes-spike-findings.md`.
 > Router configuration, Key Vault/Entra operations, lifecycle semantics, and
 > terminal-GC blind spots are documented in
@@ -55,9 +60,12 @@ sandbox group** that the router spins per-issue workers up inside.
 
 - **`az login`** with an account that can create resource groups, Container
   Apps, Key Vaults, Storage, and RBAC role assignments in the target
-  subscription. (`az account set --subscription <sub>`.)
-- **Terraform >= 1.9.** (`terraform -version`.)
-- **Docker Buildx** when images are not already published to a registry.
+  subscription. (`az account set --subscription <sub>`.) Creating role
+  assignments needs **Owner**, or **Contributor + Role Based Access Control
+  Administrator**.
+- **Bicep.** `az bicep install` (the CLI installs it to `~/.azure/bin`), or the
+  standalone CLI. Verify with `bicep --version`.
+- **`jq`**, used by `scripts/deploy-azure.sh` for the stage-2 gate.
 - **The standalone `aca` CLI** for sandbox data-plane operations. Install it on
   Linux/macOS with `curl -fsSL https://aka.ms/aca-cli-install | sh`. This same
   install path is also used inside sandboxes and containers for agent-driven
@@ -70,7 +78,7 @@ sandbox group** that the router spins per-issue workers up inside.
 - **A Linear OAuth application** configured for app-actor authorization. The
   deployment needs its client ID, client secret, webhook signing secret,
   workspace access token, and workspace refresh token.
-- **A pre-registered worker disk image.** Terraform owns the sandbox group but
+- **A pre-registered worker disk image.** The template owns the sandbox group but
   not its data-plane disk images. Registration is step 6 below.
 - **Private images -> enable ACR.** The staged flow below creates ACR before the
   router app so the current source can be built and pushed without a bootstrap
@@ -80,28 +88,49 @@ sandbox group** that the router spins per-issue workers up inside.
   the client retries). `aca sandboxgroup create` auto-assigns the
   *Container Apps SandboxGroup Data Owner* role to the caller unless
   `--skip-role-check` is passed — so if you create the group via the CLI
-  instead of Terraform you may already have it.
-- **Key Vault is RBAC-only** (`rbac_authorization_enabled = true`). The stack
-  seeds the Linear app/workspace secrets from tfvars on first deploy, which
-  requires the deployer
-  principal to hold **Key Vault Secrets Officer** on the vault (or be Owner,
-  which can self-grant). After first deploy, rotate via
-  `az keyvault secret set` and stop touching the tfvars — re-applying with the
-  old value will overwrite operator rotations.
+  instead of via this template you may already have it.
+- **Key Vault is RBAC-only** (`enableRbacAuthorization: true`). The stack uses
+  fixed, versionless references to the Linear app/workspace secrets. Their
+  values are written only during an explicitly enabled bootstrap or rotation.
 
-Fresh Key Vault role assignments can take several minutes to propagate even
-though the Container App explicitly depends on both required assignments. If
-the first apply reports that a Key Vault secret reference cannot be resolved,
-wait for RBAC propagation and apply again. In restrictive subscriptions, use a
-two-stage deployment: apply through the vault, identity, roles, and secrets;
-wait for propagation; then apply the Container App.
+### Key Vault permissions: what changed
+
+Under Terraform, seeding a secret was a **data-plane** write, so the deploying
+principal needed **Key Vault Secrets Officer**, and creating the `/setup` KEK
+needed **Key Vault Crypto Officer**. Neither is required for the Bicep path:
+when deliberately enabled, Bicep declares
+`Microsoft.KeyVault/vaults/secrets` and `Microsoft.KeyVault/vaults/keys` as ARM
+child resources, which are **management-plane** writes covered by Contributor
+(or Key Vault Contributor) on the vault. A routine deployment omits the secret
+children entirely and cannot overwrite an operator rotation. You still need
+Secrets Officer to rotate a secret directly with `az keyvault secret set`.
+
+Every secret parameter is marked `@secure()`. That is not cosmetic: a secure
+parameter's value is not persisted into ARM deployment history, which is the one
+way an ARM-declared Key Vault secret could otherwise leak to anyone with
+management-plane read on the resource group.
+
+Fresh Key Vault **role assignments** can still take several minutes to
+propagate. The router identity's grants are created in the same module as the
+vault, and the router Container App consumes that module's outputs, so ARM
+already orders them correctly — but ordering is not propagation. If the first
+deployment reports that a Key Vault secret reference cannot be resolved, wait and
+re-run `./scripts/deploy-azure.sh --apply`; the deployment is idempotent and will
+converge.
 
 ## End-to-end deployment
 
 The sequence below covers a fresh private-ACR deployment through its first ACA
-user. Keep `dev.tfvars`, Terraform state, OAuth tokens, and user credentials out
-of git. This repository ignores local `*.tfvars`, `.terraform/`, and `*.tfstate`;
-use a remote encrypted Terraform backend for a shared or production deployment.
+user. A bootstrap parameter file temporarily contains OAuth values; keep it and
+all user credentials out of the public repository. `.gitignore` covers
+`*.bicepparam` and un-ignores only `*.bicepparam.example`. Private CD should use
+a secretless environment parameter file and pass it with `--params`.
+
+> **There is no state to bootstrap.** ARM incremental deployments also *adopt*
+> resources that already exist with a matching name and type, so there is no
+> import step either: if you create a resource group or a registry by hand, the
+> template converges onto it rather than colliding with it. That is what makes
+> step 3 below two `az` commands instead of a targeted apply.
 
 ### 1. Create and authorize the Linear app
 
@@ -133,143 +162,117 @@ cyrus --env-file /secure/path/linear-app.env self-auth-linear
 
 The command writes `linearToken`, `linearRefreshToken`, and the real Linear
 organization UUID to `~/.cyrus/config.json`. Use the UUID, not the workspace
-slug, for `linear_workspace_id` and every repository's
-`linear_workspace_id`. List workspace UUIDs without printing tokens:
+slug, for `linearWorkspaceId` and every repository's `linearWorkspaceId`. List
+workspace UUIDs without printing tokens:
 
 ```bash
 jq -r '.linearWorkspaces | to_entries[] | [.key, .value.linearWorkspaceSlug] | @tsv' \
   ~/.cyrus/config.json
 ```
 
-### 2. Prepare Terraform variables
+### 2. Prepare the parameter file
 
 ```bash
 REPO_ROOT=$(git rev-parse --show-toplevel)
-cd "$REPO_ROOT/infra/azure/terraform"
-cp env/dev.tfvars.example dev.tfvars
-chmod 600 dev.tfvars
+cd "$REPO_ROOT"
+cp infra/azure/bicep/main.bicepparam.example infra/azure/bicep/main.bicepparam
+chmod 600 infra/azure/bicep/main.bicepparam
 ```
 
-Fill every placeholder. For a private registry set `enable_acr = true` and point
-`router_image`/`worker_image` at the ACR login server that the naming convention
-will create. Both image refs must be immutable — Terraform rejects `:latest`,
+Fill the non-secret environment placeholders. For a private registry set
+`enableAcr = true` and point
+`routerImage`/`workerImage` at the ACR login server that the naming convention
+will create. Both image refs must be immutable — the template rejects `:latest`,
 `:deploy`, and other floating tags; see
 [Router image tag policy](#router-image-tag-policy). You fill in the real refs in
-step 4, once there is a build to pin. Set:
+step 4, once there is a build to pin; the example's placeholders are deliberately
+shape-valid so the earlier steps pass validation. Set:
 
-- `linear_workspace_id` to the organization UUID from step 1.
-- `linear_workspace_token` and `linear_workspace_refresh_token` to the OAuth
-  pair saved by `self-auth-linear`.
-- `linear_client_id`, `linear_client_secret`, and `linear_webhook_secret` to
-  the same app's values.
-- Each `cyrus_repositories[*].linear_workspace_id` to the same UUID.
-- `router_url_for_containers = null` for the first apply.
-- `operator_principal_id` to `az ad signed-in-user show --query id -o tsv` for
+- `linearWorkspaceId` to the organization UUID from step 1.
+- Each `cyrusRepositories[*].linearWorkspaceId` to the same UUID.
+- `operatorPrincipalId` to `az ad signed-in-user show --query id -o tsv` for
   backup break-glass access.
 
-Use an exact resource group by setting `resource_group_name`; otherwise it
-defaults to `rg-<project>-<environment>`.
+For the first bootstrap only, also set `writeLinearSecrets = true` and supply
+`linearWorkspaceToken`, `linearWorkspaceRefreshToken`, `linearClientId`,
+`linearClientSecret`, and `linearWebhookSecret`. The deploy script additionally
+requires `--allow-secret-writes`; this two-key guard prevents a routine CD run
+from restoring stale parameter values over a direct Key Vault rotation.
 
-### 3. Initialize and create bootstrap resources
+If this environment was already deployed with the earlier PR 29 Bicep shape,
+the secrets already exist. Do **not** bootstrap them again: add both write flags
+as `false` and clear the five Linear plus three setup-auth value fields before
+the next deployment. Incremental mode retains the existing Key Vault versions.
 
-#### Terraform state backend
+Leave `routerUrlForContainers` empty. Unlike the Terraform stack, the router's
+WSS URL is derived from the Container Apps environment's `defaultDomain` — a
+separate resource from the app — so there is no dependency cycle and no second
+apply. Set it only to point containers at a custom domain or a proxy.
 
-State lives in its own resource group, `rg-cyrus-tfstate`, which this stack does
-**not** manage. It cannot live in `azurerm_resource_group.this`: that group is
-created by the stack, so `terraform destroy` would delete the container holding
-the state file it is mid-write to, and on a first run the container would not
-exist at all.
+Use an exact resource group by setting `resourceGroupName`; empty defaults to
+`rg-<project>-<environment>`.
 
-Run once per environment, with Owner (or Contributor + Role Based Access Control
-Administrator) on the subscription:
+`project` and `environment` are capped at 10 and 9 characters. The binding
+constraint is the Key Vault name `kv-<project>-<environment>` and Key Vault's
+24-character limit; the caps make an over-long pair fail at validation rather
+than at create time.
 
-```bash
-./scripts/bootstrap-tfstate.sh \
-  --state-account <globally-unique-name> \
-  --repo <owner>/<private-repo> \
-  --location <region>
-```
-
-`--location` is required, matching `var.location` in the stack — neither has a
-default, so nothing lands in a region nobody chose. It need not match the
-stack's region: the state group holds only blobs and an identity, and carries
-none of the ACA sandbox-group region restrictions.
-
-It creates the storage account (blob versioning on — state loss is the one
-unrecoverable failure in this stack), the `tfstate` container, and the
-user-assigned identity that GitHub Actions assumes over OIDC. The federated
-credential trusts exactly one branch of one private repo; no client secret is
-created, so there is nothing to store or rotate. The script prints the values
-for `env/backend.dev.hcl` and the three repository variables when it finishes.
-
-`versions.tf` declares `backend "azurerm" {}` with no settings — a backend block
-cannot interpolate variables, so naming the account there would both publish an
-environment identifier and hardcode one environment into a parameterised stack.
-Every setting is supplied at init time instead:
+Validate before you deploy anything:
 
 ```bash
-cp env/backend.dev.hcl.example env/backend.dev.hcl   # then fill it in
-terraform init -backend-config=env/backend.dev.hcl
+./scripts/check-bicep.sh
 ```
 
-Migrating an existing local state file up is `terraform init -migrate-state
--backend-config=env/backend.dev.hcl`; answer `yes` to the copy prompt.
+### 3. Bootstrap the registry (private images only)
 
-> A plan that proposes creating every resource from scratch against a stack you
-> know exists means the `key` is wrong, not that the stack drifted. Check
-> `env/backend.dev.hcl` before applying.
-
-#### Bootstrap resources
-
-The router image cannot be created until ACR exists. Create only the resource
-group, vault, identities, sandbox group, and ACR first:
+The router image cannot be pushed until a registry exists. Create the resource
+group and the registry with the names the template will use, then let the full
+deployment adopt them:
 
 ```bash
-terraform init -backend-config=env/backend.dev.hcl
-terraform fmt -check
-terraform validate
-terraform apply -var-file=dev.tfvars \
-  -target=azurerm_key_vault.this \
-  -target=azurerm_user_assigned_identity.router \
-  -target='azurerm_container_registry.this[0]' \
-  -target=azapi_resource.sandbox_group
+PROJECT=cyrus ENVIRONMENT=dev LOCATION=<region>
+RG="rg-${PROJECT}-${ENVIRONMENT}"
+ACR="acr${PROJECT}${ENVIRONMENT}"
+
+az group create --name "$RG" --location "$LOCATION" -o none
+az acr create --name "$ACR" --resource-group "$RG" --sku Basic \
+  --admin-enabled false -o none
 ```
 
-Grant the deployer temporary data-plane rights needed to seed Key Vault and push
-the images. Terraform separately grants runtime identities their permanent roles:
+Grant yourself push rights for the build in step 4. The template separately
+grants the runtime identities their permanent roles:
 
 ```bash
 DEPLOYER_ID=$(az ad signed-in-user show --query id -o tsv)
-KV_ID=$(az keyvault show --name <vault-name> --query id -o tsv)
-ACR_ID=$(az acr show --name <acr-name> --query id -o tsv)
+ACR_ID=$(az acr show --name "$ACR" --query id -o tsv)
 
-az role assignment create --assignee-object-id "$DEPLOYER_ID" \
-  --assignee-principal-type User --role "Key Vault Secrets Officer" --scope "$KV_ID"
 az role assignment create --assignee-object-id "$DEPLOYER_ID" \
   --assignee-principal-type User --role AcrPush --scope "$ACR_ID"
 ```
 
 Allow several minutes for fresh RBAC assignments to propagate.
 
+For a **public** registry, skip this step entirely and go straight to step 5.
+
 ### 4. Build and push immutable images
 
 Derive the tag from the commit you are deploying so the tag names exactly one
 build. Never push `:latest`, `:deploy`, a branch name, or an ad-hoc hotfix tag
-into a durable environment — Terraform rejects those refs (see
+into a durable environment — the template rejects those refs (see
 [Router image tag policy](#router-image-tag-policy)).
 
 For the **router** image, `scripts/deploy-router-image.sh` does all of this —
-build, digest resolution, repinning `router_image`, and `terraform plan` — in
-one step, and refuses to build from a dirty tree so the tag cannot misname the
+build, digest resolution, repinning `routerImage`, and a what-if preview — in one
+step, and refuses to build from a dirty tree so the tag cannot misname the
 commit. Prefer it over the manual sequence below:
 
 ```bash
-./scripts/deploy-router-image.sh          # then review the plan and apply
+./scripts/deploy-router-image.sh          # then review the what-if and deploy
 ```
 
 The manual steps below remain the reference for the **worker** image, which the
 script does not handle: the worker is registered out of band as an ACA disk
-(`aca sandboxgroup disk create`) and `aca_disk_name` must move with it.
+(`aca sandboxgroup disk create`) and `acaDiskName` must move with it.
 
 Build with **`az acr build`**, not local `docker buildx --push`:
 
@@ -278,7 +281,7 @@ cd "$REPO_ROOT"
 # Same shape as the `sha-<short-sha>` tag docker-router.yml publishes to GHCR.
 TAG="sha-$(git rev-parse --short=7 HEAD)"   # or a release tag: TAG=v1.2.3
 
-az acr build --registry <acr-name> --image cyrus-worker:$TAG \
+az acr build --registry "$ACR" --image cyrus-worker:$TAG \
   --platform linux/amd64 --file docker/worker/Dockerfile \
   --no-logs --query 'outputImages[0].digest' -o tsv .
 ```
@@ -296,7 +299,7 @@ az acr build --registry <acr-name> --image cyrus-worker:$TAG \
 > To check what you pushed:
 >
 > ```bash
-> az acr manifest show <acr-name>.azurecr.io/cyrus-worker:$TAG \
+> az acr manifest show "$ACR.azurecr.io/cyrus-worker:$TAG" \
 >   --query mediaType -o tsv
 > ```
 >
@@ -304,36 +307,82 @@ az acr build --registry <acr-name> --image cyrus-worker:$TAG \
 > (`--provenance=false --sbom=false`) and confirm the media type before
 > registering the disk.
 
-Set `worker_image` in `dev.tfvars` to that exact ref. For the strongest pin,
+Set `workerImage` in `main.bicepparam` to that exact ref. For the strongest pin,
 use the digest the build printed instead of the tag:
 
 ```bash
-az acr manifest show-metadata <acr-name>.azurecr.io/cyrus-worker:$TAG \
+az acr manifest show-metadata "$ACR.azurecr.io/cyrus-worker:$TAG" \
   --query digest -o tsv
-# → worker_image = "<acr-name>.azurecr.io/cyrus-worker@sha256:<64 hex>"
+# → param workerImage = '<acr>.azurecr.io/cyrus-worker@sha256:<64 hex>'
 ```
 
 Confirm the build actually contains the commit you intend to deploy before you
 pin it — a tag is only as trustworthy as the commit it was cut from.
 
-### 5. Apply the complete stack
+### 5. Deploy the stack
 
 ```bash
-cd "$REPO_ROOT/infra/azure/terraform"
-terraform plan -var-file=dev.tfvars -out=tfplan
-terraform apply tfplan
+# Bootstrap only: the parameter file has writeLinearSecrets=true and all five
+# values. Routine deployments omit --allow-secret-writes.
+./scripts/deploy-azure.sh --allow-secret-writes            # what-if: read it
+./scripts/deploy-azure.sh --allow-secret-writes --apply
 ```
 
+The script checks the image pins at full fidelity and the `/setup` staging gate
+before it calls `az`. It also refuses either secret-write parameter unless the
+independent `--allow-secret-writes` switch is present. It prints the deployment
+outputs when it finishes. Read them straight back at any time with:
+
+```bash
+az deployment sub show --name cyrus-cyrus-dev --query 'properties.outputs' -o json
+```
+
+Immediately after a successful bootstrap, set `writeLinearSecrets = false` and
+clear all five secret values. Every later deployment is then secretless:
+
+```bash
+./scripts/deploy-azure.sh
+./scripts/deploy-azure.sh --apply
+```
+
+The omitted Key Vault child resources remain in place under Incremental mode,
+and the router keeps reading their latest versions through versionless URIs.
+
+For the private deployment repository, check out a reviewed public Cyrus commit
+and invoke this same entry point; do not copy the Bicep modules into the private
+repository. Keep its secretless environment parameters separately and override
+the newly published immutable router image at invocation time:
+
+```bash
+./scripts/deploy-azure.sh \
+  --params /private/deploy/environments/dev.bicepparam \
+  --router-image "$PINNED_ROUTER_IMAGE" \
+  --apply
+```
+
+The private workflow owns Azure OIDC, approval/environment policy, and the
+choice of public commit and image digest. The public repository owns the Bicep
+implementation, validation, and deployment contract. A separate manual
+bootstrap/rotation operation may use `--allow-secret-writes`; the routine CD job
+must not receive those secret values.
+
 If Container Apps cannot resolve a new Key Vault reference, wait for RBAC
-propagation and apply again. The router can start before the worker disk is
+propagation and deploy again. The router can start before the worker disk is
 registered, but do not delegate an issue until step 6 is complete.
+
+> **Never pass `--mode Complete`.** `deploy-azure.sh` does not offer it, and it
+> is the one thing that would delete the per-user secret store's Table and KEK —
+> the key that unwraps every stored per-user secret. Incremental mode (the
+> default, and the only mode for a subscription-scope deployment) never deletes a
+> resource merely because the template stopped mentioning it.
 
 ### 6. Configure ACA and register the worker disk
 
 ```bash
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
-RESOURCE_GROUP=$(terraform output -raw resource_group_name)
-SANDBOX_GROUP=$(terraform output -raw sandbox_group_name)
+OUT=$(az deployment sub show --name cyrus-cyrus-dev --query 'properties.outputs' -o json)
+RESOURCE_GROUP=$(echo "$OUT" | jq -r .resourceGroupName.value)
+SANDBOX_GROUP=$(echo "$OUT" | jq -r .sandboxGroupName.value)
 DEPLOYER_ID=$(az ad signed-in-user show --query id -o tsv)
 
 aca config set --subscription "$SUBSCRIPTION_ID" \
@@ -348,13 +397,13 @@ aca doctor
 For a public worker image, register it directly. For private ACR, the preview CLI
 may not resolve the sandbox group's system identity during disk import; use a
 short-lived ACR refresh token for this one operation. Runtime pulls still use the
-group's managed identity:
+group's managed identity, which the template grants AcrPull:
 
 ```bash
-ACR_TOKEN=$(az acr login --name <acr-name> --expose-token \
+ACR_TOKEN=$(az acr login --name "$ACR" --expose-token \
   --query accessToken -o tsv)
 aca sandboxgroup disk create \
-  --image <acr-name>.azurecr.io/cyrus-worker:<immutable-tag> \
+  --image "$ACR.azurecr.io/cyrus-worker:<immutable-tag>" \
   --name <aca-disk-name> \
   --username 00000000-0000-0000-0000-000000000000 \
   --token "$ACR_TOKEN" \
@@ -396,35 +445,37 @@ Wait for the disk state to become `Ready`. Private disks are created by their
 server-assigned disk ID; the router resolves the configured operator name from
 `labels.name` and sends that ID on sandbox create.
 
-### 7. Set the stable router URL and Linear webhook
+### 7. Set the Linear webhook
 
-Read the stable app ingress, not a revision-specific FQDN:
-
-```bash
-terraform output -raw router_fqdn
-terraform output -raw router_wss_url
-```
-
-Set `router_url_for_containers` in `dev.tfvars` to the `router_wss_url` output and
-apply again:
+The router's stable ingress FQDN is a deployment output. Read it, not a
+revision-specific FQDN:
 
 ```bash
-terraform apply -var-file=dev.tfvars
+az deployment sub show --name cyrus-cyrus-dev \
+  --query 'properties.outputs.routerFqdn.value' -o tsv
+az deployment sub show --name cyrus-cyrus-dev \
+  --query 'properties.outputs.routerWssUrl.value' -o tsv
 ```
+
+There is **no second deployment** for this. The WSS URL is already embedded in
+`CYRUS_ROUTER_CONTAINERS_JSON` — see
+[the two-apply flow is gone](#the-routerurlforcontainers-two-apply-flow-is-gone).
 
 In the Linear app, set the webhook URL to:
 
 ```text
-https://<router_fqdn>/linear-webhook
+https://<routerFqdn>/linear-webhook
 ```
 
-Keep the signing secret identical to `linear_webhook_secret`. `/webhook` is a
+Keep the signing secret identical to `linearWebhookSecret`. `/webhook` is a
 deprecated compatibility alias; use `/linear-webhook` for new deployments.
 
 Verify the router:
 
 ```bash
-curl -fsS "https://$(terraform output -raw router_fqdn)/healthz"
+FQDN=$(az deployment sub show --name cyrus-cyrus-dev \
+  --query 'properties.outputs.routerFqdn.value' -o tsv)
+curl -fsS "https://$FQDN/healthz"
 az containerapp logs show --name <router-app> --resource-group "$RESOURCE_GROUP" \
   --type console --tail 100
 ```
@@ -435,8 +486,8 @@ ACA executor users do not enroll a physical device, so Entra is not required for
 their worker. To protect future `cyrus connect` enrollment, create one single-
 tenant app registration per router, expose a delegated `user_impersonation`
 scope, pre-authorize Microsoft Azure CLI (`04b07795-8ddb-461a-bbee-02f9e1bf7b46`),
-and set the exact Application ID URI as `entra_audience`. Set
-`entra_tenant_id` and optionally `entra_allowed_domain`, then verify:
+and set the exact Application ID URI as `entraAudience`. Set `entraTenantId` and
+optionally `entraAllowedDomain`, then verify:
 
 ```bash
 az account get-access-token --scope '<entra-audience>/.default' -o none
@@ -487,10 +538,10 @@ warning is not a failure. Fine-grained PATs use per-resource permissions instead
 of scopes (grant Contents read/write at minimum) and report no scope list, so
 `--check-scopes` reports them as un-introspectable rather than deficient. Full
 breakdown: [docs/GIT_GITHUB.md](../../docs/GIT_GITHUB.md#token-scopes).
-`LINEAR_API_TOKEN` is a
-personal key used by the hosted Linear MCP, separate from the router app's
-workspace OAuth token. ACA users do not redeem the printed enrollment code and
-do not run `cyrus connect`; their per-issue sandbox is their device.
+`LINEAR_API_TOKEN` is a personal key used by the hosted Linear MCP, separate from
+the router app's workspace OAuth token. ACA users do not redeem the printed
+enrollment code and do not run `cyrus connect`; their per-issue sandbox is their
+device.
 
 Additional arbitrary tool credentials can be stored under any non-reserved env
 name. Secret values are injected only during a fresh create-from-image. To apply
@@ -524,96 +575,80 @@ criteria are tracked in [`TODO.md`](../../TODO.md).
 
 `/setup` lets a teammate manage their own container environment variables in a
 browser instead of through `az containerapp exec`. It is off by default, and
-turning it on is a **two-apply sequence with a live verification gate in the
+turning it on is a **two-deployment sequence with a live verification gate in the
 middle**. Read this whole section before starting; the ordering is the security
 property, not a suggestion.
 
-#### Why two applies
+#### Why two deployments
 
 `authConfigs` — the ACA built-in auth ("EasyAuth") sidecar — is an ARM **child**
-of the Container App. Terraform must create the app, and therefore publish the
-revision that serves `/setup`, *before* it can attach the sidecar. A single
-`enable_setup_ui` flag would guarantee a window in which an unauthenticated
-`/setup` is reachable on the public internet, and no post-apply check can close
-a window that opens mid-apply.
+of the Container App. ARM must create the app, and therefore publish the revision
+that serves `/setup`, *before* it can attach the sidecar. A single
+`enableSetupUi` flag would guarantee a window in which an unauthenticated
+`/setup` is reachable on the public internet, and no post-deploy check can close
+a window that opens mid-deployment.
 
-So the flags are split, and Terraform refuses to let you collapse them:
+So the flags are split, and the deploy script refuses to let you collapse them:
 
-| Variable | Apply | Effect |
+| Parameter | Deployment | Effect |
 | --- | --- | --- |
-| `enable_setup_auth` | **first, alone** | Entra client secret, token store, `authConfigs`. `/setup` still 404s. |
-| — | **verification gate** | Steps 4a–4c below. Recorded in `setup_auth_stage1_verified`. **Ordering is enforced against Azure, not by that flag** — see below. |
-| `enable_setup_ui` | **second, separate apply** | Sets `CYRUS_ROUTER_SETUP_UI_*`, which is what registers the routes. |
+| `enableSetupAuth` | **first, alone** | Token store infrastructure and `authConfigs`. A bootstrap also writes its two secrets with `writeSetupAuthSecrets`. `/setup` still 404s. |
+| — | **verification gate** | Steps 5a–5c below. Recorded in `setupAuthStage1Verified`. **Ordering is enforced against Azure, not by that flag** — see below. |
+| `enableSetupUi` | **second, separate deployment** | Sets `CYRUS_ROUTER_SETUP_UI_*`, which is what registers the routes. |
 
-`enable_setup_ui = true` fails variable validation unless both
-`enable_setup_auth` and `setup_auth_stage1_verified` are already true — and,
-more importantly, `azurerm_container_app.router` carries preconditions over a
-data source that reads the **already-deployed** `authConfigs` child out of
-Azure. Setting all three in one tfvars edit therefore fails at **plan** time,
-because on that plan the auth child genuinely does not exist yet.
+`enableSetupUi = true` fails `main.bicep`'s cross-parameter validation unless
+both `enableSetupAuth` and `setupAuthStage1Verified` are already true — and, more
+importantly, `scripts/deploy-azure.sh` reads the **already-deployed**
+`authConfigs` child out of Azure with `az containerapp auth show` and refuses to
+proceed unless it exists *and* reports `platform.enabled` and
+`identityProviders.azureActiveDirectory.enabled`.
 
-The booleans are a fast, readable first line of defence; the data source is the
-actual control. A boolean an operator supplies in the same plan can only ever
-attest to intent — it cannot establish that a prior apply happened.
+The booleans are a fast, readable first line of defence; the live read is the
+actual control. A boolean an operator supplies in the same edit can only ever
+attest to intent — it cannot establish that a prior deployment happened.
 
-**Rollback reverses the order**: clear `enable_setup_ui`, apply, confirm `/setup`
-returns 404, and only then clear `enable_setup_auth`.
+> **This is where the enforcement moved.** Terraform proved the ordering at plan
+> time, with a data source ARM answered before any resource was touched. Bicep
+> has no plan phase and no equivalent read, so the check now lives in the deploy
+> script. Same class of evidence — a question answered by ARM about real remote
+> state — with one new weakness: running `az deployment sub create` by hand
+> bypasses it. Use the script.
 
-> **If you already applied an earlier revision of this stack**, the Table and
-> KEK were created unconditionally at that time. Set
-> `enable_setup_secret_store = true` to keep them. Leaving it false produces a
-> `prevent_destroy` plan error naming the protected resource — deliberately, so
-> the flag can never silently destroy the only key that can decrypt existing
-> records. Only the dev stack should be affected; this has not shipped.
+**Rollback reverses the order**: clear `enableSetupUi`, deploy, confirm `/setup`
+returns 404, and only then clear `enableSetupAuth`.
 
 #### Prerequisites
 
-- **Only when `enable_setup_secret_store = true`:** the applying principal
-  needs **Key Vault Crypto Officer** on the vault. The
-  stack creates an RSA KEK (`azurerm_key_vault_key.setup_kek`), and the existing
-  Secrets User / Secrets Officer grants are for the *router* identity and cover
-  secrets only — no role in this stack permits creating a key.
-
-  ```bash
-  KV_ID=$(az keyvault show -n "$(terraform output -raw key_vault_name)" --query id -o tsv)
-  az role assignment create \
-    --assignee "<your-object-id>" \
-    --role "Key Vault Crypto Officer" \
-    --scope "$KV_ID"
-  ```
-
-- The storage account must allow shared-key access, because
-  `azurerm_storage_table` and the token-store SAS are both data-plane operations
-  keyed on the account key. If you have disabled shared key, set
-  `storage_use_azuread = true` in the `provider "azurerm"` block and grant the
-  applying principal *Storage Table Data Contributor* first.
+- The storage account must allow shared-key access, because the token-store SAS
+  is generated with `listServiceSas`, which is keyed on the account key. The
+  template keeps `allowSharedKeyAccess: true` for this reason and for the Azure
+  Files mount.
 
 - Entra tenant admin (or Application Administrator) to edit the app
   registration in step 2.
 
-> **The Azure Table and the KEK are created unconditionally and are not part of
-> this feature flag.** They are cheap and inert until something reads them, and
-> they are deliberately *not* gated: see "Decommissioning the per-user secret
-> store" for why, and for the only supported way to remove them.
+- **No special Key Vault data-plane role.** Terraform needed Key Vault Crypto
+  Officer to create the KEK; the ARM `vaults/keys` child resource is a
+  management-plane write covered by Contributor.
 
-#### Step 1 — read the values Terraform already knows
+#### Step 1 — read the values the deployment already knows
 
 ```bash
-cd infra/azure/terraform
-FQDN=$(terraform output -raw router_fqdn)
-REDIRECT=$(terraform output -raw setup_ui_redirect_uri)
-RG=$(terraform output -raw resource_group_name)
-APP=$(terraform output -raw router_app_name)
+OUT=$(az deployment sub show --name cyrus-cyrus-dev --query 'properties.outputs' -o json)
+FQDN=$(echo "$OUT" | jq -r .routerFqdn.value)
+REDIRECT=$(echo "$OUT" | jq -r .setupUiRedirectUri.value)
+RG=$(echo "$OUT" | jq -r .resourceGroupName.value)
+APP=$(echo "$OUT" | jq -r .routerAppName.value)
 ```
 
-`setup_ui_redirect_uri` is emitted unconditionally, precisely so it is available
+`setupUiRedirectUri` is emitted unconditionally, precisely so it is available
 *before* stage 1 — you cannot configure Entra from a value that only exists once
 the thing you are configuring is already live.
 
 #### Step 2 — extend the EXISTING router app registration
 
 Do not mint a second app. "One app registration/audience per router deployment"
-is a standing invariant, and `entra_audience` (the `api://<client-id>`
+is a standing invariant, and `entraAudience` (the `api://<client-id>`
 Application ID URI used by `/enroll` access tokens) and the setup UI's ID-token
 audience (the bare client-id GUID) are two audiences of the *same* app.
 
@@ -636,40 +671,46 @@ az ad app credential reset --id "$APP_ID" \
   --display-name "cyrus-router-easyauth" --years 2 --query password -o tsv
 ```
 
-Record both values in your gitignored tfvars:
+Record the client id and, temporarily, the generated secret and SAS window in
+your gitignored bootstrap parameter file:
 
-```hcl
-setup_ui_client_id     = "<APP_ID>"
-setup_ui_client_secret = "<the password printed above>"
+```bicep
+param setupUiClientId = '<APP_ID>'
+param writeSetupAuthSecrets = true
+param setupUiClientSecret = '<the password printed above>'
 
-# Static SAS window for the ACA token store. Must NOT be derived from
-# timestamp(): that re-evaluates every plan and would roll a new router
-# revision on every apply. Diarise the expiry — see "Rotating the setup UI
-# secrets".
-setup_ui_token_store_sas_start  = "2026-01-01T00:00:00Z"
-setup_ui_token_store_sas_expiry = "2027-01-01T00:00:00Z"
+// Static SAS window for the ACA token store. Must NOT be derived from
+// utcNow(): that re-evaluates every deployment and would roll a new router
+// revision each time. Diarise the expiry — see "Rotating the setup UI secrets".
+param setupUiTokenStoreSasStart = '2026-01-01T00:00:00Z'
+param setupUiTokenStoreSasExpiry = '2027-01-01T00:00:00Z'
 ```
 
 #### Step 3 — restrict who can sign in (HARD PREREQUISITE for auto-provisioning)
 
 By default **any** account in the tenant can obtain a token for the app.
-`setup_ui_allowed_domain` does not change that — a domain check cannot tell an
+`setupUiAllowedDomain` does not change that — a domain check cannot tell an
 assigned teammate from any other account in the same tenant. So if
-`setup_ui_auto_provision_users` is left at its default of `false`, an unknown
-signer is refused and you can skip to step 4. If you want first sign-in to
-create the user, you must restrict membership first, and Terraform enforces it:
-`setup_ui_auto_provision_users = true` fails validation unless one of the two
-options below is in place.
+`setupUiAutoProvisionUsers` is left at its default of `false`, an unknown signer
+is refused and you can skip to step 4. If you want first sign-in to create the
+user, you must restrict membership first, and the template enforces it:
+`setupUiAutoProvisionUsers = true` fails validation unless one of the two options
+below is in place.
+
+> The Terraform variable defaulted to `true` while its own README documented
+> `false` and claimed an enforcement that was never written. The Bicep parameter
+> implements the documented, stricter contract: default `false`, and the
+> membership gate is genuinely required.
 
 **Option A — `authConfigs` allowed principals (no Entra premium licence).**
-Terraform renders these into
+The template renders these into
 `identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedPrincipals`:
 
-```hcl
-setup_ui_allowed_group_object_ids     = ["00000000-0000-0000-0000-000000000000"]
-# or, less maintainably, one entry per person:
-setup_ui_allowed_principal_object_ids = []
-setup_ui_auto_provision_users         = true
+```bicep
+param setupUiAllowedGroupObjectIds = ['00000000-0000-0000-0000-000000000000']
+// or, less maintainably, one entry per person:
+param setupUiAllowedPrincipalObjectIds = []
+param setupUiAutoProvisionUsers = true
 ```
 
 An empty list sends **no** policy at all — an empty policy is not the same as an
@@ -704,40 +745,47 @@ az rest --method GET \
 
 Only then:
 
-```hcl
-setup_ui_assignment_required_verified = true
-setup_ui_auto_provision_users         = true
+```bicep
+param setupUiAssignmentRequiredVerified = true
+param setupUiAutoProvisionUsers = true
 ```
 
 > **Licensing:** assigning a *group* to an app role requires Entra ID P1/P2.
 > Without it, assign users individually or use Option A, which has no licence
 > requirement.
 
-#### Step 4 — STAGE 1 APPLY: auth only
+#### Step 4 — STAGE 1 DEPLOYMENT: auth only
 
-```hcl
-enable_setup_auth = true
-# enable_setup_ui stays FALSE. Do not set it in this edit.
+```bicep
+param enableSetupAuth = true
+param writeSetupAuthSecrets = true
+// enableSetupUi stays FALSE. Do not set it in this edit.
 ```
 
 ```bash
-terraform plan  -var-file=dev.tfvars -out=tfplan
-terraform apply tfplan
+./scripts/deploy-azure.sh --allow-secret-writes            # read the what-if
+./scripts/deploy-azure.sh --allow-secret-writes --apply
 ```
 
-Expected diff: one Key Vault secret for the client secret, one blob container +
-one Key Vault secret for the token-store SAS, two new `secret {}` blocks on the
-Container App (so a new revision), and the `azapi_resource.router_auth` child.
-No `/setup` route is created.
+Expected change list: one Key Vault secret for the client secret, one blob
+container + one Key Vault secret for the token-store SAS, two new `secrets`
+entries on the Container App (so a new revision), and the `authConfigs` child. No
+`/setup` route is created.
+
+Immediately set `writeSetupAuthSecrets = false` and clear
+`setupUiClientSecret`, `setupUiTokenStoreSasStart`, and
+`setupUiTokenStoreSasExpiry`. Leave `enableSetupAuth = true`. The stage-2 and
+all routine deployments now need no setup secret values and cannot overwrite a
+direct rotation.
 
 #### Step 5 — THE GATE
 
 **This is an acceptance criterion, not a formality.** `authConfigs` changes
 ingress behaviour for *every* path on the app. Steps 5a and 5c are the required
-behavioural checks recorded in `setup_auth_stage1_verified`; 5b is retained as a
-defence-in-depth probe rather than the trust basis of a selectable mode, since
-Terraform no longer offers `easyauth-headers`. Do not proceed to stage 2 until all three
-pass. Paste the output into the change record.
+behavioural checks recorded in `setupAuthStage1Verified`; 5b is retained as a
+defence-in-depth probe rather than the trust basis of a selectable mode, since the
+template no longer offers `easyauth-headers`. Do not proceed to stage 2 until all
+three pass. Paste the output into the change record.
 
 **5a — machine routes still reach the app.** A `302` to `/.auth/login/aad` on
 any of these means the auth config is wrong and webhook delivery and worker
@@ -766,16 +814,19 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 # A 200 at any point means STOP AND ESCALATE.
 ```
 
-Terraform refuses `easyauth-headers` outright — `setup_ui_auth_mode` accepts only `entra-token`, because the header mode's trust boundary is proxy topology the configuration cannot verify. A 200 here is still STOP-AND-ESCALATE: it means the ingress is injecting or passing identity you did not expect.
-Use the default `entra-token` mode, which verifies the forwarded ID token
-cryptographically and ignores `X-MS-CLIENT-PRINCIPAL-*` entirely — its trust
-boundary is a signature, not proxy topology.
+`setupUiAuthMode` accepts only `entra-token`, because the header mode's trust
+boundary is proxy topology the configuration cannot verify. A 200 here is still
+STOP-AND-ESCALATE: it means the ingress is injecting or passing identity you did
+not expect. `entra-token` verifies the forwarded ID token cryptographically and
+ignores `X-MS-CLIENT-PRINCIPAL-*` entirely — its trust boundary is a signature,
+not proxy topology.
 
 **5c — sign-in works.** Stage 1 is what makes this provable before any route
 exists:
 
 ```bash
-open "$(terraform output -raw setup_ui_sign_in_url)"
+open "$(az deployment sub show --name cyrus-cyrus-dev \
+  --query 'properties.outputs.setupUiSignInUrl.value' -o tsv)"
 ```
 
 You should complete an Entra sign-in and land back on the app. If step 3 Option
@@ -783,62 +834,67 @@ B is in place, confirm an **unassigned** tenant account is refused here.
 
 Record the result:
 
-```hcl
-setup_auth_stage1_verified = true
+```bicep
+param setupAuthStage1Verified = true
 ```
 
-#### Step 6 — STAGE 2 APPLY: enable the routes
+#### Step 6 — STAGE 2 DEPLOYMENT: enable the routes
 
-```hcl
-enable_setup_ui = true
-setup_ui_auth_mode      = "entra-token"   # recommended; the default
-setup_ui_allowed_domain = "example.com"   # optional defence in depth
+```bicep
+param enableSetupUi = true
+param setupUiAuthMode = 'entra-token'   // the only accepted value
+param setupUiAllowedDomain = 'example.com'   // optional defence in depth
 ```
 
 ```bash
-terraform plan  -var-file=dev.tfvars -out=tfplan
-terraform apply tfplan
-terraform output -raw setup_ui_url
+./scripts/deploy-azure.sh            # the stage-2 gate runs here
+./scripts/deploy-azure.sh --apply
+az deployment sub show --name cyrus-cyrus-dev \
+  --query 'properties.outputs.setupUiUrl.value' -o tsv
 ```
 
-Expected diff: `CYRUS_ROUTER_SETUP_UI_*` env vars on the container, and the
+Expected change list: `CYRUS_ROUTER_SETUP_UI_*` env vars on the container, and the
 resulting revision. Then re-run **5b** — it must now return `401`, not `200` —
-and sign in to `setup_ui_url` as a real teammate.
+and sign in to `setupUiUrl` as a real teammate.
 
 #### Rolling back
 
-1. `enable_setup_ui = false`; apply. Confirm `curl -o /dev/null -w '%{http_code}'
+1. `enableSetupUi = false`; deploy. Confirm `curl -o /dev/null -w '%{http_code}'
    "https://$FQDN/setup"` returns `404`.
-2. Only then `enable_setup_auth = false`; apply. This destroys the token-store
-   container (session state only — everyone is signed out, nothing is lost) and
-   the `authConfigs` child.
-3. Leave `setup_auth_stage1_verified` as it is; it records history, not intent.
+2. Only then `enableSetupAuth = false`; deploy. This removes the `authConfigs`
+   child and the two Container App secret entries. The token-store blob container
+   is left in place — incremental deployments do not delete it — which is
+   harmless: it holds only cached OAuth sessions. Delete it by hand if you want
+   everyone signed out.
+3. Leave `setupAuthStage1Verified` as it is; it records history, not intent.
 
-Never do these in one apply, and never step 2 before step 1 — that is the
+Never do these in one deployment, and never step 2 before step 1 — that is the
 unauthenticated-`/setup` window again, in reverse.
 
 ### Key Vault → Table migration for per-user secrets
 
 The Azure Table (`cyrussetup`), the envelope-encryption KEK, and the router's
 *Storage Table Data Contributor* + *Key Vault Crypto User* role assignments are
-created by every apply and are independent of the `/setup` flags. Cutting the
-router **over** to them is a separate, ordered operation:
+created by `enableSetupSecretStore`. Cutting the router **over** to them is a
+separate, ordered operation:
 
-1. Set `enable_setup_secret_store = true` and apply. The Table and KEK now exist; the router still reads Key
-   Vault, because `enable_setup_table_backend` is `false`.
+1. Set `enableSetupSecretStore = true` and deploy. The Table and KEK now exist;
+   the router still reads Key Vault, because `enableSetupTableBackend` is
+   `false`.
 2. `az containerapp exec` into the replica and dry-run the copy. The target is
    named explicitly, because `containers.tableStore` is deliberately NOT in the
    config yet — adding it is what makes the router start *reading* from the
    Table, which must come after the data is verified in place. Take the two
-   values from `terraform output`:
+   values from the deployment outputs:
    ```bash
+   OUT=$(az deployment sub show --name cyrus-cyrus-dev --query 'properties.outputs' -o json)
    cyrus router secrets migrate --from keyvault --to table --dry-run \
-     --to-endpoint "$(terraform output -raw setup_table_endpoint)" \
-     --to-key-id  "$(terraform output -raw setup_kek_versioned_key_id)"
+     --to-endpoint "$(echo "$OUT" | jq -r .setupTableEndpoint.value)" \
+     --to-key-id  "$(echo "$OUT" | jq -r .setupKekVersionedKeyId.value)"
    ```
    Eyeball the `email  KEY  (n bytes)` list. Values are never printed.
 3. Re-run without `--dry-run`, same flags.
-4. Set `enable_setup_table_backend = true` and apply. This adds
+4. Set `enableSetupTableBackend = true` and deploy. This adds
    `containers.tableStore` to `CYRUS_ROUTER_CONTAINERS_JSON` and rolls one
    revision.
 5. `cyrus router secrets list <email>` for two users — the key sets must match
@@ -848,12 +904,12 @@ router **over** to them is a separate, ordered operation:
    rollback path. Deleting them is a separate change.
 
 **Rollback is only safe until the first write through the UI.** Flipping
-`enable_setup_table_backend = false` drops the router back to the Key Vault
-backend, and nothing is destroyed — but migration is one-way, so every value a
-user has added, changed, or rotated through `/setup` since cutover exists only
-in the Table. Rolling back after that point silently restores the migration-time
-snapshot, which can reinstate a credential the user believed they had replaced
-or revoked.
+`enableSetupTableBackend = false` drops the router back to the Key Vault backend,
+and nothing is destroyed — but migration is one-way, so every value a user has
+added, changed, or rotated through `/setup` since cutover exists only in the
+Table. Rolling back after that point silently restores the migration-time
+snapshot, which can reinstate a credential the user believed they had replaced or
+revoked.
 
 Treat the Key Vault copy as a rollback path for the cutover window only. Once
 users are editing through the UI, a return to Key Vault requires an explicit
@@ -864,60 +920,80 @@ reverse export that does not exist yet — do not assume it is a flag flip.
 - **Entra client secret.** Rotate in Entra first
   (`az ad app credential reset --id "$APP_ID" --display-name cyrus-router-easyauth`),
   then `az keyvault secret set --vault-name <vault> --name setup-ui-client-secret
-  --value <new>`. The Container App references it by *versionless* id, so the
-  sidecar picks it up on the next revision without a Terraform apply. Update
-  `setup_ui_client_secret` in tfvars in the same change or the next apply will
-  overwrite the rotation.
-- **Token-store SAS.** `setup_ui_token_store_sas_expiry` is a **live failure
+  --value <new>`. The Container App references it by *versionless* URI, so the
+  sidecar picks it up on the next revision. Leave `writeSetupAuthSecrets = false`;
+  routine deployments omit the secret resource and cannot overwrite the new
+  version.
+- **Token-store SAS.** `setupUiTokenStoreSasExpiry` is a **live failure
   deadline**: past it, the sidecar can no longer persist sessions and sign-in
-  breaks. Bump both window variables and apply. `Microsoft.App/containerApps/
-  authConfigs@2024-03-01` models the token store as `sasUrlSettingName` only —
-  there is no managed-identity token store on any shipped Microsoft.App auth
-  API version — so a SAS is the only available shape, not a shortcut.
+  breaks. Renew the two setup-auth credentials as a coordinated pair: create a
+  new Entra client secret first, temporarily set `writeSetupAuthSecrets = true`,
+  supply that new client secret plus a new SAS start and expiry, deploy with
+  `--allow-secret-writes`, then restore the flag to `false` and clear all three
+  values.
+  `Microsoft.App/containerApps/authConfigs@2024-03-01` models the token store as
+  `sasUrlSettingName` only — there is no managed-identity token store on any
+  shipped Microsoft.App auth API version — so a SAS is the only available shape,
+  not a shortcut. The template generates it with `listServiceSas`, which is
+  deterministic for a fixed window and account key, so the secret does not churn
+  between deployments.
 - **KEK.** Rotating the key does **not** re-wrap existing rows. Each record
   pins the key *version* it was wrapped with, so old versions must stay
   **enabled** until a re-wrap pass has run.
 
 ### Decommissioning the per-user secret store
 
-There is deliberately no flag that removes the Table, the KEK, or the two role
-assignments. Both the Table and the KEK carry `prevent_destroy = true`, so
-`terraform destroy` — and any plan that would remove them — **fails on purpose**.
-Destroying the KEK makes every wrapped record permanently unreadable; the
-wrapped DEKs are useless without it. That is not a state a boolean should be
-able to reach.
+Clearing `enableSetupSecretStore` does **not** delete the Table or the KEK.
+Incremental ARM deployments do not delete a resource that leaves the template, so
+the flag simply stops managing them: the data stays readable, and setting the
+flag again re-adopts them. This is a straight improvement over the Terraform
+stack, where the same safety needed `prevent_destroy`, a deliberately asymmetric
+flag whose "off" position failed the plan, and a `terraform state rm` step in this
+runbook. All three are gone.
 
-The supported workflow, in order:
+Destroying the KEK makes every wrapped record permanently unreadable — the
+wrapped DEKs are useless without it — so removal stays a deliberate, manual act:
 
 1. Export every record and verify the export opens (`cyrus router secrets list`
    per user against the Table backend, plus a read-back of at least two users'
    full key sets).
-2. `enable_setup_table_backend = false`; apply. The router is now off the Table.
+2. `enableSetupTableBackend = false`; deploy. The router is now off the Table.
 3. Confirm workers still boot for a migrated user.
 4. Retire KEK versions in Key Vault only after step 3 has held for a full
    retention window.
-5. Only then remove the resources: delete the blocks from `setup_ui.tf`, drop
-   the `prevent_destroy` guards in the same commit, and apply. To retire the
-   Azure resources while keeping them out of Terraform's hands instead, use
-   `terraform state rm` and delete them manually.
+5. Only then remove the resources by hand:
+   ```bash
+   az keyvault key delete --vault-name <vault> --name cyrus-setup-kek
+   az storage entity query --table-name cyrussetup --auth-mode login \
+     --account-name <account>          # confirm what you are about to lose
+   az storage table delete --name cyrussetup --auth-mode login \
+     --account-name <account>
+   ```
+6. Set `enableSetupSecretStore = false` so the template stops trying to recreate
+   them.
 
-The same applies to whole-stack teardown — see "Teardown (M5)", which now has a
-step for this.
+The same applies to whole-stack teardown — see [Teardown](#teardown).
 
-### `routerUrlForContainers` two-apply rationale
+### The `routerUrlForContainers` two-apply flow is gone
 
-The stable ingress FQDN is known only after the Container App exists. Embedding
-it into the router's own environment in the same plan creates a Terraform
-dependency cycle. The first apply therefore uses a placeholder; step 7 copies the
-stable `azurerm_container_app.router.ingress[0].fqdn` output into tfvars and
-applies a second revision.
+Terraform needed two applies here: the stable ingress FQDN was only knowable from
+`azurerm_container_app.router` itself, and embedding it into that same resource's
+environment created a dependency cycle. The first apply used a placeholder and
+step 7 copied the real value into tfvars for a second apply.
 
-The `cyrus_router_containers_json` output is non-sensitive and contains the
+Bicep derives the FQDN as `<app-name>.<managedEnvironment.defaultDomain>`. The
+Container Apps **environment** is a separate resource from the app, so reading
+`defaultDomain` from it is not self-referential, and the router's own environment
+gets the correct WSS URL on the very first deployment. `routerUrlForContainers`
+remains as an override for a custom domain or a proxy in front of the app.
+
+The `cyrusRouterContainersJson` output is non-sensitive and contains the
 complete, merge-ready config (image, router WSS URL, repositories, `aca`
 block with subscriptionId/resourceGroup/sandboxGroup/region/disk/cpu/memory/
-autoSuspendSeconds/egress*/keepSnapshots/managementEndpoint, `keyVaultUrl`,
-`artifactsDir`, `backupBlobUrl`). It does not contain secret values; per-user
-secrets live in Key Vault and are injected per-sandbox on create (D1/D5).
+autoSuspendSeconds/egress/keepSnapshots/disconnectedRecreateMs/managementEndpoint,
+`keyVaultUrl`, `artifactsDir`, `backupBlobUrl`). It does not contain secret
+values; per-user secrets live in Key Vault and are injected per-sandbox on create
+(D1/D5).
 
 ## Cost posture
 
@@ -931,7 +1007,7 @@ secrets live in Key Vault and are injected per-sandbox on create (D1/D5).
   snapshot-storage meter is published, and the plan's "free during preview,
   billed as blob storage afterwards" claim **could not be substantiated from
   an official source**. Treat post-preview snapshot cost as an unquantified
-  risk; default `keep_snapshots = 2` and run `gc-snapshots` (Task 7). Re-check
+  risk; default `acaKeepSnapshots = 2` and run `gc-snapshots` (Task 7). Re-check
   the pricing page at GA.
 
 ### `maxSandboxCount` does NOT exist as a cost guard
@@ -944,19 +1020,20 @@ router's job:
 
 - Keep `idleStopMs` and `staleDestroyMs` (router config) healthy — these are
   the actual idle and abandon controllers. `idleStopMs` defaults to 5 minutes
-  and is set explicitly by Terraform (`var.idle_stop_ms`). It counts from the
-  later of the last routed event and the moment a session *parked*.
+  and is set explicitly by the template (the `idleStopMs` parameter). It counts
+  from the later of the last routed event and the moment a session *parked*.
 - Set up `gc-snapshots` (Task 7) on a schedule.
 - Rate-limit issue assignment (Linear automation) if you want a hard ceiling
   on concurrent workers — the platform will not enforce one.
 
 ## Monitoring and alerts
 
-`monitoring.tf` provisions saved KQL searches and alert rules over the router's
-JSON log stream. No agent, no exporter, no OpenTelemetry dependency — the
-Container Apps environment already ships the router's stdout to the Log
-Analytics workspace created in `main.tf`, and the router already writes one flat
-JSON object per line (`CYRUS_LOG_FORMAT=json`, set in `router.tf`).
+`bicep/modules/monitoring.bicep` provisions saved KQL searches and alert rules
+over the router's JSON log stream. No agent, no exporter, no OpenTelemetry
+dependency — the Container Apps environment already ships the router's stdout to
+the Log Analytics workspace created in `bicep/modules/foundation.bicep`, and the
+router already writes one flat JSON object per line (`CYRUS_LOG_FORMAT=json`, set
+in `bicep/modules/router-app.bicep`).
 
 The data comes from the `sandbox_*` event family documented in
 [`docs/ROUTER.md`](../../docs/ROUTER.md) → "Sandbox lifecycle telemetry". The
@@ -977,31 +1054,31 @@ worker logs" for the queries and the `CYRUS_LOG_FORWARD_*` volume guard — the
 defaults (WARN and above, 2/sec sustained) exist because this workspace is
 PerGB2018 and unfiltered session stdout from every sandbox is not cheap.
 
-### OpenTelemetry log export (`enable_otel_logs`, default on)
+### OpenTelemetry log export (`enableOtelLogs`, default on)
 
 Everything above reads `ContainerAppConsoleLogs_CL` and needs no exporter. On top
-of it, `enable_otel_logs` also backs the router's `ILogger` with the OpenTelemetry
+of it, `enableOtelLogs` also backs the router's `ILogger` with the OpenTelemetry
 Logs API, so each of its existing log calls additionally leaves the process as a
-structured OTLP record. Set `CYRUS_OTEL_LOGS_ENABLED=false` — or the Terraform
-variable to `false` — to turn it off completely; the console path is unchanged
+structured OTLP record. Set `CYRUS_OTEL_LOGS_ENABLED=false` — or the Bicep
+parameter to `false` — to turn it off completely; the console path is unchanged
 either way.
 
-`azurerm_application_insights.otel` is the OTLP endpoint and nothing more. It is
-**workspace-based**, pointed at the same `azurerm_log_analytics_workspace.this`
+`Microsoft.Insights/components` in `bicep/modules/monitoring.bicep` is the OTLP
+endpoint and nothing more. It is **workspace-based**, pointed at the same Log Analytics workspace
 the environment already ships stdout to, so there is no second data store, no
 separate retention setting, and no new billing surface beyond the ingested
 volume. Classic (non-workspace) mode would keep its own store, out of reach of
-every query above — hence the explicit `workspace_id`.
+every query above — hence the explicit `WorkspaceResourceId`.
 
 **The one thing to know: OTLP records land in `AppTraces`, not
 `ContainerAppConsoleLogs_CL`.** Every saved search and alert rule in this file
 reads the console table and is therefore blind to them; enabling this changes
-nothing about their behaviour. `terraform output otel_logs_query` prints
+nothing about their behaviour. The deployment's `otelLogsQuery` output is
 paste-ready KQL. `service.name` arrives as `AppRoleName`,
 `service.instance.id` as `AppRoleInstance`, and the rest of the resource semconv
 (`cloud.*`, `deployment.environment.name`) as keys inside `Properties`.
 
-Volume is governed by `var.otel_logs_level` (default `INFO`), which is
+Volume is governed by `otelLogsLevel` (default `INFO`), which is
 independent of what the container prints locally. Same PerGB2018 economics as the
 worker forwarder above: `INFO` carries the `sandbox_*` event family and every
 warning and error, while debug volume stays on stdout only. Named `event()`
@@ -1027,7 +1104,7 @@ router's bootstrap knows this is Azure. See
 
 | Rule | Fires when | Severity |
 |------|-----------|----------|
-| `…-sandbox-long-running` | a sandbox has been running continuously for more than `var.sandbox_uptime_alert_hours` (default 6) | 2 |
+| `…-sandbox-long-running` | a sandbox has been running continuously for more than `sandboxUptimeAlertHours` (default 6) | 2 |
 | `…-sandbox-sweep-stalled` | no lifecycle sweep has reported in for 15 minutes | 1 |
 | `…-sandbox-boot-failures` | any sandbox failed to boot | 2 |
 
@@ -1061,20 +1138,22 @@ a dead router.
 
 ### Configuration
 
-```hcl
-# Where alerts land. Empty (the default) still creates the rules and still
-# records fired alerts in Azure Monitor — it just emails nobody.
-alert_email_receivers = ["oncall@example.com"]
+```bicep
+// Where alerts land. Empty (the default) still creates the rules and still
+// records fired alerts in Azure Monitor — it just emails nobody.
+param alertEmailReceivers = ['oncall@example.com']
 
-# Tune the uptime threshold, or turn the rules off entirely.
-sandbox_uptime_alert_hours = 6
-enable_monitoring_alerts   = true
+// Tune the uptime threshold, or turn the rules off entirely.
+param sandboxUptimeAlertHours = 6
+param enableMonitoringAlerts = true
 ```
 
-The saved searches are created regardless of `enable_monitoring_alerts`; they
+The saved searches are created regardless of `enableMonitoringAlerts`; they
 are free and evaluate nothing until someone opens them. Setting the flag to
-false removes the three scheduled-query rules (and their Azure Monitor per-rule
-charge) while leaving the queries in place.
+false stops managing the three scheduled-query rules — but note that, unlike
+`terraform destroy`, an incremental deployment does not delete them. Remove them
+with `az monitor scheduled-query delete` if you want the per-rule Azure Monitor
+charge to stop.
 
 ### Verifying the long-running alert
 
@@ -1101,16 +1180,15 @@ its real value. Note the sweep reconciles this column against real provider
 state each tick, so a backdated value on a sandbox that is genuinely running
 persists, while one on a stopped sandbox is cleared within a tick.
 
-## Teardown (M5)
+## Teardown
 
-Terraform tracks the **ARM group** but NOT its **data-plane children**
+The template tracks the **ARM group** but NOT its **data-plane children**
 (sandboxes, snapshots, disk images). **Azure never GCs snapshots** (spike S3b
 confirmed: a snapshot whose source sandbox was deleted stayed listed and still
-pointed at the dead `sandboxId`). Destroying a non-empty group can strand
-billed snapshots with no Cyrus-side way to enumerate them once the router is
-gone.
+pointed at the dead `sandboxId`). Deleting a non-empty group can strand billed
+snapshots with no Cyrus-side way to enumerate them once the router is gone.
 
-Before `terraform destroy`:
+Before deleting the resource group:
 
 ```bash
 # 1. Sweep-destroy every managed container the router knows about:
@@ -1130,19 +1208,17 @@ aca sandbox snapshot delete --resource-group <rg> --sandbox-group <group> --id <
 aca sandboxgroup disk list  --resource-group <rg> --sandbox-group <group>
 aca sandboxgroup disk delete --name <disk> --resource-group <rg> --sandbox-group <group>
 
-# 4. Clear the per-user secret store guards. `azurerm_storage_table.setup` and
-#    `azurerm_key_vault_key.setup_kek` carry `prevent_destroy = true`, so the
-#    destroy below FAILS while they are in state. That is intentional: the KEK
-#    unwraps every stored per-user secret, and losing it is unrecoverable.
-#    Export and verify first (README → "Decommissioning the per-user secret
-#    store"), then either delete the resource blocks together with their
-#    `prevent_destroy` guards, or drop them from state and remove them by hand:
-terraform -chdir=infra/azure/terraform state rm \
-  azurerm_storage_table.setup azurerm_key_vault_key.setup_kek
+# 4. EXPORT AND VERIFY the per-user secret store first, if it was ever enabled.
+#    Deleting the resource group destroys the KEK, and every wrapped per-user
+#    record becomes permanently unreadable. See "Decommissioning the per-user
+#    secret store" — that runbook is the only safe order.
 
-# 5. THEN destroy the stack.
-terraform -chdir=infra/azure/terraform destroy -var-file=dev.tfvars
+# 5. THEN delete the group.
+az group delete --name <rg> --yes
 ```
+
+There is no state file to clean up afterwards, and no state resource group to
+remember to delete separately.
 
 (If the router itself is already gone and `cyrus router containers list`
 fails, fall back to the `aca` CLI directly: `aca sandbox list --labels
@@ -1153,7 +1229,7 @@ confirmed server-side label filtering works with `cyrus.managed=true`.)
 
 ### Router image tag policy
 
-`router_image` and `worker_image` must be pinned to an **immutable** reference:
+`routerImage` and `workerImage` must be pinned to an **immutable** reference:
 
 | Form | Example | Use |
 | --- | --- | --- |
@@ -1161,36 +1237,53 @@ confirmed server-side label filtering works with `cyrus.managed=true`.)
 | Release tag | `…/cyrus-router:v1.2.3` | Published by `docker-router.yml` on `v*` tags. |
 | Git-SHA tag | `…/cyrus-router:sha-a1b2c3d` | Published by `docker-router.yml` on every push to `main`. |
 
-Terraform **rejects** anything else (`:latest`, `:deploy`, a branch name, an
-ad-hoc hotfix tag, or an untagged ref). The escape hatch
-`allow_mutable_image_tags = true` exists for throwaway stacks only and must stay
-`false` in a durable environment.
+Anything else is **rejected** (`:latest`, `:deploy`, a branch name, an ad-hoc
+hotfix tag, or an untagged ref). The escape hatch `allowMutableImageTags = true`
+exists for throwaway stacks only and must stay `false` in a durable environment.
 
-Why: a mutable tag does not identify a build. The tag string recorded in
-Terraform state never changes, so Terraform reports **no diff** while the
-registry quietly re-points the tag at different bits. The next unrelated
-`terraform apply` then pulls whatever that tag means at that moment — which can
-roll the router **backwards** onto an older image, silently reverting a fix, with
-nothing in the plan output to warn you.
+Enforcement is split between the template and the deploy script, which is worth
+knowing when you read a rejection message:
+
+- `main.bicep` checks the ref **shape** and fails template evaluation. ARM has no
+  regex engine, so this cannot check character classes.
+- `scripts/deploy-azure.sh` applies the full regex — 64 **hex** for a digest,
+  7–40 **hex** after `sha-`, decimal components for a semver tag. This is the
+  layer a raw `az deployment` invocation skips.
+
+One narrowing versus the Terraform regex: a **bare hex tag** (`repo:a1b2c3d`,
+with no `sha-` prefix) is no longer accepted. `docker-router.yml` only ever
+publishes `sha-<sha>` and `v<semver>`, so nothing in practice regresses.
+
+Why any of this matters: a mutable tag does not identify a build. ARM compares
+the container spec it is given against the spec on the resource, so an unchanged
+tag string is an unchanged deployment — while the registry quietly re-points that
+tag at different bits. The next unrelated deployment then pulls whatever the tag
+means at that moment, which can roll the router **backwards** onto an older
+image, silently reverting a fix, with nothing in the change list to warn you.
 
 #### Reconciling a hand-patched (emergency) router image
 
 This is the situation to look for: someone hotfixed the live Container App with
-`az containerapp update --image …:deploy-aca-disk-fix` while `dev.tfvars` still
-said `:deploy`. The running revision and the Terraform input now disagree, and
-the next apply reverts the hotfix. Reconcile **before** the next apply:
+`az containerapp update --image …:deploy-aca-disk-fix` while the parameter file
+still said `:deploy`. The running revision and the declared input now disagree,
+and the next deployment reverts the hotfix. Reconcile **before** the next
+deployment:
 
-1. Diff what is actually running against what Terraform declares. If these two
-   differ, an apply right now would change the running image:
+1. Diff what is actually running against what the template declares. If these
+   two differ, a deployment right now would change the running image:
 
    ```bash
-   RG=$(terraform output -raw resource_group_name)
-   APP=$(terraform output -raw router_app_name)
+   OUT=$(az deployment sub show --name cyrus-cyrus-dev --query 'properties.outputs' -o json)
+   RG=$(echo "$OUT" | jq -r .resourceGroupName.value)
+   APP=$(echo "$OUT" | jq -r .routerAppName.value)
 
    echo "live:     $(az containerapp show -g "$RG" -n "$APP" \
      --query 'properties.template.containers[0].image' -o tsv)"
-   echo "declared: $(terraform output -raw router_image)"
+   echo "declared: $(echo "$OUT" | jq -r .routerImageRef.value)"
    ```
+
+   `./scripts/deploy-azure.sh` (what-if, no `--apply`) shows the same thing as a
+   change list, which is the better check when more than the image has drifted.
 
 2. Identify the commit that image was built from. If it is not obvious, inspect
    the image's revision/source labels, or rebuild from the commit you know
@@ -1200,20 +1293,20 @@ the next apply reverts the hotfix. Reconcile **before** the next apply:
    reuse the hotfix tag; cut `sha-<short-sha>` (or a release tag) from the exact
    commit.
 
-4. Pin it in `dev.tfvars`:
+4. Pin it in `main.bicepparam`:
 
-   ```hcl
-   router_image = "<acr-name>.azurecr.io/cyrus-router:sha-<short-sha>"
+   ```bicep
+   param routerImage = '<acr>.azurecr.io/cyrus-router:sha-<short-sha>'
    ```
 
-5. Plan and read the diff **before** applying. Expect either no image change
-   (if the immutable tag resolves to the same bits already running) or a single
-   deliberate image change. A plan that reverts the image to an older ref means
-   you pinned the wrong commit — stop and go back to step 2.
+5. Preview and read the change list **before** deploying. Expect either no image
+   change (if the immutable tag resolves to the same bits already running) or a
+   single deliberate image change. A change list that reverts the image to an
+   older ref means you pinned the wrong commit — stop and go back to step 2.
 
    ```bash
-   terraform plan -var-file=dev.tfvars -out=tfplan
-   terraform apply tfplan
+   ./scripts/deploy-azure.sh
+   ./scripts/deploy-azure.sh --apply
    ```
 
 6. Verify the new revision is serving and healthy before closing out:
@@ -1223,9 +1316,9 @@ the next apply reverts the hotfix. Reconcile **before** the next apply:
      --query '[].{name:name,active:properties.active,image:properties.template.containers[0].image}' -o table
    ```
 
-Rolling back is then just re-pinning the previous immutable ref and applying —
+Rolling back is then just re-pinning the previous immutable ref and deploying —
 which is the whole point of the policy. Note the router runs a single replica by
-design, so an apply that changes the image is a brief interruption, not a
+design, so a deployment that changes the image is a brief interruption, not a
 zero-downtime rollout; drain or expect in-flight sessions to reconnect.
 
 ### Break-glass: corrupt `router.db`
@@ -1234,16 +1327,15 @@ If the replica enters a CrashLoopBackOff because a restored `router.db` blob is
 corrupt:
 
 1. `az storage blob delete` the blob from the `router-backups` container (your
-   `operator_principal_id` tfvars value has **Storage Blob Data Contributor**
-   on that container — without that role assignment, set in main.tf via the
-   `operator_principal_id` variable, you cannot do this; M2).
+   `operatorPrincipalId` parameter value has **Storage Blob Data Contributor**
+   on that container — without that role assignment you cannot do this; M2).
 2. Restart the replica (`az containerapp revision restart …` or redeploy). The
    router starts fresh (404 on `router.db` = empty DB; `StateBackup.ts` treats
    anything other than 404 as a fatal restore failure — see the Task 3 runbook).
 
 ### Auto-suspend (N5 / F2)
 
-`aca_auto_suspend_seconds` defaults to **0 = DISABLED**. ACA-side auto-suspend
+`acaAutoSuspendSeconds` defaults to **0 = DISABLED**. ACA-side auto-suspend
 has NO session-affinity gate and can freeze a live worker mid-task (spike F2:
 create-from-snapshot silently reset the policy to the 300 s default). The
 provider sets the lifecycle policy explicitly on every create path. **Do not
@@ -1326,10 +1418,19 @@ reaches only a create-from-image, never a resume or a create-from-snapshot.
 
 ### Secret rotation (N4)
 
-The Linear app and workspace secrets in Key Vault are **seeded from Terraform vars on first
-deploy and then operator-owned** — re-apply may overwrite operator rotations.
-After first deploy, rotate via `az keyvault secret set` (or
-`az containerapp exec` into the replica and `cyrus router secrets set …`).
+The Linear app and workspace secrets in Key Vault are **seeded once and then
+operator-owned**. Keep `writeLinearSecrets = false` and all five secret
+parameters empty during routine deployments. Bicep then omits those secret child
+resources, Incremental mode preserves their existing versions, and a stale
+parameter file cannot revert a rotation. The router references fixed secret
+names through versionless Key Vault URIs.
+
+Rotate directly with `az keyvault secret set`. If a controlled bootstrap job
+must perform the write through Bicep instead, temporarily supply all five values,
+set `writeLinearSecrets = true`, and deploy with `--allow-secret-writes`. Restore
+the flag to `false` and clear the values immediately afterwards. Both controls
+are required so a routine CD identity never receives or rewrites secrets by
+accident.
 
 **Propagation limit:** a rotated per-user secret is picked up only by the next
 **create-from-image**. Resume and create-from-snapshot keep their baked env
@@ -1350,12 +1451,15 @@ proxies through the router.
 
 ```bash
 cyrus --env-file /secure/path/linear-app.env self-auth-linear
-# update linear_workspace_token + linear_workspace_refresh_token in tfvars,
-# then apply so the Key Vault secrets are updated:
-terraform -chdir=infra/azure/terraform apply -var-file=dev.tfvars
+# Deliberate Bicep rotation path: update all five Linear values in the protected
+# parameter file, temporarily set writeLinearSecrets=true, then:
+./scripts/deploy-azure.sh --allow-secret-writes
+./scripts/deploy-azure.sh --allow-secret-writes --apply
+# Immediately restore writeLinearSecrets=false and clear all five values.
 
-RG=$(terraform -chdir=infra/azure/terraform output -raw resource_group_name)
-APP=$(terraform -chdir=infra/azure/terraform output -raw router_app_name)
+OUT=$(az deployment sub show --name cyrus-cyrus-dev --query 'properties.outputs' -o json)
+RG=$(echo "$OUT" | jq -r .resourceGroupName.value)
+APP=$(echo "$OUT" | jq -r .routerAppName.value)
 
 az containerapp revision restart -g "$RG" -n "$APP" \
   --revision "$(az containerapp show -g "$RG" -n "$APP" \
@@ -1377,9 +1481,10 @@ repeat of the HTTP 400 refusal in the logs, means the credential is genuinely
 dead.
 
 The router stores each rotated token in the runtime-created Key Vault secret
-`cyrus-linear-refresh-<workspaceId>`. That secret is **not** managed by
-Terraform, so `terraform apply` never reverts it. Changing the seed in tfvars is
-what tells the router to abandon the stored chain and adopt the new credential.
+`cyrus-linear-refresh-<workspaceId>`. That secret is **not** declared by the
+template, so a deployment never reverts it. Changing the seed in the parameter
+file during an explicitly authorized write is what tells the router to abandon
+the stored chain and adopt the new credential.
 
 ### Entra enrollment
 
@@ -1388,20 +1493,20 @@ identity used for ACA data-plane calls. Follow
 [`docs/ROUTER.md`](../../docs/ROUTER.md#optional-entra-gated-enrollment): create
 one app registration per router deployment, use its Application ID URI as the
 exact audience, and authenticate operators/users with `az login`. Set
-`entra_tenant_id` and `entra_audience` together; optionally set
-`entra_allowed_domain`. Terraform maps these to the canonical
+`entraTenantId` and `entraAudience` together; optionally set
+`entraAllowedDomain`. The template maps these to the canonical
 `CYRUS_ROUTER_ENTRA_TENANT_ID`, `CYRUS_ROUTER_ENTRA_AUDIENCE`, and
 `CYRUS_ROUTER_ENTRA_ALLOWED_DOMAIN` environment variables.
 
 That **same** app registration is reused for `/setup` sign-in (§11) — one app,
-two audiences: the `api://<client-id>` Application ID URI in `entra_audience`
+two audiences: the `api://<client-id>` Application ID URI in `entraAudience`
 for `/enroll` **access** tokens, and the bare client-id GUID for the **ID**
 token the auth sidecar forwards. Do not mint a second app, and do not set
-`setup_ui_id_token_audience` to the `api://` form.
+`setupUiIdTokenAudience` to the `api://` form.
 
 ### Egress (D7 / M4)
 
-Default `aca_egress_default_action = "Deny"` + `trafficInspection = "Full"`.
+Default `acaEgressDefaultAction = 'Deny'` + `acaEgressTrafficInspection = 'Full'`.
 The router injects the full D7 allowlist per sandbox on create (router, GitHub
 + `*.github.com` + `*.githubusercontent.com`, `api.anthropic.com` AND
 `console.anthropic.com` (OAuth refresh — without it sessions 401 on first
@@ -1410,16 +1515,29 @@ WSS works through `Full`; blocked hosts fail fast with HTTP 403. **`Full`
 blocks non-HTTP TCP/UDP** → `git+ssh://` / SSH submodule URLs are unsupported —
 use HTTPS submodule URLs (documented v1 limitation).
 
-Leave `aca_egress_host_rules = null` to retain that provider-managed list and
-the dynamically appended router host. Setting explicit host rules replaces the
+Leave `acaEgressHostRules = []` to retain that provider-managed list and the
+dynamically appended router host. Setting explicit host rules replaces the
 provider defaults.
+
+### Custom domains
+
+`routerCustomDomains` is passed straight into
+`configuration.ingress.customDomains`. Certificate issuance and DNS validation
+happen out of band; supply the resulting certificate resource id per entry.
+
+The default `*.azurecontainerapps.io` FQDN is stable and fine for webhooks and
+WSS, so only enable this if you need a branded hostname. **Do not add a hostname
+with `az containerapp hostname add` and leave it out of the parameter file:** ARM
+owns the whole ingress object, so the next deployment removes any custom domain
+the template does not list.
 
 ### VNet / private endpoints
 
-Out of scope for v1. The Key Vault is created with `default_action = "Allow"`
-for dev ergonomics; tighten to your VNet/IP list in prod. The deferred VNet
-shape for the sandbox group lives in `bicep/sandbox-group-vnet.bicep`
-(reference only — not wired into Terraform).
+Out of scope for v1. The Key Vault is created with `networkAcls.defaultAction:
+'Allow'` for dev ergonomics; tighten to your VNet/IP list in prod. The deferred
+VNet shape for the sandbox group lives in
+`bicep/modules/sandbox-group-vnet.bicep` (reference only — not called by
+`main.bicep`).
 
 ### Terminal GC blind spots
 
@@ -1442,21 +1560,30 @@ router and worker images.
 ## Files
 
 ```
-terraform/
-  versions.tf     providers + terraform >=1.9
-  variables.tf    every variable (documented)
-  main.tf         RG, Log Analytics, KV, UAI, storage, CAE, RBAC, seed secrets
-  router.tf       router Container App + env + Files mount + custom domain flag
-  sandbox.tf      azapi_resource sandbox group + Data Owner RBAC + optional ACR
-  setup_ui.tf     /setup: staged EasyAuth (authConfigs + token store) AND the
-                  opt-in, then create-once Table/KEK/RBAC for per-user secrets — see §11
-  monitoring.tf   saved KQL searches + alert rules over the router's JSON logs
-  outputs.tf      paste-ready outputs (N8)
-  env/dev.tfvars.example  complete variable checklist
 bicep/
-  README.md                     reference shape; parity-gate usage
-  sandbox-group.bicep           canonical ARM shape (properties: {})
-  sandbox-group-rbac.bicep     Data Owner assignment for a principal
-  sandbox-group-vnet.bicep      optional vnetConnections child (deferred)
-  sandbox-group.bicepparam.example
+  README.md                       template layout, and where enforcement lives
+  main.bicep                      subscription scope: parameters, cross-parameter
+                                  validation, RG, module orchestration, outputs
+  main.bicepparam.example         complete parameter checklist
+  modules/
+    foundation.bicep              Log Analytics, Key Vault + opt-in secret writes,
+                                  router identity, storage + Files share + blob
+                                  containers + optional Table/KEK, Container Apps
+                                  environment + Files link, optional ACR, all RBAC
+    sandbox-group.bicep           sandboxGroups (properties: {}) + Data Owner
+                                  RBAC + the group identity's AcrPull
+    router-app.bicep              router Container App + env + Files mount +
+                                  readiness probe + optional custom domains
+    router-auth.bicep             authConfigs child (stage 1 of /setup)
+    monitoring.bicep              saved KQL searches + alert rules
+    sandbox-group-vnet.bicep      optional vnetConnections child (deferred)
+```
+
+Deploy and check scripts:
+
+```
+scripts/deploy-azure.sh           what-if / deploy, image-pin, secret-write and stage-2 gates
+scripts/deploy-router-image.sh    build router image into ACR, repin, what-if
+scripts/deploy-router-image.test.sh   covers the repin rewrite and the pin gate
+scripts/check-bicep.sh            compile every template; warnings are failures
 ```

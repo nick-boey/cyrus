@@ -484,6 +484,31 @@ The agent automatically moves issues to the "started" state when assigned. Linea
    - The teardown callback is durable on both sides. Device: `TeardownCallbackQueue` records the intent (plus its idempotency key) to `~/.cyrus/router-client/teardown-callbacks.jsonl` **synchronously, before the first `await` of `handleIssueStateChangeMessage`** — that is what puts the write inside the window where `RouterConnection`'s inbox entry is still unprocessed, so a kill anywhere in the sequence replays instead of losing the callback. It replays on the connection's `"connected"` event and retries the same key with backoff. Router: `TerminalTeardown` mirrors each pending teardown into the `container_teardowns` table so the out-of-process `router containers list` can render its `TEARDOWN` column; that mirror is observability + retry accounting, NOT a restart journal, and is cleared on construction to match the coordinator's empty in-memory state. Re-delivered callbacks log as `callback retry`, distinct from `grace expiry`.
    - `ContainerTargets.inFlightBoots` joins a concurrent boot **only as a dedup of overlapping `ensureRunning`/`mintDeviceToken` work — never as evidence the container ended up running**. The joined attempt may predate the event the joiner is reacting to (classically: the idle sweep parked the container while it was still starting), so after joining, re-check `executor.status()` and boot for real if it is not running. Getting this wrong silently swallows a terminal-teardown wake, and only the grace deadline then reclaims the container. An attempt in flight past `BOOT_JOIN_TIMEOUT_MS` is abandoned rather than joined, so a hung provider call cannot permanently disable booting for a device. Every `AcaSandboxClient` request also carries a `requestTimeoutMs` deadline (default 120s) because Node's `fetch` has none, and an unbounded call blocks the provider mutex and the boot slot behind it.
    - Before Azure stack deletion, destroy managed sandboxes and sweep snapshots before destroying the sandbox group. Keep the operator Blob role for corrupt-backup break glass. See `infra/azure/README.md` and `docs/ROUTER.md`.
+   - **The Azure deployment is Bicep (`infra/azure/bicep`), applied with
+     `scripts/deploy-azure.sh`. There is no Terraform and no state file.** Three
+     consequences bind anything you change there:
+     1. **Incremental only.** ARM never deletes a resource that leaves the
+        template, which is what lets the per-user secret store's Table and KEK
+        outlive `enableSetupSecretStore` instead of needing `prevent_destroy`.
+        `--mode Complete` would delete the KEK that unwraps every stored
+        per-user secret; `deploy-azure.sh` does not offer it and nothing should.
+     2. **Two guarantees live in the deploy script, not the template**, because
+        ARM cannot express them: the character-level half of the immutable
+        image-tag policy (no regex engine), and the `/setup` stage-1-before-
+        stage-2 ordering gate (no plan phase, so no equivalent of Terraform's
+        "read the deployed authConfigs child" data source — the script asks
+        `az containerapp auth show` instead). Both are bypassed by calling
+        `az deployment` directly. Anything that changes those rules must change
+        `scripts/deploy-azure.sh`, not only the template.
+     3. **Cross-parameter invariants use the `parameterGuard` idiom** in
+        `main.bicep` — a violation text used as an object key ARM cannot
+        resolve — and the guard is folded into `defaultTags` so it is
+        guaranteed to be evaluated. Do not "simplify" it out of the tags, and do
+        not replace it with `assert`: assertions require an experimental feature
+        flag and emit `languageVersion: 2.1-experimental`.
+     Run `./scripts/check-bicep.sh` after any template change; it compiles every
+     template, type-checks `main.bicepparam.example` against `main.bicep`, and
+     treats warnings as failures.
    - Repository selection for **container** targets happens on the **router**,
      in `EventRouter.routeCreated`, before any device row or sandbox exists.
      The decision is persisted in `issue_repositories` and is what
@@ -541,7 +566,7 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      `packages/core`: it is depended on by every runner and the CLI, so the cost
      lands on upstream installs that never export anything.
    - **OTLP records land in `AppTraces`, NOT `ContainerAppConsoleLogs_CL`.**
-     Every saved search and alert rule in `infra/azure/terraform/monitoring.tf`
+     Every saved search and alert rule in `infra/azure/bicep/modules/monitoring.bicep`
      reads the console table and is blind to OTLP records. `service.name` becomes
      `AppRoleName`, `service.instance.id` becomes `AppRoleInstance`, everything
      else is a key in `Properties`. The Application Insights component must be

@@ -29,7 +29,7 @@ through it automatically:
 The router/client modes are documented in [ROUTER.md](./ROUTER.md). The rest of
 this guide covers **standalone**.
 
-For the Azure option, use the maintained Terraform stack and operator runbook in
+For the Azure option, use the maintained Bicep stack and operator runbook in
 [`infra/azure/README.md`](../infra/azure/README.md), then read
 [Azure hosting and ACA Sandboxes](./ROUTER.md#azure-hosting-and-aca-sandboxes).
 It requires a published worker image registered as an ACA disk image, Azure

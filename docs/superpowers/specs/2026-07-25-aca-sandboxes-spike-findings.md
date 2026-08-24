@@ -2,8 +2,8 @@
 
 > Companion to `docs/superpowers/plans/2026-07-25-container-executors-azure-aca-sandboxes.md`.
 > **Run date:** 2026-07-26
-> **Environment:** subscription `dit-development` (`<subscription-id>`),
-> tenant `c9857cc6-…` (Northrop), resource group `<resource-group>-aca-spike`, region **australiaeast**,
+> **Environment:** subscription `<subscription>` (`<subscription-id>`),
+> tenant `<tenant-id>`, resource group `<resource-group>-aca-spike`, region **australiaeast**,
 > sandbox group `cyrus-spike-grp`.
 > **Cost posture:** all sandboxes, snapshots and disk images created during the spike were
 > deleted at the end of the run. Only the (compute-free) sandbox group remains.
@@ -525,7 +525,7 @@ exact issue key. A defensive length guard (truncate/reject >63) is the only vali
 
 ## S7 — Region availability — PASS
 
-`Microsoft.App` is **Registered** in `dit-development`; `sandboxGroups` and
+`Microsoft.App` is **Registered** in the target subscription; `sandboxGroups` and
 `sandboxGroups/vnetConnections` both advertise api-version `2026-02-01-preview` only.
 
 **35 regions** are supported — far beyond the eastus2/westus2/westus3 doc examples. Notably

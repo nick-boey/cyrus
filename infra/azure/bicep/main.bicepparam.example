@@ -1,0 +1,254 @@
+////////////////////////////////////////////////////////////////////////////////
+// main.bicepparam.example — copy to main.bicepparam and fill in.
+// A routine deployment keeps every secret value empty. Bootstrap/rotation may
+// temporarily put Linear or /setup secrets here; never commit that populated
+// file to the public repository. `.gitignore` covers `*.bicepparam` and
+// un-ignores `*.bicepparam.example`.
+//
+// Every parameter is documented on its @description in main.bicep; this file
+// lists each one with a sample or placeholder so a fresh operator has a complete
+// checklist.
+//
+// Deploy with:
+//   ./scripts/deploy-azure.sh                       # preferred
+//   az deployment sub create --location <region> \
+//     --template-file infra/azure/bicep/main.bicep \
+//     --parameters infra/azure/bicep/main.bicepparam
+////////////////////////////////////////////////////////////////////////////////
+
+using 'main.bicep'
+
+// ---- Project / naming -------------------------------------------------------
+param project = 'cyrus'
+param environment = 'dev'
+// Empty means rg-<project>-<environment>.
+param resourceGroupName = ''
+param tags = {
+  owner: 'platform'
+  'cost-center': 'research'
+}
+
+// ---- Location — REQUIRED, no default ----------------------------------------
+// Spike S7: ACA sandbox groups are supported in 35 regions; australiaeast is the
+// verified one for this tenant. An unsupported region fails at sandbox-group
+// create, not at template validation.
+param location = 'australiaeast'
+
+// ---- Container images -------------------------------------------------------
+// BOTH image refs MUST be immutable: a digest (`@sha256:<64 hex>`), a release tag
+// (`v1.2.3`), or a git-SHA tag (`sha-a1b2c3d`). The template REJECTS mutable tags
+// (`:latest`, `:deploy`, branch or ad-hoc hotfix tags) — a floating tag means the
+// next deployment can silently redeploy a DIFFERENT (possibly older) build while
+// ARM sees an unchanged container spec. See README → "Router image tag policy".
+//
+// Both placeholders below are deliberately SHAPE-VALID but fake, so a staged
+// first deployment passes validation. Replace them with real refs before the
+// full deployment.
+param routerImage = 'ghcr.io/ceedaragents/cyrus-router:sha-0000000'
+
+// NOT pulled by the router. Register it as a group disk image OUT OF BAND after
+// the first deployment:
+//   aca sandboxgroup disk create --image <workerImage> --name <acaDiskName> \
+//     --resource-group <rg> --sandbox-group <sandboxGroupName>
+// Immutable here too — the disk image is registered out of band, so a floating
+// tag leaves no way to tell which build a registered disk was cut from.
+param workerImage = 'ghcr.io/ceedaragents/cyrus-worker:sha-0000000'
+
+// ESCAPE HATCH, leave false. Setting it true re-permits `:latest`/`:deploy`/branch
+// tags above and forfeits the guarantee that a deployment ships the build you
+// tested. Throwaway stacks only.
+param allowMutableImageTags = false
+
+// Leave EMPTY. The router's WSS URL is derived from the Container Apps
+// environment's defaultDomain, which is a separate resource from the app — so
+// unlike the Terraform stack this needs no second apply. Set it only to point
+// containers at a custom domain or a proxy in front of the app.
+param routerUrlForContainers = ''
+
+// The disk image NAME the group knows the worker image by. Must match the
+// `--name` passed to `aca sandboxgroup disk create`.
+param acaDiskName = 'cyrus-worker'
+
+// ---- ACA per-sandbox compute defaults ---------------------------------------
+// These are PASSED TO THE ROUTER CONFIG (CYRUS_ROUTER_CONTAINERS_JSON), NOT to
+// the ARM sandboxGroups resource — that resource accepts `properties: {}` only.
+// See README → "maxSandboxCount does NOT exist as a cost guard".
+param acaCpu = '4000m' // XL tier; most expensive — set consciously.
+param acaMemory = '8192Mi'
+
+// The router's affinity-aware idle controller, in milliseconds.
+param idleStopMs = 300000
+
+// 0 = DISABLED (spike N5/F2: ACA-side suspend has no session-affinity gate and
+// can freeze a live session mid-task). Leave this at 0.
+param acaAutoSuspendSeconds = 0
+
+// Deny-by-default egress (D7). The router injects the full D7 allowlist on each
+// sandbox create. 'Allow' disables the wall for isolated test sandboxes.
+param acaEgressDefaultAction = 'Deny'
+param acaEgressTrafficInspection = 'Full'
+// Leave EMPTY to retain the provider's complete built-in allowlist and the
+// dynamically appended router WSS host. A non-empty list replaces it entirely.
+param acaEgressHostRules = []
+
+// Retention for the explicit per-issue labeled snapshots the provider prunes on
+// the create path. Snapshots are NEVER GC'd by Azure — keep this modest.
+param acaKeepSnapshots = 2
+
+// How long an ACA worker may stay disconnected from router WSS before
+// ensureRunning replaces it.
+param acaDisconnectedRecreateMs = 120000
+
+// ---- Linear secret bootstrap/rotation ---------------------------------------
+// Real organization UUID from `cyrus self-auth-linear`; do not use the slug.
+param linearWorkspaceId = '00000000-0000-0000-0000-000000000000'
+
+// STEADY STATE: leave the write flag false and all five values empty. The router
+// references existing versionless Key Vault secrets; routine deployments never
+// receive or overwrite their values.
+//
+// FIRST BOOTSTRAP / COORDINATED ROTATION ONLY: set writeLinearSecrets=true,
+// populate all five values from your password manager, and invoke
+// `scripts/deploy-azure.sh --allow-secret-writes`. Immediately restore false and
+// clear the values after the successful write.
+param writeLinearSecrets = false
+param linearWorkspaceToken = '' // '<linear-workspace-api-token>'
+param linearWorkspaceRefreshToken = '' // '<linear-workspace-refresh-token>'
+// HMAC secret — generate with `openssl rand -hex 32` and paste the SAME value
+// into Linear's webhook subscription UI.
+param linearWebhookSecret = '' // '<openssl-rand-hex-32>'
+param linearClientId = '' // '<linear-oauth-client-id>'
+param linearClientSecret = '' // '<linear-oauth-client-secret>'
+
+// ---- RBAC -------------------------------------------------------------------
+// Bicep cannot resolve a role definition by display name, so the GUID is the
+// primary path. Spike S6 verified this value in-tenant. Confirm in yours with
+//   az role definition list --name "Container Apps SandboxGroup Data Owner" \
+//     --query "[].name" -o tsv
+param sandboxGroupDataOwnerRoleId = 'c24cf47c-5077-412d-a19c-45202126392c'
+
+// Operator break-glass principal (Entra object id). Without this, an operator
+// cannot delete a corrupt router.db blob (M2). Empty in pure-CI envs.
+param operatorPrincipalId = ''
+
+// ---- Cyrus repositories -----------------------------------------------------
+// Passed VERBATIM into CYRUS_ROUTER_CONTAINERS_JSON.repositories, so this is the
+// router's own repository shape (camelCase), not a re-mapped subset. Optional
+// per-entry keys: baseBranch, projectKeys, teamKeys.
+param cyrusRepositories = [
+  {
+    name: 'cyrus-containers'
+    githubSlug: 'ceedaragents/cyrus-containers'
+    linearWorkspaceId: '00000000-0000-0000-0000-000000000000'
+    baseBranch: 'main'
+  }
+]
+
+// ---- Optional feature flags -------------------------------------------------
+param enableAcr = false
+
+// Custom domains bound to the router ingress, e.g.
+//   [{ name: 'router.example.com', certificateId: '<managed-cert-resource-id>',
+//      bindingType: 'SniEnabled' }]
+// ARM owns the whole ingress object, so a hostname added out of band with
+// `az containerapp hostname add` is REMOVED by the next deployment — list it here.
+param routerCustomDomains = []
+
+// Set tenant + audience together to enable Entra-gated enrollment. The audience
+// is the app registration's exact Application ID URI (for example api://...).
+param entraTenantId = ''
+param entraAudience = ''
+param entraAllowedDomain = ''
+
+// ---- Setup management UI (/setup) — STAGED, see README §11 ------------------
+// TWO SEPARATE DEPLOYMENTS with a live verification gate between them.
+// `authConfigs` is a child of the Container App, so a single flag would
+// necessarily publish the revision serving /setup BEFORE the auth sidecar exists.
+//
+//   Deploy 1: enableSetupAuth = true   (routes still 404)
+//   GATE:     README §11 step 5 — machine routes + sign-in, then attest below
+//   Deploy 2: enableSetupUi   = true   (routes exist)
+// Rollback reverses the order.
+//
+// scripts/deploy-azure.sh refuses deploy 2 until `az containerapp auth show`
+// reports a live auth child on the router app. Setting both flags in one edit and
+// running the script fails there; running `az deployment` by hand bypasses that
+// check, so don't.
+param enableSetupAuth = false
+param enableSetupUi = false
+
+// Required when enableSetupAuth = true. Reuse the EXISTING router app
+// registration — one app registration/audience per router deployment.
+param setupUiClientId = '' // bare client-id GUID
+
+// STEADY STATE: leave this write flag false and the three values below empty.
+// STAGE-1 BOOTSTRAP / COORDINATED RENEWAL ONLY: set it true, populate the client
+// secret and static SAS window, then pass --allow-secret-writes. Restore false
+// and clear the values immediately afterwards.
+param writeSetupAuthSecrets = false
+param setupUiClientSecret = '' // SENSITIVE — `az ad app credential reset`, shown once
+
+// Required only when writeSetupAuthSecrets=true. Static RFC 3339 window for the
+// ACA token-store SAS. EXPIRY IS A LIVE FAILURE DEADLINE — diarise the protected
+// manual renewal.
+param setupUiTokenStoreSasStart = '' // '2026-01-01T00:00:00Z'
+param setupUiTokenStoreSasExpiry = '' // '2027-01-01T00:00:00Z'
+
+// ATTESTATION, not a switch. Set true only after deploying stage 1 ALONE and
+// passing the README §11 step 5 behavioural checks against the live app: machine
+// routes do not 302 to /.auth, and sign-in works while /setup still 404s.
+param setupAuthStage1Verified = false
+
+// 'entra-token' is the ONLY value this stack accepts. It verifies the forwarded
+// ID token cryptographically and ignores X-MS-CLIENT-PRINCIPAL-* entirely.
+param setupUiAuthMode = 'entra-token'
+param setupUiIdTokenAudience = '' // defaults to setupUiClientId; NOT the api:// URI
+
+// Optional in-router domain allowlist. Defence in depth only — it cannot tell an
+// assigned teammate from any other account in the same tenant.
+param setupUiAllowedDomain = '' // 'example.com'
+
+// Auto-provisioning is OFF by default and the template REFUSES to enable it
+// without a membership gate: populate an allowedPrincipals list below, or run the
+// Entra assignment commands in README §11 step 3 and attest to them.
+param setupUiAutoProvisionUsers = false
+param setupUiAllowedGroupObjectIds = []
+param setupUiAllowedPrincipalObjectIds = []
+param setupUiAssignmentRequiredVerified = false
+
+// ---- Per-user secret storage backend ----------------------------------------
+// TWO FLAGS, and they are not interchangeable.
+//
+// enableSetupSecretStore CREATES the Azure Table, the envelope-encryption KEK and
+// the router's Storage Table Data Contributor + Key Vault Crypto User roles. It is
+// FALSE by default so a stack wanting none of this creates nothing. Clearing it
+// later does NOT delete the Table or the KEK: ARM incremental deployments never
+// delete a resource that leaves the template, so the data and the key survive and
+// can be re-adopted. (The corollary: never deploy with `--mode Complete`.)
+param enableSetupSecretStore = false
+
+// enableSetupTableBackend SELECTS that Table as the router's secret backend. This
+// is the reversible control and the rollback path: clearing it drops the router
+// back to Key Vault on the next revision, with no deletion and no data loss.
+// Requires enableSetupSecretStore. Enable only AFTER `cyrus router secrets
+// migrate` has run and been verified.
+param enableSetupTableBackend = false
+
+// Provider inherited by users whose stored executor is the explicit
+// {"type":"default"} sentinel. EMPTY omits the field entirely and leaves the
+// rendered router config — and therefore the running revision — untouched. Set
+// 'aca' to opt in. Even then, a null/absent stored executor still means "physical
+// device" and is never captured by this, so nobody silently moves to ACA.
+param routerDefaultExecutor = ''
+
+// ---- Monitoring -------------------------------------------------------------
+// Empty receivers still creates the rules and still records fired alerts in Azure
+// Monitor — it just emails nobody.
+param alertEmailReceivers = []
+param sandboxUptimeAlertHours = 6
+param enableMonitoringAlerts = true
+
+// Additive structured OTLP export into AppTraces in the same Log Analytics
+// workspace. Disable to omit Application Insights and its router env/secret.
+param enableOtelLogs = true
+param otelLogsLevel = 'INFO'

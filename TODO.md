@@ -41,9 +41,9 @@ A `webhook_claims` table plus `RouterStore.claimWebhookEvent` — one
 `INSERT OR IGNORE` inside an immediate transaction, arbitrated by the PRIMARY KEY,
 never a read-then-write. `EventRouter.route()` claims before any dispatch, so no
 queue row, issue lock, activity, or MCP mutation can happen twice for one
-delivery. Bounded retention sweep rides the existing 60s tick. Terraform already
-had `revision_mode = "Single"` and one replica; a `/healthz` readiness probe was
-added so ingress cannot shift before the router has opened SQLite.
+delivery. Bounded retention sweep rides the existing 60s tick. The deployment
+already had single-revision mode and one replica; a `/healthz` readiness probe
+was added so ingress cannot shift before the router has opened SQLite.
 
 Linear's payload carries no delivery id — verified against the SDK's generated
 types, it lives in an HTTP header the transport never surfaces — so the key is
@@ -133,24 +133,32 @@ Correction found while verifying against the code: `EdgeWorker.resolveGitHubToke
 reads `GITHUB_TOKEN` only. `GH_TOKEN` is exclusively a router/container credential
 consumed by `ContainerBootCommand`.
 
-### 7. Reconcile the emergency router image with Terraform
+### 7. Reconcile the emergency router image with the deployment
 
 **Status:** fixed in config and docs; **the image publish remains a manual
-operator step.** **Priority:** was high before the next apply.
+operator step.** **Priority:** was high before the next deployment.
 
-`router_image`/`worker_image` now validate as a digest, release tag, or git-SHA
-tag, with `allow_mutable_image_tags` as a deliberate escape hatch that shows up in
-the tfvars diff. A positive allowlist, not a blocklist — a blocklist would have
-missed `deploy-aca-disk-fix`. Terraform state records the tag *string*, so a
-re-pointed mutable tag produces no plan diff while the deployed bits change, which
-is exactly how `:deploy-aca-disk-fix` and `:deploy` diverged.
+`routerImage`/`workerImage` now validate as a digest, release tag, or `sha-`
+git-SHA tag, with `allowMutableImageTags` as a deliberate escape hatch that shows
+up in the parameter-file diff. A positive allowlist, not a blocklist — a
+blocklist would have missed `deploy-aca-disk-fix`. ARM compares the container
+spec it is given against the spec on the resource, so a re-pointed mutable tag
+produces no change list while the deployed bits change, which is exactly how
+`:deploy-aca-disk-fix` and `:deploy` diverged.
 
-**Before the next apply, an operator must:** build and push an immutable tag from
-the commit carrying the private-disk fix, then set `router_image` to it. Otherwise
-the next apply fails validation — which is the intended fail-loud. Identifying
-which commit `:deploy-aca-disk-fix` was built from needs access to the live
-environment. `terraform fmt -check` and `terraform validate` have not been run
-(no toolchain here) and still should be.
+The check is split across two layers now that the stack is Bicep: `main.bicep`
+enforces the ref *shape* (ARM has no regex engine) and
+`scripts/deploy-azure.sh` applies the full character-level regex. See
+`infra/azure/bicep/README.md` → "Where enforcement lives".
+
+**Before the next deployment, an operator must:** build and push an immutable tag
+from the commit carrying the private-disk fix, then set `routerImage` to it.
+Otherwise the deployment fails validation — which is the intended fail-loud.
+Identifying which commit `:deploy-aca-disk-fix` was built from needs access to
+the live environment. `./scripts/check-bicep.sh` compiles every template and
+type-checks the parameter checklist and runs in CI; `az deployment sub what-if`
+against the live subscription has not been run (no Azure credential here) and
+still should be, before the next apply.
 
 ### Completed during the drive: private ACA disk IDs
 
