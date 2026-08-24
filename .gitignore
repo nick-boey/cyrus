@@ -50,33 +50,22 @@ CLAUDE.local.md
 
 docker/router/.env
 
-# Terraform local state and sensitive variable files
-**/.terraform/
-*.tfstate
-*.tfstate.*
-*.tfvars
-!*.tfvars.example
+# Bicep parameter files. These hold the Linear client secret and both OAuth
+# tokens in plaintext, exactly as the Terraform tfvars they replace did. Only the
+# committed `.example` checklist is tracked.
+*.bicepparam
+!*.bicepparam.example
 # scripts/deploy-router-image.sh stages its rewrite in a mode-600 temp file
-# beside dev.tfvars. `*.tfvars` above does not match a name with a suffix after
-# `.tfvars`, and BSD mktemp only substitutes a TRAILING run of X's, so the temp
-# name cannot both be unique and end in `.tfvars`. Ignore the prefix instead:
-# a SIGKILL mid-rewrite leaves behind the client secret and both OAuth tokens.
-*.tfvars.tmp.*
-# Partial backend config (`terraform init -backend-config=…`). A backend block
-# cannot take variables, so the state account name would otherwise be a literal
-# in versions.tf — and environment identifiers were deliberately scrubbed from
-# this public repo in 44665f32. These files carry no credential (the backend
-# authenticates via AAD, `use_azuread_auth = true`), only identifiers.
-backend*.hcl
-!backend*.hcl.example
-# Saved plan files. A plan embeds sensitive values in PLAINTEXT regardless of
-# `sensitive = true` — that only redacts CLI output — so a committed plan leaks
-# the Linear client secret and both OAuth tokens exactly as state would. Bare
-# `tfplan` alone is too narrow: `-out=` takes any name, and `tfplan.bin` /
-# `plan.out` are common enough that one of them will get used.
-tfplan*
-*.tfplan
-plan.out
+# beside main.bicepparam. `*.bicepparam` above does not match a name with a
+# suffix after `.bicepparam`, and BSD mktemp only substitutes a TRAILING run of
+# X's, so the temp name cannot both be unique and end in `.bicepparam`. Ignore
+# the prefix instead: a SIGKILL mid-rewrite leaves behind the client secret and
+# both OAuth tokens.
+*.bicepparam.tmp.*
+# Compiled ARM output. `bicep build` writes <name>.json beside the template by
+# default; it embeds nothing secret, but it is a build artifact and a committed
+# copy immediately goes stale against the .bicep it came from.
+infra/azure/bicep/**/*.json
 
 # Claude worktrees
 .claude/worktrees

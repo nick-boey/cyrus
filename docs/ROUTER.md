@@ -471,16 +471,21 @@ Azure Container Apps (ACA) Sandbox per issue. Set the executor with:
 cyrus router users set-executor alice@example.com aca
 ```
 
+The deployment is Bicep, at `infra/azure/bicep`, applied with
+`scripts/deploy-azure.sh`. It is stateless: there is no state file, and
+`az deployment sub what-if` reads the real resources rather than a recorded
+belief about them.
+
 Both the router and worker image refs must be pinned to an **immutable**
 reference — a digest, a release tag (`v1.2.3`), or a git-SHA tag
-(`sha-a1b2c3d`). Terraform rejects mutable tags such as `:latest` or `:deploy`:
-a floating tag leaves the tag string in state unchanged while the registry
-re-points it, so a later unrelated `terraform apply` can silently roll the router
-backwards onto an older build. See
-[Router image tag policy](../infra/azure/README.md#router-image-tag-policy) for
-the build/push/pin runbook and for reconciling a hand-patched Container App.
+(`sha-a1b2c3d`). The template rejects mutable tags such as `:latest` or
+`:deploy`: an unchanged tag string is an unchanged deployment as far as ARM is
+concerned, while the registry re-points that tag at different bits, so a later
+unrelated deployment can silently roll the router backwards onto an older build.
+See [Router image tag policy](../infra/azure/README.md#router-image-tag-policy)
+for the build/push/pin runbook and for reconciling a hand-patched Container App.
 
-The Terraform stack produces the complete `containers` configuration. Its ACA
+The Bicep stack produces the complete `containers` configuration. Its ACA
 provider needs a pre-registered worker disk image and these provider fields:
 
 ```json
@@ -723,10 +728,11 @@ Router restart during the in-memory teardown grace also loses that immediate
 callback registration; idle-stop and stale GC still bound it.
 
 Before deleting Azure infrastructure, follow the ordered sweep in
-[`infra/azure/README.md`](../infra/azure/README.md#teardown-m5): destroy all
+[`infra/azure/README.md`](../infra/azure/README.md#teardown): destroy all
 router-managed containers, delete leftover data-plane snapshots (and optional
-disk images), then run `terraform destroy`. Terraform does not own those
-data-plane children.
+disk images), export the per-user secret store if it was ever enabled, and only
+then `az group delete`. The Bicep stack owns the ARM sandbox group but none of
+its data-plane children.
 
 ---
 
@@ -880,7 +886,7 @@ to the config it starts with. `cyrus router secrets set/list/unset` keep
 working against whichever backend is active, and remain the break-glass path
 when the UI itself is unreachable.
 
-For the full staged Terraform rollout — the two-apply sequence, the live
+For the full staged rollout — the two-deployment sequence, the live
 verification gate in between, and how to decommission the Table and its
 encryption key safely — see
 ["Optional: the setup management UI (`/setup`)"](../infra/azure/README.md#11-optional-the-setup-management-ui-setup)
