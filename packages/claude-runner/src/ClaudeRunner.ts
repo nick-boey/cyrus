@@ -27,7 +27,9 @@ import type {
 	LiveBackgroundTask,
 } from "cyrus-core";
 import {
+	CYRUS_EVENTS,
 	createLogger,
+	cyrusAttributes,
 	type IAgentRunner,
 	type ILogger,
 	LogLevel,
@@ -213,7 +215,12 @@ function buildSanitizedQueryOptions(
 function flattenSanitizedQueryOptions(
 	sanitized: SanitizedQueryOptions,
 ): Record<string, string | number | boolean | null | undefined> {
-	const ATTR_PREFIX = "cqo.";
+	// Already fully namespaced, so `cyrusAttributes` (which treats any key
+	// containing a `.` as pre-namespaced) leaves these alone rather than
+	// producing `cyrus.cqo.…` from a bare `cqo.…`. `cqo.` on its own would
+	// escape the `cyrus.*` namespace entirely — it is not a convention anyone
+	// else owns, so it belongs underneath ours.
+	const ATTR_PREFIX = "cyrus.cqo.";
 	const out: Record<string, string | number | boolean | null | undefined> = {};
 	for (const [key, value] of Object.entries(sanitized)) {
 		const attrKey = `${ATTR_PREFIX}${key}`;
@@ -491,12 +498,15 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 		this.liveBackgroundTasks.clear();
 
 		const isResumed = !!this.config.resumeSessionId;
-		this.logger.event(isResumed ? "session_resumed" : "session_started", {
-			resumeSessionId: this.config.resumeSessionId,
-			workingDirectory: this.config.workingDirectory,
-			model: this.config.model,
-			fallbackModel: this.config.fallbackModel,
-		});
+		this.logger.event(
+			isResumed ? CYRUS_EVENTS.sessionResumed : CYRUS_EVENTS.sessionStarted,
+			cyrusAttributes({
+				resume_session_id: this.config.resumeSessionId,
+				working_directory: this.config.workingDirectory,
+				model: this.config.model,
+				fallback_model: this.config.fallbackModel,
+			}),
+		);
 		this.logger.debug("Working directory:", this.config.workingDirectory);
 
 		// Ensure working directory exists
@@ -787,7 +797,10 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			const flat = flattenSanitizedQueryOptions(
 				buildSanitizedQueryOptions(queryOptions),
 			);
-			this.logger.event("claude_query_options", flat);
+			this.logger.event(
+				CYRUS_EVENTS.sessionQueryOptions,
+				cyrusAttributes(flat),
+			);
 
 			// Process messages from the query
 			// Use pre-warmed session if available (eliminates cold-start subprocess spawn cost).
@@ -808,9 +821,10 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 				// Extract session ID from first message if we don't have one yet
 				if (!this.sessionInfo.sessionId && message.session_id) {
 					this.sessionInfo.sessionId = message.session_id;
-					this.logger.event("claude_session_id_assigned", {
-						claudeSessionId: message.session_id,
-					});
+					this.logger.event(
+						CYRUS_EVENTS.sessionAgentIdAssigned,
+						cyrusAttributes({ agent_session_id: message.session_id }),
+					);
 
 					// Update streaming prompt with session ID if it exists
 					if (this.streamingPrompt) {
@@ -843,10 +857,13 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 				// follow-up messages so the SDK session can be reused. Otherwise we
 				// complete the streaming prompt on result so the for-await loop exits
 				// and the subprocess can shut down (pre-warm-sessions behavior).
-				this.logger.event("message_emitted", {
-					messageType: message.type,
-					claudeSessionId: this.sessionInfo?.sessionId,
-				});
+				this.logger.event(
+					CYRUS_EVENTS.sessionMessageEmitted,
+					cyrusAttributes({
+						message_type: message.type,
+						agent_session_id: this.sessionInfo?.sessionId,
+					}),
+				);
 				this.emit("message", message);
 				this.recordLiveBackgroundTasks(message);
 				this.processMessage(message);
@@ -866,11 +883,15 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					// prompt here. Error results always complete: pending-work
 					// state may be stale when a turn dies mid-flight.
 					if (message.subtype === "success" && this.hasPendingWork()) {
-						this.logger.event("session_held_open_for_pending_work", {
-							sessionCronCount: this.pendingSessionCrons.length,
-							backgroundTaskCount: this.pendingBackgroundTasks.length,
-							claudeSessionId: this.sessionInfo?.sessionId,
-						});
+						this.logger.event(
+							CYRUS_EVENTS.sessionHeldOpen,
+							cyrusAttributes({
+								reason: "pending_work",
+								session_cron_count: this.pendingSessionCrons.length,
+								background_task_count: this.pendingBackgroundTasks.length,
+								agent_session_id: this.sessionInfo?.sessionId,
+							}),
+						);
 					} else {
 						this.streamingPrompt.complete();
 					}
@@ -881,10 +902,13 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 
 			// Session completed successfully - mark as not running BEFORE emitting result
 			// This ensures any code checking isRunning() during result processing sees the correct state
-			this.logger.event("session_completed", {
-				messageCount: this.messages.length,
-				claudeSessionId: this.sessionInfo?.sessionId,
-			});
+			this.logger.event(
+				CYRUS_EVENTS.sessionCompleted,
+				cyrusAttributes({
+					message_count: this.messages.length,
+					agent_session_id: this.sessionInfo?.sessionId,
+				}),
+			);
 			this.sessionInfo.isRunning = false;
 
 			// Emit deferred result message after marking isRunning = false
@@ -916,15 +940,21 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 
 			if (isAbortError) {
 				// User-initiated stop - log at info level, not error
-				this.logger.event("session_stopped", {
-					reason: "user_abort",
-					claudeSessionId: this.sessionInfo?.sessionId,
-				});
+				this.logger.event(
+					CYRUS_EVENTS.sessionStopped,
+					cyrusAttributes({
+						reason: "user_abort",
+						agent_session_id: this.sessionInfo?.sessionId,
+					}),
+				);
 			} else if (isSigterm) {
-				this.logger.event("session_stopped", {
-					reason: "sigterm",
-					claudeSessionId: this.sessionInfo?.sessionId,
-				});
+				this.logger.event(
+					CYRUS_EVENTS.sessionStopped,
+					cyrusAttributes({
+						reason: "sigterm",
+						agent_session_id: this.sessionInfo?.sessionId,
+					}),
+				);
 			} else {
 				// Actual error - log and emit
 				this.logger.error("Session error:", error);
@@ -1076,10 +1106,13 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 				},
 			]),
 		);
-		this.logger.event("live_background_tasks_changed", {
-			liveBackgroundTaskCount: this.liveBackgroundTasks.size,
-			claudeSessionId: this.sessionInfo?.sessionId,
-		});
+		this.logger.event(
+			CYRUS_EVENTS.sessionBackgroundTasksChanged,
+			cyrusAttributes({
+				live_background_task_count: this.liveBackgroundTasks.size,
+				agent_session_id: this.sessionInfo?.sessionId,
+			}),
+		);
 	}
 
 	/**
@@ -1116,11 +1149,14 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					this.pendingSessionCrons = stopInput.session_crons ?? [];
 					this.pendingBackgroundTasks = stopInput.background_tasks ?? [];
 					if (this.hasPendingWork()) {
-						this.logger.event("pending_work_recorded", {
-							sessionCronCount: this.pendingSessionCrons.length,
-							backgroundTaskCount: this.pendingBackgroundTasks.length,
-							claudeSessionId: this.sessionInfo?.sessionId,
-						});
+						this.logger.event(
+							CYRUS_EVENTS.sessionPendingWorkRecorded,
+							cyrusAttributes({
+								session_cron_count: this.pendingSessionCrons.length,
+								background_task_count: this.pendingBackgroundTasks.length,
+								agent_session_id: this.sessionInfo?.sessionId,
+							}),
+						);
 					}
 					return {};
 				},
@@ -1138,9 +1174,10 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	 */
 	stop(): void {
 		if (this.abortController) {
-			this.logger.event("session_stop_requested", {
-				claudeSessionId: this.sessionInfo?.sessionId,
-			});
+			this.logger.event(
+				CYRUS_EVENTS.sessionStopRequested,
+				cyrusAttributes({ agent_session_id: this.sessionInfo?.sessionId }),
+			);
 			this.abortController.abort();
 			this.abortController = null;
 		}

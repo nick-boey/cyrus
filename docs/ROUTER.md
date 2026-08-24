@@ -293,6 +293,35 @@ attributes the JSON console format emits (`component`, `sessionId`,
 `issueIdentifier`, `repository`, `event`, `args`), under the same key names, so
 existing queries transfer.
 
+**Errors carry exception semconv.** Any log call handed an `Error` — at any
+level, so `logger.warn("retrying", err)` counts — emits `exception.type`,
+`exception.message` and `exception.stacktrace`. Those three are STABLE OTel
+semconv and describe nothing Cyrus-specific, which is why they are the one place
+the sink uses standard names rather than Cyrus-native ones: a backend that
+special-cases them renders the record as an exception rather than a line of
+text. The stacktrace includes any `cause` chain, appended as `Caused by:` blocks
+— a transport that wraps `ECONNREFUSED` in `new Error("failed to send", {
+cause })` has an outer stack that points only at our own retry helper. A
+sandbox worker's exception survives the trip to the router intact: it rides its
+own field on the `log` frame rather than being flattened into `args`, and the
+router re-emits it with the *worker's* stack, not its own.
+
+```kql
+AppTraces
+| where AppRoleName == "cyrus-router"
+| where isnotempty(Properties["exception.type"])
+| summarize failures = count(), sample = any(Message)
+    by type = tostring(Properties["exception.type"]),
+       component = tostring(Properties.component)
+| order by failures desc
+```
+
+Everything Cyrus-specific goes under the private `cyrus.*` namespace instead —
+OTel defines no convention for a Linear issue, a sandbox, a device, or an agent
+session. GenAI semconv (`gen_ai.*`) was evaluated for session/token/cost
+attributes and deliberately **not** adopted; see
+[ADR 0003](adr/0003-defer-genai-semantic-conventions.md).
+
 **Records land in `AppTraces`, not `ContainerAppConsoleLogs_CL`.** This is the
 one thing to know before querying them; the saved searches and alert rules in
 `infra/azure/bicep/modules/monitoring.bicep` all read the console table and do not see
@@ -313,7 +342,7 @@ Two operational notes:
 
 - **`CYRUS_OTEL_LOGS_LEVEL` is what you pay for**, and is independent of
   `CYRUS_LOG_LEVEL` (which only governs the container's own stdout). It defaults
-  to `INFO`, which carries the `sandbox_*` event family and every warning and
+  to `INFO`, which carries the `sandbox.*` event family and every warning and
   error while leaving debug volume local. `SILENT` stops export without tearing
   the pipeline down — but does not suppress named `event()` records, which ride
   past the threshold by contract.
@@ -336,35 +365,43 @@ On top of the JSON lines above, the router emits a named **event** family for
 every ephemeral sandbox. Events go through the logger's `event()` channel rather
 than `info()` — `debug` and `info` are deliberately never forwarded to the
 structured stream, so anything an operator needs to query has to be an event.
-Each one carries `issue_key`, `device_id` and `provider`, and every name is
-prefixed `sandbox_`, so a single predicate selects the whole family.
+Each one carries `cyrus.issue_key`, `cyrus.device_id` and `cyrus.provider`, and
+every name is prefixed `sandbox.`, so a single predicate selects the whole
+family.
+
+Names are dotted lowercase and every Cyrus-specific attribute lives under
+`cyrus.*` (matching the labels already stamped on ACA sandboxes). A dotted key
+is NOT reachable with dot syntax in KQL — `p.cyrus.issue_key` parses as a nested
+lookup and silently returns null — so read them with bracket syntax:
+`p["cyrus.issue_key"]`. The structural keys the JSON renderer owns (`event`,
+`component`, `level`, `message`, `timestamp`, `args`) keep their bare names.
 
 | Event | Emitted when |
 |-------|--------------|
-| `sandbox_boot_started` | the router asked a provider to boot or resume a sandbox |
-| `sandbox_running` | the provider reported it running (`transitioned` is false for a re-route that found it already up) |
-| `sandbox_boot_failed` | `ensureRunning` rejected; `reason` carries the message |
-| `sandbox_parked` | a session blocked on a user answer and released affinity |
-| `sandbox_unparked` | a park was reversed and the agent went back to work |
-| `sandbox_idle_stopped` | the lifecycle sweep parked an affinity-free sandbox past `idleStopMs` |
-| `sandbox_destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
-| `sandbox_teardown_completed` | a terminal teardown finished; carries `action` and whether the worker's callback or the grace deadline triggered it |
-| `sandbox_gauge` | once per sandbox per 60s lifecycle sweep — the point-in-time inventory |
-| `sandbox_sweep_completed` | once per completed sweep, even with zero sandboxes — the fleet rollup. The sweep is non-reentrant, so a tick that fires while the previous one is still running is skipped and logs a warning instead |
+| `sandbox.boot_started` | the router asked a provider to boot or resume a sandbox |
+| `sandbox.running` | the provider reported it running (`transitioned` is false for a re-route that found it already up) |
+| `sandbox.boot_failed` | `ensureRunning` rejected; `reason` carries the message |
+| `sandbox.parked` | a session blocked on a user answer and released affinity |
+| `sandbox.unparked` | a park was reversed and the agent went back to work |
+| `sandbox.idle_stopped` | the lifecycle sweep parked an affinity-free sandbox past `idleStopMs` |
+| `sandbox.destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
+| `sandbox.teardown_completed` | a terminal teardown finished; carries `action` and whether the worker's callback or the grace deadline triggered it |
+| `sandbox.gauge` | once per sandbox per 60s lifecycle sweep — the point-in-time inventory |
+| `sandbox.sweep_completed` | once per completed sweep, even with zero sandboxes — the fleet rollup. The sweep is non-reentrant, so a tick that fires while the previous one is still running is skipped and logs a warning instead |
 
-Two attributes on `sandbox_gauge` are easy to confuse and mean different things:
+Two attributes on `sandbox.gauge` are easy to confuse and mean different things:
 
-- **`age_ms`** is the device row's age (`devices.created_ms`). The row survives
+- **`cyrus.age_ms`** is the device row's age (`devices.created_ms`). The row survives
   every stop/resume cycle, so this answers "how long has this issue had a
   sandbox", never "how long has it been burning 4 vCPU".
-- **`uptime_ms`** is CONTINUOUS running time (`devices.running_since_ms`),
+- **`cyrus.uptime_ms`** is CONTINUOUS running time (`devices.running_since_ms`),
   stamped when a sandbox transitions to running and cleared on every transition
   out. This is the one an uptime alert must key on. Null while stopped.
 
-`sandbox_gauge` also carries the router's own liveness view — `online` (a live
-WSS socket) and `last_seen_age_ms` (age of the last heartbeat pong) — alongside
-the provider's `state`. Both are needed: ACA reports a sandbox as `Running` even
-when its entrypoint has exited, so a query keyed on `state` alone will happily
+`sandbox.gauge` also carries the router's own liveness view — `cyrus.online` (a live
+WSS socket) and `cyrus.last_seen_age_ms` (age of the last heartbeat pong) —
+alongside the provider's `cyrus.state`. Both are needed: ACA reports a sandbox as `Running` even
+when its entrypoint has exited, so a query keyed on `cyrus.state` alone will happily
 report a zombie as a healthy agent.
 
 Current open sandboxes, with issue keys and uptimes, in one query:
@@ -373,11 +410,14 @@ Current open sandboxes, with issue keys and uptimes, in one query:
 ContainerAppConsoleLogs_CL
 | where TimeGenerated > ago(15m)
 | extend p = parse_json(Log_s)
-| where tostring(p.event) == "sandbox_gauge"
-| extend issue_key = tostring(p.issue_key), device_id = tostring(p.device_id),
-         state = tostring(p.state), sessions = toint(p.sessions),
-         online = tobool(p.online), uptime_ms = tolong(p.uptime_ms),
-         last_seen_age_ms = tolong(p.last_seen_age_ms)
+| where tostring(p.event) == "sandbox.gauge"
+| extend issue_key = tostring(p["cyrus.issue_key"]),
+         device_id = tostring(p["cyrus.device_id"]),
+         state = tostring(p["cyrus.state"]),
+         sessions = toint(p["cyrus.sessions"]),
+         online = tobool(p["cyrus.online"]),
+         uptime_ms = tolong(p["cyrus.uptime_ms"]),
+         last_seen_age_ms = tolong(p["cyrus.last_seen_age_ms"])
 | summarize arg_max(TimeGenerated, *) by device_id
 | where state == "running"
 | project issue_key, device_id, sessions, uptime = uptime_ms * 1ms,
@@ -407,25 +447,25 @@ through its own logger. That makes them inherit the router's existing path into
 deny-by-default egress allowlist** (the router's own host is already its one
 entry), and no Azure credential inside the sandbox.
 
-Relayed lines are tagged `source: "sandbox"` and their component is prefixed
+Relayed lines are tagged `cyrus.source: "sandbox"` and their component is prefixed
 `sandbox/`, so one predicate separates them from the router's own output:
 
 ```kql
 ContainerAppConsoleLogs_CL
 | where TimeGenerated > ago(1h)
 | extend p = parse_json(Log_s)
-| where tostring(p.source) == "sandbox"
-| project TimeGenerated, issue_key = tostring(p.issue_key),
-          device_id = toint(p.device_id), level = tostring(p.level),
+| where tostring(p["cyrus.source"]) == "sandbox"
+| project TimeGenerated, issue_key = tostring(p["cyrus.issue_key"]),
+          device_id = toint(p["cyrus.device_id"]), level = tostring(p.level),
           component = tostring(p.component), message = tostring(p.message)
 | order by TimeGenerated desc
 ```
 
-`issue_key`, `device_id` and `provider` come from the **device row the router
-authenticated**, not from the frame — a worker cannot label its logs with
-someone else's issue. If the worker's own view of the issue disagrees, it is
-recorded separately as `reported_issue_identifier` rather than silently
-resolved. `emitted_at` carries the device's clock alongside the router's own
+`cyrus.issue_key`, `cyrus.device_id` and `cyrus.provider` come from the **device
+row the router authenticated**, not from the frame — a worker cannot label its
+logs with someone else's issue. If the worker's own view of the issue disagrees, it
+is recorded separately as `cyrus.reported_issue_identifier` rather than silently
+resolved. `cyrus.emitted_at` carries the device's clock alongside the router's own
 timestamp, so sandbox/router clock skew is visible.
 
 **Volume guard.** Piping full session stdout from every sandbox into a PerGB2018
@@ -438,18 +478,19 @@ workspace is not cheap, so the device filters before forwarding:
 | `CYRUS_LOG_FORWARD_BURST` | `40` | Bucket capacity — how large a burst passes untouched. |
 
 Two things ride *past* the level threshold by design: named `event()` records
-(the `sandbox_*` vocabulary above), because a lifecycle event is low-volume and
+(the `sandbox.*` vocabulary above), because a lifecycle event is low-volume and
 always meant to reach the structured stream. They still pay a rate-limit token.
 
 Nothing is dropped silently. Records the guard discards — rate-limited, or
 emitted while the socket was down — are counted and the count rides the next
-frame that does get through, as a `dropped` attribute:
+frame that does get through, as a `cyrus.dropped` attribute:
 
 ```kql
 ContainerAppConsoleLogs_CL
 | extend p = parse_json(Log_s)
-| where tostring(p.source) == "sandbox"
-| summarize lost = sum(tolong(p.dropped)) by issue_key = tostring(p.issue_key)
+| where tostring(p["cyrus.source"]) == "sandbox"
+| summarize lost = sum(tolong(p["cyrus.dropped"]))
+    by issue_key = tostring(p["cyrus.issue_key"])
 | where lost > 0
 ```
 

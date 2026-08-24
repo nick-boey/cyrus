@@ -9,7 +9,11 @@ import {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
 } from "../src/TerminalTeardown.js";
-import { type TestLogger, testLogger } from "./helpers/logger.js";
+import {
+	eventsNamed as namedEvents,
+	type TestLogger,
+	testLogger,
+} from "./helpers/logger.js";
 
 function executor(destroy = vi.fn(async () => {})): ContainerExecutor {
 	return {
@@ -62,15 +66,12 @@ describe("TerminalTeardown", () => {
 	}
 
 	describe("sandbox telemetry", () => {
-		const eventsNamed = (name: string) =>
-			logger.event.mock.calls
-				.filter(([emitted]) => emitted === name)
-				.map(([, attributes]) => (attributes ?? {}) as Record<string, unknown>);
+		const eventsNamed = (name: string) => namedEvents(logger, name);
 
 		/**
-		 * Two events, not one. `sandbox_destroyed` is what closes an issue out of
+		 * Two events, not one. `sandbox.destroyed` is what closes an issue out of
 		 * the sandbox-count series regardless of why it went away, while
-		 * `sandbox_teardown_completed` carries the teardown-specific dimensions.
+		 * `sandbox.teardown_completed` carries the teardown-specific dimensions.
 		 * Collapsing them would force every "how many sandboxes are open" query to
 		 * special-case teardowns.
 		 */
@@ -81,13 +82,13 @@ describe("TerminalTeardown", () => {
 
 			await teardown.handleCallback("CYPACK-1", deviceId, "cb-1");
 
-			expect(eventsNamed("sandbox_destroyed")[0]).toMatchObject({
+			expect(eventsNamed("sandbox.destroyed")[0]).toMatchObject({
 				issue_key: "CYPACK-1",
 				device_id: deviceId,
 				provider: "docker",
 				reason: "terminal_teardown",
 			});
-			expect(eventsNamed("sandbox_teardown_completed")[0]).toMatchObject({
+			expect(eventsNamed("sandbox.teardown_completed")[0]).toMatchObject({
 				issue_key: "CYPACK-1",
 				device_id: deviceId,
 				action: "closed",
@@ -111,10 +112,10 @@ describe("TerminalTeardown", () => {
 
 			timers.callbacks[0]?.();
 			await vi.waitFor(() =>
-				expect(eventsNamed("sandbox_teardown_completed")).toHaveLength(1),
+				expect(eventsNamed("sandbox.teardown_completed")).toHaveLength(1),
 			);
 
-			expect(eventsNamed("sandbox_teardown_completed")[0]).toMatchObject({
+			expect(eventsNamed("sandbox.teardown_completed")[0]).toMatchObject({
 				action: "deleted",
 				trigger: "grace expiry",
 			});
@@ -132,8 +133,8 @@ describe("TerminalTeardown", () => {
 				teardown.handleCallback("CYPACK-1", deviceId, "cb-1"),
 			).rejects.toThrow("azure unavailable");
 
-			expect(eventsNamed("sandbox_destroyed")).toHaveLength(0);
-			expect(eventsNamed("sandbox_teardown_completed")).toHaveLength(0);
+			expect(eventsNamed("sandbox.destroyed")).toHaveLength(0);
+			expect(eventsNamed("sandbox.teardown_completed")).toHaveLength(0);
 		});
 	});
 

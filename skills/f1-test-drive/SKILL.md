@@ -84,7 +84,7 @@ Use when validating the Slack → ChatSessionHandler → ClaudeRunner path. F1 e
 2. Verify shared auto-memory wiring:
    - The chat workspace exists at `<cyrusHome>/slack-workspaces/<sanitized-threadKey>/`.
    - The shared auto-memory directory exists (or is lazily creatable) at `<cyrusHome>/slack-memory/`.
-   - The `claude_query_options` event emitted by `ClaudeRunner` carries `cqo.settingsAutoMemoryDirectory=<cyrusHome>/slack-memory`.
+   - The `session.query_options` event emitted by `ClaudeRunner` carries `cyrus.cqo.settingsAutoMemoryDirectory=<cyrusHome>/slack-memory`.
 
 3. Verify per-thread workspace isolation alongside shared memory:
    - Dispatch a second event in a different channel/thread.

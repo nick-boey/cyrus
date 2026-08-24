@@ -56,7 +56,9 @@ import type {
 import {
 	CLIIssueTrackerService,
 	CLIRPCServer,
+	CYRUS_EVENTS,
 	createLogger,
+	cyrusAttributes,
 	DEFAULT_PROXY_URL,
 	getDefaultWorktreesDir,
 	isAgentSessionCreatedWebhook,
@@ -3627,12 +3629,15 @@ ${taskSection}`;
 
 		const webhookAction = (webhook as { action?: string }).action;
 		const webhookType = (webhook as { type?: string }).type;
-		this.logger.event("webhook_received", {
-			source: "linear",
-			action: webhookAction,
-			type: webhookType,
-			repoCount: repos.length,
-		});
+		this.logger.event(
+			CYRUS_EVENTS.webhookReceived,
+			cyrusAttributes({
+				source: "linear",
+				action: webhookAction,
+				type: webhookType,
+				repo_count: repos.length,
+			}),
+		);
 
 		// Log verbose webhook info if enabled
 		if (process.env.CYRUS_WEBHOOK_DEBUG === "true") {
@@ -6390,8 +6395,8 @@ ${taskSection}`;
 			typeof fastify.register !== "function" ||
 			typeof fastify.addHook !== "function"
 		) {
-			console.warn(
-				"[EdgeWorker] Skipping cyrus-tools MCP endpoint registration: Fastify instance does not support register/addHook",
+			this.logger.warn(
+				"Skipping cyrus-tools MCP endpoint registration: Fastify instance does not support register/addHook",
 			);
 			return;
 		}
@@ -6433,19 +6438,15 @@ ${taskSection}`;
 		});
 
 		this.cyrusToolsMcpSessions.on("connected", (sessionId) => {
-			console.log(
-				`[EdgeWorker] cyrus-tools MCP session connected: ${sessionId}`,
-			);
+			this.logger.debug(`cyrus-tools MCP session connected: ${sessionId}`);
 		});
 
 		this.cyrusToolsMcpSessions.on("terminated", (sessionId) => {
-			console.log(
-				`[EdgeWorker] cyrus-tools MCP session terminated: ${sessionId}`,
-			);
+			this.logger.debug(`cyrus-tools MCP session terminated: ${sessionId}`);
 		});
 
 		this.cyrusToolsMcpSessions.on("error", (error) => {
-			console.error("[EdgeWorker] cyrus-tools MCP session error:", error);
+			this.logger.error("cyrus-tools MCP session error:", error);
 		});
 
 		await fastify.register(streamableHttp, {
@@ -6495,8 +6496,8 @@ ${taskSection}`;
 		});
 
 		this.cyrusToolsMcpRegistered = true;
-		console.log(
-			`✅ Cyrus tools MCP endpoint registered at ${this.cyrusToolsMcpEndpoint}`,
+		this.logger.info(
+			`Cyrus tools MCP endpoint registered at ${this.cyrusToolsMcpEndpoint}`,
 		);
 	}
 
@@ -6657,15 +6658,15 @@ ${taskSection}`;
 		childSessionId: string,
 		parentSessionId: string,
 	): void {
-		console.log(
-			`[EdgeWorker] Agent session created: ${childSessionId}, mapping to parent ${parentSessionId}`,
+		this.logger.info(
+			`Agent session created: ${childSessionId}, mapping to parent ${parentSessionId}`,
 		);
 		this.globalSessionRegistry.setParentSession(
 			childSessionId,
 			parentSessionId,
 		);
-		console.log(
-			`[EdgeWorker] Parent-child mapping registered in GlobalSessionRegistry`,
+		this.logger.debug(
+			`Parent-child mapping registered in GlobalSessionRegistry`,
 		);
 	}
 
@@ -6673,8 +6674,8 @@ ${taskSection}`;
 		childSessionId: string,
 		message: string,
 	): Promise<boolean> {
-		console.log(
-			`[EdgeWorker] Processing feedback delivery to child session ${childSessionId}`,
+		this.logger.info(
+			`Processing feedback delivery to child session ${childSessionId}`,
 		);
 
 		// Find the parent session ID for context
@@ -6691,8 +6692,8 @@ ${taskSection}`;
 			!childRepo ||
 			!this.agentSessionManager.hasAgentRunner(childSessionId)
 		) {
-			console.error(
-				`[EdgeWorker] Child session ${childSessionId} not found in any repository`,
+			this.logger.error(
+				`Child session ${childSessionId} not found in any repository`,
 			);
 			return false;
 		}
@@ -6700,13 +6701,11 @@ ${taskSection}`;
 		// Get the child session
 		const childSession = this.agentSessionManager.getSession(childSessionId);
 		if (!childSession) {
-			console.error(`[EdgeWorker] Child session ${childSessionId} not found`);
+			this.logger.error(`Child session ${childSessionId} not found`);
 			return false;
 		}
 
-		console.log(
-			`[EdgeWorker] Found child session - Issue: ${childSession.issueId}`,
-		);
+		this.logger.debug(`Found child session - Issue: ${childSession.issueId}`);
 
 		// Get parent session info for better context in the thought
 		let parentIssueId: string | undefined;
@@ -6739,27 +6738,21 @@ ${taskSection}`;
 				});
 
 				if (result.success) {
-					console.log(
-						`[EdgeWorker] Posted feedback receipt thought for child session ${childSessionId}`,
+					this.logger.debug(
+						`Posted feedback receipt thought for child session ${childSessionId}`,
 					);
 				} else {
-					console.error(
-						`[EdgeWorker] Failed to post feedback receipt thought:`,
-						result,
-					);
+					this.logger.error(`Failed to post feedback receipt thought:`, result);
 				}
 			} catch (error) {
-				console.error(
-					`[EdgeWorker] Error posting feedback receipt thought:`,
-					error,
-				);
+				this.logger.error(`Error posting feedback receipt thought:`, error);
 			}
 		}
 
 		const feedbackPrompt = `## Received feedback from orchestrator\n\n---\n\n${message}\n\n---`;
 
-		console.log(
-			`[EdgeWorker] Handling feedback delivery to child session ${childSessionId}`,
+		this.logger.debug(
+			`Handling feedback delivery to child session ${childSessionId}`,
 		);
 
 		this.handlePromptWithStreamingCheck(
@@ -6775,19 +6768,19 @@ ${taskSection}`;
 			childWorkspaceId,
 		)
 			.then(() => {
-				console.log(
-					`[EdgeWorker] Child session ${childSessionId} completed processing feedback`,
+				this.logger.info(
+					`Child session ${childSessionId} completed processing feedback`,
 				);
 			})
 			.catch((error) => {
-				console.error(
-					`[EdgeWorker] Failed to process feedback in child session:`,
+				this.logger.error(
+					`Failed to process feedback in child session:`,
 					error,
 				);
 			});
 
-		console.log(
-			`[EdgeWorker] Feedback delivered successfully to child session ${childSessionId}`,
+		this.logger.info(
+			`Feedback delivered successfully to child session ${childSessionId}`,
 		);
 		return true;
 	}
@@ -8284,8 +8277,8 @@ ${input.userComment}
 						? session.codexSessionId
 						: session.cursorSessionId;
 
-		console.log(
-			`[resumeAgentSession] needsNewSession=${needsNewSession}, resumeSessionId=${resumeSessionId ?? "none"}`,
+		this.logger.debug(
+			`resumeAgentSession: needsNewSession=${needsNewSession}, resumeSessionId=${resumeSessionId ?? "none"}`,
 		);
 
 		// Create runner configuration

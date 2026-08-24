@@ -1,4 +1,4 @@
-import type { ILogger } from "cyrus-core";
+import { cyrusAttributes, type ILogger } from "cyrus-core";
 import type {
 	ExecutorRegistry,
 	ManagedContainerState,
@@ -494,14 +494,17 @@ export class ContainerLifecycle {
 		// The rollup an operator actually asks for first ("how many sandboxes are
 		// open right now?"). Emitted even when zero, so a flat line is
 		// distinguishable from a router that stopped sweeping.
-		this.logger.event(SANDBOX_EVENTS.sweepCompleted, {
-			sandboxes: rows.length,
-			running: counts.running,
-			stopped: counts.stopped,
-			absent: counts.absent,
-			unknown: counts.unknown,
-			pinned,
-			duration_ms: this.now() - now,
-		});
+		this.logger.event(
+			SANDBOX_EVENTS.sweepCompleted,
+			cyrusAttributes({
+				sandboxes: rows.length,
+				running: counts.running,
+				stopped: counts.stopped,
+				absent: counts.absent,
+				unknown: counts.unknown,
+				pinned,
+				duration_ms: this.now() - now,
+			}),
+		);
 	}
 }

@@ -7,9 +7,9 @@ import {
 import { testLogger } from "./helpers/logger.js";
 
 describe("SandboxTelemetry", () => {
-	it("names every event in the sandbox_ family so one KQL predicate selects them all", () => {
+	it("names every event in the sandbox. family so one KQL predicate selects them all", () => {
 		for (const name of Object.values(SANDBOX_EVENTS)) {
-			expect(name).toMatch(/^sandbox_[a-z_]+$/);
+			expect(name).toMatch(/^sandbox\.[a-z_]+$/);
 		}
 		// Distinct names — a duplicate would silently merge two lifecycle
 		// transitions into one series.
@@ -27,11 +27,11 @@ describe("SandboxTelemetry", () => {
 			{ extra: "value" },
 		);
 
-		expect(logger.event).toHaveBeenCalledWith("sandbox_boot_started", {
-			issue_key: "NOR-279",
-			device_id: 7,
-			provider: "aca",
-			extra: "value",
+		expect(logger.event).toHaveBeenCalledWith("sandbox.boot_started", {
+			"cyrus.issue_key": "NOR-279",
+			"cyrus.device_id": 7,
+			"cyrus.provider": "aca",
+			"cyrus.extra": "value",
 		});
 	});
 
@@ -46,10 +46,10 @@ describe("SandboxTelemetry", () => {
 			provider: "docker",
 		});
 
-		expect(logger.event).toHaveBeenCalledWith("sandbox_destroyed", {
-			issue_key: "NOR-279",
-			device_id: null,
-			provider: "docker",
+		expect(logger.event).toHaveBeenCalledWith("sandbox.destroyed", {
+			"cyrus.issue_key": "NOR-279",
+			"cyrus.device_id": null,
+			"cyrus.provider": "docker",
 		});
 	});
 
@@ -72,18 +72,18 @@ describe("SandboxTelemetry", () => {
 			lastRoutedAgeMs: 30_000,
 		});
 
-		expect(logger.event).toHaveBeenCalledWith("sandbox_gauge", {
-			issue_key: "NOR-279",
-			device_id: 7,
-			provider: "aca",
-			state: "running",
-			sessions: 1,
-			online: true,
-			age_ms: 90_000,
-			uptime_ms: 60_000,
-			last_seen_age_ms: 5_000,
-			parked_for_ms: null,
-			last_routed_age_ms: 30_000,
+		expect(logger.event).toHaveBeenCalledWith("sandbox.gauge", {
+			"cyrus.issue_key": "NOR-279",
+			"cyrus.device_id": 7,
+			"cyrus.provider": "aca",
+			"cyrus.state": "running",
+			"cyrus.sessions": 1,
+			"cyrus.online": true,
+			"cyrus.age_ms": 90_000,
+			"cyrus.uptime_ms": 60_000,
+			"cyrus.last_seen_age_ms": 5_000,
+			"cyrus.parked_for_ms": null,
+			"cyrus.last_routed_age_ms": 30_000,
 		});
 	});
 
@@ -105,12 +105,12 @@ describe("SandboxTelemetry", () => {
 		});
 
 		expect(logger.event).toHaveBeenCalledWith(
-			"sandbox_gauge",
+			"sandbox.gauge",
 			expect.objectContaining({
-				uptime_ms: null,
-				last_seen_age_ms: null,
-				parked_for_ms: null,
-				last_routed_age_ms: null,
+				"cyrus.uptime_ms": null,
+				"cyrus.last_seen_age_ms": null,
+				"cyrus.parked_for_ms": null,
+				"cyrus.last_routed_age_ms": null,
 			}),
 		);
 	});

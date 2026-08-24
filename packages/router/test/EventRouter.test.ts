@@ -665,23 +665,23 @@ describe("EventRouter", () => {
 			state: "active",
 		});
 
-		expect(logger.event).toHaveBeenCalledWith("sandbox_parked", {
-			issue_key: "PAR-146",
-			device_id: deviceId,
-			provider: "aca",
-			session_id: "sess-1",
+		expect(logger.event).toHaveBeenCalledWith("sandbox.parked", {
+			"cyrus.issue_key": "PAR-146",
+			"cyrus.device_id": deviceId,
+			"cyrus.provider": "aca",
+			"cyrus.session_id": "sess-1",
 		});
-		expect(logger.event).toHaveBeenCalledWith("sandbox_unparked", {
-			issue_key: "PAR-146",
-			device_id: deviceId,
-			provider: "aca",
-			session_id: "sess-1",
+		expect(logger.event).toHaveBeenCalledWith("sandbox.unparked", {
+			"cyrus.issue_key": "PAR-146",
+			"cyrus.device_id": deviceId,
+			"cyrus.provider": "aca",
+			"cyrus.session_id": "sess-1",
 		});
 	});
 
 	/**
 	 * `handleSessionState` is shared by physical devices and sandboxes, but the
-	 * `sandbox_*` family has to stay countable as sandboxes — a teammate's laptop
+	 * `sandbox.*` family has to stay countable as sandboxes — a teammate's laptop
 	 * parking a session is not a fleet-cost signal and must not appear in it.
 	 */
 	it("(e3b) emits no sandbox event when the parking device is a physical laptop", async () => {
@@ -699,7 +699,7 @@ describe("EventRouter", () => {
 
 		expect(
 			logger.event.mock.calls.filter(([name]) =>
-				String(name).startsWith("sandbox_"),
+				String(name).startsWith("sandbox."),
 			),
 		).toHaveLength(0);
 	});

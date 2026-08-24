@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { installRecordingLogSink } from "cyrus-core";
+import { CYRUS_EVENTS, installRecordingLogSink } from "cyrus-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock the Claude SDK
@@ -632,7 +632,7 @@ describe("ClaudeRunner", () => {
 
 		it("should only extract session ID once from first message that has it", async () => {
 			// Asserted on the structured record rather than the rendered console
-			// line. The claim is "exactly one claude_session_id_assigned event, and
+			// line. The claim is "exactly one session.agent_id_assigned event, and
 			// it carries the FIRST id" — which the record states directly, instead
 			// of being inferred from a regex over a timestamp, a padded level
 			// label, and a JSON tail.
@@ -657,14 +657,14 @@ describe("ClaudeRunner", () => {
 			expect(sessionInfo.sessionId).toBe("first-session-id");
 			try {
 				const assigned = recorder.sink.findAll({
-					event: "claude_session_id_assigned",
+					event: CYRUS_EVENTS.sessionAgentIdAssigned,
 				});
 				// One event, not two — the second message's id is ignored entirely
 				// rather than merely logged and discarded.
 				expect(assigned).toHaveLength(1);
 				expect(assigned[0]).toMatchObject({
 					component: "ClaudeRunner",
-					attributes: { claudeSessionId: "first-session-id" },
+					attributes: { "cyrus.agent_session_id": "first-session-id" },
 				});
 			} finally {
 				recorder.restore();

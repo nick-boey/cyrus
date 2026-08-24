@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { setGlobalErrorReporter } from "cyrus-core";
+import { createLogger, setGlobalErrorReporter } from "cyrus-core";
 import dotenv from "dotenv";
 import { buildProgram } from "./buildProgram.js";
 import { createErrorReporter } from "./services/createErrorReporter.js";
@@ -41,7 +41,10 @@ const program = buildProgram(packageJson, errorReporter);
 	} catch (error) {
 		errorReporter.captureException(error, { tags: { phase: "bootstrap" } });
 		await errorReporter.flush(2000).catch(() => false);
-		console.error("Fatal error:", error);
+		// Through ILogger rather than console.error so the failure that killed the
+		// process carries exception semconv (`exception.type`/`.stacktrace`) into
+		// whatever structured stream is configured, instead of only stderr.
+		createLogger({ component: "cli" }).error("Fatal error:", error);
 		process.exit(1);
 	}
 })();

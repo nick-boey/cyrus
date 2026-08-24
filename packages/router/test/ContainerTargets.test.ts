@@ -18,7 +18,11 @@ import type {
 } from "../src/RepositoryRegistry.js";
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
-import { type TestLogger, testLogger } from "./helpers/logger.js";
+import {
+	eventsNamed as namedEvents,
+	type TestLogger,
+	testLogger,
+} from "./helpers/logger.js";
 
 /** Minimal fake ContainerExecutor whose ensureRunning/destroy are inspectable mocks. */
 function fakeExecutor(
@@ -233,11 +237,7 @@ describe("ContainerTargetService", () => {
 	});
 
 	describe("sandbox lifecycle telemetry", () => {
-		/** Every `logger.event(name, attrs)` recorded for one event name. */
-		const eventsNamed = (name: string) =>
-			logger.event.mock.calls
-				.filter(([emitted]) => emitted === name)
-				.map(([, attributes]) => (attributes ?? {}) as Record<string, unknown>);
+		const eventsNamed = (name: string) => namedEvents(logger, name);
 
 		async function bootOnce(now?: () => number): Promise<number> {
 			const { userId } = store.addUser({ email: "a@example.com" });
@@ -260,13 +260,13 @@ describe("ContainerTargetService", () => {
 			await bootOnce();
 
 			await vi.waitFor(() =>
-				expect(eventsNamed("sandbox_running")).toHaveLength(1),
+				expect(eventsNamed("sandbox.running")).toHaveLength(1),
 			);
-			expect(eventsNamed("sandbox_boot_started")[0]).toMatchObject({
+			expect(eventsNamed("sandbox.boot_started")[0]).toMatchObject({
 				issue_key: "NOR-279",
 				provider: "docker",
 			});
-			expect(eventsNamed("sandbox_running")[0]).toMatchObject({
+			expect(eventsNamed("sandbox.running")[0]).toMatchObject({
 				issue_key: "NOR-279",
 				transitioned: true,
 			});
@@ -314,9 +314,9 @@ describe("ContainerTargetService", () => {
 			expect(store.getContainerDeviceForIssue("NOR-279")?.runningSinceMs).toBe(
 				1_000,
 			);
-			// The second `sandbox_running` says it changed nothing, so a query
+			// The second `sandbox.running` says it changed nothing, so a query
 			// counting real transitions can filter on it.
-			expect(eventsNamed("sandbox_running").map((e) => e.transitioned)).toEqual(
+			expect(eventsNamed("sandbox.running").map((e) => e.transitioned)).toEqual(
 				[true, false],
 			);
 		});
@@ -339,9 +339,9 @@ describe("ContainerTargetService", () => {
 			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
 
 			await vi.waitFor(() =>
-				expect(eventsNamed("sandbox_boot_failed")).toHaveLength(1),
+				expect(eventsNamed("sandbox.boot_failed")).toHaveLength(1),
 			);
-			expect(eventsNamed("sandbox_boot_failed")[0]).toMatchObject({
+			expect(eventsNamed("sandbox.boot_failed")[0]).toMatchObject({
 				issue_key: "NOR-279",
 				provider: "docker",
 				reason: "docker daemon unreachable",
@@ -350,7 +350,7 @@ describe("ContainerTargetService", () => {
 			expect(
 				store.getContainerDeviceForIssue("NOR-279")?.runningSinceMs,
 			).toBeUndefined();
-			expect(eventsNamed("sandbox_running")).toHaveLength(0);
+			expect(eventsNamed("sandbox.running")).toHaveLength(0);
 		});
 
 		it("emits a destroy event when a provider switch replaces the device", async () => {
@@ -369,7 +369,7 @@ describe("ContainerTargetService", () => {
 			store.setUserExecutor("a@example.com", '{"type":"fake2"}');
 			service.ensureDevice({ userId, email: "a@example.com" }, "NOR-279");
 
-			expect(eventsNamed("sandbox_destroyed")[0]).toMatchObject({
+			expect(eventsNamed("sandbox.destroyed")[0]).toMatchObject({
 				issue_key: "NOR-279",
 				provider: "docker",
 				reason: "provider_switch",

@@ -6,6 +6,7 @@ import {
 	getGlobalErrorReporter,
 	getGlobalErrorTags,
 } from "../error-reporting/globalReporter.js";
+import { describeException, extractError } from "./exception.js";
 import type { ILogger, LogContext, LogEventAttributes } from "./ILogger.js";
 import { LogLevel } from "./ILogger.js";
 import { getGlobalLogSink } from "./LogSink.js";
@@ -203,6 +204,9 @@ class Logger implements ILogger {
 		if (options?.event === undefined && level < sink.minLevel) return;
 		const attributes = options?.attributes ?? this.context.attributes;
 		try {
+			// Any level, not just ERROR: `logger.warn("retrying", err)` describes a
+			// real exception and an operator grouping by `exception.type` wants it.
+			const error = extractError(args);
 			sink.write({
 				timestampMs: Date.now(),
 				level,
@@ -217,6 +221,7 @@ class Logger implements ILogger {
 							return summary ? { args: summary } : {};
 						})()
 					: {}),
+				...(error ? { exception: describeException(error) } : {}),
 			});
 		} catch {
 			// A broken sink must never take down the caller.
@@ -505,11 +510,6 @@ function safeStringify(record: Record<string, unknown>): string {
 }
 
 /**
- * Find the first {@link Error} in the trailing args of a `logger.error(...)`
- * call. Also follows `error.cause` chains (used by transports that wrap an
- * underlying failure) and unwraps objects that look like `{ error: Error }`.
- */
-/**
  * Replace dynamic fragments in a log message with placeholders so messages
  * that differ only by embedded IDs/paths/numbers collapse to one fingerprint.
  *
@@ -557,19 +557,4 @@ function summariseArgs(args: unknown[]): string | undefined {
 	if (parts.length === 0) return undefined;
 	const joined = parts.join(" ");
 	return joined.length > 500 ? `${joined.slice(0, 500)}…` : joined;
-}
-
-function extractError(args: unknown[]): Error | undefined {
-	for (const arg of args) {
-		if (arg instanceof Error) return arg;
-		if (
-			arg &&
-			typeof arg === "object" &&
-			"error" in arg &&
-			(arg as { error: unknown }).error instanceof Error
-		) {
-			return (arg as { error: Error }).error;
-		}
-	}
-	return undefined;
 }

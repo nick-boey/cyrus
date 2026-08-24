@@ -1,5 +1,6 @@
 import {
 	createLogger,
+	cyrusAttributes,
 	type ILogger,
 	type LogEventAttributes,
 } from "cyrus-core";
@@ -8,8 +9,9 @@ import type { LogFrame } from "cyrus-router-protocol";
 /**
  * Re-emitted worker lines are tagged with this so a KQL query can separate them
  * from the router's own output in a single predicate
- * (`where source == "sandbox"`), and so an operator reading raw console output
- * is never misled into thinking the router itself logged something.
+ * (`where p["cyrus.source"] == "sandbox"`), and so an operator reading raw
+ * console output is never misled into thinking the router itself logged
+ * something.
  */
 export const SANDBOX_LOG_SOURCE = "sandbox";
 
@@ -30,6 +32,8 @@ const MAX_MESSAGE_CHARS = 8_000;
 const MAX_COMPONENT_CHARS = 128;
 const MAX_ATTRIBUTES = 32;
 const MAX_ATTRIBUTE_CHARS = 1_000;
+/** Stacktraces are the payload of an error record; see RouterLogForwarder. */
+const MAX_STACKTRACE_CHARS = 8_000;
 
 /**
  * How many distinct worker components we keep a cached logger for. Bounded
@@ -59,11 +63,11 @@ export interface SandboxLogOrigin {
  * Azure credential inside the sandbox.
  *
  * ── ATTRIBUTION IS ROUTER-SIDE ──
- * `device_id` / `issue_key` come from the device row the gateway authenticated,
- * NOT from the frame. A worker cannot label its logs with someone else's issue.
- * The device's own `issueIdentifier` is carried separately as
- * `reported_issue_identifier` so a mismatch is visible rather than silently
- * resolved one way or the other.
+ * `cyrus.device_id` / `cyrus.issue_key` come from the device row the gateway
+ * authenticated, NOT from the frame. A worker cannot label its logs with someone
+ * else's issue. The device's own `issueIdentifier` is carried separately as
+ * `cyrus.reported_issue_identifier` so a mismatch is visible rather than
+ * silently resolved one way or the other.
  *
  * ── LEVEL MAPPING ──
  * A worker's WARN/ERROR is re-emitted at the SAME level, which means it also
@@ -92,18 +96,24 @@ export class SandboxLogRelay {
 		try {
 			const logger = this.loggerFor(frame.component, frame, origin);
 			const message = truncate(frame.message, MAX_MESSAGE_CHARS);
+			// Passed as a trailing arg rather than an attribute so it re-enters the
+			// logger through the ordinary error path: `Logger` then derives the same
+			// `exception.*` semconv it would for a locally-thrown error, and the
+			// error reporter captures it as an exception with the WORKER's stack
+			// instead of an opaque message. See rehydrateError.
+			const args = rehydrateError(frame.exception);
 			switch (frame.level) {
 				case "error":
-					logger.error(message);
+					logger.error(message, ...args);
 					break;
 				case "warn":
-					logger.warn(message);
+					logger.warn(message, ...args);
 					break;
 				case "debug":
-					logger.debug(message);
+					logger.debug(message, ...args);
 					break;
 				default:
-					logger.info(message);
+					logger.info(message, ...args);
 					break;
 			}
 		} catch {
@@ -142,7 +152,14 @@ export class SandboxLogRelay {
 			this.loggers.set(safeComponent, base);
 		}
 
-		const attributes: LogEventAttributes = {
+		// Router-side attribution, namespaced like every other Cyrus-specific
+		// attribute (see `cyrusAttributes`). The structural keys below — `event`,
+		// `args`, and the W3C trace-context pair — are deliberately NOT namespaced:
+		// `event` and `args` mirror `LogRecord`'s own fields on the direct path, so
+		// namespacing them here would make a relayed line and a locally-emitted one
+		// disagree about the same fact, and `traceparent`/`tracestate` are
+		// standard names owned by W3C rather than by us.
+		const attributes: LogEventAttributes = cyrusAttributes({
 			source: SANDBOX_LOG_SOURCE,
 			device_id: origin.deviceId,
 			issue_key: origin.issueKey ?? null,
@@ -151,16 +168,16 @@ export class SandboxLogRelay {
 			// clock skew between sandbox and router is visible rather than
 			// silently reordering the stream.
 			emitted_at: frame.ts,
-		};
+		});
 		if (frame.event !== undefined) attributes.event = frame.event;
 		if (frame.args !== undefined) {
 			attributes.args = truncate(frame.args, MAX_ATTRIBUTE_CHARS);
 		}
 		if (frame.dropped !== undefined && frame.dropped > 0) {
-			// Surfaced as a first-class attribute so `summarize sum(dropped)`
-			// reports the real loss. A truncated log stream that does not say it
-			// was truncated reads as complete.
-			attributes.dropped = frame.dropped;
+			// Surfaced as a first-class attribute so `summarize sum(...)` reports
+			// the real loss. A truncated log stream that does not say it was
+			// truncated reads as complete.
+			attributes["cyrus.dropped"] = frame.dropped;
 		}
 		if (frame.traceparent !== undefined) {
 			attributes.traceparent = frame.traceparent;
@@ -174,7 +191,7 @@ export class SandboxLogRelay {
 		) {
 			// Only recorded when it disagrees with the router's own view — see
 			// the class doc on router-side attribution.
-			attributes.reported_issue_identifier = frame.issueIdentifier;
+			attributes["cyrus.reported_issue_identifier"] = frame.issueIdentifier;
 		}
 		for (const [key, value] of boundedEntries(frame.attributes)) {
 			// Worker attributes never override the router's attribution keys.
@@ -189,6 +206,26 @@ export class SandboxLogRelay {
 			...(frame.repository ? { repository: frame.repository } : {}),
 		});
 	}
+}
+
+/**
+ * Rebuild an `Error` from a frame's exception fields, as a zero-or-one-element
+ * arg list so the call sites stay a single spread.
+ *
+ * The reconstructed error deliberately carries the WORKER's stack verbatim. A
+ * freshly-constructed Error's own stack points at this function and the gateway
+ * message loop — frames that describe how the line reached the router and
+ * nothing at all about why the sandbox failed.
+ */
+function rehydrateError(exception: LogFrame["exception"]): [Error] | [] {
+	if (!exception) return [];
+	const error = new Error(truncate(exception.message, MAX_MESSAGE_CHARS));
+	error.name = truncate(exception.type, MAX_COMPONENT_CHARS);
+	error.stack =
+		exception.stacktrace !== undefined
+			? truncate(exception.stacktrace, MAX_STACKTRACE_CHARS)
+			: `${error.name}: ${error.message}`;
+	return [error];
 }
 
 function truncate(text: string, max: number): string {

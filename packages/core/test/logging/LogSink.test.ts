@@ -110,6 +110,33 @@ describe("global LogSink", () => {
 		});
 	});
 
+	it("shapes a trailing Error into exception semconv on the record", () => {
+		// Structured rather than folded into `args`: `exception.type` is what
+		// groups failures and `exception.stacktrace` is why an operator opens the
+		// record at all. Neither survives a one-line summary.
+		const error = new TypeError("cannot read properties of undefined");
+		createLogger({ component: "EdgeWorker" }).error("session error", error);
+		expect(sink.records[0]?.exception).toMatchObject({
+			type: "TypeError",
+			message: "cannot read properties of undefined",
+		});
+		expect(sink.records[0]?.exception?.stacktrace).toContain("TypeError");
+	});
+
+	it("shapes an exception at WARN too, not only ERROR", () => {
+		// `logger.warn("retrying", err)` describes a real exception, and an
+		// operator grouping by `exception.type` wants it in the same series.
+		createLogger({ component: "EdgeWorker" }).warn("retrying", new Error("x"));
+		expect(sink.records[0]?.exception).toMatchObject({ type: "Error" });
+	});
+
+	it("leaves the record's exception unset when no arg is an Error", () => {
+		createLogger({ component: "EdgeWorker" }).error("plain failure", {
+			code: 500,
+		});
+		expect(sink.records[0]?.exception).toBeUndefined();
+	});
+
 	it("never lets a throwing sink break the call it was describing", () => {
 		setGlobalLogSink({
 			minLevel: LogLevel.DEBUG,

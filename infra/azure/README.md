@@ -1067,11 +1067,19 @@ the Log Analytics workspace created in `bicep/modules/foundation.bicep`, and the
 router already writes one flat JSON object per line (`CYRUS_LOG_FORMAT=json`, set
 in `bicep/modules/router-app.bicep`).
 
-The data comes from the `sandbox_*` event family documented in
+The data comes from the `sandbox.*` event family documented in
 [`docs/ROUTER.md`](../../docs/ROUTER.md) → "Sandbox lifecycle telemetry". The
-load-bearing one is `sandbox_gauge`: one sample per sandbox per 60-second
+load-bearing one is `sandbox.gauge`: one sample per sandbox per 60-second
 lifecycle sweep, carrying the issue key, provider state, live session count, and
 both uptime clocks.
+
+One KQL gotcha the saved searches all work around: every Cyrus-specific
+attribute lives under the `cyrus.*` namespace, and a dotted key is **not**
+reachable with dot syntax. `p.cyrus.issue_key` parses as a nested lookup and
+silently returns null — it does not error. Use bracket syntax:
+`p["cyrus.issue_key"]`. The structural keys the JSON renderer owns (`event`,
+`component`, `level`, `message`, `timestamp`, `args`) keep their bare names and
+their dot syntax.
 
 The **workers themselves** reach the same workspace by the same route. A sandbox
 writes to a stdout nothing collects — the ACA sandbox group is a separate ARM
@@ -1112,7 +1120,7 @@ paste-ready KQL. `service.name` arrives as `AppRoleName`,
 
 Volume is governed by `otelLogsLevel` (default `INFO`), which is
 independent of what the container prints locally. Same PerGB2018 economics as the
-worker forwarder above: `INFO` carries the `sandbox_*` event family and every
+worker forwarder above: `INFO` carries the `sandbox.*` event family and every
 warning and error, while debug volume stays on stdout only. Named `event()`
 records ride past the threshold by contract, so raising the level never loses the
 lifecycle vocabulary the alerts depend on.
@@ -1164,7 +1172,7 @@ alert by a `worker` dimension:
 The sweep-stalled rule is what makes the other two trustworthy: every sandbox
 alert derives from the 60-second sweep, so if the sweep stops emitting they all
 go quietly blind and look exactly like "nothing is wrong". It keys on the
-absence of `sandbox_sweep_completed`, which is emitted on every tick including
+absence of `sandbox.sweep_completed`, which is emitted on every tick including
 ticks with zero sandboxes, precisely so a quiet fleet stays distinguishable from
 a dead router.
 

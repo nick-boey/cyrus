@@ -572,10 +572,43 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      else is a key in `Properties`. The Application Insights component must be
      **workspace-based**; classic mode keeps its own store, out of reach of those
      queries.
-   - OTLP attribute keys deliberately mirror the Phase 0 JSON console format
-     (`component`, `sessionId`, `issueIdentifier`, `repository`, `event`, `args`)
-     rather than semconv. OTel defines no semconv for them and operators have
-     queries against those names; renaming breaks every saved query for no gain.
+   - **The naming split is deliberate and has exactly three halves.** (a) The
+     per-record STRUCTURAL keys — `component`, `sessionId`, `issueIdentifier`,
+     `repository`, `platform`, `event`, `args` — keep their Phase 0 names on both
+     the JSON console line and the OTLP record. They ride every record, prose
+     included, so renaming them is the exhaustive rewrite Phase 4 excludes and
+     would break every saved query for no new queryability. (b) `exception.*` is
+     stable OTel semconv, describes nothing Cyrus-specific, and is what makes a
+     backend render a record as an exception — use the standard names. (c)
+     Everything else Cyrus-specific goes under `cyrus.*` via `cyrusAttributes`
+     (`packages/core/src/logging/events.ts`), matching the labels already on ACA
+     sandboxes. Event names are dotted lowercase (`session.completed`,
+     `sandbox.gauge`) — never snake_case — and the domain prefix is load-bearing:
+     `event startswith "sandbox."` is how every sandbox alert is scoped.
+   - **Namespacing happens at the CALL SITE, not inside a sink.** `cyrusAttributes`
+     is applied where the event is emitted. A sink that silently rewrote keys
+     would need a list of reserved ones (`event`, `args`, `traceparent`, …) that
+     must NOT be rewritten, and that list rots the first time someone adds a
+     structural field. A key already containing a `.` is treated as
+     pre-namespaced and passed through — which is what lets `exception.*` and a
+     future `gen_ai.*` work unchanged, and why a private prefix like `cqo.` must
+     be spelled `cyrus.cqo.` at source rather than relying on the helper.
+   - **A dotted attribute key is not reachable with KQL dot syntax.**
+     `p.cyrus.issue_key` parses as a nested lookup and silently returns null — it
+     does not error. Every query over a `cyrus.*` attribute must use bracket
+     syntax: `p["cyrus.issue_key"]`. Renaming an event or attribute therefore
+     means editing `infra/azure/bicep/modules/monitoring.bicep` in the same
+     change; its saved searches and alert rules key on those literal strings.
+   - **GenAI semconv (`gen_ai.*`) is evaluated and deliberately NOT adopted** —
+     still pre-stable, moved to `open-telemetry/semantic-conventions-genai` with
+     no tagged release or schema URL to pin against. See
+     `docs/adr/0003-defer-genai-semantic-conventions.md` before reopening it.
+   - **`packages/core` has all the console calls it is going to have.** The ~56
+     `console.*` matches in it are JSDoc examples; the only real ones are in
+     `Logger.ts`, which IS the console sink. The `console.*` left in `apps/cli` is
+     interactive UI (OAuth walkthroughs, status tables, prompts) — routing it
+     through `ILogger` would stamp timestamps and level labels onto text a human
+     is reading, which is a regression, not a cleanup.
    - **Assert on log records, not console output.** Use `RecordingLogSink` /
      `installRecordingLogSink` from `cyrus-core`. Regexing a rendered line
      couples the test to a timestamp format, a level-label width, and
