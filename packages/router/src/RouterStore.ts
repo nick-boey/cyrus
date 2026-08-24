@@ -1261,6 +1261,111 @@ export class RouterStore {
 		return txn();
 	}
 
+	/**
+	 * Repair a regressed event-sequence counter against the high-water mark the
+	 * device reports at `hello`.
+	 *
+	 * `next_seq` lives in SQLite on ephemeral per-revision disk and is restored
+	 * from a ≤5-minute-stale blob on every revision rollover, while the device's
+	 * `lastAckedSeq` survives in its floor bundle. When the restore rolls
+	 * `next_seq` back to at or below the device's `lastAckedSeq`, every event we
+	 * subsequently issue carries a seq the device discards as a duplicate
+	 * (`RouterConnection.onEvent`) — permanently, and with no signal on either
+	 * side. See NOR-263.
+	 *
+	 * Fast-forwarding past the device's mark is the only safe reconciliation:
+	 * the events the lost seqs belonged to are already gone from our side, and
+	 * refusing the device instead would leave it deaf until an operator noticed.
+	 *
+	 * Queued events with `seq <= lastAckedSeq` are **resequenced above the mark
+	 * rather than treated as duplicates**. Under detected skew such a row is
+	 * far more likely to be a victim — an event enqueued at a rolled-back seq
+	 * between the restore and this `hello` — than a genuine replay, and the
+	 * caller's normal already-acked purge would otherwise delete it undelivered.
+	 * Re-delivering a true duplicate is recoverable; dropping a user's prompt
+	 * silently is the bug being fixed.
+	 *
+	 * A no-op (`repaired: false`) on the overwhelmingly common healthy path.
+	 */
+	reconcileDeviceSeq(
+		deviceId: number,
+		lastAckedSeq: number,
+		nowMs: number,
+	): {
+		repaired: boolean;
+		previousNextSeq: number;
+		nextSeq: number;
+		resequenced: number;
+	} {
+		const txn = this.db.transaction(() => {
+			const deviceRow = this.db
+				.prepare("SELECT next_seq FROM devices WHERE device_id = ?")
+				.get(deviceId) as Pick<DeviceRow, "next_seq"> | undefined;
+			if (!deviceRow) {
+				throw new Error(`Unknown device: ${deviceId}`);
+			}
+			const previousNextSeq = deviceRow.next_seq;
+			if (previousNextSeq > lastAckedSeq) {
+				return {
+					repaired: false,
+					previousNextSeq,
+					nextSeq: previousNextSeq,
+					resequenced: 0,
+				};
+			}
+
+			// Only live rows are worth moving; an expired one is left in place
+			// for the periodic expireEvents sweep. Every issued seq is < next_seq
+			// <= lastAckedSeq here, so this is in practice the whole queue.
+			const victims = this.db
+				.prepare(
+					`SELECT seq, payload_json, enqueued_ms, expires_ms FROM events
+					 WHERE device_id = ? AND seq <= ? AND expires_ms > ?
+					 ORDER BY seq ASC`,
+				)
+				.all(deviceId, lastAckedSeq, nowMs) as Array<
+				Pick<EventRow, "seq" | "payload_json" | "enqueued_ms" | "expires_ms">
+			>;
+
+			let nextSeq = lastAckedSeq + 1;
+			for (const victim of victims) {
+				// Delete-then-insert, not UPDATE: the new seq is always above
+				// lastAckedSeq and therefore above every old seq, so the rewrite
+				// cannot collide with a row still waiting its turn.
+				this.db
+					.prepare("DELETE FROM events WHERE device_id = ? AND seq = ?")
+					.run(deviceId, victim.seq);
+				this.db
+					.prepare(
+						`INSERT INTO events (device_id, seq, payload_json, enqueued_ms, expires_ms)
+						 VALUES (?, ?, ?, ?, ?)`,
+					)
+					.run(
+						deviceId,
+						nextSeq,
+						victim.payload_json,
+						victim.enqueued_ms,
+						// TTL is preserved deliberately: resequencing must not
+						// resurrect a prompt that has already aged out.
+						victim.expires_ms,
+					);
+				nextSeq += 1;
+			}
+
+			this.db
+				.prepare("UPDATE devices SET next_seq = ? WHERE device_id = ?")
+				.run(nextSeq, deviceId);
+
+			return {
+				repaired: true,
+				previousNextSeq,
+				nextSeq,
+				resequenced: victims.length,
+			};
+		});
+		return txn();
+	}
+
 	recordMutation(
 		deviceId: number,
 		mutationId: string,
