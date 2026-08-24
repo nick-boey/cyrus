@@ -34,15 +34,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tag immutability matters for durable deployments (the Azure router
-      # Container App). IMMUTABLE — safe to pin in Terraform:
+      # Container App). IMMUTABLE — safe to pin in Bicep:
       #   type=semver {{version}}  -> v1.2.3   (a release tag is cut once)
       #   type=sha                 -> sha-a1b2c3d
       # MUTABLE — convenience only, NEVER pin these in a durable environment:
       #   type=ref,event=branch    -> main, deploy, …
       #   type=semver {{major}}.{{minor}} -> 1.2 (moves on each patch)
       #   type=raw latest
-      # `infra/azure/terraform` REJECTS mutable refs for `router_image` /
-      # `worker_image`. See infra/azure/README.md → "Router image tag policy".
+      # `infra/azure/bicep` REJECTS mutable refs for `routerImage` /
+      # `workerImage`. See infra/azure/README.md → "Router image tag policy".
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -69,7 +69,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       # Echo only the refs that are safe to pin, so an operator deploying the
-      # Azure router can copy one straight into dev.tfvars.
+      # Azure router can copy one straight into main.bicepparam.
       - name: Summarize immutable refs
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/cyrus-router
