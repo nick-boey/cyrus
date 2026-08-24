@@ -14,14 +14,17 @@ covers the template layout and the things that are specific to Bicep.
 ```
 main.bicep                        subscription scope: parameters, validation,
                                   resource group, module orchestration, outputs
+bootstrap-role-assignments.bicep  resource-group bootstrap entry point for the
+                                  runtime identities' deterministic RBAC grants
 main.bicepparam.example           complete operator checklist — copy, fill, chmod 600
 modules/
   foundation.bicep                Log Analytics, Key Vault + opt-in secret writes,
                                   router identity, storage + Files share + blob
                                   containers + optional Table/KEK, Container Apps
-                                  environment + Files link, optional ACR, all RBAC
-  sandbox-group.bicep             Microsoft.App/sandboxGroups (properties: {}) +
-                                  Data Owner RBAC + the group identity's AcrPull
+                                  environment + Files link, optional ACR
+  sandbox-group.bicep             Microsoft.App/sandboxGroups (properties: {})
+  role-assignments.bicep          all runtime-identity and break-glass RBAC;
+                                  shared by main and the bootstrap entry point
   router-app.bicep                the router Container App
   router-auth.bicep               the authConfigs child (stage 1 of /setup)
   monitoring.bicep                saved KQL searches + action group + alert rules
@@ -42,6 +45,22 @@ The steady-state parameter file contains no secret values. A first deployment or
 deliberate rotation temporarily sets `writeLinearSecrets = true`, supplies all
 five Linear values, and adds `--allow-secret-writes` to both commands. Clear the
 values and restore the flag to `false` immediately afterwards.
+
+RBAC has a separate lifecycle from routine infrastructure changes. Bootstrap or
+reconcile the runtime identities' grants with an operator that can create role
+assignments, then set `manageRoleAssignments = false` in the steady-state file:
+
+```bash
+./scripts/bootstrap-azure-role-assignments.sh            # what-if preview
+./scripts/bootstrap-azure-role-assignments.sh --apply    # privileged bootstrap
+./scripts/deploy-azure.sh --apply                        # Contributor-only CD
+```
+
+Both entry points call `modules/role-assignments.bicep`, so the resource scopes
+and deterministic names cannot drift. Omitting that module in an Incremental
+deployment does not delete existing grants. An environment already deployed by
+the earlier Bicep shape needs no migration: preview/apply the bootstrap once to
+confirm the same assignments, then turn the flag off.
 
 Private deployment automation can keep its environment file outside this public
 checkout and select the public build without rewriting either file:
@@ -156,6 +175,22 @@ environment parameters, and immutable image refs, but receives no Linear or
 `/setup` secret values. Seed or rotate those values in a separately authorized
 manual operation.
 
+### Runtime RBAC is bootstrapped separately
+
+`Contributor` deliberately cannot create Azure role assignments. The routine
+deployment therefore sets `manageRoleAssignments = false`; a separately
+authorized operator runs `scripts/bootstrap-azure-role-assignments.sh` when the
+environment is created or when a runtime grant changes. The script defaults to
+what-if and accepts `--apply` for the mutation. It reads only the naming,
+feature, operator-principal, and preview-role fields from the main parameter
+file, never any secret value.
+
+The bootstrap template and `main.bicep` both call the same
+`modules/role-assignments.bicep`. Keeping one owner for those declarations is
+important: their `guid(...)` expressions are Azure resource identities, so a
+second implementation could replace working assignments even if its display
+names looked identical.
+
 ### Cross-parameter invariants
 
 Bicep's `@allowed` / `@minValue` / `@minLength` decorators cover
@@ -180,7 +215,7 @@ compiler itself warns against using in production. This idiom compiles to plain
 ## Role definition GUIDs
 
 Bicep cannot resolve a role definition by display name. Built-in roles carry the
-same GUID in every tenant, so `modules/foundation.bicep` names them as
+same GUID in every tenant, so `modules/role-assignments.bicep` names them as
 constants. Verify any of them with:
 
 ```bash

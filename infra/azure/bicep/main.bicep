@@ -185,6 +185,9 @@ param linearClientSecret string = ''
 // RBAC
 ////////////////////////////////////////////////////////////////////////////////
 
+@description('Manage the stack\'s runtime role assignments in this deployment. Keep true for a fresh/full deployment. Set false only after scripts/bootstrap-azure-role-assignments.sh has created them; routine CD then needs Contributor but not Microsoft.Authorization/roleAssignments/write. Incremental mode retains the bootstrapped grants.')
+param manageRoleAssignments bool = true
+
 @description('Role-definition GUID for \'Container Apps SandboxGroup Data Owner\'. Bicep cannot resolve a role definition by display name the way the Terraform data source did, so the GUID is the primary path here. Spike S6 verified this value in-tenant. Confirm in your own tenant with `az role definition list --name "Container Apps SandboxGroup Data Owner" --query "[].name" -o tsv` and override if it differs. A second undocumented role, \'Container Apps SandboxGroup Contributor\' (11b23f7a-6229-4518-88db-0576f10dd2a0), exists for least-privilege readers — do NOT give the router that one.')
 param sandboxGroupDataOwnerRoleId string = 'c24cf47c-5077-412d-a19c-45202126392c'
 
@@ -487,7 +490,7 @@ resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {
 
 ////////////////////////////////////////////////////////////////////////////////
 // Foundation: Log Analytics, Key Vault + opt-in secret writes, identity, storage,
-// Container Apps environment, optional ACR, RBAC, optional per-user secret store
+// Container Apps environment, optional ACR, optional per-user secret store
 ////////////////////////////////////////////////////////////////////////////////
 
 module foundation 'modules/foundation.bicep' = {
@@ -499,7 +502,6 @@ module foundation 'modules/foundation.bicep' = {
     location: location
     tags: defaultTags
     enableAcr: enableAcr
-    operatorPrincipalId: operatorPrincipalId
     linearWorkspaceId: linearWorkspaceId
     writeLinearSecrets: writeLinearSecrets
     linearWorkspaceToken: linearWorkspaceToken
@@ -517,7 +519,7 @@ module foundation 'modules/foundation.bicep' = {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// ACA sandbox group + its RBAC
+// ACA sandbox group
 ////////////////////////////////////////////////////////////////////////////////
 
 module sandboxGroup 'modules/sandbox-group.bicep' = {
@@ -527,10 +529,28 @@ module sandboxGroup 'modules/sandbox-group.bicep' = {
     name: sandboxGroupName
     location: location
     tags: defaultTags
-    routerPrincipalId: foundation.outputs.routerPrincipalId
-    dataOwnerRoleDefinitionId: sandboxGroupDataOwnerRoleId
-    acrName: enableAcr ? foundation.outputs.acrName : ''
   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Runtime RBAC — optional for Contributor-only routine CD after bootstrap
+////////////////////////////////////////////////////////////////////////////////
+
+module roleAssignments 'modules/role-assignments.bicep' = if (manageRoleAssignments) {
+  scope: rg
+  name: 'cyrus-role-assignments'
+  params: {
+    namePrefix: namePrefix
+    flatNamePrefix: flatNamePrefix
+    enableAcr: enableAcr
+    enableSetupSecretStore: enableSetupSecretStore
+    routerPrincipalId: foundation.outputs.routerPrincipalId
+    operatorPrincipalId: operatorPrincipalId
+    sandboxGroupDataOwnerRoleId: sandboxGroupDataOwnerRoleId
+  }
+  dependsOn: [
+    sandboxGroup
+  ]
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -652,11 +672,13 @@ module routerApp 'modules/router-app.bicep' = {
   }
   // ACA resolves Key Vault secret references while creating the revision, so
   // both vault role grants must exist first; the Table backend needs its two
-  // grants at RUNTIME and neither is implied by a reference in the app. No
-  // explicit dependsOn is needed for either: this module consumes foundation
-  // outputs, and a module is not complete until every resource in it — including
-  // all five role assignments — has been created. Azure RBAC PROPAGATION is a
-  // separate matter and can still require a retry; see README.
+  // grants at RUNTIME and neither is implied by a reference in the app. The
+  // dependency is removed automatically when manageRoleAssignments=false. Azure
+  // RBAC PROPAGATION is a separate matter and can still require a retry; see
+  // README.
+  dependsOn: [
+    roleAssignments
+  ]
 }
 
 ////////////////////////////////////////////////////////////////////////////////

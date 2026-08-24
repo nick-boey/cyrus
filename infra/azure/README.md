@@ -59,10 +59,12 @@ sandbox group** that the router spins per-issue workers up inside.
 ## Prerequisites
 
 - **`az login`** with an account that can create resource groups, Container
-  Apps, Key Vaults, Storage, and RBAC role assignments in the target
-  subscription. (`az account set --subscription <sub>`.) Creating role
-  assignments needs **Owner**, or **Contributor + Role Based Access Control
-  Administrator**.
+  Apps, Key Vaults, and Storage in the target subscription. (`az account set
+  --subscription <sub>`.) Routine deployment needs **Contributor**. The
+  separate RBAC bootstrap also needs `Microsoft.Authorization/roleAssignments/write`
+  for the roles and scopes in `modules/role-assignments.bicep` (for example
+  Owner, or an appropriately constrained Role Based Access Control
+  Administrator).
 - **Bicep.** `az bicep install` (the CLI installs it to `~/.azure/bin`), or the
   standalone CLI. Verify with `bicep --version`.
 - **`jq`**, used by `scripts/deploy-azure.sh` for the stage-2 gate.
@@ -111,12 +113,10 @@ way an ARM-declared Key Vault secret could otherwise leak to anyone with
 management-plane read on the resource group.
 
 Fresh Key Vault **role assignments** can still take several minutes to
-propagate. The router identity's grants are created in the same module as the
-vault, and the router Container App consumes that module's outputs, so ARM
-already orders them correctly — but ordering is not propagation. If the first
-deployment reports that a Key Vault secret reference cannot be resolved, wait and
-re-run `./scripts/deploy-azure.sh --apply`; the deployment is idempotent and will
-converge.
+propagate. Bootstrap them before the first routine deployment, as described
+below. If the first deployment reports that a Key Vault secret reference cannot
+be resolved, wait and re-run `./scripts/deploy-azure.sh --apply`; the deployment
+is idempotent and will converge.
 
 ## End-to-end deployment
 
@@ -212,6 +212,11 @@ apply. Set it only to point containers at a custom domain or a proxy.
 Use an exact resource group by setting `resourceGroupName`; empty defaults to
 `rg-<project>-<environment>`.
 
+Set `manageRoleAssignments = true` for a fresh all-in-one operator deployment.
+For routine CD, bootstrap the grants separately as described next and set it to
+`false`; the deployment identity then needs Contributor only. An Incremental
+deployment that omits the RBAC module retains every existing assignment.
+
 `project` and `environment` are capped at 10 and 9 characters. The binding
 constraint is the Key Vault name `kv-<project>-<environment>` and Key Vault's
 24-character limit; the caps make an over-long pair fail at validation rather
@@ -222,6 +227,30 @@ Validate before you deploy anything:
 ```bash
 ./scripts/check-bicep.sh
 ```
+
+### 2a. Bootstrap runtime RBAC
+
+Use an operator identity allowed to create the runtime roles, preview the exact
+assignments, then apply them:
+
+```bash
+./scripts/bootstrap-azure-role-assignments.sh \
+  --params infra/azure/bicep/main.bicepparam
+./scripts/bootstrap-azure-role-assignments.sh \
+  --params infra/azure/bicep/main.bicepparam --apply
+```
+
+The script reads no Linear or `/setup` secret values. Its template and the
+optional module in `main.bicep` both call the same role-assignment module, with
+the same deterministic resource names and scopes.
+
+If the environment is the existing `rg-cyrus` deployment that already received
+the pre-split Bicep template, the assignments are already present. Run the two
+commands above once as a reconciliation check; Azure should retain the same
+assignment resources rather than replace them. Then set
+`manageRoleAssignments = false` in the private environment file. There is no
+resource migration and no need to grant the private CD identity an RBAC-admin
+role.
 
 ### 3. Bootstrap the registry (private images only)
 
@@ -364,7 +393,10 @@ The private workflow owns Azure OIDC, approval/environment policy, and the
 choice of public commit and image digest. The public repository owns the Bicep
 implementation, validation, and deployment contract. A separate manual
 bootstrap/rotation operation may use `--allow-secret-writes`; the routine CD job
-must not receive those secret values.
+must not receive those secret values. Its Azure identity also needs Contributor
+only: runtime role assignments are reconciled through the separate bootstrap
+entry point above, while the private parameter file keeps
+`manageRoleAssignments = false`.
 
 If Container Apps cannot resolve a new Key Vault reference, wait for RBAC
 propagation and deploy again. The router can start before the worker disk is
@@ -1564,14 +1596,15 @@ bicep/
   README.md                       template layout, and where enforcement lives
   main.bicep                      subscription scope: parameters, cross-parameter
                                   validation, RG, module orchestration, outputs
+  bootstrap-role-assignments.bicep resource-group RBAC bootstrap entry point
   main.bicepparam.example         complete parameter checklist
   modules/
     foundation.bicep              Log Analytics, Key Vault + opt-in secret writes,
                                   router identity, storage + Files share + blob
                                   containers + optional Table/KEK, Container Apps
-                                  environment + Files link, optional ACR, all RBAC
-    sandbox-group.bicep           sandboxGroups (properties: {}) + Data Owner
-                                  RBAC + the group identity's AcrPull
+                                  environment + Files link, optional ACR
+    sandbox-group.bicep           sandboxGroups (properties: {})
+    role-assignments.bicep        all deterministic runtime/break-glass RBAC
     router-app.bicep              router Container App + env + Files mount +
                                   readiness probe + optional custom domains
     router-auth.bicep             authConfigs child (stage 1 of /setup)
@@ -1583,6 +1616,7 @@ Deploy and check scripts:
 
 ```
 scripts/deploy-azure.sh           what-if / deploy, image-pin, secret-write and stage-2 gates
+scripts/bootstrap-azure-role-assignments.sh privileged runtime-RBAC what-if / apply
 scripts/deploy-router-image.sh    build router image into ACR, repin, what-if
 scripts/deploy-router-image.test.sh   covers the repin rewrite and the pin gate
 scripts/check-bicep.sh            compile every template; warnings are failures

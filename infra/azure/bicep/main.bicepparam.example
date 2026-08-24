@@ -121,6 +121,13 @@ param linearClientId = '' // '<linear-oauth-client-id>'
 param linearClientSecret = '' // '<linear-oauth-client-secret>'
 
 // ---- RBAC -------------------------------------------------------------------
+// Fresh environment: leave true for the first full deployment, or run
+// scripts/bootstrap-azure-role-assignments.sh explicitly. After those runtime
+// grants exist, set false for routine CD so its Contributor identity never needs
+// Microsoft.Authorization/roleAssignments/write. Incremental mode preserves
+// the existing assignments while this module is omitted.
+param manageRoleAssignments = true
+
 // Bicep cannot resolve a role definition by display name, so the GUID is the
 // primary path. Spike S6 verified this value in-tenant. Confirm in yours with
 //   az role definition list --name "Container Apps SandboxGroup Data Owner" \
