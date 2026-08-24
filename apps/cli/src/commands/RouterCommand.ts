@@ -30,6 +30,7 @@ import {
 	SecretStore,
 	type SecretStoreBackend,
 	type SessionInfo,
+	startRouterOtelLogging,
 	TableSecretStore,
 } from "cyrus-router";
 import { z } from "zod";
@@ -44,6 +45,37 @@ import { BaseCommand } from "./ICommand.js";
  * GUID it can look up directly.
  */
 const ISSUE_IDENTIFIER_RE = /^[A-Za-z][A-Za-z0-9]*-\d+$/;
+
+/**
+ * How long the OTel pipeline gets to flush on shutdown. Shorter than the
+ * exporter's own 30s export timeout so a wedged ingestion endpoint cannot hold
+ * the process open until the platform escalates SIGTERM to SIGKILL.
+ */
+const OTEL_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+/**
+ * Resolve `promise`, or give up after `ms`. Swallows rejection: this is only
+ * used for best-effort telemetry teardown, where neither a failure nor a hang
+ * should change how the process exits.
+ */
+async function withTimeout(
+	promise: Promise<unknown>,
+	ms: number,
+): Promise<void> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		await Promise.race([
+			promise.catch(() => {}),
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, ms);
+				// Don't let the timer itself be the reason the loop stays alive.
+				timer.unref?.();
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
 
 /** Valid values for `cyrus router users set-executor <email> <type>`. */
 const EXECUTOR_TYPES = [
@@ -601,6 +633,22 @@ export class RouterCommand extends BaseCommand {
 				: {}),
 		};
 
+		// Started BEFORE the server so the sink is in place for startup logging
+		// (secret-backend selection, registry seeding, Linear token resolution) —
+		// the lines that explain a bad boot. No ESM loader hook or import-order
+		// constraint applies: this is a logs bridge, not auto-instrumentation.
+		// Returns undefined unless CYRUS_OTEL_LOGS_ENABLED is explicitly set, in
+		// which case everything below behaves exactly as before.
+		const otel = startRouterOtelLogging({
+			logger: this.logger,
+			serviceVersion: this.app.version,
+			// `containers.aca.region` is the sandboxes' region; see the option's
+			// doc comment on why it is a fallback rather than the primary source.
+			...(parsed.data.containers?.aca?.region
+				? { fallbackRegion: parsed.data.containers.aca.region }
+				: {}),
+		});
+
 		const server = await RouterServer.create(config);
 		await server.start();
 		this.logSuccess(`Router server listening on port ${server.port}`);
@@ -611,6 +659,18 @@ export class RouterCommand extends BaseCommand {
 			shuttingDown = true;
 			this.logger.info("Shutting down router server...");
 			await server.stop();
+			// After server.stop(), so shutdown logging is captured too. The batch
+			// processor buffers, so without this the last window of records —
+			// including whatever explains the shutdown — never leaves the replica.
+			//
+			// Bounded, and deliberately shorter than the exporter's own 30s export
+			// timeout: a hung ingestion endpoint must not hold the process open
+			// until the platform escalates SIGTERM to SIGKILL. Losing a few
+			// buffered log lines is strictly better than a killed shutdown, which
+			// would lose them anyway AND skip the rest of this handler.
+			if (otel) {
+				await withTimeout(otel.shutdown(), OTEL_SHUTDOWN_TIMEOUT_MS);
+			}
 			process.exit(0);
 		};
 		process.on("SIGINT", () => void shutdown());

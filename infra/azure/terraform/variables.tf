@@ -592,3 +592,20 @@ variable "sandbox_uptime_alert_hours" {
     error_message = "sandbox_uptime_alert_hours must be greater than zero."
   }
 }
+
+variable "enable_otel_logs" {
+  description = "Ship the router's ILogger output to Log Analytics over OTLP, in addition to the JSON stdout stream Phase 0 already collects. Creates a workspace-based Application Insights component wired to the SAME Log Analytics workspace (so no new data silo and no separate retention setting) and sets CYRUS_OTEL_LOGS_ENABLED + APPLICATIONINSIGHTS_CONNECTION_STRING on the router app. Defaults TRUE, which is a deliberate departure from the default-off norm the router-config variables follow (see router_default_executor / R2-06): this is the whole deliverable of NOR-281, and unlike those variables it adds telemetry rather than changing routing behaviour. Note that it DOES add env vars to the router container, so the first apply after upgrading rolls the single replica once. Records land in the AppTraces table, NOT ContainerAppConsoleLogs_CL — existing Phase 0/1 saved queries are unaffected and do not see them."
+  type        = bool
+  default     = true
+}
+
+variable "otel_logs_level" {
+  description = "Minimum level forwarded over OTLP (DEBUG/INFO/WARN/ERROR/SILENT). Independent of CYRUS_LOG_LEVEL, which governs only what the container prints locally: this is what leaves the process and gets billed per GB. Defaults to INFO, which carries the sandbox_* event family and every warning/error while leaving debug volume on stdout only. SILENT stops export without tearing the pipeline down, but does not suppress named event() records, which ride past the threshold by contract."
+  type        = string
+  default     = "INFO"
+
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARN", "ERROR", "SILENT"], var.otel_logs_level)
+    error_message = "otel_logs_level must be one of DEBUG, INFO, WARN, ERROR, SILENT. An unrecognised value would be silently ignored by the router, which falls back to INFO."
+  }
+}

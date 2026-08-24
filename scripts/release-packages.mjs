@@ -41,6 +41,9 @@ export const releasePackages = [
 	{ directory: "packages/codex-runner", name: "cyrus-codex-runner" },
 	{ directory: "packages/cursor-runner", name: "cyrus-cursor-runner" },
 	{ directory: "packages/gemini-runner", name: "cyrus-gemini-runner" },
+	// Depends only on core, and is consumed by router (which wires the Azure
+	// Monitor exporter into it), so it must precede the router block below.
+	{ directory: "packages/otel-logs", name: "cyrus-otel-logs" },
 	// Router mode. Ordered among themselves as well as ahead of their
 	// consumers: edge-worker depends on router-client and workspace-sync, and
 	// apps/cli on router and workspace-sync.

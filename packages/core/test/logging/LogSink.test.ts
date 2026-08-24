@@ -1,29 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { LogRecord, LogSink } from "../../src/logging/index.js";
 import {
 	createLogger,
 	getGlobalLogSink,
 	LogLevel,
+	RecordingLogSink,
 	resetGlobalLogSink,
 	setGlobalLogSink,
 } from "../../src/logging/index.js";
 
-class RecordingSink implements LogSink {
-	readonly records: LogRecord[] = [];
-	constructor(readonly minLevel: LogLevel = LogLevel.DEBUG) {}
-	write(record: LogRecord): void {
-		this.records.push(record);
-	}
-}
-
 describe("global LogSink", () => {
-	let sink: RecordingSink;
+	let sink: RecordingLogSink;
 
 	beforeEach(() => {
 		vi.spyOn(console, "log").mockImplementation(() => {});
 		vi.spyOn(console, "warn").mockImplementation(() => {});
 		vi.spyOn(console, "error").mockImplementation(() => {});
-		sink = new RecordingSink();
+		sink = new RecordingLogSink();
 		setGlobalLogSink(sink);
 	});
 
@@ -42,7 +34,7 @@ describe("global LogSink", () => {
 	});
 
 	it("returns the previous sink so a host can restore it", () => {
-		const replacement = new RecordingSink();
+		const replacement = new RecordingLogSink();
 		const previous = setGlobalLogSink(replacement);
 		expect(previous).toBe(sink);
 		setGlobalLogSink(previous);
@@ -68,11 +60,11 @@ describe("global LogSink", () => {
 	});
 
 	it("pre-filters on the sink's own minLevel", () => {
-		setGlobalLogSink(new RecordingSink(LogLevel.WARN));
+		setGlobalLogSink(new RecordingLogSink(LogLevel.WARN));
 		const logger = createLogger({ component: "EdgeWorker" });
 		logger.info("quiet");
 		logger.warn("loud");
-		const records = (getGlobalLogSink() as RecordingSink).records;
+		const records = (getGlobalLogSink() as RecordingLogSink).records;
 		expect(records.map((r) => r.message)).toEqual(["loud"]);
 	});
 
@@ -94,12 +86,12 @@ describe("global LogSink", () => {
 	it("forwards an event past a threshold that would otherwise drop it", () => {
 		// ILogger.event promises a named event always reaches the structured
 		// stream regardless of level.
-		setGlobalLogSink(new RecordingSink(LogLevel.ERROR));
+		setGlobalLogSink(new RecordingLogSink(LogLevel.ERROR));
 		createLogger({ component: "ContainerLifecycle" }).event("sandbox_gauge", {
 			issue_key: "NOR-280",
 			sessions: 2,
 		});
-		const records = (getGlobalLogSink() as RecordingSink).records;
+		const records = (getGlobalLogSink() as RecordingLogSink).records;
 		expect(records).toHaveLength(1);
 		expect(records[0]).toMatchObject({
 			event: "sandbox_gauge",

@@ -977,6 +977,42 @@ worker logs" for the queries and the `CYRUS_LOG_FORWARD_*` volume guard — the
 defaults (WARN and above, 2/sec sustained) exist because this workspace is
 PerGB2018 and unfiltered session stdout from every sandbox is not cheap.
 
+### OpenTelemetry log export (`enable_otel_logs`, default on)
+
+Everything above reads `ContainerAppConsoleLogs_CL` and needs no exporter. On top
+of it, `enable_otel_logs` also backs the router's `ILogger` with the OpenTelemetry
+Logs API, so each of its existing log calls additionally leaves the process as a
+structured OTLP record. Set `CYRUS_OTEL_LOGS_ENABLED=false` — or the Terraform
+variable to `false` — to turn it off completely; the console path is unchanged
+either way.
+
+`azurerm_application_insights.otel` is the OTLP endpoint and nothing more. It is
+**workspace-based**, pointed at the same `azurerm_log_analytics_workspace.this`
+the environment already ships stdout to, so there is no second data store, no
+separate retention setting, and no new billing surface beyond the ingested
+volume. Classic (non-workspace) mode would keep its own store, out of reach of
+every query above — hence the explicit `workspace_id`.
+
+**The one thing to know: OTLP records land in `AppTraces`, not
+`ContainerAppConsoleLogs_CL`.** Every saved search and alert rule in this file
+reads the console table and is therefore blind to them; enabling this changes
+nothing about their behaviour. `terraform output otel_logs_query` prints
+paste-ready KQL. `service.name` arrives as `AppRoleName`,
+`service.instance.id` as `AppRoleInstance`, and the rest of the resource semconv
+(`cloud.*`, `deployment.environment.name`) as keys inside `Properties`.
+
+Volume is governed by `var.otel_logs_level` (default `INFO`), which is
+independent of what the container prints locally. Same PerGB2018 economics as the
+worker forwarder above: `INFO` carries the `sandbox_*` event family and every
+warning and error, while debug volume stays on stdout only. Named `event()`
+records ride past the threshold by contract, so raising the level never loses the
+lifecycle vocabulary the alerts depend on.
+
+The instrumentation itself is vendor-neutral — `cyrus-otel-logs` takes its
+exporter as an argument and `cyrus-core` has no Azure dependency. Only the
+router's bootstrap knows this is Azure. See
+[`docs/ROUTER.md`](../../docs/ROUTER.md) → "OpenTelemetry log export".
+
 ### Saved searches (category "Cyrus Sandboxes")
 
 | Search | Answers |
