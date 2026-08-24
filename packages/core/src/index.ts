@@ -18,17 +18,21 @@ export {
 } from "./error-reporting/index.js";
 export type {
 	ILogger,
+	InstalledRecordingLogSink,
 	LogContext,
 	LogEventAttributes,
 	LogFormat,
 	LogRecord,
+	LogRecordQuery,
 	LogSink,
 } from "./logging/index.js";
 export {
 	createLogger,
 	createNoopLogger,
 	getGlobalLogSink,
+	installRecordingLogSink,
 	LogLevel,
+	RecordingLogSink,
 	resetGlobalLogSink,
 	setGlobalLogSink,
 } from "./logging/index.js";

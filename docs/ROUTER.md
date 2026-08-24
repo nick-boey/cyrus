@@ -231,6 +231,14 @@ runs — branch and `sha-*` tags (amd64 + arm64).
 | `CYRUS_LOG_FORWARD_LEVEL` | no | `WARN` | worker-side only — minimum level a sandbox worker forwards to the router (see "Sandbox worker logs") |
 | `CYRUS_LOG_FORWARD_RATE` | no | `2` | worker-side only — sustained forwarded records/second |
 | `CYRUS_LOG_FORWARD_BURST` | no | `40` | worker-side only — forwarding burst capacity |
+| `CYRUS_OTEL_LOGS_ENABLED` | no | `false` | not config-backed — master switch for OTLP log export (see "OpenTelemetry log export") |
+| `CYRUS_OTEL_LOGS_LEVEL` | no | `INFO` | minimum level exported over OTLP; independent of `CYRUS_LOG_LEVEL` |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | when OTLP is on | — | the OTLP endpoint. Absent while `CYRUS_OTEL_LOGS_ENABLED` is set, the router warns and stays on stdout only |
+| `CYRUS_OTEL_SERVICE_NAME` | no | `CONTAINER_APP_NAME`, else `cyrus-router` | `service.name` |
+| `CYRUS_OTEL_SERVICE_VERSION` | no | the CLI version, else `CONTAINER_APP_REVISION` | `service.version` |
+| `CYRUS_OTEL_SERVICE_INSTANCE_ID` | no | `CONTAINER_APP_REPLICA_NAME`, else the hostname | `service.instance.id` |
+| `CYRUS_OTEL_DEPLOYMENT_ENV` | no | — | `deployment.environment.name` |
+| `CYRUS_OTEL_CLOUD_REGION` | no | `containers.aca.region` | `cloud.region` |
 
 Set `CYRUS_LOG_FORMAT=json` when the router's stdout is collected by something
 that indexes fields (Azure Log Analytics, Loki, CloudWatch). Each line becomes a
@@ -256,6 +264,71 @@ ContainerAppConsoleLogs_CL
 ```
 
 Leave it unset for local use; the default human-readable output is unchanged.
+
+### OpenTelemetry log export
+
+The JSON stdout stream above is collected by whatever runs the router — on Azure
+Container Apps, the environment ships it to Log Analytics as
+`ContainerAppConsoleLogs_CL`. That path stays the default and is unchanged.
+
+Setting `CYRUS_OTEL_LOGS_ENABLED=true` additionally backs `ILogger` with the
+OpenTelemetry Logs API, so every one of the router's existing log calls also
+leaves the process as a structured OTLP record. No call site changed: the
+`LogSink` seam in `cyrus-core` is the interception point, and the console sink
+keeps working exactly as before. Adopting `ILogger` alone would not have been
+enough — the console sink renders `prefix + message`, i.e. prose, so the
+structured payload only exists on the forwarding path.
+
+**The instrumentation is vendor-neutral.** `cyrus-otel-logs` depends on nothing
+but `@opentelemetry/*` and `cyrus-core`, and takes its exporter as an argument;
+`cyrus-core` has no Azure dependency at all. Only the router's own bootstrap
+knows about Azure, where it supplies an Azure Monitor exporter and the
+`cloud.provider` / `cloud.platform` values. Point a different exporter at it and
+nothing else changes.
+
+Every record carries resource semconv — `service.name`, `service.version`,
+`service.instance.id`, `deployment.environment.name`, `cloud.provider`,
+`cloud.platform=azure_container_apps`, `cloud.region` — plus the same per-line
+attributes the JSON console format emits (`component`, `sessionId`,
+`issueIdentifier`, `repository`, `event`, `args`), under the same key names, so
+existing queries transfer.
+
+**Records land in `AppTraces`, not `ContainerAppConsoleLogs_CL`.** This is the
+one thing to know before querying them; the saved searches and alert rules in
+`infra/azure/bicep/modules/monitoring.bicep` all read the console table and do not see
+OTLP records.
+
+```kql
+AppTraces
+| where AppRoleName == "cyrus-router"
+| extend component = tostring(Properties.component), event = tostring(Properties.event)
+| project TimeGenerated, SeverityLevel, component, event, Message
+| order by TimeGenerated desc
+```
+
+`service.name` arrives as `AppRoleName` and `service.instance.id` as
+`AppRoleInstance`; everything else is a key inside `Properties`.
+
+Two operational notes:
+
+- **`CYRUS_OTEL_LOGS_LEVEL` is what you pay for**, and is independent of
+  `CYRUS_LOG_LEVEL` (which only governs the container's own stdout). It defaults
+  to `INFO`, which carries the `sandbox_*` event family and every warning and
+  error while leaving debug volume local. `SILENT` stops export without tearing
+  the pipeline down — but does not suppress named `event()` records, which ride
+  past the threshold by contract.
+- **No ESM loader hook or `--import` flag is needed.** OTel on ESM requires
+  those only for auto-instrumentation, which monkey-patches modules and so must
+  run before they are imported. This is a logs bridge that patches nothing, so it
+  can start at any point in the bootstrap. It is deliberately not registered as
+  the OTel *global* logger provider either, which would otherwise capture any
+  dependency that grabs a logger off the global API and make the volume you pay
+  for depend on your dependency tree.
+
+On the Bicep stack this is on by default: `enableOtelLogs` creates a
+workspace-based Application Insights component wired to the *same* Log Analytics
+workspace (so no second data store and no separate retention), and sets the env
+vars above. Application Insights is used purely as an OTLP endpoint.
 
 ### Sandbox lifecycle telemetry
 

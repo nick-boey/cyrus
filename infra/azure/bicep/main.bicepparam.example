@@ -232,3 +232,8 @@ param routerDefaultExecutor = ''
 param alertEmailReceivers = []
 param sandboxUptimeAlertHours = 6
 param enableMonitoringAlerts = true
+
+// Additive structured OTLP export into AppTraces in the same Log Analytics
+// workspace. Disable to omit Application Insights and its router env/secret.
+param enableOtelLogs = true
+param otelLogsLevel = 'INFO'

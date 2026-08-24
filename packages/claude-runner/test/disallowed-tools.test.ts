@@ -1,5 +1,5 @@
 import * as claudeCode from "@anthropic-ai/claude-agent-sdk";
-import { createLogger, LogLevel } from "cyrus-core";
+import { createLogger, installRecordingLogSink, LogLevel } from "cyrus-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ClaudeRunner } from "../src/ClaudeRunner";
 import type { ClaudeRunnerConfig } from "../src/types";
@@ -142,7 +142,10 @@ describe("ClaudeRunner - disallowedTools", () => {
 	});
 
 	it("should log disallowedTools when configured", async () => {
-		const consoleSpy = vi.spyOn(console, "log");
+		// Asserted on the structured record rather than the rendered console line:
+		// what this test is about is that the configured tools are reported at
+		// DEBUG, not how a timestamp or a level label happens to be formatted.
+		const recorder = installRecordingLogSink();
 
 		const config: ClaudeRunnerConfig = {
 			workingDirectory: "/test",
@@ -169,13 +172,18 @@ describe("ClaudeRunner - disallowedTools", () => {
 		await runner.start("Test");
 
 		// Check that disallowedTools were logged (now at DEBUG level via logger)
-		expect(consoleSpy).toHaveBeenCalledWith(
-			expect.stringMatching(
-				/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[DEBUG] \[ClaudeRunner] Disallowed tools configured:$/,
-			),
-			["Bash", "SystemAccess", "DangerousTool"],
-		);
-
-		consoleSpy.mockRestore();
+		try {
+			expect(
+				recorder.sink.find({
+					message: "Disallowed tools configured:",
+					level: LogLevel.DEBUG,
+					component: "ClaudeRunner",
+				}),
+			).toMatchObject({
+				args: JSON.stringify(["Bash", "SystemAccess", "DangerousTool"]),
+			});
+		} finally {
+			recorder.restore();
+		}
 	});
 });

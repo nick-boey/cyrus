@@ -37,9 +37,24 @@ param routerAppName string
 param enableAlerts bool
 param alertEmailReceivers array
 param sandboxUptimeAlertHours int
+param enableOtelLogs bool
 
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
   name: logAnalyticsWorkspaceName
+}
+
+// Application Insights is only the first-party OTLP ingestion endpoint. It is
+// workspace-based, so records land in this same Log Analytics workspace under
+// AppTraces; it does not introduce a second data store or retention policy.
+resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = if (enableOtelLogs) {
+  name: 'appi-${namePrefix}'
+  location: location
+  kind: 'web'
+  tags: tags
+  properties: {
+    Application_Type: 'web'
+    WorkspaceResourceId: logAnalytics.id
+  }
 }
 
 var appFilter = '| where ContainerAppName_s == "${routerAppName}"'
@@ -494,3 +509,11 @@ resource sandboxBootFailures 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
     }
   }
 }
+
+output applicationInsightsName string = enableOtelLogs ? applicationInsights.name : ''
+
+@secure()
+// The ternary is guarded by the same flag as the resource, and ARM's if()
+// evaluates only the selected branch. BCP318 cannot prove that relationship.
+#disable-next-line BCP318
+output applicationInsightsConnectionString string = enableOtelLogs ? applicationInsights.properties.ConnectionString : ''

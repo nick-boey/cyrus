@@ -144,4 +144,9 @@ export {
 	type TerminalTeardownAction,
 	type TerminalTeardownOptions,
 } from "./TerminalTeardown.js";
+export {
+	APPINSIGHTS_CONNECTION_STRING_ENV,
+	type StartRouterOtelLoggingOptions,
+	startRouterOtelLogging,
+} from "./telemetry/otelLogging.js";
 export { registerWorkspacesRoute } from "./workspaces.js";

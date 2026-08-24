@@ -1,4 +1,5 @@
 import type { SDKStatusMessage } from "cyrus-claude-runner";
+import { installRecordingLogSink, LogLevel } from "cyrus-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
 import type { IActivitySink } from "../src/sinks/IActivitySink";
@@ -146,10 +147,9 @@ describe("AgentSessionManager - Status Messages", () => {
 		// Mock postActivity to throw
 		postActivitySpy.mockRejectedValueOnce(new Error("Failed to post"));
 
-		// Spy on console.error
-		const consoleErrorSpy = vi
-			.spyOn(console, "error")
-			.mockImplementation(() => {});
+		// Record structured records rather than console lines: the claim is that
+		// the failure was logged at ERROR with the underlying Error attached.
+		const recorder = installRecordingLogSink();
 
 		// Create a status message with compacting status
 		const statusMessage: SDKStatusMessage = {
@@ -163,13 +163,16 @@ describe("AgentSessionManager - Status Messages", () => {
 		await manager.handleClaudeMessage(sessionId, statusMessage);
 
 		// Verify error was logged
-		expect(consoleErrorSpy).toHaveBeenCalledWith(
-			expect.stringContaining("Error creating compacting status:"),
-			expect.any(Error),
-		);
-
-		// Clean up
-		consoleErrorSpy.mockRestore();
+		try {
+			expect(
+				recorder.sink.find({
+					message: "Error creating compacting status:",
+					level: LogLevel.ERROR,
+				}),
+			).toMatchObject({ args: "Error: Failed to post" });
+		} finally {
+			recorder.restore();
+		}
 	});
 
 	it("should handle error when posting status clear fails", async () => {
@@ -185,10 +188,9 @@ describe("AgentSessionManager - Status Messages", () => {
 		// Mock postActivity to throw for the next call
 		postActivitySpy.mockRejectedValueOnce(new Error("Failed to post"));
 
-		// Spy on console.error
-		const consoleErrorSpy = vi
-			.spyOn(console, "error")
-			.mockImplementation(() => {});
+		// Record structured records rather than console lines: the claim is that
+		// the failure was logged at ERROR with the underlying Error attached.
+		const recorder = installRecordingLogSink();
 
 		// Send status clear
 		const statusClearMessage: SDKStatusMessage = {
@@ -202,13 +204,16 @@ describe("AgentSessionManager - Status Messages", () => {
 		await manager.handleClaudeMessage(sessionId, statusClearMessage);
 
 		// Verify error was logged
-		expect(consoleErrorSpy).toHaveBeenCalledWith(
-			expect.stringContaining("Error creating status clear:"),
-			expect.any(Error),
-		);
-
-		// Clean up
-		consoleErrorSpy.mockRestore();
+		try {
+			expect(
+				recorder.sink.find({
+					message: "Error creating status clear:",
+					level: LogLevel.ERROR,
+				}),
+			).toMatchObject({ args: "Error: Failed to post" });
+		} finally {
+			recorder.restore();
+		}
 	});
 
 	it("should not crash if session is not found", async () => {

@@ -354,6 +354,19 @@ param alertEmailReceivers array = []
 @minValue(1)
 param sandboxUptimeAlertHours int = 6
 
+@description('Ship the router\'s ILogger output to the existing Log Analytics workspace over OTLP, in addition to its JSON stdout stream. Creates a workspace-based Application Insights component as the ingestion endpoint and sets CYRUS_OTEL_LOGS_ENABLED plus APPLICATIONINSIGHTS_CONNECTION_STRING on the router app. Defaults TRUE because this is additive telemetry, though changing it rolls the single router replica. Records land in AppTraces, not ContainerAppConsoleLogs_CL.')
+param enableOtelLogs bool = true
+
+@description('Minimum level exported over OTLP. Independent of CYRUS_LOG_LEVEL, which governs only container stdout; this controls billed export volume. Named event() records bypass the threshold by contract.')
+@allowed([
+  'DEBUG'
+  'INFO'
+  'WARN'
+  'ERROR'
+  'SILENT'
+])
+param otelLogsLevel string = 'INFO'
+
 ////////////////////////////////////////////////////////////////////////////////
 // Naming
 ////////////////////////////////////////////////////////////////////////////////
@@ -620,6 +633,10 @@ module routerApp 'modules/router-app.bicep' = {
     setupUiIdTokenAudience: empty(setupUiIdTokenAudience) ? setupUiClientId : setupUiIdTokenAudience
     setupUiAllowedDomain: setupUiAllowedDomain
     setupUiAutoProvisionUsers: setupUiAutoProvisionUsers
+    enableOtelLogs: enableOtelLogs
+    otelLogsLevel: otelLogsLevel
+    deploymentEnvironment: environment
+    applicationInsightsConnectionString: monitoring.outputs.applicationInsightsConnectionString
   }
   // ACA resolves Key Vault secret references while creating the revision, so
   // both vault role grants must exist first; the Table backend needs its two
@@ -675,6 +692,7 @@ module monitoring 'modules/monitoring.bicep' = {
     enableAlerts: enableMonitoringAlerts
     alertEmailReceivers: alertEmailReceivers
     sandboxUptimeAlertHours: sandboxUptimeAlertHours
+    enableOtelLogs: enableOtelLogs
   }
 }
 
@@ -745,3 +763,20 @@ output setupTableEndpoint string = enableSetupSecretStore ? foundation.outputs.t
 
 @description('VERSIONED Key Vault key id of the envelope-encryption KEK, exactly as rendered into containers.tableStore.keyId. Empty unless enableSetupSecretStore is true. Not a secret — it names a public key handle. Records pin the version segment they were wrapped with, so old versions must stay ENABLED until a re-wrap pass has run.')
 output setupKekVersionedKeyId string = enableSetupSecretStore ? foundation.outputs.setupKekVersionedKeyId : ''
+
+@description('Name of the workspace-based Application Insights component used as the router\'s OTLP endpoint. Empty when enableOtelLogs is false.')
+output otelLogsApplicationInsightsName string = monitoring.outputs.applicationInsightsName
+
+@description('The single Log Analytics workspace receiving both router stdout in ContainerAppConsoleLogs_CL and OTLP records in AppTraces.')
+output logAnalyticsWorkspaceName string = foundation.outputs.logAnalyticsWorkspaceName
+
+@description('Paste-ready KQL for the router\'s OTLP stream. Empty when enableOtelLogs is false.')
+output otelLogsQuery string = enableOtelLogs
+  ? join([
+      'AppTraces'
+      '| where AppRoleName == "${routerAppName}" or AppRoleName == "cyrus-router"'
+      '| extend component = tostring(Properties.component), event = tostring(Properties.event)'
+      '| project TimeGenerated, SeverityLevel, component, event, Message, Properties'
+      '| order by TimeGenerated desc'
+    ], '\n')
+  : ''

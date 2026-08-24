@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { installRecordingLogSink, LogLevel } from "cyrus-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 import type { EdgeWorkerConfig } from "../src/types.js";
@@ -150,8 +151,10 @@ Repository: {{repository_name}}`;
 		edgeWorker = new EdgeWorker(mockConfig);
 		process.env.CYRUS_LOG_LEVEL = originalLogLevel;
 
-		// Spy on console.log to check for version logging
-		const logSpy = vi.spyOn(console, "log");
+		// Record structured log records rather than console lines: the claim is
+		// "the resolved template version was logged at DEBUG", which does not
+		// depend on how the line is rendered.
+		const recorder = installRecordingLogSink();
 
 		// Use reflection to test the promptBuilder.buildIssueContextPrompt method
 		const promptBuilder = (edgeWorker as any).promptBuilder;
@@ -172,9 +175,16 @@ Repository: {{repository_name}}`;
 		await buildIssueContextPrompt(mockIssue, [mockConfig.repositories[0]]);
 
 		// Check that version was logged (at DEBUG level)
-		expect(logSpy).toHaveBeenCalledWith(
-			expect.stringContaining("Prompt template version: debugger-v2.1.0"),
-		);
+		try {
+			expect(
+				recorder.sink.find({
+					message: "Prompt template version: debugger-v2.1.0",
+					level: LogLevel.DEBUG,
+				}),
+			).toBeDefined();
+		} finally {
+			recorder.restore();
+		}
 	});
 
 	it("should not log version when template has no version tag", async () => {
@@ -184,7 +194,7 @@ Repository: {{repository_name}}`;
 
 		vi.mocked(readFile).mockResolvedValue(templateWithoutVersion);
 
-		const logSpy = vi.spyOn(console, "log");
+		const recorder = installRecordingLogSink();
 
 		// Use reflection to test the promptBuilder.buildIssueContextPrompt method
 		const promptBuilder = (edgeWorker as any).promptBuilder;
@@ -205,9 +215,12 @@ Repository: {{repository_name}}`;
 		await buildIssueContextPrompt(mockIssue, [mockConfig.repositories[0]]);
 
 		// Check that version was NOT logged
-		const versionLogs = logSpy.mock.calls.filter((call) =>
-			call[0]?.includes("Prompt template version:"),
-		);
-		expect(versionLogs).toHaveLength(0);
+		try {
+			expect(
+				recorder.sink.findAll({ message: "Prompt template version:" }),
+			).toHaveLength(0);
+		} finally {
+			recorder.restore();
+		}
 	});
 });

@@ -533,6 +533,56 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      JSON**, deliberately not envelope-encrypted, so it works without the *Key
      Vault Crypto User* role. Never store a credential on that row.
 
+13. **Logging sinks and OpenTelemetry export**:
+   - `ILogger` is the chokepoint for ~957 log calls, but adopting it does **not**
+     by itself produce queryable fields — the console sink renders
+     `prefix + message`, i.e. prose. The structured payload exists only on the
+     forwarding path, so the extension point is the `LogSink` seam
+     (`packages/core/src/logging/LogSink.ts`), not the logger interface.
+   - `setGlobalLogSink` is **single-slot and clobbers**. `EdgeWorker` installs
+     `RouterLogForwarder` when it connects to a router, and the router process
+     installs `OtelLogSink`; these never collide today only because they are
+     different processes. If you need two destinations in one process, add a
+     composite — do not have two components race to install.
+   - **Any new sink must guard re-entrancy.** A sink is called FROM the logger,
+     and everything under it (`ws`, an OTLP exporter, `@azure/core-rest-pipeline`)
+     can log. One unguarded log line on the write path turns a single record into
+     an unbounded loop. Both existing sinks use an `inWrite` flag and never log
+     anything themselves. Cap message/args/attribute sizes too: these
+     destinations are billed per GB.
+   - **OTel logs need no ESM loader hook.** `register()` / `--import` are for
+     *auto-instrumentation*, which monkey-patches modules and so must run before
+     they are imported. `cyrus-otel-logs` calls the Logs API directly from a sink
+     the app installs, so it has no import-order constraint and can start
+     anywhere in the bootstrap. It also deliberately does not register a global
+     OTel logger provider — that would capture any dependency that grabs a logger
+     off the global API, making the volume we pay for depend on our dep tree.
+   - **`cyrus-otel-logs` must stay vendor-neutral, and `packages/core` must stay
+     Azure-free.** The exporter is a constructor argument, and
+     `cloud.provider` / `cloud.platform` are inputs to
+     `buildResourceAttributes`, never defaults. Everything Azure lives in
+     `packages/router/src/telemetry/otelLogging.ts` — the only file importing
+     `@azure/monitor-opentelemetry-exporter`. Do not add OTel to
+     `packages/core`: it is depended on by every runner and the CLI, so the cost
+     lands on upstream installs that never export anything.
+   - **OTLP records land in `AppTraces`, NOT `ContainerAppConsoleLogs_CL`.**
+     Every saved search and alert rule in `infra/azure/bicep/modules/monitoring.bicep`
+     reads the console table and is blind to OTLP records. `service.name` becomes
+     `AppRoleName`, `service.instance.id` becomes `AppRoleInstance`, everything
+     else is a key in `Properties`. The Application Insights component must be
+     **workspace-based**; classic mode keeps its own store, out of reach of those
+     queries.
+   - OTLP attribute keys deliberately mirror the Phase 0 JSON console format
+     (`component`, `sessionId`, `issueIdentifier`, `repository`, `event`, `args`)
+     rather than semconv. OTel defines no semconv for them and operators have
+     queries against those names; renaming breaks every saved query for no gain.
+   - **Assert on log records, not console output.** Use `RecordingLogSink` /
+     `installRecordingLogSink` from `cyrus-core`. Regexing a rendered line
+     couples the test to a timestamp format, a level-label width, and
+     `CYRUS_LOG_FORMAT` — none of which are what the test is about. `restore()`
+     puts back the *previous* sink, not the no-op, so a nested recorder cannot
+     disarm an outer one.
+
 ## Dependency Security Policy (MANDATE)
 
 > **Config location (pnpm ≥10):** The root `package.json` `pnpm` field

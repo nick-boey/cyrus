@@ -49,6 +49,13 @@ param setupUiIdTokenAudience string
 param setupUiAllowedDomain string
 param setupUiAutoProvisionUsers bool
 
+param enableOtelLogs bool
+param otelLogsLevel string
+param deploymentEnvironment string
+
+@secure()
+param applicationInsightsConnectionString string
+
 var entraEnabled = !empty(entraTenantId) && !empty(entraAudience)
 
 // Linear secrets sourced from Key Vault via the router identity (Key Vault
@@ -83,6 +90,17 @@ var setupAuthSecrets = enableSetupAuth
         name: 'setup-ui-token-store-sas'
         keyVaultUrl: '${keyVaultUri}secrets/setup-ui-token-store-sas'
         identity: routerIdentityId
+      }
+    ]
+  : []
+
+// Inline ACA secret rather than a Key Vault round trip: this value is computed
+// from a resource in the same deployment, not supplied or rotated by an operator.
+var otelSecrets = enableOtelLogs
+  ? [
+      {
+        name: 'appinsights-connection-string'
+        value: applicationInsightsConnectionString
       }
     ]
   : []
@@ -144,6 +162,35 @@ var baseEnv = [
     value: routerIdentityClientId
   }
 ]
+
+var otelEnv = concat(
+  [
+    {
+      name: 'CYRUS_OTEL_LOGS_ENABLED'
+      value: string(enableOtelLogs)
+    }
+    {
+      name: 'CYRUS_OTEL_LOGS_LEVEL'
+      value: otelLogsLevel
+    }
+    {
+      name: 'CYRUS_OTEL_DEPLOYMENT_ENV'
+      value: deploymentEnvironment
+    }
+    {
+      name: 'CYRUS_OTEL_CLOUD_REGION'
+      value: location
+    }
+  ],
+  enableOtelLogs
+    ? [
+        {
+          name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+          secretRef: 'appinsights-connection-string'
+        }
+      ]
+    : []
+)
 
 // Entra env is optional and uses the canonical entrypoint/Zod names. It governs
 // enrollment bearer tokens for /enroll and says nothing about setup identity.
@@ -241,7 +288,7 @@ resource routerApp 'Microsoft.App/containerApps@2024-03-01' = {
         ]
         customDomains: customDomains
       }
-      secrets: concat(linearSecrets, setupAuthSecrets)
+      secrets: concat(linearSecrets, setupAuthSecrets, otelSecrets)
       registries: empty(acrLoginServer)
         ? []
         : [
@@ -260,7 +307,7 @@ resource routerApp 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.5')
             memory: '1Gi'
           }
-          env: concat(baseEnv, entraEnv, setupUiEnv)
+          env: concat(baseEnv, otelEnv, entraEnv, setupUiEnv)
           volumeMounts: [
             {
               volumeName: 'artifacts'
