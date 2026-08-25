@@ -7,6 +7,7 @@ import {
 	RPC_METHODS,
 	SESSION_SCOPED_RPC_METHODS,
 	SESSIONS_QUERY_CAPABILITY,
+	SPAN_INGEST_CAPABILITY,
 } from "../src/index.js";
 
 describe("frames", () => {
@@ -253,5 +254,156 @@ describe("log frames", () => {
 			JSON.stringify({ type: "hello_ack", user: {}, serverVersion: "1" }),
 		);
 		expect(legacy).not.toHaveProperty("capabilities");
+	});
+});
+
+describe("span frames", () => {
+	const TRACE_ID = "0af7651916cd43dd8448eb211c80319c";
+	const SPAN_ID = "b7ad6b7169203331";
+
+	const span = {
+		traceId: TRACE_ID,
+		spanId: SPAN_ID,
+		traceFlags: 1,
+		name: "session.turn",
+		kind: 1,
+		startTime: [1_800_000_000, 250_000_000],
+		endTime: [1_800_000_004, 100_000_000],
+		statusCode: 0,
+	};
+
+	it("parses a minimal span frame", () => {
+		const frame = parseDeviceFrame(
+			JSON.stringify({ type: "span", spans: [span] }),
+		);
+		if (frame.type !== "span") throw new Error("wrong type");
+		expect(frame.spans).toHaveLength(1);
+		expect(frame.spans[0]?.traceId).toBe(TRACE_ID);
+	});
+
+	it("carries the originating process's resource so the router does not restamp it", () => {
+		const frame = parseDeviceFrame(
+			JSON.stringify({
+				type: "span",
+				resource: { "service.name": "cyrus-worker" },
+				spans: [span],
+			}),
+		);
+		if (frame.type !== "span") throw new Error("wrong type");
+		expect(frame.resource).toEqual({ "service.name": "cyrus-worker" });
+	});
+
+	it("keeps HrTime as a two-element tuple", () => {
+		// A millisecond number would discard the sub-millisecond precision that
+		// is the whole reason to look at a span.
+		const frame = parseDeviceFrame(
+			JSON.stringify({ type: "span", spans: [span] }),
+		);
+		if (frame.type !== "span") throw new Error("wrong type");
+		expect(frame.spans[0]?.startTime).toEqual([1_800_000_000, 250_000_000]);
+	});
+
+	it("rejects a wrong-length trace id", () => {
+		// A malformed id breaks the backend's own parsing; better to refuse it at
+		// the door than to ship a batch that silently disappears downstream.
+		expect(() =>
+			parseDeviceFrame(
+				JSON.stringify({
+					type: "span",
+					spans: [{ ...span, traceId: "too-short" }],
+				}),
+			),
+		).toThrow();
+	});
+
+	it("rejects an empty batch", () => {
+		expect(() =>
+			parseDeviceFrame(JSON.stringify({ type: "span", spans: [] })),
+		).toThrow();
+	});
+
+	it("rejects a null attribute value", () => {
+		// Unlike a log attribute, OTel has no null span attribute — accepting one
+		// would mean inventing a representation for it on the way back out.
+		expect(() =>
+			parseDeviceFrame(
+				JSON.stringify({
+					type: "span",
+					spans: [{ ...span, attributes: { k: null } }],
+				}),
+			),
+		).toThrow();
+	});
+
+	it("carries the device's dropped count so a truncated stream says so", () => {
+		const frame = parseDeviceFrame(
+			JSON.stringify({ type: "span", spans: [span], dropped: 7 }),
+		);
+		if (frame.type !== "span") throw new Error("wrong type");
+		expect(frame.dropped).toBe(7);
+	});
+
+	it("is gated by a router-advertised capability, not a version bump", () => {
+		const ack = parseServerFrame(
+			JSON.stringify({
+				type: "hello_ack",
+				user: {},
+				serverVersion: "1",
+				capabilities: [LOG_INGEST_CAPABILITY, SPAN_INGEST_CAPABILITY],
+			}),
+		);
+		if (ack.type !== "hello_ack") throw new Error("wrong type");
+		expect(ack.capabilities).toContain("span_ingest");
+		expect(PROTOCOL_VERSION).toBe(2);
+	});
+});
+
+describe("trace context on dispatch frames", () => {
+	const TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+	it("carries trace context on an event frame", () => {
+		const frame = parseServerFrame(
+			JSON.stringify({
+				type: "event",
+				seq: 1,
+				event: {},
+				traceparent: TRACEPARENT,
+				tracestate: "vendor=v",
+			}),
+		);
+		if (frame.type !== "event") throw new Error("wrong type");
+		expect(frame.traceparent).toBe(TRACEPARENT);
+		expect(frame.tracestate).toBe("vendor=v");
+	});
+
+	it("carries trace context on an rpc_request frame", () => {
+		const frame = parseDeviceFrame(
+			JSON.stringify({
+				type: "rpc_request",
+				id: "r1",
+				method: "fetchIssue",
+				params: ["ABC-1"],
+				traceparent: TRACEPARENT,
+			}),
+		);
+		if (frame.type !== "rpc_request") throw new Error("wrong type");
+		expect(frame.traceparent).toBe(TRACEPARENT);
+	});
+
+	it("treats trace context as optional on both", () => {
+		// A build without tracing sends neither, and both sides must tolerate it.
+		expect(
+			parseServerFrame(JSON.stringify({ type: "event", seq: 1, event: {} })),
+		).not.toHaveProperty("traceparent");
+		expect(
+			parseDeviceFrame(
+				JSON.stringify({
+					type: "rpc_request",
+					id: "r1",
+					method: "fetchIssue",
+					params: [],
+				}),
+			),
+		).not.toHaveProperty("traceparent");
 	});
 });

@@ -9,6 +9,13 @@ import {
 	type LogEventAttributes,
 	type Webhook,
 } from "cyrus-core";
+import {
+	cyrusSpanAttributes,
+	injectTraceContext,
+	SpanKind,
+	withSpan,
+	withSpanSync,
+} from "cyrus-otel-traces";
 import type { SessionStateFrame } from "cyrus-router-protocol";
 import {
 	type ContainerTargetService,
@@ -46,6 +53,7 @@ import type {
 	TerminalTeardown,
 	TerminalTeardownAction,
 } from "./TerminalTeardown.js";
+import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
 /**
  * `agentSessionCreated` and `agentSessionPrompted` webhooks are the same
@@ -228,8 +236,37 @@ export class EventRouter {
 		this.now = opts.now ?? Date.now;
 	}
 
+	/**
+	 * Route one inbound webhook.
+	 *
+	 * The span wrapping this is the pivot of the whole trace. `RouterServer`
+	 * invokes it as `void route(event)` from inside the webhook handler, so it
+	 * inherits the HTTP server span's context but outlives the HTTP response —
+	 * which is the honest shape of the work and exactly what a trace should
+	 * show. Everything downstream (target resolution, repository selection,
+	 * container boot, the event the sandbox worker eventually picks up) hangs
+	 * off this span.
+	 */
 	async route(event: AgentEvent): Promise<void> {
 		const webhook = event as unknown as Webhook;
+		return withSpan(
+			routerTracer(),
+			ROUTER_SPANS.route,
+			{
+				// CONSUMER, not SERVER: the HTTP exchange is already covered by the
+				// Fastify span above this one. What this span measures is the
+				// consumption of a message that arrived over it.
+				kind: SpanKind.CONSUMER,
+				attributes: cyrusSpanAttributes({
+					webhook_type: webhook.type,
+					webhook_action: webhook.action,
+				}),
+			},
+			() => this.routeInner(webhook),
+		);
+	}
+
+	private async routeInner(webhook: Webhook): Promise<void> {
 		// Duplicate-delivery gate, BEFORE any routing work. A rolling deployment
 		// overlaps the outgoing and incoming router revision, so the same webhook
 		// (a Linear retry, or the same durable work replayed after a restart) can
@@ -378,6 +415,7 @@ export class EventRouter {
 			JSON.stringify(webhook),
 			this.now(),
 			this.config.eventTtlMs,
+			injectTraceContext(),
 		);
 		if (this.gateway.isOnline(deviceId)) {
 			this.gateway.deliverPending(deviceId);
@@ -815,7 +853,39 @@ export class EventRouter {
 	 * repository nobody has chosen yet. Waiting here costs nothing, which is the
 	 * whole point of asking on the router rather than inside a container.
 	 */
-	private async ensureRepositoryDecision(
+	private ensureRepositoryDecision(
+		webhook: SessionEvent,
+		issueKey: string,
+		workspaceId: string,
+		issueId: string | undefined,
+	): Promise<"ready" | "held"> {
+		// Worth its own span because `"held"` is a wait on a HUMAN — the router
+		// posted an elicitation and nothing boots until someone answers. Without
+		// this the gap shows up as an unexplained multi-minute hole between the
+		// webhook and the boot.
+		return withSpan(
+			routerTracer(),
+			ROUTER_SPANS.resolveRepository,
+			{
+				attributes: cyrusSpanAttributes({
+					issue_key: issueKey,
+					workspace_id: workspaceId,
+				}),
+			},
+			async (span) => {
+				const outcome = await this.ensureRepositoryDecisionInner(
+					webhook,
+					issueKey,
+					workspaceId,
+					issueId,
+				);
+				span.setAttributes(cyrusSpanAttributes({ outcome }));
+				return outcome;
+			},
+		);
+	}
+
+	private async ensureRepositoryDecisionInner(
 		webhook: SessionEvent,
 		issueKey: string,
 		workspaceId: string,
@@ -1519,16 +1589,46 @@ export class EventRouter {
 		issueId: string | undefined,
 		creator: SessionEvent["agentSession"]["creator"] | undefined,
 	): { target: ResolvedTarget | undefined; invalidIssueKey?: string } {
-		try {
-			return {
-				target: this.resolveTarget(webhook, sessionId, issueId, creator),
-			};
-		} catch (err) {
-			if (err instanceof InvalidIssueKeyError) {
-				return { target: undefined, invalidIssueKey: err.issueKey };
-			}
-			throw err;
-		}
+		// The routing DECISION, spanned separately from the routing work around
+		// it. It is fast — a handful of SQLite reads — so it is not here for its
+		// duration; it is here because `cyrus.outcome` on this span is the single
+		// attribute that answers "why did this issue go to that machine", which
+		// is otherwise reconstructible only by reading four log lines in order.
+		return withSpanSync(
+			routerTracer(),
+			ROUTER_SPANS.resolveTarget,
+			{ attributes: cyrusSpanAttributes({ session_id: sessionId }) },
+			(span) => {
+				try {
+					const target = this.resolveTarget(
+						webhook,
+						sessionId,
+						issueId,
+						creator,
+					);
+					span.setAttributes(
+						cyrusSpanAttributes({
+							outcome: target ? "resolved" : "unroutable",
+							device_id: target?.deviceId,
+							target_kind: target?.kind,
+						}),
+					);
+					return { target };
+				} catch (err) {
+					if (err instanceof InvalidIssueKeyError) {
+						// Not recorded as a span error: an unusable issue key is a
+						// rejected input, not a router fault, and the caller turns it
+						// into a user-facing message. Marking it red would put it in
+						// the same bucket as a database failure.
+						span.setAttributes(
+							cyrusSpanAttributes({ outcome: "invalid_issue_key" }),
+						);
+						return { target: undefined, invalidIssueKey: err.issueKey };
+					}
+					throw err;
+				}
+			},
+		);
 	}
 
 	/**
@@ -1700,17 +1800,49 @@ export class EventRouter {
 		return undefined;
 	}
 
-	private async deliverOrNotify(
+	private deliverOrNotify(
 		event: SessionEvent,
 		target: ResolvedTarget,
 		sessionId: string,
 		workspaceId: string,
 	): Promise<void> {
+		return withSpan(
+			routerTracer(),
+			ROUTER_SPANS.dispatch,
+			{
+				// PRODUCER: this hands the event to a queue that another process
+				// consumes. The matching CONSUMER span is the worker's, minted when
+				// `RouterConnection` delivers the `event` frame — which is what makes
+				// the two halves of the trace meet.
+				kind: SpanKind.PRODUCER,
+				attributes: cyrusSpanAttributes({
+					device_id: target.deviceId,
+					target_kind: target.kind,
+					session_id: sessionId,
+					workspace_id: workspaceId,
+				}),
+			},
+			() => this.deliverOrNotifyInner(event, target, sessionId, workspaceId),
+		);
+	}
+
+	private async deliverOrNotifyInner(
+		event: SessionEvent,
+		target: ResolvedTarget,
+		sessionId: string,
+		workspaceId: string,
+	): Promise<void> {
+		// Captured HERE, at enqueue time, and persisted with the row. The device
+		// may be offline for minutes — a cold container boot, a suspended
+		// sandbox — and `deliverPending` runs from a socket callback with no
+		// relation to this call stack, so a context derived at send time would
+		// attach the event to the wrong thing entirely.
 		this.store.enqueueEvent(
 			target.deviceId,
 			JSON.stringify(event),
 			this.now(),
 			this.config.eventTtlMs,
+			injectTraceContext(),
 		);
 
 		if (this.gateway.isOnline(target.deviceId)) {

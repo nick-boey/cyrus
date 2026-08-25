@@ -1200,3 +1200,75 @@ describe("pending repository selections", () => {
 		expect(store.getPendingRepoSelection("sess-2")).toBeDefined();
 	});
 });
+
+describe("RouterStore trace context on queued events", () => {
+	const TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+	it("persists the enqueue-time trace context with the row", () => {
+		// It must be the ENQUEUE-time context, not one derived at delivery: the
+		// two are routinely minutes apart (an offline device, a cold sandbox
+		// boot), and that gap is exactly what the trace exists to show.
+		const { store, device } = storeWithDevice();
+		store.enqueueEvent(device.deviceId, "{}", NOW, 60_000, {
+			traceparent: TRACEPARENT,
+			tracestate: "vendor=v",
+		});
+
+		const [pending] = store.pendingEvents(device.deviceId, 0, NOW);
+		expect(pending?.traceparent).toBe(TRACEPARENT);
+		expect(pending?.tracestate).toBe("vendor=v");
+	});
+
+	it("omits the fields entirely when tracing is off", () => {
+		// The caller spreads these into a frame the protocol schema validates, so
+		// an explicit `undefined` key would be a trap; absence is the contract.
+		const { store, device } = storeWithDevice();
+		store.enqueueEvent(device.deviceId, "{}", NOW, 60_000);
+
+		const [pending] = store.pendingEvents(device.deviceId, 0, NOW);
+		expect(pending).not.toHaveProperty("traceparent");
+		expect(pending).not.toHaveProperty("tracestate");
+	});
+
+	it("carries trace context across a seq-regression resequence", () => {
+		// A resequenced event is the SAME event under a new seq. Dropping its
+		// trace context would silently detach exactly the deliveries a seq
+		// regression (NOR-263) makes interesting to trace.
+		const { store, device } = storeWithDevice();
+		store.enqueueEvent(device.deviceId, "{}", NOW, 60_000, {
+			traceparent: TRACEPARENT,
+		});
+
+		const result = store.reconcileDeviceSeq(device.deviceId, 50, NOW);
+		expect(result.repaired).toBe(true);
+		expect(result.resequenced).toBe(1);
+
+		const [pending] = store.pendingEvents(device.deviceId, 0, NOW);
+		expect(pending?.seq).toBe(51);
+		expect(pending?.traceparent).toBe(TRACEPARENT);
+	});
+
+	it("migrates a database that predates the columns", () => {
+		// Deliberately not backfilled: a row enqueued before this column existed
+		// was produced by a router that had no trace to record. NULL is honest,
+		// and the delivery path reads it as "no trace context".
+		const dir = mkdtempSync(join(tmpdir(), "router-store-trace-"));
+		const dbPath = join(dir, "router.db");
+		const raw = new Database(dbPath);
+		raw.exec(V1_SCHEMA);
+		raw.close();
+
+		const store = new RouterStore(dbPath);
+		store.addUser({ email: "alice@example.com" });
+		const code = store.mintEnrollmentCode("alice@example.com", NOW);
+		const device = store.redeemEnrollmentCode(code, NOW + 1000);
+		if (!device) throw new Error("redeem failed");
+
+		store.enqueueEvent(device.deviceId, "{}", NOW, 60_000, {
+			traceparent: TRACEPARENT,
+		});
+		expect(store.pendingEvents(device.deviceId, 0, NOW)[0]?.traceparent).toBe(
+			TRACEPARENT,
+		);
+	});
+});

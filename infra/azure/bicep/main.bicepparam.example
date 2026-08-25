@@ -259,3 +259,15 @@ param enableMonitoringAlerts = true
 // workspace. Disable to omit Application Insights and its router env/secret.
 param enableOtelLogs = true
 param otelLogsLevel = 'INFO'
+
+// Distributed tracing across the router and the sandbox worker. Requires
+// enableOtelLogs (that is what creates the Application Insights component both
+// signals share). Spans land in AppRequests/AppDependencies — a different pair
+// of tables from either stdout or OTLP logs.
+//
+// The ratio is a decimal STRING because Bicep has no float type. It applies
+// only to root spans: a sandbox always inherits the router's decision, so a
+// trace is never half-collected. See
+// docs/adr/0004-parent-based-head-sampling-for-traces.md.
+param enableOtelTraces = true
+param otelTracesSampleRatio = '1'

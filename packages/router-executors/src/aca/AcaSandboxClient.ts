@@ -13,6 +13,17 @@
  * provider (Task 5) layers issue↔sandbox mapping on top via labels.
  */
 
+import {
+	cyrusSpanAttributes,
+	getTracer,
+	type Span,
+	SpanKind,
+	withSpan,
+} from "cyrus-otel-traces";
+
+/** Instrumentation scope for ACA data-plane dependency spans. */
+const ACA_TRACER_NAME = "cyrus-aca-client";
+
 export type AcaSandboxState =
 	| "Running"
 	| "Stopped"
@@ -292,7 +303,7 @@ export class AcaSandboxClient {
 	 * 403 (RBAC propagation) is retried inside this helper with the same
 	 * token; 401 (wrong audience) is never retried.
 	 */
-	private async request<T>(
+	private request<T>(
 		method: string,
 		path: string,
 		body?: unknown,
@@ -300,6 +311,47 @@ export class AcaSandboxClient {
 			okOn404?: boolean;
 			query?: Record<string, string>;
 			/** Override the per-attempt deadline; see {@link SLOW_OPERATION_TIMEOUT_MS}. */
+			timeoutMs?: number;
+		},
+	): Promise<T | null> {
+		// Every ACA data-plane call gets a dependency span. This is the reason
+		// Phase 5 lists dependency spans as a work item at all: Node's `fetch`
+		// has NO default timeout, which is why each attempt carries an explicit
+		// `requestTimeoutMs` deadline — and a call that sits on that deadline for
+		// two minutes is, from every other signal we have, indistinguishable from
+		// a call that was never made. The span makes the stall itself the thing
+		// you can see.
+		return withSpan(
+			getTracer(ACA_TRACER_NAME),
+			"aca.request",
+			{
+				kind: SpanKind.CLIENT,
+				attributes: {
+					"http.request.method": method,
+					"server.address": new URL(this.baseUrl).host,
+					...cyrusSpanAttributes({
+						"aca.operation": operationTemplate(path),
+						// `0` means timeouts are disabled (tests); emitted as absent
+						// rather than as a literal zero, which would read in a
+						// dashboard as "the deadline was zero milliseconds".
+						"aca.timeout_ms":
+							opts?.timeoutMs ?? (this.requestTimeoutMs || undefined),
+						"aca.region": this.region,
+					}),
+				},
+			},
+			(span) => this.requestTraced<T>(span, method, path, body, opts),
+		);
+	}
+
+	private async requestTraced<T>(
+		span: Span,
+		method: string,
+		path: string,
+		body?: unknown,
+		opts?: {
+			okOn404?: boolean;
+			query?: Record<string, string>;
 			timeoutMs?: number;
 		},
 	): Promise<T | null> {
@@ -319,8 +371,14 @@ export class AcaSandboxClient {
 		let lastBody: any;
 		for (let attempt = 0; attempt <= RBAC_403_RETRY_MAX; attempt++) {
 			const signal = this.timeoutSignal(opts?.timeoutMs);
+			// Recorded before the await, not after: if this attempt is the one that
+			// hangs until the deadline, the attempt count is the only thing that
+			// distinguishes "the first call stalled" from "we burned the whole
+			// RBAC retry budget and the last one stalled".
+			span.setAttribute("cyrus.aca.attempt", attempt);
 			const r = await this.fetchFn(url, signal ? { ...init, signal } : init);
 			lastStatus = r.status;
+			span.setAttribute("http.response.status_code", r.status);
 			const text = await r.text();
 			let parsed: unknown;
 			if (text) {
@@ -622,4 +680,52 @@ export class AcaSandboxClient {
 		);
 		return r ?? ({} as AcaDiskImage);
 	}
+}
+
+/**
+ * Reduce a request path to a LOW-CARDINALITY operation name for the span.
+ *
+ * A span attribute that is unique per call is a column full of noise: you
+ * cannot group by it, average over it, or alert on it, and in a backend that
+ * indexes attributes it is pure cost. The raw path is exactly that — it carries
+ * a subscription id, a resource group, a sandbox group and a server-assigned
+ * sandbox GUID, so every call produces a distinct value.
+ *
+ * The ARM prefix is stripped rather than templated because it is invariant for
+ * a given deployment: it identifies the router's own sandbox group, which is
+ * already implied by `service.name` and `cloud.region`, and it is the longest
+ * part of the string. What remains — `sandboxes/{id}/stop`, `snapshots`,
+ * `diskimages` — is the part that says what the call was actually for.
+ *
+ * The concrete sandbox id is deliberately NOT re-added as its own attribute
+ * here. `AcaSandboxesProvider` already stamps `cyrus.issue_key` on the spans
+ * above this one, and the issue key is the identifier an operator has in hand;
+ * the ACA GUID is a lookup away from it and nobody starts a debugging session
+ * holding one.
+ */
+function operationTemplate(path: string): string {
+	// Everything up to and including the sandbox group is deployment-invariant.
+	const afterGroup = path.replace(
+		/^\/subscriptions\/[^/]+\/resourceGroups\/[^/]+\/sandboxGroups\/[^/]+\/?/,
+		"",
+	);
+	const trimmed = (afterGroup || path).replace(/^\/+/, "");
+	if (!trimmed) return "sandboxGroup";
+	// Collapse identifier segments. A sandbox name is a server-assigned GUID and
+	// a snapshot/disk-image name is user-chosen, so both are matched positionally
+	// — the segment after a known collection — rather than by trying to
+	// recognise the value, which would let a well-formed name slip through as a
+	// literal and split one operation into two.
+	return trimmed
+		.split("/")
+		.map((segment, index, all) => {
+			if (index === 0) return segment;
+			const parent = all[index - 1];
+			return parent === "sandboxes" ||
+				parent === "snapshots" ||
+				parent === "diskimages"
+				? "{name}"
+				: segment;
+		})
+		.join("/");
 }

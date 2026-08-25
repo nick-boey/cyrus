@@ -52,6 +52,14 @@ export const RESERVED_ENV_KEYS = [
 	"CYRUS_REPOS_JSON",
 	"CYRUS_WORKSPACES_DIR",
 	"CYRUS_REPO_CACHE_DIR",
+	// Tracing switches are propagated from the ROUTER's own env
+	// (`ContainerTargets.buildEnv`), and must stay in lockstep with it. A user
+	// who could set these per-sandbox could produce a trace the router sampled
+	// and the worker did not — a half-collected trace, which renders as a
+	// complete story with a hole in the middle. See
+	// `docs/adr/0004-parent-based-head-sampling-for-traces.md`.
+	"CYRUS_OTEL_TRACES_ENABLED",
+	"CYRUS_OTEL_TRACES_SAMPLE_RATIO",
 	"PATH",
 	"HOME",
 	"NODE_OPTIONS",

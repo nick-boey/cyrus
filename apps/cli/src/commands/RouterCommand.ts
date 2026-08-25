@@ -8,8 +8,10 @@ import {
 import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import { resolvePath } from "cyrus-core";
+import { buildResourceAttributes } from "cyrus-otel-logs";
 import {
 	buildGitHubTokenScopeReport,
+	buildRouterResourceInput,
 	type ContainerDeviceInfo,
 	createAcaSandboxesProvider,
 	createSetupIdTokenVerifier,
@@ -31,6 +33,7 @@ import {
 	type SecretStoreBackend,
 	type SessionInfo,
 	startRouterOtelLogging,
+	startRouterOtelTracing,
 	TableSecretStore,
 } from "cyrus-router";
 import { z } from "zod";
@@ -639,17 +642,39 @@ export class RouterCommand extends BaseCommand {
 		// constraint applies: this is a logs bridge, not auto-instrumentation.
 		// Returns undefined unless CYRUS_OTEL_LOGS_ENABLED is explicitly set, in
 		// which case everything below behaves exactly as before.
-		const otel = startRouterOtelLogging({
-			logger: this.logger,
+		const resourceOptions = {
 			serviceVersion: this.app.version,
 			// `containers.aca.region` is the sandboxes' region; see the option's
 			// doc comment on why it is a fallback rather than the primary source.
 			...(parsed.data.containers?.aca?.region
 				? { fallbackRegion: parsed.data.containers.aca.region }
 				: {}),
+		};
+
+		const otel = startRouterOtelLogging({
+			logger: this.logger,
+			...resourceOptions,
+		});
+
+		// Traces, on their own flag. Started here rather than inside RouterServer
+		// so the global tracer provider is registered before anything the server
+		// constructor does can start a span, and so `RouterServerConfig` stays a
+		// plain serialisable object with no OTel in its type.
+		//
+		// Given the SAME resource the logs pipeline derived, so one replica's
+		// logs and traces agree about `service.instance.id` and can be joined.
+		const tracing = startRouterOtelTracing({
+			logger: this.logger,
+			resourceAttributes: buildResourceAttributes(
+				buildRouterResourceInput(resourceOptions, process.env),
+			),
 		});
 
 		const server = await RouterServer.create(config);
+		// Relayed sandbox spans go to the SAME exporter as the router's own, so
+		// both halves of a trace share one connection, one retry store, and one
+		// flush at shutdown.
+		if (tracing) server.setSpanExporter(tracing.exporter);
 		await server.start();
 		this.logSuccess(`Router server listening on port ${server.port}`);
 
@@ -670,6 +695,11 @@ export class RouterCommand extends BaseCommand {
 			// would lose them anyway AND skip the rest of this handler.
 			if (otel) {
 				await withTimeout(otel.shutdown(), OTEL_SHUTDOWN_TIMEOUT_MS);
+			}
+			// Same bound, same reasoning, and separately awaited so a hung log
+			// flush cannot eat the trace flush's budget as well.
+			if (tracing) {
+				await withTimeout(tracing.handle.shutdown(), OTEL_SHUTDOWN_TIMEOUT_MS);
 			}
 			process.exit(0);
 		};

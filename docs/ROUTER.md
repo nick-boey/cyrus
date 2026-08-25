@@ -234,6 +234,10 @@ runs — branch and `sha-*` tags (amd64 + arm64).
 | `CYRUS_OTEL_LOGS_ENABLED` | no | `false` | not config-backed — master switch for OTLP log export (see "OpenTelemetry log export") |
 | `CYRUS_OTEL_LOGS_LEVEL` | no | `INFO` | minimum level exported over OTLP; independent of `CYRUS_LOG_LEVEL` |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | when OTLP is on | — | the OTLP endpoint. Absent while `CYRUS_OTEL_LOGS_ENABLED` is set, the router warns and stays on stdout only |
+| `CYRUS_OTEL_TRACES_ENABLED` | no | `false` | not config-backed — master switch for distributed tracing (see "Distributed tracing"). Propagated into every sandbox the router boots |
+| `CYRUS_OTEL_TRACES_SAMPLE_RATIO` | no | `1` | root-span head-sampling ratio, `0`–`1`. Never consulted for a span with a remote parent |
+| `CYRUS_SPAN_FORWARD_RATE` | no | `200` | worker-side only — sustained forwarded spans/second |
+| `CYRUS_SPAN_FORWARD_BURST` | no | `2000` | worker-side only — span-forwarding burst capacity |
 | `CYRUS_OTEL_SERVICE_NAME` | no | `CONTAINER_APP_NAME`, else `cyrus-router` | `service.name` |
 | `CYRUS_OTEL_SERVICE_VERSION` | no | the CLI version, else `CONTAINER_APP_REVISION` | `service.version` |
 | `CYRUS_OTEL_SERVICE_INSTANCE_ID` | no | `CONTAINER_APP_REPLICA_NAME`, else the hostname | `service.instance.id` |
@@ -507,6 +511,127 @@ on its first line and reconnect straight into the same loop. The protocol versio
 is deliberately *not* bumped for this — a bump would reject every not-yet-updated
 worker outright, which is far worse than not shipping its logs. An old router
 simply never advertises, and an old worker never sends.
+
+### Distributed tracing
+
+Logs answer *what happened*. Traces answer *why did this take four minutes*. A
+Cyrus trace follows one unit of work — Linear webhook → routing decision →
+container boot → device dispatch → agent session — across the router/sandbox
+process boundary, so the whole thing renders as a single timeline.
+
+Off by default. `CYRUS_OTEL_TRACES_ENABLED=true` turns it on, and it needs
+`APPLICATIONINSIGHTS_CONNECTION_STRING` (the same endpoint OTLP log export uses).
+The Azure stack wires both from `enableOtelTraces`, which the template refuses to
+accept without `enableOtelLogs` — that flag is what creates the Application
+Insights component.
+
+**Where the spans land is a third pair of tables.** Not
+`ContainerAppConsoleLogs_CL` (router stdout), not `AppTraces` (OTLP log records)
+— Application Insights splits spans by kind:
+
+| Span kind | Table |
+|---|---|
+| `SERVER`, `CONSUMER` | `AppRequests` |
+| `CLIENT`, `PRODUCER`, `INTERNAL` | `AppDependencies` |
+
+Everything joins on `OperationId`, which is Application Insights' name for the
+W3C trace id. `service.name` becomes `AppRoleName`; every `cyrus.*` attribute is
+a key in `Properties` and **must be read with bracket syntax** —
+`Properties.cyrus.issue_key` parses as a nested lookup and silently returns
+null.
+
+The span vocabulary:
+
+| Span | Kind | What it measures |
+|---|---|---|
+| `{METHOD} {route}` | server | One HTTP request. `/healthz` is deliberately excluded. |
+| `router.route` | consumer | One webhook, from idempotency claim to dispatch or refusal. |
+| `router.resolve_target` | internal | The routing decision. `cyrus.outcome` says why it went where it went. |
+| `router.resolve_repository` | internal | Repository selection — including a `held` wait on a human answering an elicitation. |
+| `router.dispatch` | producer | Queueing the event, and sending it if the device is online. |
+| `sandbox.boot` | client | Booting or resuming a container. Usually the answer to "why four minutes". |
+| `sandbox.sweep` | internal | One lifecycle sweep tick; root for the ACA calls it makes. |
+| `aca.request` | client | One ACA data-plane call. Carries `cyrus.aca.timeout_ms`. |
+| `linear.request` | client | One device RPC and the Linear round-trip behind it. |
+| `worker.event_received` | consumer | The sandbox picking the event up. **This is where the two halves join.** |
+| `session.query` / `session.resume` | internal | One agent query, start to terminal state. The far end of the trace. |
+
+**How the join works.** `router.dispatch` captures W3C trace context at *enqueue*
+time and persists it in the `events` row, not just on the wire. The gap between
+enqueue and delivery is routinely minutes — an offline device, a cold sandbox
+boot — and that gap is precisely what the trace exists to show, so a context
+derived at send time would attach the event to an unrelated socket callback.
+`RouterConnection` then activates the extracted context around its `event` emit,
+which means every span the worker starts afterwards joins the router's trace with
+no call-site changes at all.
+
+**Sandbox spans ride the same WSS connection as its logs**, as a `span` frame,
+gated by a router-advertised `span_ingest` capability — the same
+negotiate-don't-bump discipline as `log_ingest`. The router rebuilds each span
+and hands it to its own exporter *without re-minting it through a tracer*: a
+tracer would assign a new span id and orphan every child the worker had already
+recorded. Attribution (`cyrus.source: "sandbox"`, `cyrus.device_id`,
+`cyrus.issue_key`) is stamped from the authenticated device row and overrides
+anything the worker claimed; the worker's own `resource` is preserved, so a
+relayed span still says `service.name = cyrus-worker`.
+
+**Sampling is decided once, by the router.** The sampler is
+`ParentBased(root = TraceIdRatioBased(ratio))`, so a sandbox worker never takes
+its own decision — it inherits the one on the incoming `traceparent`. That is
+what stops a trace being *half* collected, which renders as a complete story
+with a hole in the middle and is worse than no trace at all.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CYRUS_OTEL_TRACES_ENABLED` | `false` | Master switch. Propagated by the router into every sandbox it boots. |
+| `CYRUS_OTEL_TRACES_SAMPLE_RATIO` | `1` | Root-span ratio, `0`–`1`. Only applies where there is no remote parent. |
+| `CYRUS_SPAN_FORWARD_RATE` | `200` | Device-side sustained spans/second. |
+| `CYRUS_SPAN_FORWARD_BURST` | `2000` | Device-side bucket capacity. |
+
+The ratio defaults to 1 because root spans here are driven by human actions —
+someone assigns an issue, someone posts a prompt — so the rate is issues-per-day,
+not requests-per-second. Both switches are reserved env keys: a user cannot set
+them on their own sandbox, because a sandbox that disagreed with the router about
+sampling is exactly how you get a half-collected trace. The full reasoning,
+including why tail sampling is not used, is in
+[`docs/adr/0004-parent-based-head-sampling-for-traces.md`](adr/0004-parent-based-head-sampling-for-traces.md).
+
+One issue's whole trace, both processes:
+
+```kql
+let target_issue = "NOR-283";
+let trace_ids =
+    union AppRequests, AppDependencies
+    | where tostring(Properties["cyrus.issue_key"]) == target_issue
+    | distinct OperationId;
+union AppRequests, AppDependencies
+| where OperationId in (trace_ids)
+| project TimeGenerated, trace_id = OperationId, span = Name,
+          service = AppRoleName, duration_ms = DurationMs, ok = Success,
+          origin = coalesce(tostring(Properties["cyrus.source"]), "router")
+| order by trace_id asc, TimeGenerated asc
+```
+
+**Logs stay correlatable even when a trace is not sampled.** A head sampler
+cannot preferentially keep the traces that failed — nothing has failed yet at
+root-span time. What covers that gap is that `traceparent` is stamped onto every
+forwarded log record regardless of the sampled flag, and the sandbox forwarder's
+threshold is `WARN`. So an unsampled trace still leaves a complete, queryable
+error record carrying its trace id; what it loses is the timing breakdown, not
+the fact of the failure.
+
+**HTTP request logging arrived with this.** The router's Fastify instance is
+constructed with no options, which disables its built-in pino logger — until now
+there was no request logging and no timing of any kind. The tracing plugin adds
+both, deliberately through `ILogger` rather than by switching pino on: pino
+writes straight to stdout on its own path, bypassing the `LogSink` seam and
+therefore the OTLP export. 5xx logs at `error`, 4xx at `warn`, everything else at
+`debug`. Query strings are stripped from span names and attributes — several
+router routes carry tokens in query position.
+
+The Azure stack provisions five trace saved searches under the **Cyrus Traces**
+category, including boot-latency percentiles and a query for outbound calls that
+sat on their own deadline.
 
 `cyrus router containers list` renders the same three clocks locally, as
 elapsed durations:

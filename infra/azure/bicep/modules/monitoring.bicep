@@ -47,6 +47,9 @@ param alertEmailReceivers array
 param sandboxUptimeAlertHours int
 param enableOtelLogs bool
 
+@description('Whether distributed tracing is on. Gates the Cyrus Traces saved searches — they query AppRequests/AppDependencies, which stay empty without it, and a saved search that silently returns nothing is worse than no saved search. main.bicep already enforces that this implies enableOtelLogs.')
+param enableOtelTraces bool
+
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
   name: logAnalyticsWorkspaceName
 }
@@ -255,6 +258,187 @@ resource sandboxBootHealth 'Microsoft.OperationalInsights/workspaces/savedSearch
         '| extend unresolved = started - reached_running - failed'
         '| where failed > 0 or unresolved > 0'
         '| order by unresolved desc, failed desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Distributed traces (Phase 5 / NOR-283)
+////////////////////////////////////////////////////////////////////////////////
+//
+// ── A DIFFERENT SET OF TABLES ──
+// Spans do NOT land in ContainerAppConsoleLogs_CL, and they do not land in
+// AppTraces either — that is where Phase 3's LOG records go. Application
+// Insights splits spans by kind: a SERVER or CONSUMER span becomes an
+// AppRequests row and a CLIENT/PRODUCER/INTERNAL span becomes an
+// AppDependencies row. Everything above keys on the console table and is blind
+// to all three, which is why these queries are new rather than amendments.
+//
+// The join key across every table is OperationId — Application Insights' name
+// for the W3C trace id. That is what makes a router log line, a sandbox log
+// line, a router span, and a relayed sandbox span all resolve to one story.
+//
+// ── BRACKET SYNTAX IS MANDATORY ──
+// `customDimensions.cyrus.issue_key` parses as a nested lookup and silently
+// returns null. Every `cyrus.*` attribute must be read as
+// `customDimensions["cyrus.issue_key"]`.
+
+// The headline query: everything that happened for one issue, both processes,
+// in one timeline. This is what "why did this take four minutes" is answered
+// with.
+resource traceForIssue 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = if (enableOtelTraces) {
+  parent: logAnalytics
+  name: 'Cyrus-Trace-For-Issue'
+  properties: {
+    category: 'Cyrus Traces'
+    displayName: 'Full trace for one issue, router + sandbox (edit the issue key)'
+    query: join(
+      [
+        'let target_issue = "REPLACE-ME";'
+        '// Find every trace that touched this issue, from either process.'
+        'let trace_ids ='
+        '    union AppRequests, AppDependencies'
+        '    | where tostring(Properties["cyrus.issue_key"]) == target_issue'
+        '    | distinct OperationId;'
+        'union AppRequests, AppDependencies'
+        '| where OperationId in (trace_ids)'
+        '| project'
+        '    TimeGenerated,'
+        '    trace_id  = OperationId,'
+        '    span      = Name,'
+        '    service   = AppRoleName,'
+        '    duration_ms = DurationMs,'
+        '    ok        = Success,'
+        // cyrus.source is stamped by SandboxSpanRelay and is the one attribute
+        // that says which side of the socket a span came from.
+        '    origin    = coalesce(tostring(Properties["cyrus.source"]), "router"),'
+        '    issue_key = tostring(Properties["cyrus.issue_key"])'
+        '| order by trace_id asc, TimeGenerated asc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// Where the wall-clock actually goes. Ranked by total time rather than by count,
+// because the interesting answer is almost always one slow span type, not a
+// frequent fast one.
+resource traceSlowestSpans 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = if (enableOtelTraces) {
+  parent: logAnalytics
+  name: 'Cyrus-Trace-Slowest-Spans'
+  properties: {
+    category: 'Cyrus Traces'
+    displayName: 'Slowest span types, router and sandbox'
+    query: join(
+      [
+        'union AppRequests, AppDependencies'
+        '| summarize'
+        '    count(),'
+        '    p50_ms = percentile(DurationMs, 50),'
+        '    p95_ms = percentile(DurationMs, 95),'
+        '    max_ms = max(DurationMs),'
+        '    total_s = sum(DurationMs) / 1000'
+        '  by span = Name, service = AppRoleName'
+        '| order by total_s desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// The dependency view the phase brief calls out by name: ACA data-plane calls
+// that sat on their 120s deadline, and Linear round-trips. Node's fetch has no
+// default timeout, so a stalled call is otherwise indistinguishable from one
+// that was never made.
+resource traceStalledDependencies 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = if (enableOtelTraces) {
+  parent: logAnalytics
+  name: 'Cyrus-Trace-Stalled-Dependencies'
+  properties: {
+    category: 'Cyrus Traces'
+    displayName: 'Outbound calls that stalled or failed (ACA data plane, Linear)'
+    query: join(
+      [
+        'AppDependencies'
+        '| where Name in ("aca.request", "linear.request")'
+        '| extend'
+        '    timeout_ms = toint(Properties["cyrus.aca.timeout_ms"]),'
+        '    operation  = coalesce(tostring(Properties["cyrus.aca.operation"]), tostring(Properties["cyrus.rpc_method"]))'
+        // A call within 5s of its own deadline did not "just take a while" —
+        // it hit the wall, and the deadline is the only reason it returned.
+        '| extend at_deadline = isnotnull(timeout_ms) and DurationMs >= timeout_ms - 5000'
+        '| where at_deadline or Success == false'
+        '| project'
+        '    TimeGenerated,'
+        '    trace_id = OperationId,'
+        '    Name,'
+        '    operation,'
+        '    DurationMs,'
+        '    timeout_ms,'
+        '    at_deadline,'
+        '    Success,'
+        '    issue_key = tostring(Properties["cyrus.issue_key"])'
+        '| order by TimeGenerated desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// Cold-boot latency, which is the number the idle-stop and affinity-grace
+// defaults are calibrated against. Sourced from the span rather than from the
+// two log lines around it, so it is a measured duration and not a subtraction.
+resource traceBootLatency 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = if (enableOtelTraces) {
+  parent: logAnalytics
+  name: 'Cyrus-Trace-Boot-Latency'
+  properties: {
+    category: 'Cyrus Traces'
+    displayName: 'Sandbox boot latency distribution'
+    query: join(
+      [
+        'AppDependencies'
+        '| where Name == "sandbox.boot"'
+        '| summarize'
+        '    boots = count(),'
+        '    failed = countif(tostring(Properties["cyrus.boot_failed"]) == "true"),'
+        '    p50_s = percentile(DurationMs, 50) / 1000,'
+        '    p95_s = percentile(DurationMs, 95) / 1000,'
+        '    max_s = max(DurationMs) / 1000'
+        '  by provider = tostring(Properties["cyrus.provider"])'
+        '| order by boots desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// The log↔trace join. An unsampled trace records no spans but its WARN/ERROR
+// log records still carry the trace id (see the sampling ADR), so this finds the
+// errors and then pulls in whatever span context does exist.
+resource traceErrorCorrelation 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = if (enableOtelTraces) {
+  parent: logAnalytics
+  name: 'Cyrus-Trace-Error-Correlation'
+  properties: {
+    category: 'Cyrus Traces'
+    displayName: 'Errors joined to the spans they happened inside'
+    query: join(
+      [
+        'AppTraces'
+        '| where SeverityLevel >= 3'
+        '| project'
+        '    TimeGenerated,'
+        '    trace_id = OperationId,'
+        '    Message,'
+        '    component = tostring(Properties["component"]),'
+        '    issue_key = tostring(Properties["cyrus.issue_key"]),'
+        '    exception = tostring(Properties["exception.type"])'
+        '| join kind=leftouter ('
+        '    union AppRequests, AppDependencies'
+        '    | summarize spans = make_set(Name, 20), trace_ms = sum(DurationMs) by OperationId'
+        '  ) on $left.trace_id == $right.OperationId'
+        '| project-away OperationId'
+        '| order by TimeGenerated desc'
       ],
       '\n'
     )

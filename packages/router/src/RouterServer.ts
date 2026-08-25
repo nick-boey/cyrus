@@ -12,6 +12,7 @@ import {
 	LinearIssueTrackerService,
 	type LinearOAuthConfig,
 } from "cyrus-linear-event-transport";
+import type { SpanExporter } from "cyrus-otel-traces";
 import type {
 	ContainerExecutor,
 	ExecutorRegistry,
@@ -24,6 +25,7 @@ import type {
 	LogFrame,
 	RpcRequestFrame,
 	SessionStateFrame,
+	SpanFrame,
 } from "cyrus-router-protocol";
 import Fastify, { type FastifyInstance } from "fastify";
 import { createAcaSandboxesProvider } from "./AcaProviderFactory.js";
@@ -46,6 +48,7 @@ import {
 import { RepositoryResolver } from "./RepositoryResolver.js";
 import { RouterStore } from "./RouterStore.js";
 import { SandboxLogRelay } from "./SandboxLogRelay.js";
+import { SandboxSpanRelay } from "./SandboxSpanRelay.js";
 import {
 	DEFAULT_REQUIRED_SECRET_KEYS,
 	SecretStore,
@@ -68,6 +71,7 @@ import {
 	registerTerminalTeardownRoute,
 	TerminalTeardown,
 } from "./TerminalTeardown.js";
+import { registerHttpTracing } from "./telemetry/httpTracing.js";
 import { registerWorkspacesRoute } from "./workspaces.js";
 
 /** 48 hours — default TTL for queued offline events. */
@@ -356,6 +360,16 @@ export class RouterServer {
 	private readonly gateway: DeviceGateway;
 	/** Re-emits sandbox worker logs into the router's own (collected) stdout. */
 	private readonly sandboxLogRelay: SandboxLogRelay;
+	/**
+	 * Re-exports sandbox worker spans through the router's own span exporter.
+	 *
+	 * Undefined until {@link setSpanExporter} is called. It cannot be built in
+	 * the constructor because it needs the exporter, and the exporter belongs to
+	 * the tracing pipeline the CLI bootstrap starts — which must remain optional,
+	 * so that a self-host router with no Azure connection string constructs and
+	 * runs exactly as it does today.
+	 */
+	private sandboxSpanRelay: SandboxSpanRelay | undefined;
 	private readonly executor: LinearExecutor;
 	private readonly trackers: Map<string, IIssueTrackerService>;
 	private readonly logger: ILogger;
@@ -397,6 +411,12 @@ export class RouterServer {
 		this.logger = config.logger ?? createNoopLogger();
 		this.store = new RouterStore(config.dbPath);
 		this.fastify = Fastify();
+		// Registered FIRST, before any route: Fastify runs `onRequest` hooks in
+		// registration order, and the server span has to be active before
+		// anything a route does can attach to it. This is also the router's only
+		// request logging — see the plugin's note on why Fastify's own pino
+		// logger is deliberately left off.
+		registerHttpTracing(this.fastify, { logger: this.logger });
 
 		// Shared by reference with LinearExecutor, so a refresh that writes here is
 		// immediately visible to the attachment-download path.
@@ -626,6 +646,26 @@ export class RouterServer {
 				...(info?.provider ? { provider: info.provider } : {}),
 			});
 		});
+		// Sandbox worker spans. Handed straight to the router's own span exporter
+		// — NOT re-created through a tracer, which would mint new span ids and
+		// orphan every child the worker already recorded. Attribution comes from
+		// the device row; the worker's `resource` is preserved so a relayed span
+		// keeps saying it came from the worker.
+		//
+		// `sandboxSpanRelay` is undefined until `setSpanExporter` is called by the
+		// bootstrap, which happens only when trace export is enabled. Until then
+		// the frames are parsed, ignored, and cost nothing — a worker whose router
+		// has tracing off never gets the capability advertised in the first place,
+		// so in practice none arrive.
+		this.gateway.on("span", (deviceId: number, frame: SpanFrame) => {
+			if (!this.sandboxSpanRelay) return;
+			const info = this.store.getDeviceInfo(deviceId);
+			this.sandboxSpanRelay.relay(frame, {
+				deviceId,
+				...(info?.issueKey ? { issueKey: info.issueKey } : {}),
+				...(info?.provider ? { provider: info.provider } : {}),
+			});
+		});
 		// NOTE: no "deviceConnected" → deliverPending wiring here. DeviceGateway
 		// already calls this.deliverPending() internally at the end of handleHello
 		// (right after emitting "deviceConnected"), so adding it here would deliver
@@ -688,6 +728,24 @@ export class RouterServer {
 
 	isDeviceOnline(deviceId: number): boolean {
 		return this.gateway.isOnline(deviceId);
+	}
+
+	/**
+	 * Point the sandbox span relay at the router's span exporter.
+	 *
+	 * Called by the CLI bootstrap after it starts trace export, and never when
+	 * tracing is disabled. A setter rather than a constructor argument because
+	 * `RouterServerConfig` is a plain, serialisable config object shared with the
+	 * F1 rig and every test — threading an OTel exporter through it would make an
+	 * optional telemetry dependency part of the router's construction contract.
+	 *
+	 * Safe to call before `start()` and safe never to call at all.
+	 */
+	setSpanExporter(exporter: SpanExporter): void {
+		this.sandboxSpanRelay = new SandboxSpanRelay({
+			exporter,
+			logger: this.logger,
+		});
 	}
 
 	/** Actual bound TCP port (useful after `start({ port: 0 })`). */

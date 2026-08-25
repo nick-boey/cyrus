@@ -1,11 +1,11 @@
 {
-	"name": "cyrus-claude-runner",
-	"version": "0.2.68",
-	"description": "Claude CLI execution wrapper for Cyrus",
+	"name": "cyrus-otel-traces",
+	"version": "0.2.66",
+	"description": "Vendor-neutral OpenTelemetry tracing foundation and W3C trace-context propagation for Cyrus",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/cyrusagents/cyrus.git",
-		"directory": "packages/claude-runner"
+		"directory": "packages/otel-traces"
 	},
 	"type": "module",
 	"main": "dist/index.js",
@@ -21,22 +21,15 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@anthropic-ai/claude-agent-sdk": "0.3.220",
-		"@anthropic-ai/sdk": "^0.115.0",
-		"@linear/sdk": "^64.0.0",
-		"cyrus-core": "workspace:*",
-		"cyrus-otel-traces": "workspace:*",
-		"dotenv": "^16.6.1",
-		"fs-extra": "^11.4.0",
-		"zod": "4.3.6"
-	},
-	"devDependencies": {
 		"@opentelemetry/api": "^1.9.0",
 		"@opentelemetry/context-async-hooks": "^2.10.0",
+		"@opentelemetry/core": "^2.10.0",
+		"@opentelemetry/resources": "^2.10.0",
 		"@opentelemetry/sdk-trace-base": "^2.10.0",
-		"@types/fs-extra": "^11.0.4",
+		"cyrus-core": "workspace:*"
+	},
+	"devDependencies": {
 		"@types/node": "^20.19.43",
-		"tsx": "^4.23.1",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.10"
 	},

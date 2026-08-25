@@ -366,6 +366,12 @@ param sandboxUptimeAlertHours int = 6
 @description('Ship the router\'s ILogger output to the existing Log Analytics workspace over OTLP, in addition to its JSON stdout stream. Creates a workspace-based Application Insights component as the ingestion endpoint and sets CYRUS_OTEL_LOGS_ENABLED plus APPLICATIONINSIGHTS_CONNECTION_STRING on the router app. Defaults TRUE because this is additive telemetry, though changing it rolls the single router replica. Records land in AppTraces, not ContainerAppConsoleLogs_CL.')
 param enableOtelLogs bool = true
 
+@description('Export distributed traces (spans) as well as logs, so one trace spans the router and the sandbox worker. Requires enableOtelLogs, which is what creates the Application Insights component both signals export through. Sets CYRUS_OTEL_TRACES_ENABLED on the router app, which propagates it to every sandbox it boots. Defaults TRUE; changing it rolls the single router replica. Spans land in AppRequests/AppDependencies, not AppTraces and not ContainerAppConsoleLogs_CL.')
+param enableOtelTraces bool = true
+
+@description('Head-sampling ratio for ROOT spans, as a decimal string in 0..1 (Bicep has no float type, so \'0.25\' must be quoted). Only consulted for a span with no remote parent — a sandbox worker always inherits the router\'s decision, so a trace is never half-collected. Defaults to \'1\' because Cyrus root spans are driven by human actions (an issue assigned, a prompt posted), not by request rate. See docs/adr/0004-parent-based-head-sampling-for-traces.md.')
+param otelTracesSampleRatio string = '1'
+
 @description('Minimum level exported over OTLP. Independent of CYRUS_LOG_LEVEL, which governs only container stdout; this controls billed export volume. Named event() records bypass the threshold by contract.')
 @allowed([
   'DEBUG'
@@ -460,6 +466,7 @@ var parameterViolations = concat(
   writeSetupAuthSecrets || (empty(setupUiClientSecret) && empty(setupUiTokenStoreSasStart) && empty(setupUiTokenStoreSasExpiry)) ? [] : ['writeSetupAuthSecrets=false requires setupUiClientSecret, setupUiTokenStoreSasStart, and setupUiTokenStoreSasExpiry to be empty. Remove stale bootstrap values before a steady-state deployment so routine CD does not transmit them to ARM.'],
   !enableSetupAuth || !empty(entraTenantId) ? [] : ['enableSetupAuth requires entraTenantId: the sidecar openIdIssuer is the tenant\'s v2.0 OIDC endpoint on the cloud login authority. Setting entraTenantId also requires entraAudience, which is intended — the same app registration serves both /enroll access tokens and /setup sign-in.'],
   !enableSetupUi || enableSetupAuth ? [] : ['enableSetupUi requires enableSetupAuth. Enabling the routes without the auth sidecar publishes an unauthenticated /setup.'],
+  !enableOtelTraces || enableOtelLogs ? [] : ['enableOtelTraces requires enableOtelLogs. The Application Insights component that both signals export through is only created when enableOtelLogs is true, so tracing alone would set CYRUS_OTEL_TRACES_ENABLED with no connection string — which the router warns about and then silently records nothing.'],
   !enableSetupUi || setupAuthStage1Verified ? [] : ['enableSetupUi requires setupAuthStage1Verified=true. Stage 1 must be deployed on its own and verified live (README section 11 step 5) BEFORE the routes exist.'],
   !enableSetupUi || setupUiAuthMode != 'entra-token' || !empty(setupUiIdTokenAudience) || !empty(setupUiClientId) ? [] : ['setupUiAuthMode=entra-token needs an ID token audience: set setupUiClientId (the audience defaults to it) or override setupUiIdTokenAudience explicitly.'],
   !enableSetupTableBackend || enableSetupSecretStore ? [] : ['enableSetupTableBackend requires enableSetupSecretStore=true. The selector points the router at a Table and a KEK that the creation flag provisions; without it the rendered config would name resources that do not exist.'],
@@ -666,6 +673,8 @@ module routerApp 'modules/router-app.bicep' = {
     setupUiAllowedDomain: setupUiAllowedDomain
     setupUiAutoProvisionUsers: setupUiAutoProvisionUsers
     enableOtelLogs: enableOtelLogs
+    enableOtelTraces: enableOtelTraces
+    otelTracesSampleRatio: otelTracesSampleRatio
     otelLogsLevel: otelLogsLevel
     deploymentEnvironment: environment
     applicationInsightsConnectionString: monitoring.outputs.applicationInsightsConnectionString
@@ -727,6 +736,7 @@ module monitoring 'modules/monitoring.bicep' = {
     alertEmailReceivers: alertEmailReceivers
     sandboxUptimeAlertHours: sandboxUptimeAlertHours
     enableOtelLogs: enableOtelLogs
+    enableOtelTraces: enableOtelTraces
   }
 }
 
@@ -812,5 +822,20 @@ output otelLogsQuery string = enableOtelLogs
       '| extend component = tostring(Properties.component), event = tostring(Properties.event)'
       '| project TimeGenerated, SeverityLevel, component, event, Message, Properties'
       '| order by TimeGenerated desc'
+    ], '\n')
+  : ''
+
+@description('Paste-ready KQL for one issue\'s distributed trace, spanning the router and the sandbox worker. Empty when enableOtelTraces is false. Note the tables: spans are AppRequests (SERVER/CONSUMER) and AppDependencies (CLIENT/PRODUCER/INTERNAL), NOT AppTraces — that is where log records go. Dotted attribute keys need bracket syntax; `Properties.cyrus.issue_key` silently returns null.')
+output otelTracesQuery string = enableOtelTraces
+  ? join([
+      'let target_issue = "REPLACE-ME";'
+      'let trace_ids ='
+      '    union AppRequests, AppDependencies'
+      '    | where tostring(Properties["cyrus.issue_key"]) == target_issue'
+      '    | distinct OperationId;'
+      'union AppRequests, AppDependencies'
+      '| where OperationId in (trace_ids)'
+      '| project TimeGenerated, trace_id = OperationId, span = Name, service = AppRoleName, duration_ms = DurationMs, ok = Success, origin = coalesce(tostring(Properties["cyrus.source"]), "router")'
+      '| order by trace_id asc, TimeGenerated asc'
     ], '\n')
   : ''
