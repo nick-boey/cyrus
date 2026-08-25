@@ -23,6 +23,7 @@
 	"dependencies": {
 		"cyrus-core": "workspace:*",
 		"cyrus-linear-event-transport": "workspace:*",
+		"cyrus-otel-traces": "workspace:*",
 		"cyrus-router-protocol": "workspace:*",
 		"ws": "^8.21.1"
 	},

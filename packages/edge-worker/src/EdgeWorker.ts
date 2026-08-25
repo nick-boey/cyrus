@@ -143,10 +143,18 @@ import {
 	type FailureModesHttpClient,
 	type ResolvedSession,
 } from "cyrus-mcp-tools";
+import { buildResourceAttributes } from "cyrus-otel-logs";
+import {
+	isOtelTracingEnabled,
+	type OtelTracingHandle,
+	readOtelSampleRatio,
+	startOtelTracing,
+} from "cyrus-otel-traces";
 import {
 	RouterConnection,
 	RouterIssueTrackerService,
 	RouterLogForwarder,
+	RouterSpanForwarder,
 } from "cyrus-router-client";
 import {
 	SlackEventTransport,
@@ -215,6 +223,17 @@ type CyrusToolsMcpContext = {
 };
 
 /**
+ * How long `stop()` waits for buffered spans to flush.
+ *
+ * Deliberately short. The flush writes to the router WSS connection, which at
+ * shutdown may already be closing, so the realistic failure is that it never
+ * resolves. Losing a few seconds of spans is strictly better than a shutdown
+ * that hangs until the platform escalates to SIGKILL — which loses them anyway
+ * AND skips whatever cleanup was still queued behind it.
+ */
+const TRACING_SHUTDOWN_TIMEOUT_MS = 2_000;
+
+/**
  * Unified edge worker that **orchestrates**
  *   capturing Linear webhooks,
  *   managing Claude Code processes, and
@@ -255,6 +274,12 @@ export class EdgeWorker extends EventEmitter {
 	 */
 	private logForwarder?: RouterLogForwarder;
 	private previousLogSink?: LogSink;
+	/**
+	 * The span pipeline, when trace export is on. Held so `stop()` can flush it —
+	 * the batch processor buffers up to 5 seconds of spans, which is exactly the
+	 * window that explains a shutdown.
+	 */
+	private tracing?: OtelTracingHandle;
 	private workspaceSync?: WorkspaceSyncService; // Persistence-floor sync of WIP snapshots + state bundles to the router (router platform mode, opt-in via floorSync === true)
 	private readonly wipSnapshotReaper: WipSnapshotReaper; // Deletes WIP snapshot refs at terminal teardown, and retries the ones whose deletion failed
 	private teardownCallbacks?: TeardownCallbackQueue; // Durable, retrying "terminal cleanup is done" callback to the router (router platform mode)
@@ -721,6 +746,18 @@ export class EdgeWorker extends EventEmitter {
 				connection: this.routerConnection,
 			});
 			this.previousLogSink = setGlobalLogSink(this.logForwarder);
+
+			// Ship this process's SPANS off the box the same way, so a worker's
+			// session work joins the router's trace instead of being a black box
+			// between "router dispatched an event" and "session posted a result".
+			//
+			// Same egress argument as the logs above: the sandbox's allowlist has
+			// the router's host as its only entry, so exporting straight to an
+			// ingestion endpoint is not an option. Off unless
+			// CYRUS_OTEL_TRACES_ENABLED is set, and inert on top of that unless the
+			// router advertises `span_ingest` — so a physical-device user in router
+			// mode pays nothing.
+			this.startRouterTracing(this.routerConnection);
 
 			// Durable record of "I owe the router a teardown callback". Written
 			// before terminal cleanup starts and retried until the router accepts
@@ -3085,6 +3122,81 @@ ${taskSection}`;
 			else resetGlobalLogSink();
 			this.logForwarder = undefined;
 			this.previousLogSink = undefined;
+		}
+
+		// Flush and tear down tracing after the sink, and bounded: the batch
+		// processor holds up to 5 seconds of spans, so without a flush the last
+		// window — which is exactly the window that explains a shutdown — never
+		// leaves the sandbox. The timeout matters more here than for logs: this
+		// flush writes to the WSS connection, which by this point may already be
+		// closing, and a hung shutdown gets the process SIGKILLed and loses the
+		// spans anyway.
+		if (this.tracing) {
+			const tracing = this.tracing;
+			this.tracing = undefined;
+			await Promise.race([
+				tracing.shutdown(),
+				new Promise<void>((resolve) =>
+					setTimeout(resolve, TRACING_SHUTDOWN_TIMEOUT_MS).unref?.(),
+				),
+			]).catch(() => {
+				// A failed flush is not worth failing a shutdown over.
+			});
+		}
+	}
+
+	/**
+	 * Start span export over the router connection, if an operator asked for it.
+	 *
+	 * Returns without doing anything unless `CYRUS_OTEL_TRACES_ENABLED` is
+	 * explicitly truthy — the same opt-in contract as the logs bridge, so adding
+	 * this code changes nothing for upstream CLI users and every self-host
+	 * deployment.
+	 *
+	 * ── SAMPLING IS NOT DECIDED HERE ──
+	 * The sampler is parent-based, so for the work that matters (a session the
+	 * router dispatched) this process takes NO sampling decision: it inherits the
+	 * router's, off the `traceparent` on the event frame. The ratio configured
+	 * here only ever applies to a root span the worker starts on its own, which
+	 * is a path that should not normally exist. See
+	 * `docs/adr/0004-parent-based-head-sampling-for-traces.md`.
+	 */
+	private startRouterTracing(connection: RouterConnection): void {
+		if (!isOtelTracingEnabled(process.env)) return;
+		try {
+			const resourceAttributes = buildResourceAttributes({
+				serviceName:
+					process.env.CYRUS_OTEL_SERVICE_NAME?.trim() || "cyrus-worker",
+				...(process.env.CYRUS_OTEL_SERVICE_VERSION
+					? { serviceVersion: process.env.CYRUS_OTEL_SERVICE_VERSION }
+					: {}),
+				// The issue key is the identifier an operator has in hand, and in a
+				// per-issue sandbox it is exactly "which replica is this" — which is
+				// what `service.instance.id` is for.
+				...(process.env.CYRUS_ISSUE_KEY
+					? { serviceInstanceId: process.env.CYRUS_ISSUE_KEY }
+					: {}),
+				...(process.env.CYRUS_OTEL_DEPLOYMENT_ENV
+					? { deploymentEnvironment: process.env.CYRUS_OTEL_DEPLOYMENT_ENV }
+					: {}),
+			});
+			this.tracing = startOtelTracing({
+				exporter: new RouterSpanForwarder({ connection, resourceAttributes }),
+				resourceAttributes,
+				...(readOtelSampleRatio(process.env) !== undefined
+					? { sampleRatio: readOtelSampleRatio(process.env) }
+					: {}),
+			});
+			this.logger.info(
+				`OpenTelemetry span export enabled, relayed via the router (${Object.entries(
+					resourceAttributes,
+				)
+					.map(([key, value]) => `${key}=${value}`)
+					.join(", ")})`,
+			);
+		} catch (err) {
+			// Telemetry must never be able to stop a worker from doing its job.
+			this.logger.warn("Failed to start OpenTelemetry span export", err);
 		}
 	}
 

@@ -1,6 +1,10 @@
 import { AzureMonitorLogExporter } from "@azure/monitor-opentelemetry-exporter";
 import type { ILogger, LogLevel } from "cyrus-core";
-import type { LogRecordExporter, OtelLoggingHandle } from "cyrus-otel-logs";
+import type {
+	LogRecordExporter,
+	OtelLoggingHandle,
+	ResourceAttributeInput,
+} from "cyrus-otel-logs";
 import {
 	isOtelLoggingEnabled,
 	readOtelLogLevel,
@@ -110,34 +114,13 @@ export function startRouterOtelLogging(
 		return undefined;
 	}
 
-	const overrides = readOtelResourceEnvOverrides(env);
 	const exporter = (options.createExporter ?? createAzureMonitorExporter)(
 		connectionString,
 	);
 
 	const handle = startOtelLogging({
 		exporter,
-		// Precedence throughout: explicit env override, then what the platform
-		// tells us about itself, then a static default. Never the other way
-		// round — an operator's env var has to be able to win.
-		resource: {
-			serviceName:
-				overrides.serviceName ??
-				env[ACA_APP_NAME_ENV]?.trim() ??
-				DEFAULT_SERVICE_NAME,
-			serviceVersion:
-				overrides.serviceVersion ??
-				options.serviceVersion ??
-				env[ACA_REVISION_ENV],
-			serviceInstanceId:
-				overrides.serviceInstanceId ?? env[ACA_REPLICA_NAME_ENV],
-			...(overrides.deploymentEnvironment !== undefined
-				? { deploymentEnvironment: overrides.deploymentEnvironment }
-				: {}),
-			cloudProvider: CLOUD_PROVIDER,
-			cloudPlatform: CLOUD_PLATFORM,
-			cloudRegion: overrides.cloudRegion ?? options.fallbackRegion,
-		},
+		resource: buildRouterResourceInput(options, env),
 		...(minLevelFor(options, env) !== undefined
 			? { minLevel: minLevelFor(options, env) as LogLevel }
 			: {}),
@@ -153,6 +136,50 @@ export function startRouterOtelLogging(
 	);
 
 	return handle;
+}
+
+/**
+ * The router's resource semconv, derived once.
+ *
+ * Extracted from {@link startRouterOtelLogging} so the TRACES pipeline can use
+ * the identical value — see `startRouterOtelTracing`'s `resourceAttributes`
+ * option. It has to be shared rather than each pipeline deriving its own:
+ * `service.instance.id` is what distinguishes replicas, and two derivations
+ * that ever disagree about it would split one replica's logs from its own
+ * traces in the backend, defeating the correlation this phase creates.
+ *
+ * It also has to be callable when logging is DISABLED and tracing is not, which
+ * a value hanging off the logging handle could not be.
+ *
+ * Precedence throughout: explicit env override, then what the platform tells us
+ * about itself, then a static default. Never the other way round — an
+ * operator's env var has to be able to win.
+ */
+export function buildRouterResourceInput(
+	options: Pick<
+		StartRouterOtelLoggingOptions,
+		"serviceVersion" | "fallbackRegion"
+	>,
+	env: NodeJS.ProcessEnv,
+): ResourceAttributeInput {
+	const overrides = readOtelResourceEnvOverrides(env);
+	return {
+		serviceName:
+			overrides.serviceName ??
+			env[ACA_APP_NAME_ENV]?.trim() ??
+			DEFAULT_SERVICE_NAME,
+		serviceVersion:
+			overrides.serviceVersion ??
+			options.serviceVersion ??
+			env[ACA_REVISION_ENV],
+		serviceInstanceId: overrides.serviceInstanceId ?? env[ACA_REPLICA_NAME_ENV],
+		...(overrides.deploymentEnvironment !== undefined
+			? { deploymentEnvironment: overrides.deploymentEnvironment }
+			: {}),
+		cloudProvider: CLOUD_PROVIDER,
+		cloudPlatform: CLOUD_PLATFORM,
+		cloudRegion: overrides.cloudRegion ?? options.fallbackRegion,
+	};
 }
 
 function minLevelFor(

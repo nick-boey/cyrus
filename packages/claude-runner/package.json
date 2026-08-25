@@ -25,11 +25,15 @@
 		"@anthropic-ai/sdk": "^0.115.0",
 		"@linear/sdk": "^64.0.0",
 		"cyrus-core": "workspace:*",
+		"cyrus-otel-traces": "workspace:*",
 		"dotenv": "^16.6.1",
 		"fs-extra": "^11.4.0",
 		"zod": "4.3.6"
 	},
 	"devDependencies": {
+		"@opentelemetry/api": "^1.9.0",
+		"@opentelemetry/context-async-hooks": "^2.10.0",
+		"@opentelemetry/sdk-trace-base": "^2.10.0",
 		"@types/fs-extra": "^11.0.4",
 		"@types/node": "^20.19.43",
 		"tsx": "^4.23.1",

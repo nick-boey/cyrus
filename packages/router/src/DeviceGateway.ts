@@ -12,6 +12,7 @@ import {
 	parseDeviceFrame,
 	type RpcResponseFrame,
 	SESSIONS_QUERY_CAPABILITY,
+	SPAN_INGEST_CAPABILITY,
 } from "cyrus-router-protocol";
 import { WebSocket, WebSocketServer } from "ws";
 import type { RouterStore } from "./RouterStore.js";
@@ -37,6 +38,7 @@ interface SocketState {
  *  - "sessionState"(deviceId: number, frame: SessionStateFrame)
  *  - "eventAck"(deviceId: number, seq: number)
  *  - "log"(deviceId: number, frame: LogFrame)
+ *  - "span"(deviceId: number, frame: SpanFrame)
  */
 export class DeviceGateway extends EventEmitter {
 	private readonly store: RouterStore;
@@ -102,12 +104,20 @@ export class DeviceGateway extends EventEmitter {
 				`Delivering ${pending.length} pending event(s) to device ${deviceId}`,
 			);
 		}
-		for (const { seq, payloadJson } of pending) {
+		for (const { seq, payloadJson, traceparent, tracestate } of pending) {
 			ws.send(
 				JSON.stringify({
 					type: "event",
 					seq,
 					event: JSON.parse(payloadJson) as unknown,
+					// The trace context stored WITH the row, not one captured here.
+					// This loop runs from a socket "connection" handler or a
+					// reconnect, which is an unrelated call stack — re-deriving the
+					// context at send time would attach the event to whatever the
+					// gateway happened to be doing, which is the one thing that is
+					// certainly not its cause.
+					...(traceparent ? { traceparent } : {}),
+					...(tracestate ? { tracestate } : {}),
 				}),
 			);
 		}
@@ -310,6 +320,12 @@ export class DeviceGateway extends EventEmitter {
 				// confirm (see the `log` frame's fire-and-forget contract).
 				this.emit("log", deviceId, frame);
 				break;
+			case "span":
+				// Same contract as `log`: fire-and-forget, nothing to ack, and
+				// never logged here — a relayed span must not be able to generate
+				// router log lines, which would in turn generate router spans.
+				this.emit("span", deviceId, frame);
+				break;
 			case "sessions_report": {
 				const pending = this.pendingSessionQueries.get(frame.id);
 				if (!pending) break; // Late or unsolicited reply — the timeout already won.
@@ -390,7 +406,7 @@ export class DeviceGateway extends EventEmitter {
 				// this a worker that forwarded logs to an older router would have
 				// its socket closed as "invalid frame" on every log line — see
 				// LOG_INGEST_CAPABILITY.
-				capabilities: [LOG_INGEST_CAPABILITY],
+				capabilities: [LOG_INGEST_CAPABILITY, SPAN_INGEST_CAPABILITY],
 			}),
 		);
 

@@ -1,5 +1,6 @@
 import type { LogRecord, LogSink } from "cyrus-core";
 import { LogLevel } from "cyrus-core";
+import { injectTraceContext } from "cyrus-otel-traces";
 import type { LogFrame, LogFrameLevel } from "cyrus-router-protocol";
 import type { RouterConnection } from "./RouterConnection.js";
 
@@ -261,6 +262,16 @@ export class RouterLogForwarder implements LogSink {
 					}
 				: {}),
 			...(this.dropped > 0 ? { dropped: this.dropped } : {}),
+			// The span this record was emitted under, so the router can re-stamp it
+			// and a log line joins the trace that produced it.
+			//
+			// Stamped whether or not the trace was SAMPLED, deliberately. That is
+			// what makes the head-sampling trade in
+			// `docs/adr/0004-parent-based-head-sampling-for-traces.md` acceptable:
+			// this forwarder's threshold is WARN, so every warning and error still
+			// reaches Log Analytics carrying a trace id, even for a trace whose
+			// spans were never collected.
+			...injectTraceContext(),
 		};
 	}
 }

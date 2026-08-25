@@ -10,6 +10,15 @@ import {
 import { join } from "node:path";
 import { createLogger, type ILogger } from "cyrus-core";
 import {
+	cyrusSpanAttributes,
+	extractTraceContext,
+	getTracer,
+	injectTraceContext,
+	recordSpanError,
+	SpanKind,
+	withSpanActive,
+} from "cyrus-otel-traces";
+import {
 	type EventFrame,
 	HEARTBEAT_INTERVAL_MS,
 	type HelloAckFrame,
@@ -26,6 +35,8 @@ import {
 	type ServerFrame,
 	type SessionStateAckFrame,
 	type SessionsQueryFrame,
+	SPAN_INGEST_CAPABILITY,
+	type SpanFrame,
 } from "cyrus-router-protocol";
 import { WebSocket } from "ws";
 import { reviveDates } from "./date-revival.js";
@@ -43,6 +54,16 @@ const DEFAULT_RPC_TIMEOUT_MS = 30_000;
  */
 const LIVENESS_CHECK_DIVISOR = 2;
 const LIVENESS_CHECK_FLOOR_MS = 1_000;
+
+/**
+ * Instrumentation scope for the spans the worker side produces here.
+ *
+ * Named for the WORKER rather than for this class, because that is what an
+ * operator is looking at: these spans are the sandbox's half of the trace, and
+ * distinguishing them from `cyrus-router` is what lets a query attribute time
+ * to one side of the socket or the other.
+ */
+const WORKER_TRACER_NAME = "cyrus-worker";
 
 export interface RouterConnectionOptions {
 	/** Base router URL; the `/device` path is appended automatically. */
@@ -395,6 +416,34 @@ export class RouterConnection extends EventEmitter {
 		}
 	}
 
+	/** True once the router has advertised that it accepts `span` frames. */
+	get acceptsSpans(): boolean {
+		return this.serverCapabilities.has(SPAN_INGEST_CAPABILITY);
+	}
+
+	/**
+	 * Ships a batch of finished worker spans to the router. Returns false when
+	 * the frame was not sent, so the caller can count it as dropped.
+	 *
+	 * Fire-and-forget, exactly like {@link sendLog}: no ack, no durable buffer,
+	 * no replay. A sampled trace that loses its tail to a reconnect renders as a
+	 * legible partial; making the frame durable would cost disk writes on the
+	 * hot path for a signal that is, by construction, already sampled.
+	 *
+	 * Deliberately silent on failure for the same reason as `sendLog`: this runs
+	 * on the span-export path, where logging would produce more spans.
+	 */
+	sendSpans(frame: SpanFrame): boolean {
+		if (!this.acceptsSpans) return false;
+		if (!this.isOnline() || !this.ws) return false;
+		try {
+			this.ws.send(JSON.stringify(frame));
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	/** Best-effort transmit; the durable entry survives until acked. */
 	private trySendSessionState(entry: SessionStateEntry): void {
 		if (!this.isOnline() || !this.ws) return;
@@ -679,7 +728,21 @@ export class RouterConnection extends EventEmitter {
 		// CONSUMER CONTRACT (see class doc): the "event" listener must complete
 		// its durable handoff synchronously within this emit — the inbox entry is
 		// marked processed the instant emit returns.
-		const delivered = this.emit("event", frame.event, frame.seq);
+		//
+		// The emit runs inside a CONSUMER span parented on the router's
+		// `traceparent`, which is the join between the two halves of the trace.
+		// Doing it HERE rather than at each call site is the whole trick: the
+		// AsyncLocalStorage context manager carries the context into everything
+		// the listener starts, including the work it does not await, so a
+		// session's spans land in the router's trace without a single handler
+		// having to know a trace exists.
+		//
+		// The span is ended as soon as the emit returns. It measures the handoff,
+		// not the session: the session outlives this call by minutes and gets
+		// spans of its own, as children of this one.
+		const delivered = this.receiveEventTraced(frame, () =>
+			this.emit("event", frame.event, frame.seq),
+		);
 		// If we were shut down/closed during the emit (e.g. a crash), leave the
 		// entry unprocessed so it replays on the next startup.
 		if (this.stopped) return;
@@ -692,6 +755,36 @@ export class RouterConnection extends EventEmitter {
 			this.logger.warn(
 				`Inbox event seq=${frame.seq} had no consumer; kept on disk for replay`,
 			);
+		}
+	}
+
+	/**
+	 * Run `emit` inside a CONSUMER span whose parent is the router's context.
+	 *
+	 * Returns whatever `emit` returned, unchanged — the caller's durability
+	 * decision must not become a function of whether tracing is on. For the same
+	 * reason the span is created with the ordinary `startSpan`/`end` pair inside
+	 * `withSpanActive` rather than `withSpan`: `withSpan` is async, and awaiting
+	 * anything here would break the synchronous-handoff contract that keeps the
+	 * inbox entry replayable across a crash.
+	 */
+	private receiveEventTraced(frame: EventFrame, emit: () => boolean): boolean {
+		const parent = extractTraceContext(frame);
+		const span = getTracer(WORKER_TRACER_NAME).startSpan(
+			"worker.event_received",
+			{
+				kind: SpanKind.CONSUMER,
+				attributes: cyrusSpanAttributes({ event_seq: frame.seq }),
+			},
+			parent,
+		);
+		try {
+			return withSpanActive(span, emit, parent);
+		} catch (err) {
+			recordSpanError(span, err);
+			throw err;
+		} finally {
+			span.end();
 		}
 	}
 
@@ -734,6 +827,11 @@ export class RouterConnection extends EventEmitter {
 			method,
 			params,
 			...(mutationId ? { mutationId } : {}),
+			// The worker's active span, so the Linear round-trip the router makes
+			// on our behalf appears inside this trace rather than as a root of its
+			// own. Empty when tracing is off, which produces a frame byte-identical
+			// to what an untraced build sends.
+			...injectTraceContext(),
 		};
 		return new Promise<unknown>((resolve, reject) => {
 			const timer = setTimeout(() => {

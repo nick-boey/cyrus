@@ -57,6 +57,7 @@
 		"node-fetch": "^2.7.0",
 		"open": "^10.2.0",
 		"zod": "4.3.6",
+		"cyrus-otel-logs": "workspace:*",
 		"cyrus-router": "workspace:*",
 		"cyrus-workspace-sync": "workspace:*"
 	},

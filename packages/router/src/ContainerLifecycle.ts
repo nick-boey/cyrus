@@ -1,4 +1,5 @@
 import { cyrusAttributes, type ILogger } from "cyrus-core";
+import { withSpan } from "cyrus-otel-traces";
 import type {
 	ExecutorRegistry,
 	ManagedContainerState,
@@ -11,6 +12,7 @@ import {
 	type SandboxDestroyReason,
 	type SandboxGaugeState,
 } from "./SandboxTelemetry.js";
+import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
 /**
  * One provider's view of the containers it manages, taken once per sweep tick.
@@ -297,7 +299,22 @@ export class ContainerLifecycle {
 			);
 			return;
 		}
-		this.inFlight = this.sweepOnce().finally(() => {
+		// The sweep gets its own ROOT span rather than joining anything: it is
+		// fired by a bare 60s `setInterval`, so it has no caller and no inbound
+		// request to inherit from. It needs one because the ACA dependency spans
+		// it produces — one per provider listing, plus one per stop/destroy —
+		// would otherwise each be a root of their own, and the tick that made
+		// them would be unreconstructable.
+		//
+		// This is also where the sampling ratio bites hardest: unlike a webhook,
+		// this fires on a timer whether or not anyone is working. See
+		// `docs/adr/0004-parent-based-head-sampling-for-traces.md`.
+		this.inFlight = withSpan(
+			routerTracer(),
+			ROUTER_SPANS.sandboxSweep,
+			{},
+			() => this.sweepOnce(),
+		).finally(() => {
 			this.inFlight = undefined;
 		});
 		return this.inFlight;

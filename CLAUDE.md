@@ -631,6 +631,72 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      puts back the *previous* sink, not the no-op, so a nested recorder cannot
      disarm an outer one.
 
+14. **Distributed tracing (`cyrus-otel-traces`)**:
+   - **Traces register globally; logs deliberately do not.** `startOtelTracing`
+     calls `trace.setGlobalTracerProvider`, `propagation.setGlobalPropagator`,
+     and `context.setGlobalContextManager` — it has to, because
+     `trace.getTracer()` at a call site returns a NO-OP tracer otherwise, so
+     every span in the codebase would silently record nothing. The symmetric
+     risk that made `startOtelLogging` avoid `setGlobalLoggerProvider` (capturing
+     a dependency's volume) does not arise: a library only emits spans if an
+     auto-instrumentation patched it, and we install none. Consequence: `withSpan`
+     / `withSpanActive` / `withTraceContext` propagate NOTHING until that context
+     manager is installed, which is exactly why an untraced process pays nothing
+     for the call sites.
+   - **The sampler must stay `ParentBased`.** A sandbox worker takes NO sampling
+     decision for real work — it inherits the router's off the incoming
+     `traceparent`. Anything that lets the two sides decide independently produces
+     a *half-collected* trace, which renders as a complete story with a hole in
+     the middle and is worse than no trace. `CYRUS_OTEL_TRACES_ENABLED` and
+     `CYRUS_OTEL_TRACES_SAMPLE_RATIO` are therefore in `RESERVED_ENV_KEYS` and
+     propagated router → sandbox by `ContainerTargets.buildEnv`. See
+     `docs/adr/0004-parent-based-head-sampling-for-traces.md`.
+   - **Trace context is captured at ENQUEUE time and persisted on the `events`
+     row**, not derived when `deliverPending` sends. Delivery routinely happens
+     minutes later (an offline device, a cold sandbox boot) from a socket callback
+     with no relation to the enqueue's call stack — and that gap is the thing the
+     trace exists to show. `reconcileDeviceSeq` carries the columns across a
+     resequence for the same reason: a resequenced event is the same event.
+   - **A relayed sandbox span is handed straight to the exporter, never re-minted
+     through a tracer.** A tracer assigns its own span id, which orphans every
+     child the worker already recorded against the original — the trace comes back
+     as disconnected fragments. `SandboxSpanRelay` reconstructs a `ReadableSpan`
+     and calls `exporter.export`. It also preserves the worker's `resource` (so a
+     relayed span still says `service.name = cyrus-worker`) while stamping
+     attribution from the authenticated device row OVER the span's own attributes.
+   - **Span names must stay low-cardinality.** A span name is the grouping key for
+     every latency percentile and error rate in the backend; interpolating an issue
+     key or session id gives every request a sample size of one. Identity goes in
+     `cyrus.*` attributes. `AcaSandboxClient` templates its request paths for this
+     reason (`sandboxes/{name}/stop`), and the Fastify plugin names spans from
+     `request.routeOptions.url`, never the concrete path.
+   - **Spans land in `AppRequests` (SERVER/CONSUMER) and `AppDependencies`
+     (CLIENT/PRODUCER/INTERNAL)** — a third pair of tables, distinct from both
+     `ContainerAppConsoleLogs_CL` and the `AppTraces` that Phase 3's log records go
+     to. `OperationId` is the W3C trace id and the join key across all of them.
+     The bracket-syntax rule for dotted attribute keys applies unchanged:
+     `Properties["cyrus.issue_key"]`.
+   - **New device→router frame types are capability-gated, never version-bumped.**
+     `SPAN_INGEST_CAPABILITY` follows `LOG_INGEST_CAPABILITY` exactly: the router
+     advertises in `hello_ack` and the device sends nothing until it sees that,
+     because `DeviceGateway.handleMessage` closes the socket on any frame it cannot
+     parse. Bumping `PROTOCOL_VERSION` instead would reject every not-yet-updated
+     worker outright.
+   - **`RouterSpanForwarder` must report `SUCCESS` even when it drops.** A `FAILED`
+     export result makes `BatchSpanProcessor` retry — including a batch dropped
+     deliberately for cost, which is the loop the volume guard exists to prevent.
+     Loss is reported honestly via `dropped` on the next frame that lands. It also
+     needs the same `inWrite`-style re-entrancy guard as every sink: it touches
+     `RouterConnection`, whose logger feeds `RouterLogForwarder`, which touches the
+     same socket.
+   - **Do NOT switch on Fastify's built-in pino logger.** `RouterServer` constructs
+     Fastify with no options, and `registerHttpTracing` supplies request logging
+     through `ILogger` instead. pino writes straight to stdout on its own path,
+     bypassing the `LogSink` seam and therefore the OTLP export the whole telemetry
+     program is built on. The plugin also strips query strings — several router
+     routes carry tokens in query position, and a secret that reaches a telemetry
+     backend is disclosed.
+
 ## Dependency Security Policy (MANDATE)
 
 > **Config location (pnpm ≥10):** The root `package.json` `pnpm` field

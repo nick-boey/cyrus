@@ -50,6 +50,8 @@ param setupUiAllowedDomain string
 param setupUiAutoProvisionUsers bool
 
 param enableOtelLogs bool
+param enableOtelTraces bool
+param otelTracesSampleRatio string
 param otelLogsLevel string
 param deploymentEnvironment string
 
@@ -172,6 +174,18 @@ var otelEnv = concat(
     {
       name: 'CYRUS_OTEL_LOGS_LEVEL'
       value: otelLogsLevel
+    }
+    {
+      // Read by the router AND propagated verbatim into every sandbox it boots
+      // (ContainerTargets.buildEnv). The two must move together: a deployment
+      // where the router traces and the worker does not produces traces with a
+      // hole where the agent session should be.
+      name: 'CYRUS_OTEL_TRACES_ENABLED'
+      value: string(enableOtelTraces)
+    }
+    {
+      name: 'CYRUS_OTEL_TRACES_SAMPLE_RATIO'
+      value: otelTracesSampleRatio
     }
     {
       name: 'CYRUS_OTEL_DEPLOYMENT_ENV'

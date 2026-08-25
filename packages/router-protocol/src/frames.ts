@@ -72,6 +72,104 @@ export const SESSIONS_QUERY_CAPABILITY = "sessions_query";
 export const LOG_INGEST_CAPABILITY = "log_ingest";
 
 /**
+ * Advertised by the ROUTER in `hello_ack.capabilities` when it accepts `span`
+ * frames. A device forwards worker spans ONLY after seeing this.
+ *
+ * Exactly the {@link LOG_INGEST_CAPABILITY} pattern, and for exactly the same
+ * reason: `span` is a device→router frame type an older router cannot parse,
+ * and `DeviceGateway.handleMessage` closes the socket on any frame it cannot
+ * parse. Negotiating router-first means an old router simply never advertises,
+ * the worker never forwards, and a mixed-version fleet keeps working. Bumping
+ * {@link PROTOCOL_VERSION} instead would reject every not-yet-updated worker
+ * outright — a far worse failure than not shipping its traces.
+ *
+ * Separate from `log_ingest` rather than folded into it because the two are
+ * independently useful: a deployment can accept a sandbox's warnings and errors
+ * (cheap, always on) while its trace pipeline is off, and turning tracing off
+ * during an incident must not also blind the operator to the logs.
+ */
+export const SPAN_INGEST_CAPABILITY = "span_ingest";
+
+/**
+ * W3C Trace Context fields, carried on the frames that hand a unit of work from
+ * one process to the other.
+ *
+ * Optional on both ends, always. A frame from a build that predates tracing
+ * carries neither, and a process with tracing disabled produces neither — so
+ * "absent" is the common case and must never be an error. The receiving side
+ * reads them into a remote parent context; a missing or malformed
+ * `traceparent` simply means the work starts its own trace.
+ */
+const traceContextFields = {
+	traceparent: z.string().optional(),
+	tracestate: z.string().optional(),
+};
+
+/**
+ * Attribute values a span may carry. Primitive-only, matching what
+ * `serializeSpan` in `cyrus-otel-traces` projects a `ReadableSpan`'s attributes
+ * down to. `null` is deliberately NOT permitted (unlike {@link logAttributeValue}):
+ * OTel has no null attribute value, so accepting one would mean inventing a
+ * representation for it on the way back out.
+ */
+const spanAttributeValue = z.union([z.string(), z.number(), z.boolean()]);
+
+/**
+ * `[epochSeconds, nanos]` — OpenTelemetry's `HrTime`, carried verbatim.
+ *
+ * Not a single millisecond number: that would discard the sub-millisecond
+ * precision which is the entire reason to look at a span. Not a nanosecond
+ * integer either — every real timestamp in nanoseconds exceeds
+ * `Number.MAX_SAFE_INTEGER`, so JSON would round it.
+ */
+const hrTime = z.tuple([z.number(), z.number()]);
+
+const spanAttributes = z.record(z.string(), spanAttributeValue);
+
+/**
+ * One finished span, shipped device → router.
+ *
+ * Structurally identical to `SerializedSpan` in `cyrus-otel-traces`, which is
+ * the OTel-aware projection of a `ReadableSpan`. The two are declared
+ * separately so this package stays free of an OpenTelemetry dependency (it is
+ * imported by the CLI and by every runner) and that one stays free of a
+ * protocol dependency. `packages/router` sees both and asserts their mutual
+ * assignability, so drift between them fails typecheck rather than failing
+ * silently on the wire.
+ */
+const spanRecord = z.object({
+	/** 32 lowercase hex chars. Length-checked, not regex-matched: a malformed
+	 *  id is the exporter's problem, but a wrong-length one breaks the backend's
+	 *  own parsing and is worth rejecting at the door. */
+	traceId: z.string().length(32),
+	spanId: z.string().length(16),
+	parentSpanId: z.string().length(16).optional(),
+	traceFlags: z.number().int().nonnegative(),
+	traceState: z.string().optional(),
+	name: z.string().min(1),
+	kind: z.number().int().nonnegative(),
+	startTime: hrTime,
+	endTime: hrTime,
+	statusCode: z.number().int().nonnegative(),
+	statusMessage: z.string().optional(),
+	attributes: spanAttributes.optional(),
+	events: z
+		.array(
+			z.object({
+				name: z.string(),
+				time: hrTime,
+				attributes: spanAttributes.optional(),
+			}),
+		)
+		.optional(),
+	droppedAttributesCount: z.number().int().nonnegative().optional(),
+	droppedEventsCount: z.number().int().nonnegative().optional(),
+	droppedLinksCount: z.number().int().nonnegative().optional(),
+	scopeName: z.string().optional(),
+	scopeVersion: z.string().optional(),
+});
+
+/**
  * Log levels carried on a {@link LogFrame}. Mirrors `cyrus-core`'s `LogLevel`
  * enum minus `SILENT` (never emitted) — spelled as strings so the wire format
  * survives a renumbering of the enum, and so a router-side KQL predicate reads
@@ -121,6 +219,10 @@ const rpcRequestFrame = z.object({
 	// Present on mutating calls: stable across buffer replays so the router
 	// can dedupe (idempotent replay — see Task 9).
 	mutationId: z.string().min(1).optional(),
+	// The worker's active span, so the router's own work for this call — the
+	// Linear API dependency span in particular — lands inside the worker's
+	// trace rather than dangling as a root of its own.
+	...traceContextFields,
 });
 const sessionStateFrame = z.object({
 	type: z.literal("session_state"),
@@ -219,14 +321,68 @@ const logFrame = z.object({
 	 */
 	dropped: z.number().int().nonnegative().optional(),
 	/**
-	 * W3C Trace Context, reserved for Phase 5 (NOR-283). Present here from the
-	 * start so propagating a trace across the sandbox boundary is a matter of
-	 * populating a field rather than renegotiating the frame: the router will
-	 * read these to stitch a worker's log records onto the span that produced
-	 * them. Nothing writes them yet; both sides must tolerate their absence.
+	 * W3C Trace Context for the span this record was emitted under. Reserved in
+	 * Phase 2 and populated as of Phase 5 (NOR-283): the router re-stamps them
+	 * so a worker's log record joins the span that produced it.
+	 *
+	 * Deliberately populated even for a trace the root did NOT sample. That is
+	 * what makes the head-sampling trade in
+	 * `docs/adr/0004-parent-based-head-sampling-for-traces.md` acceptable — an
+	 * unsampled trace still leaves a complete, queryable error record carrying
+	 * the trace id, so it can be correlated with anything else that shares it.
+	 *
+	 * Both sides must still tolerate their absence: a build without tracing
+	 * enabled sends neither.
 	 */
 	traceparent: z.string().optional(),
 	tracestate: z.string().optional(),
+});
+
+/**
+ * A batch of finished worker spans, shipped device → router.
+ *
+ * Batched rather than one-span-per-frame because a span exporter is handed a
+ * batch by the SDK's `BatchSpanProcessor` and splitting it would multiply the
+ * per-frame overhead for no benefit — and because a batch shares one `resource`,
+ * which is otherwise repeated on every span.
+ *
+ * ── WHY THIS EXISTS AT ALL ──
+ * The same reason as {@link LogFrame}: the sandbox's egress allowlist is
+ * deny-by-default with the router's host as its only entry, so a worker cannot
+ * reach an Azure ingestion endpoint. Widening the allowlist to let it would be a
+ * policy change and would need an Azure credential inside the sandbox. Spans
+ * ride the WSS connection the worker already holds instead, and the router
+ * re-exports them through its own pipeline.
+ *
+ * ── DURABILITY ──
+ * Fire-and-forget, with no ack and no durable buffer — like `log`, unlike
+ * `session_state`. An unsampled trace produces no spans at all, and a sampled
+ * one that loses its tail to a disconnect is a legible partial rather than a
+ * corruption. Neither is worth the disk writes that making the frame durable
+ * would cost.
+ *
+ * ── ATTRIBUTION ──
+ * As with `log`, the router stamps identity (`cyrus.device_id`,
+ * `cyrus.issue_key`) from the device row it authenticated, over the top of the
+ * span's own attributes. A worker cannot label its spans with someone else's
+ * issue.
+ */
+const spanFrame = z.object({
+	type: z.literal("span"),
+	/**
+	 * The ORIGINATING process's resource semconv, applied to every span in this
+	 * frame. Carried because the router must not re-stamp its own: a sandbox
+	 * span claiming `service.name = cyrus-router` would be indistinguishable
+	 * from one the router really emitted.
+	 */
+	resource: z.record(z.string(), z.string()).optional(),
+	spans: z.array(spanRecord).min(1),
+	/**
+	 * How many spans the device's volume guard dropped since the last frame it
+	 * managed to send. Same contract as `LogFrame.dropped`: a truncated stream
+	 * that does not say it was truncated reads as complete.
+	 */
+	dropped: z.number().int().nonnegative().optional(),
 });
 
 const sessionStateAckFrame = z.object({
@@ -274,6 +430,12 @@ const eventFrame = z.object({
 	type: z.literal("event"),
 	seq: z.number().int().positive(),
 	event: z.unknown(),
+	// The span the router was in when it ENQUEUED this event — not when it
+	// delivered it. The two can be minutes apart (an offline device, a cold
+	// sandbox boot), which is exactly the gap a trace exists to make visible, so
+	// the context is persisted with the queued row rather than re-derived at
+	// send time. See RouterStore's `events.traceparent` column.
+	...traceContextFields,
 });
 const rpcResponseFrame = z.object({
 	type: z.literal("rpc_response"),
@@ -290,6 +452,7 @@ const deviceFrame = z.discriminatedUnion("type", [
 	sessionStateFrame,
 	sessionsReportFrame,
 	logFrame,
+	spanFrame,
 ]);
 const serverFrame = z.discriminatedUnion("type", [
 	helloAckFrame,
@@ -308,6 +471,8 @@ export type SessionStateAckFrame = z.infer<typeof sessionStateAckFrame>;
 export type SessionsQueryFrame = z.infer<typeof sessionsQueryFrame>;
 export type SessionsReportFrame = z.infer<typeof sessionsReportFrame>;
 export type LogFrame = z.infer<typeof logFrame>;
+export type SpanFrame = z.infer<typeof spanFrame>;
+export type SpanRecord = z.infer<typeof spanRecord>;
 export type HelloAckFrame = z.infer<typeof helloAckFrame>;
 export type HelloErrorFrame = z.infer<typeof helloErrorFrame>;
 export type EventFrame = z.infer<typeof eventFrame>;

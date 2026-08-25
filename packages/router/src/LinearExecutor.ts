@@ -7,12 +7,21 @@ import {
 	type IssueFacts,
 } from "cyrus-core";
 import {
+	activeSpan,
+	cyrusSpanAttributes,
+	extractTraceContext,
+	SpanKind,
+	SpanStatusCode,
+	withSpan,
+} from "cyrus-otel-traces";
+import {
 	RPC_METHODS,
 	type RpcRequestFrame,
 	type RpcResponseFrame,
 	SESSION_SCOPED_RPC_METHODS,
 } from "cyrus-router-protocol";
 import type { RouterStore } from "./RouterStore.js";
+import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
 /** 20 MiB — default ceiling for token-authenticated attachment downloads. */
 const DEFAULT_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
@@ -75,7 +84,49 @@ export class LinearExecutor {
 		this.logger = opts.logger ?? createNoopLogger();
 	}
 
-	async dispatch(
+	dispatch(
+		deviceId: number,
+		frame: RpcRequestFrame,
+	): Promise<RpcResponseFrame> {
+		// Parented on the WORKER's span, not on whatever the router happens to be
+		// doing. This call exists because a sandbox asked for it, and the frame
+		// carries the sandbox's trace context for exactly this purpose — so the
+		// Linear round-trip appears inside the worker's trace, where the four
+		// seconds it took are attributable to the turn that caused them.
+		//
+		// Falls back to the active context when the frame carries none (an older
+		// worker, or tracing disabled), which in practice means a root span.
+		const parent = extractTraceContext(frame);
+		return withSpan(
+			routerTracer(),
+			ROUTER_SPANS.linearRequest,
+			{
+				kind: SpanKind.CLIENT,
+				context: parent,
+				attributes: cyrusSpanAttributes({
+					rpc_method: frame.method,
+					device_id: deviceId,
+				}),
+			},
+			async (span) => {
+				const response = await this.dispatchInner(deviceId, frame);
+				// `dispatch` never throws by contract — a refusal and a tracker
+				// failure both come back as `{ ok: false }` — so `withSpan` has no
+				// exception to see. Without this the span would report success for
+				// every failed RPC.
+				span.setAttribute("cyrus.rpc_ok", response.ok);
+				if (!response.ok) {
+					span.setStatus({
+						code: SpanStatusCode.ERROR,
+						message: response.error ?? "rpc failed",
+					});
+				}
+				return response;
+			},
+		);
+	}
+
+	private async dispatchInner(
 		deviceId: number,
 		frame: RpcRequestFrame,
 	): Promise<RpcResponseFrame> {
@@ -99,6 +150,10 @@ export class LinearExecutor {
 			if (mutationId !== undefined) {
 				const cached = this.store.getMutation(deviceId, mutationId);
 				if (cached !== undefined) {
+					// Recorded on the span above so a replay is visibly a replay: it
+					// returns in microseconds and makes no Linear call, which would
+					// otherwise look like an implausibly fast API round-trip.
+					activeSpan()?.setAttribute("cyrus.rpc_replayed_from_cache", true);
 					return JSON.parse(cached) as RpcResponseFrame;
 				}
 			}

@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS events (
   payload_json TEXT NOT NULL,
   enqueued_ms INTEGER NOT NULL,
   expires_ms INTEGER NOT NULL,
+  traceparent TEXT,
+  tracestate TEXT,
   PRIMARY KEY (device_id, seq)
 );
 CREATE TABLE IF NOT EXISTS rpc_mutations (
@@ -312,6 +314,19 @@ interface EventRow {
 	payload_json: string;
 	enqueued_ms: number;
 	expires_ms: number;
+	/**
+	 * W3C Trace Context captured when the event was ENQUEUED, not when it is
+	 * delivered. The gap between the two is routinely minutes — an offline
+	 * device, a cold sandbox boot — and it is precisely the interval a trace
+	 * exists to make visible, so the context has to be persisted with the row
+	 * rather than re-derived at send time (by which point the router is in some
+	 * unrelated timer callback, or a different process entirely).
+	 *
+	 * NULL for every row enqueued with tracing off, and for every row that
+	 * predates the migration.
+	 */
+	traceparent: string | null;
+	tracestate: string | null;
 }
 
 interface SessionAffinityRow {
@@ -469,6 +484,29 @@ export class RouterStore {
 			!deviceColsNow.some((c) => c.name === "running_since_ms")
 		) {
 			this.db.exec("ALTER TABLE devices ADD COLUMN running_since_ms INTEGER");
+		}
+
+		// Deliberately NOT backfilled, and there is nothing sensible to backfill
+		// with: a row enqueued before this column existed was produced by a
+		// router that had no trace to record. NULL is the honest answer and the
+		// delivery path already treats it as "no trace context", so a
+		// pre-upgrade event is simply delivered without one and the device starts
+		// its own trace.
+		//
+		// The two columns are checked independently rather than as a pair: these
+		// `ALTER`s run outside a transaction, so a crash between them would leave
+		// a database with one column and not the other, and a paired check would
+		// then skip the repair forever.
+		const eventCols = this.db
+			.prepare("PRAGMA table_info(events)")
+			.all() as Array<{ name: string }>;
+		if (eventCols.length > 0) {
+			if (!eventCols.some((c) => c.name === "traceparent")) {
+				this.db.exec("ALTER TABLE events ADD COLUMN traceparent TEXT");
+			}
+			if (!eventCols.some((c) => c.name === "tracestate")) {
+				this.db.exec("ALTER TABLE events ADD COLUMN tracestate TEXT");
+			}
 		}
 
 		// Existing rows predate the column. Backfill them to migration time rather
@@ -1228,11 +1266,17 @@ export class RouterStore {
 		return result.changes;
 	}
 
+	/**
+	 * @param traceContext W3C Trace Context for the span this event is being
+	 * enqueued under, persisted with the row so a delivery minutes later still
+	 * joins the trace that produced it. Omit it entirely when tracing is off.
+	 */
 	enqueueEvent(
 		deviceId: number,
 		payloadJson: string,
 		nowMs: number,
 		ttlMs: number,
+		traceContext?: { traceparent?: string; tracestate?: string },
 	): number {
 		const txn = this.db.transaction(() => {
 			const deviceRow = this.db
@@ -1247,10 +1291,18 @@ export class RouterStore {
 				.run(seq + 1, deviceId);
 			this.db
 				.prepare(
-					`INSERT INTO events (device_id, seq, payload_json, enqueued_ms, expires_ms)
-					 VALUES (?, ?, ?, ?, ?)`,
+					`INSERT INTO events (device_id, seq, payload_json, enqueued_ms, expires_ms, traceparent, tracestate)
+					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 				)
-				.run(deviceId, seq, payloadJson, nowMs, nowMs + ttlMs);
+				.run(
+					deviceId,
+					seq,
+					payloadJson,
+					nowMs,
+					nowMs + ttlMs,
+					traceContext?.traceparent ?? null,
+					traceContext?.tracestate ?? null,
+				);
 			// Drives the container idle-stop policy (Task 8); harmless for
 			// physical devices, which ignore last_routed_ms.
 			this.db
@@ -1319,12 +1371,20 @@ export class RouterStore {
 			// <= lastAckedSeq here, so this is in practice the whole queue.
 			const victims = this.db
 				.prepare(
-					`SELECT seq, payload_json, enqueued_ms, expires_ms FROM events
+					`SELECT seq, payload_json, enqueued_ms, expires_ms, traceparent, tracestate FROM events
 					 WHERE device_id = ? AND seq <= ? AND expires_ms > ?
 					 ORDER BY seq ASC`,
 				)
 				.all(deviceId, lastAckedSeq, nowMs) as Array<
-				Pick<EventRow, "seq" | "payload_json" | "enqueued_ms" | "expires_ms">
+				Pick<
+					EventRow,
+					| "seq"
+					| "payload_json"
+					| "enqueued_ms"
+					| "expires_ms"
+					| "traceparent"
+					| "tracestate"
+				>
 			>;
 
 			let nextSeq = lastAckedSeq + 1;
@@ -1337,8 +1397,8 @@ export class RouterStore {
 					.run(deviceId, victim.seq);
 				this.db
 					.prepare(
-						`INSERT INTO events (device_id, seq, payload_json, enqueued_ms, expires_ms)
-						 VALUES (?, ?, ?, ?, ?)`,
+						`INSERT INTO events (device_id, seq, payload_json, enqueued_ms, expires_ms, traceparent, tracestate)
+						 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 					)
 					.run(
 						deviceId,
@@ -1348,6 +1408,12 @@ export class RouterStore {
 						// TTL is preserved deliberately: resequencing must not
 						// resurrect a prompt that has already aged out.
 						victim.expires_ms,
+						// Likewise carried across: a resequenced event is the SAME
+						// event under a new seq, and dropping its trace context would
+						// silently detach exactly the deliveries that a seq regression
+						// makes interesting to trace (NOR-263).
+						victim.traceparent,
+						victim.tracestate,
 					);
 				nextSeq += 1;
 			}
@@ -1423,19 +1489,31 @@ export class RouterStore {
 		deviceId: number,
 		afterSeq: number,
 		nowMs: number,
-	): Array<{ seq: number; payloadJson: string }> {
+	): Array<{
+		seq: number;
+		payloadJson: string;
+		traceparent?: string;
+		tracestate?: string;
+	}> {
 		const rows = this.db
 			.prepare(
-				`SELECT seq, payload_json FROM events
+				`SELECT seq, payload_json, traceparent, tracestate FROM events
 				 WHERE device_id = ? AND seq > ? AND expires_ms > ?
 				 ORDER BY seq ASC`,
 			)
 			.all(deviceId, afterSeq, nowMs) as Array<
-			Pick<EventRow, "seq" | "payload_json">
+			Pick<EventRow, "seq" | "payload_json" | "traceparent" | "tracestate">
 		>;
+		// NULL becomes an ABSENT property rather than an explicit `undefined`,
+		// because the caller spreads the result into a frame the protocol schema
+		// validates: `{ traceparent: undefined }` survives `JSON.stringify` as
+		// nothing at all, but an explicitly-undefined key is a trap for any
+		// future code that checks `"traceparent" in frame`.
 		return rows.map((row) => ({
 			seq: row.seq,
 			payloadJson: row.payload_json,
+			...(row.traceparent ? { traceparent: row.traceparent } : {}),
+			...(row.tracestate ? { tracestate: row.tracestate } : {}),
 		}));
 	}
 

@@ -35,6 +35,7 @@ import {
 	LogLevel,
 	StreamingPrompt,
 } from "cyrus-core";
+import { cyrusSpanAttributes, getTracer, type Span } from "cyrus-otel-traces";
 import dotenv from "dotenv";
 import { ClaudeMessageFormatter, type IMessageFormatter } from "./formatter.js";
 import { buildHomeDirectoryDisallowedTools } from "./home-directory-restrictions.js";
@@ -49,6 +50,15 @@ import type {
 	ClaudeSessionInfo,
 	McpServerStatusReport,
 } from "./types.js";
+
+/**
+ * Instrumentation scope for the agent-session span.
+ *
+ * Distinct from `cyrus-worker` (the `RouterConnection` join point) so a query
+ * can separate "the sandbox picked the work up" from "the agent was thinking",
+ * which are the two halves of the sandbox-side duration.
+ */
+const CLAUDE_RUNNER_TRACER_NAME = "cyrus-claude-runner";
 
 // AbortError is no longer exported in v1.0.95, so we define it locally
 export class AbortError extends Error {
@@ -282,6 +292,24 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	private cyrusHome: string;
 	private formatter: IMessageFormatter;
 	private pendingResultMessage: SDKMessage | null = null;
+	/**
+	 * The span covering one agent query, start to terminal state.
+	 *
+	 * This is the far end of the distributed trace: without it a trace stops at
+	 * "the worker received the event" and the minutes the agent actually spent
+	 * are a gap. Held on the instance rather than wrapped around the query,
+	 * because the query has one entry point and several terminal paths (normal
+	 * completion, user abort, SIGTERM, error) that all converge on a single
+	 * `finally` — which is where it is ended.
+	 *
+	 * Deliberately NOT made the active span. Doing so would mean wrapping the
+	 * whole query body in a callback, and it buys nothing today: nothing inside
+	 * the SDK loop starts a span of its own. The parent is whatever context was
+	 * active when the query began, which — thanks to `RouterConnection`
+	 * activating the router's context around its `event` emit — is the router's
+	 * dispatch span.
+	 */
+	private sessionSpan: Span | undefined;
 	private canUseToolCallback: CanUseTool | undefined;
 	private repositoryEnv: Record<string, string> = {};
 	private keepSessionWarm: boolean;
@@ -532,6 +560,21 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 
 		// Reset messages array
 		this.messages = [];
+
+		// Started immediately before the try whose `finally` ends it, so there is
+		// no window in which a throw could leak it. The setup above (env loading,
+		// log stream creation) is deliberately outside the span: it is not the
+		// agent working, and a failure there never reaches the query at all.
+		this.sessionSpan = getTracer(CLAUDE_RUNNER_TRACER_NAME).startSpan(
+			isResumed ? "session.resume" : "session.query",
+			{
+				attributes: cyrusSpanAttributes({
+					model: this.config.model,
+					fallback_model: this.config.fallbackModel,
+					resumed: isResumed,
+				}),
+			},
+		);
 
 		try {
 			// Determine prompt mode and setup
@@ -964,6 +1007,12 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 				);
 			}
 		} finally {
+			// Every terminal path converges here — normal completion, user abort,
+			// SIGTERM, and error alike — so this is the one place the session span
+			// can be ended exactly once. A leaked span is worse than a missing one:
+			// it never exports, so the trace renders with a silent gap rather than
+			// with an error.
+			this.endSessionSpan();
 			// Clean up
 			this.abortController = null;
 			this.activeQuery = null;
@@ -1193,6 +1242,29 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 		if (this.sessionInfo) {
 			this.sessionInfo.isRunning = false;
 		}
+	}
+
+	/**
+	 * End the session span, once.
+	 *
+	 * The agent session id and the message count are only known at the end, so
+	 * they are stamped here rather than at start. `sessionInfo.isRunning` has
+	 * already been set false on every path that reaches this, so it is not a
+	 * usable status signal — the span is left `UNSET` unless the query threw,
+	 * which `startWithPrompt`'s catch has already turned into an emitted error.
+	 * An abort is not an error: a user stopping a session is a normal operation.
+	 */
+	private endSessionSpan(): void {
+		const span = this.sessionSpan;
+		if (!span) return;
+		this.sessionSpan = undefined;
+		span.setAttributes(
+			cyrusSpanAttributes({
+				message_count: this.messages.length,
+				agent_session_id: this.sessionInfo?.sessionId,
+			}),
+		);
+		span.end();
 	}
 
 	/**

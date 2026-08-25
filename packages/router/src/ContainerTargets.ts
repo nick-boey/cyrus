@@ -1,4 +1,12 @@
 import type { ILogger } from "cyrus-core";
+import {
+	cyrusSpanAttributes,
+	OTEL_TRACES_ENABLED_ENV,
+	OTEL_TRACES_SAMPLE_RATIO_ENV,
+	SpanKind,
+	SpanStatusCode,
+	withSpan,
+} from "cyrus-otel-traces";
 import type { ExecutorRegistry } from "cyrus-router-executors";
 import { containerBootFailedMessage } from "./messages.js";
 import type {
@@ -17,6 +25,7 @@ import {
 	type SecretStoreBackend,
 } from "./SecretStore.js";
 import { resolveExecutor } from "./setup/bootstrap.js";
+import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
 /**
  * A device/webhook-supplied issue key flows into filesystem paths, Docker
@@ -410,13 +419,58 @@ export class ContainerTargetService {
 	 * caught and logged rather than thrown, since this always runs detached
 	 * from a caller that could otherwise catch it.
 	 */
-	private async bootInner(
+	private bootInner(
 		deviceId: number,
 		userId: number,
 		provider: string,
 		issueKey: string,
 		notify?: { workspaceId: string; sessionId: string },
 	): Promise<void> {
+		// The single most valuable span in the router: a cold ACA boot is ~60s
+		// and an image pull can be minutes, so "why did this take four minutes"
+		// is usually answered here. Note it never records an ERROR status —
+		// `bootInnerTraced` catches everything by contract (see the doc above),
+		// so the failure shows up as the `cyrus.boot_failed` attribute rather
+		// than as a thrown exception `withSpan` could see.
+		return withSpan(
+			routerTracer(),
+			ROUTER_SPANS.sandboxBoot,
+			{
+				kind: SpanKind.CLIENT,
+				attributes: cyrusSpanAttributes({
+					issue_key: issueKey,
+					device_id: deviceId,
+					provider,
+				}),
+			},
+			async (span) => {
+				const failure = await this.bootInnerTraced(
+					deviceId,
+					userId,
+					provider,
+					issueKey,
+					notify,
+				);
+				span.setAttribute("cyrus.boot_failed", failure !== undefined);
+				if (failure !== undefined) {
+					span.setStatus({ code: SpanStatusCode.ERROR, message: failure });
+				}
+			},
+		);
+	}
+
+	/**
+	 * @returns the failure message when the boot failed, `undefined` on success.
+	 * Reported by return value rather than by throwing because this function's
+	 * whole contract is that it never rejects.
+	 */
+	private async bootInnerTraced(
+		deviceId: number,
+		userId: number,
+		provider: string,
+		issueKey: string,
+		notify?: { workspaceId: string; sessionId: string },
+	): Promise<string | undefined> {
 		const executor = this.deps.executors.get(provider);
 		try {
 			if (!executor) {
@@ -469,6 +523,7 @@ export class ContainerTargetService {
 				{ transitioned },
 			);
 			this.bootFailedNotified.delete(issueKey);
+			return undefined;
 		} catch (err) {
 			this.deps.logger.error(`Container boot failed for ${issueKey}`, err);
 			emitSandboxEvent(
@@ -500,6 +555,7 @@ export class ContainerTargetService {
 					);
 				}
 			}
+			return err instanceof Error ? err.message : String(err);
 		}
 	}
 
@@ -540,6 +596,20 @@ export class ContainerTargetService {
 			CYRUS_REPOS_JSON: JSON.stringify(
 				await this.reposForIssue(issueKey, workspaceId),
 			),
+			// Propagate the router's own tracing switches into the sandbox, so a
+			// worker's spans exist exactly when the router's do. Deriving them from
+			// the router's live env rather than from config is deliberate: these
+			// travel together, and a deployment where one side traces and the other
+			// does not produces the half-collected traces that
+			// `docs/adr/0004-parent-based-head-sampling-for-traces.md` exists to
+			// prevent.
+			//
+			// No Application Insights connection string is passed, and must not be.
+			// The worker exports through the router over WSS (see
+			// `RouterSpanForwarder`); giving a sandbox a direct ingestion credential
+			// would need a wider egress allowlist and would put that credential in
+			// every sandbox.
+			...traceEnv(),
 		};
 		// Spread the user's map, skipping reserved keys. `set` already rejects
 		// them; this is belt-and-braces against a hand-edited secrets file.
@@ -662,4 +732,31 @@ export class ContainerTargetService {
 		if (!email) throw new Error(`unknown user ${userId}`);
 		return email;
 	}
+}
+
+/**
+ * The tracing environment a sandbox worker inherits from the router.
+ *
+ * Read from `process.env` at boot time rather than captured at startup so a
+ * router restarted with tracing newly enabled starts producing traced sandboxes
+ * immediately, without the value being baked into a long-lived object.
+ *
+ * Only forwards what is set. An absent `CYRUS_OTEL_TRACES_ENABLED` leaves the
+ * worker's env byte-identical to what it was before this phase, which is what
+ * keeps this change inert for every deployment that has not opted in.
+ */
+function traceEnv(): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const key of [
+		OTEL_TRACES_ENABLED_ENV,
+		OTEL_TRACES_SAMPLE_RATIO_ENV,
+		// Not a tracing switch, but the sandbox's `deployment.environment.name`
+		// has to match the router's or the two halves of a trace land in
+		// different environments in the backend.
+		"CYRUS_OTEL_DEPLOYMENT_ENV",
+	]) {
+		const value = process.env[key]?.trim();
+		if (value) env[key] = value;
+	}
+	return env;
 }

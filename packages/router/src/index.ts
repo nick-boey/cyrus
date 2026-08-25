@@ -67,6 +67,11 @@ export {
 	SandboxLogRelay,
 } from "./SandboxLogRelay.js";
 export {
+	type SandboxSpanOrigin,
+	SandboxSpanRelay,
+	type SandboxSpanRelayOptions,
+} from "./SandboxSpanRelay.js";
+export {
 	emitSandboxEvent,
 	emitSandboxGauge,
 	SANDBOX_EVENTS,
@@ -145,8 +150,24 @@ export {
 	type TerminalTeardownOptions,
 } from "./TerminalTeardown.js";
 export {
+	type HttpTracingOptions,
+	registerHttpTracing,
+} from "./telemetry/httpTracing.js";
+export {
 	APPINSIGHTS_CONNECTION_STRING_ENV,
+	buildRouterResourceInput,
 	type StartRouterOtelLoggingOptions,
 	startRouterOtelLogging,
 } from "./telemetry/otelLogging.js";
+export {
+	type RouterOtelTracing,
+	type StartRouterOtelTracingOptions,
+	startRouterOtelTracing,
+} from "./telemetry/otelTracing.js";
+export {
+	ROUTER_SPANS,
+	ROUTER_TRACER_NAME,
+	type RouterSpanName,
+	routerTracer,
+} from "./telemetry/tracing.js";
 export { registerWorkspacesRoute } from "./workspaces.js";
