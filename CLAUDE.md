@@ -524,6 +524,26 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      Run `./scripts/check-bicep.sh` after any template change; it compiles every
      template, type-checks `main.bicepparam.example` against `main.bicep`, and
      treats warnings as failures.
+   - **`aca sandboxgroup disk create` can no longer register the worker image,
+     and `workerImage` + `acaDiskName` must move as a pair.** The
+     `PUT …/diskimages` import is synchronous and scales with image size, while
+     the preview CLI abandons each attempt at ~60s (two attempts, ~120s total)
+     and reports it as `Error: Network issue — retry policy expired` — which
+     reads as a network blip. Everything past ~1 GB is over the ceiling and the
+     image is well past it (NOR-296 reviewed the growth and accepted it), so
+     this does not resolve itself. `scripts/deploy-worker-image.sh` issues the
+     PUT directly: audience `https://dynamicsessions.io` (NOT
+     `management.azure.com`, which 401s), credential field `token` (NOT
+     `password`, which 400s naming the required property), and ONE attempt —
+     aborting the client does not abort the server-side import, so a retry
+     races a running import rather than replacing it. Gate on `disk list`
+     showing `Ready`; a 2xx only says the request was accepted. And because
+     `workerImage` (what the router advertises) and `acaDiskName` (what the
+     group boots) describe one build, a rewrite that lands one without the
+     other is undetectable downstream — they are rewritten in a single verified
+     pass, and each disk is named after its build so a name that did not move
+     means an image that did not either. Retrying instead of doing this is what
+     left `sha-d7fb6a3` built-but-never-deployed for four days (NOR-295).
    - Repository selection for **container** targets happens on the **router**,
      in `EventRouter.routeCreated`, before any device row or sandbox exists.
      The decision is persisted in `issue_repositories` and is what

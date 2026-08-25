@@ -299,9 +299,20 @@ commit. Prefer it over the manual sequence below:
 ./scripts/deploy-router-image.sh          # then review the what-if and deploy
 ```
 
-The manual steps below remain the reference for the **worker** image, which the
-script does not handle: the worker is registered out of band as an ACA disk
-(`aca sandboxgroup disk create`) and `acaDiskName` must move with it.
+The **worker** image has its own script, `scripts/deploy-worker-image.sh`, which
+additionally registers the ACA disk and moves `acaDiskName` with `workerImage`:
+
+```bash
+./scripts/deploy-worker-image.sh          # then review the what-if and deploy
+```
+
+It does the build below, then everything in [step 6](#6-configure-aca-and-register-the-worker-disk)
+— so if you use it, skip step 6. Note that it registers the disk with a **raw
+PUT**, not `aca sandboxgroup disk create`; see
+[the CLI cannot register large disks](#the-aca-cli-cannot-register-large-disks)
+for why that is no longer optional.
+
+The manual steps below remain the reference for what the script does.
 
 Build with **`az acr build`**, not local `docker buildx --push`:
 
@@ -426,6 +437,15 @@ aca sandboxgroup role create \
 aca doctor
 ```
 
+The `aca config` / `role create` / `doctor` steps above are still required — they
+set up the data-plane access `scripts/deploy-worker-image.sh` also relies on.
+
+> **The `disk create` step below will NOT work for the current `cyrus-worker`
+> image.** It is kept because it documents the arguments and is still correct for
+> a small image, but at this image's size the CLI times out before the import
+> finishes. Use `scripts/deploy-worker-image.sh`, or the raw PUT in
+> [the CLI cannot register large disks](#the-aca-cli-cannot-register-large-disks).
+
 For a public worker image, register it directly. For private ACR, the preview CLI
 may not resolve the sandbox group's system identity during disk import; use a
 short-lived ACR refresh token for this one operation. Runtime pulls still use the
@@ -451,27 +471,81 @@ reports the *pipeline's* status, so a failed import reads as exit 0. The
 authoritative check is the disk appearing in `aca sandboxgroup disk list` with
 state `Ready`.
 
-> **`Error: Network issue — retry policy expired`.** This message is emitted
-> for any transport-level failure of the `PUT …/diskimages` call and is
-> frequently *not* a network fault. Before treating it as one:
->
-> - Re-run with `--verbose`. A genuine network problem shows a real HTTP status;
->   a client-side timeout shows `failed to execute 'reqwest' request` with no
->   status, retried once, failing at roughly 120 s total (two ~60 s attempts).
-> - Confirm the pushed image is a plain Docker v2 manifest, not an OCI index
->   (see step 4) — the importer cannot consume an index.
-> - Check reachability independently. `curl` a GET *and* a PUT against the same
->   `…/diskimages` URL: a 401 from both means the endpoint and method are fine
->   and the problem is not your egress path.
-> - Run `aca doctor` to rule out auth, region, group, and the
->   *SandboxGroup Data Owner* role assignment.
->
-> If all of those pass and the PUT still times out with no HTTP status, the
-> preview data-plane service is the remaining suspect; retry later rather than
-> rebuilding images. A failed registration changes nothing, so it is safe to
-> deploy the router alone and register the disk afterwards — an older worker
-> parses `CYRUS_REPOS_JSON` with a non-strict schema and ignores fields it does
-> not know, and the router scopes that list before the worker ever sees it.
+#### The `aca` CLI cannot register large disks
+
+**`Error: Network issue — retry policy expired and the request will no longer be
+retried` is, for this image, neither a network fault nor a transient service
+problem.** The `PUT …/diskimages` import is synchronous and its duration scales
+with image size, while the preview CLI abandons each attempt at ~60 s (two
+attempts, ~120 s total). Measured on `cyrus-worker`:
+
+| tag | compressed | disk size | import time | result |
+| -- | -- | -- | -- | -- |
+| `sha-8e16d01` | 1.02 GB | 4177 MB | ~18 s | Ready |
+| `sha-d7fb6a3` | 1.40 GB | — | — | **never registered** |
+| `sha-6de8aff` | 1.71 GB | 5931 MB | **99 s** | Ready, only via raw PUT |
+
+Anything past roughly 1 GB is now over the ceiling, and the image is well past
+it — the growth was reviewed and accepted, so this does not resolve itself.
+
+**Do not retry and do not rebuild.** An earlier version of this runbook advised
+retrying later. That is how `sha-d7fb6a3` came to be built and silently never
+deployed: the worker sat on a build from four days earlier while the router
+moved ahead, and the error read as a network blip. Retrying is also actively
+counterproductive — aborting the client does not abort the server-side import,
+so a retry races an import that is still running.
+
+Use `scripts/deploy-worker-image.sh`, which issues the PUT itself with a
+deadline you control. To do it by hand:
+
+```bash
+# The audience is https://dynamicsessions.io — NOT https://management.azure.com/.
+# The data plane kept the resource URI from its dynamic-sessions lineage; the
+# management audience yields a token the endpoint answers with 401.
+ACA_TOKEN=$(az account get-access-token \
+  --resource https://dynamicsessions.io --query accessToken -o tsv)
+ACR_TOKEN=$(az acr login --name "$ACR" --expose-token --query accessToken -o tsv)
+ENDPOINT=$(echo "$OUT" | jq -r .managementEndpoint.value)
+
+# The credential field is `token`, NOT `password`. A wrong guess returns a fast
+# 400 naming the required property, which reads like a malformed body.
+jq -n --arg n "<aca-disk-name>" --arg b "$ACR.azurecr.io/cyrus-worker@<digest>" \
+      --arg t "$ACR_TOKEN" \
+  '{name:$n, image:{base:$b, registryCredentials:
+     {username:"00000000-0000-0000-0000-000000000000", token:$t}}}' >/tmp/disk.json
+
+curl --max-time 900 --request PUT --data-binary @/tmp/disk.json \
+  --header "Content-Type: application/json" \
+  --header "Authorization: Bearer $ACA_TOKEN" \
+  "${ENDPOINT}/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/sandboxGroups/${SANDBOX_GROUP}/diskimages?api-version=2026-02-01-preview"
+
+rm -f /tmp/disk.json; unset ACR_TOKEN ACA_TOKEN
+```
+
+Then poll `aca sandboxgroup disk list` until the disk reports `Ready` — a 2xx
+here says the request was accepted, not that the image imported.
+
+#### Ruling out the other causes first
+
+The same message *is* emitted for genuine transport failures, so before reaching
+for the raw PUT:
+
+- Re-run with `--verbose`. A genuine network problem shows a real HTTP status;
+  the size-driven timeout shows `failed to execute 'reqwest' request` with no
+  status, retried once, failing at roughly 120 s total.
+- Confirm the pushed image is a plain Docker v2 manifest, not an OCI index
+  (see step 4) — the importer cannot consume an index.
+- Check reachability independently. `curl` a GET *and* a PUT against the same
+  `…/diskimages` URL: a 401 from both means the endpoint and method are fine
+  and the problem is not your egress path.
+- Run `aca doctor` to rule out auth, region, group, and the
+  *SandboxGroup Data Owner* role assignment.
+
+A failed registration changes nothing, so it is safe to deploy the router alone
+and register the disk afterwards — an older worker parses `CYRUS_REPOS_JSON`
+with a non-strict schema and ignores fields it does not know, and the router
+scopes that list before the worker ever sees it. But do not leave it unfinished:
+that gap is exactly the one that went unnoticed for four days.
 
 Wait for the disk state to become `Ready`. Private disks are created by their
 server-assigned disk ID; the router resolves the configured operator name from

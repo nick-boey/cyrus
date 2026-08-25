@@ -47,9 +47,14 @@ param location = 'australiaeast'
 param routerImage = 'ghcr.io/ceedaragents/cyrus-router:sha-0000000'
 
 // NOT pulled by the router. Register it as a group disk image OUT OF BAND after
-// the first deployment:
-//   aca sandboxgroup disk create --image <workerImage> --name <acaDiskName> \
-//     --resource-group <rg> --sandbox-group <sandboxGroupName>
+// the first deployment. Use `scripts/deploy-worker-image.sh`, which builds,
+// registers, and rewrites this parameter together with acaDiskName below.
+//
+// The `aca sandboxgroup disk create` CLI can no longer register an image this
+// size: its ~60s per-attempt ceiling is below the import time, and it reports
+// the timeout as `Error: Network issue — retry policy expired`. See README →
+// "The aca CLI cannot register large disks".
+//
 // Immutable here too — the disk image is registered out of band, so a floating
 // tag leaves no way to tell which build a registered disk was cut from.
 param workerImage = 'ghcr.io/ceedaragents/cyrus-worker:sha-0000000'
@@ -65,8 +70,15 @@ param allowMutableImageTags = false
 // containers at a custom domain or a proxy in front of the app.
 param routerUrlForContainers = ''
 
-// The disk image NAME the group knows the worker image by. Must match the
-// `--name` passed to `aca sandboxgroup disk create`.
+// The disk image NAME the group knows the worker image by. Must match the name
+// the disk was registered under.
+//
+// This and workerImage above are two parameters describing ONE build, and they
+// must move together: set one without the other and the router advertises an
+// image the group is not booting. deploy-worker-image.sh rewrites them in a
+// single verified pass for that reason, and names each disk after the build it
+// holds (`cyrus-worker-sha-<sha>`) so a disk name that did not change is a
+// visible sign that the image did not either.
 param acaDiskName = 'cyrus-worker'
 
 // ---- ACA per-sandbox compute defaults ---------------------------------------

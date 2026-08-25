@@ -41,6 +41,7 @@ jobs:
     - name: Test deploy scripts
       run: |
         bash scripts/deploy-router-image.test.sh
+        bash scripts/deploy-worker-image.test.sh
         bash scripts/bootstrap-azure-role-assignments.test.sh
 
   test:
