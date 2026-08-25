@@ -15,6 +15,12 @@ export const releasePackages = [
 	},
 	// core precedes mcp-tools: mcp-tools depends on it.
 	{ directory: "packages/core", name: "cyrus-core" },
+	// Depends only on core, and sits this early because claude-runner (three
+	// entries below) emits the agent-session span. Note the contrast with
+	// otel-logs further down: that one is consumed only by the router, whereas
+	// tracing call sites are spread across the runner, the executors, the
+	// router-client and the router — so it has to precede all of them.
+	{ directory: "packages/otel-traces", name: "cyrus-otel-traces" },
 	{ directory: "packages/mcp-tools", name: "cyrus-mcp-tools" },
 	{ directory: "packages/claude-runner", name: "cyrus-claude-runner" },
 	{ directory: "packages/config-updater", name: "cyrus-config-updater" },
