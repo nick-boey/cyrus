@@ -114,13 +114,33 @@ resource authConfig 'Microsoft.App/containerApps/authConfigs@2024-03-01' = {
           // allowedPrincipals is not the same as sending none, and the safe
           // reading of "unset" is "the Entra assignment requirement is the
           // gate".
+          //
+          // The SAME rule applies one level down, per key. An EMPTY `groups` is
+          // not an ABSENT one: EasyAuth sidecar 1.14.0.0 resolves group
+          // membership whenever the key is present, and it resolves it through
+          // Azure AD Graph (graph.windows.net) -- retired -- so the lookup
+          // cannot succeed. The failure is not caught: it escapes as a 500 on
+          // /.auth/login/aad/callback AFTER sign-in has already succeeded, and
+          // BEFORE `identities` is ever consulted, so listing a user there does
+          // not save them. Sidecar 1.12.9.0 short-circuited on the empty array,
+          // which is why this deployment worked until Azure rolled the sidecar
+          // underneath a running revision on 2026-08-24 (no redeploy involved).
+          // Emit each key only when its list is non-empty.
           allowedPrincipalsConfigured
             ? {
                 defaultAuthorizationPolicy: {
-                  allowedPrincipals: {
-                    groups: allowedGroupObjectIds
-                    identities: allowedPrincipalObjectIds
-                  }
+                  allowedPrincipals: union(
+                    empty(allowedGroupObjectIds)
+                      ? {}
+                      : {
+                          groups: allowedGroupObjectIds
+                        },
+                    empty(allowedPrincipalObjectIds)
+                      ? {}
+                      : {
+                          identities: allowedPrincipalObjectIds
+                        }
+                  )
                 }
               }
             : {}
