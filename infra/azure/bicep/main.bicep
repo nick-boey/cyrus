@@ -85,7 +85,7 @@ param location string
 @minLength(3)
 param routerImage string
 
-@description('Fully-qualified OCI image for the Cyrus worker, pinned to an IMMUTABLE reference for the same reason as routerImage. This image is NOT pulled by the router — it is registered as a group-scoped ACA disk image OUT OF BAND (`aca sandboxgroup disk create --image <workerImage>`), and the disk name the group knows it by is acaDiskName. It is passed here purely so the router can embed it in CYRUS_ROUTER_CONTAINERS_JSON. Because the disk image is registered out of band, a floating tag here also makes it impossible to tell which build a registered disk was cut from.')
+@description('Fully-qualified OCI image for the Cyrus worker, pinned to an IMMUTABLE reference for the same reason as routerImage. This image is NOT pulled by the router — it is registered as a group-scoped ACA disk image OUT OF BAND (scripts/deploy-worker-image.sh; the `aca sandboxgroup disk create` CLI can no longer register an image this size, see README → "The aca CLI cannot register large disks"), and the disk name the group knows it by is acaDiskName. It is passed here purely so the router can embed it in CYRUS_ROUTER_CONTAINERS_JSON. Because the disk image is registered out of band, a floating tag here also makes it impossible to tell which build a registered disk was cut from. This parameter and acaDiskName describe ONE build and must always be changed together.')
 @minLength(3)
 param workerImage string
 
@@ -95,7 +95,7 @@ param allowMutableImageTags bool = false
 @description('Optional override for the WSS URL containers dial to reach the router. Leave empty: unlike the Terraform stack, this template derives the value from the Container Apps environment\'s defaultDomain, which is a SEPARATE resource from the app and therefore introduces no dependency cycle. The two-apply flow the Terraform stack needed for this is gone.')
 param routerUrlForContainers string = ''
 
-@description('Name of the pre-registered ACA group disk image (created out of band from workerImage). This is the value the router passes to sourcesRef.diskImage on sandbox create.')
+@description('Name of the pre-registered ACA group disk image (created out of band from workerImage). This is the value the router passes to sourcesRef.diskImage on sandbox create. Must move WITH workerImage: the two describe one build, so setting one without the other leaves the router advertising an image the group is not booting, and nothing downstream can detect the disagreement. scripts/deploy-worker-image.sh rewrites both in a single verified pass.')
 @minLength(1)
 param acaDiskName string
 
