@@ -507,12 +507,20 @@ ACA_TOKEN=$(az account get-access-token \
 ACR_TOKEN=$(az acr login --name "$ACR" --expose-token --query accessToken -o tsv)
 ENDPOINT=$(echo "$OUT" | jq -r .managementEndpoint.value)
 
-# The credential field is `token`, NOT `password`. A wrong guess returns a fast
-# 400 naming the required property, which reads like a malformed body.
+# This is the body `aca sandboxgroup disk create` itself sends, captured from its
+# --verbose output. Three parts are load-bearing:
+#   - `registryCredentials` is a SIBLING of `image`, not a member of it. Nested
+#     inside `image` the service never reads it and answers 401 RegistryAuthFailed
+#     asking for the field you just sent (see below).
+#   - the requested name goes in `labels.name`. The server assigns its own GUID as
+#     `name` and preserves the label, which is what the router resolves against.
+#   - the credential field is `token`, NOT `password`. A wrong guess returns a fast
+#     400 naming the required property, which reads like a malformed body.
 jq -n --arg n "<aca-disk-name>" --arg b "$ACR.azurecr.io/cyrus-worker@<digest>" \
       --arg t "$ACR_TOKEN" \
-  '{name:$n, image:{base:$b, registryCredentials:
-     {username:"00000000-0000-0000-0000-000000000000", token:$t}}}' >/tmp/disk.json
+  '{labels:{name:$n}, image:{base:$b},
+    registryCredentials:{username:"00000000-0000-0000-0000-000000000000",
+                         token:$t}}' >/tmp/disk.json
 
 curl --max-time 900 --request PUT --data-binary @/tmp/disk.json \
   --header "Content-Type: application/json" \
@@ -524,6 +532,17 @@ rm -f /tmp/disk.json; unset ACR_TOKEN ACA_TOKEN
 
 Then poll `aca sandboxgroup disk list` until the disk reports `Ready` — a 2xx
 here says the request was accepted, not that the image imported.
+
+**`401 RegistryAuthFailed` here is a misplaced key, not a bad credential.** The
+response asks you to "provide `registryCredentials` (username and token) or
+`managedIdentityClientId`" — which is exactly what you did send, one level too
+deep. Nested inside `image` the field is never read, no pull is attempted, and
+the failure comes back within seconds. That timing is the tell: a real
+credential problem fails *after* a pull attempt. Confirmed against the ACR
+refresh token, an exchanged ACR access token, `managedIdentityClientId` for the
+group's system-assigned identity, and an explicit `AcrPull` grant to the calling
+user — all four fail identically, and independently of digest vs tag reference
+(NOR-337). Move `registryCredentials` to the top level.
 
 #### Ruling out the other causes first
 

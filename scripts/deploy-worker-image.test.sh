@@ -487,15 +487,53 @@ else
   sed 's/^/       /' "$E2E/curl-urls" >&2
 fi
 
-# `token`, NOT `password`. A wrong guess returns a fast 400 naming the required
-# property, which reads like a malformed body rather than a wrong field name.
-if [[ "$(jq -r '.image.registryCredentials.token' "$E2E/put-body.json")" == "ACR-REFRESH-TOKEN" ]] \
-   && [[ "$(jq -r '.image.registryCredentials.username' "$E2E/put-body.json")" == "00000000-0000-0000-0000-000000000000" ]] \
-   && [[ "$(jq -r '.name' "$E2E/put-body.json")" == "$E2E_DISK" ]] \
-   && [[ "$(jq -r '.image.base' "$E2E/put-body.json")" == "$E2E_REF" ]]; then
-  ok "PUT body carries name, base, and registryCredentials.token"
+# The body's SHAPE, asserted whole rather than field by field.
+#
+# This is the assertion NOR-337 needed and did not have. The previous version
+# checked that the credential field was named `token` rather than `password`, and
+# that the name, base and credentials were all present somewhere — every one of
+# which was true of the body that shipped, which nested `registryCredentials`
+# inside `image` and put the name at the top level, and which failed 100% of the
+# time with `401 RegistryAuthFailed`. A misplaced key is invisible to a lookup
+# that already knows where to look, so the whole object is compared against the
+# one `aca sandboxgroup disk create` sends.
+expected_body="$(jq -Sn --arg n "$E2E_DISK" --arg b "$E2E_REF" \
+  '{labels:{name:$n},
+    image:{base:$b},
+    registryCredentials:{username:"00000000-0000-0000-0000-000000000000",
+                         token:"ACR-REFRESH-TOKEN"}}')"
+if [[ "$(jq -S . "$E2E/put-body.json")" == "$expected_body" ]]; then
+  ok "PUT body matches the CLI's request shape exactly"
 else
-  fail "the PUT body is malformed"
+  fail "the PUT body does not match the CLI's request shape"
+  # `|| true` because of `set -o pipefail`: diff exits 1 on a difference, which
+  # here is the expected case, and an unguarded pipeline would abort the run at
+  # the first shape failure — hiding the two named checks below, which are the
+  # ones that say WHY.
+  { diff <(printf '%s\n' "$expected_body") <(jq -S . "$E2E/put-body.json") \
+    | sed 's/^/       /' >&2; } || true
+fi
+
+# The two placements the whole-object diff would report only as noise, named
+# individually so a regression says what is actually wrong.
+#
+# Nested inside `image`, the credentials are never read: the service attempts an
+# anonymous pull against a private ACR and returns a 401 asking for the field
+# that was sent, within seconds and identically for every credential value.
+if [[ "$(jq -r 'has("registryCredentials")' "$E2E/put-body.json")" == "true" ]] \
+   && [[ "$(jq -r '.image | has("registryCredentials")' "$E2E/put-body.json")" == "false" ]]; then
+  ok "registryCredentials is a sibling of image, not nested inside it"
+else
+  fail "registryCredentials is nested inside image — the service never reads it"
+  sed 's/^/       /' "$E2E/put-body.json" >&2
+fi
+# `labels.name` is what the server preserves; `name` it assigns itself. This is
+# the same field disk_status() reads back, and the reader has always matched it.
+if [[ "$(jq -r '.labels.name' "$E2E/put-body.json")" == "$E2E_DISK" ]] \
+   && [[ "$(jq -r 'has("name")' "$E2E/put-body.json")" == "false" ]]; then
+  ok "the requested disk name travels in labels.name"
+else
+  fail "the requested disk name is not in labels.name"
   sed 's/^/       /' "$E2E/put-body.json" >&2
 fi
 

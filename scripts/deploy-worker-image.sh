@@ -476,9 +476,24 @@ Delete it, or pass --disk-name with a name that is not taken."
       || die "could not acquire an ACR refresh token for ${REGISTRY}"
     [[ -n "$acr_token" ]] || die "acquired an empty ACR refresh token"
 
-    # The credential field is `token`, NOT `password`. A wrong guess returns a
-    # fast 400 naming the required property, which is easy to mistake for a
-    # malformed body.
+    # THE SHAPE BELOW IS THE CLI'S OWN, CAPTURED FROM ITS `--verbose` OUTPUT.
+    # Three things are load-bearing and each fails in a way that names something
+    # other than itself:
+    #
+    #   - `registryCredentials` is a SIBLING of `image`, not a member of it.
+    #     Nested inside `image` the service never reads it, attempts an anonymous
+    #     pull against a private ACR, and answers `401 RegistryAuthFailed` asking
+    #     for the very field that was sent. That reads as a credential problem,
+    #     so every credential VALUE gets tried in turn — refresh token, exchanged
+    #     access token, managedIdentityClientId, an explicit AcrPull grant — and
+    #     all four fail identically and within seconds, because none of them is
+    #     ever read (NOR-337).
+    #   - the requested name goes in `labels.name`, not at the top level. The
+    #     server assigns its own GUID as `name`; the label is what it preserves
+    #     and what disk_status() above matches on.
+    #   - the credential field is `token`, NOT `password`. A wrong guess returns
+    #     a fast 400 naming the required property, which is easy to mistake for a
+    #     malformed body.
     #
     # The body is written to a mode-600 file under SCRATCH (outside the repo)
     # because it carries that refresh token: putting it in argv would expose it
@@ -489,7 +504,7 @@ Delete it, or pass --disk-name with a name that is not taken."
       --arg base "$ref" \
       --arg username "$ACR_TOKEN_USERNAME" \
       --arg token "$acr_token" \
-      '{name: $name, image: {base: $base, registryCredentials: {username: $username, token: $token}}}' \
+      '{labels: {name: $name}, image: {base: $base}, registryCredentials: {username: $username, token: $token}}' \
       >"$body_file") || die "could not build the disk-image request body"
 
     response_file="${SCRATCH}/response.json"
