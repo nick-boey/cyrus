@@ -62,6 +62,11 @@ The kind of machine an issue's agent runs on — a contributor's own device, or 
 ephemeral container. Which executor is used changes nothing about the persistence
 floor.
 
+**Sandbox**:
+Azure Container Apps' own name for a container. Confined to code and docs facing
+the Azure API — the concept is a *container* everywhere else, including in
+conversation about it.
+
 **Device**:
 An enrolled machine authorised to receive one user's sessions. A container gets
 its own device identity, distinct from the person's physical device.
@@ -80,3 +85,15 @@ _Avoid_: pause, suspend, sleep
 The end of an issue's life — the workspace is removed, the container destroyed,
 and the issue's held resources released. Triggered by an issue reaching a
 completed, canceled, or deleted state.
+
+**Credential rotation**:
+A user replacing one of the credentials their containers run with. A rotation
+takes effect by replacing the container, never by updating a running one.
+_Avoid_: token refresh, re-auth
+
+**Stale container**:
+A container built from inputs that have since been superseded — an older worker
+image, or credentials the user has since rotated. A stale container is replaced
+rather than reused; replacement is safe because the persistence floor holds the
+work.
+_Avoid_: outdated container, dirty container
