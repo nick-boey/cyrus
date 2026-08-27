@@ -533,11 +533,20 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      image is well past it (NOR-296 reviewed the growth and accepted it), so
      this does not resolve itself. `scripts/deploy-worker-image.sh` issues the
      PUT directly: audience `https://dynamicsessions.io` (NOT
-     `management.azure.com`, which 401s), credential field `token` (NOT
-     `password`, which 400s naming the required property), and ONE attempt —
+     `management.azure.com`, which 401s), body
+     `{labels:{name}, image:{base}, registryCredentials:{username, token}}` —
+     the CLI's own shape, with `registryCredentials` a **sibling** of `image`
+     and the name in `labels.name` — credential field `token` (NOT `password`,
+     which 400s naming the required property), and ONE attempt —
      aborting the client does not abort the server-side import, so a retry
-     races a running import rather than replacing it. Gate on `disk list`
-     showing `Ready`; a 2xx only says the request was accepted. And because
+     races a running import rather than replacing it. Nesting
+     `registryCredentials` inside `image` is the failure that looks like
+     something else: the field is never read, an anonymous pull is attempted
+     against a private ACR, and the `401 RegistryAuthFailed` asks for the very
+     field that was sent — so every credential *value* is tried in turn and all
+     fail identically within seconds, because none of them is read (NOR-337).
+     Gate on `disk list` showing `Ready`; a 2xx only says the request was
+     accepted. And because
      `workerImage` (what the router advertises) and `acaDiskName` (what the
      group boots) describe one build, a rewrite that lands one without the
      other is undetectable downstream — they are rewritten in a single verified
