@@ -25,6 +25,12 @@ The isolated checkout an agent works in for a single issue. May contain more tha
 one repository.
 _Avoid_: worktree (that's the git mechanism, not the concept), sandbox
 
+**Primary repository**:
+The one repository among an issue's several that gets to decide things only one
+repository can decide — chiefly which environment the agent works in. Chosen
+deliberately when a repository is registered, never inferred from the order the
+router happened to return them in.
+
 **Subroutine**:
 A named stage in an agent's run for an issue — implementing, verifying, shipping,
 summarizing. A procedure is an ordered sequence of them.
@@ -93,10 +99,23 @@ _Avoid_: token refresh, re-auth
 
 **Worker image**:
 What a container boots from: the agent CLIs, the language toolchains, and
-Cyrus's own worker, together in one artifact. One image currently serves every
-repository.
+Cyrus's own worker, together in one artifact. A repository that declares its own
+environment gets its own; every other repository gets the default one.
 _Avoid_: base image, sandbox image, container image (ambiguous — see *Disk
 image*)
+
+**Default worker image**:
+The worker image used by a repository that declares no environment of its own,
+and the one a container falls back to when a repository's own image cannot be
+built. It carries a toolchain for every language Cyrus has been asked to work
+in, which is why it is large and why it keeps growing.
+_Avoid_: base worker image, fallback image
+
+**Worker feature**:
+What makes an arbitrary image able to host a Cyrus agent — the worker and
+everything it needs to run, packaged so that an image can carry it without
+being built for Cyrus. Self-contained by requirement: it assumes nothing of the
+image it is added to.
 
 **Disk image**:
 Azure Container Apps' registration of a worker image, and the thing a sandbox
