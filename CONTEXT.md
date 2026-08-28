@@ -91,6 +91,20 @@ A user replacing one of the credentials their containers run with. A rotation
 takes effect by replacing the container, never by updating a running one.
 _Avoid_: token refresh, re-auth
 
+**Worker image**:
+What a container boots from: the agent CLIs, the language toolchains, and
+Cyrus's own worker, together in one artifact. One image currently serves every
+repository.
+_Avoid_: base image, sandbox image, container image (ambiguous — see *Disk
+image*)
+
+**Disk image**:
+Azure Container Apps' registration of a worker image, and the thing a sandbox
+is actually created from. Registering one is a separate, slow, and separately
+named act from publishing the worker image it points at, which is why the two
+are distinguished at all. Same confinement as *Sandbox*: Azure-API-facing code
+and docs only — elsewhere the concept is the worker image.
+
 **Stale container**:
 A container built from inputs that have since been superseded — an older worker
 image, or credentials the user has since rotated. A stale container is replaced
