@@ -1097,6 +1097,51 @@ Then re-prompt the issue so its replacement container is created fresh with
 the new value. This is the single most common point of confusion with the
 feature — a save that looks like it "did nothing" is almost always this.
 
+### Custom skills via a dotfiles repo
+
+Two per-user variables, set on this page like any other, let a teammate bring
+their own agent skills into their containers:
+
+| Variable | Effect |
+|----------|--------|
+| `DOTFILES_REPO` | A git URL cloned into `$HOME/dotfiles` on every boot; its `install.sh` is then run |
+| `CYRUS_DEFAULT_SKILLS` | Which of the **bundled Cyrus** skills to keep — unset or `all` (default), `none`, or a comma-separated list |
+
+`install.sh` delivers skills by copying directories into `$HOME/.claude/skills`,
+which Cyrus unions into the session's skill set:
+
+```sh
+# install.sh
+mkdir -p ~/.claude/skills
+cp -R "$(dirname "$0")"/skills/. ~/.claude/skills/
+```
+
+A plain directory copy is the supported route. `claude` is not on `PATH` in the
+worker image — Claude Code reaches the container only as the SDK-bundled copy —
+so `claude plugin install` and `claude plugin marketplace add` are unavailable
+to `install.sh`, and `~/.claude/plugins/installed_plugins.json` is an internal
+format that should not be hand-written.
+
+`CYRUS_DEFAULT_SKILLS` affects **only** the five bundled Cyrus skills. Skills
+from a dotfiles repo, from the CYHOST-managed user plugin, and from a repo's own
+`.claude/skills` are never filtered by it.
+
+Two of the bundled five are product plumbing rather than workflow opinion:
+`summarize` is what streams a session's final message into the Linear agent
+session, and `verify-and-ship` is what opens the pull request. Turning them off
+is supported, but you are then responsible for supplying replacements —
+otherwise sessions quietly stop opening PRs and stop posting summaries. If you
+are replacing the set, `CYRUS_DEFAULT_SKILLS=summarize,verify-and-ship` is the
+recommended starting point.
+
+Scope note: skills reach **Claude and Codex** sessions. Gemini and Cursor
+sessions are unaffected. And since this repo symlinks its own skills into
+`.claude/skills`, `CYRUS_DEFAULT_SKILLS=none` will not hide them when the
+session is working on cyrus itself — they arrive repo-locally as well.
+
+The same variables work for physical-device targets, sourced from
+`~/.cyrus/.env` rather than from the router's per-user secret store.
+
 ### Storage backend
 
 Per-user secrets live in one of three places, selected by what's present under

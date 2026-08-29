@@ -66,7 +66,11 @@ describe("SkillsPluginResolver scope filtering", () => {
 		);
 		await mkdir(home, { recursive: true });
 		await writeManifest(home);
-		resolver = new SkillsPluginResolver(home, createTestLogger());
+		// homeDir is pinned to the temp dir so discovery never reads the real
+		// developer's ~/.claude/skills.
+		resolver = new SkillsPluginResolver(home, createTestLogger(), {
+			homeDir: home,
+		});
 	});
 
 	afterEach(async () => {

@@ -1,4 +1,5 @@
 import { access, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { SdkPluginConfig } from "cyrus-claude-runner";
 import type { ILogger } from "cyrus-core";
@@ -32,6 +33,157 @@ interface SkillScope {
 	linearLabelIds?: string[];
 }
 
+/** Optional collaborators/knobs. Both default to the production behaviour. */
+export interface SkillsPluginResolverOptions {
+	/**
+	 * Raw `CYRUS_DEFAULT_SKILLS` value — a per-user switch over the *bundled
+	 * Cyrus* skills only (the internal `cyrus-skills` plugin). User skills,
+	 * repo-local skills and `~/.claude/skills` are never affected.
+	 *
+	 * - unset / `"all"` — every bundled skill (default)
+	 * - `"none"` — the internal plugin contributes nothing
+	 * - comma-separated list — only the named bundled skills, e.g.
+	 *   `"summarize,verify-and-ship"`
+	 *
+	 * Injected rather than read from `process.env` here so it is testable and
+	 * consistent with how `cyrusHome`/`logger` arrive. Deliberately NOT added
+	 * to `RESERVED_ENV_KEYS` in `cyrus-router` — users must be able to set it.
+	 */
+	defaultSkills?: string;
+	/**
+	 * `$HOME`, whose `.claude/skills` directory is unioned into discovery.
+	 * Defaults to `os.homedir()`.
+	 *
+	 * This is NOT `cyrusHome`: in a worker container the two differ
+	 * (`cyrusHome` is `/workspaces/.cyrus`, `$HOME` is `/home/cyrus`), and it
+	 * is `$HOME` that a dotfiles `install.sh` writes skills into. Only tests
+	 * should pass this.
+	 */
+	homeDir?: string;
+}
+
+/** Resolved form of {@link SkillsPluginResolverOptions.defaultSkills}. */
+type DefaultSkillsSelection =
+	| { mode: "all" }
+	| { mode: "none" }
+	| { mode: "list"; names: Set<string> };
+
+function parseDefaultSkills(raw: string | undefined): DefaultSkillsSelection {
+	const value = raw?.trim();
+	if (!value) return { mode: "all" };
+	const lowered = value.toLowerCase();
+	if (lowered === "all") return { mode: "all" };
+	if (lowered === "none") return { mode: "none" };
+	const names = value
+		.split(",")
+		.map((name) => name.trim())
+		.filter((name) => name.length > 0);
+	// A value of only separators (e.g. `",,"`) is meaningless; treat it as
+	// unset rather than as "hide everything", which would be a surprising
+	// reading of a typo.
+	if (names.length === 0) return { mode: "all" };
+	return { mode: "list", names: new Set(names) };
+}
+
+/**
+ * A discovered skill: its directory name (what the SDK allowlist and the
+ * guidance block use) plus the directory itself, so the skill's `SKILL.md`
+ * frontmatter can be read without re-deriving the path.
+ */
+interface SkillEntry {
+	name: string;
+	dir: string;
+}
+
+/**
+ * True when a `SKILL.md` declares `disable-model-invocation: true` in its
+ * YAML frontmatter — meaning the SDK will refuse to run it via the Skill
+ * tool, and it is reachable only as a user-typed `/slash-command`.
+ *
+ * Deliberately a targeted scan rather than a YAML parse: this is the only
+ * frontmatter key we need, and pulling in a YAML dependency to read one
+ * boolean would be a poor trade.
+ */
+function declaresDisableModelInvocation(source: string): boolean {
+	const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(source);
+	if (!frontmatter?.[1]) return false;
+	const flag = /^disable-model-invocation[ \t]*:[ \t]*(.+?)[ \t]*$/m.exec(
+		frontmatter[1],
+	);
+	if (!flag?.[1]) return false;
+	const value = flag[1].replace(/^["']|["']$/g, "").toLowerCase();
+	return value === "true" || value === "yes";
+}
+
+/** One step of a routing rule in the guidance block. */
+interface RoutingStep {
+	skill: string;
+	/** Rendered fragment, e.g. "`summarize` to narrate results". */
+	phrase: string;
+}
+
+interface RoutingRule {
+	/** Rendered situation, e.g. "**Bug report or error**". */
+	context: string;
+	/**
+	 * Ordered steps. The FIRST step is the rule's primary skill — when it is
+	 * unavailable the whole rule is dropped, since a rule that opens with
+	 * "then …" describes no entry point.
+	 */
+	steps: RoutingStep[];
+}
+
+/**
+ * Routing rules for the bundled Cyrus skills. Emitted conditionally: a rule
+ * appears only when its primary skill survived resolution, and each rule drops
+ * the steps whose skills did not.
+ *
+ * This has to be generated rather than emitted as a fixed block because
+ * `CYRUS_DEFAULT_SKILLS` makes every one of these skills optional — a hard-coded
+ * block would instruct the model to use skills that do not exist for that user.
+ */
+const ROUTING_RULES: readonly RoutingRule[] = [
+	{
+		context: "**Code changes requested** (feature, bug fix, refactor)",
+		steps: [
+			{ skill: "implementation", phrase: "`implementation` to write code" },
+			{
+				skill: "verify-and-ship",
+				phrase: "`verify-and-ship` to run checks and create a PR",
+			},
+			{ skill: "summarize", phrase: "`summarize` to narrate results" },
+		],
+	},
+	{
+		context: "**Bug report or error**",
+		steps: [
+			{ skill: "debug", phrase: "`debug` to reproduce, root-cause, and fix" },
+			{ skill: "verify-and-ship", phrase: "`verify-and-ship`" },
+			{ skill: "summarize", phrase: "`summarize`" },
+		],
+	},
+	{
+		context: "**Question or research request**",
+		steps: [
+			{
+				skill: "investigate",
+				phrase: "`investigate` to search the codebase and provide an answer",
+			},
+			{ skill: "summarize", phrase: "`summarize`" },
+		],
+	},
+	{
+		context: "**PR review feedback** (changes requested)",
+		steps: [
+			{
+				skill: "implementation",
+				phrase: "`implementation` to address review comments",
+			},
+			{ skill: "verify-and-ship", phrase: "`verify-and-ship`" },
+		],
+	},
+];
+
 /**
  * Resolves skills plugins for agent sessions.
  *
@@ -49,14 +201,23 @@ export class SkillsPluginResolver {
 	private readonly internalPluginPath: string;
 	private readonly userPluginPath: string;
 	private readonly userSkillsDir: string;
+	private readonly homeSkillsDir: string;
+	private readonly defaultSkills: DefaultSkillsSelection;
 
 	constructor(
 		private readonly cyrusHome: string,
 		private readonly logger: ILogger,
+		options: SkillsPluginResolverOptions = {},
 	) {
 		this.internalPluginPath = join(this.cyrusHome, "cyrus-skills-plugin");
 		this.userPluginPath = join(this.cyrusHome, "user-skills-plugin");
 		this.userSkillsDir = join(this.userPluginPath, "skills");
+		this.homeSkillsDir = join(
+			options.homeDir ?? homedir(),
+			".claude",
+			"skills",
+		);
+		this.defaultSkills = parseDefaultSkills(options.defaultSkills);
 	}
 
 	/**
@@ -125,9 +286,18 @@ export class SkillsPluginResolver {
 			plugins.push(user);
 		}
 
-		const internal = await this.resolveInternalPlugin();
-		if (internal) {
-			plugins.push(internal);
+		// `CYRUS_DEFAULT_SKILLS=none` drops the bundled plugin outright rather
+		// than resolving it and filtering every entry away — cheaper, and it
+		// keeps the SDK from being handed a plugin that contributes nothing.
+		if (this.defaultSkills.mode === "none") {
+			this.logger.debug(
+				"CYRUS_DEFAULT_SKILLS=none — skipping the internal Cyrus skills plugin",
+			);
+		} else {
+			const internal = await this.resolveInternalPlugin();
+			if (internal) {
+				plugins.push(internal);
+			}
 		}
 
 		await this.logConflicts(plugins);
@@ -157,18 +327,66 @@ export class SkillsPluginResolver {
 	 * `scope.json` filter is NOT applied to them. They are appended after the
 	 * plugin skills, so a plugin skill of the same name takes precedence in the
 	 * (display-order-sensitive) dedup.
+	 *
+	 * Home-directory skills: `$HOME/.claude/skills/*` is unioned in last, on the
+	 * same no-scope-filter terms. This is how a per-user dotfiles repo delivers
+	 * skills — `ContainerBootCommand.applyDotfiles()` runs the repo's
+	 * `install.sh`, which copies skill directories there. Without this union the
+	 * SDK allowlist would omit them and the model would see none of them, with
+	 * the files sitting on disk and no error anywhere.
 	 */
 	async discoverSkillNames(
 		plugins: SdkPluginConfig[],
 		context?: SkillSessionContext,
 	): Promise<string[]> {
-		const skillNames: string[] = [];
+		const entries = await this.discoverSkillEntries(plugins, context);
+		return entries.map((entry) => entry.name);
+	}
+
+	/**
+	 * Discovery proper — see {@link discoverSkillNames} for the rules. Returns
+	 * each skill's directory alongside its name so callers that need the
+	 * skill's `SKILL.md` (currently only {@link buildSkillsGuidance}, for the
+	 * `disable-model-invocation` frontmatter flag) do not have to re-derive it.
+	 *
+	 * Deduplicated first-wins, preserving source precedence:
+	 * plugin skills → repo-local skills → home-directory skills.
+	 */
+	private async discoverSkillEntries(
+		plugins: SdkPluginConfig[],
+		context?: SkillSessionContext,
+	): Promise<SkillEntry[]> {
+		const entries: SkillEntry[] = [];
+		const seen = new Set<string>();
+		const add = (name: string, skillsDir: string): void => {
+			if (seen.has(name)) return;
+			seen.add(name);
+			entries.push({ name, dir: join(skillsDir, name) });
+		};
 
 		for (const plugin of plugins) {
+			const isInternal = plugin.path === this.internalPluginPath;
+			// Defensive: resolve() already withholds the internal plugin on
+			// "none", but discoverSkillNames also runs against caller-supplied
+			// plugin lists.
+			if (isInternal && this.defaultSkills.mode === "none") {
+				continue;
+			}
 			const skillsDir = join(plugin.path, "skills");
-			const entries = await this.readSkillDirEntries(skillsDir);
+			const names = await this.readSkillDirEntries(skillsDir);
 
-			for (const entry of entries) {
+			for (const entry of names) {
+				if (
+					isInternal &&
+					this.defaultSkills.mode === "list" &&
+					!this.defaultSkills.names.has(entry)
+				) {
+					this.logger.debug(
+						`Bundled Cyrus skill "${entry}" excluded by CYRUS_DEFAULT_SKILLS`,
+					);
+					continue;
+				}
+
 				if (context) {
 					const scope = await this.loadSkillScope(skillsDir, entry);
 					if (!this.scopeMatches(scope, context)) {
@@ -179,7 +397,7 @@ export class SkillsPluginResolver {
 					}
 				}
 
-				skillNames.push(entry);
+				add(entry, skillsDir);
 			}
 		}
 
@@ -187,13 +405,18 @@ export class SkillsPluginResolver {
 		// tree. No scope.json filtering — presence in the repo is the scope.
 		for (const repoPath of context?.repoPaths ?? []) {
 			const skillsDir = join(repoPath, ".claude", "skills");
-			const entries = await this.readSkillDirEntries(skillsDir);
-			for (const entry of entries) {
-				skillNames.push(entry);
+			for (const entry of await this.readSkillDirEntries(skillsDir)) {
+				add(entry, skillsDir);
 			}
 		}
 
-		return [...new Set(skillNames)];
+		// Union skills installed into $HOME by a dotfiles repo. Same terms as
+		// repo-local skills: no scope.json filtering, absent-tolerant.
+		for (const entry of await this.readSkillDirEntries(this.homeSkillsDir)) {
+			add(entry, this.homeSkillsDir);
+		}
+
+		return entries;
 	}
 
 	/**
@@ -320,34 +543,94 @@ export class SkillsPluginResolver {
 	 *
 	 * Accepts pre-resolved plugins to avoid redundant filesystem access
 	 * when resolve() is also called separately for the runner config.
+	 *
+	 * Two filters are applied on top of plain discovery:
+	 *
+	 * 1. Skills whose `SKILL.md` sets `disable-model-invocation: true` are
+	 *    omitted from the listing. They stay in the SDK allowlist — the user can
+	 *    still invoke them as `/slash-commands` — but the SDK refuses to run
+	 *    them via the Skill tool, so advertising them here would be telling the
+	 *    model to reach for something it cannot use.
+	 * 2. The routing rules below are generated from the surviving set, so a user
+	 *    who trimmed the bundled skills with `CYRUS_DEFAULT_SKILLS` is not
+	 *    instructed to use skills they no longer have.
 	 */
 	async buildSkillsGuidance(
 		plugins?: SdkPluginConfig[],
 		context?: SkillSessionContext,
 	): Promise<string> {
 		const resolvedPlugins = plugins ?? (await this.resolve());
-		const availableSkills = await this.discoverSkillNames(
-			resolvedPlugins,
-			context,
-		);
+		const entries = await this.discoverSkillEntries(resolvedPlugins, context);
+
+		const availableSkills: string[] = [];
+		for (const entry of entries) {
+			if (await this.isModelInvocable(entry)) {
+				availableSkills.push(entry.name);
+			}
+		}
 
 		if (availableSkills.length === 0) {
 			return "";
 		}
 
+		const available = new Set(availableSkills);
 		const skillsList = availableSkills.map((s) => `\`${s}\``).join(", ");
 
-		return (
+		let guidance =
 			"\n\n## Skills\n\n" +
-			`You have skills available via the Skill tool: ${skillsList}\n\n` +
-			"Choose the appropriate skill based on the context:\n\n" +
-			"- **Code changes requested** (feature, bug fix, refactor): Use `implementation` to write code, then `verify-and-ship` to run checks and create a PR, then `summarize` to narrate results.\n" +
-			"- **Bug report or error**: Use `debug` to reproduce, root-cause, and fix, then `verify-and-ship`, then `summarize`.\n" +
-			"- **Question or research request**: Use `investigate` to search the codebase and provide an answer, then `summarize`.\n" +
-			"- **PR review feedback** (changes requested): Use `implementation` to address review comments, then `verify-and-ship`.\n\n" +
-			"Analyze the issue description, labels, and any user comments to determine which workflow fits. " +
-			"Do NOT skip the verify-and-ship step if you made code changes — it ensures quality checks pass and a PR is created."
-		);
+			`You have skills available via the Skill tool: ${skillsList}\n\n`;
+
+		const renderedRules = ROUTING_RULES.filter(
+			(rule) => rule.steps[0] && available.has(rule.steps[0].skill),
+		).map((rule) => {
+			const phrases = rule.steps
+				.filter((step) => available.has(step.skill))
+				.map((step) => step.phrase);
+			return `- ${rule.context}: Use ${phrases.join(", then ")}.\n`;
+		});
+
+		if (renderedRules.length > 0) {
+			guidance += `Choose the appropriate skill based on the context:\n\n${renderedRules.join("")}\n`;
+			guidance +=
+				"Analyze the issue description, labels, and any user comments to determine which workflow fits.";
+			if (available.has("verify-and-ship")) {
+				guidance +=
+					" Do NOT skip the verify-and-ship step if you made code changes — it ensures quality checks pass and a PR is created.";
+			}
+		}
+
+		// `implement` and `implementation` are different skills from different
+		// sets, and the names are one character apart. Picking `implement` skips
+		// verification and opens no PR — which reads downstream as the agent
+		// simply having chosen not to ship. Only worth saying when both exist.
+		if (available.has("implement") && available.has("implementation")) {
+			guidance +=
+				"\n\nNote: `implementation` and `implement` are different skills. " +
+				"Use `implementation` for the workflows above — `implement` neither runs verification nor opens a pull request.";
+		}
+
+		// The skills list ends in a blank line that only makes sense when a
+		// routing block follows it. A no-op when one does.
+		return guidance.trimEnd();
+	}
+
+	/**
+	 * Whether the model may invoke this skill via the Skill tool, i.e. its
+	 * `SKILL.md` does not set `disable-model-invocation: true`.
+	 *
+	 * A missing or unreadable `SKILL.md` counts as invocable — the same
+	 * permissive default the rest of this class uses for absent sidecars, and
+	 * the conservative choice here is to keep listing a skill rather than
+	 * silently hide it over a read error.
+	 */
+	private async isModelInvocable(entry: SkillEntry): Promise<boolean> {
+		let raw: string;
+		try {
+			raw = await readFile(join(entry.dir, "SKILL.md"), "utf-8");
+		} catch {
+			return true;
+		}
+		return !declaresDisableModelInvocation(raw);
 	}
 
 	private async resolveInternalPlugin(): Promise<SdkPluginConfig | null> {

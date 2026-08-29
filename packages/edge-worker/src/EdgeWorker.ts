@@ -930,6 +930,16 @@ export class EdgeWorker extends EventEmitter {
 		this.skillsPluginResolver = new SkillsPluginResolver(
 			this.cyrusHome,
 			this.logger,
+			{
+				// Per-user switch over the bundled Cyrus skills. Sourced from the
+				// environment rather than `EdgeWorkerConfig` on purpose: a new
+				// top-level config field would have to be added to two hardcoded
+				// lists in ConfigManager or it is silently dropped on every reload
+				// (see CLAUDE.md note 9). For container targets it arrives from the
+				// router's per-user SecretStore via `ContainerTargets.buildEnv`;
+				// for physical devices, from `~/.cyrus/.env`.
+				defaultSkills: process.env.CYRUS_DEFAULT_SKILLS,
+			},
 		);
 
 		// Components will be initialized and registered in start() method before server starts
