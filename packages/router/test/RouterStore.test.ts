@@ -1040,6 +1040,94 @@ describe("container devices (schema v2)", () => {
 			store.close();
 		});
 	});
+
+	describe("last_active_ms", () => {
+		const makeContainerDevice = (store: RouterStore, issueKey: string) => {
+			const { userId } = store.addUser({ email: `${issueKey}@example.com` });
+			return store.createContainerDevice(userId, issueKey, "aca").deviceId;
+		};
+		const lastActiveFor = (store: RouterStore, deviceId: number) =>
+			store.listContainerDevices().find((d) => d.deviceId === deviceId)
+				?.lastActiveMs;
+
+		it("is undefined for a device that has never held a session", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-366-a");
+
+			expect(lastActiveFor(store, deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		/**
+		 * The exact inverse of `markDeviceRunning`'s set-if-null contract, and the
+		 * distinction the two columns exist for. `running_since_ms` answers "how
+		 * long has this sandbox been up" and must survive re-stamping;
+		 * `last_active_ms` answers "when did it last do anything", so re-stamping
+		 * IS the semantics. Conflating them is what NOR-366 was.
+		 */
+		it("re-stamps unconditionally, unlike the uptime clock", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-366-b");
+
+			store.markDeviceActive(deviceId, 1_000);
+			store.markDeviceActive(deviceId, 9_999);
+
+			expect(lastActiveFor(store, deviceId)).toBe(9_999);
+			expect(store.getContainerDeviceForIssue("NOR-366-b")?.lastActiveMs).toBe(
+				9_999,
+			);
+			store.close();
+		});
+
+		it("is stamped by setSessionAffinity, so a claim resets the idle clock immediately", () => {
+			// The sweep only ever OBSERVES a pin on its next tick. Without the stamp
+			// happening in the same call that creates the pin, there is a whole sweep
+			// interval in which a just-claimed container looks unpinned and — for any
+			// issue whose container is older than idleStopMs — already expired.
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-366-c");
+
+			store.setSessionAffinity("review", deviceId, undefined, 4_242);
+
+			expect(lastActiveFor(store, deviceId)).toBe(4_242);
+			store.close();
+		});
+
+		/**
+		 * Backfilled, unlike `running_since_ms`, because this column only ever
+		 * DELAYS an idle-stop. Leaving it NULL would make every pre-upgrade
+		 * container instantly eligible for the very stop it exists to prevent;
+		 * backfilling costs at most one extra idleStopMs before a genuinely idle
+		 * container is parked.
+		 */
+		it("backfills existing container rows on migration rather than leaving them expired", () => {
+			const dir = mkdtempSync(join(tmpdir(), "router-store-active-"));
+			const dbPath = join(dir, "router.db");
+			const before = Date.now();
+
+			const raw = new Database(dbPath);
+			raw.exec(V1_SCHEMA);
+			raw.prepare("INSERT INTO users (email) VALUES ('c@example.com')").run();
+			raw.close();
+
+			// Open once to migrate to v2 (which is what creates the container-device
+			// shape at all), seed a container row, then drop the column and reopen so
+			// the last_active_ms migration runs against a row that predates it.
+			const migrated = new RouterStore(dbPath);
+			const { deviceId } = migrated.createContainerDevice(1, "OLD-1", "aca");
+			migrated.close();
+
+			const stripped = new Database(dbPath);
+			stripped.exec("ALTER TABLE devices DROP COLUMN last_active_ms");
+			stripped.close();
+
+			const store = new RouterStore(dbPath);
+			const lastActiveMs = lastActiveFor(store, deviceId);
+			expect(lastActiveMs).toBeGreaterThanOrEqual(before);
+			expect(lastActiveMs).toBeLessThanOrEqual(Date.now());
+			store.close();
+		});
+	});
 });
 
 describe("repository decisions", () => {

@@ -264,6 +264,68 @@ resource sandboxBootHealth 'Microsoft.OperationalInsights/workspaces/savedSearch
   }
 }
 
+// Sandboxes stopped out from under a live session, newest first.
+//
+// The companion to the `-stranded-sessions` alert: the alert says an issue is
+// affected, this says how it got there. Each stranded sandbox is joined back to
+// the `sandbox.idle_stopped` that preceded it, so `killed_after` shows how long
+// the session that was killed had been running — a value of seconds is the
+// NOR-366 handoff race, and a large one is something else.
+resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sandbox-Stranded-Sessions'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Stranded sessions (stopped sandbox still holding affinity)'
+    query: join(
+      [
+        'let stops ='
+        '    ContainerAppConsoleLogs_CL'
+        appFilter
+        '    | extend p = parse_json(Log_s)'
+        '    | where tostring(p.event) == "sandbox.idle_stopped"'
+        '    | project stopped_at = TimeGenerated,'
+        '        device_id = tostring(p["cyrus.device_id"]),'
+        '        idle_for  = tolong(p["cyrus.idle_for_ms"]) * 1ms,'
+        '        uptime    = tolong(p["cyrus.uptime_ms"]) * 1ms;'
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "sandbox.stranded_session"'
+        '| extend device_id = tostring(p["cyrus.device_id"])'
+        '| summarize'
+        '    first_reported = min(TimeGenerated),'
+        '    last_reported  = max(TimeGenerated),'
+        '    ticks          = count(),'
+        '    issue_key      = any(tostring(p["cyrus.issue_key"])),'
+        '    provider       = any(tostring(p["cyrus.provider"])),'
+        '    sessions       = max(toint(p["cyrus.sessions"])),'
+        '    state          = any(tostring(p["cyrus.state"]))'
+        '  by device_id'
+        // The stop that produced this, if there was one: the newest idle-stop for
+        // the same device at or before we first reported it. `absent` sandboxes and
+        // stops older than the window simply have no match, hence the left join.
+        '| join kind=leftouter ('
+        '    stops | summarize arg_max(stopped_at, *) by device_id'
+        '  ) on device_id'
+        '| project'
+        '    issue_key,'
+        '    device_id,'
+        '    provider,'
+        '    state,'
+        '    sessions,'
+        '    stopped_at,'
+        '    killed_after = uptime,'
+        '    stranded_for = last_reported - first_reported,'
+        '    ticks,'
+        '    first_reported'
+        '| order by first_reported desc'
+      ],
+      '\n'
+    )
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Distributed traces (Phase 5 / NOR-283)
 ////////////////////////////////////////////////////////////////////////////////
@@ -671,6 +733,85 @@ resource sandboxBootFailures 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
           )
           timeAggregation: 'Total'
           metricMeasureColumn: 'failures'
+          threshold: 0
+          operator: 'GreaterThan'
+          dimensions: [
+            {
+              name: 'issue_key'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+            {
+              name: 'provider'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+          ]
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: actionGroupIds
+    }
+  }
+}
+
+// The impossible state, and the only alert here that fires on an INVARIANT
+// rather than on a threshold.
+//
+// `sandbox.stranded_session` means the router still holds session affinity for a
+// sandbox that is neither running nor connected. Nothing about it is visible
+// anywhere else: Linear renders a normal in-progress agent session for as long
+// as it lasts, the gauge records it as three unremarkable fields, and none of the
+// other rules here cover it — `-long-running` needs a running sandbox,
+// `-boot-failures` needs a boot that failed, and `-sweep-stalled` needs the sweep
+// to stop. That combined blind spot is what turned NOR-366's 38-second race into
+// a nine-hour outage across five agent sessions.
+//
+// Severity 1, not 2: every event is one Linear issue whose agent has silently
+// stopped making progress, and the user has no way to tell. Recovery is a prompt
+// into the thread, which cold-boots the sandbox.
+//
+// ContainerLifecycle already applies its own grace window before emitting (a cold
+// boot presents identically), so this rule needs no threshold beyond "any".
+resource sandboxStrandedSessions 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = if (enableAlerts) {
+  name: 'alert-${namePrefix}-sandbox-stranded-sessions'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'alert-${namePrefix}-sandbox-stranded-sessions'
+    description: 'A Cyrus sandbox is stopped and offline but still holds session affinity. Linear is showing a live agent session against a sandbox that cannot make progress. Prompt the thread again to cold-boot it, then check the "cyrus.stranded_for_ms" attribute for how long it was lost.'
+    severity: 1
+    enabled: true
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    scopes: [
+      logAnalytics.id
+    ]
+    autoMitigate: true
+    criteria: {
+      allOf: [
+        {
+          query: join(
+            [
+              'ContainerAppConsoleLogs_CL'
+              appFilter
+              '| extend p = parse_json(Log_s)'
+              '| where tostring(p.event) == "sandbox.stranded_session"'
+              '| summarize stranded = count() by issue_key = tostring(p["cyrus.issue_key"]), provider = tostring(p["cyrus.provider"])'
+            ],
+            '\n'
+          )
+          timeAggregation: 'Total'
+          metricMeasureColumn: 'stranded'
           threshold: 0
           operator: 'GreaterThan'
           dimensions: [

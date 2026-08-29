@@ -29,7 +29,8 @@ import {
  *        ▼             │  └────────────┘
  *   boot_failed        ▼
  *                  idle_stopped ──► (next route) boot_started
- *                      │
+ *                      │  │
+ *                      │  └──► stranded_session   (invariant violation)
  *                      ▼
  *   teardown_completed / destroyed
  * ```
@@ -49,6 +50,18 @@ export const SANDBOX_EVENTS = {
 	unparked: "sandbox.unparked",
 	/** The lifecycle sweep stopped an affinity-free sandbox past `idleStopMs`. */
 	idleStopped: "sandbox.idle_stopped",
+	/**
+	 * The impossible state: the router still holds session affinity for a sandbox
+	 * that is not running and whose worker is not connected. Linear shows a live
+	 * agent session the whole time, so this is invisible from every other angle —
+	 * which is how NOR-366 turned a 38-second race into a nine-hour outage.
+	 *
+	 * Emitted once per sweep tick for as long as it holds, so an alert rule can
+	 * key on a non-zero count in its window. Deliberately NOT emitted during the
+	 * cold-boot window, when the same three facts are the expected state of a
+	 * container that was just routed to and has not dialled back yet.
+	 */
+	strandedSession: "sandbox.stranded_session",
 	/** The sandbox (and its disk/volume) was destroyed. `reason` says why. */
 	destroyed: "sandbox.destroyed",
 	/** A terminal teardown finished: worker cleaned up and the row was deleted. */

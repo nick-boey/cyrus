@@ -27,6 +27,18 @@ interface ProviderListing {
 }
 
 /**
+ * 10 minutes — default {@link ContainerLifecycleOptions.strandedSessionGraceMs}.
+ *
+ * Sized against a COLD BOOT, not against the sweep interval. Between the moment
+ * a session is routed and the moment its worker dials back, the container is
+ * legitimately `absent`/`stopped` with affinity held and no socket — exactly the
+ * shape of the invariant violation — and a first ACA boot that pulls the image
+ * can take minutes. Reporting inside that window would make the signal fire on
+ * every cold start, which is the fastest way to get an alert rule ignored.
+ */
+const DEFAULT_STRANDED_SESSION_GRACE_MS = 600_000;
+
+/**
  * Lets the sweep re-derive a device's affinity from the device itself rather
  * than trusting rows that only ever clear on a frame the worker may never
  * send. Injected so the sweep stays unit-testable without a gateway.
@@ -50,6 +62,10 @@ export interface ContainerLifecycleOptions {
 	 *  Safe because an offline device is by definition running nothing, so there
 	 *  is no live session to freeze. Default: 1 hour. */
 	offlineAgeOutMs: number;
+	/** How long the `stopped && sessions > 0 && !online` invariant violation must
+	 *  hold before it is reported. Must comfortably exceed a cold boot, during
+	 *  which those same three facts are the EXPECTED state. Default: 10 minutes. */
+	strandedSessionGraceMs?: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
 	sessionReconciler?: SessionReconciler;
 	logger: ILogger;
@@ -62,7 +78,12 @@ export interface ContainerLifecycleOptions {
  *
  *  - Idle-stop: a container with no active session affinity, untouched for
  *    `idleStopMs`, gets `stop()`ed — parked, volume retained, cheap to
- *    resume.
+ *    resume. "Untouched" means untouched by anything, INCLUDING the agent's
+ *    own work: the clock resets while a session holds the device (see
+ *    `markDeviceActive` at the pin below). Before that it only ever reset on
+ *    something the router did, so a container that had been busy for half an
+ *    hour was permanently past the threshold and survived on the pin alone —
+ *    NOR-366.
  *  - Stale-destroy backstop: terminal webhooks normally destroy containers
  *    immediately. A container untouched for `staleDestroyMs` still gets
  *    `destroy()`ed (container AND volume) and its device row deleted. Safe
@@ -83,7 +104,13 @@ export interface ContainerLifecycleOptions {
  *
  * A device with active session affinity is NEVER stopped or destroyed,
  * regardless of timestamps — this is the safety invariant that keeps work in
- * progress from being yanked out from under a live session.
+ * progress from being yanked out from under a live session. It is re-checked
+ * immediately before the stop as well as at the gate, because the gate's
+ * decision is separated from the stop by two provider round trips, and a
+ * session that claims the device in between would otherwise be killed within
+ * seconds of starting. The converse — affinity held against a container that
+ * is NOT running — is reported by {@link noteStranded}; it is the only state
+ * here that should be impossible.
  *
  * Executor errors are logged and skipped, never thrown: one unreachable
  * provider (e.g. a dead Docker daemon) must not stop the sweep from
@@ -95,9 +122,14 @@ export class ContainerLifecycle {
 	private readonly idleStopMs: number;
 	private readonly staleDestroyMs: number;
 	private readonly offlineAgeOutMs: number;
+	private readonly strandedSessionGraceMs: number;
 	private readonly sessionReconciler: SessionReconciler | undefined;
 	/** Devices already reported as pinned, so the 60s tick logs on transition only. */
 	private readonly pinnedDevices = new Set<number>();
+	/** Same idea for the stranded-session invariant: the EVENT is emitted every
+	 *  tick (an alert rule needs a non-zero count in its window) but the
+	 *  human-readable ERROR line is logged once per entry into the state. */
+	private readonly strandedDevices = new Set<number>();
 	private readonly logger: ILogger;
 	private readonly now: () => number;
 	/** Non-undefined while a tick is running; see {@link sweep}. */
@@ -109,6 +141,8 @@ export class ContainerLifecycle {
 		this.idleStopMs = opts.idleStopMs;
 		this.staleDestroyMs = opts.staleDestroyMs;
 		this.offlineAgeOutMs = opts.offlineAgeOutMs;
+		this.strandedSessionGraceMs =
+			opts.strandedSessionGraceMs ?? DEFAULT_STRANDED_SESSION_GRACE_MS;
 		this.sessionReconciler = opts.sessionReconciler;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
@@ -158,6 +192,82 @@ export class ContainerLifecycle {
 		if (!this.pinnedDevices.delete(deviceId)) return;
 		this.logger.info(
 			`Container device ${deviceId} is no longer pinned by session affinity`,
+		);
+	}
+
+	/**
+	 * Report the one sandbox state that is not supposed to be reachable: the
+	 * router holds live session affinity for a container that is NOT running and
+	 * whose worker is NOT connected.
+	 *
+	 * Nothing else surfaces it. The gauge samples it as three unremarkable
+	 * fields, no lifecycle transition fires, and Linear goes on rendering an
+	 * in-progress agent session for as long as it lasts — which is why NOR-366's
+	 * five killed sessions sat unnoticed for nine hours. The whole value of this
+	 * method is turning that silence into one queryable event.
+	 *
+	 * Detection only. It deliberately does NOT boot the container back up: the
+	 * same three facts also describe a container legitimately parked while a
+	 * leaked affinity row (PAR-146's shape) outlives the session that made it,
+	 * and auto-resuming those would undo idle-stop for exactly the sandboxes
+	 * idle-stop exists for. Recovery stays a prompt away — cold-booting from a
+	 * new comment is reliable — while the fixes above stop the state being
+	 * produced in the first place.
+	 *
+	 * Three exclusions keep this specific enough to alert on:
+	 *  - `unknown` state: a provider we could not read this tick says nothing.
+	 *  - within {@link strandedSessionGraceMs} of the last route or heartbeat: a
+	 *    cold boot presents identically and is the expected path, not a fault.
+	 *  - a pending terminal teardown: that container is meant to be going away,
+	 *    and TerminalTeardown's own grace deadline is what covers it.
+	 */
+	private noteStranded(
+		row: ContainerDeviceInfo,
+		state: SandboxGaugeState,
+		affinity: number,
+		now: number,
+	): void {
+		const notRunning = state === "stopped" || state === "absent";
+		const online = this.sessionReconciler?.isOnline(row.deviceId) ?? false;
+		const lastContact = Math.max(
+			row.lastRoutedMs ?? 0,
+			row.lastSeenMs ?? 0,
+			row.createdMs,
+		);
+		const strandedForMs = now - lastContact;
+		if (
+			!notRunning ||
+			online ||
+			strandedForMs <= this.strandedSessionGraceMs ||
+			this.store.getPendingTeardown(row.issueKey) !== undefined
+		) {
+			this.strandedDevices.delete(row.deviceId);
+			return;
+		}
+
+		emitSandboxEvent(
+			this.logger,
+			SANDBOX_EVENTS.strandedSession,
+			{
+				issueKey: row.issueKey,
+				deviceId: row.deviceId,
+				provider: row.provider,
+			},
+			{
+				state,
+				sessions: affinity,
+				stranded_for_ms: strandedForMs,
+				stranded_grace_ms: this.strandedSessionGraceMs,
+				age_ms: now - row.createdMs,
+			},
+		);
+		if (this.strandedDevices.has(row.deviceId)) return;
+		this.strandedDevices.add(row.deviceId);
+		this.logger.error(
+			`Container for ${row.issueKey} (device=${row.deviceId}) is ${state} and offline ` +
+				`but still holds ${affinity} session affinity row(s): Linear is showing a live ` +
+				`agent session against a sandbox that cannot make progress. Prompt the thread ` +
+				`again to cold-boot it. (strandedForMs=${strandedForMs} state=${state})`,
 		);
 	}
 
@@ -353,6 +463,17 @@ export class ContainerLifecycle {
 			const executor = this.executors.get(row.provider);
 			if (!executor) continue;
 			try {
+				// Snapshot of the sessions the affinity gate below is about to make
+				// its decision from, so the pre-stop re-check can tell a session that
+				// claimed this device DURING the decision from one the gate already
+				// saw and deliberately discounted (a leaked row the reconciler
+				// reclaimed, or an offline device's aged-out row). Same
+				// snapshot-then-re-check idiom as `knownKeys` in the orphan pass.
+				const knownSessions = new Set(
+					this.store
+						.listSessionAffinityForDevice(row.deviceId)
+						.map((r) => r.sessionId),
+				);
 				const affinity = await this.resolveAffinity(row.deviceId, now);
 				// Sampled for EVERY row, before the pinned early-return below.
 				// The pinned rows are the ones the operational questions are
@@ -368,10 +489,24 @@ export class ContainerLifecycle {
 				counts[state] += 1;
 				if (affinity > 0) {
 					pinned += 1;
+					// THE idle-clock reset. The router stamps `last_routed_ms` when it
+					// hands the device an event and nothing after that, so an agent
+					// working for forty minutes without a new prompt leaves every other
+					// input to the clock frozen at the session's start — the container
+					// is past `idleStopMs` the whole time it is busy and survives only
+					// because this branch skips it. That made the pin the only thing
+					// standing between a busy sandbox and a stop, and the instant it
+					// lapsed during an implement->review handoff the already-expired
+					// clock fired (NOR-366). Stamping here means a container that was
+					// busy on the previous tick gets a FULL idle window once its
+					// session ends, which is what the threshold was always meant to be.
+					this.store.markDeviceActive(row.deviceId, now);
 					this.notePinned(row.deviceId, row.issueKey);
+					this.noteStranded(row, state, affinity, now);
 					continue;
 				}
 				this.noteUnpinned(row.deviceId);
+				this.strandedDevices.delete(row.deviceId);
 				const lastTouch = Math.max(
 					row.lastRoutedMs ?? 0,
 					row.lastSeenMs ?? 0,
@@ -405,14 +540,23 @@ export class ContainerLifecycle {
 					);
 					continue;
 				}
-				// `parkedAtMs` is when a session on this device blocked on a user
-				// answer. Without it the clock is `lastRoutedMs`, so an agent that
-				// worked for twenty minutes and only then asked a question would be
-				// suspended on the very next tick — the clock having expired while
-				// it was legitimately busy.
+				// Three inputs, each covering a way the others go stale:
+				//  - `lastRoutedMs`: the router handed this device an event.
+				//  - `parkedAtMs`: a session on it blocked on a user answer. Without
+				//    it the clock is `lastRoutedMs`, so an agent that worked for
+				//    twenty minutes and only then asked a question would be suspended
+				//    on the very next tick, the clock having expired while it was
+				//    legitimately busy.
+				//  - `lastActiveMs`: the device last held a live session (see
+				//    `RouterStore.markDeviceActive`). The only one stamped by the
+				//    AGENT working rather than by the router doing something TO the
+				//    agent, and so the only one that moves during a long session.
+				//    Without it a 40-minute session leaves the other two frozen at its
+				//    start and the container reads as idle for 35 of those minutes.
 				const idleSince = Math.max(
 					row.lastRoutedMs ?? 0,
 					row.parkedAtMs ?? 0,
+					row.lastActiveMs ?? 0,
 					row.createdMs,
 				);
 				const idleForMs = now - idleSince;
@@ -420,6 +564,35 @@ export class ContainerLifecycle {
 					// `status` is read only once the clock already qualifies, so the
 					// logged value is the same one the decision used.
 					const status = await executor.status(row.issueKey);
+					// Re-read affinity immediately before the stop. The gate above ran
+					// before two awaits (`resolveAffinity`'s query to the device, then
+					// `status()`), and a session that claimed this device during them is
+					// invisible to it — a window of seconds that the implement->review
+					// handoff lands in often enough to have killed 5 of 9 sessions in
+					// one day (NOR-366). Same TOCTOU shape, and same remedy, as the
+					// orphan-GC re-check below.
+					//
+					// Only sessions MISSING from the snapshot count. A bare "any
+					// affinity at all" re-check would look more defensive and would in
+					// fact break the two paths that reach here with rows still in the
+					// table on purpose: a leaked row the reconciler declined to trust,
+					// and an offline device's row aged out past `offlineAgeOutMs`. Both
+					// are decisions the gate already made, and re-litigating them here
+					// would restore the permanent pin those mechanisms exist to break.
+					const claimedMidSweep = this.store
+						.listSessionAffinityForDevice(row.deviceId)
+						.filter((r) => !knownSessions.has(r.sessionId));
+					if (claimedMidSweep.length > 0) {
+						// Activity, and the reason this device must keep its idle window:
+						// the stop is being abandoned precisely because work arrived.
+						this.store.markDeviceActive(row.deviceId, now);
+						this.logger.info(
+							`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
+								`session(s) ${claimedMidSweep.map((r) => r.sessionId).join(", ")} ` +
+								`claimed it while the sweep was deciding`,
+						);
+						continue;
+					}
 					if (status === "running") {
 						await executor.stop(row.issueKey);
 						// The container is no longer running, so its continuous-uptime
