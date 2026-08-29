@@ -597,6 +597,29 @@ export class SkillsPluginResolver {
 				guidance +=
 					" Do NOT skip the verify-and-ship step if you made code changes — it ensures quality checks pass and a PR is created.";
 			}
+		} else {
+			// No rule survived — every entry-point skill was trimmed, so this user
+			// is running their own workflow and there is nothing to route. But
+			// `verify-and-ship` and `summarize` are product plumbing rather than
+			// workflow opinion (they open the pull request and post the session's
+			// final message), so when they survive they still have to be asked
+			// for. Otherwise the documented `CYRUS_DEFAULT_SKILLS=summarize,
+			// verify-and-ship` — keep exactly the plumbing, replace the workflow —
+			// would name them in the listing and then never mention them again,
+			// which is the silent no-PR/no-summary failure this whole block exists
+			// to prevent.
+			const plumbing: string[] = [];
+			if (available.has("verify-and-ship")) {
+				plumbing.push(
+					"Use `verify-and-ship` whenever you have made code changes — it runs the quality checks and opens the pull request.",
+				);
+			}
+			if (available.has("summarize")) {
+				plumbing.push(
+					"Use `summarize` to produce the session's final message.",
+				);
+			}
+			guidance += plumbing.join(" ");
 		}
 
 		// `implement` and `implementation` are different skills from different

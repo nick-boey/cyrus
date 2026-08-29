@@ -10,6 +10,7 @@ import {
 	rmSync,
 	symlinkSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
 interface CodexSkillSource {
@@ -32,6 +33,18 @@ export interface SkillStagingInput {
 	additionalDirectories?: string[];
 	skills?: string[] | "all";
 	plugins?: LocalPluginLike[];
+	/**
+	 * `$HOME`, whose `.claude/skills` directory is staged alongside plugin and
+	 * repo-local skills. Defaults to `os.homedir()`; only tests should pass it.
+	 *
+	 * Codex has no equivalent of Claude Code's user-level skill discovery, so
+	 * unlike plugin and repo skills these are only reachable because they are
+	 * staged here. The allow-list Cyrus computes
+	 * (`SkillsPluginResolver.discoverSkillNames`) already includes them, so
+	 * without this a Codex session is told it has a skill that exists nowhere
+	 * it looks.
+	 */
+	homeDir?: string;
 }
 
 /**
@@ -127,6 +140,13 @@ export class CodexSkillStager {
 		for (const directory of this.getRepoLocalSkillRoots()) {
 			addFromSkillsDirectory(join(directory, ".claude", "skills"));
 		}
+
+		// Skills a dotfiles `install.sh` copied into the user's home directory.
+		// Last, so the precedence matches `SkillsPluginResolver`'s dedup order:
+		// plugin -> repo-local -> home.
+		addFromSkillsDirectory(
+			join(this.input.homeDir ?? homedir(), ".claude", "skills"),
+		);
 
 		return sources;
 	}

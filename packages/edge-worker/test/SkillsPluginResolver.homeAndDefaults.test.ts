@@ -308,6 +308,40 @@ describe("SkillsPluginResolver home-directory skills and CYRUS_DEFAULT_SKILLS", 
 			expect(guidance).not.toContain("Do NOT skip");
 		});
 
+		it("still asks for the plumbing skills when no routing rule survives", async () => {
+			// The documented "replace the workflow, keep the plumbing" setup.
+			// No rule's primary skill survives, so there is nothing to route —
+			// but `verify-and-ship` opens the PR and `summarize` posts the final
+			// message, so dropping their instruction along with the rules would
+			// silently stop both.
+			const resolver = build("summarize,verify-and-ship");
+			const guidance = await resolver.buildSkillsGuidance(
+				await resolver.resolve(),
+			);
+
+			expect(guidance).not.toContain("Choose the appropriate skill");
+			expect(guidance).toContain(
+				"Use `verify-and-ship` whenever you have made code changes",
+			);
+			expect(guidance).toContain(
+				"Use `summarize` to produce the session's final message.",
+			);
+		});
+
+		it("says nothing about plumbing skills the user turned off", async () => {
+			await writeSkill(homeSkillsDir, "codebase-design");
+
+			const resolver = build("summarize");
+			const guidance = await resolver.buildSkillsGuidance(
+				await resolver.resolve(),
+			);
+
+			expect(guidance).not.toContain("verify-and-ship");
+			expect(guidance).toContain(
+				"Use `summarize` to produce the session's final message.",
+			);
+		});
+
 		it("returns an empty string when nothing is discoverable", async () => {
 			await rm(join(cyrusHome, "cyrus-skills-plugin"), {
 				recursive: true,

@@ -1104,7 +1104,7 @@ their own agent skills into their containers:
 
 | Variable | Effect |
 |----------|--------|
-| `DOTFILES_REPO` | A git URL cloned into `$HOME/dotfiles` on every boot; its `install.sh` is then run |
+| `DOTFILES_REPO` | A git URL cloned into `$HOME/dotfiles`; its `install.sh` is run on every boot |
 | `CYRUS_DEFAULT_SKILLS` | Which of the **bundled Cyrus** skills to keep — unset or `all` (default), `none`, or a comma-separated list |
 
 `install.sh` delivers skills by copying directories into `$HOME/.claude/skills`,
@@ -1115,6 +1115,12 @@ which Cyrus unions into the session's skill set:
 mkdir -p ~/.claude/skills
 cp -R "$(dirname "$0")"/skills/. ~/.claude/skills/
 ```
+
+The clone happens once per container filesystem — `applyDotfiles` skips it when
+`$HOME/dotfiles/.git` already exists, and only re-runs `install.sh`. A container
+that is suspended and resumed keeps the copy it cloned, so **pushing a new skill
+to your dotfiles repo does not reach a container that already exists**. Destroy
+the container (or re-prompt the issue so a fresh one is created) to pick it up.
 
 A plain directory copy is the supported route. `claude` is not on `PATH` in the
 worker image — Claude Code reaches the container only as the SDK-bundled copy —
@@ -1132,12 +1138,19 @@ session, and `verify-and-ship` is what opens the pull request. Turning them off
 is supported, but you are then responsible for supplying replacements —
 otherwise sessions quietly stop opening PRs and stop posting summaries. If you
 are replacing the set, `CYRUS_DEFAULT_SKILLS=summarize,verify-and-ship` is the
-recommended starting point.
+recommended starting point: none of Cyrus's routing advice is emitted (every
+rule it describes opens with a skill you have removed), but the agent is still
+told to run `verify-and-ship` after a code change and to close with
+`summarize`.
 
-Scope note: skills reach **Claude and Codex** sessions. Gemini and Cursor
-sessions are unaffected. And since this repo symlinks its own skills into
-`.claude/skills`, `CYRUS_DEFAULT_SKILLS=none` will not hide them when the
-session is working on cyrus itself — they arrive repo-locally as well.
+Scope note: skills reach **Claude and Codex** sessions — Claude discovers
+`~/.claude/skills` natively, and Cyrus stages the same directories into Codex's
+`.agents/skills` layout. Gemini and Cursor sessions get no skills; note that the
+skills listing is still appended to their system prompt, so an agent on those
+runners may be told about skills it cannot invoke. And since this repo symlinks
+its own skills into `.claude/skills`, `CYRUS_DEFAULT_SKILLS=none` will not hide
+them when the session is working on cyrus itself — they arrive repo-locally as
+well.
 
 The same variables work for physical-device targets, sourced from
 `~/.cyrus/.env` rather than from the router's per-user secret store.
