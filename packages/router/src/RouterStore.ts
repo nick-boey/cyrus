@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS devices (
   last_seen_ms INTEGER,
   last_routed_ms INTEGER,
   parked_at_ms INTEGER,
-  running_since_ms INTEGER
+  running_since_ms INTEGER,
+  last_active_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS enrollment_codes (
   code_hash TEXT PRIMARY KEY,
@@ -154,6 +155,7 @@ interface DeviceRow {
 	last_routed_ms: number | null;
 	parked_at_ms: number | null;
 	running_since_ms: number | null;
+	last_active_ms: number | null;
 }
 
 interface ContainerDeviceRow {
@@ -166,6 +168,7 @@ interface ContainerDeviceRow {
 	last_routed_ms: number | null;
 	parked_at_ms: number | null;
 	running_since_ms: number | null;
+	last_active_ms: number | null;
 }
 
 export interface ContainerDeviceInfo {
@@ -197,6 +200,23 @@ export interface ContainerDeviceInfo {
 	 * cleared on every transition out of running.
 	 */
 	runningSinceMs?: number;
+	/**
+	 * When this device was last observed DOING WORK — a session claiming it, or
+	 * a lifecycle sweep finding it still held by live session affinity.
+	 *
+	 * This is the idle clock's reset. Every other input to that clock
+	 * (`createdMs`, `lastRoutedMs`, `parkedAtMs`) is stamped by something the
+	 * ROUTER does, and the router does nothing at all while an agent works: a
+	 * session that runs for forty minutes without a new prompt leaves every one
+	 * of them frozen at its start, so the container is permanently past
+	 * `idleStopMs` and survives only because affinity pins it. The instant
+	 * affinity lapses between two sessions on the same issue, an already-expired
+	 * clock stops it mid-handoff (NOR-366).
+	 *
+	 * Absent for a row created before the column existed and never active since;
+	 * the clock then falls back to the older inputs exactly as before.
+	 */
+	lastActiveMs?: number;
 }
 
 interface ContainerTeardownRow {
@@ -299,6 +319,7 @@ function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
 		lastRoutedMs: row.last_routed_ms ?? undefined,
 		parkedAtMs: row.parked_at_ms ?? undefined,
 		runningSinceMs: row.running_since_ms ?? undefined,
+		lastActiveMs: row.last_active_ms ?? undefined,
 	};
 }
 
@@ -484,6 +505,25 @@ export class RouterStore {
 			!deviceColsNow.some((c) => c.name === "running_since_ms")
 		) {
 			this.db.exec("ALTER TABLE devices ADD COLUMN running_since_ms INTEGER");
+		}
+
+		// Backfilled to migration time, unlike `running_since_ms` above, and for
+		// the opposite reason. This column only ever DELAYS an idle-stop, so the
+		// two directions of error are not symmetric: leaving it NULL makes every
+		// pre-upgrade container instantly eligible for the stop this column exists
+		// to prevent, while backfilling costs at most one extra `idleStopMs` before
+		// a genuinely idle container is parked. Erring toward the survivable side
+		// is the whole point of the fix (NOR-366).
+		if (
+			deviceColsNow.length > 0 &&
+			!deviceColsNow.some((c) => c.name === "last_active_ms")
+		) {
+			this.db.exec("ALTER TABLE devices ADD COLUMN last_active_ms INTEGER");
+			this.db
+				.prepare(
+					"UPDATE devices SET last_active_ms = ? WHERE kind = 'container'",
+				)
+				.run(Date.now());
 		}
 
 		// Deliberately NOT backfilled, and there is nothing sensible to backfill
@@ -808,7 +848,7 @@ export class RouterStore {
 	): ContainerDeviceInfo | undefined {
 		const row = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms
 				 FROM devices WHERE kind = 'container' AND issue_key = ?`,
 			)
 			.get(issueKey) as ContainerDeviceRow | undefined;
@@ -878,7 +918,7 @@ export class RouterStore {
 	listContainerDevices(): ContainerDeviceInfo[] {
 		const rows = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms
 				 FROM devices WHERE kind = 'container'`,
 			)
 			.all() as ContainerDeviceRow[];
@@ -934,6 +974,26 @@ export class RouterStore {
 	 * gone. Idempotent; returns true only when a clock was actually running, so
 	 * the caller can emit a stop transition exactly once.
 	 */
+	/**
+	 * Reset this device's idle clock: it is doing work right now.
+	 *
+	 * UNCONDITIONAL, which is the exact opposite of {@link markDeviceRunning}'s
+	 * set-if-null contract, and deliberately so. `running_since_ms` answers "how
+	 * long has this sandbox been up", so it must survive re-stamping; this column
+	 * answers "when did it last do anything", so re-stamping IS the semantics.
+	 * Conflating the two is what NOR-366 was: with only the uptime clock and the
+	 * router-side stamps, a continuously busy sandbox looked idle from the moment
+	 * it was five minutes old.
+	 *
+	 * Harmless for physical devices — nothing reads `last_active_ms` for them —
+	 * exactly as `last_routed_ms` already is.
+	 */
+	markDeviceActive(deviceId: number, nowMs: number): void {
+		this.db
+			.prepare("UPDATE devices SET last_active_ms = ? WHERE device_id = ?")
+			.run(nowMs, deviceId);
+	}
+
 	clearDeviceRunningSince(deviceId: number): boolean {
 		const result = this.db
 			.prepare(
@@ -1582,6 +1642,13 @@ export class RouterStore {
 		// A device with a live session is by definition not parked. Leaving the
 		// stamp would let the idle clock read from a park that has since ended.
 		this.clearDeviceParkedAt(deviceId);
+		// Claiming the device IS activity, and stamping it here — synchronously,
+		// in the same call that creates the pin — is what closes the handoff race
+		// in NOR-366. The sweep only ever learns about a pin on its next tick, so
+		// between one session ending and the next one being observed there is a
+		// window of up to the sweep interval in which the container looks both
+		// unpinned and (without this) long past its idle deadline.
+		this.markDeviceActive(deviceId, establishedMs);
 	}
 
 	getSessionAffinity(sessionId: string): number | undefined {
