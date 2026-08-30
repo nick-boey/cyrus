@@ -177,6 +177,9 @@ export interface RouterContainersConfig {
 	affinityGraceMs?: number;
 	/** Default 3_600_000 (1 hour). */
 	offlineAgeOutMs?: number;
+	/** Default 600_000 (10 minutes). How long a stopped-but-still-claimed sandbox
+	 *  must stay that way before `sandbox.stranded_session` is reported. */
+	strandedSessionGraceMs?: number;
 	/** Default 5_000 (5 seconds). */
 	sessionsQueryTimeoutMs?: number;
 	/**
@@ -979,6 +982,9 @@ export class RouterServer {
 			idleStopMs: containers.idleStopMs ?? DEFAULT_IDLE_STOP_MS,
 			staleDestroyMs: containers.staleDestroyMs ?? DEFAULT_STALE_DESTROY_MS,
 			offlineAgeOutMs: containers.offlineAgeOutMs ?? DEFAULT_OFFLINE_AGE_OUT_MS,
+			...(containers.strandedSessionGraceMs !== undefined
+				? { strandedSessionGraceMs: containers.strandedSessionGraceMs }
+				: {}),
 			logger: this.logger,
 			sessionReconciler: {
 				isOnline: (deviceId) => this.gateway.isOnline(deviceId),

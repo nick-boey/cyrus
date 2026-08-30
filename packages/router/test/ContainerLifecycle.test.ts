@@ -1173,4 +1173,381 @@ describe("ContainerLifecycle", () => {
 			});
 		});
 	});
+
+	// ── NOR-366: the implement -> review handoff ───────────────────────────
+	// A follow-up session started moments after the previous one on the same
+	// issue ended was reliably killed within seconds. Two independent causes,
+	// each sufficient on its own, so each gets its own tests.
+
+	describe("idle clock resets on session activity", () => {
+		it("does not idle-stop a container that was busy on the previous tick, however old it is", async () => {
+			// THE defect. The router stamps `last_routed_ms` when it hands a device
+			// an event and nothing thereafter, so an agent that works for 30 minutes
+			// without a new prompt leaves every clock frozen at its start: in every
+			// observed kill, `idle_for_ms` equalled `age_ms` to the millisecond. The
+			// container was past `idleStopMs` the entire time it was busy, and only
+			// the affinity pin stood between it and a stop.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-69", "aca");
+			const aca = fakeExecutor("aca", { status: "running" });
+			const idleStopMs = 300_000;
+			let now = createdMs + 1_000;
+
+			store.setSessionAffinity("implement", deviceId, undefined, createdMs);
+
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+			});
+
+			// 30 minutes of continuous work, six times longer than idleStopMs.
+			for (let tick = 0; tick < 30; tick++) {
+				now = createdMs + tick * 60_000;
+				await lifecycle.sweep();
+			}
+			expect(aca.stop).not.toHaveBeenCalled();
+
+			// The implementation session ends. The very next tick is the one that
+			// used to stop the container, because its clock had expired 25 minutes
+			// earlier. It must not: the container was working one tick ago.
+			store.clearSessionAffinity("implement");
+			now = createdMs + 30 * 60_000;
+			await lifecycle.sweep();
+
+			expect(aca.stop).not.toHaveBeenCalled();
+			// And the window it gets is the FULL threshold, not whatever was left.
+			now = createdMs + 29 * 60_000 + idleStopMs;
+			await lifecycle.sweep();
+			expect(aca.stop).not.toHaveBeenCalled();
+		});
+
+		it("still idle-stops once a full idleStopMs passes with no session", async () => {
+			// The other half of the contract: `idle_stopped` is NOT always a fault.
+			// A sandbox whose session legitimately completed must still be parked,
+			// or the fix above trades a correctness bug for a cost one.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-70", "aca");
+			const aca = fakeExecutor("aca", { status: "running" });
+			const idleStopMs = 300_000;
+			let now = createdMs + 1_000;
+
+			store.setSessionAffinity("done", deviceId, undefined, createdMs);
+
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+			});
+
+			await lifecycle.sweep();
+			const lastBusyMs = now;
+			store.clearSessionAffinity("done");
+
+			now = lastBusyMs + idleStopMs + 1;
+			await lifecycle.sweep();
+
+			expect(aca.stop).toHaveBeenCalledWith("CAN-70");
+		});
+
+		it("resets the idle clock the moment a session claims the device, before any sweep sees it", async () => {
+			// The pin is only ever OBSERVED on the next tick, so the store write has
+			// to carry the reset on its own — otherwise there is a whole sweep
+			// interval in which the container is unpinned and already expired.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-94", "aca");
+			const claimedMs = createdMs + 30 * 60_000;
+
+			expect(
+				store.getContainerDeviceForIssue("CAN-94")?.lastActiveMs,
+			).toBeUndefined();
+
+			store.setSessionAffinity("review", deviceId, undefined, claimedMs);
+
+			expect(store.getContainerDeviceForIssue("CAN-94")?.lastActiveMs).toBe(
+				claimedMs,
+			);
+		});
+	});
+
+	describe("sessions claimed while the sweep is deciding", () => {
+		it("abandons an idle-stop when a session claims the device mid-sweep", async () => {
+			// CAN-98: created 02:32:28, idle-stopped 02:32:31, pinned 02:32:33. The
+			// affinity gate runs before two awaits — the reconciler's round trip to
+			// the device, then status() — and a session claimed during them is
+			// invisible to it.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-98", "aca");
+			const idleStopMs = 300_000;
+			const now = createdMs + idleStopMs + 1;
+
+			// The review session lands while the provider is answering status().
+			const aca = fakeExecutor("aca", { status: "running" });
+			aca.status.mockImplementation(async () => {
+				store.setSessionAffinity("review", deviceId, undefined, now);
+				return "running";
+			});
+
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+			});
+
+			await lifecycle.sweep();
+
+			expect(aca.stop).not.toHaveBeenCalled();
+			expect(
+				logger.info.mock.calls.filter(([m]) =>
+					String(m).includes("Skipped idle-stop of CAN-98"),
+				),
+			).toHaveLength(1);
+		});
+
+		it("still ages out an offline device's affinity rather than treating them as a mid-sweep claim", async () => {
+			// The re-check must key on sessions MISSING from the pre-decision
+			// snapshot, not on "any affinity at all". Both the offline age-out and
+			// the reconciler's leaked-row reclaim reach the stop with rows still in
+			// the table on purpose, and a blanket re-check would restore the exact
+			// permanent pin those mechanisms exist to break (PAR-146).
+			const { deviceId, createdMs } = makeContainerDevice("PAR-146b", "aca");
+			const aca = fakeExecutor("aca", { status: "running" });
+			const offlineAgeOutMs = 3_600_000;
+
+			store.setSessionAffinity("aged-out", deviceId, undefined, createdMs);
+
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs,
+				logger,
+				now: () => createdMs + offlineAgeOutMs + 1,
+				sessionReconciler: { isOnline: () => false, reconcile: async () => 1 },
+			});
+
+			await lifecycle.sweep();
+
+			expect(aca.stop).toHaveBeenCalledWith("PAR-146b");
+			expect(store.countSessionAffinityForDevice(deviceId)).toBe(1);
+		});
+	});
+
+	describe("stranded sessions", () => {
+		/**
+		 * A clock comfortably past the 10-minute stranded grace but still WELL
+		 * inside `offlineAgeOutMs` (1 hour). These devices are offline by
+		 * construction, so a clock past the age-out would resolve their affinity to
+		 * zero and the assertions would pass for the wrong reason — never reaching
+		 * the branch under test at all.
+		 */
+		const PAST_GRACE_MS = 700_000;
+
+		/** A device holding affinity for a sandbox its provider reports stopped. */
+		function strandedFixture(issueKey: string, state: "stopped" | "absent") {
+			const { deviceId, createdMs } = makeContainerDevice(issueKey, "aca");
+			const aca = fakeExecutor("aca", {
+				status: "stopped",
+				listStates: state === "stopped" ? [{ issueKey, status: state }] : [],
+			});
+			store.setSessionAffinity("orphaned", deviceId, undefined, createdMs);
+			return { deviceId, createdMs, aca };
+		}
+
+		function strandedLifecycle(
+			aca: ContainerExecutor,
+			now: () => number,
+			graceMs = 600_000,
+		) {
+			return new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				strandedSessionGraceMs: graceMs,
+				logger,
+				now,
+				sessionReconciler: { isOnline: () => false, reconcile: async () => 1 },
+			});
+		}
+
+		it("reports a stopped, offline sandbox that still holds session affinity", async () => {
+			// The state CAN-95 sat in across four consecutive sweeps with no signal
+			// of any kind: `state=stopped sessions=1 online=false`. Linear renders a
+			// normal in-progress agent session throughout.
+			const { deviceId, createdMs, aca } = strandedFixture("CAN-95", "stopped");
+			const graceMs = 600_000;
+			const now = createdMs + graceMs + 1;
+
+			await strandedLifecycle(aca, () => now, graceMs).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")[0]).toMatchObject({
+				issue_key: "CAN-95",
+				device_id: deviceId,
+				provider: "aca",
+				state: "stopped",
+				sessions: 1,
+				stranded_for_ms: graceMs + 1,
+			});
+			expect(
+				logger.error.mock.calls.filter(([m]) =>
+					String(m).includes("still holds 1 session affinity row(s)"),
+				),
+			).toHaveLength(1);
+		});
+
+		it("reports it every tick but only logs the error once", async () => {
+			// The event feeds an alert rule, which needs a non-zero count in its
+			// window; the ERROR line is for a human reading the console and must not
+			// repeat every 60 seconds for hours.
+			const { createdMs, aca } = strandedFixture("CAN-95", "stopped");
+			const graceMs = 600_000;
+			let now = createdMs + graceMs + 1;
+			const lifecycle = strandedLifecycle(aca, () => now, graceMs);
+
+			await lifecycle.sweep();
+			now += 60_000;
+			await lifecycle.sweep();
+			now += 60_000;
+			await lifecycle.sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(3);
+			expect(
+				logger.error.mock.calls.filter(([m]) =>
+					String(m).includes("still holds"),
+				),
+			).toHaveLength(1);
+		});
+
+		it("reports a sandbox the provider no longer has at all", async () => {
+			const { createdMs, aca } = strandedFixture("CAN-96", "absent");
+			const graceMs = 600_000;
+
+			await strandedLifecycle(
+				aca,
+				() => createdMs + graceMs + 1,
+				graceMs,
+			).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")[0]).toMatchObject({
+				issue_key: "CAN-96",
+				state: "absent",
+			});
+		});
+
+		it("stays silent during the cold-boot window, when the same three facts are expected", async () => {
+			// A container that was just routed to is absent/stopped, holds affinity,
+			// and has no socket — identical to the fault — until its worker dials
+			// back, which for a first ACA boot with an image pull is minutes. Firing
+			// here would make the rule useless.
+			const { createdMs, aca } = strandedFixture("CAN-97", "absent");
+			const graceMs = 600_000;
+
+			await strandedLifecycle(
+				aca,
+				() => createdMs + graceMs - 1,
+				graceMs,
+			).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+			expect(logger.error).not.toHaveBeenCalled();
+		});
+
+		it("stays silent for a container whose provider could not be read this tick", async () => {
+			// `unknown` is not `stopped`. One throttled ARM call must not report the
+			// entire fleet as stranded.
+			const { createdMs } = makeContainerDevice("CAN-99", "aca");
+			const aca = fakeExecutor("aca", { status: "stopped" });
+			aca.listStates = vi.fn(async () => {
+				throw new Error("ARM throttled");
+			});
+			store.setSessionAffinity(
+				"orphaned",
+				store.getContainerDeviceForIssue("CAN-99")!.deviceId,
+				undefined,
+				createdMs,
+			);
+
+			await strandedLifecycle(aca, () => createdMs + PAST_GRACE_MS).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+		});
+
+		it("stays silent for a container with a terminal teardown pending", async () => {
+			// That container is supposed to be going away, and TerminalTeardown's own
+			// grace deadline is what covers it.
+			const { deviceId, createdMs, aca } = strandedFixture(
+				"CAN-100",
+				"stopped",
+			);
+			store.upsertPendingTeardown({
+				issueKey: "CAN-100",
+				deviceId,
+				action: "closed",
+				registeredMs: createdMs,
+				deadlineMs: createdMs + 600_000,
+			});
+
+			await strandedLifecycle(aca, () => createdMs + PAST_GRACE_MS).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+		});
+
+		it("stays silent for a running sandbox, and for one whose worker is connected", async () => {
+			const { createdMs } = makeContainerDevice("CAN-101", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-101", status: "running" }],
+			});
+			store.setSessionAffinity(
+				"live",
+				store.getContainerDeviceForIssue("CAN-101")!.deviceId,
+				undefined,
+				createdMs,
+			);
+
+			await strandedLifecycle(aca, () => createdMs + PAST_GRACE_MS).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+		});
+
+		it("clears its once-only error latch when the sandbox recovers, so a recurrence is reported again", async () => {
+			const { deviceId, createdMs } = makeContainerDevice("CAN-102", "aca");
+			let state: "running" | "stopped" = "stopped";
+			const aca = fakeExecutor("aca", {
+				status: "stopped",
+				listStates: () => [{ issueKey: "CAN-102", status: state }],
+			});
+			store.setSessionAffinity("orphaned", deviceId, undefined, createdMs);
+			let now = createdMs + PAST_GRACE_MS;
+			const lifecycle = strandedLifecycle(aca, () => now);
+
+			await lifecycle.sweep();
+			state = "running";
+			now += 60_000;
+			await lifecycle.sweep();
+			state = "stopped";
+			now += 60_000;
+			await lifecycle.sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(2);
+			expect(
+				logger.error.mock.calls.filter(([m]) =>
+					String(m).includes("still holds"),
+				),
+			).toHaveLength(2);
+		});
+	});
 });

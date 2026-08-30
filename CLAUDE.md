@@ -460,6 +460,40 @@ The agent automatically moves issues to the "started" state when assigned. Linea
    - ACA sandboxes use server-assigned GUIDs; issue identity is labels-only (`cyrus.issue`, `cyrus.device-id`, `cyrus.disk`). The ARM sandbox-group body is `properties: {}` and has no `maxSandboxCount` or default CPU/memory/disk fields. Per-sandbox create config is the source of truth.
    - ACA `Running` is infrastructure state, not worker-process liveness: an exited entrypoint can leave `tini` and the sandbox Running. Reconciliation must include router device/WSS heartbeat state. This applies to `resumeSandbox` too — `AcaSandboxesProvider` polls the router's `deviceConnectivity` seam after a resume (`resumeConnectTimeoutMs`, default 90s) and replaces a sandbox whose worker never rejoins, rather than reporting success on infrastructure state alone.
    - Suspend delivers no SIGTERM. Keep ACA auto-suspend disabled and let the affinity-aware router idle sweep stop workers. Explicit snapshots preserve env/device tokens, require lineage checks, and are never garbage-collected by Azure.
+   - **The idle clock must be reset by the AGENT working, not only by the router
+     acting on it.** `created_ms`, `last_routed_ms` and `parked_at_ms` are all
+     stamped by something the router does, and the router does nothing at all
+     while a session runs — so a sandbox busy for 30 minutes reads as 30 minutes
+     idle, is permanently past `idleStopMs`, and survives on the `affinity > 0`
+     gate alone. That made the pin load-bearing rather than defensive, and the
+     implement→review handoff — where one session's affinity drops before the
+     next is established — is exactly where it lapses (NOR-366: 5 of 9 sessions
+     killed in one day, 3s–176s after starting). `devices.last_active_ms`
+     (`markDeviceActive`) is the fix and is stamped in TWO places for two
+     different windows: in `setSessionAffinity`, so a claim resets the clock in
+     the same call that creates the pin rather than a sweep later, and in the
+     sweep on every pinned tick. It is unconditional — the inverse of
+     `markDeviceRunning`'s set-if-null contract, and the reason the two columns
+     are separate. Any new idle-like clock needs the same question asked of it:
+     what moves this while an agent is silently working?
+   - **The affinity gate is re-checked immediately before `executor.stop()`,
+     against a SNAPSHOT of session ids, not against a raw count.** Two awaits
+     separate the gate from the stop (the reconciler's round trip, then
+     `status()`), which is enough to lose the race. But two paths reach the stop
+     with affinity rows still in the table *on purpose* — a leaked row the
+     reconciler declined to trust, and an offline device's row aged out past
+     `offlineAgeOutMs` — so a "block if any affinity exists" re-check silently
+     restores the permanent pin PAR-146 removed. Only session ids absent from
+     the pre-gate snapshot may veto a stop.
+   - **`state=stopped && sessions>0 && online=false` is an impossible state that
+     produces no signal on its own.** No lifecycle transition fires, the gauge
+     records it as three unremarkable fields, and Linear keeps rendering a live
+     agent session — which is why NOR-366 ran for nine hours. `noteStranded`
+     emits `sandbox.stranded_session` for it, and it is DETECTION ONLY: waking
+     the container would also resurrect leaked-affinity rows and undo idle-stop
+     for the sandboxes idle-stop exists for. It must stay excluded during the
+     cold-boot window (`strandedSessionGraceMs`, sized against an ACA boot, which
+     presents identically) and for issues with a pending terminal teardown.
    - `ContainerLifecycle.sweep()` is **non-reentrant by contract** — a tick still
      running makes the next one a logged no-op. `RouterServer` fires it on a bare
      60s `setInterval` and the loop is sequential, so without that guard a single

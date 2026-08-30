@@ -277,6 +277,7 @@ const RouterConfigFileSchema = z.object({
 			teardownGraceMs: z.number().optional(),
 			affinityGraceMs: z.number().optional(),
 			offlineAgeOutMs: z.number().optional(),
+			strandedSessionGraceMs: z.number().optional(),
 			sessionsQueryTimeoutMs: z.number().optional(),
 			requiredSecretKeys: z
 				.array(
