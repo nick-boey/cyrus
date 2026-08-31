@@ -18,6 +18,7 @@ import type {
 } from "../src/RepositoryRegistry.js";
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
+import { encodeDefaultRunnerJson } from "../src/setup/runnerDefaults.js";
 import {
 	eventsNamed as namedEvents,
 	type TestLogger,
@@ -1122,5 +1123,229 @@ describe("ContainerTargetService", () => {
 				),
 			).toEqual(["cyrus-web"]);
 		});
+	});
+});
+
+/* ------------------------------------------- the per-user runner/model default -- */
+
+describe("ContainerTargetService — the per-user runner default", () => {
+	let store: RouterStore;
+	let secrets: SecretStore;
+	let logger: TestLogger;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+		secrets = new SecretStore(freshSecretsPath());
+		logger = testLogger();
+	});
+
+	function serviceWith(overrides: Partial<ContainerRoutingDeps> = {}): {
+		service: ContainerTargetService;
+		docker: ReturnType<typeof fakeExecutor>;
+	} {
+		const docker = fakeExecutor("docker");
+		const service = new ContainerTargetService({
+			store,
+			secrets,
+			executors: new Map([["docker", docker]]),
+			registry: stubRegistry(),
+			containersConfig: CONTAINERS_CONFIG,
+			postActivity: vi.fn(async () => {}),
+			logger,
+			...overrides,
+		});
+		return { service, docker };
+	}
+
+	async function bootEnv(
+		service: ContainerTargetService,
+		docker: ReturnType<typeof fakeExecutor>,
+		userId: number,
+	): Promise<Record<string, string>> {
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+		await vi.waitFor(() => expect(docker.ensureRunning).toHaveBeenCalled());
+		const ctx = docker.ensureRunning.mock.calls[0]?.[0] as
+			| IssueExecutionContext
+			| undefined;
+		if (!ctx) throw new Error("ensureRunning was called with no context");
+		return ctx.env;
+	}
+
+	function claudeUser(): number {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+		return userId;
+	}
+
+	it("emits nothing when the user has no preference", async () => {
+		const userId = claudeUser();
+		const { service, docker } = serviceWith();
+
+		const env = await bootEnv(service, docker, userId);
+		expect(env.CYRUS_DEFAULT_RUNNER).toBeUndefined();
+		expect(env.CYRUS_CLAUDE_DEFAULT_MODEL).toBeUndefined();
+	});
+
+	it("emits the runner and its model var", async () => {
+		const userId = claudeUser();
+		store.setUserDefaultRunner(
+			userId,
+			encodeDefaultRunnerJson({ runner: "claude", model: "sonnet" }),
+		);
+		const { service, docker } = serviceWith();
+
+		const env = await bootEnv(service, docker, userId);
+		expect(env.CYRUS_DEFAULT_RUNNER).toBe("claude");
+		expect(env.CYRUS_CLAUDE_DEFAULT_MODEL).toBe("sonnet");
+	});
+
+	it("does not let a stale stored variable shadow the picker", async () => {
+		// The whole reason these keys are reserved: a user who hand-set
+		// CYRUS_DEFAULT_RUNNER before the picker existed would otherwise change
+		// their default, see it saved, and get the old runner anyway.
+		const userId = claudeUser();
+		store.setUserDefaultRunner(
+			userId,
+			encodeDefaultRunnerJson({ runner: "claude", model: "opus" }),
+		);
+		// Injected through the backend rather than through `set`, which rejects a
+		// reserved name — the point is a bundle that predates the reservation.
+		// `mockReturnValue`, not `mockResolvedValue`: `FileSecretStore` is
+		// synchronous and `isFullyAuthenticated` reads `get()` directly.
+		const bundle = secrets.get("a@example.com");
+		vi.spyOn(secrets, "get").mockReturnValue({
+			...bundle,
+			CYRUS_DEFAULT_RUNNER: "codex",
+			CYRUS_CLAUDE_DEFAULT_MODEL: "haiku",
+		});
+		const { service, docker } = serviceWith();
+
+		const env = await bootEnv(service, docker, userId);
+		expect(env.CYRUS_DEFAULT_RUNNER).toBe("claude");
+		expect(env.CYRUS_CLAUDE_DEFAULT_MODEL).toBe("opus");
+	});
+
+	it("boots a Codex user who holds no Claude token", async () => {
+		// The defect this fixes: `DEFAULT_REQUIRED_SECRET_KEYS` hard-required
+		// the Claude token, so a codex-only user could not boot at all.
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		secrets.set("a@example.com", "OPENAI_API_KEY", "sk-openai");
+		store.setUserDefaultRunner(
+			userId,
+			encodeDefaultRunnerJson({ runner: "codex", model: "gpt-5.5" }),
+		);
+		const { service, docker } = serviceWith();
+
+		const env = await bootEnv(service, docker, userId);
+		expect(env.CYRUS_DEFAULT_RUNNER).toBe("codex");
+		expect(env.CYRUS_CODEX_DEFAULT_MODEL).toBe("gpt-5.5");
+	});
+
+	it("still demands the Claude token from a Claude user", async () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		store.setUserDefaultRunner(
+			userId,
+			encodeDefaultRunnerJson({ runner: "claude", model: "opus" }),
+		);
+		const postActivity = vi.fn(async () => {});
+		const { service, docker } = serviceWith({ postActivity });
+
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+
+		await vi.waitFor(() => expect(postActivity).toHaveBeenCalled());
+		expect(docker.ensureRunning).not.toHaveBeenCalled();
+		expect(String(postActivity.mock.calls[0]?.[2])).toMatch(
+			/CLAUDE_CODE_OAUTH_TOKEN/,
+		);
+	});
+
+	it("fails a Codex boot with a remedy when there is no credential at all", async () => {
+		// Never falls back to Claude: running a different runner than the user
+		// chose erodes trust in the whole picker, and they would have no way to
+		// tell it had happened.
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"docker"}');
+		store.setUserDefaultRunner(
+			userId,
+			encodeDefaultRunnerJson({ runner: "codex", model: "gpt-5.5" }),
+		);
+		const postActivity = vi.fn(async () => {});
+		const { service, docker } = serviceWith({ postActivity });
+
+		const { deviceId } = service.ensureDevice(
+			{ userId, email: "a@example.com" },
+			"CYPACK-1",
+		);
+		service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+
+		await vi.waitFor(() => expect(postActivity).toHaveBeenCalled());
+		expect(docker.ensureRunning).not.toHaveBeenCalled();
+		const body = String(postActivity.mock.calls[0]?.[2]);
+		expect(body).toMatch(/codex login --device-auth/);
+		expect(body).toMatch(/OPENAI_API_KEY/);
+	});
+});
+
+describe("ContainerTargetService — forced executor", () => {
+	let store: RouterStore;
+	let secrets: SecretStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+		secrets = new SecretStore(freshSecretsPath());
+	});
+
+	function forcedService(): ContainerTargetService {
+		return new ContainerTargetService({
+			store,
+			secrets,
+			executors: new Map([["aca", fakeExecutor("aca")]]),
+			registry: stubRegistry(),
+			containersConfig: { ...CONTAINERS_CONFIG, forcedExecutor: "aca" },
+			postActivity: vi.fn(async () => {}),
+			logger: testLogger(),
+		});
+	}
+
+	it.each([
+		[null, "a NULL executor"],
+		['{"type":"device"}', "an explicit device pin"],
+		['{"type":"default"}', "the inherit-default sentinel"],
+		["{ not json", "a corrupt value"],
+		['{"type":"docker"}', "another provider"],
+	])("routes %s (%s) to the forced provider", (stored) => {
+		// The usual one-way degradation to physical device is inverted on
+		// purpose here: with ACA registered it is the only executor that works,
+		// so degrading AWAY from it drops the user onto a device they may never
+		// have enrolled, where the routed event is silently discarded.
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", stored);
+		expect(forcedService().executorFor(userId)).toBe("aca");
+	});
+
+	it("leaves resolution alone when nothing is forced", () => {
+		const { userId } = store.addUser({ email: "a@example.com" });
+		store.setUserExecutor("a@example.com", '{"type":"device"}');
+		const service = new ContainerTargetService({
+			store,
+			secrets,
+			executors: new Map([["docker", fakeExecutor("docker")]]),
+			registry: stubRegistry(),
+			containersConfig: CONTAINERS_CONFIG,
+			postActivity: vi.fn(async () => {}),
+			logger: testLogger(),
+		});
+		expect(service.executorFor(userId)).toBeUndefined();
 	});
 });

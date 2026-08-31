@@ -703,12 +703,53 @@ docker compose exec cyrus-router cyrus router unlock <issueId>
 ## Azure hosting and ACA Sandboxes
 
 The maintained Azure deployment in [`infra/azure/`](../infra/azure/README.md)
-runs the router as one Azure Container App replica and gives selected users one
-Azure Container Apps (ACA) Sandbox per issue. Set the executor with:
+runs the router as one Azure Container App replica and gives users one
+Azure Container Apps (ACA) Sandbox per issue.
+
+**Where an ACA provider is registered, every user's sessions run in an ACA
+container** and `executor_json` is not consulted (NOR-364). ACA is the only
+executor that works on such a deployment, so there is no choice left to
+express — and the alternative, degrading to a physical device the user may
+never have enrolled, silently discards the routed event. The stored values are
+left untouched, so removing `containers.aca` restores the previous behaviour
+exactly. On a router with no ACA provider, set the executor with:
 
 ```bash
-cyrus router users set-executor alice@example.com aca
+cyrus router users set-executor alice@example.com docker
 ```
+
+The router also refuses to start when `containers.defaultExecutor` names a
+provider that is not registered: without that check, every user inheriting the
+default creates a device row, queues their event onto it, and only then fails
+at boot — leaving the event stranded on a device nothing will ever connect to.
+
+### Per-user runner and model defaults
+
+Each user picks their default coding agent and model under **Session defaults**
+on `/setup`. It is per-user and workspace-wide, and it sits *below* the existing
+per-issue overrides: an `[agent=…]`/`[model=…]` tag in an issue description, or
+an agent/model label on the issue, still wins for that issue.
+
+The picker is a curated list, not free text, and it offers only Claude and
+Codex. Gemini and Cursor are absent rather than disabled: neither runs in a
+container today. `CYRUS_DEFAULT_RUNNER` and the per-runner model variables are
+reserved — the router owns them, so a hand-set value in a user's secret bundle
+is ignored (with a warning) rather than silently shadowing the picker.
+
+Which credentials a user must have set follows their chosen runner. A user
+whose default is Codex is not asked for `CLAUDE_CODE_OAUTH_TOKEN`; a Codex user
+supplies a ChatGPT subscription in the **Codex account** section instead (see
+[`docs/adr/0005`](adr/0005-codex-authenticates-by-router-held-subscription-tokens.md)),
+or `OPENAI_API_KEY` for metered billing. Connecting a subscription needs
+`containers.codex` in `router-config.json`; without it the section is not
+rendered.
+
+Changing a default applies to issues that start a container **after** the save.
+An issue that already has one keeps the runner it booted with, because
+`resolveTarget`'s affinity fast path returns the bound device before
+`executorFor` is consulted — so there may be no next `ensureDevice` for that
+issue at all. To move a live issue, run
+`cyrus router containers destroy <issueKey>` and re-prompt it.
 
 The deployment is Bicep, at `infra/azure/bicep`, applied with
 `scripts/deploy-azure.sh`. It is stateless: there is no state file, and

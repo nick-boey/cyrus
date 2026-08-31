@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS users (
   name TEXT,
   linear_id TEXT,
   executor_json TEXT,
-  entra_object_id TEXT
+  entra_object_id TEXT,
+  default_runner_json TEXT,
+  codex_auth_sealed TEXT
 );
 CREATE TABLE IF NOT EXISTS devices (
   device_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -459,6 +461,27 @@ export class RouterStore {
 			!userCols.some((c) => c.name === "entra_object_id")
 		) {
 			this.db.exec("ALTER TABLE users ADD COLUMN entra_object_id TEXT");
+		}
+		// The per-user runner/model picker (NOR-364). Deliberately NOT backfilled:
+		// NULL means "no preference", which leaves `RunnerSelectionService`'s own
+		// fallback chain intact and is exactly the behaviour every pre-upgrade user
+		// already had. Writing a value here would be inventing a choice nobody made.
+		if (
+			userCols.length > 0 &&
+			!userCols.some((c) => c.name === "default_runner_json")
+		) {
+			this.db.exec("ALTER TABLE users ADD COLUMN default_runner_json TEXT");
+		}
+		// The sealed Codex subscription credential (ADR 0005). Sealing is not
+		// optional and this column must never hold plaintext: `users` is plain
+		// SQLite and `StateBackup.upload` PUTs the raw `.db` to blob storage, so an
+		// unsealed column would be a strict confidentiality downgrade from the
+		// envelope-encrypted secret bundle. See {@link CodexTokenStore}.
+		if (
+			userCols.length > 0 &&
+			!userCols.some((c) => c.name === "codex_auth_sealed")
+		) {
+			this.db.exec("ALTER TABLE users ADD COLUMN codex_auth_sealed TEXT");
 		}
 
 		// Re-read rather than reusing `deviceCols`: that snapshot predates the
@@ -1202,6 +1225,77 @@ export class RouterStore {
 			.prepare("UPDATE users SET entra_object_id = ? WHERE user_id = ?")
 			.run(objectId, userId);
 		return result.changes > 0;
+	}
+
+	/**
+	 * The user's stored runner/model preference, as the raw
+	 * `default_runner_json` literal. Parsed by `resolveDefaultRunner`, which
+	 * owns every degradation rule; this is deliberately a dumb accessor so the
+	 * store never has an opinion about which runners exist.
+	 */
+	getUserDefaultRunner(userId: number): string | undefined {
+		const row = this.db
+			.prepare("SELECT default_runner_json FROM users WHERE user_id = ?")
+			.get(userId) as { default_runner_json: string | null } | undefined;
+		return row?.default_runner_json ?? undefined;
+	}
+
+	/** Writes (or, with `null`, clears) the runner/model preference. */
+	setUserDefaultRunner(
+		userId: number,
+		defaultRunnerJson: string | null,
+	): boolean {
+		const result = this.db
+			.prepare("UPDATE users SET default_runner_json = ? WHERE user_id = ?")
+			.run(defaultRunnerJson, userId);
+		return result.changes > 0;
+	}
+
+	/**
+	 * The user's sealed Codex credential envelope, as stored JSON.
+	 *
+	 * Opaque to the store on purpose: sealing and opening happen in
+	 * {@link CodexTokenStore}, which holds the `KeyWrapper`. Nothing here can
+	 * read the credential, which is what keeps the plaintext out of the SQLite
+	 * file that `StateBackup` uploads.
+	 */
+	getUserCodexAuth(userId: number): string | undefined {
+		const row = this.db
+			.prepare("SELECT codex_auth_sealed FROM users WHERE user_id = ?")
+			.get(userId) as { codex_auth_sealed: string | null } | undefined;
+		return row?.codex_auth_sealed ?? undefined;
+	}
+
+	/** Writes (or, with `null`, clears) the sealed Codex credential. */
+	setUserCodexAuth(userId: number, sealed: string | null): boolean {
+		const result = this.db
+			.prepare("UPDATE users SET codex_auth_sealed = ? WHERE user_id = ?")
+			.run(sealed, userId);
+		return result.changes > 0;
+	}
+
+	/**
+	 * Case-insensitive lookup by email, matching `users.email`'s
+	 * `UNIQUE COLLATE NOCASE`. `SetupBootstrap` already feature-detects this
+	 * method; the `/setup` routes need it to resolve a signed-in principal's
+	 * stored preferences without scanning every user.
+	 */
+	getUserByEmail(
+		email: string,
+	): { userId: number; email: string; name?: string } | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT user_id, email, name FROM users WHERE email = ? COLLATE NOCASE",
+			)
+			.get(email) as
+			| { user_id: number; email: string; name: string | null }
+			| undefined;
+		if (!row) return undefined;
+		return {
+			userId: row.user_id,
+			email: row.email,
+			...(row.name ? { name: row.name } : {}),
+		};
 	}
 
 	getUserEmail(userId: number): string | undefined {
