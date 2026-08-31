@@ -240,6 +240,15 @@ const TRACING_SHUTDOWN_TIMEOUT_MS = 2_000;
  *   processes results through to Linear Agent Activity Sessions
  */
 export class EdgeWorker extends EventEmitter {
+	/**
+	 * A `/skill` command leading the user's comment, tolerating any number of
+	 * `@mention`s ahead of it (Linear puts its own there) and accepting
+	 * `plugin:skill` qualified names. Anchored, so a slash appearing mid-sentence
+	 * is prose and not a command.
+	 */
+	private static readonly LEADING_SLASH_COMMAND =
+		/^\s*(?:@[\w.-]+[ \t]+)*(\/[a-zA-Z][\w-]*(?::[a-zA-Z][\w-]*)?)(?=[ \t\n]|$)/;
+
 	private config: EdgeWorkerConfig;
 	private repositories: Map<string, RepositoryConfig> = new Map(); // repository 'id' (internal, stored in config.json) mapped to the full repo config
 	private agentSessionManager: AgentSessionManager; // Single instance managing all agent sessions across repositories
@@ -6975,6 +6984,13 @@ ${taskSection}`;
 	private async assemblePrompt(
 		input: PromptAssemblyInput,
 	): Promise<PromptAssembly> {
+		const assembly = await this.buildPromptForInput(input);
+		return this.prefixSlashCommand(assembly, input);
+	}
+
+	private async buildPromptForInput(
+		input: PromptAssemblyInput,
+	): Promise<PromptAssembly> {
 		// If actively streaming, just pass through the comment
 		if (input.isStreaming) {
 			return this.buildStreamingPrompt(input);
@@ -6987,6 +7003,61 @@ ${taskSection}`;
 
 		// Existing session continuation - just user comment + attachments
 		return this.buildContinuationPrompt(input);
+	}
+
+	/**
+	 * Echo a leading `/<skill>` token from the user's comment onto line 1 of the
+	 * assembled prompt.
+	 *
+	 * Claude Code expands a slash command ONLY when the prompt string starts
+	 * with `/<name>`. Every builder above either wraps the comment in XML
+	 * (`<user_comment>` / `<new_comment>`) or lets Linear's `@mention` lead, so
+	 * `@cyrus1 /grill-with-docs ...` never expands. The model is then left to
+	 * guess at the name from prose, and measurably refuses ("no such skill
+	 * available") about as often as it guesses right.
+	 *
+	 * Two measured properties of the expansion make this the whole fix
+	 * (`@anthropic-ai/claude-agent-sdk` 0.3.220):
+	 *
+	 * 1. Text AFTER the command is preserved and reaches the model verbatim,
+	 *    whether or not the skill body references `$ARGUMENTS`. So the wrapped
+	 *    comment stays exactly where it is and no context is lost — this is a
+	 *    prefix, not a rewrite.
+	 * 2. Expansion ignores both `disable-model-invocation: true` and the SDK
+	 *    `skills` allowlist. That is what makes the slash-only skills in a
+	 *    dotfiles set (14 of the 25 in `mattpocock-skills`) reachable from
+	 *    Linear at all — they are invisible to the `Skill` tool by design.
+	 *
+	 * Unknown commands are left to the model as plain text, exactly as today; a
+	 * name check here would buy nothing and would have to be kept in sync with
+	 * `SkillsPluginResolver`.
+	 */
+	private prefixSlashCommand(
+		assembly: PromptAssembly,
+		input: PromptAssemblyInput,
+	): PromptAssembly {
+		const command = EdgeWorker.LEADING_SLASH_COMMAND.exec(
+			input.userComment,
+		)?.[1];
+		if (!command || assembly.userPrompt.startsWith(command)) {
+			return assembly;
+		}
+
+		this.logger.event(
+			CYRUS_EVENTS.skillSlashInvoked,
+			cyrusAttributes({
+				skill: command.slice(1),
+				prompt_type: assembly.metadata.promptType,
+				issue_key: input.fullIssue?.identifier,
+				new_session: assembly.metadata.isNewSession,
+				streaming: assembly.metadata.isStreaming,
+			}),
+		);
+
+		return {
+			...assembly,
+			userPrompt: `${command}\n${assembly.userPrompt}`,
+		};
 	}
 
 	/**

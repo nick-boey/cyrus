@@ -548,9 +548,13 @@ export class SkillsPluginResolver {
 	 *
 	 * 1. Skills whose `SKILL.md` sets `disable-model-invocation: true` are
 	 *    omitted from the listing. They stay in the SDK allowlist — the user can
-	 *    still invoke them as `/slash-commands` — but the SDK refuses to run
-	 *    them via the Skill tool, so advertising them here would be telling the
-	 *    model to reach for something it cannot use.
+	 *    still invoke them as `/slash-commands`, which `EdgeWorker` enables by
+	 *    echoing a leading `/<skill>` onto line 1 of the prompt.
+	 *
+	 *    Measured against agent SDK 0.3.220, the `Skill` tool does NOT refuse
+	 *    these: it ran one when the model named it explicitly. The real gate is
+	 *    this listing, which is why omitting them here is what actually keeps the
+	 *    model from reaching for a skill its author marked user-invoked-only.
 	 * 2. The routing rules below are generated from the surviving set, so a user
 	 *    who trimmed the bundled skills with `CYRUS_DEFAULT_SKILLS` is not
 	 *    instructed to use skills they no longer have.
