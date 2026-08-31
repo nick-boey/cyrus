@@ -7,6 +7,12 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import type { RunnerType } from "cyrus-core";
+import { CODEX_AUTH_JSON_ENV } from "./setup/codexAuth.js";
+import {
+	DEFAULT_RUNNER_ENV,
+	MODEL_ENV_BY_RUNNER,
+} from "./setup/runnerDefaults.js";
 
 /** Per-user container secrets: an env-var-name → value map. */
 export type UserSecretBundle = Record<string, string>;
@@ -60,21 +66,110 @@ export const RESERVED_ENV_KEYS = [
 	// `docs/adr/0004-parent-based-head-sampling-for-traces.md`.
 	"CYRUS_OTEL_TRACES_ENABLED",
 	"CYRUS_OTEL_TRACES_SAMPLE_RATIO",
+	// The runner/model picker on `/setup`. Once the router owns these keys, a
+	// stale hand-typed variable must not shadow the picker — the user would
+	// change their default, see it saved, and get the old runner anyway, with
+	// nothing anywhere saying why.
+	DEFAULT_RUNNER_ENV,
+	MODEL_ENV_BY_RUNNER.claude,
+	MODEL_ENV_BY_RUNNER.codex,
+	// The router is the sole holder and sole refresher of a user's Codex
+	// subscription credential (ADR 0005). A hand-set value would shadow the
+	// freshly-minted token with a stale one and reintroduce exactly the
+	// rotation race that decision exists to dissolve — and it would fail
+	// invisibly, because the boot step cannot tell a user's paste from the
+	// router's injection.
+	CODEX_AUTH_JSON_ENV,
 	"PATH",
 	"HOME",
 	"NODE_OPTIONS",
 ] as const;
 
-/** Default "fully authenticated" set. The gate is additive on top of this. */
-export const DEFAULT_REQUIRED_SECRET_KEYS = [
-	"CLAUDE_CODE_OAUTH_TOKEN",
-] as const;
+/**
+ * The credentials each runner needs before a container can usefully boot.
+ *
+ * This used to be a flat `["CLAUDE_CODE_OAUTH_TOKEN"]`, which made
+ * "select Codex as your default" a lie: a codex-only user could not boot a
+ * container at all, because the boot gate demanded an Anthropic credential
+ * they had no reason to hold.
+ *
+ * Codex requires nothing here on purpose. Its credential is a router-held
+ * ChatGPT subscription token that never lives in the secret bundle (ADR 0005),
+ * with `OPENAI_API_KEY` as the documented fallback — so neither is a bundle key
+ * the readiness banner can meaningfully demand. A Codex user with no usable
+ * credential fails at boot with a message naming the remedy, which is the
+ * failure this table cannot express and {@link CodexTokenService} can.
+ */
+export const RUNNER_REQUIRED_SECRET_KEYS: Record<
+	RunnerType,
+	readonly string[]
+> = {
+	claude: ["CLAUDE_CODE_OAUTH_TOKEN"],
+	codex: [],
+	gemini: [],
+	cursor: [],
+};
+
+/**
+ * Default "fully authenticated" set for a user with no stored runner
+ * preference. The gate is additive on top of this.
+ *
+ * Kept as the Claude set because that is what an unset preference resolves to
+ * downstream (`RunnerSelectionService.getDefaultRunner` falls back to
+ * `"claude"`), so the readiness banner keeps asking for exactly the credential
+ * such a user's sessions will actually try to use.
+ */
+export const DEFAULT_REQUIRED_SECRET_KEYS = RUNNER_REQUIRED_SECRET_KEYS.claude;
+
+/**
+ * The one expression for "which variables must this user have set".
+ *
+ * There is deliberately a single implementation rather than one per caller:
+ * the `/setup` readiness banner, the record backfill in `SetupBootstrap`, and
+ * the boot gate in `ContainerTargets.buildEnv` must never disagree, because
+ * the failure mode when they do is a page that says "all set" above a
+ * container that refuses to boot.
+ */
+export function requiredSecretKeysFor(
+	runner: RunnerType | undefined,
+	extra: readonly string[] | undefined,
+): string[] {
+	const runnerKeys =
+		(runner ? RUNNER_REQUIRED_SECRET_KEYS[runner] : undefined) ??
+		DEFAULT_REQUIRED_SECRET_KEYS;
+	return [...new Set([...runnerKeys, ...(extra ?? [])])];
+}
 
 /** POSIX-style environment variable name. */
 export const VALID_ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export function isReservedEnvKey(key: string): boolean {
 	return (RESERVED_ENV_KEYS as readonly string[]).includes(key);
+}
+
+/**
+ * Keys that became reserved AFTER users could already store them.
+ *
+ * Everything else in {@link RESERVED_ENV_KEYS} has been reserved since before
+ * any bundle existed, so a form submitting one can only be tampered with — and
+ * `applyEdits` fails the whole save, deliberately, rather than making an attack
+ * look like a success.
+ *
+ * These four are different: they were ordinary variables until the `/setup`
+ * runner picker took ownership of them (NOR-364), so a user may hold one
+ * legitimately, from before. Failing their save would leave them unable to
+ * change anything at all until an operator edited their record by hand, which
+ * is a worse outcome than treating the field as stale — which is what it is.
+ */
+export const LATE_RESERVED_ENV_KEYS: readonly string[] = [
+	DEFAULT_RUNNER_ENV,
+	MODEL_ENV_BY_RUNNER.claude,
+	MODEL_ENV_BY_RUNNER.codex,
+	CODEX_AUTH_JSON_ENV,
+];
+
+export function isLateReservedEnvKey(key: string): boolean {
+	return LATE_RESERVED_ENV_KEYS.includes(key);
 }
 
 /** A key a user may store: a valid env-var name that is not reserved. */

@@ -1,5 +1,5 @@
 import type { CyrusAgentSession, ILogger, RepositoryConfig } from "cyrus-core";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
 	type IChatToolResolver,
 	type IMcpConfigProvider,
@@ -26,6 +26,7 @@ function makeCodexBuilder(): RunnerConfigBuilder {
 		determineRunnerSelection: () => ({ runnerType: "codex" as const }),
 		getDefaultModelForRunner: () => "gpt-5.5",
 		getDefaultFallbackModelForRunner: () => "gpt-5.4",
+		inferRunnerFromModel: () => undefined,
 	};
 	return new RunnerConfigBuilder(
 		chatToolResolver,
@@ -65,6 +66,7 @@ function buildCodexConfig(sandboxSettings?: Record<string, unknown>) {
 		...(sandboxSettings ? { sandboxSettings } : {}),
 	});
 	return config as {
+		sandbox?: string;
 		sandboxSettings?: { allowWrite?: string[]; allowRead?: string[] };
 	};
 }
@@ -82,5 +84,45 @@ describe("RunnerConfigBuilder Codex sandbox plumbing", () => {
 
 	it("leaves Codex sandbox settings unset when the egress sandbox is disabled", () => {
 		expect(buildCodexConfig(undefined).sandboxSettings).toBeUndefined();
+	});
+});
+
+describe("RunnerConfigBuilder Codex sandbox mode in a worker container", () => {
+	afterEach(() => {
+		delete process.env.CYRUS_ISSUE_KEY;
+		delete process.env.CYRUS_DEVICE_TOKEN;
+	});
+
+	// Codex enforces every sandbox mode through bubblewrap, and bubblewrap
+	// cannot create a user namespace inside a worker container — so EVERY shell
+	// command exits 1 before it starts and the session finishes having done
+	// nothing. The container is the boundary in that mode.
+	it("disables the nested Codex sandbox in headless container mode", () => {
+		process.env.CYRUS_ISSUE_KEY = "DEF-1";
+		process.env.CYRUS_DEVICE_TOKEN = "tok";
+		const config = buildCodexConfig({ enabled: true });
+		expect(config.sandbox).toBe("danger-full-access");
+		// `sandboxSettings` must stay UNSET, not merely be overridden. With it
+		// set, `resolveCodexSandbox` returns `kind: "profile"` regardless of
+		// mode, and `threadOptionsParams` sends `permissions` and DROPS
+		// `sandbox` — so the mode never reaches Codex and bwrap is back in the
+		// path. Asserting only `.sandbox` passes while the bug is present.
+		expect(config.sandboxSettings).toBeUndefined();
+	});
+
+	it("keeps the Codex sandbox on a workstation, where it is the only boundary", () => {
+		const config = buildCodexConfig({ enabled: true });
+		expect(config.sandbox).toBeUndefined();
+		// And the filesystem profile is still built there — the workstation is
+		// the case the profile exists for.
+		expect(config.sandboxSettings).toEqual({
+			allowWrite: ["/ws/root"],
+			allowRead: ["/ws/root", "/ws/root", "/repos/repo-a"],
+		});
+	});
+
+	it("needs BOTH container signals, so a stray CYRUS_ISSUE_KEY does not disarm it", () => {
+		process.env.CYRUS_ISSUE_KEY = "DEF-1";
+		expect(buildCodexConfig({ enabled: true }).sandbox).toBeUndefined();
 	});
 });

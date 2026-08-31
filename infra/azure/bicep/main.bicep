@@ -626,6 +626,28 @@ var routerContainersConfig = union(
     backupBlobUrl: backupBlobUrl
   },
   empty(routerDefaultExecutor) ? {} : { defaultExecutor: routerDefaultExecutor },
+  // Codex ChatGPT-subscription credentials (ADR 0005). Rendered on
+  // enableSetupSecretStore — the flag that provisions the KEK *and* the
+  // router's Key Vault Crypto User role — and NOT on enableSetupTableBackend,
+  // which is the unrelated staged migration of the secret backend.
+  //
+  // Deliberately absent when that flag is off, rather than rendered with a
+  // local key. The router database lives on the container's own ephemeral
+  // disk and only `router.db` is backed up to Blob, so a local KEK here would
+  // be regenerated on every revision: the sealed credential would come back
+  // from the backup and be permanently unopenable, while `/setup` went on
+  // showing the account as connected. With no `codex` block the "Codex
+  // account" section is simply not offered, and a Codex user runs on
+  // OPENAI_API_KEY — an honest capability gap instead of a silent data loss.
+  enableSetupSecretStore
+    ? {
+        codex: {
+          // VERSIONED, like tableStore.keyId: a sealed record pins the version
+          // it was wrapped with, so old versions must stay ENABLED.
+          keyId: foundation.outputs.setupKekVersionedKeyId
+        }
+      }
+    : {},
   enableSetupTableBackend
     ? {
         tableStore: {

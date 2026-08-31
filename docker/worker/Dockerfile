@@ -83,9 +83,15 @@ RUN set -eu; \
 # same CLI Cyrus itself drives.
 #
 # Neither CLI is authenticated here — credentials are runtime concerns, and
-# baking them into a layer would leak them into the image. How `codex` should
-# get its credentials inside a worker container is still open; see NOR-290.
-# Until that lands, this image only puts the CLI on PATH.
+# baking them into a layer would leak them into the image.
+#
+# `codex` gets its credentials at boot, not from this image (NOR-290, resolved
+# by NOR-364): the router holds each user's ChatGPT subscription tokens, is the
+# sole process that refreshes them, and injects a freshly-minted short-lived
+# copy as `CODEX_AUTH_JSON`. `cyrus container-boot` writes that to
+# `$CODEX_HOME/auth.json` at 0600 before launching the session. `OPENAI_API_KEY`
+# remains supported as the metered fallback. See
+# docs/adr/0005-codex-authenticates-by-router-held-subscription-tokens.md.
 ARG CODEX_VERSION=0.144.6
 ARG OPENCODE_VERSION=1.18.13
 RUN npm install -g \

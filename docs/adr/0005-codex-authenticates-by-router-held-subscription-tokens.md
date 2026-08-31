@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Codex authenticates by router-held ChatGPT subscription tokens

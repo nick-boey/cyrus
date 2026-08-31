@@ -271,7 +271,7 @@ describe("F1 router-mode fake ACA lifecycle drive", () => {
 			staleDestroyMs: 14 * 24 * 60 * 60_000,
 			logger: { info: () => {}, warn: () => {} },
 		});
-		rig.seedUser({
+		await rig.seedUser({
 			email: CREATOR.email,
 			linearId: CREATOR.id,
 			provider: "aca",

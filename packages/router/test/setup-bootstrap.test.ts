@@ -39,7 +39,7 @@ function harness(
 	const bootstrap = new SetupBootstrap({
 		store,
 		secrets,
-		requiredKeys: REQUIRED,
+		requiredKeys: () => REQUIRED,
 		autoProvisionUsers: options.autoProvisionUsers ?? true,
 		logger,
 	});
@@ -281,9 +281,14 @@ describe("SetupBootstrap.ensure", () => {
 		// user" once, so `addUser` runs and trips `users.email UNIQUE COLLATE
 		// NOCASE`. A raw SQLITE_CONSTRAINT must never reach a teammate whose
 		// only mistake was double-clicking.
-		const real = store.listUsers.bind(store);
+		//
+		// Stubs `getUserByEmail`, which is what `findUser` calls now that
+		// `RouterStore` implements it — it used to fall back to scanning
+		// `listUsers`, and stubbing that no longer intercepts the lookup at all.
+		const real = store.getUserByEmail.bind(store);
 		let calls = 0;
-		store.listUsers = (() => (calls++ === 0 ? [] : real())) as typeof real;
+		store.getUserByEmail = ((email: string) =>
+			calls++ === 0 ? undefined : real(email)) as typeof real;
 		const { bootstrap } = harness({ store });
 
 		const result = await bootstrap.ensure({ email: "alice@example.com" });
