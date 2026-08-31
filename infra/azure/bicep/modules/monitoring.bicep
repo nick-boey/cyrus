@@ -327,6 +327,81 @@ resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Skills (NOR-368)
+////////////////////////////////////////////////////////////////////////////////
+//
+// `skill.slash_invoked` is emitted by the sandbox WORKER, not the router, and
+// reaches this table only because SandboxLogRelay re-emits forwarded frames onto
+// the router's own stdout. It therefore carries the router's ContainerAppName
+// like every query above, with `component` reading `sandbox/<worker component>`
+// and `cyrus.device_id` / `cyrus.issue_key` supplied by the router's device row
+// rather than by the worker.
+//
+// This event is the ONLY record a slash-invoked skill leaves. Expansion happens
+// before the model gets a turn and bypasses the Skill tool entirely, so unlike a
+// model-invoked skill there is no tool-use activity to correlate against.
+
+// Which skills people actually reach for, and on how many distinct issues. The
+// query to open when deciding what belongs in a dotfiles set.
+resource skillSlashUsage 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Skill-Slash-Usage'
+  properties: {
+    category: 'Cyrus Skills'
+    displayName: 'Slash-invoked skills by usage'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "skill.slash_invoked"'
+        '| extend'
+        '    skill     = tostring(p["cyrus.skill"]),'
+        '    issue_key = tostring(p["cyrus.issue_key"])'
+        '| summarize'
+        '    invocations   = count(),'
+        '    issues        = dcount(issue_key),'
+        '    new_sessions  = countif(tobool(p["cyrus.new_session"])),'
+        '    first_used    = min(TimeGenerated),'
+        '    last_used     = max(TimeGenerated)'
+        '  by skill'
+        '| order by invocations desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// Every slash invocation in order, for tracing one issue's session back to the
+// command that started it.
+resource skillSlashTimeline 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Skill-Slash-Timeline'
+  properties: {
+    category: 'Cyrus Skills'
+    displayName: 'Slash-invoked skills over time'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "skill.slash_invoked"'
+        '| project'
+        '    TimeGenerated,'
+        '    skill       = tostring(p["cyrus.skill"]),'
+        '    issue_key   = tostring(p["cyrus.issue_key"]),'
+        '    prompt_type = tostring(p["cyrus.prompt_type"]),'
+        '    new_session = tobool(p["cyrus.new_session"]),'
+        '    streaming   = tobool(p["cyrus.streaming"]),'
+        '    device_id   = tostring(p["cyrus.device_id"])'
+        '| order by TimeGenerated desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Distributed traces (Phase 5 / NOR-283)
 ////////////////////////////////////////////////////////////////////////////////
 //
