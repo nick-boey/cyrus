@@ -1006,6 +1006,18 @@ separate, ordered operation:
 1. Set `enableSetupSecretStore = true` and deploy. The Table and KEK now exist;
    the router still reads Key Vault, because `enableSetupTableBackend` is
    `false`.
+
+   > This same flag is what enables **Codex ChatGPT-subscription credentials**,
+   > which are a separate feature that happens to need the same KEK. The
+   > template renders `containers.codex.keyId` here — read independently of
+   > `containers.tableStore.keyId`, so connecting a subscription never requires
+   > finishing the migration below. It is gated on this flag rather than
+   > rendered unconditionally because the router database is on the container's
+   > **ephemeral** disk and only `router.db` is backed up: a local sealing key
+   > would be regenerated on every revision, and every stored credential would
+   > come back from the backup permanently unopenable while `/setup` went on
+   > showing the account as connected. With the flag off, the **Codex account**
+   > section is simply not offered and Codex users run on `OPENAI_API_KEY`.
 2. `az containerapp exec` into the replica and dry-run the copy. The target is
    named explicitly, because `containers.tableStore` is deliberately NOT in the
    config yet — adding it is what makes the router start *reading* from the

@@ -723,8 +723,16 @@ export class ContainerTargetService {
 		}
 
 		if (hasApiKey) return;
+		// Two different messages, because the remedy is different and the wrong
+		// one is worse than none. Without a token store there IS no "Codex
+		// account" section on `/setup` — it is rendered only when the store
+		// exists — so telling the user to go and use it sends them looking for a
+		// control that is not on their page, on a deployment where connecting a
+		// subscription is not possible at all.
 		throw new Error(
-			`${email} has Codex selected as their default runner but no Codex credential. Connect a ChatGPT subscription in the "Codex account" section of /setup (run \`codex login --device-auth\` on your own machine and paste the resulting auth.json), or add OPENAI_API_KEY as a variable to use metered billing instead.`,
+			tokens
+				? `${email} has Codex selected as their default runner but no Codex credential. Connect a ChatGPT subscription in the "Codex account" section of /setup (run \`codex login --device-auth\` on your own machine and paste the resulting auth.json), or add OPENAI_API_KEY as a variable to use metered billing instead.`
+				: `${email} has Codex selected as their default runner, but this router is not configured for ChatGPT-subscription credentials, so there is no way to connect one here. Add OPENAI_API_KEY as a variable to run Codex on metered billing, or ask the router's operator to configure containers.codex.`,
 		);
 	}
 

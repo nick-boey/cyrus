@@ -1270,10 +1270,10 @@ describe("ContainerTargetService — the per-user runner default", () => {
 		);
 	});
 
-	it("fails a Codex boot with a remedy when there is no credential at all", async () => {
-		// Never falls back to Claude: running a different runner than the user
-		// chose erodes trust in the whole picker, and they would have no way to
-		// tell it had happened.
+	/** Drives a Codex-default user to a failed boot and returns the activity. */
+	async function codexBootFailureBody(
+		overrides: Partial<ContainerRoutingDeps> = {},
+	): Promise<string> {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');
 		store.setUserDefaultRunner(
@@ -1281,7 +1281,7 @@ describe("ContainerTargetService — the per-user runner default", () => {
 			encodeDefaultRunnerJson({ runner: "codex", model: "gpt-5.5" }),
 		);
 		const postActivity = vi.fn(async () => {});
-		const { service, docker } = serviceWith({ postActivity });
+		const { service, docker } = serviceWith({ postActivity, ...overrides });
 
 		const { deviceId } = service.ensureDevice(
 			{ userId, email: "a@example.com" },
@@ -1291,9 +1291,33 @@ describe("ContainerTargetService — the per-user runner default", () => {
 
 		await vi.waitFor(() => expect(postActivity).toHaveBeenCalled());
 		expect(docker.ensureRunning).not.toHaveBeenCalled();
-		const body = String(postActivity.mock.calls[0]?.[2]);
+		return String(postActivity.mock.calls[0]?.[2]);
+	}
+
+	it("fails a Codex boot with a remedy when the user has connected no account", async () => {
+		// Never falls back to Claude: running a different runner than the user
+		// chose erodes trust in the whole picker, and they would have no way to
+		// tell it had happened.
+		const codexTokens = {
+			mint: async () => undefined,
+		} as unknown as ContainerRoutingDeps["codexTokens"];
+		const body = await codexBootFailureBody({ codexTokens });
 		expect(body).toMatch(/codex login --device-auth/);
+		expect(body).toMatch(/Codex account/);
 		expect(body).toMatch(/OPENAI_API_KEY/);
+	});
+
+	it("does not name the /setup section on a router with no credential store", async () => {
+		// The section is rendered only when the store exists, so on such a
+		// deployment (every Azure one before `containers.codex` was added to the
+		// Bicep) the old message sent the user looking for a control that is not
+		// on their page, to do something that deployment cannot do at all.
+		const body = await codexBootFailureBody();
+		expect(body).not.toMatch(/codex login --device-auth/);
+		expect(body).not.toMatch(/Codex account/);
+		expect(body).toMatch(/not configured for ChatGPT-subscription credentials/);
+		expect(body).toMatch(/OPENAI_API_KEY/);
+		expect(body).toMatch(/containers\.codex/);
 	});
 });
 

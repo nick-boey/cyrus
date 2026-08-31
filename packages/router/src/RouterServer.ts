@@ -213,9 +213,29 @@ export interface RouterContainersConfig {
 		 */
 		clientId?: string;
 		/**
+		 * Versioned Key Vault key id to seal stored credentials with.
+		 *
+		 * Separate from `tableStore.keyId` on purpose. The KEK and the router's
+		 * *Key Vault Crypto User* role are provisioned by one Azure flag
+		 * (`enableSetupSecretStore`) while `tableStore` is rendered by a
+		 * different one (`enableSetupTableBackend`, the staged migration of the
+		 * secret backend). Reading the KEK only off `tableStore` therefore meant
+		 * a deployment that had a perfectly good vault key still sealed Codex
+		 * credentials with a local file — and made using a subscription
+		 * conditional on an unrelated migration.
+		 */
+		keyId?: string;
+		/**
 		 * Where the local key-encryption key lives when no Key Vault KEK is
 		 * configured. Defaults to `codex-kek.key` beside the router database.
-		 * Ignored when `tableStore.keyId` is set, which is the stronger option.
+		 * Ignored when a `keyId` (here or on `tableStore`) is set, which is the
+		 * stronger option.
+		 *
+		 * **This file is not backed up by anything.** `StateBackup` uploads
+		 * `router.db` alone, so on a host whose disk does not survive a restart
+		 * the database comes back and the key does not — and every sealed
+		 * credential in it becomes permanently unopenable while still *looking*
+		 * connected. Point this at durable storage, or configure a `keyId`.
 		 */
 		localKeyPath?: string;
 	};
@@ -995,21 +1015,32 @@ export class RouterServer {
 			);
 		}
 
-		// The Codex credential store needs a KEK. The Key Vault key configured for
-		// the secret bundle is preferred; without one, a 0600 local key file keeps
-		// the credential out of the `.db` that `StateBackup` uploads. Sealing is
-		// never skipped — see `LocalKeyWrapper` for exactly what each buys.
+		// The Codex credential store needs a KEK. A Key Vault key is preferred —
+		// `codex.keyId` first, then the one the secret bundle uses; without
+		// either, a 0600 local key file keeps the credential out of the `.db`
+		// that `StateBackup` uploads. Sealing is never skipped — see
+		// `LocalKeyWrapper` for exactly what each buys.
 		let codexTokens: CodexTokenStore | undefined;
 		if (containers.codex) {
-			const wrapper = containers.tableStore?.keyId
-				? new KeyVaultKeyWrapper({
-						keyId: containers.tableStore.keyId,
-						logger: this.logger,
-					})
-				: new LocalKeyWrapper(
-						containers.codex.localKeyPath ??
-							join(dirname(this.config.dbPath), "codex-kek.key"),
-					);
+			const keyId = containers.codex.keyId ?? containers.tableStore?.keyId;
+			const localKeyPath =
+				containers.codex.localKeyPath ??
+				join(dirname(this.config.dbPath), "codex-kek.key");
+			if (!keyId) {
+				// Loud, because the failure it precedes is silent and delayed:
+				// nothing backs this file up (`StateBackup` uploads `router.db`
+				// only), so on a host with an ephemeral disk the database returns
+				// after a restart and the key does not. `openBundle` then fails,
+				// `CodexTokenStore.get` reports the credential as absent, and the
+				// user sees "no account connected" — indistinguishable from never
+				// having connected one, days after they did.
+				this.logger.warn(
+					`Sealing Codex credentials with the local key at ${localKeyPath}. Nothing backs that file up, so every stored credential is lost — while still appearing connected — if this host's disk does not survive a restart. Configure containers.codex.keyId with a Key Vault key, or point containers.codex.localKeyPath at durable storage.`,
+				);
+			}
+			const wrapper = keyId
+				? new KeyVaultKeyWrapper({ keyId, logger: this.logger })
+				: new LocalKeyWrapper(localKeyPath);
 			codexTokens = new CodexTokenStore({
 				store: this.store,
 				wrapper,

@@ -742,7 +742,24 @@ supplies a ChatGPT subscription in the **Codex account** section instead (see
 [`docs/adr/0005`](adr/0005-codex-authenticates-by-router-held-subscription-tokens.md)),
 or `OPENAI_API_KEY` for metered billing. Connecting a subscription needs
 `containers.codex` in `router-config.json`; without it the section is not
-rendered.
+rendered, and a Codex user with no `OPENAI_API_KEY` is told so rather than being
+pointed at a control their deployment does not have.
+
+**The sealing key must outlive the host.** Stored credentials are sealed with a
+KEK, and `containers.codex.keyId` (a versioned Key Vault key) is the durable
+choice. Without one the router falls back to a 0600 local file —
+`containers.codex.localKeyPath`, defaulting to `codex-kek.key` beside the
+database — and warns at startup, because **nothing backs that file up**:
+`StateBackup` uploads `router.db` alone. On a host whose disk does not survive a
+restart the database returns and the key does not, `openBundle` fails, and every
+stored credential reads as "no account connected" — indistinguishable, days
+later, from never having connected one. On Azure this is why the Bicep renders
+`containers.codex` only under `enableSetupSecretStore` (the flag that provisions
+the KEK *and* the router's *Key Vault Crypto User* role): the router database
+sits on the container's ephemeral disk, so the local-key path there would
+guarantee that loss. `codex.keyId` is read independently of
+`tableStore.keyId`, so using a subscription never requires the separate
+`enableSetupTableBackend` migration.
 
 Changing a default applies to issues that start a container **after** the save.
 An issue that already has one keeps the runner it booted with, because
