@@ -59,10 +59,12 @@ export async function startControlServer(opts: {
 			email: string;
 			linearId: string;
 			provider: string;
-			claudeOauthToken: string;
+			claudeOauthToken?: string;
+			defaultRunner?: string;
+			codexAuthJson?: string;
 			env?: Record<string, string>;
 		};
-		opts.rig.seedUser(b);
+		await opts.rig.seedUser(b);
 		reply.send({ ok: true });
 	});
 

@@ -18,6 +18,7 @@ import type {
 	RepositoryConfig,
 	RunnerType,
 } from "cyrus-core";
+import { isHeadlessContainerMode } from "cyrus-core";
 import { buildIntentToAddHook } from "./hooks/IntentToAddHook.js";
 import { buildPrMarkerHook } from "./hooks/PrMarkerHook.js";
 import { appendBrowserUseAddendum } from "./prompts/browserUsePromptAddendum.js";
@@ -500,16 +501,48 @@ export class RunnerConfigBuilder {
 			}
 		}
 
-		// When the egress sandbox is enabled, give Codex the same filesystem
-		// posture Claude gets (see buildSandboxConfig): writes restricted to the
-		// worktree, reads restricted to the worktree + allowed directories (home
-		// is denied by omission). The Codex runner turns this into a per-thread
-		// app-server permission profile (read/write allow-list).
-		if (runnerType === "codex" && input.sandboxSettings) {
-			config.sandboxSettings = {
-				allowWrite: [input.session.workspace.path],
-				allowRead: [input.session.workspace.path, ...input.allowedDirectories],
-			};
+		if (runnerType === "codex") {
+			// Codex enforces EVERY sandbox arm — the coarse mode and the granular
+			// permission profile alike — by running each command under bubblewrap,
+			// and bubblewrap needs a user namespace a worker container does not
+			// get: `bwrap: No permissions to create a new namespace, likely
+			// because the kernel does not allow non-privileged user namespaces`.
+			//
+			// The failure is total, and it presents as success: every shell
+			// command exits 1 *before it starts*, so the session burns its turns
+			// discovering it cannot read a file and then completes with
+			// `subtype: success` having changed nothing (NOR-364 phase 3, observed
+			// on the first Codex-in-a-container drive ever run).
+			//
+			// The container IS the boundary — an ephemeral, single-issue,
+			// throwaway machine — so nesting a second OS sandbox inside it buys
+			// nothing it does not already have. Scoped to headless container mode
+			// deliberately: a workstation `cyrus start` keeps Codex's sandbox,
+			// where it is the only boundary there is.
+			if (isHeadlessContainerMode()) {
+				// `sandboxSettings` must be left UNSET, not merely overridden.
+				// `resolveCodexSandbox` returns `kind: "profile"` whenever it is
+				// present — the mode only reshapes the profile's filesystem map —
+				// and `AppServerCodexBackend.threadOptionsParams` then sends
+				// `permissions` and drops `sandbox` entirely. Setting the mode
+				// beside a profile is therefore a silent no-op that puts bwrap
+				// straight back in the path.
+				config.sandbox = "danger-full-access";
+			} else if (input.sandboxSettings) {
+				// When the egress sandbox is enabled, give Codex the same
+				// filesystem posture Claude gets (see buildSandboxConfig): writes
+				// restricted to the worktree, reads restricted to the worktree +
+				// allowed directories (home is denied by omission). The Codex
+				// runner turns this into a per-thread app-server permission
+				// profile (read/write allow-list).
+				config.sandboxSettings = {
+					allowWrite: [input.session.workspace.path],
+					allowRead: [
+						input.session.workspace.path,
+						...input.allowedDirectories,
+					],
+				};
+			}
 		}
 
 		if (input.resumeSessionId) {

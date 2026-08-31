@@ -46,7 +46,7 @@ describe("createRouterRig (fake executor, no Docker)", () => {
 			executors: new Map([["docker", exec]]),
 			logger: { info: () => {}, warn: () => {} },
 		});
-		rig.seedUser({
+		await rig.seedUser({
 			email: "cold@example.com",
 			linearId: "lin-cold",
 			provider: "docker",
@@ -72,8 +72,8 @@ describe("createRouterRig (fake executor, no Docker)", () => {
 		expect(rig.port).toBeGreaterThan(0);
 	});
 
-	it("seeds the Claude token under CLAUDE_CODE_OAUTH_TOKEN and stores extra env under raw keys", () => {
-		rig.seedUser({
+	it("seeds the Claude token under CLAUDE_CODE_OAUTH_TOKEN and stores extra env under raw keys", async () => {
+		await rig.seedUser({
 			email: "drive@example.com",
 			linearId: "lin-1",
 			provider: "docker",
@@ -110,7 +110,7 @@ describe("createRouterRig requiredSecretKeys gate (fake executor, no Docker)", (
 	});
 
 	it("blocks boot for a user missing a configured required key, naming it", async () => {
-		rig.seedUser({
+		await rig.seedUser({
 			email: "gated@example.com",
 			linearId: "lin-gated",
 			provider: "docker",
@@ -138,7 +138,7 @@ describe("createRouterRig requiredSecretKeys gate (fake executor, no Docker)", (
 	});
 
 	it("re-seeding the same user adds the missing key and unblocks boot", async () => {
-		rig.seedUser({
+		await rig.seedUser({
 			email: "gated@example.com",
 			linearId: "lin-gated",
 			provider: "docker",

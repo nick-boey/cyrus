@@ -387,7 +387,7 @@ export class RouterServer {
 	 * section only when it exists, so a deployment without it never shows a
 	 * control that could not work.
 	 */
-	private codexTokens: CodexTokenStore | undefined;
+	codexTokens: CodexTokenStore | undefined;
 	private terminalTeardown?: TerminalTeardown;
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;

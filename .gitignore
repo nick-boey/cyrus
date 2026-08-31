@@ -70,3 +70,9 @@ infra/azure/bicep/**/*.json
 # Claude worktrees
 .claude/worktrees
 .superpowers/
+
+# Key-encryption keys must never be committed (0600 local KEK for sealed
+# Codex credentials; a stray one appears if a router is pointed at a
+# ":memory:" database, whose dirname is the CWD).
+codex-kek.key
+**/codex-kek.key

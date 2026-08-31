@@ -96,13 +96,45 @@ describe("resolveDefaultRunner", () => {
 		['"claude"', "a bare string"],
 		['{"runner":"claude"}', "no model"],
 		['{"runner":"gemini","model":"gemini-2.5-pro"}', "an unoffered runner"],
-		['{"runner":"claude","model":"opus-4"}', "a model no longer offered"],
 	])("degrades %j (%s) to no preference, with a warning", (stored) => {
 		const warn = vi.fn();
 		expect(resolveDefaultRunner(stored, { warn })).toBeUndefined();
 		// Silence here would be the bad outcome: the user's stored preference has
 		// stopped applying and only a log line can say why.
 		expect(warn).toHaveBeenCalledTimes(1);
+	});
+
+	// A RETIRED MODEL keeps the runner, unlike every case above. Dropping the
+	// whole selection also drops the runner, and the runner is what
+	// `requiredSecretKeysFor` keys off — so a Codex user whose model left the
+	// catalog would be asked for a Claude token they never had and every
+	// container they own would refuse to boot. Retiring a model is the routine
+	// change here (phase 3 retired three of four Codex models), so a catalog
+	// edit must never be able to revoke "Codex needs no Anthropic subscription".
+	it.each([
+		['{"runner":"claude","model":"opus-4"}', "claude", "opus"],
+		['{"runner":"codex","model":"gpt-5.5-codex"}', "codex", "gpt-5.5"],
+	])(
+		"keeps the runner in %j and falls back to its first catalog model",
+		(stored, runner, model) => {
+			const warn = vi.fn();
+			expect(resolveDefaultRunner(stored, { warn })).toEqual({
+				runner,
+				model,
+			});
+			expect(warn).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it("keeps a codex user off the Claude-token gate when their model retires", () => {
+		// The failure this exists to prevent, stated end to end.
+		const selection = resolveDefaultRunner(
+			'{"runner":"codex","model":"gpt-5.5-codex"}',
+		);
+		expect(selection?.runner).toBe("codex");
+		expect(requiredSecretKeysFor(selection?.runner, undefined)).not.toContain(
+			"CLAUDE_CODE_OAUTH_TOKEN",
+		);
 	});
 });
 

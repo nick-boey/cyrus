@@ -69,13 +69,29 @@ export const RUNNER_CATALOG: readonly RunnerCatalogEntry[] = [
 	},
 	{
 		runner: "codex",
+		// One model, and that is not an oversight. Cyrus runs Codex on a
+		// router-held ChatGPT subscription (ADR 0005), and OpenAI serves a
+		// narrower model set to subscription auth than to a metered API key: on
+		// a live account every other name we shipped came back
+		// `400 invalid_request_error — The '<model>' model is not supported when
+		// using Codex with a ChatGPT account`. That is a semantic rejection AFTER
+		// a successful auth, so it cannot be probed for and does not degrade —
+		// the session simply dies. Measured 2026-08-31 against a real
+		// subscription inside the worker image (codex-cli 0.144.6): `gpt-5.5`
+		// answered; `gpt-5.5-codex`, `gpt-5.2-codex`, `gpt-5.1-codex`, `gpt-5`,
+		// `gpt-5-codex`, `gpt-5.5-codex-mini`, `gpt-5.5-mini`, `gpt-5.5-pro` and
+		// `codex-mini-latest` were all rejected.
+		//
+		// Listing them anyway for the sake of the `OPENAI_API_KEY` fallback would
+		// invert the whole point of a curated control: it would render an option
+		// that is a guaranteed dead session for every user on the credential the
+		// product actually mandates, to serve the path documented as the
+		// fallback. Same rule that keeps Gemini and Cursor out.
+		//
+		// Re-run the probe when OpenAI ships a model — a name that works here is
+		// a one-line addition, and one that does not must stay out.
 		label: "Codex",
-		models: [
-			{ model: "gpt-5.5-codex", label: "GPT-5.5 Codex" },
-			{ model: "gpt-5.5", label: "GPT-5.5" },
-			{ model: "gpt-5.2-codex", label: "GPT-5.2 Codex" },
-			{ model: "gpt-5", label: "GPT-5" },
-		],
+		models: [{ model: "gpt-5.5", label: "GPT-5.5" }],
 	},
 ] as const;
 
@@ -150,14 +166,27 @@ export function encodeDefaultRunnerJson(
 /**
  * Reads `users.default_runner_json` back.
  *
- * Every unreadable state — NULL, empty, malformed JSON, a runner or model no
- * longer in the catalog — resolves to `undefined`, meaning "no per-user
- * default", which leaves `RunnerSelectionService`'s own fallback chain intact.
- * That is the honest degradation: an absent default costs a user the
- * convenience of the picker, whereas inventing one would silently run a
- * different agent than they chose. A model dropped from the catalog is the
- * realistic case and is logged, because the user's stored preference has
- * quietly stopped applying and only a log line can say why.
+ * Every unreadable state — NULL, empty, malformed JSON, an unknown runner —
+ * resolves to `undefined`, meaning "no per-user default", which leaves
+ * `RunnerSelectionService`'s own fallback chain intact. That is the honest
+ * degradation: an absent default costs a user the convenience of the picker,
+ * whereas inventing one would silently run a different agent than they chose.
+ *
+ * **A retired MODEL is the one case that does not degrade to `undefined`**, and
+ * that exception is load-bearing. Dropping the whole selection also drops the
+ * RUNNER, and the runner is what `requiredSecretKeysFor` keys off — so a Codex
+ * user whose model left the catalog stops being a Codex user, is asked for a
+ * `CLAUDE_CODE_OAUTH_TOKEN` they were never required to have, and every
+ * container they own refuses to boot. The picker's whole premise is that
+ * choosing Codex must not require an Anthropic subscription; a catalog edit
+ * must not be able to revoke that. Retiring a model is also the *routine*
+ * change here — NOR-364 phase 3 retired three of four Codex models on its first
+ * live run — so this path is exercised, not theoretical.
+ *
+ * Falling back to the runner's first catalog model keeps the axis the user
+ * actually chose (which agent) and moves only the axis the catalog controls
+ * (which of its models). It is logged either way, because their stored
+ * preference has quietly stopped applying and only a log line can say why.
  */
 export function resolveDefaultRunner(
 	defaultRunnerJson: string | null | undefined,
@@ -195,13 +224,23 @@ export function resolveDefaultRunner(
 		return undefined;
 	}
 	const selection = parseSelection(`${runner}:${model}`);
-	if (!selection) {
+	if (selection) return selection;
+
+	// The runner survives even when its model does not — see the note above on
+	// why losing the runner is not an acceptable degradation.
+	const entry = RUNNER_CATALOG.find((candidate) => candidate.runner === runner);
+	const replacement = entry?.models[0];
+	if (entry && replacement) {
 		logger?.warn(
-			`Stored default runner ${runner}/${model} is no longer offered; using the router's own runner defaults`,
+			`Stored default model ${runner}/${model} is no longer offered; falling back to ${runner}/${replacement.model}`,
 		);
-		return undefined;
+		return { runner: entry.runner, model: replacement.model };
 	}
-	return selection;
+
+	logger?.warn(
+		`Stored default runner ${runner}/${model} is no longer offered; using the router's own runner defaults`,
+	);
+	return undefined;
 }
 
 /**

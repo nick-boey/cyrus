@@ -1652,6 +1652,31 @@ describe("writeCodexAuth", () => {
 		expect(statSync(authPath).mode & 0o777).toBe(0o600);
 	});
 
+	it("scrubs CODEX_AUTH_JSON from the environment once the file exists", () => {
+		// The credential is multi-line JSON, and the Codex CLI snapshots the
+		// environment into a /bin/sh script at session start — leaving it set
+		// makes that script unparseable ("Unterminated quoted string"), so every
+		// shell command the agent runs loses its snapshot. It is also a live
+		// OAuth token that would otherwise be in the env of every command the
+		// agent runs. Nothing downstream reads it: `codex` reads auth.json.
+		const homeDir = tempHome();
+		const env = baseEnv({ CODEX_AUTH_JSON: CREDENTIAL });
+		process.env.CODEX_AUTH_JSON = CREDENTIAL;
+		try {
+			new ContainerBootCommand({
+				env,
+				homeDir,
+				logger: silentLogger(),
+			}).writeCodexAuth();
+
+			expect(existsSync(join(homeDir, ".codex", "auth.json"))).toBe(true);
+			expect(env.CODEX_AUTH_JSON).toBeUndefined();
+			expect(process.env.CODEX_AUTH_JSON).toBeUndefined();
+		} finally {
+			delete process.env.CODEX_AUTH_JSON;
+		}
+	});
+
 	it("honours CODEX_HOME, the way the Codex CLI resolves it", () => {
 		const homeDir = tempHome();
 		const codexHome = join(tempHome(), "custom-codex");

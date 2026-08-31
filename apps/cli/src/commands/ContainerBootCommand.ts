@@ -950,6 +950,22 @@ export class ContainerBootCommand implements ICommand {
 	 *
 	 * A no-op when `CODEX_AUTH_JSON` is unset, which is every Claude session and
 	 * every Codex session running on `OPENAI_API_KEY` instead.
+	 *
+	 * **The variable is deleted once the file exists.** Two reasons, and the
+	 * second is not hypothetical:
+	 *
+	 * - It is a live OAuth access + refresh token, and leaving it set puts it in
+	 *   the environment of every command the agent subsequently runs — where any
+	 *   `env`, `printenv` or process dump the agent or a build script performs
+	 *   would print it into the session transcript.
+	 * - It is multi-line JSON, and the Codex CLI snapshots the shell environment
+	 *   into a `/bin/sh` script at session start. The embedded newlines and
+	 *   quotes make that script unparseable — `Syntax error: Unterminated quoted
+	 *   string` — so the snapshot is discarded and the agent visibly works around
+	 *   a broken shell for the rest of the session (NOR-364 phase 3).
+	 *
+	 * Nothing downstream reads it: `codex` reads `$CODEX_HOME/auth.json`, which
+	 * is what this method just wrote.
 	 */
 	writeCodexAuth(): void {
 		const raw = this.env.CODEX_AUTH_JSON;
@@ -972,6 +988,10 @@ export class ContainerBootCommand implements ICommand {
 			// `writeFileSync`'s mode only applies on creation; enforce on overwrite
 			// too, in case a warm volume carries a looser-permissioned leftover.
 			chmodSync(authPath, 0o600);
+			// Both copies: `this.env` is what the rest of the boot sequence reads,
+			// `process.env` is what `launch()`'s child inherits.
+			delete this.env.CODEX_AUTH_JSON;
+			delete process.env.CODEX_AUTH_JSON;
 			this.logger.info(`Wrote Codex credentials to ${authPath}`);
 		} catch (error) {
 			// Fatal, unlike dotfiles: the session was routed to Codex precisely
