@@ -6985,7 +6985,7 @@ ${taskSection}`;
 		input: PromptAssemblyInput,
 	): Promise<PromptAssembly> {
 		const assembly = await this.buildPromptForInput(input);
-		return this.prefixSlashCommand(assembly, input);
+		return await this.prefixSlashCommand(assembly, input);
 	}
 
 	private async buildPromptForInput(
@@ -7028,18 +7028,27 @@ ${taskSection}`;
 	 *    dotfiles set (14 of the 25 in `mattpocock-skills`) reachable from
 	 *    Linear at all — they are invisible to the `Skill` tool by design.
 	 *
-	 * Unknown commands are left to the model as plain text, exactly as today; a
-	 * name check here would buy nothing and would have to be kept in sync with
-	 * `SkillsPluginResolver`.
+	 * The command MUST be checked against the discovered skills first. An
+	 * unrecognised one does not degrade to plain text — the CLI answers
+	 * "Unknown command: /foo" and the rest of the prompt never reaches the
+	 * model, so blindly prefixing would swallow the comment of anyone who
+	 * opened with a `/word` we do not own. Observed in an F1 drive against a
+	 * skill that was not in the worktree.
 	 */
-	private prefixSlashCommand(
+	private async prefixSlashCommand(
 		assembly: PromptAssembly,
 		input: PromptAssemblyInput,
-	): PromptAssembly {
+	): Promise<PromptAssembly> {
 		const command = EdgeWorker.LEADING_SLASH_COMMAND.exec(
 			input.userComment,
 		)?.[1];
 		if (!command || assembly.userPrompt.startsWith(command)) {
+			return assembly;
+		}
+		if (!(await this.isKnownSkill(command.slice(1), input))) {
+			this.logger.debug(
+				`Comment opens with "${command}", which is not a discovered skill — left as prose`,
+			);
 			return assembly;
 		}
 
@@ -7058,6 +7067,48 @@ ${taskSection}`;
 			...assembly,
 			userPrompt: `${command}\n${assembly.userPrompt}`,
 		};
+	}
+
+	/**
+	 * Whether `name` is a skill this session can actually run.
+	 *
+	 * Matches `discoverSkillNames`, the same list handed to the SDK as the
+	 * `skills` allowlist, so the check cannot drift from what is installed.
+	 * A plugin-qualified `plugin:skill` is matched on either form because the
+	 * SDK accepts both.
+	 *
+	 * Fails OPEN on a discovery error: leaving the comment as prose is the
+	 * behaviour that predates NOR-368, and losing a slash invocation is far
+	 * cheaper than losing the comment.
+	 */
+	private async isKnownSkill(
+		name: string,
+		input: PromptAssemblyInput,
+	): Promise<boolean> {
+		const repository = input.repositories?.[0] ?? input.repository;
+		if (!repository) return false;
+		try {
+			const names = await this.skillsPluginResolver.discoverSkillNames(
+				await this.skillsPluginResolver.resolve(),
+				this.buildSkillSessionContext(
+					repository,
+					input.fullIssue,
+					input.session,
+				),
+			);
+			const unqualified = name.includes(":") ? name.split(":").pop() : name;
+			return names.some(
+				(known) =>
+					known === name ||
+					known === unqualified ||
+					known.split(":").pop() === unqualified,
+			);
+		} catch (error) {
+			this.logger.warn(
+				`Skill discovery failed while checking "/${name}"; leaving the comment as prose: ${(error as Error).message}`,
+			);
+			return false;
+		}
 	}
 
 	/**
