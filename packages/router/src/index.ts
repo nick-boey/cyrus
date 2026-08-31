@@ -1,5 +1,10 @@
 export { createAcaSandboxesProvider } from "./AcaProviderFactory.js";
 export {
+	type CodexAccountView,
+	CodexTokenStore,
+	type CodexTokenStoreOptions,
+} from "./CodexTokenStore.js";
+export {
 	type ContainerRoutingDeps,
 	ContainerTargetService,
 } from "./ContainerTargets.js";
@@ -89,6 +94,8 @@ export {
 	LEGACY_SECRET_KEY_MAP,
 	normalizeSecretKey,
 	RESERVED_ENV_KEYS,
+	RUNNER_REQUIRED_SECRET_KEYS,
+	requiredSecretKeysFor,
 	SecretStore,
 	type SecretStoreBackend,
 	type UserSecretBundle,
@@ -107,6 +114,19 @@ export {
 	type SetupBootstrapDeps,
 } from "./setup/bootstrap.js";
 export {
+	CODEX_AUTH_JSON_ENV,
+	CODEX_REFRESH_BUFFER_MS,
+	CodexAuthValidationError,
+	type CodexCredential,
+	CodexRefreshError,
+	codexAccountStatus,
+	DEFAULT_CODEX_OAUTH_CLIENT_ID,
+	needsRefresh,
+	parseCodexAuthPaste,
+	refreshCodexCredential,
+	renderCodexAuthFile,
+} from "./setup/codexAuth.js";
+export {
 	assertKekVersion,
 	BundleTooLargeError,
 	KeyVaultKeyWrapper,
@@ -121,6 +141,7 @@ export {
 	type SetupIdTokenConfig,
 	SetupIdTokenError,
 } from "./setup/idTokenVerifier.js";
+export { LocalKeyWrapper } from "./setup/localKeyWrapper.js";
 export {
 	parseEasyAuthPrincipal,
 	requireSetupPrincipal,
@@ -134,6 +155,19 @@ export {
 	type SetupUiConfig,
 	validateSetupAuthConfig,
 } from "./setup/principal.js";
+export {
+	DEFAULT_RUNNER_ENV,
+	type DefaultRunnerSelection,
+	defaultRunnerEnv,
+	encodeDefaultRunnerJson,
+	encodeSelection,
+	MODEL_ENV_BY_RUNNER,
+	parseSelection,
+	RUNNER_CATALOG,
+	type RunnerCatalogEntry,
+	resolveDefaultRunner,
+	SELECTABLE_RUNNERS,
+} from "./setup/runnerDefaults.js";
 export {
 	createTableStorageTokenProvider,
 	DEFAULT_TABLE_NAME,

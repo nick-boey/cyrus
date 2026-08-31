@@ -81,13 +81,14 @@ async function withTimeout(
 }
 
 /** Valid values for `cyrus router users set-executor <email> <type>`. */
-const EXECUTOR_TYPES = [
-	"device",
-	"docker",
-	"fly",
-	"codespaces",
-	"aca",
-] as const;
+// `fly` and `codespaces` were accepted here and advertised in every help
+// string, but no provider class has ever existed for either. Choosing one
+// succeeded, created a device row, and enqueued the issue's event onto it —
+// then failed in `bootInnerTraced` with "no executor configured", leaving the
+// event queued on a device nothing will ever connect to and giving the user a
+// session that simply never starts. Removed rather than implemented: nothing is
+// planned for either target.
+const EXECUTOR_TYPES = ["device", "docker", "aca"] as const;
 type ExecutorType = (typeof EXECUTOR_TYPES)[number];
 
 function isExecutorType(value: string): value is ExecutorType {
@@ -383,7 +384,7 @@ interface LinearTokenProbe {
  *   cyrus router users add <email> [--name x]   # register a user + mint an enrollment code
  *   cyrus router users list                     # list registered users + their running session counts
  *   cyrus router users remove <email>           # remove a user
- *   cyrus router users set-executor <email> <device|docker|fly|codespaces|aca>
+ *   cyrus router users set-executor <email> <device|docker|aca>
  *                                                # choose where a user's sessions run
  *   cyrus router devices list                   # list enrolled devices + who owns them
  *   cyrus router devices revoke <email>         # revoke a user's enrolled device
@@ -447,7 +448,7 @@ export class RouterCommand extends BaseCommand {
 				return this.unlock(rest[0]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|fly|codespaces|aca>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email> [--check-scopes]|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|linear status|unlock <issueId>>",
+					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|aca>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email> [--check-scopes]|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|linear status|unlock <issueId>>",
 				);
 		}
 	}
@@ -916,7 +917,7 @@ export class RouterCommand extends BaseCommand {
 				return this.usersSetExecutor(userRest[0], userRest[1]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router users <add <email> [--name <name>]|list|remove <email>|set-executor <email> <device|docker|fly|codespaces|aca>>",
+					"Usage: cyrus router users <add <email> [--name <name>]|list|remove <email>|set-executor <email> <device|docker|aca>>",
 				);
 		}
 	}
@@ -1037,7 +1038,7 @@ export class RouterCommand extends BaseCommand {
 	): void {
 		if (!email || !type) {
 			this.exitWithError(
-				"Usage: cyrus router users set-executor <email> <device|docker|fly|codespaces|aca>",
+				"Usage: cyrus router users set-executor <email> <device|docker|aca>",
 			);
 		}
 		if (!isExecutorType(type)) {

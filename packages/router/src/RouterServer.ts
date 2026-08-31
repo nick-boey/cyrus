@@ -30,6 +30,7 @@ import type {
 import Fastify, { type FastifyInstance } from "fastify";
 import { createAcaSandboxesProvider } from "./AcaProviderFactory.js";
 import { registerArtifactsRoute } from "./artifacts.js";
+import { CodexTokenStore } from "./CodexTokenStore.js";
 import { ContainerLifecycle } from "./ContainerLifecycle.js";
 import { ContainerTargetService } from "./ContainerTargets.js";
 import { DeviceGateway } from "./DeviceGateway.js";
@@ -50,13 +51,15 @@ import { RouterStore } from "./RouterStore.js";
 import { SandboxLogRelay } from "./SandboxLogRelay.js";
 import { SandboxSpanRelay } from "./SandboxSpanRelay.js";
 import {
-	DEFAULT_REQUIRED_SECRET_KEYS,
+	requiredSecretKeysFor,
 	SecretStore,
 	type SecretStoreBackend,
 } from "./SecretStore.js";
 import { StateBackup } from "./StateBackup.js";
-import { SetupBootstrap } from "./setup/bootstrap.js";
+import { EXECUTOR_TYPE_DEVICE, SetupBootstrap } from "./setup/bootstrap.js";
 import { createCsrfTokens } from "./setup/csrf.js";
+import { KeyVaultKeyWrapper } from "./setup/envelope.js";
+import { LocalKeyWrapper } from "./setup/localKeyWrapper.js";
 import {
 	type SetupAuthConfig,
 	type SetupAuthMode,
@@ -66,6 +69,7 @@ import {
 } from "./setup/principal.js";
 import { registerRepositoryRoutes } from "./setup/repositoryRoutes.js";
 import { registerSetupRoutes } from "./setup/routes.js";
+import { resolveDefaultRunner } from "./setup/runnerDefaults.js";
 import { TableSecretStore } from "./TableSecretStore.js";
 import {
 	registerTerminalTeardownRoute,
@@ -195,6 +199,26 @@ export interface RouterContainersConfig {
 	 * "physical device" and is deliberately NOT captured — see F11 on NOR-270.
 	 */
 	defaultExecutor?: string;
+	/**
+	 * Codex ChatGPT-subscription support (ADR 0005). Optional: without it the
+	 * "Codex account" section of `/setup` is unavailable and a Codex user falls
+	 * back to `OPENAI_API_KEY` from their own secret bundle.
+	 */
+	codex?: {
+		/**
+		 * Overrides the Codex CLI's OAuth client id. A refresh token can only be
+		 * redeemed by the client it was issued to, so this must match whatever
+		 * `codex login --device-auth` used. Exposed as config so a deployment can
+		 * react to an upstream change without waiting for a release.
+		 */
+		clientId?: string;
+		/**
+		 * Where the local key-encryption key lives when no Key Vault KEK is
+		 * configured. Defaults to `codex-kek.key` beside the router database.
+		 * Ignored when `tableStore.keyId` is set, which is the stronger option.
+		 */
+		localKeyPath?: string;
+	};
 	docker?: { memoryLimit?: string; network?: string };
 	/**
 	 * Azure Container Apps (ACA) Sandboxes provider settings. When present,
@@ -357,6 +381,13 @@ export class RouterServer {
 	containerLifecycle?: ContainerLifecycle;
 	/** Set only when `containers` is configured. Consumed by the setup UI. */
 	repositoryRegistry: RepositoryRegistry | undefined;
+	/**
+	 * Per-user Codex subscription credentials. Set only when
+	 * `containers.codex` is configured; the setup UI renders the "Codex account"
+	 * section only when it exists, so a deployment without it never shows a
+	 * control that could not work.
+	 */
+	private codexTokens: CodexTokenStore | undefined;
 	private terminalTeardown?: TerminalTeardown;
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;
@@ -534,12 +565,25 @@ export class RouterServer {
 			}
 			// Exactly the expression ContainerTargets.buildEnv uses, so the page
 			// and the boot gate can never disagree about what "required" means.
-			const setupRequiredKeys = [
-				...new Set([
-					...DEFAULT_REQUIRED_SECRET_KEYS,
-					...(config.containers?.requiredSecretKeys ?? []),
-				]),
-			];
+			//
+			// It is a FUNCTION of the user rather than a fixed array because the
+			// required set now depends on which runner they chose: a Codex user
+			// needs no Anthropic credential, and demanding one made the picker a
+			// lie for anyone without an Anthropic subscription. Parameterised, not
+			// duplicated — there is still exactly one expression, evaluated here.
+			const setupRequiredKeys = (email?: string): string[] => {
+				const user = email ? this.store.getUserByEmail(email) : undefined;
+				const selection = user
+					? resolveDefaultRunner(
+							this.store.getUserDefaultRunner(user.userId),
+							this.logger,
+						)
+					: undefined;
+				return requiredSecretKeysFor(
+					selection?.runner,
+					config.containers?.requiredSecretKeys,
+				);
+			};
 			const setupAuthConfig: SetupAuthConfig = {
 				// validateSetupAuthConfig ran at the top of this constructor and
 				// throws when `auth` is unset, so this is proven non-null.
@@ -582,6 +626,8 @@ export class RouterServer {
 				auth: setupAuthConfig,
 				bootstrap: setupBootstrap,
 				csrf: setupCsrf,
+				store: this.store,
+				...(this.codexTokens ? { codexTokens: this.codexTokens } : {}),
 				...(setupIdTokenVerifier
 					? { verifyIdToken: setupIdTokenVerifier }
 					: {}),
@@ -918,6 +964,63 @@ export class RouterServer {
 			});
 		const executors = executorRegistryFactory(containers);
 
+		// The registered-provider startup check specified in the /setup
+		// management-UI plan and never implemented. Without it, a
+		// `defaultExecutor` naming a provider that does not exist is accepted
+		// silently and only surfaces per-issue, deep in `bootInnerTraced`, after
+		// a device row has been created and the event queued onto it — an event
+		// that will never be delivered because nothing will ever connect.
+		if (
+			containers.defaultExecutor &&
+			containers.defaultExecutor !== EXECUTOR_TYPE_DEVICE &&
+			!executors.has(containers.defaultExecutor)
+		) {
+			throw new Error(
+				`containers.defaultExecutor is "${containers.defaultExecutor}", but no such container provider is registered (registered: ${
+					[...executors.keys()].join(", ") || "none"
+				}). Every user inheriting this default would create a device row, queue their event onto it, and then fail at boot with the event stranded.`,
+			);
+		}
+
+		// Executor forcing (NOR-364). Where ACA is registered it is the only
+		// executor that works, so there is no choice left to express and the
+		// per-user `executor_json` picker becomes noise that can only be set
+		// wrong. Forcing here rather than rewriting every `users` row keeps the
+		// stored values intact, so removing `containers.aca` restores the previous
+		// behaviour exactly.
+		const forcedExecutor = executors.has("aca") ? "aca" : undefined;
+		if (forcedExecutor) {
+			this.logger.info(
+				`ACA is registered, so every user's sessions run in an ACA container regardless of their stored executor. Physical-device enrollment is inactive on this router.`,
+			);
+		}
+
+		// The Codex credential store needs a KEK. The Key Vault key configured for
+		// the secret bundle is preferred; without one, a 0600 local key file keeps
+		// the credential out of the `.db` that `StateBackup` uploads. Sealing is
+		// never skipped — see `LocalKeyWrapper` for exactly what each buys.
+		let codexTokens: CodexTokenStore | undefined;
+		if (containers.codex) {
+			const wrapper = containers.tableStore?.keyId
+				? new KeyVaultKeyWrapper({
+						keyId: containers.tableStore.keyId,
+						logger: this.logger,
+					})
+				: new LocalKeyWrapper(
+						containers.codex.localKeyPath ??
+							join(dirname(this.config.dbPath), "codex-kek.key"),
+					);
+			codexTokens = new CodexTokenStore({
+				store: this.store,
+				wrapper,
+				logger: this.logger,
+				...(containers.codex.clientId
+					? { clientId: containers.codex.clientId }
+					: {}),
+			});
+		}
+		this.codexTokens = codexTokens;
+
 		const repositoryRegistry = createRepositoryRegistry({
 			...(containers.tableStore
 				? {
@@ -955,7 +1058,9 @@ export class RouterServer {
 				routerUrlForContainers: containers.routerUrlForContainers,
 				requiredSecretKeys: containers.requiredSecretKeys,
 				defaultExecutor: containers.defaultExecutor,
+				...(forcedExecutor ? { forcedExecutor } : {}),
 			},
+			...(codexTokens ? { codexTokens } : {}),
 			postActivity: (workspaceId, agentSessionId, body) =>
 				this.executor.postActivity(workspaceId, agentSessionId, body),
 			logger: this.logger,

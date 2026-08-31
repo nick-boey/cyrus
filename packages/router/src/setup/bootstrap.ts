@@ -60,12 +60,26 @@ export const INHERIT_DEFAULT_EXECUTOR_JSON = JSON.stringify({
  * malformed setting is an *unknown* intent, not an unset one, and quietly
  * upgrading it to "boot a cloud sandbox" is the wrong way to fail. Physical
  * device is the safe landing spot in every ambiguous case.
+ *
+ * **`forcedExecutor` inverts exactly that property, deliberately** (NOR-364).
+ * The table above answers "which of several executors did this user pick"; a
+ * deployment that registers an ACA provider has no such question, because ACA
+ * is the only executor that works there. With one option there is no escalation
+ * to guard against, and the safety valve stops being a safety valve: degrading
+ * *away* from the only working executor drops the user onto a physical device
+ * they may never have enrolled, where the routed event is **silently
+ * discarded** — strictly worse than the cost the one-way rule was protecting
+ * against. So when a forced executor is supplied, every row of the table
+ * resolves to it, and the caller is responsible for supplying it only when that
+ * provider is genuinely registered (see `RouterServer.buildContainerTargets`).
  */
 export function resolveExecutor(
 	executorJson: string | null | undefined,
 	defaultExecutor: string | undefined,
 	logger?: { warn(msg: string): void },
+	forcedExecutor?: string,
 ): string | undefined {
+	if (forcedExecutor) return forcedExecutor;
 	if (
 		executorJson === null ||
 		executorJson === undefined ||
@@ -138,13 +152,17 @@ export interface SetupBootstrapDeps {
 	store: RouterStore;
 	secrets: SecretStoreBackend;
 	/**
-	 * `DEFAULT_REQUIRED_SECRET_KEYS` ∪ `containers.requiredSecretKeys`, computed
-	 * once by `RouterServer` and shared with `ContainerTargetService` so the page
-	 * and the container boot gate can never disagree about what "required"
-	 * means — which is the failure mode where the UI says "all set" and the
-	 * container refuses to boot.
+	 * The required-key set for one user: their runner's credentials ∪
+	 * `containers.requiredSecretKeys`. Computed once by `RouterServer` and
+	 * shared with `ContainerTargetService` so the page and the container boot
+	 * gate can never disagree about what "required" means — which is the failure
+	 * mode where the UI says "all set" and the container refuses to boot.
+	 *
+	 * A function rather than an array because the set depends on the user's
+	 * chosen runner (a Codex user needs no Anthropic credential). Called with no
+	 * email where no user is in hand, which yields the default (Claude) set.
 	 */
-	requiredKeys: readonly string[];
+	requiredKeys: (email?: string) => readonly string[];
 	/**
 	 * Whether an email with no `users` row may register itself.
 	 *
@@ -394,9 +412,9 @@ export class SetupBootstrap {
 		// before any network call, exactly like the backends do, so a bad
 		// `requiredSecretKeys` entry fails loudly instead of writing a key the
 		// bundle will never expose under that name.
-		const requiredKeys = this.deps.requiredKeys.map((key) =>
-			normalizeSecretKey(key),
-		);
+		const requiredKeys = this.deps
+			.requiredKeys(email)
+			.map((key) => normalizeSecretKey(key));
 
 		const backend = this.deps.secrets;
 		if (supportsRecordApi(backend)) {

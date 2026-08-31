@@ -59,9 +59,13 @@ export interface IRunnerSelector {
 		runnerType: RunnerType;
 		modelOverride?: string;
 		fallbackModelOverride?: string;
+		/** Set only when a description tag or label named the model. */
+		explicitModel?: string;
+		explicitFallbackModel?: string;
 	};
 	getDefaultModelForRunner(runnerType: RunnerType): string;
 	getDefaultFallbackModelForRunner(runnerType: RunnerType): string;
+	inferRunnerFromModel(model?: string): RunnerType | undefined;
 }
 
 /**
@@ -329,28 +333,44 @@ export class RunnerConfigBuilder {
 		let runnerType = runnerSelection.runnerType;
 		let modelOverride = runnerSelection.modelOverride;
 		let fallbackModelOverride = runnerSelection.fallbackModelOverride;
+		// What a tag or label actually asked for, as opposed to the runner
+		// default `modelOverride` always falls back to. Only this may outrank
+		// `repository.model` below.
+		let explicitModel = runnerSelection.explicitModel;
+		let explicitFallbackModel = runnerSelection.explicitFallbackModel;
 
 		// If the labels have changed, and we are resuming a session. Use the existing runner for the session.
+		// The explicit model is cleared alongside the override in each branch: the
+		// resumed runner is not the one the tag/label named, so the model it named
+		// does not belong to this runner either.
 		if (input.session.claudeSessionId && runnerType !== "claude") {
 			runnerType = "claude";
 			modelOverride = this.runnerSelector.getDefaultModelForRunner("claude");
 			fallbackModelOverride =
 				this.runnerSelector.getDefaultFallbackModelForRunner("claude");
+			explicitModel = undefined;
+			explicitFallbackModel = undefined;
 		} else if (input.session.geminiSessionId && runnerType !== "gemini") {
 			runnerType = "gemini";
 			modelOverride = this.runnerSelector.getDefaultModelForRunner("gemini");
 			fallbackModelOverride =
 				this.runnerSelector.getDefaultFallbackModelForRunner("gemini");
+			explicitModel = undefined;
+			explicitFallbackModel = undefined;
 		} else if (input.session.codexSessionId && runnerType !== "codex") {
 			runnerType = "codex";
 			modelOverride = this.runnerSelector.getDefaultModelForRunner("codex");
 			fallbackModelOverride =
 				this.runnerSelector.getDefaultFallbackModelForRunner("codex");
+			explicitModel = undefined;
+			explicitFallbackModel = undefined;
 		} else if (input.session.cursorSessionId && runnerType !== "cursor") {
 			runnerType = "cursor";
 			modelOverride = this.runnerSelector.getDefaultModelForRunner("cursor");
 			fallbackModelOverride =
 				this.runnerSelector.getDefaultFallbackModelForRunner("cursor");
+			explicitModel = undefined;
+			explicitFallbackModel = undefined;
 		}
 
 		// Log model override if found
@@ -358,10 +378,26 @@ export class RunnerConfigBuilder {
 			log.debug(`Model override via selector: ${modelOverride}`);
 		}
 
-		// Determine final model from selectors, repository override, then runner-specific defaults
+		// Priority: label/tag override > repository config > runner default.
+		//
+		// The repository entries were unreachable until now — see `explicitModel`
+		// on `determineRunnerSelection`. A repository model is applied only when
+		// it belongs to the runner we actually resolved: `repository.model` is a
+		// single field shared across every runner an issue in that repo might be
+		// routed to, so handing `haiku` to Codex (or `gpt-5.5` to Claude) would
+		// turn a per-repo preference into a hard failure for the other runners.
+		const repositoryModel = this.modelForRunner(
+			input.repository.model,
+			runnerType,
+		);
+		const repositoryFallbackModel = this.modelForRunner(
+			input.repository.fallbackModel,
+			runnerType,
+		);
 		const finalModel =
+			explicitModel ||
+			repositoryModel ||
 			modelOverride ||
-			input.repository.model ||
 			this.runnerSelector.getDefaultModelForRunner(runnerType);
 
 		const resolvedWorkspaceId =
@@ -416,8 +452,9 @@ export class RunnerConfigBuilder {
 			// Priority order: label override > repository config > global default
 			model: finalModel,
 			fallbackModel:
+				explicitFallbackModel ||
+				repositoryFallbackModel ||
 				fallbackModelOverride ||
-				input.repository.fallbackModel ||
 				this.runnerSelector.getDefaultFallbackModelForRunner(runnerType),
 			logger: log,
 			hooks,
@@ -497,6 +534,28 @@ export class RunnerConfigBuilder {
 		log: ILogger,
 	): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
 		return buildStopHook(log);
+	}
+
+	/**
+	 * A repository-configured model, but only if the resolved runner can
+	 * actually use it.
+	 *
+	 * `repository.model` is one field shared by every runner an issue in that
+	 * repository might route to, so it cannot be applied blind: under
+	 * subscription auth Codex's 404 model-fallback probe is a no-op, which makes
+	 * a model from the wrong family a hard app-server error rather than a silent
+	 * downgrade. A name no runner claims (a dated Claude id, a bare alias) is
+	 * passed through — the check is for a model that provably belongs to a
+	 * *different* runner, not a whitelist.
+	 */
+	private modelForRunner(
+		model: string | undefined,
+		runnerType: RunnerType,
+	): string | undefined {
+		if (!model) return undefined;
+		const implied = this.runnerSelector.inferRunnerFromModel(model);
+		if (implied && implied !== runnerType) return undefined;
+		return model;
 	}
 
 	private runnerSupportsManagedSkills(runnerType: RunnerType): boolean {

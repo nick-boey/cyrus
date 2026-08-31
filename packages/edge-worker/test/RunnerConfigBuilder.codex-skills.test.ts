@@ -26,6 +26,7 @@ function makeBuilder(): RunnerConfigBuilder {
 		determineRunnerSelection: () => ({ runnerType: "codex" as const }),
 		getDefaultModelForRunner: () => "gpt-5.5",
 		getDefaultFallbackModelForRunner: () => "gpt-5.2-codex",
+		inferRunnerFromModel: () => undefined,
 	};
 	return new RunnerConfigBuilder(
 		chatToolResolver,
