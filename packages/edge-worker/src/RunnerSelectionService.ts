@@ -92,6 +92,38 @@ export class RunnerSelectionService {
 	}
 
 	/**
+	 * Which runner a model name belongs to, or `undefined` when no runner
+	 * claims it.
+	 *
+	 * Public because a model name is only usable by the runner that owns it,
+	 * and callers outside this class need to check that before applying one —
+	 * `RunnerConfigBuilder` uses it to decide whether a repository's `model`
+	 * applies to the runner an issue actually resolved to. Handing `haiku` to
+	 * Codex is a hard failure, not a downgrade.
+	 */
+	public inferRunnerFromModel(model?: string): RunnerType | undefined {
+		if (!model) return undefined;
+		const normalizedModel = model.toLowerCase();
+		if (normalizedModel.startsWith("gemini")) return "gemini";
+		if (
+			normalizedModel === "fable" ||
+			normalizedModel === "opus" ||
+			normalizedModel === "sonnet" ||
+			normalizedModel === "haiku" ||
+			normalizedModel.startsWith("claude")
+		) {
+			return "claude";
+		}
+		if (
+			/gpt-[a-z0-9.-]*codex$/i.test(normalizedModel) ||
+			/^gpt-[a-z0-9.-]+$/i.test(normalizedModel)
+		) {
+			return "codex";
+		}
+		return undefined;
+	}
+
+	/**
 	 * Parse a bracketed tag from issue description.
 	 *
 	 * Supports escaped brackets (`\\[tag=value\\]`) which Linear can emit.
@@ -129,6 +161,21 @@ export class RunnerSelectionService {
 		runnerType: RunnerType;
 		modelOverride?: string;
 		fallbackModelOverride?: string;
+		/**
+		 * The model a description tag or label named, if either did.
+		 *
+		 * `modelOverride` is NEVER empty — it falls back to the runner's default —
+		 * so a caller reading it alone cannot tell "the user asked for sonnet"
+		 * from "nobody asked for anything, so sonnet". That made
+		 * `repository.model` and `repository.fallbackModel` unreachable in
+		 * `RunnerConfigBuilder`: their branches sat behind a value that was always
+		 * truthy, so setting `"model": "haiku"` on a repository silently did
+		 * nothing while the comment above it claimed a three-level priority.
+		 * This field is what makes the middle level reachable.
+		 */
+		explicitModel?: string;
+		/** As {@link explicitModel}, for the fallback model. */
+		explicitFallbackModel?: string;
 	} {
 		const normalizedLabels = (labels || []).map((label) => label.toLowerCase());
 		const normalizedDescription = issueDescription || "";
@@ -157,22 +204,8 @@ export class RunnerSelectionService {
 		const isCodexModel = (model: string): boolean =>
 			/gpt-[a-z0-9.-]*codex$/i.test(model) || /^gpt-[a-z0-9.-]+$/i.test(model);
 
-		const inferRunnerFromModel = (model?: string): RunnerType | undefined => {
-			if (!model) return undefined;
-			const normalizedModel = model.toLowerCase();
-			if (normalizedModel.startsWith("gemini")) return "gemini";
-			if (
-				normalizedModel === "fable" ||
-				normalizedModel === "opus" ||
-				normalizedModel === "sonnet" ||
-				normalizedModel === "haiku" ||
-				normalizedModel.startsWith("claude")
-			) {
-				return "claude";
-			}
-			if (isCodexModel(normalizedModel)) return "codex";
-			return undefined;
-		};
+		const inferRunnerFromModel = (model?: string): RunnerType | undefined =>
+			this.inferRunnerFromModel(model);
 
 		const inferFallbackModel = (
 			model: string,
@@ -321,6 +354,19 @@ export class RunnerSelectionService {
 			runnerType,
 			modelOverride: resolvedModelOverride,
 			fallbackModelOverride,
+			// Only when a tag or label actually named it. `modelOverride` above is
+			// cleared when an explicit agent conflicts with the model's implied
+			// runner, and this must be cleared with it — a gpt-* model named
+			// alongside `[agent=claude]` is not a Claude model request.
+			...(modelOverride ? { explicitModel: modelOverride } : {}),
+			...(modelOverride
+				? {
+						explicitFallbackModel: inferFallbackModel(
+							modelOverride,
+							runnerType,
+						),
+					}
+				: {}),
 		};
 	}
 }

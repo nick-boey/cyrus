@@ -3,21 +3,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CodexTokenStore } from "../src/CodexTokenStore.js";
 import { RouterStore } from "../src/RouterStore.js";
 import {
 	FileSecretStore,
 	normalizeSecretKey,
+	requiredSecretKeysFor,
 	type SecretStoreBackend,
 	type UserSecretBundle,
 } from "../src/SecretStore.js";
 import { SetupBootstrap } from "../src/setup/bootstrap.js";
 import { createCsrfTokens } from "../src/setup/csrf.js";
 import { MAX_BUNDLE_BYTES } from "../src/setup/envelope.js";
+import { LocalKeyWrapper } from "../src/setup/localKeyWrapper.js";
 import type {
 	SetupAuthConfig,
 	SetupIdTokenVerifier,
 } from "../src/setup/principal.js";
 import { applyEdits, registerSetupRoutes } from "../src/setup/routes.js";
+import { resolveDefaultRunner } from "../src/setup/runnerDefaults.js";
 import { SetupConflictError } from "../src/TableSecretStore.js";
 import { testLogger } from "./helpers/logger.js";
 
@@ -155,6 +159,11 @@ interface HarnessOptions {
 	secrets?: SecretStoreBackend;
 	verifyIdToken?: SetupIdTokenVerifier;
 	requiredKeys?: readonly string[];
+	/**
+	 * Built from the harness's own store, so the token store and the routes
+	 * write to the same `users` table — two stores would silently diverge.
+	 */
+	codexTokens?: (store: RouterStore) => CodexTokenStore;
 }
 
 const openApps: FastifyInstance[] = [];
@@ -175,24 +184,36 @@ async function harness(options: HarnessOptions = {}) {
 	const bootstrap = new SetupBootstrap({
 		store,
 		secrets,
-		requiredKeys,
+		requiredKeys: () => requiredKeys,
 		autoProvisionUsers: options.autoProvisionUsers ?? true,
 		logger,
 	});
 	const csrf = createCsrfTokens("test-secret-for-routes");
+	const codexTokens = options.codexTokens?.(store);
 	const app = Fastify();
 	openApps.push(app);
 	registerSetupRoutes(app, {
 		secrets,
-		requiredKeys,
+		requiredKeys: () => requiredKeys,
 		auth: options.auth ?? DEV_AUTH,
 		bootstrap,
 		csrf,
+		store,
 		logger,
+		...(codexTokens ? { codexTokens } : {}),
 		...(options.verifyIdToken ? { verifyIdToken: options.verifyIdToken } : {}),
 	});
 	await app.ready();
-	return { app, store, secrets, bootstrap, csrf, logger, requiredKeys };
+	return {
+		app,
+		store,
+		secrets,
+		bootstrap,
+		csrf,
+		logger,
+		requiredKeys,
+		codexTokens,
+	};
 }
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -1068,12 +1089,17 @@ describe("POST /setup/save", () => {
 		expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining("GONE"));
 	});
 
-	it("tells the user when the change takes effect", async () => {
+	it("tells the user when the change takes effect, and how to apply it now", async () => {
 		const h = await provisioned(await harness());
 		const res = await renderAndSave(h, {
 			"value:CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-new",
 		});
-		expect(res.body).toMatch(/next session|already running/i);
+		expect(res.body).toMatch(/start a container after now/i);
+		// The remedy, not just the limitation. "Next session" was the old
+		// wording and was wrong for an affinity-pinned issue, which may never
+		// reach `ensureDevice` again — so the message has to name the command
+		// that actually replaces the container.
+		expect(res.body).toMatch(/containers destroy/i);
 	});
 
 	it("requires csrf", async () => {
@@ -1368,5 +1394,316 @@ describe("applyEdits", () => {
 		const snapshot = { ...current };
 		applyEdits(current, { "value:MY_TOOL_KEY": ["new"] }, REQUIRED);
 		expect(current).toEqual(snapshot);
+	});
+});
+
+/* ------------------------------------------------- the runner/model picker -- */
+
+/** Mints a CSRF token the way a rendered page would, without going through it. */
+function csrfFor(h: Harness, email = ALICE): string {
+	return h.csrf.issue(email);
+}
+
+function userIdOf(h: Harness, email = ALICE): number {
+	const user = h.store.getUserByEmail(email);
+	if (!user) throw new Error(`${email} is not registered`);
+	return user.userId;
+}
+
+describe("POST /setup/defaults — the runner/model picker", () => {
+	it("persists a catalog selection on the users row", async () => {
+		const h = await provisioned(await harness());
+		const res = await post(h, "/setup/defaults", {
+			csrf: csrfFor(h),
+			default_runner: "codex:gpt-5.5",
+		});
+
+		expect(res.statusCode).toBe(200);
+		expect(
+			resolveDefaultRunner(h.store.getUserDefaultRunner(userIdOf(h))),
+		).toEqual({ runner: "codex", model: "gpt-5.5" });
+	});
+
+	it("renders the saved choice back as the selected option", async () => {
+		const h = await provisioned(await harness());
+		await post(h, "/setup/defaults", {
+			csrf: csrfFor(h),
+			default_runner: "claude:sonnet",
+		});
+
+		const page = await get(h, "/setup", ALICE);
+		expect(page.body).toMatch(/value="claude:sonnet" selected/);
+	});
+
+	it("clears back to the router default on the empty choice", async () => {
+		const h = await provisioned(await harness());
+		await post(h, "/setup/defaults", {
+			csrf: csrfFor(h),
+			default_runner: "codex:gpt-5.5",
+		});
+		const res = await post(h, "/setup/defaults", {
+			csrf: csrfFor(h),
+			default_runner: "",
+		});
+
+		expect(res.statusCode).toBe(200);
+		expect(h.store.getUserDefaultRunner(userIdOf(h))).toBeUndefined();
+	});
+
+	it("refuses a value that is not in the catalog, storing nothing", async () => {
+		// The point of a typed control: an unusable value has to fail here,
+		// where the user can see it, not inside the sandbox at session start.
+		const h = await provisioned(await harness());
+		const res = await post(h, "/setup/defaults", {
+			csrf: csrfFor(h),
+			default_runner: "gemini:gemini-2.5-pro",
+		});
+
+		expect(res.statusCode).toBe(400);
+		expect(h.store.getUserDefaultRunner(userIdOf(h))).toBeUndefined();
+	});
+
+	it("requires csrf", async () => {
+		const h = await provisioned(await harness());
+		const res = await post(h, "/setup/defaults", {
+			default_runner: "codex:gpt-5.5",
+		});
+		expect(res.statusCode).toBe(403);
+		expect(h.store.getUserDefaultRunner(userIdOf(h))).toBeUndefined();
+	});
+
+	it("refuses an unregistered principal", async () => {
+		const h = await harness({ autoProvisionUsers: false });
+		const res = await post(
+			h,
+			"/setup/defaults",
+			{ csrf: csrfFor(h, BOB), default_runner: "codex:gpt-5.5" },
+			BOB,
+		);
+		// 303 back to /setup, which renders whichever of sign-in or first-run
+		// provisioning they actually need — the same funnel every other mutating
+		// route uses for an unregistered caller.
+		expect(res.statusCode).toBe(303);
+		expect(h.store.getUserByEmail(BOB)).toBeUndefined();
+	});
+
+	it("offers no Gemini or Cursor option at all", async () => {
+		// Absent, not disabled — neither runs in a container.
+		const h = await provisioned(await harness());
+		const page = await get(h, "/setup", ALICE);
+		expect(page.body).toMatch(/value="claude:opus"/);
+		expect(page.body).not.toMatch(/value="gemini:/);
+		expect(page.body).not.toMatch(/value="cursor:/);
+	});
+
+	it("names the containers-destroy remedy next to the picker", async () => {
+		// `docs/ROUTER.md` prescribes it and the UI has never mentioned it,
+		// which left "applies to the next session" as the only (wrong) answer
+		// for an issue that already has a container.
+		const h = await provisioned(await harness());
+		const page = await get(h, "/setup", ALICE);
+		expect(page.body).toMatch(/containers destroy/);
+	});
+});
+
+describe("the readiness banner follows the chosen runner", () => {
+	it("demands the Claude token for a user with no preference", async () => {
+		const h = await provisioned(
+			await harness({
+				requiredKeys: requiredSecretKeysFor(undefined, undefined),
+			}),
+		);
+		const page = await get(h, "/setup", ALICE);
+		expect(page.body).toMatch(/readiness-banner/);
+		expect(page.body).toMatch(/CLAUDE_CODE_OAUTH_TOKEN/);
+	});
+
+	it("demands nothing from a Codex user's bundle", async () => {
+		// Before this, `DEFAULT_REQUIRED_SECRET_KEYS` hard-required the Claude
+		// token, so a codex-only user could not boot a container at all — which
+		// made "select Codex as your default" a lie for anyone without an
+		// Anthropic subscription.
+		const h = await provisioned(
+			await harness({
+				requiredKeys: requiredSecretKeysFor("codex", undefined),
+			}),
+		);
+		const page = await get(h, "/setup", ALICE);
+		expect(page.body).not.toMatch(/readiness-banner/);
+	});
+});
+
+/* ------------------------------------------------------ the Codex account -- */
+
+function codexTokensFor(store: RouterStore, fetchFn?: typeof fetch) {
+	return new CodexTokenStore({
+		store,
+		wrapper: new LocalKeyWrapper(
+			join(mkdtempSync(join(tmpdir(), "cyrus-setup-kek-")), "kek.key"),
+		),
+		logger: testLogger(),
+		...(fetchFn ? { fetchFn } : {}),
+	});
+}
+
+/** A valid subscription auth.json, as `codex login --device-auth` writes it. */
+function codexAuthPaste(): string {
+	const exp = Math.floor((Date.now() + 3_600_000) / 1000);
+	const payload = Buffer.from(JSON.stringify({ exp })).toString("base64url");
+	return JSON.stringify({
+		OPENAI_API_KEY: null,
+		tokens: {
+			id_token: "id",
+			access_token: `h.${payload}.`,
+			refresh_token: "refresh-1",
+			account_id: "acct",
+		},
+	});
+}
+
+async function codexHarness(): Promise<Harness> {
+	return provisioned(
+		await harness({ codexTokens: (store) => codexTokensFor(store) }),
+	);
+}
+
+describe("the Codex account section", () => {
+	it("is absent entirely when the router has no Codex support", async () => {
+		// Same principle as Gemini in the picker: do not render a control that
+		// cannot work.
+		const h = await provisioned(await harness());
+		const page = await get(h, "/setup", ALICE);
+		expect(page.body).not.toMatch(/id="codex-account"/);
+	});
+
+	it("renders a paste box and a status row, never a password input", async () => {
+		const h = await codexHarness();
+		const page = await get(h, "/setup", ALICE);
+		expect(page.body).toMatch(/id="codex-account"/);
+		expect(page.body).toMatch(/<textarea[^>]*name="codex_auth_json"/);
+		expect(page.body).toMatch(/Not connected/);
+	});
+
+	it("accepts a valid paste, seals it, and reports connected", async () => {
+		const h = await codexHarness();
+		const res = await post(h, "/setup/codex", {
+			csrf: csrfFor(h),
+			codex_auth_json: codexAuthPaste(),
+		});
+
+		expect(res.statusCode).toBe(200);
+		expect(await h.codexTokens?.view(userIdOf(h))).toMatchObject({
+			status: "connected",
+		});
+		// Sealed, not plaintext: `users` rows ride into every StateBackup blob.
+		expect(h.store.getUserCodexAuth(userIdOf(h))).not.toContain("refresh-1");
+	});
+
+	it("never echoes the pasted credential back", async () => {
+		const h = await codexHarness();
+		const res = await post(h, "/setup/codex", {
+			csrf: csrfFor(h),
+			codex_auth_json: codexAuthPaste(),
+		});
+		expect(res.body).not.toContain("refresh-1");
+	});
+
+	it("rejects an API-key file at paste time, naming the problem", async () => {
+		// A malformed paste accepted silently surfaces as a dead Codex session
+		// hours later, which is the failure the typed control exists to remove.
+		const h = await codexHarness();
+		const res = await post(h, "/setup/codex", {
+			csrf: csrfFor(h),
+			codex_auth_json: JSON.stringify({
+				auth_mode: "apikey",
+				tokens: { refresh_token: "r" },
+			}),
+		});
+
+		expect(res.statusCode).toBe(400);
+		expect(res.body).toMatch(/apikey/);
+		expect(h.store.getUserCodexAuth(userIdOf(h))).toBeUndefined();
+	});
+
+	it("rejects a paste with no refresh token", async () => {
+		const h = await codexHarness();
+		const res = await post(h, "/setup/codex", {
+			csrf: csrfFor(h),
+			codex_auth_json: JSON.stringify({ tokens: { access_token: "a" } }),
+		});
+		expect(res.statusCode).toBe(400);
+		expect(res.body).toMatch(/refresh_token/);
+	});
+
+	it("requires csrf on the paste", async () => {
+		const h = await codexHarness();
+		const res = await post(h, "/setup/codex", {
+			codex_auth_json: codexAuthPaste(),
+		});
+		expect(res.statusCode).toBe(403);
+		expect(h.store.getUserCodexAuth(userIdOf(h))).toBeUndefined();
+	});
+
+	it("disconnects and says what that costs", async () => {
+		const h = await codexHarness();
+		await post(h, "/setup/codex", {
+			csrf: csrfFor(h),
+			codex_auth_json: codexAuthPaste(),
+		});
+
+		const res = await post(h, "/setup/codex/disconnect", { csrf: csrfFor(h) });
+		expect(res.statusCode).toBe(200);
+		expect(res.body).toMatch(/OPENAI_API_KEY/);
+		expect(h.store.getUserCodexAuth(userIdOf(h))).toBeUndefined();
+	});
+
+	it("refuses the paste when the router has no Codex support", async () => {
+		const h = await provisioned(await harness());
+		const res = await post(h, "/setup/codex", {
+			csrf: csrfFor(h),
+			codex_auth_json: codexAuthPaste(),
+		});
+		expect(res.statusCode).toBe(400);
+		expect(res.body).toMatch(/containers\.codex/);
+	});
+});
+
+/* ----------------------------------------------- newly-reserved variables -- */
+
+describe("variables that became reserved after they could be stored", () => {
+	it("stops rendering a stored CYRUS_DEFAULT_RUNNER row", async () => {
+		// Rendering it would offer an edit that `buildEnv` now ignores.
+		const h = await provisioned(await harness());
+		const bundle = await h.secrets.get(ALICE);
+		// Write it the way a pre-picker deployment would have: straight into the
+		// stored bundle, bypassing `set`'s reserved-name check.
+		Object.assign(bundle, { CYRUS_DEFAULT_RUNNER: "codex" });
+		vi.spyOn(h.secrets, "get").mockResolvedValue(bundle);
+
+		const page = await get(h, "/setup", ALICE);
+		expect(page.body).not.toMatch(/CYRUS_DEFAULT_RUNNER/);
+	});
+
+	it("ignores a submitted late-reserved field instead of failing the save", () => {
+		// Failing the whole save would leave such a user unable to change
+		// anything at all until an operator edited their record by hand.
+		const applied = applyEdits(
+			{ MY_TOOL_KEY: "old" },
+			{
+				"value:CYRUS_DEFAULT_RUNNER": ["codex"],
+				"value:MY_TOOL_KEY": ["new"],
+			},
+			REQUIRED,
+		);
+		expect(applied.ignored).toContain("CYRUS_DEFAULT_RUNNER");
+		expect(applied.next.MY_TOOL_KEY).toBe("new");
+	});
+
+	it("still fails the save outright on a long-standing reserved name", () => {
+		// `PATH` cannot have come from a rendered row at any point in this UI's
+		// history, so it stays a hard failure rather than a silent no-op.
+		expect(() => applyEdits({}, { "value:PATH": ["/evil"] }, REQUIRED)).toThrow(
+			/reserved/,
+		);
 	});
 });

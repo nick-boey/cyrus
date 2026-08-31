@@ -168,7 +168,7 @@ describe("router multi-repository routing (Task 18 F1 drive)", () => {
 			executors: new Map([["docker", capturingExecutor(boots)]]),
 			logger,
 		});
-		rig.seedUser({
+		await rig.seedUser({
 			email: ALICE.email,
 			linearId: ALICE.id,
 			provider: "docker",

@@ -2,6 +2,7 @@
  * router:seed-user - Seed a router user with a container executor + Claude secret
  */
 
+import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { success } from "../../utils/colors.js";
 import { controlPost } from "./controlClient.js";
@@ -10,7 +11,9 @@ interface RouterSeedUserOptions {
 	email: string;
 	linearId: string;
 	provider: string;
-	claudeToken: string;
+	claudeToken?: string;
+	defaultRunner?: string;
+	codexAuth?: string;
 	env: string[];
 }
 
@@ -40,9 +43,17 @@ export function createRouterSeedUserCommand(): Command {
 		.requiredOption("-e, --email <email>", "User email")
 		.requiredOption("-l, --linear-id <id>", "User linear id")
 		.option("-p, --provider <provider>", "Executor provider", "docker")
-		.requiredOption(
+		.option(
 			"--claude-token <token>",
-			"CLAUDE_CODE_OAUTH_TOKEN for the container",
+			"CLAUDE_CODE_OAUTH_TOKEN for the container. Optional: a user whose default runner is Codex needs no Claude token, and seeding one hides that.",
+		)
+		.option(
+			"--default-runner <runner:model>",
+			"Per-user default runner, e.g. codex:gpt-5.5. Must be a catalog value.",
+		)
+		.option(
+			"--codex-auth <path>",
+			"Path to a `codex login --device-auth` auth.json to seal as this user's Codex credential",
 		)
 		.option(
 			"--env <KEY=VALUE>",
@@ -55,7 +66,11 @@ export function createRouterSeedUserCommand(): Command {
 				email: o.email,
 				linearId: o.linearId,
 				provider: o.provider,
-				claudeOauthToken: o.claudeToken,
+				...(o.claudeToken ? { claudeOauthToken: o.claudeToken } : {}),
+				...(o.defaultRunner ? { defaultRunner: o.defaultRunner } : {}),
+				...(o.codexAuth
+					? { codexAuthJson: readFileSync(o.codexAuth, "utf-8") }
+					: {}),
 				env: parseEnvPairs(o.env),
 			});
 			console.log(success(`Seeded user ${o.email} (${o.provider})`));

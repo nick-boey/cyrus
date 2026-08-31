@@ -8,6 +8,7 @@ import {
 	withSpan,
 } from "cyrus-otel-traces";
 import type { ExecutorRegistry } from "cyrus-router-executors";
+import type { CodexTokenStore } from "./CodexTokenStore.js";
 import { containerBootFailedMessage } from "./messages.js";
 import type {
 	RegisteredRepository,
@@ -20,11 +21,20 @@ import {
 	type SandboxDestroyReason,
 } from "./SandboxTelemetry.js";
 import {
-	DEFAULT_REQUIRED_SECRET_KEYS,
 	isReservedEnvKey,
+	requiredSecretKeysFor,
 	type SecretStoreBackend,
 } from "./SecretStore.js";
 import { resolveExecutor } from "./setup/bootstrap.js";
+import {
+	CODEX_AUTH_JSON_ENV,
+	CodexRefreshError,
+	renderCodexAuthFile,
+} from "./setup/codexAuth.js";
+import {
+	defaultRunnerEnv,
+	resolveDefaultRunner,
+} from "./setup/runnerDefaults.js";
 import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
 /**
@@ -105,7 +115,20 @@ export interface ContainerRoutingDeps {
 		 * See {@link resolveExecutor}.
 		 */
 		defaultExecutor?: string;
+		/**
+		 * When set, the provider EVERY user routes to, regardless of their stored
+		 * `executor_json`. `RouterServer` sets this to `"aca"` exactly when an ACA
+		 * provider is registered — see {@link resolveExecutor} for why that
+		 * inverts the usual degradation direction on purpose.
+		 */
+		forcedExecutor?: string;
 	};
+	/**
+	 * Per-user Codex subscription credentials (ADR 0005). Absent on deployments
+	 * with no Codex support configured, in which case a Codex user falls back to
+	 * `OPENAI_API_KEY` from their own bundle.
+	 */
+	codexTokens?: CodexTokenStore;
 	postActivity: (
 		workspaceId: string,
 		agentSessionId: string,
@@ -152,7 +175,18 @@ export class ContainerTargetService {
 			{
 				warn: (msg) => this.deps.logger.warn(`${msg} (user ${userId})`),
 			},
+			this.deps.containersConfig.forcedExecutor,
 		);
+	}
+
+	/**
+	 * The user's per-user runner/model default, or `undefined` when they have
+	 * not chosen one (which leaves the in-sandbox fallback chain untouched).
+	 */
+	private defaultRunnerFor(userId: number) {
+		return resolveDefaultRunner(this.deps.store.getUserDefaultRunner(userId), {
+			warn: (msg) => this.deps.logger.warn(`${msg} (user ${userId})`),
+		});
 	}
 
 	/**
@@ -572,14 +606,18 @@ export class ContainerTargetService {
 		workspaceId?: string,
 	): Promise<Record<string, string>> {
 		const email = this.emailFor(userId);
-		// Additive: the container hard-requires the Claude token, so it is
-		// always required regardless of config; requiredSecretKeys adds to it.
-		const requiredKeys = [
-			...new Set([
-				...DEFAULT_REQUIRED_SECRET_KEYS,
-				...(this.deps.containersConfig.requiredSecretKeys ?? []),
-			]),
-		];
+		const selection = this.defaultRunnerFor(userId);
+		// Which credentials a container needs is a function of WHICH RUNNER it is
+		// going to start. Hard-requiring the Claude token unconditionally meant a
+		// user whose default is Codex could not boot a container at all, which
+		// made "select Codex as your default" a lie for anyone without an
+		// Anthropic subscription. `requiredSecretKeysFor` is the single expression
+		// the `/setup` readiness banner uses too, so the page and this gate cannot
+		// disagree.
+		const requiredKeys = requiredSecretKeysFor(
+			selection?.runner,
+			this.deps.containersConfig.requiredSecretKeys,
+		);
 		const { ok, missing } = await this.deps.secrets.isFullyAuthenticated(
 			email,
 			requiredKeys,
@@ -610,6 +648,10 @@ export class ContainerTargetService {
 			// would need a wider egress allowlist and would put that credential in
 			// every sandbox.
 			...traceEnv(),
+			// The per-user picker (NOR-364). Emitted before the user's own bundle
+			// is spread, but the reserved-key skip below means a hand-typed
+			// variable can never shadow it either way.
+			...defaultRunnerEnv(selection),
 		};
 		// Spread the user's map, skipping reserved keys. `set` already rejects
 		// them; this is belt-and-braces against a hand-edited secrets file.
@@ -623,7 +665,75 @@ export class ContainerTargetService {
 			}
 			env[key] = value;
 		}
+
+		if (selection?.runner === "codex") {
+			await this.attachCodexCredential(userId, email, env);
+		}
 		return env;
+	}
+
+	/**
+	 * Mints the short-lived Codex credential a container boots with, or fails
+	 * the boot with a message naming the remedy.
+	 *
+	 * Three outcomes, and the difference between them is the whole point:
+	 *
+	 * - **A connected account** — inject `CODEX_AUTH_JSON`, refreshing first if
+	 *   the stored access token is inside its five-minute window. The container
+	 *   therefore never refreshes on its own, which is what dissolves the
+	 *   rotation race between one user's concurrent issues (ADR 0005).
+	 * - **No connected account, but `OPENAI_API_KEY` in the bundle** — let it
+	 *   run on metered billing. That path stays supported precisely because the
+	 *   subscription path relies on an unofficial OAuth client that OpenAI could
+	 *   gate.
+	 * - **Neither, or a credential that no longer refreshes** — fail the boot.
+	 *
+	 * It deliberately does **not** fall back to Claude. Silently running a
+	 * different runner than the user chose erodes trust in the whole picker, and
+	 * the user would have no way to tell it had happened.
+	 */
+	private async attachCodexCredential(
+		userId: number,
+		email: string,
+		env: Record<string, string>,
+	): Promise<void> {
+		const hasApiKey = Boolean(env.OPENAI_API_KEY);
+		const tokens = this.deps.codexTokens;
+		if (tokens) {
+			try {
+				const credential = await tokens.mint(userId);
+				if (credential) {
+					env[CODEX_AUTH_JSON_ENV] = renderCodexAuthFile(credential);
+					return;
+				}
+			} catch (error) {
+				if (error instanceof CodexRefreshError) {
+					if (hasApiKey) {
+						this.deps.logger.warn(
+							`Codex credential refresh failed for ${email}; falling back to OPENAI_API_KEY: ${error.message}`,
+						);
+						return;
+					}
+					throw new Error(
+						`Your Codex account could not be refreshed. ${error.message}\n\n${error.remedy}`,
+					);
+				}
+				throw error;
+			}
+		}
+
+		if (hasApiKey) return;
+		// Two different messages, because the remedy is different and the wrong
+		// one is worse than none. Without a token store there IS no "Codex
+		// account" section on `/setup` — it is rendered only when the store
+		// exists — so telling the user to go and use it sends them looking for a
+		// control that is not on their page, on a deployment where connecting a
+		// subscription is not possible at all.
+		throw new Error(
+			tokens
+				? `${email} has Codex selected as their default runner but no Codex credential. Connect a ChatGPT subscription in the "Codex account" section of /setup (run \`codex login --device-auth\` on your own machine and paste the resulting auth.json), or add OPENAI_API_KEY as a variable to use metered billing instead.`
+				: `${email} has Codex selected as their default runner, but this router is not configured for ChatGPT-subscription credentials, so there is no way to connect one here. Add OPENAI_API_KEY as a variable to run Codex on metered billing, or ask the router's operator to configure containers.codex.`,
+		);
 	}
 
 	/**

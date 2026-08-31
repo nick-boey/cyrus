@@ -36,6 +36,24 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	{ pattern: "*.githubusercontent.com", action: "Allow" },
 	{ pattern: "api.anthropic.com", action: "Allow" },
 	{ pattern: "console.anthropic.com", action: "Allow" },
+	// Codex, in both auth modes, and unconditionally — see ADR 0005.
+	//
+	// `chatgpt.com` is the one that matters and the one that is easy to miss:
+	// under ChatGPT-subscription auth, inference goes to
+	// `chatgpt.com/backend-api/codex/responses` and `api.openai.com` is never
+	// touched, so allowlisting only the latter produces the worst failure shape
+	// available — authentication succeeds and every request fails. It needs
+	// WebSocket upgrades to ride through `Full` inspection, as the router's own
+	// host already does (spike S4). `auth.openai.com` carries refresh and
+	// revocation; `api.openai.com` is the metered `OPENAI_API_KEY` fallback.
+	//
+	// All three go in regardless of which mode a given user runs, because egress
+	// is applied at sandbox-CREATE time only and has no update API: an
+	// unnecessary entry costs nothing, while a missing one costs a fleet-wide
+	// destroy-and-recreate.
+	{ pattern: "chatgpt.com", action: "Allow" },
+	{ pattern: "auth.openai.com", action: "Allow" },
+	{ pattern: "api.openai.com", action: "Allow" },
 	{ pattern: "mcp.linear.app", action: "Allow" },
 	{ pattern: "api.linear.app", action: "Allow" },
 	{ pattern: "*.linear.app", action: "Allow" },

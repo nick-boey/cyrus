@@ -399,11 +399,26 @@ docker build -f docker/worker/Dockerfile \
   -t cyrus-worker:dev .
 ```
 
-> **`codex` is on `PATH` but not yet authenticated.** Nothing is authenticated
-> at build time — credentials are a runtime concern, and baking them into a
-> layer would leak them into the image. How Codex should get its credentials
-> inside a worker container is still being worked out (NOR-290), so this
-> runbook does not yet document a setup for it.
+> **`codex` is on `PATH` and is authenticated at boot, not at build.** Nothing
+> is authenticated at build time — credentials are a runtime concern, and
+> baking them into a layer would leak them into the image.
+>
+> A user connects their ChatGPT subscription once, in the **Codex account**
+> section of `/setup`: they run `codex login --device-auth` on their own
+> machine and paste the resulting `~/.codex/auth.json`. The router seals it on
+> their `users` row, is the **sole** process that ever refreshes it — which is
+> what stops one user's concurrent issues rotating the token out from under
+> each other — and injects a freshly-minted short-lived copy as
+> `CODEX_AUTH_JSON`. `cyrus container-boot` writes that to
+> `$CODEX_HOME/auth.json` at 0600 before launching the session, following the
+> same env-var-to-dotfile pattern as `~/.git-credentials`.
+>
+> `OPENAI_API_KEY` remains supported as the metered fallback, and is the only
+> mode in which Codex's 404 model-fallback probe does anything. Requires
+> `containers.codex` in `router-config.json`; without it the `/setup` section
+> is not rendered. See
+> `docs/adr/0005-codex-authenticates-by-router-held-subscription-tokens.md`
+> (NOR-290, NOR-364).
 
 ### Playwright caveats
 

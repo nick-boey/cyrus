@@ -42,15 +42,47 @@ export const REQUIRED_ENV_VARS = [
 	"CYRUS_DEVICE_TOKEN",
 	"CYRUS_ISSUE_KEY",
 	"CYRUS_REPOS_JSON",
-	"CLAUDE_CODE_OAUTH_TOKEN",
 ] as const;
+
+/**
+ * The credential each runner needs, checked on top of {@link REQUIRED_ENV_VARS}.
+ *
+ * `CLAUDE_CODE_OAUTH_TOKEN` used to be unconditionally required here, which
+ * meant a container whose default runner is Codex could not boot at all — the
+ * same defect the router-side gate had, and it had to be fixed on both sides or
+ * the two would disagree about what a bootable container is.
+ *
+ * Codex requires nothing at this layer: its credential arrives as
+ * `CODEX_AUTH_JSON` (a router-minted subscription token, ADR 0005) or as
+ * `OPENAI_API_KEY`, and the router has already refused the boot when neither is
+ * available. Re-checking here would only turn the router's specific,
+ * remedy-naming message into a generic "missing env var".
+ */
+const RUNNER_REQUIRED_ENV_VARS: Record<string, readonly string[]> = {
+	claude: ["CLAUDE_CODE_OAUTH_TOKEN"],
+	codex: [],
+	gemini: [],
+	cursor: [],
+};
 
 export const DEFAULT_WORKSPACES_DIR = "/workspaces";
 export const DEFAULT_REPO_CACHE_DIR = "/var/cache/repos";
 
+/**
+ * Where the Codex CLI reads its credential from. Overridable by `CODEX_HOME`,
+ * which is how the CLI itself resolves it.
+ */
+export const DEFAULT_CODEX_HOME_DIRNAME = ".codex";
+
 /** Returns the names of any required env vars that are unset/empty. */
 export function findMissingEnvVars(env: NodeJS.ProcessEnv): string[] {
-	return REQUIRED_ENV_VARS.filter((key) => !env[key]);
+	// An unrecognised runner falls back to Claude's requirement, matching
+	// `RunnerSelectionService.getDefaultRunner`, which resolves an absent or
+	// unusable `defaultRunner` to "claude".
+	const runner = env.CYRUS_DEFAULT_RUNNER?.trim() || "claude";
+	const runnerKeys =
+		RUNNER_REQUIRED_ENV_VARS[runner] ?? RUNNER_REQUIRED_ENV_VARS.claude ?? [];
+	return [...REQUIRED_ENV_VARS, ...runnerKeys].filter((key) => !env[key]);
 }
 
 /**
@@ -388,6 +420,7 @@ export class ContainerBootCommand implements ICommand {
 		});
 		await this.cloneRepos({ workspacesDir, repoCacheDir, repos, gitToken });
 		this.writeConfig({ workspacesDir, routerUrl, deviceToken, repos });
+		this.writeCodexAuth();
 		await this.applyDotfiles({ dotfilesRepo: this.env.DOTFILES_REPO });
 		this.launch({ cyrusHome: this.cyrusHomeFor(workspacesDir) });
 	}
@@ -901,6 +934,74 @@ export class ContainerBootCommand implements ICommand {
 		renameSync(tmpPath, configPath);
 		// writeFileSync's mode only applies on creation; enforce on overwrite too.
 		chmodSync(configPath, 0o600);
+	}
+
+	/**
+	 * Materialises the router-minted Codex credential into
+	 * `$CODEX_HOME/auth.json` at 0600, before `launch()`.
+	 *
+	 * This is the third instance of an established pattern in this file, not a
+	 * new primitive: `~/.git-credentials` is written from `GIT_TOKEN`, and
+	 * `config.json` is written carrying `LINEAR_API_TOKEN`. What is new is that
+	 * the router is the sole refresher — the token here is already fresh, and the
+	 * container is expected never to reach its own refresh window during a normal
+	 * session, which is what dissolves the rotation race between one user's
+	 * concurrent issues (ADR 0005).
+	 *
+	 * A no-op when `CODEX_AUTH_JSON` is unset, which is every Claude session and
+	 * every Codex session running on `OPENAI_API_KEY` instead.
+	 *
+	 * **The variable is deleted once the file exists.** Two reasons, and the
+	 * second is not hypothetical:
+	 *
+	 * - It is a live OAuth access + refresh token, and leaving it set puts it in
+	 *   the environment of every command the agent subsequently runs — where any
+	 *   `env`, `printenv` or process dump the agent or a build script performs
+	 *   would print it into the session transcript.
+	 * - It is multi-line JSON, and the Codex CLI snapshots the shell environment
+	 *   into a `/bin/sh` script at session start. The embedded newlines and
+	 *   quotes make that script unparseable — `Syntax error: Unterminated quoted
+	 *   string` — so the snapshot is discarded and the agent visibly works around
+	 *   a broken shell for the rest of the session (NOR-364 phase 3).
+	 *
+	 * Nothing downstream reads it: `codex` reads `$CODEX_HOME/auth.json`, which
+	 * is what this method just wrote.
+	 */
+	writeCodexAuth(): void {
+		const raw = this.env.CODEX_AUTH_JSON;
+		if (!raw?.trim()) return;
+
+		const codexHome =
+			this.env.CODEX_HOME?.trim() ||
+			join(this.homeDir, DEFAULT_CODEX_HOME_DIRNAME);
+		try {
+			mkdirSync(codexHome, { recursive: true });
+			const authPath = join(codexHome, "auth.json");
+			const tmpPath = `${authPath}.tmp`;
+			// Written via a temp file and renamed so a `codex` invocation racing
+			// this boot step never observes a half-written credential.
+			writeFileSync(tmpPath, raw.endsWith("\n") ? raw : `${raw}\n`, {
+				mode: 0o600,
+			});
+			chmodSync(tmpPath, 0o600);
+			renameSync(tmpPath, authPath);
+			// `writeFileSync`'s mode only applies on creation; enforce on overwrite
+			// too, in case a warm volume carries a looser-permissioned leftover.
+			chmodSync(authPath, 0o600);
+			// Both copies: `this.env` is what the rest of the boot sequence reads,
+			// `process.env` is what `launch()`'s child inherits.
+			delete this.env.CODEX_AUTH_JSON;
+			delete process.env.CODEX_AUTH_JSON;
+			this.logger.info(`Wrote Codex credentials to ${authPath}`);
+		} catch (error) {
+			// Fatal, unlike dotfiles: the session was routed to Codex precisely
+			// because the user chose it, and continuing would start an
+			// unauthenticated Codex that fails at its first request with an error
+			// nothing connects back to this step.
+			throw new Error(
+				`Could not write the Codex credential to ${codexHome}/auth.json: ${(error as Error).message}`,
+			);
+		}
 	}
 
 	/**

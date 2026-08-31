@@ -1,12 +1,17 @@
 import type { ILogger } from "cyrus-core";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { CodexTokenStore } from "../CodexTokenStore.js";
+import type { RouterStore } from "../RouterStore.js";
 import {
+	isLateReservedEnvKey,
+	isReservedEnvKey,
 	normalizeSecretKey,
 	type SecretStoreBackend,
 	type UserSecretBundle,
 } from "../SecretStore.js";
 import { SetupConflictError } from "../TableSecretStore.js";
 import type { SetupBootstrap } from "./bootstrap.js";
+import { CodexAuthValidationError, parseCodexAuthPaste } from "./codexAuth.js";
 import type { CsrfTokens } from "./csrf.js";
 import { BundleTooLargeError, MAX_BUNDLE_BYTES } from "./envelope.js";
 import {
@@ -22,10 +27,17 @@ import {
 	type SetupPrincipal,
 	shouldRedirectToSetup,
 } from "./principal.js";
+import {
+	encodeDefaultRunnerJson,
+	parseSelection,
+	resolveDefaultRunner,
+} from "./runnerDefaults.js";
 import { HTMX_JS } from "./vendor/htmx.js";
 import { PICO_CSS } from "./vendor/pico.js";
 import {
 	escapeHtml,
+	renderCodexSection,
+	renderDefaultsSection,
 	renderMessage,
 	renderPage,
 	renderVariablesTable,
@@ -110,16 +122,33 @@ const VERSION_SCOPE = "setup-version";
 
 export interface SetupRouteDeps {
 	secrets: SecretStoreBackend;
-	/** `DEFAULT_REQUIRED_SECRET_KEYS` ∪ `containers.requiredSecretKeys`. */
-	requiredKeys: readonly string[];
+	/**
+	 * The required-key set for one user: their runner's credentials ∪
+	 * `containers.requiredSecretKeys`. A function rather than an array because
+	 * a Codex user needs no Anthropic credential — see `requiredSecretKeysFor`.
+	 */
+	requiredKeys: (email?: string) => readonly string[];
 	auth: SetupAuthConfig;
 	bootstrap: SetupBootstrap;
 	csrf: CsrfTokens;
+	/** Reads and writes the per-user runner default on the `users` row. */
+	store: Pick<
+		RouterStore,
+		"getUserByEmail" | "getUserDefaultRunner" | "setUserDefaultRunner"
+	>;
+	/**
+	 * Per-user Codex credentials. Absent when this router has no Codex support
+	 * configured, in which case the "Codex account" section is not rendered and
+	 * its routes refuse.
+	 */
+	codexTokens?: CodexTokenStore;
 	/** Required when `auth.auth.mode === "entra-token"`; ignored otherwise. */
 	verifyIdToken?: SetupIdTokenVerifier;
 	logger: ILogger;
 	/** Test seam. Default 64 KiB, matching {@link parseFormBody}. */
 	maxFormBodyBytes?: number;
+	/** Test seam for the Codex status row's expiry arithmetic. */
+	now?: () => number;
 }
 
 /* -------------------------------------------------------------- backends -- */
@@ -248,20 +277,34 @@ function fieldsOf(request: FastifyRequest): Record<string, unknown> {
 
 /* ------------------------------------------------------------ page model -- */
 
-function buildModel(
+/** Extra, section-scoped messages a mutation can attach to a re-render. */
+interface ModelExtras {
+	message?: SetupMessage;
+	defaultsMessage?: SetupMessage;
+	codexMessage?: SetupMessage;
+}
+
+async function buildModel(
 	deps: SetupRouteDeps,
 	principal: SetupPrincipal,
 	state: RecordState,
-	message?: SetupMessage,
-): SetupPageModel {
-	const required = new Set(deps.requiredKeys);
+	extras: ModelExtras = {},
+): Promise<SetupPageModel> {
+	const requiredKeys = deps.requiredKeys(principal.email);
+	const required = new Set(requiredKeys);
 	// Required first in configured order, then the rest alphabetically. Without
 	// this the table order follows `Object.keys` on a decrypted JSON object and
 	// reshuffles whenever a key is added or removed.
+	//
+	// Stored keys that have SINCE become reserved are filtered out. This change
+	// reserves `CYRUS_DEFAULT_RUNNER` and the per-runner model vars, so a user
+	// who hand-set one before the picker existed still has it in their bundle —
+	// rendering it would offer an edit that `buildEnv` now ignores, which is
+	// worse than not showing it. `buildEnv` skips it with a warning either way.
 	const names = [
-		...deps.requiredKeys,
+		...requiredKeys,
 		...Object.keys(state.bundle)
-			.filter((name) => !required.has(name))
+			.filter((name) => !required.has(name) && !isReservedEnvKey(name))
 			.sort(),
 	];
 	const variables: VariableView[] = names.map((name) => ({
@@ -269,13 +312,32 @@ function buildModel(
 		required: required.has(name),
 		isSet: Boolean(state.bundle[name]),
 	}));
+
+	const user = deps.store.getUserByEmail(principal.email);
+	const defaultRunner = user
+		? resolveDefaultRunner(
+				deps.store.getUserDefaultRunner(user.userId),
+				deps.logger,
+			)
+		: undefined;
+	const codex =
+		deps.codexTokens && user
+			? await deps.codexTokens.view(user.userId)
+			: undefined;
+
 	return {
 		email: principal.email,
 		variables,
-		missingRequired: deps.requiredKeys.filter((key) => !state.bundle[key]),
+		missingRequired: requiredKeys.filter((key) => !state.bundle[key]),
 		csrfToken: deps.csrf.issue(principal.email),
 		versionToken: issueVersionToken(deps, principal.email, state.etag),
-		...(message ? { message } : {}),
+		...(defaultRunner ? { defaultRunner } : {}),
+		...(codex ? { codex } : {}),
+		...(extras.message ? { message: extras.message } : {}),
+		...(extras.defaultsMessage
+			? { defaultsMessage: extras.defaultsMessage }
+			: {}),
+		...(extras.codexMessage ? { codexMessage: extras.codexMessage } : {}),
 	};
 }
 
@@ -370,10 +432,53 @@ async function respond(
 	// user must see what is ACTUALLY stored, and after a successful write the
 	// fragment must carry the NEW version token or the next save 409s.
 	const state = await readState(deps, principal.email);
-	const model = buildModel(deps, principal, state, message);
+	const model = await buildModel(deps, principal, state, { message });
 	return secureHtml(reply)
 		.status(status)
 		.send(`${renderMessage(model.message)}${renderVariablesTable(model)}`);
+}
+
+/**
+ * The Session defaults fragment, for `POST /setup/defaults`.
+ *
+ * A separate swap target from the variables table on purpose: the two forms are
+ * independent, and swapping the whole table after a picker change would discard
+ * any value the user had typed into it but not yet saved.
+ */
+async function respondDefaults(
+	reply: FastifyReply,
+	deps: SetupRouteDeps,
+	principal: SetupPrincipal,
+	status: number,
+	message: SetupMessage,
+): Promise<FastifyReply> {
+	const state = await readState(deps, principal.email);
+	const model = await buildModel(deps, principal, state, {
+		defaultsMessage: message,
+	});
+	return secureHtml(reply).status(status).send(renderDefaultsSection(model));
+}
+
+/** The Codex account fragment, for the paste and disconnect routes. */
+async function respondCodex(
+	reply: FastifyReply,
+	deps: SetupRouteDeps,
+	principal: SetupPrincipal,
+	status: number,
+	message: SetupMessage,
+): Promise<FastifyReply> {
+	const state = await readState(deps, principal.email);
+	const model = await buildModel(deps, principal, state, {
+		codexMessage: message,
+	});
+	// `renderCodexSection` renders nothing when this router has no Codex
+	// support, which is right for the page but would make a refusal a
+	// zero-length body — a status code and no explanation. Fall back to the
+	// message alone so the reason always reaches the caller.
+	const fragment = renderCodexSection(model);
+	return secureHtml(reply)
+		.status(status)
+		.send(fragment || renderMessage(message));
 }
 
 /**
@@ -542,11 +647,30 @@ export function applyEdits(
 		const isClear = field.startsWith(CLEAR_PREFIX);
 		if (!isValue && !isClear) continue;
 
+		const submittedName = field.slice(
+			isValue ? VALUE_PREFIX.length : CLEAR_PREFIX.length,
+		);
+		// A name that BECAME reserved after it was stored is a real,
+		// non-adversarial case — this change reserves `CYRUS_DEFAULT_RUNNER` and
+		// the per-runner model vars, which users could set by hand before the
+		// picker existed. `normalizeSecretKey` throws on a reserved name, and
+		// letting that throw here would fail the ENTIRE save, leaving such a user
+		// unable to change anything at all until an operator edited their record.
+		// Treat it as stale instead: same handling as any other field that no
+		// longer corresponds to a rendered row, and `buildModel` has already
+		// stopped rendering it.
+		//
+		// Scoped to `isLateReservedEnvKey`, NOT to every reserved name: a form
+		// submitting `PATH` or `CYRUS_DEVICE_TOKEN` cannot have come from a
+		// rendered row at any point in this UI's history, so that stays a hard
+		// failure rather than a silently-ignored field.
+		if (isLateReservedEnvKey(submittedName)) {
+			ignored.push(submittedName);
+			continue;
+		}
 		// The single source of truth for reserved names, the env-name regex, and
 		// legacy-name mapping. Never write a second validator here.
-		const name = normalizeSecretKey(
-			field.slice(isValue ? VALUE_PREFIX.length : CLEAR_PREFIX.length),
-		);
+		const name = normalizeSecretKey(submittedName);
 		const entry = edits.get(name) ?? { clear: false };
 		if (isClear) entry.clear = true;
 		else entry.value = lastValue(raw);
@@ -684,7 +808,7 @@ export function registerSetupRoutes(
 		}
 		const state = await readState(deps, auth.principal.email);
 		return secureHtml(reply).send(
-			renderPage(buildModel(deps, auth.principal, state)),
+			renderPage(await buildModel(deps, auth.principal, state)),
 		);
 	});
 
@@ -704,7 +828,7 @@ export function registerSetupRoutes(
 		}
 		const state = await readState(deps, auth.principal.email);
 		return secureHtml(reply).send(
-			renderVariablesTable(buildModel(deps, auth.principal, state)),
+			renderVariablesTable(await buildModel(deps, auth.principal, state)),
 		);
 	});
 
@@ -740,9 +864,11 @@ export function registerSetupRoutes(
 		const state = await readState(deps, guard.principal.email);
 		return secureHtml(reply).send(
 			renderPage(
-				buildModel(deps, guard.principal, state, {
-					kind: "ok",
-					text: "Your account is ready. Enter your credentials below and save.",
+				await buildModel(deps, guard.principal, state, {
+					message: {
+						kind: "ok",
+						text: "Your account is ready. Enter your credentials below and save.",
+					},
 				}),
 			),
 		);
@@ -804,7 +930,7 @@ export function registerSetupRoutes(
 			// throw "not fully authenticated" on the next boot, so refuse it
 			// server-side — after normalization, so a legacy alias cannot slip
 			// past the check.
-			if (deps.requiredKeys.includes(name)) {
+			if (deps.requiredKeys(guard.principal.email).includes(name)) {
 				return respond(reply, deps, guard.principal, 400, {
 					kind: "error",
 					text: `${name} is required and cannot be deleted. Clear its value instead.`,
@@ -852,7 +978,11 @@ export function registerSetupRoutes(
 		const state = await readState(deps, email);
 		let applied: AppliedEdits;
 		try {
-			applied = applyEdits(state.bundle, guard.fields, deps.requiredKeys);
+			applied = applyEdits(
+				state.bundle,
+				guard.fields,
+				deps.requiredKeys(email),
+			);
 		} catch (error) {
 			// A name that never appeared on a rendered row: fail the whole save
 			// rather than partially applying a tampered form.
@@ -919,9 +1049,150 @@ export function registerSetupRoutes(
 			throw error;
 		}
 
+		// The old wording — "applies to the next session that starts" — was wrong
+		// for an issue that already has a container. `resolveTarget`'s fast path
+		// returns the affinity-pinned device before `executorFor` is consulted, so
+		// there may be no next `ensureDevice` for that issue at all: the old
+		// values survive for the life of the CONTAINER, not of one session. The
+		// remedy `docs/ROUTER.md` prescribes has never been mentioned here.
 		return respond(reply, deps, guard.principal, 200, {
 			kind: "ok",
-			text: "Saved. New values apply to the next session that starts; a session already running keeps the values it started with.",
+			text: "Saved. New values apply to issues that start a container after now. An issue that already has one keeps the values it booted with — to apply these to it now, run `cyrus router containers destroy <issueKey>` and re-prompt the issue.",
+		});
+	});
+
+	/**
+	 * The runner/model picker (NOR-364).
+	 *
+	 * Separate from `/setup/save` because it writes a different store — the
+	 * `users` row, not the secret bundle — and so has no ETag to carry. The
+	 * router is single-replica SQLite, so there is no contention to guard
+	 * against here the way there is on the Table-backed bundle.
+	 */
+	fastify.post("/setup/defaults", async (request, reply) => {
+		const guard = await requireMutation(deps, request);
+		if ("error" in guard) return sendError(deps, reply, guard.error);
+
+		const user = deps.store.getUserByEmail(guard.principal.email);
+		if (!user) {
+			// `requireMutation` already proved the user exists; this can only be a
+			// row deleted between the two reads.
+			return respondDefaults(reply, deps, guard.principal, 409, {
+				kind: "conflict",
+				text: "Your account is no longer registered. Reload the page.",
+			});
+		}
+
+		const raw = lastValue(guard.fields.default_runner)?.trim() ?? "";
+		if (raw === "") {
+			deps.store.setUserDefaultRunner(user.userId, null);
+			return respondDefaults(reply, deps, guard.principal, 200, {
+				kind: "ok",
+				text: "Cleared. Your sessions will use the router's own default agent and model.",
+			});
+		}
+
+		const selection = parseSelection(raw);
+		if (!selection) {
+			// Only values from a rendered `<option>` are accepted. Passing an
+			// unknown one through is exactly the failure this typed control
+			// exists to remove: `WorkerService` casts the env var without parsing
+			// it, so a bad value throws inside the sandbox at session start and
+			// the user sees a dead session rather than a setup error.
+			return respondDefaults(reply, deps, guard.principal, 400, {
+				kind: "error",
+				text: "That is not an agent and model Cyrus can run in a container. Pick one from the list and save again.",
+			});
+		}
+
+		deps.store.setUserDefaultRunner(
+			user.userId,
+			encodeDefaultRunnerJson(selection),
+		);
+		return respondDefaults(reply, deps, guard.principal, 200, {
+			kind: "ok",
+			text: `Saved. New issues will run ${selection.runner} on ${selection.model}. An issue that already has a container keeps its current agent until the container is replaced.`,
+		});
+	});
+
+	/**
+	 * Bootstraps a Codex subscription credential from a pasted `auth.json`
+	 * (ADR 0005).
+	 *
+	 * Validated on submit, and every rejection names what is wrong. That is the
+	 * whole point: a malformed paste accepted silently surfaces as a dead Codex
+	 * session hours later — the failure mode the typed picker exists to
+	 * eliminate — and by then nothing connects the two events.
+	 */
+	fastify.post("/setup/codex", async (request, reply) => {
+		const guard = await requireMutation(deps, request);
+		if ("error" in guard) return sendError(deps, reply, guard.error);
+
+		const codexTokens = deps.codexTokens;
+		if (!codexTokens) {
+			return respondCodex(reply, deps, guard.principal, 400, {
+				kind: "error",
+				text: "This router has no Codex support configured. Ask an administrator to set `containers.codex` in router-config.json.",
+			});
+		}
+		const user = deps.store.getUserByEmail(guard.principal.email);
+		if (!user) {
+			return respondCodex(reply, deps, guard.principal, 409, {
+				kind: "conflict",
+				text: "Your account is no longer registered. Reload the page.",
+			});
+		}
+
+		let credential: ReturnType<typeof parseCodexAuthPaste>;
+		try {
+			credential = parseCodexAuthPaste(
+				lastValue(guard.fields.codex_auth_json) ?? "",
+				(deps.now ?? Date.now)(),
+			);
+		} catch (error) {
+			if (error instanceof CodexAuthValidationError) {
+				return respondCodex(reply, deps, guard.principal, 400, {
+					kind: "error",
+					text: error.message,
+				});
+			}
+			throw error;
+		}
+
+		await codexTokens.put(user.userId, credential);
+		deps.logger.info(
+			`Connected a Codex subscription credential for ${guard.principal.email}`,
+		);
+		return respondCodex(reply, deps, guard.principal, 200, {
+			kind: "ok",
+			text: "Connected. Cyrus will refresh this for you and hand each container a fresh copy at boot.",
+		});
+	});
+
+	/**
+	 * Forgets the stored credential. A POST rather than a DELETE so htmx sends
+	 * it as a body-carrying request — see the note on `renderDeleteButton` for
+	 * why htmx puts DELETE parameters in the query string, which this UI refuses.
+	 */
+	fastify.post("/setup/codex/disconnect", async (request, reply) => {
+		const guard = await requireMutation(deps, request);
+		if ("error" in guard) return sendError(deps, reply, guard.error);
+
+		const codexTokens = deps.codexTokens;
+		const user = deps.store.getUserByEmail(guard.principal.email);
+		if (!codexTokens || !user) {
+			return respondCodex(reply, deps, guard.principal, 400, {
+				kind: "error",
+				text: "There is nothing to disconnect.",
+			});
+		}
+		codexTokens.clear(user.userId);
+		deps.logger.info(
+			`Disconnected the Codex subscription credential for ${guard.principal.email}`,
+		);
+		return respondCodex(reply, deps, guard.principal, 200, {
+			kind: "ok",
+			text: "Disconnected. Codex sessions will fail to start until you connect an account again or set OPENAI_API_KEY.",
 		});
 	});
 }

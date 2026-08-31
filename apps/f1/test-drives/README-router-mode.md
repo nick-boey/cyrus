@@ -126,10 +126,15 @@ set -a && source .env && source .env.user && set +a
   --linear-id lin-you \
   --claude-token "$CLAUDE_CODE_OAUTH_TOKEN" \
   --env LINEAR_API_TOKEN="$LINEAR_API_TOKEN" \
-  --env GIT_TOKEN="$GIT_TOKEN" \
+  --env GH_TOKEN="$GH_TOKEN" \
   --env GIT_USER_NAME="$GIT_USER_NAME" \
   --env GIT_USER_EMAIL="$GIT_USER_EMAIL"
 ```
+
+Seed `GH_TOKEN`, not `GIT_TOKEN`, for any drive that expects a pull request. `gh`
+reads `GH_TOKEN` natively and `gh auth setup-git` makes git ride the same credential;
+`GIT_TOKEN` is the legacy git-only fallback, so a session seeded with it clones and
+pushes a branch and then cannot run `gh pr create`.
 
 Flags verified against `apps/f1/src/commands/router/seedUser.ts`:
 
@@ -138,7 +143,9 @@ Flags verified against `apps/f1/src/commands/router/seedUser.ts`:
 | `-e, --email <email>` | yes | — | User email. |
 | `-l, --linear-id <id>` | yes | — | User's Linear id — this is the value you'll pass as `--creator-id` to `router:inject` in step 4; they must match, or the router won't route the event to this user. |
 | `-p, --provider <provider>` | no | `"docker"` | Executor provider. Leave as `docker` for this drive. |
-| `--claude-token <token>` | yes | — | The `CLAUDE_CODE_OAUTH_TOKEN` value the container will use to run the real Claude session. |
+| `--claude-token <token>` | no | — | The `CLAUDE_CODE_OAUTH_TOKEN` value the container will use to run the real Claude session. Required in practice for a Claude user (the boot gate demands it); omit it for a Codex user, where seeding one would hide the very gate a drive is checking. |
+| `--default-runner <runner:model>` | no | — | Per-user default runner and model, e.g. `codex:gpt-5.5`. Must be a value from `RUNNER_CATALOG`; anything else is rejected here rather than inside the sandbox. |
+| `--codex-auth <path>` | no | — | Path to a `codex login --device-auth` `auth.json`, sealed onto the user's row as their Codex subscription credential. Not an `--env` var: it lives on the `users` row, not in the secret bundle (ADR 0005). |
 | `--env <KEY=VALUE>` | no | `[]` | Repeatable. Extra per-user container env vars (e.g. `LINEAR_API_TOKEN`, which also enables the hosted Linear MCP inside the container's Claude session). Reserved keys (`CYRUS_*` routing/bootstrap vars, `PATH`, `HOME`, `NODE_OPTIONS`) are rejected. |
 
 Under the hood this calls `POST /router/seed-user` (`ControlServer.ts:57-66`), which registers the

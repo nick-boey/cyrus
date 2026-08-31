@@ -1,4 +1,10 @@
 import { randomBytes } from "node:crypto";
+import type { CodexAccountView } from "../CodexTokenStore.js";
+import {
+	type DefaultRunnerSelection,
+	encodeSelection,
+	RUNNER_CATALOG,
+} from "./runnerDefaults.js";
 
 /**
  * Pure HTML rendering for the `/setup` management page. No I/O, no Fastify —
@@ -42,6 +48,22 @@ export interface SetupPageModel {
 	 * as an inert hidden field — the routes layer mints and verifies it.
 	 */
 	versionToken?: string;
+	/**
+	 * The user's stored runner/model default, or `undefined` when they have not
+	 * chosen one (rendered as "Router default").
+	 */
+	defaultRunner?: DefaultRunnerSelection;
+	/** A message scoped to the Session defaults section. */
+	defaultsMessage?: SetupMessage;
+	/**
+	 * The Codex account status, or `undefined` when this router has no Codex
+	 * support configured — in which case the section is not rendered at all,
+	 * rather than rendered disabled. Same principle as Gemini and Cursor being
+	 * absent from the runner picker: do not show a control that cannot work.
+	 */
+	codex?: CodexAccountView;
+	/** A message scoped to the Codex account section. */
+	codexMessage?: SetupMessage;
 }
 
 /** `&` first — escaping it later would double-escape the entities we emit. */
@@ -182,6 +204,116 @@ export function renderVariablesTable(model: SetupPageModel): string {
 </div>`;
 }
 
+/* ------------------------------------------------------- session defaults -- */
+
+/**
+ * Copy for what changing a default actually does to work in flight.
+ *
+ * The variables form says *"applies to the next session that starts"*, and for
+ * an affinity-pinned live session that is simply wrong: `resolveTarget`'s fast
+ * path returns the already-bound device before `executorFor` is ever consulted,
+ * so for an issue that already has a container there may be no next
+ * `ensureDevice` at all — the old value survives for the life of that issue, not
+ * for the life of one session. `docs/ROUTER.md` prescribes the remedy and the UI
+ * has never mentioned it.
+ */
+const NEXT_SESSION_NOTE = `Applies to issues that start a container after you save. An issue that already has one keeps its current runner until the container is replaced — to move it now, run <code>cyrus router containers destroy &lt;issueKey&gt;</code> and re-prompt the issue.`;
+
+/**
+ * The runner/model picker: one `<select>`, grouped by runner, because naming a
+ * model names the runner.
+ *
+ * Curated `<option>`s rather than a text box — see {@link RUNNER_CATALOG} for
+ * why free text reintroduces exactly the failure this control exists to remove.
+ */
+export function renderDefaultsSection(model: SetupPageModel): string {
+	const current = model.defaultRunner
+		? encodeSelection(model.defaultRunner)
+		: "";
+	const groups = RUNNER_CATALOG.map((entry) => {
+		const options = entry.models
+			.map((option) => {
+				const value = encodeSelection({
+					runner: entry.runner,
+					model: option.model,
+				});
+				const selected = value === current ? " selected" : "";
+				return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(option.label)}</option>`;
+			})
+			.join("");
+		return `<optgroup label="${escapeHtml(entry.label)}">${options}</optgroup>`;
+	}).join("");
+
+	return `<div id="session-defaults">
+	${renderMessage(model.defaultsMessage)}
+	<form hx-post="/setup/defaults" hx-target="#session-defaults" hx-swap="outerHTML">
+		<input type="hidden" name="csrf" value="${escapeHtml(model.csrfToken)}">
+		<label for="default-runner">Default agent and model</label>
+		<select id="default-runner" name="default_runner">
+			<option value=""${current === "" ? " selected" : ""}>Router default</option>
+			${groups}
+		</select>
+		<button type="submit" class="secondary">Save default</button>
+		<p><small>${NEXT_SESSION_NOTE}</small></p>
+		<p><small>A <code>[agent=…]</code> or <code>[model=…]</code> tag in an issue description, or an agent/model label on the issue, still overrides this for that issue.</small></p>
+	</form>
+</div>`;
+}
+
+/* ---------------------------------------------------------- codex account -- */
+
+const CODEX_STATUS_TEXT: Record<CodexAccountView["status"], string> = {
+	absent: "Not connected",
+	connected: "Connected",
+	expiring: "Connected — will be refreshed on the next container boot",
+	"needs-attention": "Needs attention",
+};
+
+/**
+ * The Codex account section: a paste box and a status row, never a password
+ * input.
+ *
+ * The variables table's `<input type="password">` is the wrong shape here twice
+ * over — an `auth.json` is a multi-KB JSON blob, and there is nothing about it a
+ * user can usefully re-type. What they need to see is whether the credential
+ * still works, which is what the status row is.
+ */
+export function renderCodexSection(model: SetupPageModel): string {
+	const codex = model.codex;
+	if (!codex) return "";
+	const status = CODEX_STATUS_TEXT[codex.status];
+	const updated =
+		codex.updatedMs === undefined
+			? ""
+			: ` <small>(last refreshed ${escapeHtml(new Date(codex.updatedMs).toISOString())})</small>`;
+	const error = codex.error
+		? `<p role="alert"><small>${escapeHtml(codex.error)}</small></p>`
+		: "";
+	const disconnect =
+		codex.status === "absent"
+			? ""
+			: `<form hx-post="/setup/codex/disconnect" hx-target="#codex-account" hx-swap="outerHTML">
+			<input type="hidden" name="csrf" value="${escapeHtml(model.csrfToken)}">
+			<button type="submit" class="secondary">Disconnect</button>
+		</form>`;
+
+	return `<div id="codex-account">
+	${renderMessage(model.codexMessage)}
+	<p><strong>Codex account:</strong> ${escapeHtml(status)}${updated}</p>
+	${error}
+	<form hx-post="/setup/codex" hx-target="#codex-account" hx-swap="outerHTML">
+		<input type="hidden" name="csrf" value="${escapeHtml(model.csrfToken)}">
+		<label for="codex-auth">Connect your ChatGPT subscription</label>
+		<p><small>Run <code>codex login --device-auth</code> on your own machine, then paste the contents of <code>~/.codex/auth.json</code> here. Cyrus holds and refreshes it for you, and hands each container a fresh short-lived copy — so you never have to sign in from inside a session.</small></p>
+		<textarea id="codex-auth" name="codex_auth_json" rows="4"
+			autocomplete="off" spellcheck="false"
+			placeholder="{ &quot;tokens&quot;: { … } }"></textarea>
+		<button type="submit">Connect Codex</button>
+	</form>
+	${disconnect}
+</div>`;
+}
+
 /**
  * F12: htmx 2.x's default `responseHandling` does not swap 4xx/5xx
  * responses — `htmx:responseError` fires and the DOM is left untouched. Every
@@ -257,8 +389,16 @@ export function renderPage(model: SetupPageModel): string {
 			<p>Signed in as <strong>${escapeHtml(model.email)}</strong> &middot; <a href="/setup/repositories">Repositories</a> &middot; <a href="/.auth/logout">Sign out</a></p>
 		</header>
 		${renderMessage(model.message)}
-		<p><small>These environment variables are injected into the container that runs your Cyrus sessions. Stored values are never displayed — leave a field blank to keep the current value.</small></p>
-		${renderVariablesTable(model)}
+		<article>
+			<h2>Session defaults</h2>
+			${renderDefaultsSection(model)}
+		</article>
+		<article>
+			<h2>Credentials</h2>
+			<p><small>These environment variables are injected into the container that runs your Cyrus sessions. Stored values are never displayed — leave a field blank to keep the current value.</small></p>
+			${renderVariablesTable(model)}
+		</article>
+		${model.codex ? `<article><h2>Codex account</h2>${renderCodexSection(model)}</article>` : ""}
 	</main>
 </body>
 </html>`;
