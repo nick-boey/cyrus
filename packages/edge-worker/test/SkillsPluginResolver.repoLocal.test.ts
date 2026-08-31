@@ -86,7 +86,11 @@ describe("SkillsPluginResolver repo-local skill discovery", () => {
 		await mkdir(repoA, { recursive: true });
 		await mkdir(repoB, { recursive: true });
 		await writeManifest(home);
-		resolver = new SkillsPluginResolver(home, createTestLogger());
+		// homeDir is pinned to the temp dir so discovery never reads the real
+		// developer's ~/.claude/skills.
+		resolver = new SkillsPluginResolver(home, createTestLogger(), {
+			homeDir: home,
+		});
 	});
 
 	afterEach(async () => {
