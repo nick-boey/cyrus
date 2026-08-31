@@ -82,9 +82,11 @@ fails (Task 7). Cost reduction is not a success criterion here.
    carrying every toolchain and therefore often the right answer for a genuinely
    polyglot issue; and the prompt must state that repositories other than the
    chosen one are cloned into an environment lacking their toolchain.
-2. **Devcontainer file precedence (Q17).** The requested order is
-   `.devcontainer.json` then `.devcontainer/devcontainer.json`. The spec's
-   documented order is the reverse. See *Task 0* — the spike should settle it.
+**Settled:** devcontainer file precedence follows the spec —
+`.devcontainer/devcontainer.json` first, then `.devcontainer.json`. Diverging
+would build a repo carrying both files from the file its author believed was
+inactive, differing silently from VS Code, Codespaces and the `devcontainer`
+CLI, with nothing anywhere saying so.
 
 ## Task dependency order
 
@@ -140,10 +142,11 @@ spike.
       import past what the preview CLI could do at all (NOR-337).
 - [ ] Confirm `devcontainer build` runs inside an ACR task, since ADR 0006 puts
       builds there and nowhere else.
-- [ ] **Settle open question 2.** Check what the reference implementation
-      actually does when both `.devcontainer.json` and
-      `.devcontainer/devcontainer.json` exist, and report it against the spec's
-      stated precedence.
+- [ ] Confirm the reference implementation's behaviour when both
+      `.devcontainer.json` and `.devcontainer/devcontainer.json` exist matches
+      the spec's stated precedence. The order is already decided; this is
+      checking that spec text and implementation agree, since where they don't,
+      the implementation is what repository authors will have built against.
 
 #### Success criteria
 
@@ -167,8 +170,9 @@ degradation. Update ADR 0005's status rather than quietly changing course.
 ### Task 1: Devcontainer discovery and the cache key
 
 Read the devcontainer file over the GitHub contents API for a repository's base
-branch; compute the content hash that keys the cache. Precedence per open
-question 2. Multi-config (`.devcontainer/<folder>/devcontainer.json`) is
+branch; compute the content hash that keys the cache. Precedence follows the
+spec: `.devcontainer/devcontainer.json`, then `.devcontainer.json`.
+Multi-config (`.devcontainer/<folder>/devcontainer.json`) is
 unsupported: it exists so a human can choose, and we have nowhere to ask.
 Reject `dockerComposeFile` here, at registration, with a clear message.
 
