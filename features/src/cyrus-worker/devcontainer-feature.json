@@ -1,0 +1,57 @@
+{
+	"id": "cyrus-worker",
+	"version": "0.1.0",
+	"name": "Cyrus worker",
+	"description": "Makes an arbitrary image able to host a Cyrus agent: a private Node runtime, the cyrus-ai worker, the non-root agent user, the workspace and repository-cache paths, and the git/gh/curl/jq tools the boot sequence shells out to.",
+	"documentationURL": "https://github.com/ceedaragents/cyrus/tree/main/features/src/cyrus-worker",
+	"options": {
+		"tarball": {
+			"type": "string",
+			"default": "",
+			"description": "URL of a gzipped tar of a 'pnpm deploy --prod --legacy' tree built from this repository, extracted as-is. This is the primary mechanism: the cyrus-ai package on public npm is a different, older CLI with no container-boot command. Takes precedence over 'version'."
+		},
+		"version": {
+			"type": "string",
+			"default": "latest",
+			"description": "npm version range of cyrus-ai, used only when 'tarball' is empty. Valid only where the resolved registry publishes THIS worker; the install asserts container-boot exists and fails the build if it does not."
+		},
+		"nodeVersion": {
+			"type": "string",
+			"default": "22.22.0",
+			"description": "Exact Node version the worker runs on. Installed privately and deliberately kept OFF PATH so it cannot shadow whatever Node the repository's own toolchain provides."
+		},
+		"username": {
+			"type": "string",
+			"default": "cyrus",
+			"description": "Non-root user the worker runs as. Created if absent; reused if the base image already defines it."
+		},
+		"uid": {
+			"type": "string",
+			"default": "1001",
+			"description": "uid for the worker user when this feature creates it. Ignored if the user already exists."
+		},
+		"gid": {
+			"type": "string",
+			"default": "1001",
+			"description": "gid for the worker group when this feature creates it. Ignored if the group already exists."
+		},
+		"workspacesDir": {
+			"type": "string",
+			"default": "/workspaces",
+			"description": "Must match CYRUS_WORKSPACES_DIR. Created and chowned to the worker user."
+		},
+		"repoCacheDir": {
+			"type": "string",
+			"default": "/var/cache/repos",
+			"description": "Must match CYRUS_REPO_CACHE_DIR. Created and chowned to the worker user."
+		},
+		"ghVersion": {
+			"type": "string",
+			"default": "2.63.2",
+			"description": "GitHub CLI version. Installed from the checksum-verified release tarball rather than a distro package, because no single package source covers every base family."
+		}
+	},
+	"containerEnv": {
+		"CYRUS_WORKER_HOME": "/opt/cyrus-worker"
+	}
+}

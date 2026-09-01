@@ -1,0 +1,19 @@
+{
+	"id": "agent-clis",
+	"version": "0.1.0",
+	"name": "Agent CLIs (codex, opencode)",
+	"description": "Puts `codex` and `opencode` on PATH. Neither is authenticated here — credentials are a runtime concern and baking them in would leak them into a layer.",
+	"options": {
+		"codexVersion": {
+			"type": "string",
+			"default": "0.144.6",
+			"description": "@openai/codex version. Keep in step with the version resolved in pnpm-lock.yaml so a session invoking `codex` gets the CLI Cyrus itself drives."
+		},
+		"opencodeVersion": {
+			"type": "string",
+			"default": "1.18.13",
+			"description": "opencode-ai version."
+		}
+	},
+	"installsAfter": ["ghcr.io/devcontainers/features/node"]
+}
