@@ -90,6 +90,12 @@ export interface ContainerRoutingDeps {
 	 * next container without restarting the router.
 	 */
 	registry: RepositoryRegistry;
+	/**
+	 * Resolves the disk an issue is pinned to (NOR-309). Optional: without it
+	 * every container boots the deployment's default worker image, which is what
+	 * every deployment did before per-repository images existed.
+	 */
+	devcontainers?: { diskForIssue(issueKey: string): string | undefined };
 	containersConfig: {
 		routerUrlForContainers: string;
 		/**
@@ -492,9 +498,20 @@ export class ContainerTargetService {
 				deviceId,
 				provider,
 			});
+			// A pure store read, deliberately: a build must never be started from
+			// the boot path. An issue with no pin — including a terminal-teardown
+			// wake, which boots for an issue that may have none — gets
+			// `undefined` and the deployment's default disk.
+			const disk = this.deps.devcontainers?.diskForIssue(issueKey);
+			if (disk) {
+				this.deps.logger.info(
+					`${issueKey} is pinned to workspace image ${disk}`,
+				);
+			}
 			await executor.ensureRunning({
 				issueKey,
 				env,
+				...(disk ? { disk } : {}),
 				mintDeviceToken: () =>
 					this.deps.store.rotateContainerDeviceToken(deviceId),
 				// ACA provider's snapshot-lineage check (B5/D3): the live device

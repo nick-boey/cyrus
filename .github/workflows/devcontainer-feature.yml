@@ -1,0 +1,82 @@
+name: Cyrus Worker Feature
+
+# NOR-309 Task 2. Publishes `features/src/cyrus-worker` as an OCI artifact so a
+# repository's own devcontainer can be built with Cyrus grafted on, and
+# publishes the worker PAYLOAD the feature extracts.
+#
+# The two must move together. The feature installs a `pnpm deploy` tree from a
+# URL; a feature version published against a payload that no longer exists (or
+# that came from a different commit) builds cleanly and dies at boot as a
+# sandbox stuck Running with no worker attached.
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: devcontainer-feature-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  payload:
+    # The payload carries native modules (better-sqlite3), so it MUST be built
+    # inside Linux — a tree built on the runner's host toolchain for another
+    # platform loads nothing. The image's own build stage is already exactly
+    # this `pnpm deploy`, so reuse it rather than reproducing it here.
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.payload.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the worker payload
+        id: payload
+        run: |
+          set -euo pipefail
+          docker build --target build -t cyrus-worker-payload:ci -f docker/worker/Dockerfile .
+          docker run --rm cyrus-worker-payload:ci tar -czf - -C / out > worker-payload.tgz
+          ls -l worker-payload.tgz
+          echo "digest=$(sha256sum worker-payload.tgz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # ~256 MB compressed. Kept as a release artifact rather than a container
+      # layer because the feature fetches it with curl at build time, from
+      # inside somebody else's base image, with no registry credential.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker-payload
+          path: worker-payload.tgz
+          retention-days: 90
+
+  publish-feature:
+    needs: payload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publishing is versioned from `devcontainer-feature.json`'s own
+      # `version`, and the version is part of every build's cache key — so a
+      # bump here rebuilds every repository image, which is the point: the
+      # worker rides on top of all of them.
+      - uses: devcontainers/action@v1
+        with:
+          publish-features: 'true'
+          base-path-to-features: './features/src'
+          oci-registry: ghcr.io
+          features-namespace: ${{ github.repository_owner }}/cyrus-features
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -816,6 +816,106 @@ anyone. A workspace with exactly one repository in scope is never asked to
 choose, even with no default set and no match above it — the sole repository
 is used directly.
 
+### Per-repository devcontainer images
+
+A registered repository may declare its own environment with a `devcontainer.json`,
+and Cyrus builds that repository its own worker image. Adding a toolchain then
+needs a commit to that repository, not a commit to Cyrus plus a full worker-image
+redeploy.
+
+This is **off by default**. Turn it on with a `containers.devcontainers` block —
+it additionally requires `containers.aca`, because a per-repository image is a
+per-repository ACA disk image and there is nothing for it to do on a provider
+with no concept of one:
+
+```json
+{
+  "containers": {
+    "devcontainers": {
+      "githubToken": "ghp_…",
+      "registry": "cyrusacr",
+      "loginServer": "cyrusacr.azurecr.io",
+      "imageRepository": "cyrus/devcontainers",
+      "workerFeatureRef": "ghcr.io/<owner>/cyrus-features/cyrus-worker:0.1.0",
+      "workerFeatureVersion": "0.1.0",
+      "workerPayloadTarball": "https://…/worker-payload.tgz"
+    }
+  }
+}
+```
+
+`githubToken` is **router-level, not per-user**: the repository registry is
+global, so the environment a repository declares is a property of the repository
+rather than of whoever delegated the issue. The same credential reads the
+devcontainer file and clones inside the build.
+
+`workerFeatureVersion` and `workerPayloadTarball` are part of every image's cache
+key. Bumping either rebuilds every repository image — which is the point: the
+worker rides on top of all of them, so a deployment must never keep booting
+repositories on a worker it has since replaced. They are published together by
+`.github/workflows/devcontainer-feature.yml`; a feature version published against
+a payload from a different commit builds cleanly and dies at boot.
+
+#### What is honoured, and what is not
+
+| Field | Behaviour |
+| -- | -- |
+| `image`, `build.dockerfile`, `build.context`, `build.args` | Used |
+| `features`, `overrideFeatureInstallOrder` | Used. The Cyrus worker feature is always installed **first** |
+| `containerEnv` | Used |
+| `postCreateCommand` | Run at boot after the clone, alongside `cyrus-setup.sh` — devcontainer first, then the script |
+| `dockerComposeFile` | **Rejected at registration.** A Compose devcontainer is several containers; a sandbox is one, with no Docker daemon inside it |
+| `mounts`, `forwardPorts`, `customizations`, `remoteUser`, `containerUser` | Silently ignored |
+| `onCreateCommand`, `updateContentCommand` | Ignored — the source is cloned at boot, never baked into the image |
+| `postStartCommand` | Ignored, deliberately: a parked container resumes many times per issue and this would run on every unpark |
+| `postAttachCommand` | No analogue |
+
+File precedence follows the spec: `.devcontainer/devcontainer.json`, then
+`.devcontainer.json`. `.devcontainer/<folder>/devcontainer.json` is **not**
+supported — it exists so a human can choose between configurations, and there is
+nowhere to ask. The reference CLI does not implement that discovery either.
+
+#### Known gaps
+
+- **An issue that edits its own devcontainer gets the base branch's
+  environment.** The file is read from the repository's base branch, not from
+  the issue's own branch, so an issue whose whole job is to add a toolchain does
+  not get it. This was chosen deliberately — per-issue builds would multiply
+  disk imports by issue count — and is written down here so it is not filed as a
+  bug.
+- **A devcontainer change never applies retroactively.** An issue is pinned to
+  its image the first time it routes. Treating an author's edit like a
+  worker-image bump would replace every in-flight sandbox on that repository
+  *and delete its snapshots*, cold-restarting work that was mid-flight and
+  destroying the warm path that would have made the restore cheap. A move of the
+  **deployment's** own worker image is different, and does still replace
+  everything.
+- **An issue spanning several repositories uses the default worker image**, and
+  says so on the issue. It is the only image carrying every toolchain, and a
+  deliberate multi-repository fan-out is exactly the polyglot case. Asking the
+  user which environment they want is a possible future refinement.
+- **Builds are not verified inside an ACR task yet.** The mechanism exists (ACR
+  `cmd` steps accept `docker run` parameters, and the agent has a Docker socket)
+  and the build has been proven on an ordinary Docker host, but not on an ACR
+  agent.
+
+#### Failure behaviour
+
+A build failure falls back to the default worker image and posts why on the
+issue, including the ACR run id — the run id is the load-bearing part, because it
+is what makes `az acr task logs --run-id` possible. The full build log is never
+relayed: that build ran with unrestricted egress over repository-controlled
+content, so it stays behind Azure's own authorization.
+
+A repository registered through the setup UI gets a **warm build** immediately,
+fire-and-forget. It never blocks or fails registration; its status appears in the
+Environment column of `/setup/repositories`, which is the only place a
+fire-and-forget failure is visible at all.
+
+Unreferenced disk images are collected every 6 hours. Nothing is deleted while
+any issue is pinned to it, while any snapshot was taken from it, while it is the
+newest ready image for its repository, or if it is the deployment's own default.
+
 ### Observed ACA behavior
 
 - Sandboxes have server-assigned GUIDs, not operator-selected names. Cyrus maps

@@ -19,6 +19,22 @@ export interface IssueExecutionContext {
 	 * providers keep working unchanged.
 	 */
 	deviceId?: string;
+	/**
+	 * The disk image this issue is PINNED to (NOR-309 Task 5), when it differs
+	 * from the deployment's default.
+	 *
+	 * This is the staleness key the `cyrus.disk` label is compared against, and
+	 * it is decided once per issue and never revised in place — which is what
+	 * stops a repository author's devcontainer edit from cold-restarting every
+	 * in-flight issue on that repository (and destroying the snapshots that
+	 * would have made the restore warm). A move of the DEPLOYMENT's worker
+	 * image still replaces everything, because the router invalidates the pin
+	 * when that moves and hands down a new value here.
+	 *
+	 * Omitted for every issue on the default worker image, and by providers
+	 * that have no concept of a disk.
+	 */
+	disk?: string;
 }
 
 export type ContainerStatus = "running" | "stopped" | "absent";

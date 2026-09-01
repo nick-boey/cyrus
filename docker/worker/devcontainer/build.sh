@@ -2,10 +2,10 @@
 # NOR-309 Task 0 spike — build the devcontainer expression of the worker image
 # and check the boot contract against it.
 #
-# Run this on a host with Docker. The spike that produced these files could
-# not: its sandbox has no container runtime and its egress allowlist does not
-# include nodejs.org. Everything below is therefore WRITTEN BUT UNEXECUTED —
-# treat a failure here as new evidence, not as a regression.
+# Run this on a host with Docker. EXECUTED 2026-09-01 on Docker 29.7.2
+# (darwin/arm64): all 23 boot-contract assertions pass, `devcontainer build`
+# takes 205s and produces a 7.76 GB image. See the spike document for the two
+# findings that only a real build could produce.
 #
 #   ./docker/worker/devcontainer/build.sh
 #
@@ -130,11 +130,16 @@ check "/ms-playwright writable (repo may pin another revision)" \
 # Reaching "Missing required environment variable(s)" means the whole chain —
 # private node, app path, argv, command registration — is intact.
 echo "==> entrypoint reaches container-boot"
-if docker run --rm "${IMAGE_FINAL}" 2>&1 | grep -q 'Missing required environment variable'; then
+# `container-boot` exits NON-ZERO here — that is the success condition, not a
+# failure: it validated its environment and refused to start. Under `pipefail`
+# the pipeline's status is the docker run's, so the grep must be evaluated on
+# captured output rather than through a pipe, or a passing check reads as FAIL.
+entrypoint_out="$(docker run --rm "${IMAGE_FINAL}" 2>&1 || true)"
+if printf '%s' "${entrypoint_out}" | grep -q 'Missing required environment variable'; then
 	echo "  ok    /entrypoint.sh reaches container-boot's env validation"
 else
 	echo "  FAIL  /entrypoint.sh did not reach container-boot"
-	docker run --rm "${IMAGE_FINAL}" 2>&1 | tail -20
+	printf '%s\n' "${entrypoint_out}" | tail -20
 	fail=1
 fi
 

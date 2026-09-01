@@ -142,6 +142,7 @@ export {
 	getDefaultReposDir,
 	getDefaultWorktreesDir,
 } from "./constants.js";
+export { DEVCONTAINER_PATHS, parseJsonc } from "./devcontainer.js";
 // Issue Tracker Abstraction
 export type {
 	AgentActivity,

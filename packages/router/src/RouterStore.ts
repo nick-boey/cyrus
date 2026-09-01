@@ -85,6 +85,33 @@ CREATE TABLE IF NOT EXISTS pending_repo_selections (
   created_event TEXT NOT NULL,
   created_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS repo_devcontainer_images (
+  cache_key TEXT PRIMARY KEY,
+  repository_name TEXT NOT NULL,
+  disk_name TEXT NOT NULL,
+  image_ref TEXT NOT NULL,
+  state TEXT NOT NULL,
+  run_id TEXT,
+  error TEXT,
+  updated_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS issue_disk_images (
+  issue_key TEXT PRIMARY KEY,
+  repository_name TEXT NOT NULL,
+  cache_key TEXT NOT NULL,
+  disk_name TEXT NOT NULL,
+  image_ref TEXT NOT NULL,
+  deployment_disk TEXT NOT NULL,
+  decided_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_devcontainer_builds (
+  agent_session_id TEXT PRIMARY KEY,
+  issue_key TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  cache_key TEXT NOT NULL,
+  created_event TEXT NOT NULL,
+  created_ms INTEGER NOT NULL
+);
 `;
 
 // A user may have at most one physical device row, and an issue may have at
@@ -101,6 +128,8 @@ const INDEXES = `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_physical_user ON devices(user_id) WHERE kind = 'device';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_container_issue ON devices(issue_key) WHERE kind = 'container';
 CREATE INDEX IF NOT EXISTS idx_webhook_claims_claimed_ms ON webhook_claims(claimed_ms);
+CREATE INDEX IF NOT EXISTS idx_pending_devcontainer_builds_cache_key ON pending_devcontainer_builds(cache_key);
+CREATE INDEX IF NOT EXISTS idx_issue_disk_images_cache_key ON issue_disk_images(cache_key);
 `;
 
 function sha256Hex(value: string): string {
@@ -364,6 +393,62 @@ export interface StoredRepositoryDecision {
 	/** A `RoutingMethod`, kept as a string so the store stays schema-free. */
 	method: string;
 	decidedMs: number;
+}
+
+/**
+ * One cached devcontainer build, keyed by the content hash of everything the
+ * image is a function of (NOR-309 Task 4).
+ *
+ * `building` rows are what make the build lazy AND single-flight: the first
+ * issue to need an image inserts one, and every later issue for the same key
+ * joins it instead of scheduling a second ACR run.
+ */
+export interface DevcontainerImageRow {
+	cacheKey: string;
+	repositoryName: string;
+	/** Derived digest name, inside the 63-character `cyrus.disk` label budget. */
+	diskName: string;
+	imageRef: string;
+	state: "building" | "ready" | "failed";
+	/** ACR run id — the load-bearing half of a failure report (ADR 0006). */
+	runId?: string;
+	error?: string;
+	updatedMs: number;
+}
+
+/**
+ * The disk an issue is pinned to, decided ONCE and never revised in place.
+ *
+ * This pin is what stops a repository author's devcontainer edit from
+ * cold-restarting every in-flight issue on that repository: the `cyrus.disk`
+ * label is compared against this row, not against whatever the repository's
+ * current devcontainer would hash to, so a new devcontainer applies to
+ * containers created after it and to nothing else.
+ *
+ * `deploymentDisk` is the other half of that split. A move of the DEPLOYMENT's
+ * own worker image must still replace every sandbox — the worker feature has
+ * changed underneath them — so the pin records which deployment image it was
+ * made under and is treated as stale when that moves. One label, two
+ * lifetimes.
+ */
+export interface IssueDiskImage {
+	issueKey: string;
+	repositoryName: string;
+	cacheKey: string;
+	diskName: string;
+	imageRef: string;
+	deploymentDisk: string;
+	decidedMs: number;
+}
+
+/** A `created` webhook held while its repository's image is still building. */
+export interface PendingDevcontainerBuild {
+	agentSessionId: string;
+	issueKey: string;
+	workspaceId: string;
+	cacheKey: string;
+	createdEvent: string;
+	createdMs: number;
 }
 
 /** An elicitation posted, with the `created` webhook held until it is answered. */
@@ -866,6 +951,20 @@ export class RouterStore {
 			this.db
 				.prepare("DELETE FROM container_teardowns WHERE device_id = ?")
 				.run(deviceId);
+			// The workspace-image PIN is keyed by issue too, and dropping it here
+			// is what makes the disk it names collectable: the GC counts a pin as
+			// a live reference, so a pin outliving its container would keep that
+			// disk forever. Read the issue key off the row before it goes.
+			const device = this.db
+				.prepare(
+					"SELECT issue_key FROM devices WHERE device_id = ? AND kind = 'container'",
+				)
+				.get(deviceId) as { issue_key: string | null } | undefined;
+			if (device?.issue_key) {
+				this.db
+					.prepare("DELETE FROM issue_disk_images WHERE issue_key = ?")
+					.run(device.issue_key);
+			}
 			this.db
 				.prepare(
 					"DELETE FROM devices WHERE device_id = ? AND kind = 'container'",
@@ -1915,6 +2014,272 @@ export class RouterStore {
 				agentSessionId: row.agent_session_id,
 				workspaceId: row.workspace_id,
 				issueKey: row.issue_key,
+			}));
+		});
+		return txn();
+	}
+
+	// ── Devcontainer images (NOR-309) ──────────────────────────────────────
+	// Three concerns, deliberately three tables: the build CACHE keyed by
+	// content hash, the per-issue PIN that decides what a boot uses, and the
+	// `created` webhooks HELD while a build runs.
+
+	getDevcontainerImage(cacheKey: string): DevcontainerImageRow | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT cache_key, repository_name, disk_name, image_ref, state, run_id, error, updated_ms FROM repo_devcontainer_images WHERE cache_key = ?",
+			)
+			.get(cacheKey) as
+			| {
+					cache_key: string;
+					repository_name: string;
+					disk_name: string;
+					image_ref: string;
+					state: string;
+					run_id: string | null;
+					error: string | null;
+					updated_ms: number;
+			  }
+			| undefined;
+		if (!row) return undefined;
+		return {
+			cacheKey: row.cache_key,
+			repositoryName: row.repository_name,
+			diskName: row.disk_name,
+			imageRef: row.image_ref,
+			state: row.state as DevcontainerImageRow["state"],
+			runId: row.run_id ?? undefined,
+			error: row.error ?? undefined,
+			updatedMs: row.updated_ms,
+		};
+	}
+
+	listDevcontainerImages(): DevcontainerImageRow[] {
+		const rows = this.db
+			.prepare(
+				"SELECT cache_key FROM repo_devcontainer_images ORDER BY updated_ms DESC",
+			)
+			.all() as Array<{ cache_key: string }>;
+		return rows
+			.map((row) => this.getDevcontainerImage(row.cache_key))
+			.filter((row): row is DevcontainerImageRow => row !== undefined);
+	}
+
+	/**
+	 * Claims the right to run a build for `cacheKey`.
+	 *
+	 * Returns `true` only for the caller that actually inserted the `building`
+	 * row. Two issues arriving on the same repository seconds apart must
+	 * schedule ONE ACR run, not two — a build is minutes of agent compute, and a
+	 * second one would push the same tag from a second checkout of the same ref.
+	 * `INSERT … ON CONFLICT DO NOTHING` inside SQLite's single writer is the
+	 * whole mutex.
+	 *
+	 * A `failed` row is re-claimable: a build that failed on a transient ACR or
+	 * network fault must not poison the key until someone edits the repository.
+	 */
+	claimDevcontainerBuild(
+		row: Omit<DevcontainerImageRow, "state" | "updatedMs" | "runId" | "error">,
+		nowMs: number,
+	): boolean {
+		const result = this.db
+			.prepare(
+				`INSERT INTO repo_devcontainer_images
+				   (cache_key, repository_name, disk_name, image_ref, state, updated_ms)
+				 VALUES (?, ?, ?, ?, 'building', ?)
+				 ON CONFLICT(cache_key) DO UPDATE SET
+				   state = 'building',
+				   run_id = NULL,
+				   error = NULL,
+				   updated_ms = excluded.updated_ms
+				 WHERE repo_devcontainer_images.state = 'failed'`,
+			)
+			.run(row.cacheKey, row.repositoryName, row.diskName, row.imageRef, nowMs);
+		return result.changes > 0;
+	}
+
+	finishDevcontainerBuild(
+		cacheKey: string,
+		outcome: { state: "ready" | "failed"; runId?: string; error?: string },
+		nowMs: number,
+	): void {
+		this.db
+			.prepare(
+				`UPDATE repo_devcontainer_images
+				 SET state = ?, run_id = ?, error = ?, updated_ms = ?
+				 WHERE cache_key = ?`,
+			)
+			.run(
+				outcome.state,
+				outcome.runId ?? null,
+				outcome.error ?? null,
+				nowMs,
+				cacheKey,
+			);
+	}
+
+	deleteDevcontainerImage(cacheKey: string): void {
+		this.db
+			.prepare("DELETE FROM repo_devcontainer_images WHERE cache_key = ?")
+			.run(cacheKey);
+	}
+
+	getIssueDiskImage(issueKey: string): IssueDiskImage | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT issue_key, repository_name, cache_key, disk_name, image_ref, deployment_disk, decided_ms FROM issue_disk_images WHERE issue_key = ?",
+			)
+			.get(issueKey) as
+			| {
+					issue_key: string;
+					repository_name: string;
+					cache_key: string;
+					disk_name: string;
+					image_ref: string;
+					deployment_disk: string;
+					decided_ms: number;
+			  }
+			| undefined;
+		if (!row) return undefined;
+		return {
+			issueKey: row.issue_key,
+			repositoryName: row.repository_name,
+			cacheKey: row.cache_key,
+			diskName: row.disk_name,
+			imageRef: row.image_ref,
+			deploymentDisk: row.deployment_disk,
+			decidedMs: row.decided_ms,
+		};
+	}
+
+	setIssueDiskImage(
+		pin: Omit<IssueDiskImage, "decidedMs">,
+		nowMs: number,
+	): void {
+		this.db
+			.prepare(
+				`INSERT INTO issue_disk_images
+				   (issue_key, repository_name, cache_key, disk_name, image_ref, deployment_disk, decided_ms)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(issue_key) DO UPDATE SET
+				   repository_name = excluded.repository_name,
+				   cache_key = excluded.cache_key,
+				   disk_name = excluded.disk_name,
+				   image_ref = excluded.image_ref,
+				   deployment_disk = excluded.deployment_disk,
+				   decided_ms = excluded.decided_ms`,
+			)
+			.run(
+				pin.issueKey,
+				pin.repositoryName,
+				pin.cacheKey,
+				pin.diskName,
+				pin.imageRef,
+				pin.deploymentDisk,
+				nowMs,
+			);
+	}
+
+	deleteIssueDiskImage(issueKey: string): void {
+		this.db
+			.prepare("DELETE FROM issue_disk_images WHERE issue_key = ?")
+			.run(issueKey);
+	}
+
+	/** Cache keys still referenced by a live issue pin — the GC's floor. */
+	referencedDevcontainerCacheKeys(): string[] {
+		const rows = this.db
+			.prepare("SELECT DISTINCT cache_key FROM issue_disk_images")
+			.all() as Array<{ cache_key: string }>;
+		return rows.map((row) => row.cache_key);
+	}
+
+	createPendingDevcontainerBuild(row: PendingDevcontainerBuild): void {
+		this.db
+			.prepare(
+				`INSERT INTO pending_devcontainer_builds
+				   (agent_session_id, issue_key, workspace_id, cache_key, created_event, created_ms)
+				 VALUES (?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(agent_session_id) DO UPDATE SET
+				   issue_key = excluded.issue_key,
+				   workspace_id = excluded.workspace_id,
+				   cache_key = excluded.cache_key,
+				   created_event = excluded.created_event,
+				   created_ms = excluded.created_ms`,
+			)
+			.run(
+				row.agentSessionId,
+				row.issueKey,
+				row.workspaceId,
+				row.cacheKey,
+				row.createdEvent,
+				row.createdMs,
+			);
+	}
+
+	getPendingDevcontainerBuild(
+		agentSessionId: string,
+	): PendingDevcontainerBuild | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT issue_key, workspace_id, cache_key, created_event, created_ms FROM pending_devcontainer_builds WHERE agent_session_id = ?",
+			)
+			.get(agentSessionId) as
+			| {
+					issue_key: string;
+					workspace_id: string;
+					cache_key: string;
+					created_event: string;
+					created_ms: number;
+			  }
+			| undefined;
+		if (!row) return undefined;
+		return {
+			agentSessionId,
+			issueKey: row.issue_key,
+			workspaceId: row.workspace_id,
+			cacheKey: row.cache_key,
+			createdEvent: row.created_event,
+			createdMs: row.created_ms,
+		};
+	}
+
+	deletePendingDevcontainerBuild(agentSessionId: string): void {
+		this.db
+			.prepare(
+				"DELETE FROM pending_devcontainer_builds WHERE agent_session_id = ?",
+			)
+			.run(agentSessionId);
+	}
+
+	/**
+	 * Takes every webhook held on `cacheKey` and removes the rows in one
+	 * transaction, so a build finishing can never replay the same event twice.
+	 */
+	takePendingDevcontainerBuilds(cacheKey: string): PendingDevcontainerBuild[] {
+		const txn = this.db.transaction(() => {
+			const rows = this.db
+				.prepare(
+					"SELECT agent_session_id, issue_key, workspace_id, cache_key, created_event, created_ms FROM pending_devcontainer_builds WHERE cache_key = ?",
+				)
+				.all(cacheKey) as Array<{
+				agent_session_id: string;
+				issue_key: string;
+				workspace_id: string;
+				cache_key: string;
+				created_event: string;
+				created_ms: number;
+			}>;
+			this.db
+				.prepare("DELETE FROM pending_devcontainer_builds WHERE cache_key = ?")
+				.run(cacheKey);
+			return rows.map((row) => ({
+				agentSessionId: row.agent_session_id,
+				issueKey: row.issue_key,
+				workspaceId: row.workspace_id,
+				cacheKey: row.cache_key,
+				createdEvent: row.created_event,
+				createdMs: row.created_ms,
 			}));
 		});
 		return txn();

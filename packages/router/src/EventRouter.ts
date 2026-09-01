@@ -22,8 +22,13 @@ import {
 	InvalidIssueKeyError,
 } from "./ContainerTargets.js";
 import type { DeviceGateway } from "./DeviceGateway.js";
+import type { DevcontainerImageService } from "./devcontainer/DevcontainerImageService.js";
 import { webhookIdempotencyKey } from "./idempotency.js";
 import {
+	DEVCONTAINER_BUILD_FAILED_MESSAGE,
+	DEVCONTAINER_BUILDING_MESSAGE,
+	DEVCONTAINER_MULTI_REPO_MESSAGE,
+	DEVCONTAINER_READY_MESSAGE,
 	expiredMessage,
 	fillTemplate,
 	INVALID_ISSUE_KEY_MESSAGE,
@@ -38,7 +43,11 @@ import {
 	REPOSITORY_SELECTION_PROMPT,
 	UNENROLLED_CREATOR_MESSAGE,
 } from "./messages.js";
-import { BASE_BRANCH_RE } from "./RepositoryRegistry.js";
+import {
+	BASE_BRANCH_RE,
+	type RegisteredRepository,
+	type RepositoryRegistry,
+} from "./RepositoryRegistry.js";
 import type {
 	RepositoryDecision,
 	RepositoryResolver,
@@ -123,6 +132,14 @@ export interface EventRouterOptions {
 		options: string[],
 	) => Promise<void>;
 	terminalTeardown?: TerminalTeardown;
+	/**
+	 * Builds and pins per-repository devcontainer images (NOR-309). Optional:
+	 * omitting it boots every container from the default worker image, which is
+	 * what every deployment did before this existed.
+	 */
+	devcontainers?: DevcontainerImageService;
+	/** The live repository registry, read to find an issue's primary repository. */
+	registry?: RepositoryRegistry;
 	config: {
 		eventTtlMs: number;
 		issueLock: boolean;
@@ -175,6 +192,10 @@ export class EventRouter {
 		| ((workspaceId: string, issueId: string) => Promise<string | undefined>)
 		| undefined;
 	private readonly containerTargets: ContainerTargetService | undefined;
+	private readonly devcontainers: DevcontainerImageService | undefined;
+	private readonly repositoryRegistry: RepositoryRegistry | undefined;
+	/** Issues we've already posted a "Building image…" notice for. */
+	private readonly devcontainerNotified = new Set<string>();
 	private readonly repositoryResolver: RepositoryResolver | undefined;
 	private readonly postRepositorySelection:
 		| EventRouterOptions["postRepositorySelection"]
@@ -227,6 +248,14 @@ export class EventRouter {
 		this.moveIssueToStartedState = opts.moveIssueToStartedState;
 		this.containerTargets = opts.containerTargets;
 		this.repositoryResolver = opts.repositoryResolver;
+		this.devcontainers = opts.devcontainers;
+		this.repositoryRegistry = opts.registry;
+		// A build finishing is the only thing that can release a webhook this
+		// gate held, and it happens on a timer this class does not own — so the
+		// release is a callback registered here rather than a poll.
+		this.devcontainers?.setOnBuildFinished((cacheKey) => {
+			void this.releaseHeldDevcontainerBuilds(cacheKey);
+		});
 		this.postRepositorySelection = opts.postRepositorySelection;
 		this.terminalTeardown = opts.terminalTeardown;
 		this.config = opts.config;
@@ -1054,6 +1083,198 @@ export class EventRouter {
 		);
 	}
 
+	/**
+	 * Ensures the issue's workspace image exists before anything boots.
+	 *
+	 * Returns `"held"` only while a build is running — the `created` webhook is
+	 * stashed verbatim and replayed by
+	 * {@link releaseHeldDevcontainerBuilds} when the build reaches a terminal
+	 * state. Every other outcome, including a failed build, returns `"ready"`:
+	 * the default worker image is a real fallback (it carries every toolchain),
+	 * and holding an issue forever because its devcontainer does not compile
+	 * would be worse than starting in an environment we can name.
+	 */
+	private async ensureDevcontainerImage(
+		webhook: SessionEvent,
+		issueKey: string,
+		workspaceId: string,
+	): Promise<"ready" | "held"> {
+		const devcontainers = this.devcontainers;
+		if (!devcontainers) return "ready";
+		const sessionId = webhook.agentSession.id;
+
+		if (this.store.getPendingDevcontainerBuild(sessionId)) {
+			// A repeated `created` delivery for a session already waiting on a
+			// build. Asking again would post a second notice and overwrite the
+			// held event with an identical one.
+			return "held";
+		}
+
+		const repositories = await this.repositoriesForIssue(issueKey, workspaceId);
+		if (repositories.length === 0) return "ready";
+		if (repositories.length > 1) {
+			// Task 8 is blocked on an open question (which environment wins when
+			// an issue deliberately fans out). The default worker image is the
+			// plan's own recommended answer, and it is the only one that is safe
+			// without asking — so take it, and say what it costs.
+			await this.postActivityQuietly(
+				workspaceId,
+				sessionId,
+				fillTemplate(DEVCONTAINER_MULTI_REPO_MESSAGE, {
+					repositories: repositories.map((repo) => repo.name).join(", "),
+				}),
+			);
+			return "ready";
+		}
+
+		const repo = repositories[0];
+		if (!repo) return "ready";
+		const outcome = await devcontainers.ensureForIssue(issueKey, repo);
+		switch (outcome.kind) {
+			case "default":
+				return "ready";
+			case "ready":
+				if (this.devcontainerNotified.delete(issueKey)) {
+					await this.postActivityQuietly(
+						workspaceId,
+						sessionId,
+						fillTemplate(DEVCONTAINER_READY_MESSAGE, {
+							repository: outcome.repositoryName,
+						}),
+					);
+				}
+				return "ready";
+			case "failed":
+				this.devcontainerNotified.delete(issueKey);
+				this.logger.error(
+					`Devcontainer image for ${issueKey} is unavailable; falling back to the default worker image: ${outcome.reason}`,
+				);
+				await this.postActivityQuietly(
+					workspaceId,
+					sessionId,
+					fillTemplate(DEVCONTAINER_BUILD_FAILED_MESSAGE, {
+						repository: repo.name,
+						detail: outcome.runId
+							? `ACR run ${outcome.runId}. ${outcome.reason}`
+							: outcome.reason,
+					}),
+				);
+				return "ready";
+			case "building": {
+				if (!this.devcontainerNotified.has(issueKey)) {
+					this.devcontainerNotified.add(issueKey);
+					await this.postActivityQuietly(
+						workspaceId,
+						sessionId,
+						fillTemplate(DEVCONTAINER_BUILDING_MESSAGE, {
+							repository: outcome.repositoryName,
+						}),
+					);
+				}
+				this.store.createPendingDevcontainerBuild({
+					agentSessionId: sessionId,
+					issueKey,
+					workspaceId,
+					cacheKey: outcome.cacheKey,
+					createdEvent: JSON.stringify(webhook),
+					createdMs: this.now(),
+				});
+				this.logger.info(
+					`Holding the created event for ${issueKey} while ${outcome.repositoryName}'s workspace image builds`,
+				);
+				return "held";
+			}
+		}
+	}
+
+	/**
+	 * Replays every `created` webhook held on a build that has just finished.
+	 *
+	 * The rows are taken in one transaction, so a build finishing can never
+	 * replay the same event twice — and the replay goes back through
+	 * {@link routeCreated}, which re-runs the gate and now finds a `ready` (or
+	 * `failed`) cache row instead of a `building` one.
+	 */
+	private async releaseHeldDevcontainerBuilds(cacheKey: string): Promise<void> {
+		for (const pending of this.store.takePendingDevcontainerBuilds(cacheKey)) {
+			let held: SessionEvent | undefined;
+			try {
+				held = JSON.parse(pending.createdEvent) as SessionEvent;
+			} catch (error) {
+				this.logger.error(
+					`Held created event for ${pending.issueKey} is unreadable; the delegation for this issue is lost`,
+					error,
+				);
+				continue;
+			}
+			try {
+				await this.routeCreated(held);
+			} catch (error) {
+				// `route()` is invoked as `void route(event)` with no catch, and
+				// this runs from a build's completion callback rather than from a
+				// webhook — so letting this escape would take the router process
+				// down for every teammate over one failed replay.
+				this.logger.error(
+					`Could not replay the held created event for ${pending.issueKey} after its workspace image finished building`,
+					error,
+				);
+			}
+		}
+	}
+
+	/**
+	 * The repositories an issue was routed to, as registered entries.
+	 *
+	 * Reads the decision the repository gate has already persisted; an issue
+	 * with no decision (or one naming repositories since deregistered) gets an
+	 * empty list, which the caller treats as "use the default image" rather
+	 * than guessing at an environment.
+	 */
+	private async repositoriesForIssue(
+		issueKey: string,
+		workspaceId: string,
+	): Promise<RegisteredRepository[]> {
+		const registry = this.repositoryRegistry;
+		const decision = this.store.getIssueRepositories(issueKey);
+		if (!registry || !decision) return [];
+		let all: RegisteredRepository[];
+		try {
+			({ repositories: all } = await registry.list());
+		} catch (error) {
+			this.logger.warn(
+				`Could not read the repository registry to pick an environment for ${issueKey}; using the default worker image`,
+				error,
+			);
+			return [];
+		}
+		const byName = new Map(all.map((repo) => [repo.name, repo]));
+		return decision.repoNames
+			.map((name) => byName.get(name))
+			.filter(
+				(repo): repo is RegisteredRepository =>
+					repo !== undefined && repo.linearWorkspaceId === workspaceId,
+			);
+	}
+
+	/**
+	 * A Linear 5xx while posting build progress must never abort the gate: the
+	 * build is the point, the notice is courtesy.
+	 */
+	private async postActivityQuietly(
+		workspaceId: string,
+		sessionId: string,
+		body: string,
+	): Promise<void> {
+		try {
+			await this.postActivity(workspaceId, sessionId, body);
+		} catch (error) {
+			this.logger.warn(
+				`Failed to post a devcontainer progress activity for session ${sessionId}`,
+				error,
+			);
+		}
+	}
+
 	private async routeCreated(webhook: SessionEvent): Promise<void> {
 		const sessionId = webhook.agentSession.id;
 		const workspaceId = webhook.organizationId;
@@ -1103,6 +1324,23 @@ export class EventRouter {
 				issueKey,
 				workspaceId,
 				issueId,
+			);
+			if (gate === "held") return;
+		}
+
+		// The environment gate runs AFTER the repository gate and before any
+		// target resolution, for the same reason: a build costs minutes, and
+		// paying them with the webhook held is strictly better than creating a
+		// device row and a sandbox for an issue whose image does not exist yet.
+		if (
+			issueKey !== undefined &&
+			this.devcontainers &&
+			!this.isKnownPhysicalDeviceCreator(creator)
+		) {
+			const gate = await this.ensureDevcontainerImage(
+				webhook,
+				issueKey,
+				workspaceId,
 			);
 			if (gate === "held") return;
 		}

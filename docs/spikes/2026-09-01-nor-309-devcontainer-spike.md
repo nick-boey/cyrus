@@ -8,12 +8,85 @@ model. Nothing was found that cannot be expressed. But two things ADR 0005
 assumes a Feature can do, a Feature structurally cannot, and one delivery
 mechanism the plan implies does not exist yet.
 
-**This spike did not build an image.** The sandbox it ran in has no container
-runtime and no `sudo`, and its egress allowlist blocks `nodejs.org`. Everything
-under [What was executed](#what-was-executed) is real evidence; everything under
-[What was not](#what-was-not-executed) is analysis of primary sources.
-`docker/worker/devcontainer/build.sh` exists so the unexecuted half is one
-command rather than a reconstruction. Treat a failure there as new evidence.
+**The build has now been run.** It was written blind — the sandbox that produced
+these files had no container runtime, no `sudo`, and an egress allowlist that
+blocks `nodejs.org` — and `docker/worker/devcontainer/build.sh` was left behind
+so discharging the gate would be one command rather than a reconstruction. It
+was executed on 2026-09-01 against Docker 29.7.2 (darwin/arm64):
+
+**All 23 boot-contract assertions pass.** `devcontainer build` took 205s and
+produced a **7.76 GB** image. The whole chain holds: the composed features
+install, the finalize stage drops to `cyrus`, and `/entrypoint.sh` reaches
+`container-boot`'s environment validation as the non-root user.
+
+Two things only a real build could show, and one of them contradicts this
+document's own advice — see [What the build changed](#what-the-build-changed).
+
+## What the build changed
+
+Two findings, one of which falsifies a recommendation this document made.
+
+### `--buildkit never` does not disable BuildKit. `DOCKER_BUILDKIT=0` does.
+
+This document proposed `devcontainer build --buildkit never` as the lever that
+keeps the result out of the OCI-image-index shape the ACA disk importer cannot
+consume. **The flag is not sufficient**, verified in both directions:
+
+```
+$ devcontainer build --buildkit never …
+… #28 exporting attestation manifest sha256:d9a4… done
+$ docker image inspect cyrus-worker-devcontainer:built --format '{{.Descriptor.MediaType}}'
+application/vnd.oci.image.index.v1+json      # ← exactly what the importer rejects
+
+$ DOCKER_BUILDKIT=0 devcontainer build --buildkit never …
+… Successfully built b99343ce0eb0            # ← classic builder
+application/vnd.oci.image.manifest.v1+json   # ← single manifest, no index
+```
+
+The CLI's own log says why: it shells out to plain `docker build`
+(`Start: Run: docker build --build-arg _DEV_CONTAINERS_BASE_IMAGE=…`), so
+`--buildkit never` only decides which flags *it* passes — it does not put
+`DOCKER_BUILDKIT=0` in the child's environment, and the daemon then picks
+BuildKit anyway. The environment variable has to be set by the caller.
+
+`BUILDX_NO_DEFAULT_ATTESTATIONS=1` also collapses the index to a single
+manifest, and is the right belt-and-braces flag for the finalize `docker build`.
+Neither is a *guarantee*, though: the local descriptor came back as an OCI
+manifest rather than the `application/vnd.docker.distribution.manifest.v2+json`
+that `scripts/deploy-worker-image.sh` gates on, because Docker Desktop's
+containerd image store normalises it. On an ACR agent (plain dockerd, no
+containerd store) the classic builder yields the Docker v2 manifest — but the
+build pipeline should **assert the pushed manifest's media type** rather than
+trust a flag, since every mechanism here is a property of the daemon rather than
+of anything we can pass.
+
+### The image is 7.76 GB, not ~18.4 GB — and neither is the number to plan on
+
+The estimate in [Size and build duration](#size-and-build-duration) below
+assumed the devcontainer expression would land near the Dockerfile's 18.4 GB.
+Measured on the same host, on arm64:
+
+| | Size |
+| -- | -- |
+| `docker/worker/Dockerfile` (existing build, `cyrus-worker:test`) | 6.53 GB |
+| The devcontainer expression | 7.76 GB |
+
+So the expression costs about **1.2 GB more** than the Dockerfile it reproduces
+— plausibly the devcontainer feature scaffolding plus the worker's private Node,
+which is deliberately a second Node runtime. What it does *not* do is change the
+order of magnitude, so nothing here relieves the disk-import constraints
+described below; the 18.4 GB figure is an amd64 measurement taken differently
+and is not comparable to either number in that table.
+
+`devcontainer build` took **205s** with a warm layer cache for the base and cold
+for everything else.
+
+### One bug in `build.sh` itself, now fixed
+
+The final assertion reported `FAIL` while printing the exact line it was looking
+for. `container-boot` exits non-zero when it refuses to start — which is the
+success condition — and under `set -o pipefail` the pipeline's status is the
+`docker run`'s, not the `grep`'s. The check now captures the output first.
 
 ## The two amendments
 
@@ -309,22 +382,21 @@ Real evidence, run in this sandbox:
 
 ## What was not executed
 
-- `devcontainer build`. **No container runtime, no `sudo`.**
-- The boot contract checks **against a built image**. Written as 23 assertions
-  in `build.sh`. The decisive one — `/entrypoint.sh` reaching `container-boot`'s
-  "Missing required environment variable(s)" — was run outside a container and
-  passes (see above); what remains unproven is that it still holds after the
-  Features have composed and the finalize stage has dropped to the non-root
-  user. The toolchain-as-non-root checks (`CARGO_HOME` writable, `dotnet`,
-  `pwsh`, `/ms-playwright` writable) have not run in any form.
-- The Node install path. `nodejs.org` and `unofficial-builds.nodejs.org` both
-  return 403 through this sandbox's egress allowlist.
-- `devcontainer build` inside an ACR task.
+Everything in the original list has since run **except** the two below.
+
+- `devcontainer build` inside an ACR task. Still the one unverified link in the
+  chain, and the reason the build pipeline gates on the pushed manifest's media
+  type rather than on a flag.
 - Alpine and RHEL bases. The worker Feature is written for four families; only
-  the Debian branch is exercised by the reproduction devcontainer, and none of
-  it has run. ADR 0005 names this as "the single constraint most likely to be
-  quietly dropped during implementation" — it has not been dropped, but it has
-  not been proven either.
+  the Debian branch is exercised by the reproduction devcontainer, and only that
+  branch has run. ADR 0005 names this as "the single constraint most likely to
+  be quietly dropped during implementation" — it has not been dropped, but it
+  has not been proven either.
+
+The rest of the original list is now discharged: `devcontainer build` itself,
+all 23 boot-contract assertions against a built image (including every
+toolchain-as-non-root check — `CARGO_HOME` writable, `dotnet`, `pwsh`,
+`/ms-playwright` writable), and the Node install path.
 
 ## Artifacts
 
@@ -342,5 +414,8 @@ Real evidence, run in this sandbox:
 3. **Task 3 gains three requirements:** publish a worker payload artifact per
    release; emit `overrideFeatureInstallOrder` with the worker feature first;
    build with `--buildkit never` (or attestations disabled).
-4. **Run `build.sh` on a Docker host before Task 1 starts.** Task 0's gate is
-   not fully discharged until it passes.
+4. ~~**Run `build.sh` on a Docker host before Task 1 starts.**~~ **Done** —
+   2026-09-01, 23/23. See [What the build changed](#what-the-build-changed).
+5. **The build pipeline exports `DOCKER_BUILDKIT=0`** rather than relying on
+   `--buildkit never`, and **asserts the pushed manifest's media type** rather
+   than trusting either.

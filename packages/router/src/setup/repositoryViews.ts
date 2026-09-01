@@ -21,6 +21,16 @@ export interface RepositoryView {
 	/** The `p=`/`t=` string, already formatted by `formatAssociations`. */
 	associations: string;
 	isDefault: boolean;
+	/**
+	 * Warm-build status for this repository's devcontainer image (NOR-309
+	 * Task 7). Absent when the feature is off, or when the repository declares
+	 * no devcontainer.
+	 *
+	 * This column exists because a warm build is fire-and-forget: its failures
+	 * are invisible by construction, and the person who needs to know is an
+	 * operator on this page rather than anyone watching an issue.
+	 */
+	environment?: { state: "building" | "ready" | "failed"; detail?: string };
 }
 
 export interface RepositoriesPageModel {
@@ -136,8 +146,28 @@ function renderRow(repo: RepositoryView, csrfToken: string): string {
 			aria-label="Associations for ${name}"></td>
 		<td><input type="radio" name="isDefault" value="${name}"${repo.isDefault ? " checked" : ""}
 			aria-label="Make ${name} the default"></td>
+		<td>${renderEnvironment(repo.environment)}</td>
 		<td>${renderDeleteButton(repo.name, csrfToken)}</td>
 	</tr>`;
+}
+
+/**
+ * The `detail` is rendered as a `title` rather than inline: a failure detail is
+ * an ACR run id plus a bounded log tail, which is exactly what an operator
+ * needs and exactly what would wreck a table row.
+ */
+function renderEnvironment(environment: RepositoryView["environment"]): string {
+	if (!environment) return "<small>default</small>";
+	const label =
+		environment.state === "ready"
+			? "own image"
+			: environment.state === "building"
+				? "building…"
+				: "build failed";
+	const title = environment.detail
+		? ` title="${escapeHtml(environment.detail)}"`
+		: "";
+	return `<small${title}>${escapeHtml(label)}</small>`;
 }
 
 function renderWorkspaceField(workspaceIds: string[]): string {
@@ -170,7 +200,7 @@ export function renderRepositoriesTable(model: RepositoriesPageModel): string {
 		${versionField}
 		<table>
 			<thead>
-				<tr><th>Name</th><th>GitHub slug</th><th>Base branch</th><th>Associations</th><th>Default</th><th></th></tr>
+				<tr><th>Name</th><th>GitHub slug</th><th>Base branch</th><th>Associations</th><th>Default</th><th>Environment</th><th></th></tr>
 			</thead>
 			<tbody>${rows}</tbody>
 		</table>

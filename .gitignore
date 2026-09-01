@@ -70,3 +70,10 @@ infra/azure/bicep/**/*.json
 # Claude worktrees
 .claude/worktrees
 .superpowers/
+
+# NOR-309 spike reproduction build artifacts. `build.sh` stages a copy of the
+# cyrus-worker Feature here (the devcontainer CLI refuses local feature paths
+# that escape the .devcontainer folder) and the CLI writes a lock file beside
+# it; neither is a source.
+docker/worker/devcontainer/.devcontainer/features/cyrus-worker/
+docker/worker/devcontainer/.devcontainer/devcontainer-lock.json

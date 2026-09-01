@@ -93,3 +93,32 @@ A second consequence of "assumes nothing of its base": the worker's Node runtime
 must be installed **off `PATH`**. The agent runs the repository's own builds, so
 the Node the repository pinned must be the one its sessions see; a worker Node
 shadowing it makes a version mismatch look like a bug in the repository.
+
+## Amendment: the assumption has now been tested against a real build
+
+The spike above was written without a container runtime, so its verdict was
+analysis rather than evidence. `docker/worker/devcontainer/build.sh` was
+executed on 2026-09-01 (Docker 29.7.2, darwin/arm64) and **all 23 boot-contract
+assertions pass**: the composed features install, the finalize stage drops to
+the non-root user, every toolchain is usable as that user, and `/entrypoint.sh`
+reaches `container-boot`'s environment validation.
+
+The decision therefore stands on evidence, not on argument. Two things the build
+changed:
+
+- **`--buildkit never` is not the lever the spike claimed.** The devcontainer
+  CLI shells out to plain `docker build`, so the flag only decides which flags
+  *it* passes; the daemon picks BuildKit anyway and attaches provenance/SBOM
+  attestations, producing the OCI image index the ACA disk importer cannot
+  consume. `DOCKER_BUILDKIT=0` in the environment is what selects the classic
+  builder. Since every such mechanism is a property of the daemon rather than of
+  anything we can pass, the build pipeline additionally **asserts the pushed
+  manifest's media type** and fails there.
+- **Size is 7.76 GB against the Dockerfile's 6.53 GB on the same host** — about
+  1.2 GB more, plausibly the feature scaffolding plus the worker's deliberately
+  private second Node. Same order of magnitude, so nothing here relieves the
+  disk-import constraints, and nothing here contradicts the plan's explicit
+  non-goal of shrinking the default image.
+
+Still unproven, and named here so it is not quietly dropped: `devcontainer
+build` inside an ACR task, and the Alpine/RHEL branches of the worker feature.
