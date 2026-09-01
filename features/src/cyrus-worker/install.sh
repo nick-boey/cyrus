@@ -215,6 +215,15 @@ chmod 0755 /usr/local/bin/cyrus
 printf '#!/bin/sh\nexec %s %s container-boot\n' "${NODE_BIN}" "${APP_PATH}" >/entrypoint.sh
 chmod 0755 /entrypoint.sh
 
+# The worker tree stays root-OWNED — the agent has no business writing to its
+# own runtime — but must be world-readable and world-traversable, because the
+# process that reads it runs as the non-root user. Everything here was created
+# by root under whatever umask the base image set, and a hardened base setting
+# 077 would produce a tree only root can read: the container would then fail at
+# exec with a permission error on a path that visibly exists. Same reason the
+# fleece-cli Feature does this to its --tool-path.
+chmod -R a+rX "${WORKER_HOME}"
+
 # ---------------------------------------------------------------------------
 # The worker user and the paths it owns.
 #
