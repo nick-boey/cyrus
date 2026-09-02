@@ -12,6 +12,9 @@ import {
 	checkLinuxSandboxRequirements,
 	logSandboxRequirementFailures,
 	resetSandboxRequirementsCacheForTesting,
+	resolveSubprocessEnvScrub,
+	SUBPROCESS_ENV_SCRUB_ENV,
+	SubprocessEnvScrubUnavailableError,
 } from "../src/sandbox-requirements";
 
 const spawnSyncMock = vi.mocked(spawnSync);
@@ -248,8 +251,12 @@ describe("sandbox-requirements", () => {
 			expect(mockLogger.warn.mock.calls[0]?.[0]).toContain(
 				"Linux sandbox requirements are not met",
 			);
+			// Names the switch the operator actually controls. The old wording
+			// ("skipping CLAUDE_CODE_SUBPROCESS_ENV_SCRUB") implied the flag
+			// would have been set if only the host were equipped, which was
+			// never true and is what got NOR-412 filed as a security regression.
 			expect(mockLogger.warn.mock.calls[0]?.[0]).toContain(
-				"skipping CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+				SUBPROCESS_ENV_SCRUB_ENV,
 			);
 			expect(mockLogger.warn.mock.calls[2]?.[0]).toContain("[socat]");
 			expect(mockLogger.warn.mock.calls[2]?.[0]).toContain("Install socat.");
@@ -272,6 +279,132 @@ describe("sandbox-requirements", () => {
 
 			// Only the first call should have emitted warnings
 			expect(mockLogger.warn).toHaveBeenCalledTimes(3);
+		});
+	});
+
+	describe("resolveSubprocessEnvScrub", () => {
+		function resolve(env: NodeJS.ProcessEnv) {
+			return resolveSubprocessEnvScrub({ logger: mockLogger as any, env });
+		}
+
+		it("is disabled, and probes nothing, when the opt-in env var is unset", () => {
+			setPlatform("linux");
+
+			expect(resolve({}).enabled).toBe(false);
+
+			// The host probe is the expensive part and its result is irrelevant
+			// when we never intended to set the flag — running it is what
+			// produced the misleading "requirements are not met" warning.
+			expect(spawnSyncMock).not.toHaveBeenCalled();
+			expect(mockLogger.warn).not.toHaveBeenCalled();
+		});
+
+		it.each(["", "0", "false", "off", "no"])(
+			"treats %o as disabled",
+			(value) => {
+				setPlatform("linux");
+				expect(resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: value }).enabled).toBe(
+					false,
+				);
+				expect(spawnSyncMock).not.toHaveBeenCalled();
+			},
+		);
+
+		it.each(["1", "true", "TRUE", "on", "yes"])(
+			"treats %o as requested",
+			(value) => {
+				setPlatform("linux");
+				spawnSyncMock
+					.mockReturnValueOnce(okResult("/usr/bin/socat\n"))
+					.mockReturnValueOnce(okResult("/usr/bin/bwrap\n"))
+					.mockReturnValueOnce(okResult(""));
+
+				expect(resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: value }).enabled).toBe(
+					true,
+				);
+			},
+		);
+
+		it("announces once, at info, that the scrub is off by default", () => {
+			setPlatform("linux");
+
+			resolve({});
+			resolve({});
+
+			expect(mockLogger.info).toHaveBeenCalledTimes(1);
+			expect(mockLogger.info.mock.calls[0]?.[0]).toContain(
+				SUBPROCESS_ENV_SCRUB_ENV,
+			);
+		});
+
+		it("enables the scrub when requested and the host supports it", () => {
+			setPlatform("linux");
+			spawnSyncMock
+				.mockReturnValueOnce(okResult("/usr/bin/socat\n"))
+				.mockReturnValueOnce(okResult("/usr/bin/bwrap\n"))
+				.mockReturnValueOnce(okResult(""));
+
+			expect(resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" }).enabled).toBe(true);
+			expect(mockLogger.warn).not.toHaveBeenCalled();
+		});
+
+		it("enables the scrub on non-Linux hosts, which need no bubblewrap", () => {
+			setPlatform("darwin");
+
+			expect(resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" }).enabled).toBe(true);
+			expect(spawnSyncMock).not.toHaveBeenCalled();
+		});
+
+		it("throws rather than silently degrading when requested but unsupported", () => {
+			setPlatform("linux");
+			spawnSyncMock
+				.mockReturnValueOnce(failResult("not found", 1)) // socat missing
+				.mockReturnValueOnce(failResult("not found", 1)); // bwrap missing
+
+			expect(() => resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" })).toThrow(
+				SubprocessEnvScrubUnavailableError,
+			);
+		});
+
+		it("names every unmet requirement, and its resolution, in the thrown error", () => {
+			setPlatform("linux");
+			spawnSyncMock
+				.mockReturnValueOnce(failResult("not found", 1)) // socat missing
+				.mockReturnValueOnce(failResult("not found", 1)); // bwrap missing
+
+			let error: SubprocessEnvScrubUnavailableError | undefined;
+			try {
+				resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" });
+			} catch (caught) {
+				error = caught as SubprocessEnvScrubUnavailableError;
+			}
+
+			expect(error).toBeInstanceOf(SubprocessEnvScrubUnavailableError);
+			expect(error?.failures.map((f) => f.check)).toEqual([
+				"socat",
+				"bubblewrap",
+			]);
+			// The operator must be able to act on the failure from the message
+			// alone — this is the only place the guidance appears on a path that
+			// aborts the session.
+			expect(error?.message).toContain(SUBPROCESS_ENV_SCRUB_ENV);
+			expect(error?.message).toContain("[socat]");
+			expect(error?.message).toContain("[bubblewrap]");
+			expect(error?.message).toContain("apt-get install -y socat");
+			expect(error?.message).toContain("apt-get install -y bubblewrap");
+		});
+
+		it("keeps throwing on every session, not just the first", () => {
+			setPlatform("linux");
+			spawnSyncMock
+				.mockReturnValueOnce(failResult("not found", 1))
+				.mockReturnValueOnce(failResult("not found", 1));
+
+			const env = { [SUBPROCESS_ENV_SCRUB_ENV]: "1" };
+			expect(() => resolve(env)).toThrow(SubprocessEnvScrubUnavailableError);
+			// The once-per-process log latch must not be allowed to turn the
+			// second session's hard failure into a silent one.
+			expect(() => resolve(env)).toThrow(SubprocessEnvScrubUnavailableError);
 		});
 	});
 });

@@ -39,10 +39,7 @@ import { cyrusSpanAttributes, getTracer, type Span } from "cyrus-otel-traces";
 import dotenv from "dotenv";
 import { ClaudeMessageFormatter, type IMessageFormatter } from "./formatter.js";
 import { buildHomeDirectoryDisallowedTools } from "./home-directory-restrictions.js";
-import {
-	checkLinuxSandboxRequirements,
-	logSandboxRequirementFailures,
-} from "./sandbox-requirements.js";
+import { resolveSubprocessEnvScrub } from "./sandbox-requirements.js";
 import { composeSessionEnv, normalizeMcpHttpTransport } from "./session-env.js";
 import type {
 	ClaudeRunnerConfig,
@@ -710,14 +707,14 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			const pathToClaudeCodeExecutable = this.config.pathToClaudeCodeExecutable;
 
 			// On Linux, setting CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 causes the SDK
-			// to run tool invocations under a bubblewrap-backed sandbox. If the
-			// host lacks `socat`, `bubblewrap`, or the kernel/AppArmor config
-			// needed to create an unprivileged user namespace, the sandbox will
-			// fail at runtime. Check those requirements up front so we can fall
-			// back to unscrubbed env (and log resolution guidance to stdout)
-			// instead of failing opaquely mid-session.
-			const sandboxRequirements = checkLinuxSandboxRequirements();
-			logSandboxRequirementFailures(sandboxRequirements, this.logger);
+			// to run tool invocations under a bubblewrap-backed sandbox, keeping
+			// this session's Anthropic credentials out of the env of every Bash
+			// subprocess the agent spawns. Off unless CYRUS_SUBPROCESS_ENV_SCRUB
+			// opts in; when it does opt in and the host cannot support it, this
+			// throws rather than quietly running unscrubbed. See NOR-412.
+			const subprocessEnvScrub = resolveSubprocessEnvScrub({
+				logger: this.logger,
+			});
 
 			const isDebugLogging = this.logger.getLevel() === LogLevel.DEBUG;
 
@@ -741,17 +738,20 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					// see: https://docs.claude.com/en/docs/claude-code/sdk/migration-guide#settings-sources-no-longer-loaded-by-default
 					settingSources: ["user", "project", "local"],
 					env: {
-						// CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is intentionally NOT set while
-						// the Linux bubblewrap sandbox side effects it triggers are being
-						// investigated. The sandbox requirements precheck is still run
-						// above so the diagnostics remain available when we re-enable.
-						// See: CYPACK-1108.
 						// composeSessionEnv merges base env → repository .env →
 						// additionalEnv.
 						...composeSessionEnv({
 							repositoryEnv: this.repositoryEnv,
 							additionalEnv: this.config.additionalEnv,
 						}),
+						// Set or unset explicitly. composeSessionEnv spreads the whole
+						// parent process.env, so leaving this to fall through would let
+						// a stray CLAUDE_CODE_SUBPROCESS_ENV_SCRUB in the worker's own
+						// environment enable the SDK sandbox behind resolveSubprocessEnvScrub's
+						// back — on a host it just declined to enable it for.
+						CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: subprocessEnvScrub.enabled
+							? "1"
+							: undefined,
 						// When logging at DEBUG level, enable the SDK's own debug output so
 						// --debug-to-stderr and DEBUG=1 propagate to the Claude subprocess.
 						// Explicitly set or unset to override any leaked value from process.env.

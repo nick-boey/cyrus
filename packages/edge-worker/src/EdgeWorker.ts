@@ -16,6 +16,7 @@ import {
 	ClaudeRunner,
 	HttpSessionStore,
 	normalizeMcpHttpTransport,
+	resolveSubprocessEnvScrub,
 } from "cyrus-claude-runner";
 import { getCyrusAppUrl } from "cyrus-cloudflare-tunnel-client";
 import { CodexRunner } from "cyrus-codex-runner";
@@ -7912,9 +7913,19 @@ ${input.userComment}
 							...(allowedTools.length > 0 && { allowedTools }),
 							...(disallowedTools.length > 0 && { disallowedTools }),
 							settingSources: ["user", "project", "local"],
-							// CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is intentionally not set here;
-							// see CYPACK-1108 and ClaudeRunner.start() for context.
-							env: buildBaseSessionEnv(),
+							// Must match what ClaudeRunner.start() decides, or a session
+							// that lands on a warm instance runs with a different scrub
+							// posture than the same session started cold. A throw here is
+							// caught below and simply skips the pre-warm; the real session
+							// start then fails loudly with the same error (NOR-412).
+							env: {
+								...buildBaseSessionEnv(),
+								CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: resolveSubprocessEnvScrub({
+									logger: this.logger,
+								}).enabled
+									? "1"
+									: undefined,
+							},
 						},
 					});
 

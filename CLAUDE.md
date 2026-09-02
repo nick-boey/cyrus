@@ -760,6 +760,41 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      routes carry tokens in query position, and a secret that reaches a telemetry
      backend is disclosed.
 
+15. **Subprocess env scrubbing (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`)**:
+   - **The SDK flag is not the switch; `CYRUS_SUBPROCESS_ENV_SCRUB` is.** Setting
+     the SDK flag on a host without bubblewrap does nothing at all, which is why
+     it must never be passed straight through from config or inherited from the
+     parent env. `resolveSubprocessEnvScrub`
+     (`packages/claude-runner/src/sandbox-requirements.ts`) is the only place
+     that decides, and both call sites — `ClaudeRunner.start()` and
+     `EdgeWorker.warmupRecentSessions()` — set **or unset** the SDK flag
+     explicitly. `buildBaseSessionEnv` spreads the entire parent `process.env`,
+     so an unset key there means "inherit whatever the worker happened to have",
+     not "off".
+   - **Requested-but-unavailable is FATAL, not a warn.** A security control that
+     degrades to off with a `warn` is off again the next time a dependency goes
+     missing, and nothing alerts on it — which is how the worker image ran for
+     months without `socat` or `bubblewrap` and nobody noticed (NOR-412). When
+     the opt-in is set and the host cannot support it,
+     `SubprocessEnvScrubUnavailableError` aborts the session; that abort *is* the
+     alert. When the opt-in is absent, the host is **not probed at all** — the
+     requirements of a control nothing would have enabled are not interesting,
+     and probing for them is what produced the misleading
+     "requirements are not met — skipping" warning in every sandbox.
+   - **Three prerequisites, and only two of them live in the image.** `socat` and
+     `bubblewrap` are apt packages in `docker/worker/Dockerfile`. The third —
+     creating an unprivileged user namespace — is a property of the runtime.
+     Verified to hold inside a live ACA sandbox (the exact probe
+     `runBwrapSandboxProbe` runs exits 0 there), and verified NOT to hold on at
+     least one local Docker daemon (NOR-364 phase 3: `bwrap: No permissions to
+     create a new namespace`). So the scrub stays opt-in per host, and adding the
+     packages to the image is necessary but never sufficient — confirm with the
+     probe, not with `which`.
+   - `CYRUS_SUBPROCESS_ENV_SCRUB` is deliberately **not** in
+     `RESERVED_ENV_KEYS`: a user turning on a security control for their own
+     sessions is not a hijack, and leaving it storable is what lets an operator
+     enable it from their secret bundle without a router deploy.
+
 ## Dependency Security Policy (MANDATE)
 
 > **Config location (pnpm ≥10):** The root `package.json` `pnpm` field

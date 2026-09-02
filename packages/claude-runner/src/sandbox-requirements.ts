@@ -28,10 +28,52 @@ export interface SandboxRequirementsResult {
 	failures: SandboxRequirementFailure[];
 }
 
+/**
+ * Env var that opts a host into subprocess env scrubbing.
+ *
+ * Deliberately a Cyrus-side switch rather than passing
+ * `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` straight through: the SDK flag is a
+ * best-effort hint that does nothing on a host without bubblewrap, and the
+ * whole point of {@link resolveSubprocessEnvScrub} is that asking for the
+ * control and not getting it must be an error rather than a shrug.
+ *
+ * Accepts `1` / `true` / `on` / `yes` (case-insensitive). Anything else,
+ * including unset, leaves the scrub off.
+ */
+export const SUBPROCESS_ENV_SCRUB_ENV = "CYRUS_SUBPROCESS_ENV_SCRUB";
+
+/**
+ * Thrown when a host asks for subprocess env scrubbing it cannot support.
+ *
+ * This is fatal on purpose. A security control that degrades to off with a
+ * `warn` is off again the next time a dependency goes missing, and nothing
+ * alerts on it — which is exactly how the worker image shipped for months
+ * without `socat` or `bubblewrap` and nobody noticed (NOR-412).
+ */
+export class SubprocessEnvScrubUnavailableError extends Error {
+	readonly failures: SandboxRequirementFailure[];
+
+	constructor(failures: SandboxRequirementFailure[]) {
+		super(
+			[
+				`${SUBPROCESS_ENV_SCRUB_ENV} is set, but this host cannot support subprocess env scrubbing:`,
+				...failures.map(
+					(failure) =>
+						`  [${failure.check}] ${failure.message}\n${indent(failure.resolution, 6)}`,
+				),
+				`Resolve the above, or unset ${SUBPROCESS_ENV_SCRUB_ENV} to run without the scrub.`,
+			].join("\n"),
+		);
+		this.name = "SubprocessEnvScrubUnavailableError";
+		this.failures = failures;
+	}
+}
+
 // Memoize the check at the module level so we only probe the system once per
 // process, and we only log guidance to the user on the first probe.
 let cachedResult: SandboxRequirementsResult | undefined;
 let hasLoggedFailures = false;
+let hasLoggedScrubDisabled = false;
 
 /**
  * Verify that the host Linux system has the packages and kernel/AppArmor
@@ -112,6 +154,48 @@ export function checkLinuxSandboxRequirements(): SandboxRequirementsResult {
 }
 
 /**
+ * Decide whether this session should set `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`.
+ *
+ * Three outcomes, and the asymmetry between them is the point:
+ *
+ * - **Not requested** (the default, preserving CYPACK-1108): returns disabled
+ *   *without probing the host at all*. The requirements of a control we never
+ *   intended to enable are not interesting, and probing for them is what
+ *   produced nine sandboxes' worth of "requirements are not met — skipping"
+ *   warnings for a flag no code path would have set anyway (NOR-412).
+ * - **Requested and supported**: returns enabled.
+ * - **Requested and unsupported**: throws
+ *   {@link SubprocessEnvScrubUnavailableError}. Aborting the session is the
+ *   alert that the warn-and-continue path never was.
+ */
+export function resolveSubprocessEnvScrub(options: {
+	logger: ILogger;
+	env?: NodeJS.ProcessEnv;
+}): { enabled: boolean } {
+	const env = options.env ?? process.env;
+
+	if (!isTruthyEnvValue(env[SUBPROCESS_ENV_SCRUB_ENV])) {
+		if (!hasLoggedScrubDisabled) {
+			hasLoggedScrubDisabled = true;
+			options.logger.info(
+				`Subprocess env scrubbing is off; set ${SUBPROCESS_ENV_SCRUB_ENV}=1 to require it.`,
+			);
+		}
+		return { enabled: false };
+	}
+
+	const requirements = checkLinuxSandboxRequirements();
+	if (!requirements.supported) {
+		// Log the guidance as well as throwing: the log lands in the structured
+		// sink an operator greps, while the error is what stops the session.
+		logSandboxRequirementFailures(requirements, options.logger);
+		throw new SubprocessEnvScrubUnavailableError(requirements.failures);
+	}
+
+	return { enabled: true };
+}
+
+/**
  * Log requirement failures as WARN-level messages via the dedicated logger.
  * The warnings are emitted at most once per process; subsequent calls are
  * no-ops regardless of which logger instance is passed.
@@ -126,28 +210,42 @@ export function logSandboxRequirementFailures(
 	hasLoggedFailures = true;
 
 	logger.warn(
-		"Linux sandbox requirements are not met — skipping CLAUDE_CODE_SUBPROCESS_ENV_SCRUB.",
+		`Linux sandbox requirements are not met — ${SUBPROCESS_ENV_SCRUB_ENV} cannot be honored.`,
 	);
 	logger.warn(
-		"Claude sessions will continue, but subprocess env scrubbing will be disabled until these are resolved:",
+		"Subprocess env scrubbing is unavailable on this host until these are resolved:",
 	);
 
 	for (const failure of result.failures) {
-		const resolutionBlock = failure.resolution
-			.split("\n")
-			.map((line) => `      ${line}`)
-			.join("\n");
-		logger.warn(`  [${failure.check}] ${failure.message}\n${resolutionBlock}`);
+		logger.warn(
+			`  [${failure.check}] ${failure.message}\n${indent(failure.resolution, 6)}`,
+		);
 	}
 }
 
 /**
- * Reset the cached requirements result and the "already logged" flag.
+ * Reset the cached requirements result and the "already logged" flags.
  * Intended for use in unit tests only.
  */
 export function resetSandboxRequirementsCacheForTesting(): void {
 	cachedResult = undefined;
 	hasLoggedFailures = false;
+	hasLoggedScrubDisabled = false;
+}
+
+function indent(text: string, spaces: number): string {
+	const pad = " ".repeat(spaces);
+	return text
+		.split("\n")
+		.map((line) => `${pad}${line}`)
+		.join("\n");
+}
+
+function isTruthyEnvValue(value: string | undefined): boolean {
+	if (value === undefined) {
+		return false;
+	}
+	return ["1", "true", "on", "yes"].includes(value.trim().toLowerCase());
 }
 
 function isCommandAvailable(command: string): boolean {
