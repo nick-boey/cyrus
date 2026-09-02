@@ -1,10 +1,10 @@
 # NOR-309 Task 0 — can the default worker image be expressed as a devcontainer?
 
-**Verdict: the worker feature can be made self-contained. ADR 0005 survives, with
+**Verdict: the worker feature can be made self-contained. ADR 0006 survives, with
 two amendments — one to the ADR's text and one to the plan's Task 2.**
 
 Every component of `docker/worker/Dockerfile` maps onto the Dev Containers
-model. Nothing was found that cannot be expressed. But two things ADR 0005
+model. Nothing was found that cannot be expressed. But two things ADR 0006
 assumes a Feature can do, a Feature structurally cannot, and one delivery
 mechanism the plan implies does not exist yet.
 
@@ -90,9 +90,9 @@ success condition — and under `set -o pipefail` the pipeline's status is the
 
 ## The two amendments
 
-### 1. A Feature cannot set `USER` or `ENTRYPOINT`. ADR 0005 says it must.
+### 1. A Feature cannot set `USER` or `ENTRYPOINT`. ADR 0006 says it must.
 
-ADR 0005 states the boot contract becomes an interface the feature establishes:
+ADR 0006 states the boot contract becomes an interface the feature establishes:
 "The container is entered at `/entrypoint.sh` running `container-boot`, as a
 non-root user…". A Feature contributes `RUN` layers only, and the devcontainer
 CLI does not close the gap:
@@ -112,7 +112,7 @@ So a `devcontainer build` of a repo whose base is, say, `node:22-slim` produces
 an image that runs as **root** with **node's** entrypoint, no matter what the
 composed config says.
 
-**This does not falsify ADR 0005.** The fix is a two-instruction stage over the
+**This does not falsify ADR 0006.** The fix is a two-instruction stage over the
 built image (`docker/worker/devcontainer/Dockerfile.finalize`):
 
 ```dockerfile
@@ -124,7 +124,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 That stage is **uniform** — it does not vary with the shape of the repository's
 base — so it is not the "bespoke grafting logic against every shape a base can
 take" the ADR rejects. It grafts onto the built image, not into the repository's
-Dockerfile. But ADR 0005's claim that the standard's own composition mechanism
+Dockerfile. But ADR 0006's claim that the standard's own composition mechanism
 carries the whole boot contract is too strong as written, and the build pipeline
 (Task 3) owns two instructions the ADR does not currently account for.
 
@@ -389,7 +389,7 @@ Everything in the original list has since run **except** the two below.
   type rather than on a flag.
 - Alpine and RHEL bases. The worker Feature is written for four families; only
   the Debian branch is exercised by the reproduction devcontainer, and only that
-  branch has run. ADR 0005 names this as "the single constraint most likely to
+  branch has run. ADR 0006 names this as "the single constraint most likely to
   be quietly dropped during implementation" — it has not been dropped, but it
   has not been proven either.
 
@@ -407,7 +407,7 @@ toolchain-as-non-root check — `CARGO_HOME` writable, `dotnet`, `pwsh`,
 
 ## Recommended plan changes
 
-1. **Amend ADR 0005** to record that `USER` and `ENTRYPOINT` are the build
+1. **Amend ADR 0006** to record that `USER` and `ENTRYPOINT` are the build
    pipeline's, not the feature's, and why that does not reopen the decision.
 2. **Task 2 becomes a set of Features**, not one, and `tarball` is its primary
    delivery mechanism.

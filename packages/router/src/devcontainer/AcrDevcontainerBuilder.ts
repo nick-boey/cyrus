@@ -5,7 +5,7 @@ import type { DevcontainerConfig, DevcontainerFile } from "./config.js";
  * Task 3 (NOR-309): building a repository's devcontainer, in ACR and nowhere
  * else.
  *
- * ADR 0006 is the reason this is not a local `docker build`: a registered
+ * ADR 0007 is the reason this is not a local `docker build`: a registered
  * repository is trusted, but the *builder* is what we constrain. The build runs
  * a repository-authored Dockerfile and repository-chosen Features with
  * unrestricted egress — so it runs on disposable ACR agent compute, under an
@@ -55,7 +55,7 @@ export interface AcrBuilderConfig {
 	loginServer: string;
 	/**
 	 * Repository path images are pushed under, e.g. "cyrus/devcontainers".
-	 * The build identity is scoped to exactly this path (ADR 0006).
+	 * The build identity is scoped to exactly this path (ADR 0007).
 	 */
 	imageRepository?: string;
 	/** ARM api-version for the ContainerRegistry runs API. */
@@ -117,7 +117,7 @@ export type ArmRequestFn = (
  *
  * This stage is UNIFORM: it does not vary with the shape of the repository's
  * base, which is why it is not the "bespoke grafting logic against every shape a
- * base can take" that ADR 0005 rejects. It grafts onto the built image, not into
+ * base can take" that ADR 0006 rejects. It grafts onto the built image, not into
  * the repository's Dockerfile.
  *
  * The assertion is the highest-value line in it. Without it a missing worker
@@ -134,11 +134,11 @@ export function finalizeDockerfile(
 	// that only the devcontainer CLI reads when it execs in. ACA boots the
 	// image's own OCI config and reads no such label, so a field we document as
 	// "Used" would otherwise be silently dropped — exactly the failure mode ADR
-	// 0005 calls worse than not supporting the field at all.
+	// 0006 calls worse than not supporting the field at all.
 	const env = Object.entries(containerEnv ?? {})
 		// A key that is not a shell identifier cannot be an `ENV` name; emitting
 		// it would break the build with a Dockerfile parse error rather than
-		// naming the offending key. Repository content is trusted (ADR 0006), so
+		// naming the offending key. Repository content is trusted (ADR 0007), so
 		// this is a legibility guard, not a security boundary.
 		.filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
 		.map(([key, value]) => {
@@ -182,7 +182,7 @@ ENTRYPOINT ["/entrypoint.sh"]
  *   feature running first therefore produces a root-owned `CARGO_HOME` — every
  *   `cargo build` failing at runtime, in an image that built without a warning.
  * - The repository's own feature options win on a key collision, because the
- *   repository is trusted (ADR 0006) and this is its environment. Only the
+ *   repository is trusted (ADR 0007) and this is its environment. Only the
  *   worker feature's own entry is ours.
  *
  * `containerUser`/`remoteUser` are set so the features' `_REMOTE_USER` resolves

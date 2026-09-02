@@ -150,7 +150,7 @@ export const DEVCONTAINER_READY_MESSAGE =
 	"The workspace image for {{repository}} is ready. Starting now.";
 
 /**
- * `{{runId}}` is the load-bearing half of this message (ADR 0006): the build ran
+ * `{{runId}}` is the load-bearing half of this message (ADR 0007): the build ran
  * with unrestricted egress over repository-controlled content, so the log is
  * behind Azure's own authorization and this id is what makes
  * `az acr task logs --run-id` possible for someone allowed to read it.

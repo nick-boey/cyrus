@@ -12,7 +12,7 @@
 # So the boot contract's last two clauses are applied here, over whatever
 # `devcontainer build` produced. This stage is UNIFORM: it does not vary with
 # the shape of the repository's base, which is why it is not the "bespoke
-# grafting logic" ADR 0005 rejects. It grafts onto the built image, not into
+# grafting logic" ADR 0006 rejects. It grafts onto the built image, not into
 # the repository's Dockerfile.
 ARG BUILT_IMAGE
 FROM ${BUILT_IMAGE}

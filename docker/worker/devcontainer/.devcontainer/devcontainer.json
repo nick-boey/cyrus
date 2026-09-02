@@ -1,7 +1,7 @@
 {
 	// NOR-309 Task 0 spike: docker/worker/Dockerfile expressed as a devcontainer.
 	//
-	// This is the hardest available test of ADR 0005's assumption that an
+	// This is the hardest available test of ADR 0006's assumption that an
 	// arbitrary base plus a self-contained worker feature can boot Cyrus. It is
 	// a falsification exercise, not a product artifact — see
 	// docs/spikes/2026-09-01-nor-309-devcontainer-spike.md for the verdict and

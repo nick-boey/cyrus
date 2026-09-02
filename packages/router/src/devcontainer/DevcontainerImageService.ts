@@ -391,7 +391,7 @@ export class DevcontainerImageService {
 					{
 						state: "failed",
 						runId: result.runId,
-						// The run id is the load-bearing part (ADR 0006): it is what
+						// The run id is the load-bearing part (ADR 0007): it is what
 						// makes `az acr task logs --run-id` possible for someone who
 						// is allowed to see a log that ran with unrestricted egress
 						// over repository-controlled content. The tail is a hint.

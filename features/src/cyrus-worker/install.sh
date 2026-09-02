@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cyrus worker devcontainer Feature.
 #
-# ADR 0005 makes the repository's devcontainer image the base and Cyrus a
+# ADR 0006 makes the repository's devcontainer image the base and Cyrus a
 # Feature on top. That inverts who guarantees the boot contract: everything
 # `docker/worker/Dockerfile` gets for free by owning the whole image, this
 # script has to establish on a base that knows nothing about Cyrus.

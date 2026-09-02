@@ -433,7 +433,7 @@ export interface DevcontainerImageRow {
 	diskName: string;
 	imageRef: string;
 	state: "building" | "ready" | "failed";
-	/** ACR run id — the load-bearing half of a failure report (ADR 0006). */
+	/** ACR run id — the load-bearing half of a failure report (ADR 0007). */
 	runId?: string;
 	error?: string;
 	updatedMs: number;

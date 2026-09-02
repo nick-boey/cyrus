@@ -2,7 +2,7 @@
 
 Makes an arbitrary image able to host a Cyrus agent.
 
-Under [ADR 0005](../../../docs/adr/0005-devcontainer-image-is-the-base-cyrus-is-a-feature.md)
+Under [ADR 0006](../../../docs/adr/0006-devcontainer-image-is-the-base-cyrus-is-a-feature.md)
 a repository's own devcontainer is the base and Cyrus rides on top. That inverts
 who guarantees the boot contract: everything `docker/worker/Dockerfile` gets for
 free by owning the whole image, this Feature has to establish on a base that
