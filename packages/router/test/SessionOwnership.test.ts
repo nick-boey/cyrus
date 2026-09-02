@@ -25,6 +25,7 @@ import type { RpcRequestFrame } from "cyrus-router-protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	EventRouter,
+	PARK_OWNERSHIP_GRACE_MS,
 	TERMINAL_OWNERSHIP_GRACE_MS,
 } from "../src/EventRouter.js";
 import { LinearExecutor } from "../src/LinearExecutor.js";
@@ -81,7 +82,11 @@ interface Harness {
 	clock: { value: number };
 }
 
-function makeHarness(opts?: { executorLogger?: ILogger }): Harness {
+function makeHarness(opts?: {
+	executorLogger?: ILogger;
+	/** Deployments can turn issue locking off; the park window must survive it. */
+	issueLock?: boolean;
+}): Harness {
 	const store = new RouterStore(":memory:");
 	store.addUser({ email: ALICE.email, linearId: ALICE.id });
 	const code = store.mintEnrollmentCode(ALICE.email, 1);
@@ -101,7 +106,7 @@ function makeHarness(opts?: { executorLogger?: ILogger }): Harness {
 		moveIssueToStartedState: vi.fn(async () => "In Progress"),
 		config: {
 			eventTtlMs: 60_000,
-			issueLock: true,
+			issueLock: opts?.issueLock ?? true,
 			creatorOnlyPrompting: false,
 			affinityGraceMs: 600_000,
 		},
@@ -151,6 +156,13 @@ describe("session-scoped RPC authorization (NOR-405)", () => {
 
 		expect(response.ok).toBe(true);
 		expect(h.createAgentActivity).toHaveBeenCalledTimes(1);
+		// A park waits on a human, so the window is a working day, not minutes.
+		expect(
+			h.store.getSessionOwnershipGrace(
+				SESSION,
+				h.clock.value + PARK_OWNERSHIP_GRACE_MS - 1,
+			),
+		).toBe(h.deviceId);
 	});
 
 	it("keeps accepting after an unpark restores affinity", async () => {
@@ -233,6 +245,115 @@ describe("session-scoped RPC authorization (NOR-405)", () => {
 		expect(response.ok).toBe(false);
 		expect(response.error).toBe("session not owned by this device");
 		expect(h.createAgentActivity).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * `frame.sessionId` is device-supplied and validated only as a non-empty
+	 * string, so a grant keyed on the SENDER rather than on the current owner
+	 * would let any enrolled device buy itself authorization over any session id
+	 * — turning a stray frame from a denial of service into an escalation. The
+	 * `active` branch already refuses to "mint ownership out of nothing"; the
+	 * park and terminal branches must too.
+	 */
+	it("does not let a non-owner mint a grace by forging a terminal frame", async () => {
+		const mallory = h.deviceId + 1;
+
+		h.router.handleSessionState(mallory, {
+			type: "session_state",
+			id: "ss-forged",
+			sessionId: SESSION,
+			state: "complete",
+		});
+
+		expect(h.store.getSessionOwnershipGrace(SESSION)).toBeUndefined();
+		const response = await h.executor.dispatch(mallory, activityFrame());
+		expect(response.ok).toBe(false);
+		expect(response.error).toBe("session not owned by this device");
+		expect(h.createAgentActivity).not.toHaveBeenCalled();
+	});
+
+	it("does not let a non-owner mint a grace by forging a park frame", async () => {
+		const mallory = h.deviceId + 1;
+
+		h.router.handleSessionState(mallory, {
+			type: "session_state",
+			id: "ss-forged",
+			sessionId: SESSION,
+			state: "parked",
+		});
+
+		expect(h.store.getSessionOwnershipGrace(SESSION)).toBeUndefined();
+		const response = await h.executor.dispatch(mallory, activityFrame());
+		expect(response.ok).toBe(false);
+		expect(response.error).toBe("session not owned by this device");
+	});
+
+	it("drops the park grace once an unpark restores affinity", async () => {
+		for (const state of ["parked", "active"] as const) {
+			h.router.handleSessionState(h.deviceId, {
+				type: "session_state",
+				id: `ss-${state}`,
+				sessionId: SESSION,
+				state,
+			});
+		}
+
+		// Ownership is back on the narrowest claim that supports it.
+		expect(h.store.getSessionAffinity(SESSION)).toBe(h.deviceId);
+		expect(h.store.getSessionOwnershipGrace(SESSION)).toBeUndefined();
+	});
+
+	it("shortens a park grace to the terminal window when the session completes", async () => {
+		h.router.handleSessionState(h.deviceId, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: SESSION,
+			state: "parked",
+		});
+		h.router.handleSessionState(h.deviceId, {
+			type: "session_state",
+			id: "ss-2",
+			sessionId: SESSION,
+			state: "complete",
+		});
+
+		// Still authorized for the closing summary...
+		expect(
+			await h.executor.dispatch(h.deviceId, activityFrame()),
+		).toMatchObject({ ok: true });
+		// ...but on the 5-minute terminal window, not the 24-hour park one.
+		expect(
+			h.store.getSessionOwnershipGrace(
+				SESSION,
+				h.clock.value + TERMINAL_OWNERSHIP_GRACE_MS,
+			),
+		).toBeUndefined();
+	});
+});
+
+/**
+ * Issue locking is a supported deployment knob (`CYRUS_ROUTER_ISSUE_LOCK`).
+ * With it off no `issue_locks` row is ever taken, so the lock cannot be what
+ * carries a parked session's ownership — and the PAR-275 burst NOR-405 was
+ * filed for would recur unchanged.
+ */
+describe("park window with issue locking disabled (NOR-405)", () => {
+	it("accepts an activity posted while parked", async () => {
+		const h = makeHarness({ issueLock: false });
+		await h.router.route(createdEvent());
+		expect(h.store.getIssueLockDeviceForSession(SESSION)).toBeUndefined();
+
+		h.router.handleSessionState(h.deviceId, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: SESSION,
+			state: "parked",
+		});
+
+		const response = await h.executor.dispatch(h.deviceId, activityFrame());
+
+		expect(response.ok).toBe(true);
+		expect(h.createAgentActivity).toHaveBeenCalledTimes(1);
 	});
 });
 

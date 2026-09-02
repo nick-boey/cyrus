@@ -2349,6 +2349,56 @@ export class RouterStore {
 		return row.device_id;
 	}
 
+	clearSessionOwnershipGrace(sessionId: string): void {
+		this.db
+			.prepare("DELETE FROM session_ownership_grace WHERE session_id = ?")
+			.run(sessionId);
+	}
+
+	/**
+	 * Bounded retention for lapsed grace rows.
+	 *
+	 * {@link getSessionOwnershipGrace} already deletes a row it finds expired, so
+	 * this is not needed for authorization to be correct — but that read only
+	 * happens when the session id comes up again, and the overwhelmingly common
+	 * case is a session that completes and is never asked about. Without a sweep
+	 * every terminal session leaves a permanent row, and `StateBackup` pays for
+	 * all of them on every upload. Same reasoning as `sweepWebhookClaims`.
+	 */
+	sweepSessionOwnershipGrace(cutoffMs: number): number {
+		return this.db
+			.prepare("DELETE FROM session_ownership_grace WHERE expires_ms <= ?")
+			.run(cutoffMs).changes;
+	}
+
+	/**
+	 * The device entitled to act on `sessionId`, or `undefined` if no device is.
+	 *
+	 * THE single definition of session ownership, deliberately in one place: it
+	 * is read both by {@link LinearExecutor} to authorize a session-scoped RPC
+	 * and by {@link EventRouter} to decide whether a device may be granted a
+	 * post-terminal grace. Those two must never disagree — a device that can be
+	 * granted ownership it does not have is an escalation, not a lenient check.
+	 *
+	 * The three routes, and why one is not enough:
+	 *  - **affinity**: the session is actively routed here. Cleared on park.
+	 *  - **the issue lock**: survives a park, which is the whole reason the park
+	 *    path retains it. Absent entirely when `config.issueLock` is off.
+	 *  - **a bounded grace**: covers the windows the other two cannot — a park on
+	 *    a deployment without issue locking, and the terminal frame, which drops
+	 *    both of the above while the worker's closing summary is in flight.
+	 */
+	getSessionOwner(
+		sessionId: string,
+		nowMs: number = Date.now(),
+	): number | undefined {
+		return (
+			this.getSessionAffinity(sessionId) ??
+			this.getIssueLockDeviceForSession(sessionId) ??
+			this.getSessionOwnershipGrace(sessionId, nowMs)
+		);
+	}
+
 	/**
 	 * Every issue lock currently held on behalf of a device. Used by hello-time
 	 * reconciliation to find locks whose session the device no longer tracks.

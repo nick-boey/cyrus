@@ -176,6 +176,24 @@ const DEFAULT_EMAIL = "the delegating user";
 export const TERMINAL_OWNERSHIP_GRACE_MS = 5 * 60 * 1000;
 
 /**
+ * 24 hours — how long a device may keep posting for a session it has parked.
+ *
+ * Much longer than the terminal window because a park is not an ending: the
+ * session is blocked on a human answering, which can take a working day, and
+ * for that whole time it is legitimately the device's session. On a deployment
+ * with issue locking on, the lock already grants exactly this for an unbounded
+ * period, so this is strictly tighter than the status quo; with issue locking
+ * off it is the ONLY thing covering the park window, and without it a parked
+ * session's posts are still dropped.
+ *
+ * An unparked session drops back to affinity immediately (the `active` branch
+ * clears this), and a park that ends in a terminal frame is shortened to
+ * {@link TERMINAL_OWNERSHIP_GRACE_MS}, so the long window only ever applies to
+ * a session actually sitting parked.
+ */
+export const PARK_OWNERSHIP_GRACE_MS = 24 * 60 * 60 * 1000;
+
+/**
  * 7 days — how long a claimed webhook idempotency key is kept.
  *
  * The bound only has to outlive every window in which the SAME delivery can
@@ -552,6 +570,14 @@ export class EventRouter {
 	}
 
 	handleSessionState(deviceId: number, frame: SessionStateFrame): void {
+		// Read BEFORE any branch mutates the rows it is derived from. `deviceId`
+		// is the authenticated socket's device, but `frame.sessionId` is
+		// device-supplied and unvalidated beyond being a non-empty string — so
+		// every grant below must be gated on this, never on the sender alone.
+		// Granting on the sender would turn a stray or forged terminal frame into
+		// a way to MINT authorization over someone else's session, which is the
+		// hazard the `active` branch below already refuses to allow.
+		const owner = this.store.getSessionOwner(frame.sessionId, this.now());
 		if (frame.state === "parked") {
 			const now = this.now();
 			// Stashed, not dropped: `clearSessionAffinity` deletes the row that
@@ -565,6 +591,18 @@ export class EventRouter {
 				frame.sessionId,
 				this.store.getSessionCreator(frame.sessionId),
 			);
+			// The issue lock covers this window and outlasts any park — but ONLY on
+			// a deployment with `issueLock` enabled. With it off no lock row is ever
+			// taken, so without this grant the park drops the device's last claim
+			// and every activity a parked session posts is rejected: precisely the
+			// 40-post PAR-275 burst, unfixed (NOR-405).
+			if (owner === deviceId) {
+				this.store.grantSessionOwnershipGrace(
+					frame.sessionId,
+					deviceId,
+					now + PARK_OWNERSHIP_GRACE_MS,
+				);
+			}
 			this.store.clearSessionAffinity(frame.sessionId);
 			this.store.setDeviceParkedAt(deviceId, now);
 			this.store.setAgentRunState(frame.sessionId, "parked");
@@ -589,6 +627,11 @@ export class EventRouter {
 			this.parkedSessionCreators.delete(frame.sessionId);
 			// setSessionAffinity clears the device's park stamp as a side effect.
 			this.store.setSessionAffinity(frame.sessionId, deviceId, creator);
+			// Affinity is back, so the park grace has nothing left to cover. Drop it
+			// rather than let it idle out: ownership should rest on the narrowest
+			// claim that supports it, and a terminal frame later re-grants the much
+			// shorter terminal window from scratch.
+			this.store.clearSessionOwnershipGrace(frame.sessionId);
 			this.store.setAgentRunState(frame.sessionId, "active");
 			this.logger.info(
 				`Session ${frame.sessionId} unparked on device ${deviceId}; restored affinity and cleared the idle stamp`,
@@ -602,17 +645,33 @@ export class EventRouter {
 		const now = this.now();
 		this.store.finishAgentRun(frame.sessionId, frame.state, now);
 		// Granted BEFORE the two releases below, so there is no instant in which
-		// the device owns the session by none of the three routes
-		// `LinearExecutor.ownsSession` checks. Unlike the park path, which keeps
-		// the issue lock, this frame drops every durable claim the device has —
-		// and the activities still in flight when it lands are the session's
-		// closing summary, which is the part of a run a user most wants to read
-		// (NOR-405).
-		this.store.grantSessionOwnershipGrace(
-			frame.sessionId,
-			deviceId,
-			now + TERMINAL_OWNERSHIP_GRACE_MS,
-		);
+		// the terminating device owns the session by none of the routes
+		// `getSessionOwner` checks. Unlike the park path, which keeps the issue
+		// lock, this frame drops every durable claim the device has — and the
+		// activities still in flight when it lands are the session's closing
+		// summary, which is the part of a run a user most wants to read (NOR-405).
+		//
+		// Gated on prior ownership, and note this SHORTENS a park grace rather
+		// than extending it: a parked session that then completes gets the
+		// terminal window, not the much longer park one.
+		if (owner === deviceId) {
+			this.store.grantSessionOwnershipGrace(
+				frame.sessionId,
+				deviceId,
+				now + TERMINAL_OWNERSHIP_GRACE_MS,
+			);
+		} else {
+			// Not fatal — the releases below still run, because refusing them would
+			// strand the issue lock and leave the issue permanently undelegatable,
+			// which is worse than the stray frame. But a device reporting a
+			// terminal state for a session it does not own is either a bug or an
+			// attempt to act on someone else's session, and neither should be
+			// silent.
+			this.store.clearSessionOwnershipGrace(frame.sessionId);
+			this.logger.warn(
+				`Device ${deviceId} reported terminal state '${frame.state}' for session ${frame.sessionId}, which it does not own (owner: ${owner ?? "none"}); released the session's rows but granted no posting grace`,
+			);
+		}
 		this.store.releaseIssueLockForSession(frame.sessionId);
 		this.store.clearSessionAffinity(frame.sessionId);
 		this.notifiedSessions.delete(frame.sessionId);
@@ -813,6 +872,11 @@ export class EventRouter {
 			);
 		}
 		this.store.sweepTerminalAgentRuns(now - DEFAULT_AGENT_RUN_RETENTION_MS);
+		// Same reasoning as the claims above: `getSessionOwnershipGrace` drops a
+		// lapsed row when it reads one, but the common case is a session that
+		// completes and is never asked about again, so nothing would ever collect
+		// it. Cutoff is `now`, not an age: the row already carries its own expiry.
+		this.store.sweepSessionOwnershipGrace(now);
 
 		// 4. A selection nobody ever answered. `eventTtlMs` is the right bound: it
 		// is already how long a queued event may wait for its device. Pass 1

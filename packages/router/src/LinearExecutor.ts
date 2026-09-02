@@ -171,10 +171,17 @@ export class LinearExecutor {
 			}
 
 			// 4. Session-scoped authorization: the target session must belong to the
-			//    calling device.
+			//    calling device. `getSessionOwner` is the single definition of that
+			//    — affinity, or the issue lock (which survives a park), or a bounded
+			//    grace (which covers the terminal frame, where the other two are
+			//    dropped while the closing summary is still in flight). Reading
+			//    affinity alone is what silently discarded 161 posts in a day.
 			if ((SESSION_SCOPED_RPC_METHODS as readonly string[]).includes(method)) {
 				const sessionId = extractSessionId(method, rest);
-				if (sessionId === undefined || !this.ownsSession(deviceId, sessionId)) {
+				if (
+					sessionId === undefined ||
+					this.store.getSessionOwner(sessionId) !== deviceId
+				) {
 					// Logged router-side, at WARN, because a refusal here is
 					// user-visible data loss: the device's activity never reaches
 					// Linear, and until now the only trace of it was the sandbox's own
@@ -258,40 +265,6 @@ export class LinearExecutor {
 			);
 			return fail(id, err instanceof Error ? err.message : String(err));
 		}
-	}
-
-	/**
-	 * Whether `deviceId` may make session-scoped calls for `sessionId`.
-	 *
-	 * Three sources of ownership, checked cheapest-first. Session affinity alone
-	 * used to be the whole rule, and it is the narrowest of the three — the
-	 * router drops it at two points where the worker is still legitimately
-	 * emitting, and every activity posted in either window was rejected and
-	 * silently lost (NOR-405):
-	 *
-	 * 1. **Affinity** — the session is actively routed to this device. The
-	 *    ordinary case.
-	 * 2. **The issue lock** — the park path deliberately releases affinity while
-	 *    RETAINING the lock, because the lock is what models "this device owns
-	 *    this issue's work". A parked session may still post (it typically parks
-	 *    precisely to ask the user something), so the lock is the authority that
-	 *    should have been read all along.
-	 * 3. **Post-terminal grace** — the terminal path releases the lock and
-	 *    affinity in the same call, so neither of the above survives it. But the
-	 *    activities still in flight at that moment are the session's completion
-	 *    summary, i.e. exactly what the user most wants to see. `EventRouter`
-	 *    grants a bounded grace there; see
-	 *    {@link RouterStore.grantSessionOwnershipGrace}.
-	 *
-	 * A device that owns the session by none of these is genuinely unauthorized
-	 * and is still refused.
-	 */
-	private ownsSession(deviceId: number, sessionId: string): boolean {
-		if (this.store.getSessionAffinity(sessionId) === deviceId) return true;
-		if (this.store.getIssueLockDeviceForSession(sessionId) === deviceId) {
-			return true;
-		}
-		return this.store.getSessionOwnershipGrace(sessionId) === deviceId;
 	}
 
 	/**

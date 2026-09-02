@@ -317,6 +317,21 @@ describe("RouterStore", () => {
 			expect(store.getSessionOwnershipGrace("sess-1", NOW)).toBeUndefined();
 		});
 
+		it("sweeps lapsed rows without anyone reading their session id", () => {
+			const { store, device } = storeWithDevice();
+			store.grantSessionOwnershipGrace("sess-old", device.deviceId, NOW + 100);
+			store.grantSessionOwnershipGrace(
+				"sess-live",
+				device.deviceId,
+				NOW + 600_000,
+			);
+
+			expect(store.sweepSessionOwnershipGrace(NOW + 1000)).toBe(1);
+			expect(store.getSessionOwnershipGrace("sess-live", NOW)).toBe(
+				device.deviceId,
+			);
+		});
+
 		it("is dropped when the device's scoped rows are purged", () => {
 			const { store, device } = storeWithDevice();
 			store.grantSessionOwnershipGrace(
