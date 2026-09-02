@@ -244,12 +244,23 @@ describe("Environment variable isolation", () => {
 			);
 		});
 
+		// `onError` is what makes this test worth having. start()'s catch emits
+		// "error" and returns instead of rethrowing, and EventEmitter only
+		// rethrows an unhandled "error" — so with a listener registered, which
+		// every production caller does, a throw raised inside that try would
+		// resolve start() normally and hang the session. Without this line the
+		// assertion below passes for the wrong reason.
+		const onError = vi.fn();
 		mockSuccessfulQuery();
-		const runner = new ClaudeRunner(makeConfig("/repo-a"));
+		const runner = new ClaudeRunner(
+			Object.assign(makeConfig("/repo-a"), { onError }),
+		);
 
 		await expect(runner.start("test")).rejects.toThrow("cannot support");
 		// The whole point: no query was ever issued without the scrub.
 		expect(mockQuery).not.toHaveBeenCalled();
+		// And it surfaced as a rejection, not as a swallowed error event.
+		expect(onError).not.toHaveBeenCalled();
 	});
 
 	it("should let repositoryEnv and additionalEnv override process.env", async () => {

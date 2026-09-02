@@ -37,8 +37,13 @@ export interface SandboxRequirementsResult {
  * whole point of {@link resolveSubprocessEnvScrub} is that asking for the
  * control and not getting it must be an error rather than a shrug.
  *
- * Accepts `1` / `true` / `on` / `yes` (case-insensitive). Anything else,
- * including unset, leaves the scrub off.
+ * Accepts `1` / `true` / `on` / `yes` (case-insensitive) — the same set
+ * `isOtelTracingEnabled` accepts, so the CYRUS_* switches parse alike. Anything
+ * else, including unset, leaves the scrub off.
+ *
+ * Read from the WORKER's own `process.env`, not from a repository `.env`. It
+ * describes the host's capability, which no single repository is in a position
+ * to assert; setting it in a repository `.env` has no effect.
  */
 export const SUBPROCESS_ENV_SCRUB_ENV = "CYRUS_SUBPROCESS_ENV_SCRUB";
 
@@ -186,8 +191,11 @@ export function resolveSubprocessEnvScrub(options: {
 
 	const requirements = checkLinuxSandboxRequirements();
 	if (!requirements.supported) {
-		// Log the guidance as well as throwing: the log lands in the structured
-		// sink an operator greps, while the error is what stops the session.
+		// Log the guidance as well as throwing. The log is once per process
+		// (`hasLoggedFailures`), so it is the FIRST failing session that gets a
+		// WARN block; every session after it is covered by the throw, whose
+		// message carries the same per-failure resolutions. The throw is the
+		// load-bearing half — never let this call become the only signal.
 		logSandboxRequirementFailures(requirements, options.logger);
 		throw new SubprocessEnvScrubUnavailableError(requirements.failures);
 	}

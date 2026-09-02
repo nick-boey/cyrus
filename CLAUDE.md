@@ -771,13 +771,22 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      explicitly. `buildBaseSessionEnv` spreads the entire parent `process.env`,
      so an unset key there means "inherit whatever the worker happened to have",
      not "off".
-   - **Requested-but-unavailable is FATAL, not a warn.** A security control that
-     degrades to off with a `warn` is off again the next time a dependency goes
-     missing, and nothing alerts on it — which is how the worker image ran for
-     months without `socat` or `bubblewrap` and nobody noticed (NOR-412). When
-     the opt-in is set and the host cannot support it,
-     `SubprocessEnvScrubUnavailableError` aborts the session; that abort *is* the
-     alert. When the opt-in is absent, the host is **not probed at all** — the
+   - **Requested-but-unavailable is FATAL, not a warn — and the throw has to be
+     sited OUTSIDE `startWithPrompt`'s `try`.** A security control that degrades
+     to off with a `warn` is off again the next time a dependency goes missing,
+     and nothing alerts on it — which is how the worker image ran for months
+     without `socat` or `bubblewrap` and nobody noticed (NOR-412). But that
+     `catch` **does not rethrow**: it emits `"error"` and returns `sessionInfo`,
+     and `EventEmitter` only rethrows an *unhandled* `"error"`. Every production
+     caller registers an `onError` listener (`EdgeWorker` does), so a throw
+     raised inside the `try` resolves `start()` normally and leaves a Linear
+     agent session hanging with no activities and no terminal state — the
+     NOR-402 shape, and the exact outcome this control exists to prevent. The
+     same trap swallows any future precondition check; put it above the `try`,
+     where nothing has been allocated for the `finally` to clean up. Test it
+     with an `onError` listener registered, or the assertion passes for the
+     wrong reason.
+   - When the opt-in is absent, the host is **not probed at all** — the
      requirements of a control nothing would have enabled are not interesting,
      and probing for them is what produced the misleading
      "requirements are not met — skipping" warning in every sandbox.
@@ -793,7 +802,19 @@ The agent automatically moves issues to the "started" state when assigned. Linea
    - `CYRUS_SUBPROCESS_ENV_SCRUB` is deliberately **not** in
      `RESERVED_ENV_KEYS`: a user turning on a security control for their own
      sessions is not a hijack, and leaving it storable is what lets an operator
-     enable it from their secret bundle without a router deploy.
+     enable it from their secret bundle without a router deploy. It is read from
+     the **worker's own `process.env`**, never a repository `.env` — it asserts a
+     property of the host, which no single repository is placed to assert.
+   - **`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is undocumented in the SDK, and the
+     scrub itself has never been observed.** The flag appears nowhere in
+     `sdk.d.ts` or the SDK README — only in the bundled env-var registry, read by
+     the CLI binary. What HAS been verified is the bubblewrap prerequisite, which
+     is not the same thing. Before anyone turns this on fleet-wide, observe a
+     Bash subprocess without `ANTHROPIC_API_KEY` in its env. The SDK also exposes
+     a typed, documented alternative — `options.sandbox.credentials.envVars`
+     (`{name, mode: "deny" | "mask"}`), which Cyrus could set from the `sandbox`
+     object `RunnerConfigBuilder` already builds, with no bubblewrap/socat/userns
+     chain and macOS support. That is the likely successor to this switch.
 
 ## Dependency Security Policy (MANDATE)
 

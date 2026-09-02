@@ -507,6 +507,25 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			throw new Error("Claude session already running");
 		}
 
+		// Resolved HERE — before the session span, the log streams, and above all
+		// before the `try` below — because the throw is the entire point and the
+		// `try`'s catch does not rethrow. It emits "error" and returns
+		// sessionInfo, and every production caller registers an onError listener
+		// (EdgeWorker does), so a throw raised inside it would resolve `start()`
+		// normally and leave a Linear agent session hanging with no activities
+		// and no terminal state — the NOR-402 shape, and the exact
+		// "off, with a log line nothing alerts on" outcome NOR-412 objected to.
+		// Nothing has been allocated yet at this point, so there is nothing for
+		// the `finally` to clean up.
+		//
+		// On Linux, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 makes the SDK run tool
+		// invocations under a bubblewrap-backed sandbox, keeping this session's
+		// Anthropic credentials out of the env of every Bash subprocess the agent
+		// spawns. Off unless CYRUS_SUBPROCESS_ENV_SCRUB opts in. See NOR-412.
+		const subprocessEnvScrub = resolveSubprocessEnvScrub({
+			logger: this.logger,
+		});
+
 		// Initialize session info without session ID (will be set from first message)
 		this.sessionInfo = {
 			sessionId: null,
@@ -705,16 +724,6 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			}
 
 			const pathToClaudeCodeExecutable = this.config.pathToClaudeCodeExecutable;
-
-			// On Linux, setting CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 causes the SDK
-			// to run tool invocations under a bubblewrap-backed sandbox, keeping
-			// this session's Anthropic credentials out of the env of every Bash
-			// subprocess the agent spawns. Off unless CYRUS_SUBPROCESS_ENV_SCRUB
-			// opts in; when it does opt in and the host cannot support it, this
-			// throws rather than quietly running unscrubbed. See NOR-412.
-			const subprocessEnvScrub = resolveSubprocessEnvScrub({
-				logger: this.logger,
-			});
 
 			const isDebugLogging = this.logger.getLevel() === LogLevel.DEBUG;
 
