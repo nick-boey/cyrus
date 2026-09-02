@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SDKMessage } from "cyrus-claude-runner";
@@ -11,6 +11,32 @@ import { vi } from "vitest";
 // would otherwise activate whenever CYRUS_API_KEY + CYRUS_TEAM_ID are
 // present in the developer's shell env.
 process.env.CYRUS_DISABLE_REMOTE_SESSION_STORE = "1";
+
+// Point HOME at an empty per-run temp directory.
+//
+// `SkillsPluginResolver` unions `$HOME/.claude/skills` into every session's
+// skill set, and the prompt-assembly suite asserts the *entire* system prompt —
+// so without this the assertions depend on whatever skills happen to be
+// installed on the machine running the tests. That is not hypothetical: the
+// dotfiles delivery path this union exists to serve installs skills into
+// exactly that directory, so a Cyrus worker container running `pnpm test` is
+// the case most likely to break. Also keeps `os.homedir()`-defaulted state
+// (e.g. PersistenceManager's `~/.cyrus/state`) out of the real home directory.
+process.env.HOME = mkdtempSync(join(tmpdir(), "cyrus-edge-worker-home-"));
+process.env.USERPROFILE = process.env.HOME;
+
+// Clear ambient env that changes behaviour under test. `CYRUS_DEFAULT_SKILLS`
+// trims the bundled Cyrus skills out of the prompt; `CYRUS_ISSUE_KEY` +
+// `CYRUS_DEVICE_TOKEN` trip `isHeadlessContainerMode()` and drop MCP servers.
+// All three are set in a worker container, which is where these tests are most
+// likely to be run by an agent. Tests that need them set them explicitly.
+for (const key of [
+	"CYRUS_DEFAULT_SKILLS",
+	"CYRUS_ISSUE_KEY",
+	"CYRUS_DEVICE_TOKEN",
+]) {
+	delete process.env[key];
+}
 
 // Keep Claude SDK debug output inside the test workspace to avoid HOME write restrictions.
 const claudeConfigDir =

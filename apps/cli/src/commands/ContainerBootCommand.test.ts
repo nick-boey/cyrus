@@ -101,16 +101,44 @@ describe("findMissingEnvVars", () => {
 		expect(findMissingEnvVars(env)).toEqual(["CYRUS_ISSUE_KEY"]);
 	});
 
-	it("covers all five required vars from the brief", () => {
+	it("covers the runner-independent required vars from the brief", () => {
 		expect([...REQUIRED_ENV_VARS].sort()).toEqual(
 			[
 				"CYRUS_ROUTER_URL",
 				"CYRUS_DEVICE_TOKEN",
 				"CYRUS_ISSUE_KEY",
 				"CYRUS_REPOS_JSON",
-				"CLAUDE_CODE_OAUTH_TOKEN",
 			].sort(),
 		);
+	});
+
+	// The Claude token used to be in REQUIRED_ENV_VARS unconditionally, which
+	// meant a container whose default runner is Codex could not boot at all.
+	it("requires the Claude token when no runner is named, matching the claude default", () => {
+		const env = baseEnv();
+		delete env.CLAUDE_CODE_OAUTH_TOKEN;
+		expect(findMissingEnvVars(env)).toEqual(["CLAUDE_CODE_OAUTH_TOKEN"]);
+	});
+
+	it("requires the Claude token when the runner is claude", () => {
+		const env = baseEnv({ CYRUS_DEFAULT_RUNNER: "claude" });
+		delete env.CLAUDE_CODE_OAUTH_TOKEN;
+		expect(findMissingEnvVars(env)).toEqual(["CLAUDE_CODE_OAUTH_TOKEN"]);
+	});
+
+	it("does not require the Claude token when the runner is codex", () => {
+		const env = baseEnv({ CYRUS_DEFAULT_RUNNER: "codex" });
+		delete env.CLAUDE_CODE_OAUTH_TOKEN;
+		expect(findMissingEnvVars(env)).toEqual([]);
+	});
+
+	// An unusable value must not accidentally relax the gate: it resolves to
+	// claude downstream (`RunnerSelectionService.getDefaultRunner`), so the
+	// requirement has to follow it there.
+	it("falls back to the Claude requirement for an unrecognised runner", () => {
+		const env = baseEnv({ CYRUS_DEFAULT_RUNNER: "Codex " });
+		delete env.CLAUDE_CODE_OAUTH_TOKEN;
+		expect(findMissingEnvVars(env)).toEqual(["CLAUDE_CODE_OAUTH_TOKEN"]);
 	});
 });
 
@@ -1579,5 +1607,118 @@ describe("ContainerBootCommand.execute — boot failure diagnostics", () => {
 		expect(logger.error).toHaveBeenCalledWith(
 			expect.stringContaining("Boot failed:"),
 		);
+	});
+});
+
+describe("writeCodexAuth", () => {
+	function tempHome(): string {
+		return mkdtempSync(join(tmpdir(), "cyrus-codex-home-"));
+	}
+
+	const CREDENTIAL = JSON.stringify({
+		OPENAI_API_KEY: null,
+		auth_mode: "chatgpt",
+		tokens: { access_token: "a", refresh_token: "r" },
+	});
+
+	it("is a no-op when the router injected no credential", () => {
+		// Every Claude session, and every Codex session running on
+		// OPENAI_API_KEY instead.
+		const homeDir = tempHome();
+		new ContainerBootCommand({
+			env: baseEnv(),
+			homeDir,
+			logger: silentLogger(),
+		}).writeCodexAuth();
+
+		expect(existsSync(join(homeDir, ".codex", "auth.json"))).toBe(false);
+	});
+
+	it("writes $HOME/.codex/auth.json at 0600", () => {
+		const homeDir = tempHome();
+		new ContainerBootCommand({
+			env: baseEnv({ CODEX_AUTH_JSON: CREDENTIAL }),
+			homeDir,
+			logger: silentLogger(),
+		}).writeCodexAuth();
+
+		const authPath = join(homeDir, ".codex", "auth.json");
+		expect(JSON.parse(readFileSync(authPath, "utf-8"))).toMatchObject({
+			auth_mode: "chatgpt",
+			tokens: { refresh_token: "r" },
+		});
+		// A live OAuth refresh token on a shared filesystem — same treatment as
+		// ~/.git-credentials, which this step follows.
+		expect(statSync(authPath).mode & 0o777).toBe(0o600);
+	});
+
+	it("scrubs CODEX_AUTH_JSON from the environment once the file exists", () => {
+		// The credential is multi-line JSON, and the Codex CLI snapshots the
+		// environment into a /bin/sh script at session start — leaving it set
+		// makes that script unparseable ("Unterminated quoted string"), so every
+		// shell command the agent runs loses its snapshot. It is also a live
+		// OAuth token that would otherwise be in the env of every command the
+		// agent runs. Nothing downstream reads it: `codex` reads auth.json.
+		const homeDir = tempHome();
+		const env = baseEnv({ CODEX_AUTH_JSON: CREDENTIAL });
+		process.env.CODEX_AUTH_JSON = CREDENTIAL;
+		try {
+			new ContainerBootCommand({
+				env,
+				homeDir,
+				logger: silentLogger(),
+			}).writeCodexAuth();
+
+			expect(existsSync(join(homeDir, ".codex", "auth.json"))).toBe(true);
+			expect(env.CODEX_AUTH_JSON).toBeUndefined();
+			expect(process.env.CODEX_AUTH_JSON).toBeUndefined();
+		} finally {
+			delete process.env.CODEX_AUTH_JSON;
+		}
+	});
+
+	it("honours CODEX_HOME, the way the Codex CLI resolves it", () => {
+		const homeDir = tempHome();
+		const codexHome = join(tempHome(), "custom-codex");
+		new ContainerBootCommand({
+			env: baseEnv({ CODEX_AUTH_JSON: CREDENTIAL, CODEX_HOME: codexHome }),
+			homeDir,
+			logger: silentLogger(),
+		}).writeCodexAuth();
+
+		expect(existsSync(join(codexHome, "auth.json"))).toBe(true);
+		expect(existsSync(join(homeDir, ".codex", "auth.json"))).toBe(false);
+	});
+
+	it("re-tightens permissions on an existing, looser file", () => {
+		// A warm volume can carry a leftover written under a looser umask.
+		const homeDir = tempHome();
+		const codexHome = join(homeDir, ".codex");
+		mkdirSync(codexHome, { recursive: true });
+		writeFileSync(join(codexHome, "auth.json"), "{}", { mode: 0o644 });
+
+		new ContainerBootCommand({
+			env: baseEnv({ CODEX_AUTH_JSON: CREDENTIAL }),
+			homeDir,
+			logger: silentLogger(),
+		}).writeCodexAuth();
+
+		expect(statSync(join(codexHome, "auth.json")).mode & 0o777).toBe(0o600);
+	});
+
+	it("fails the boot rather than starting an unauthenticated Codex", () => {
+		// Unlike dotfiles, this is not best-effort: the session was routed to
+		// Codex because the user chose it, and continuing would fail at the
+		// first request with an error nothing connects back to this step.
+		const homeDir = join(tempHome(), "file-in-the-way");
+		writeFileSync(homeDir, "not a directory");
+
+		expect(() =>
+			new ContainerBootCommand({
+				env: baseEnv({ CODEX_AUTH_JSON: CREDENTIAL }),
+				homeDir,
+				logger: silentLogger(),
+			}).writeCodexAuth(),
+		).toThrow(/Could not write the Codex credential/);
 	});
 });

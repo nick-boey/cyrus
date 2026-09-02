@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS users (
   name TEXT,
   linear_id TEXT,
   executor_json TEXT,
-  entra_object_id TEXT
+  entra_object_id TEXT,
+  default_runner_json TEXT,
+  codex_auth_sealed TEXT
 );
 CREATE TABLE IF NOT EXISTS devices (
   device_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,7 +26,8 @@ CREATE TABLE IF NOT EXISTS devices (
   last_seen_ms INTEGER,
   last_routed_ms INTEGER,
   parked_at_ms INTEGER,
-  running_since_ms INTEGER
+  running_since_ms INTEGER,
+  last_active_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS enrollment_codes (
   code_hash TEXT PRIMARY KEY,
@@ -183,6 +186,7 @@ interface DeviceRow {
 	last_routed_ms: number | null;
 	parked_at_ms: number | null;
 	running_since_ms: number | null;
+	last_active_ms: number | null;
 }
 
 interface ContainerDeviceRow {
@@ -195,6 +199,7 @@ interface ContainerDeviceRow {
 	last_routed_ms: number | null;
 	parked_at_ms: number | null;
 	running_since_ms: number | null;
+	last_active_ms: number | null;
 }
 
 export interface ContainerDeviceInfo {
@@ -226,6 +231,23 @@ export interface ContainerDeviceInfo {
 	 * cleared on every transition out of running.
 	 */
 	runningSinceMs?: number;
+	/**
+	 * When this device was last observed DOING WORK — a session claiming it, or
+	 * a lifecycle sweep finding it still held by live session affinity.
+	 *
+	 * This is the idle clock's reset. Every other input to that clock
+	 * (`createdMs`, `lastRoutedMs`, `parkedAtMs`) is stamped by something the
+	 * ROUTER does, and the router does nothing at all while an agent works: a
+	 * session that runs for forty minutes without a new prompt leaves every one
+	 * of them frozen at its start, so the container is permanently past
+	 * `idleStopMs` and survives only because affinity pins it. The instant
+	 * affinity lapses between two sessions on the same issue, an already-expired
+	 * clock stops it mid-handoff (NOR-366).
+	 *
+	 * Absent for a row created before the column existed and never active since;
+	 * the clock then falls back to the older inputs exactly as before.
+	 */
+	lastActiveMs?: number;
 }
 
 interface ContainerTeardownRow {
@@ -328,6 +350,7 @@ function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
 		lastRoutedMs: row.last_routed_ms ?? undefined,
 		parkedAtMs: row.parked_at_ms ?? undefined,
 		runningSinceMs: row.running_since_ms ?? undefined,
+		lastActiveMs: row.last_active_ms ?? undefined,
 	};
 }
 
@@ -545,6 +568,27 @@ export class RouterStore {
 		) {
 			this.db.exec("ALTER TABLE users ADD COLUMN entra_object_id TEXT");
 		}
+		// The per-user runner/model picker (NOR-364). Deliberately NOT backfilled:
+		// NULL means "no preference", which leaves `RunnerSelectionService`'s own
+		// fallback chain intact and is exactly the behaviour every pre-upgrade user
+		// already had. Writing a value here would be inventing a choice nobody made.
+		if (
+			userCols.length > 0 &&
+			!userCols.some((c) => c.name === "default_runner_json")
+		) {
+			this.db.exec("ALTER TABLE users ADD COLUMN default_runner_json TEXT");
+		}
+		// The sealed Codex subscription credential (ADR 0005). Sealing is not
+		// optional and this column must never hold plaintext: `users` is plain
+		// SQLite and `StateBackup.upload` PUTs the raw `.db` to blob storage, so an
+		// unsealed column would be a strict confidentiality downgrade from the
+		// envelope-encrypted secret bundle. See {@link CodexTokenStore}.
+		if (
+			userCols.length > 0 &&
+			!userCols.some((c) => c.name === "codex_auth_sealed")
+		) {
+			this.db.exec("ALTER TABLE users ADD COLUMN codex_auth_sealed TEXT");
+		}
 
 		// Re-read rather than reusing `deviceCols`: that snapshot predates the
 		// v1->v2 rebuild above, which recreates the table without this column.
@@ -569,6 +613,25 @@ export class RouterStore {
 			!deviceColsNow.some((c) => c.name === "running_since_ms")
 		) {
 			this.db.exec("ALTER TABLE devices ADD COLUMN running_since_ms INTEGER");
+		}
+
+		// Backfilled to migration time, unlike `running_since_ms` above, and for
+		// the opposite reason. This column only ever DELAYS an idle-stop, so the
+		// two directions of error are not symmetric: leaving it NULL makes every
+		// pre-upgrade container instantly eligible for the stop this column exists
+		// to prevent, while backfilling costs at most one extra `idleStopMs` before
+		// a genuinely idle container is parked. Erring toward the survivable side
+		// is the whole point of the fix (NOR-366).
+		if (
+			deviceColsNow.length > 0 &&
+			!deviceColsNow.some((c) => c.name === "last_active_ms")
+		) {
+			this.db.exec("ALTER TABLE devices ADD COLUMN last_active_ms INTEGER");
+			this.db
+				.prepare(
+					"UPDATE devices SET last_active_ms = ? WHERE kind = 'container'",
+				)
+				.run(Date.now());
 		}
 
 		// Deliberately NOT backfilled, and there is nothing sensible to backfill
@@ -893,7 +956,7 @@ export class RouterStore {
 	): ContainerDeviceInfo | undefined {
 		const row = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms
 				 FROM devices WHERE kind = 'container' AND issue_key = ?`,
 			)
 			.get(issueKey) as ContainerDeviceRow | undefined;
@@ -977,7 +1040,7 @@ export class RouterStore {
 	listContainerDevices(): ContainerDeviceInfo[] {
 		const rows = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms
 				 FROM devices WHERE kind = 'container'`,
 			)
 			.all() as ContainerDeviceRow[];
@@ -1033,6 +1096,26 @@ export class RouterStore {
 	 * gone. Idempotent; returns true only when a clock was actually running, so
 	 * the caller can emit a stop transition exactly once.
 	 */
+	/**
+	 * Reset this device's idle clock: it is doing work right now.
+	 *
+	 * UNCONDITIONAL, which is the exact opposite of {@link markDeviceRunning}'s
+	 * set-if-null contract, and deliberately so. `running_since_ms` answers "how
+	 * long has this sandbox been up", so it must survive re-stamping; this column
+	 * answers "when did it last do anything", so re-stamping IS the semantics.
+	 * Conflating the two is what NOR-366 was: with only the uptime clock and the
+	 * router-side stamps, a continuously busy sandbox looked idle from the moment
+	 * it was five minutes old.
+	 *
+	 * Harmless for physical devices — nothing reads `last_active_ms` for them —
+	 * exactly as `last_routed_ms` already is.
+	 */
+	markDeviceActive(deviceId: number, nowMs: number): void {
+		this.db
+			.prepare("UPDATE devices SET last_active_ms = ? WHERE device_id = ?")
+			.run(nowMs, deviceId);
+	}
+
 	clearDeviceRunningSince(deviceId: number): boolean {
 		const result = this.db
 			.prepare(
@@ -1301,6 +1384,77 @@ export class RouterStore {
 			.prepare("UPDATE users SET entra_object_id = ? WHERE user_id = ?")
 			.run(objectId, userId);
 		return result.changes > 0;
+	}
+
+	/**
+	 * The user's stored runner/model preference, as the raw
+	 * `default_runner_json` literal. Parsed by `resolveDefaultRunner`, which
+	 * owns every degradation rule; this is deliberately a dumb accessor so the
+	 * store never has an opinion about which runners exist.
+	 */
+	getUserDefaultRunner(userId: number): string | undefined {
+		const row = this.db
+			.prepare("SELECT default_runner_json FROM users WHERE user_id = ?")
+			.get(userId) as { default_runner_json: string | null } | undefined;
+		return row?.default_runner_json ?? undefined;
+	}
+
+	/** Writes (or, with `null`, clears) the runner/model preference. */
+	setUserDefaultRunner(
+		userId: number,
+		defaultRunnerJson: string | null,
+	): boolean {
+		const result = this.db
+			.prepare("UPDATE users SET default_runner_json = ? WHERE user_id = ?")
+			.run(defaultRunnerJson, userId);
+		return result.changes > 0;
+	}
+
+	/**
+	 * The user's sealed Codex credential envelope, as stored JSON.
+	 *
+	 * Opaque to the store on purpose: sealing and opening happen in
+	 * {@link CodexTokenStore}, which holds the `KeyWrapper`. Nothing here can
+	 * read the credential, which is what keeps the plaintext out of the SQLite
+	 * file that `StateBackup` uploads.
+	 */
+	getUserCodexAuth(userId: number): string | undefined {
+		const row = this.db
+			.prepare("SELECT codex_auth_sealed FROM users WHERE user_id = ?")
+			.get(userId) as { codex_auth_sealed: string | null } | undefined;
+		return row?.codex_auth_sealed ?? undefined;
+	}
+
+	/** Writes (or, with `null`, clears) the sealed Codex credential. */
+	setUserCodexAuth(userId: number, sealed: string | null): boolean {
+		const result = this.db
+			.prepare("UPDATE users SET codex_auth_sealed = ? WHERE user_id = ?")
+			.run(sealed, userId);
+		return result.changes > 0;
+	}
+
+	/**
+	 * Case-insensitive lookup by email, matching `users.email`'s
+	 * `UNIQUE COLLATE NOCASE`. `SetupBootstrap` already feature-detects this
+	 * method; the `/setup` routes need it to resolve a signed-in principal's
+	 * stored preferences without scanning every user.
+	 */
+	getUserByEmail(
+		email: string,
+	): { userId: number; email: string; name?: string } | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT user_id, email, name FROM users WHERE email = ? COLLATE NOCASE",
+			)
+			.get(email) as
+			| { user_id: number; email: string; name: string | null }
+			| undefined;
+		if (!row) return undefined;
+		return {
+			userId: row.user_id,
+			email: row.email,
+			...(row.name ? { name: row.name } : {}),
+		};
 	}
 
 	getUserEmail(userId: number): string | undefined {
@@ -1681,6 +1835,13 @@ export class RouterStore {
 		// A device with a live session is by definition not parked. Leaving the
 		// stamp would let the idle clock read from a park that has since ended.
 		this.clearDeviceParkedAt(deviceId);
+		// Claiming the device IS activity, and stamping it here — synchronously,
+		// in the same call that creates the pin — is what closes the handoff race
+		// in NOR-366. The sweep only ever learns about a pin on its next tick, so
+		// between one session ending and the next one being observed there is a
+		// window of up to the sweep interval in which the container looks both
+		// unpinned and (without this) long past its idle deadline.
+		this.markDeviceActive(deviceId, establishedMs);
 	}
 
 	getSessionAffinity(sessionId: string): number | undefined {

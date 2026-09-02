@@ -1,11 +1,20 @@
 // apps/f1/src/router/RouterRig.ts
+import { dirname, join } from "node:path";
 import {
 	CLIIssueTrackerService,
 	createNoopLogger,
 	type IIssueTrackerService,
 	type ILogger,
 } from "cyrus-core";
-import { RouterServer, SecretStore, type SetupUiConfig } from "cyrus-router";
+import {
+	encodeDefaultRunnerJson,
+	parseCodexAuthPaste,
+	parseSelection,
+	RouterServer,
+	RUNNER_CATALOG,
+	SecretStore,
+	type SetupUiConfig,
+} from "cyrus-router";
 import type { ContainerExecutor } from "cyrus-router-executors";
 import { allocatePort } from "./allocatePort.js";
 import { WORKSPACE } from "./fixtures.js";
@@ -30,9 +39,18 @@ export interface RouterRig {
 		email: string;
 		linearId: string;
 		provider: string;
-		claudeOauthToken: string;
+		/**
+		 * Optional since NOR-364: a user whose default runner is Codex needs no
+		 * Claude token, and seeding one anyway would make the codex-only boot
+		 * path untestable — that is exactly the case phase 3 has to prove.
+		 */
+		claudeOauthToken?: string;
+		/** `"<runner>"` or `"<runner>:<model>"`, e.g. `"codex:gpt-5.5"`. */
+		defaultRunner?: string;
+		/** The verbatim contents of a `codex login --device-auth` auth.json. */
+		codexAuthJson?: string;
 		env?: Record<string, string>;
-	}): void;
+	}): Promise<void>;
 	stop(): Promise<void>;
 }
 
@@ -120,6 +138,19 @@ export async function createRouterRig(
 			idleStopMs: opts.idleStopMs,
 			staleDestroyMs: opts.staleDestroyMs,
 			requiredSecretKeys: opts.requiredSecretKeys,
+			// Always on: without it `RouterServer` builds no `CodexTokenStore`, and
+			// a Codex user silently degrades to the `OPENAI_API_KEY` path instead
+			// of the subscription path a drive is here to exercise.
+			//
+			// `localKeyPath` is explicit because it must not be derived from
+			// `dbPath` here: tests pass `":memory:"`, whose `dirname` is `"."`,
+			// so the default would drop a 0600 key file into the package
+			// directory on every run. `secretsPath` is always a real file in the
+			// rig's own temp home, so the KEK lands beside the other per-user
+			// material and is torn down with it.
+			codex: {
+				localKeyPath: join(dirname(opts.secretsPath), "codex-kek.key"),
+			},
 		},
 		...(opts.setupUi ? { setupUi: opts.setupUi } : {}),
 		...(executors ? { executorRegistryFactory: () => executors } : {}),
@@ -130,7 +161,15 @@ export async function createRouterRig(
 		server,
 		tracker,
 		port,
-		seedUser({ email, linearId, provider, claudeOauthToken, env }) {
+		async seedUser({
+			email,
+			linearId,
+			provider,
+			claudeOauthToken,
+			defaultRunner,
+			codexAuthJson,
+			env,
+		}) {
 			// Idempotent: re-seeding an existing user updates their executor and
 			// secrets (the natural "blocked on a missing key → seed it → re-route"
 			// drive flow) instead of crashing on the users.email UNIQUE constraint.
@@ -141,9 +180,48 @@ export async function createRouterRig(
 				server.store.addUser({ email, linearId });
 			}
 			server.store.setUserExecutor(email, JSON.stringify({ type: provider }));
+			// Absent means UNSET, not "leave whatever is there". Re-seeding an
+			// existing user is the documented way to switch a drive between
+			// runners, and a leftover CLAUDE_CODE_OAUTH_TOKEN would satisfy the
+			// boot gate for a user seeded as codex-only — so the drive would
+			// report a pass for the no-Claude-token path without ever having
+			// exercised it. That is the one check this seam exists to support.
 			secrets.set(email, "CLAUDE_CODE_OAUTH_TOKEN", claudeOauthToken);
 			for (const [key, value] of Object.entries(env ?? {})) {
 				secrets.set(email, key, value);
+			}
+			if (defaultRunner || codexAuthJson) {
+				const user = server.store
+					.listUsers()
+					.find((u) => u.email.toLowerCase() === email.toLowerCase());
+				if (!user) throw new Error(`No user row for ${email}`);
+				if (defaultRunner) {
+					// `parseSelection` is the same catalog check `/setup` applies, so a
+					// typo is a seeding error here rather than a dead session inside
+					// the sandbox — which is the whole reason the control is curated.
+					const selection = parseSelection(defaultRunner);
+					if (!selection) {
+						throw new Error(
+							`Not a selectable runner:model — ${defaultRunner}. Expected one of: ${RUNNER_CATALOG.flatMap(
+								(entry) =>
+									entry.models.map((m) => `${entry.runner}:${m.model}`),
+							).join(", ")}`,
+						);
+					}
+					server.store.setUserDefaultRunner(
+						user.userId,
+						encodeDefaultRunnerJson(selection),
+					);
+				}
+				if (codexAuthJson) {
+					if (!server.codexTokens) {
+						throw new Error("Router has no Codex token store configured");
+					}
+					await server.codexTokens.put(
+						user.userId,
+						parseCodexAuthPaste(codexAuthJson, Date.now()),
+					);
+				}
 			}
 		},
 		async stop() {

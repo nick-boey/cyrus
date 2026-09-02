@@ -77,3 +77,9 @@ infra/azure/bicep/**/*.json
 # it; neither is a source.
 docker/worker/devcontainer/.devcontainer/features/cyrus-worker/
 docker/worker/devcontainer/.devcontainer/devcontainer-lock.json
+
+# Key-encryption keys must never be committed (0600 local KEK for sealed
+# Codex credentials; a stray one appears if a router is pointed at a
+# ":memory:" database, whose dirname is the CWD).
+codex-kek.key
+**/codex-kek.key

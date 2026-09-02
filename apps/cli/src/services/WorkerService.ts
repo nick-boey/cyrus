@@ -4,7 +4,9 @@ import type {
 	Issue,
 	RepoSetupHookEventHandler,
 	RepositoryConfig,
+	RunnerType,
 } from "cyrus-core";
+import { RunnerTypeSchema } from "cyrus-core";
 import type { GitService, SharedApplicationServer } from "cyrus-edge-worker";
 import { EdgeWorker } from "cyrus-edge-worker";
 import { SlackEventTransport } from "cyrus-slack-event-transport";
@@ -12,6 +14,27 @@ import { DEFAULT_SERVER_PORT, parsePort } from "../config/constants.js";
 import type { Workspace } from "../config/types.js";
 import type { ConfigService } from "./ConfigService.js";
 import type { Logger } from "./Logger.js";
+
+/**
+ * Parses `CYRUS_DEFAULT_RUNNER` instead of casting it.
+ *
+ * The cast this replaces was the reason the `/setup` runner control had to be a
+ * typed picker rather than a free-text variable: an unparsed value reaches
+ * `createRunnerForType` and throws *inside the sandbox at session start*, which
+ * a user experiences as a dead session with no indication that a setting they
+ * typed hours earlier is the cause. Falling back to the config file's
+ * `defaultRunner` on an unusable value keeps the failure recoverable and
+ * visible in the logs.
+ */
+function parseDefaultRunner(raw: string | undefined): RunnerType | undefined {
+	if (!raw?.trim()) return undefined;
+	const parsed = RunnerTypeSchema.safeParse(raw.trim());
+	if (parsed.success) return parsed.data;
+	console.warn(
+		`[WorkerService] Ignoring CYRUS_DEFAULT_RUNNER=${JSON.stringify(raw)}: not one of ${RunnerTypeSchema.options.join(", ")}`,
+	);
+	return undefined;
+}
 
 /**
  * Service responsible for EdgeWorker and Cloudflare tunnel management
@@ -242,12 +265,8 @@ export class WorkerService {
 			codexDefaultModel:
 				process.env.CYRUS_CODEX_DEFAULT_MODEL || edgeConfig.codexDefaultModel,
 			defaultRunner:
-				(process.env.CYRUS_DEFAULT_RUNNER as
-					| "claude"
-					| "gemini"
-					| "codex"
-					| "cursor"
-					| undefined) || edgeConfig.defaultRunner,
+				parseDefaultRunner(process.env.CYRUS_DEFAULT_RUNNER) ||
+				edgeConfig.defaultRunner,
 			issueUpdateTrigger: edgeConfig.issueUpdateTrigger,
 			prReviewTrigger: edgeConfig.prReviewTrigger,
 			promptDefaults: edgeConfig.promptDefaults,

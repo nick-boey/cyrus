@@ -703,12 +703,70 @@ docker compose exec cyrus-router cyrus router unlock <issueId>
 ## Azure hosting and ACA Sandboxes
 
 The maintained Azure deployment in [`infra/azure/`](../infra/azure/README.md)
-runs the router as one Azure Container App replica and gives selected users one
-Azure Container Apps (ACA) Sandbox per issue. Set the executor with:
+runs the router as one Azure Container App replica and gives users one
+Azure Container Apps (ACA) Sandbox per issue.
+
+**Where an ACA provider is registered, every user's sessions run in an ACA
+container** and `executor_json` is not consulted (NOR-364). ACA is the only
+executor that works on such a deployment, so there is no choice left to
+express — and the alternative, degrading to a physical device the user may
+never have enrolled, silently discards the routed event. The stored values are
+left untouched, so removing `containers.aca` restores the previous behaviour
+exactly. On a router with no ACA provider, set the executor with:
 
 ```bash
-cyrus router users set-executor alice@example.com aca
+cyrus router users set-executor alice@example.com docker
 ```
+
+The router also refuses to start when `containers.defaultExecutor` names a
+provider that is not registered: without that check, every user inheriting the
+default creates a device row, queues their event onto it, and only then fails
+at boot — leaving the event stranded on a device nothing will ever connect to.
+
+### Per-user runner and model defaults
+
+Each user picks their default coding agent and model under **Session defaults**
+on `/setup`. It is per-user and workspace-wide, and it sits *below* the existing
+per-issue overrides: an `[agent=…]`/`[model=…]` tag in an issue description, or
+an agent/model label on the issue, still wins for that issue.
+
+The picker is a curated list, not free text, and it offers only Claude and
+Codex. Gemini and Cursor are absent rather than disabled: neither runs in a
+container today. `CYRUS_DEFAULT_RUNNER` and the per-runner model variables are
+reserved — the router owns them, so a hand-set value in a user's secret bundle
+is ignored (with a warning) rather than silently shadowing the picker.
+
+Which credentials a user must have set follows their chosen runner. A user
+whose default is Codex is not asked for `CLAUDE_CODE_OAUTH_TOKEN`; a Codex user
+supplies a ChatGPT subscription in the **Codex account** section instead (see
+[`docs/adr/0005`](adr/0005-codex-authenticates-by-router-held-subscription-tokens.md)),
+or `OPENAI_API_KEY` for metered billing. Connecting a subscription needs
+`containers.codex` in `router-config.json`; without it the section is not
+rendered, and a Codex user with no `OPENAI_API_KEY` is told so rather than being
+pointed at a control their deployment does not have.
+
+**The sealing key must outlive the host.** Stored credentials are sealed with a
+KEK, and `containers.codex.keyId` (a versioned Key Vault key) is the durable
+choice. Without one the router falls back to a 0600 local file —
+`containers.codex.localKeyPath`, defaulting to `codex-kek.key` beside the
+database — and warns at startup, because **nothing backs that file up**:
+`StateBackup` uploads `router.db` alone. On a host whose disk does not survive a
+restart the database returns and the key does not, `openBundle` fails, and every
+stored credential reads as "no account connected" — indistinguishable, days
+later, from never having connected one. On Azure this is why the Bicep renders
+`containers.codex` only under `enableSetupSecretStore` (the flag that provisions
+the KEK *and* the router's *Key Vault Crypto User* role): the router database
+sits on the container's ephemeral disk, so the local-key path there would
+guarantee that loss. `codex.keyId` is read independently of
+`tableStore.keyId`, so using a subscription never requires the separate
+`enableSetupTableBackend` migration.
+
+Changing a default applies to issues that start a container **after** the save.
+An issue that already has one keeps the runner it booted with, because
+`resolveTarget`'s affinity fast path returns the bound device before
+`executorFor` is consulted — so there may be no next `ensureDevice` for that
+issue at all. To move a live issue, run
+`cyrus router containers destroy <issueKey>` and re-prompt it.
 
 The deployment is Bicep, at `infra/azure/bicep`, applied with
 `scripts/deploy-azure.sh`. It is stateless: there is no state file, and
@@ -1210,6 +1268,64 @@ cyrus router containers destroy <issueKey>
 Then re-prompt the issue so its replacement container is created fresh with
 the new value. This is the single most common point of confusion with the
 feature — a save that looks like it "did nothing" is almost always this.
+
+### Custom skills via a dotfiles repo
+
+Two per-user variables, set on this page like any other, let a teammate bring
+their own agent skills into their containers:
+
+| Variable | Effect |
+|----------|--------|
+| `DOTFILES_REPO` | A git URL cloned into `$HOME/dotfiles`; its `install.sh` is run on every boot |
+| `CYRUS_DEFAULT_SKILLS` | Which of the **bundled Cyrus** skills to keep — unset or `all` (default), `none`, or a comma-separated list |
+
+`install.sh` delivers skills by copying directories into `$HOME/.claude/skills`,
+which Cyrus unions into the session's skill set:
+
+```sh
+# install.sh
+mkdir -p ~/.claude/skills
+cp -R "$(dirname "$0")"/skills/. ~/.claude/skills/
+```
+
+The clone happens once per container filesystem — `applyDotfiles` skips it when
+`$HOME/dotfiles/.git` already exists, and only re-runs `install.sh`. A container
+that is suspended and resumed keeps the copy it cloned, so **pushing a new skill
+to your dotfiles repo does not reach a container that already exists**. Destroy
+the container (or re-prompt the issue so a fresh one is created) to pick it up.
+
+A plain directory copy is the supported route. `claude` is not on `PATH` in the
+worker image — Claude Code reaches the container only as the SDK-bundled copy —
+so `claude plugin install` and `claude plugin marketplace add` are unavailable
+to `install.sh`, and `~/.claude/plugins/installed_plugins.json` is an internal
+format that should not be hand-written.
+
+`CYRUS_DEFAULT_SKILLS` affects **only** the five bundled Cyrus skills. Skills
+from a dotfiles repo, from the CYHOST-managed user plugin, and from a repo's own
+`.claude/skills` are never filtered by it.
+
+Two of the bundled five are product plumbing rather than workflow opinion:
+`summarize` is what streams a session's final message into the Linear agent
+session, and `verify-and-ship` is what opens the pull request. Turning them off
+is supported, but you are then responsible for supplying replacements —
+otherwise sessions quietly stop opening PRs and stop posting summaries. If you
+are replacing the set, `CYRUS_DEFAULT_SKILLS=summarize,verify-and-ship` is the
+recommended starting point: none of Cyrus's routing advice is emitted (every
+rule it describes opens with a skill you have removed), but the agent is still
+told to run `verify-and-ship` after a code change and to close with
+`summarize`.
+
+Scope note: skills reach **Claude and Codex** sessions — Claude discovers
+`~/.claude/skills` natively, and Cyrus stages the same directories into Codex's
+`.agents/skills` layout. Gemini and Cursor sessions get no skills; note that the
+skills listing is still appended to their system prompt, so an agent on those
+runners may be told about skills it cannot invoke. And since this repo symlinks
+its own skills into `.claude/skills`, `CYRUS_DEFAULT_SKILLS=none` will not hide
+them when the session is working on cyrus itself — they arrive repo-locally as
+well.
+
+The same variables work for physical-device targets, sourced from
+`~/.cyrus/.env` rather than from the router's per-user secret store.
 
 ### Storage backend
 

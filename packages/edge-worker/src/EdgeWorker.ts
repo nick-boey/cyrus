@@ -240,6 +240,15 @@ const TRACING_SHUTDOWN_TIMEOUT_MS = 2_000;
  *   processes results through to Linear Agent Activity Sessions
  */
 export class EdgeWorker extends EventEmitter {
+	/**
+	 * A `/skill` command leading the user's comment, tolerating any number of
+	 * `@mention`s ahead of it (Linear puts its own there) and accepting
+	 * `plugin:skill` qualified names. Anchored, so a slash appearing mid-sentence
+	 * is prose and not a command.
+	 */
+	private static readonly LEADING_SLASH_COMMAND =
+		/^\s*(?:@[\w.-]+[ \t]+)*(\/[a-zA-Z][\w-]*(?::[a-zA-Z][\w-]*)?)(?=[ \t\n]|$)/;
+
 	private config: EdgeWorkerConfig;
 	private repositories: Map<string, RepositoryConfig> = new Map(); // repository 'id' (internal, stored in config.json) mapped to the full repo config
 	private agentSessionManager: AgentSessionManager; // Single instance managing all agent sessions across repositories
@@ -930,6 +939,16 @@ export class EdgeWorker extends EventEmitter {
 		this.skillsPluginResolver = new SkillsPluginResolver(
 			this.cyrusHome,
 			this.logger,
+			{
+				// Per-user switch over the bundled Cyrus skills. Sourced from the
+				// environment rather than `EdgeWorkerConfig` on purpose: a new
+				// top-level config field would have to be added to two hardcoded
+				// lists in ConfigManager or it is silently dropped on every reload
+				// (see CLAUDE.md note 9). For container targets it arrives from the
+				// router's per-user SecretStore via `ContainerTargets.buildEnv`;
+				// for physical devices, from `~/.cyrus/.env`.
+				defaultSkills: process.env.CYRUS_DEFAULT_SKILLS,
+			},
 		);
 
 		// Components will be initialized and registered in start() method before server starts
@@ -6965,6 +6984,13 @@ ${taskSection}`;
 	private async assemblePrompt(
 		input: PromptAssemblyInput,
 	): Promise<PromptAssembly> {
+		const assembly = await this.buildPromptForInput(input);
+		return await this.prefixSlashCommand(assembly, input);
+	}
+
+	private async buildPromptForInput(
+		input: PromptAssemblyInput,
+	): Promise<PromptAssembly> {
 		// If actively streaming, just pass through the comment
 		if (input.isStreaming) {
 			return this.buildStreamingPrompt(input);
@@ -6977,6 +7003,112 @@ ${taskSection}`;
 
 		// Existing session continuation - just user comment + attachments
 		return this.buildContinuationPrompt(input);
+	}
+
+	/**
+	 * Echo a leading `/<skill>` token from the user's comment onto line 1 of the
+	 * assembled prompt.
+	 *
+	 * Claude Code expands a slash command ONLY when the prompt string starts
+	 * with `/<name>`. Every builder above either wraps the comment in XML
+	 * (`<user_comment>` / `<new_comment>`) or lets Linear's `@mention` lead, so
+	 * `@cyrus1 /grill-with-docs ...` never expands. The model is then left to
+	 * guess at the name from prose, and measurably refuses ("no such skill
+	 * available") about as often as it guesses right.
+	 *
+	 * Two measured properties of the expansion make this the whole fix
+	 * (`@anthropic-ai/claude-agent-sdk` 0.3.220):
+	 *
+	 * 1. Text AFTER the command is preserved and reaches the model verbatim,
+	 *    whether or not the skill body references `$ARGUMENTS`. So the wrapped
+	 *    comment stays exactly where it is and no context is lost — this is a
+	 *    prefix, not a rewrite.
+	 * 2. Expansion ignores both `disable-model-invocation: true` and the SDK
+	 *    `skills` allowlist. That is what makes the slash-only skills in a
+	 *    dotfiles set (14 of the 25 in `mattpocock-skills`) reachable from
+	 *    Linear at all — they are invisible to the `Skill` tool by design.
+	 *
+	 * The command MUST be checked against the discovered skills first. An
+	 * unrecognised one does not degrade to plain text — the CLI answers
+	 * "Unknown command: /foo" and the rest of the prompt never reaches the
+	 * model, so blindly prefixing would swallow the comment of anyone who
+	 * opened with a `/word` we do not own. Observed in an F1 drive against a
+	 * skill that was not in the worktree.
+	 */
+	private async prefixSlashCommand(
+		assembly: PromptAssembly,
+		input: PromptAssemblyInput,
+	): Promise<PromptAssembly> {
+		const command = EdgeWorker.LEADING_SLASH_COMMAND.exec(
+			input.userComment,
+		)?.[1];
+		if (!command || assembly.userPrompt.startsWith(command)) {
+			return assembly;
+		}
+		if (!(await this.isKnownSkill(command.slice(1), input))) {
+			this.logger.debug(
+				`Comment opens with "${command}", which is not a discovered skill — left as prose`,
+			);
+			return assembly;
+		}
+
+		this.logger.event(
+			CYRUS_EVENTS.skillSlashInvoked,
+			cyrusAttributes({
+				skill: command.slice(1),
+				prompt_type: assembly.metadata.promptType,
+				issue_key: input.fullIssue?.identifier,
+				new_session: assembly.metadata.isNewSession,
+				streaming: assembly.metadata.isStreaming,
+			}),
+		);
+
+		return {
+			...assembly,
+			userPrompt: `${command}\n${assembly.userPrompt}`,
+		};
+	}
+
+	/**
+	 * Whether `name` is a skill this session can actually run.
+	 *
+	 * Matches `discoverSkillNames`, the same list handed to the SDK as the
+	 * `skills` allowlist, so the check cannot drift from what is installed.
+	 * A plugin-qualified `plugin:skill` is matched on either form because the
+	 * SDK accepts both.
+	 *
+	 * Fails OPEN on a discovery error: leaving the comment as prose is the
+	 * behaviour that predates NOR-368, and losing a slash invocation is far
+	 * cheaper than losing the comment.
+	 */
+	private async isKnownSkill(
+		name: string,
+		input: PromptAssemblyInput,
+	): Promise<boolean> {
+		const repository = input.repositories?.[0] ?? input.repository;
+		if (!repository) return false;
+		try {
+			const names = await this.skillsPluginResolver.discoverSkillNames(
+				await this.skillsPluginResolver.resolve(),
+				this.buildSkillSessionContext(
+					repository,
+					input.fullIssue,
+					input.session,
+				),
+			);
+			const unqualified = name.includes(":") ? name.split(":").pop() : name;
+			return names.some(
+				(known) =>
+					known === name ||
+					known === unqualified ||
+					known.split(":").pop() === unqualified,
+			);
+		} catch (error) {
+			this.logger.warn(
+				`Skill discovery failed while checking "/${name}"; leaving the comment as prose: ${(error as Error).message}`,
+			);
+			return false;
+		}
 	}
 
 	/**

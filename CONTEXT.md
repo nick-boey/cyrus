@@ -68,6 +68,18 @@ The kind of machine an issue's agent runs on — a contributor's own device, or 
 ephemeral container. Which executor is used changes nothing about the persistence
 floor.
 
+**Runner**:
+The coding agent an issue's work is done by — Claude Code, Codex, Gemini, or
+Cursor. Orthogonal to the executor: the runner is *what* works the issue, the
+executor is *where* it runs.
+_Avoid_: agent, harness, backend, provider (a provider implements an executor)
+
+**Model**:
+The specific model a runner drives, such as `opus` or `gpt-5.5`. Every model
+belongs to exactly one runner, so naming a model can name the runner by
+implication.
+_Avoid_: LLM
+
 **Sandbox**:
 Azure Container Apps' own name for a container. Confined to code and docs facing
 the Azure API — the concept is a *container* everywhere else, including in

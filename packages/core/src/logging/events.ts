@@ -53,6 +53,15 @@ export const CYRUS_EVENTS = {
 	sessionPendingWorkRecorded: "session.pending_work_recorded",
 	/** The set of in-flight background tasks changed. */
 	sessionBackgroundTasksChanged: "session.background_tasks_changed",
+
+	/**
+	 * A `/<skill>` command leading a user's comment was echoed onto line 1 of
+	 * the assembled prompt so the agent SDK expands it. Carries `cyrus.skill`.
+	 *
+	 * This is the only signal that a slash-invoked skill ran: expansion bypasses
+	 * the `Skill` tool entirely, so no tool-use activity is emitted for it.
+	 */
+	skillSlashInvoked: "skill.slash_invoked",
 } as const;
 
 export type CyrusEventName = (typeof CYRUS_EVENTS)[keyof typeof CYRUS_EVENTS];

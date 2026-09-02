@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+	parseRepoOverride,
 	parseRequiredSecretKeys,
 	startRouterServer,
 } from "../../router-server.js";
@@ -64,6 +65,40 @@ describe("parseRequiredSecretKeys", () => {
 		expect(parseRequiredSecretKeys("")).toBeUndefined();
 		expect(parseRequiredSecretKeys(" , ")).toBeUndefined();
 	});
+});
+
+describe("parseRepoOverride", () => {
+	it("splits owner/repo@branch, naming the repo after its second segment", () => {
+		expect(parseRepoOverride("nick-boey/thing@trunk", "ws-1")).toEqual([
+			{
+				name: "thing",
+				githubSlug: "nick-boey/thing",
+				linearWorkspaceId: "ws-1",
+				baseBranch: "trunk",
+			},
+		]);
+	});
+
+	it("defaults the base branch to main when none is given", () => {
+		expect(parseRepoOverride("nick-boey/thing", "ws-1")?.[0]?.baseBranch).toBe(
+			"main",
+		);
+	});
+
+	it("returns undefined when unset or blank, leaving the rig default", () => {
+		expect(parseRepoOverride(undefined, "ws-1")).toBeUndefined();
+		expect(parseRepoOverride("  ", "ws-1")).toBeUndefined();
+	});
+
+	// Each of these once produced a silently-unusable rig rather than an error:
+	// a trailing `@` gave an empty base branch, and a leading `@` was swallowed
+	// into the slug, yielding an unclonable "@owner/repo".
+	it.each(["nick-boey/thing@", "@nick-boey/thing", "thing", "a/b/c", "a b/c"])(
+		"rejects %j rather than booting containers against it",
+		(raw) => {
+			expect(() => parseRepoOverride(raw, "ws-1")).toThrow(/F1_ROUTER_REPO/);
+		},
+	);
 });
 
 describe("router-server requiredSecretKeys passthrough (fake executor)", () => {
