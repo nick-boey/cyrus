@@ -201,6 +201,77 @@ describe("EdgeWorker terminal teardown ordering", () => {
 		]);
 	});
 
+	/**
+	 * NOR-411: the WIP snapshot was reaped from a worktree path reconstructed
+	 * as `<cyrusHome>/worktrees/<ISSUE>`, which is not where a container
+	 * sandbox's worktrees live — so the reaper spawned git in a directory that
+	 * had never existed and the ref was never deleted from the remote.
+	 * Deleting the ref only needs a checkout whose `origin` carries it, and the
+	 * repository's main checkout is both the one we can name without guessing
+	 * and the one that outlives this teardown.
+	 */
+	it("reaps WIP snapshots from each repository's main checkout, not a reconstructed worktree path", async () => {
+		const reaped: Array<[string, string]> = [];
+		const session = {
+			id: "sess-1",
+			issue: { identifier: "CAN-129", branchName: "cyrus1/can-129-do-it" },
+			agentRunner: { stop: vi.fn() },
+		};
+		const repository = {
+			id: "repo-a",
+			name: "repo-a",
+			// A container sandbox: the clone lives under the shared workspaces
+			// root, nowhere near `<cyrusHome>/worktrees`.
+			repositoryPath: "/workspaces/repos/repo-a",
+			workspaceBaseDir: "/workspaces",
+		};
+		const fakeWorker = {
+			logger: { info: vi.fn(), warn: vi.fn() },
+			cyrusHome: "/workspaces/.cyrus",
+			agentSessionManager: {
+				getSessionsByIssueId: () => [session],
+				requestSessionStop: vi.fn(),
+				createResponseActivity: vi.fn(),
+				removeSession: vi.fn(),
+			},
+			sessionRepositories: new Map([["sess-1", "repo-a"]]),
+			repositories: new Map([["repo-a", repository]]),
+			deriveWorktreeBranchName: (issue: { branchName: string }) =>
+				issue.branchName,
+			wipSnapshotReaper: {
+				reap: async (repoPath: string, branch: string) => {
+					reaped.push([repoPath, branch]);
+				},
+				sweep: vi.fn(),
+			},
+			gitService: { deleteWorktree: vi.fn() },
+			config: { platform: "cli" },
+		};
+		const handler = (
+			EdgeWorker.prototype as unknown as {
+				handleIssueStateChangeMessage(message: {
+					workItemId: string;
+					workItemIdentifier: string;
+				}): Promise<void>;
+			}
+		).handleIssueStateChangeMessage;
+
+		await handler.call(fakeWorker, {
+			workItemId: "issue-1",
+			workItemIdentifier: "CAN-129",
+		});
+
+		expect(reaped).toEqual([
+			["/workspaces/repos/repo-a", "cyrus1/can-129-do-it"],
+		]);
+		// Teardown gets the repository so it can resolve the same workspace
+		// path creation used.
+		expect(fakeWorker.gitService.deleteWorktree).toHaveBeenCalledWith(
+			"CAN-129",
+			{ repositories: [repository] },
+		);
+	});
+
 	it("skips the callback queue entirely outside router platform mode", async () => {
 		const order: string[] = [];
 		const fakeWorker = {

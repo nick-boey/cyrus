@@ -60,6 +60,19 @@ export class WipSnapshotReaper {
 	 * deletion must not block the rest of terminal cleanup.
 	 */
 	async reap(repoPath: string, branch: string): Promise<void> {
+		// Checked before spawning, not after failing. `deleteSnapshot` shells out
+		// to git with `repoPath` as its `cwd`, and Node reports a missing `cwd`
+		// as `spawn git ENOENT` — indistinguishable from git not being installed,
+		// which is what the first investigation of NOR-411 concluded. There is
+		// also nothing to retry: without a checkout there is no remote to reach,
+		// and `sweep()` would drop the entry on sight anyway.
+		if (!existsSync(repoPath)) {
+			this.logger.warn(
+				`WipSnapshotReaper: giving up on ${branch} — the checkout at ${repoPath} does not exist, so there is no remote to delete the ref from and it must be removed by hand`,
+			);
+			this.forget(repoPath, branch);
+			return;
+		}
 		try {
 			await this.deleteSnapshot(repoPath, branch);
 			this.forget(repoPath, branch);
@@ -79,16 +92,9 @@ export class WipSnapshotReaper {
 			`WipSnapshotReaper: retrying ${pending.length} leaked WIP snapshot ref(s)`,
 		);
 		for (const entry of pending) {
-			// `repoPath` is a checkout that terminal teardown may since have
-			// removed; without it there is no remote to talk to, and no way to
-			// ever delete the ref, so stop carrying the entry.
-			if (!existsSync(entry.repoPath)) {
-				this.logger.warn(
-					`WipSnapshotReaper: giving up on ${entry.branch} — ${entry.repoPath} no longer exists, so the ref must be removed by hand`,
-				);
-				this.forget(entry.repoPath, entry.branch);
-				continue;
-			}
+			// `reap` drops an entry whose checkout has since been removed — there
+			// is no remote to talk to without one, so no way to ever delete the
+			// ref, so no reason to keep carrying the entry.
 			await this.reap(entry.repoPath, entry.branch);
 		}
 	}

@@ -141,6 +141,10 @@ export {
 	DEFAULT_WORKTREES_DIR,
 	getDefaultReposDir,
 	getDefaultWorktreesDir,
+	type ResolvedWorkspacePath,
+	resolveIssueWorkspacePath,
+	type WorkspaceBaseDirCarrier,
+	type WorkspaceBaseDirSource,
 } from "./constants.js";
 export { DEVCONTAINER_PATHS, parseJsonc } from "./devcontainer.js";
 // Issue Tracker Abstraction

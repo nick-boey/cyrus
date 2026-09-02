@@ -60,7 +60,6 @@ import {
 	createLogger,
 	cyrusAttributes,
 	DEFAULT_PROXY_URL,
-	getDefaultWorktreesDir,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isContentUpdateMessage,
@@ -4081,21 +4080,24 @@ ${taskSection}`;
 				const branchName = this.deriveWorktreeBranchName(
 					sessionWithIssue.issue,
 				);
-				// Mirrors the worktree layout GitService.deleteWorktree resolves
-				// internally: single repo -> workspace root IS the worktree;
-				// multi-repo -> each repo's worktree is a named subdirectory.
-				// Each repository carries its own snapshot under the same ref
-				// name, so every one of them has to be deleted.
-				const workspacePath = join(
-					getDefaultWorktreesDir(this.cyrusHome),
-					message.workItemIdentifier,
-				);
-				const worktreePaths =
-					teardownRepositories.length > 1
-						? teardownRepositories.map((repo) => join(workspacePath, repo.name))
-						: [workspacePath];
-				for (const worktreePath of worktreePaths) {
-					await this.wipSnapshotReaper.reap(worktreePath, branchName);
+				// Reaped from each repository's MAIN checkout, not from the
+				// issue's worktree. Deleting the ref is a remote operation —
+				// any checkout whose `origin` carries it will do — and two
+				// things follow from preferring the durable one. It cannot go
+				// looking for a worktree at a path that was reconstructed
+				// rather than resolved, which is how every container sandbox
+				// ended up reaping a directory that had never existed
+				// (NOR-411). And the path outlives this teardown, so the
+				// reaper's durable retry is actually retryable: `sweep()`
+				// discards any entry whose path has since disappeared, which a
+				// worktree always has by the time the next sweep runs. Each
+				// repository carries its own snapshot under the same ref name,
+				// so every one of them has to be deleted.
+				for (const repository of teardownRepositories) {
+					await this.wipSnapshotReaper.reap(
+						repository.repositoryPath,
+						branchName,
+					);
 				}
 				// Same trip, same remotes: retry anything a previous teardown
 				// failed to delete, so one unreachable remote at the wrong
