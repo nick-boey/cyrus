@@ -10,6 +10,7 @@ export {
 } from "./ContainerTargets.js";
 export { DeviceGateway } from "./DeviceGateway.js";
 export {
+	DEFAULT_AGENT_RUN_RETENTION_MS,
 	DEFAULT_WEBHOOK_CLAIM_RETENTION_MS,
 	EventRouter,
 	type EventRouterOptions,
@@ -60,12 +61,21 @@ export {
 	type RouterWorkspaceConfig,
 } from "./RouterServer.js";
 export {
+	type AgentRunInfo,
+	type AgentRunInput,
+	type AgentRunState,
 	type ContainerDeviceInfo,
 	type DeviceInfo,
 	type PendingTeardownInfo,
 	RouterStore,
 	type SessionInfo,
 } from "./RouterStore.js";
+export {
+	type AgentRunObservation,
+	type AgentRunsResponse,
+	type RegisterRunsRouteOptions,
+	registerRunsRoute,
+} from "./runs.js";
 export {
 	SANDBOX_LOG_SOURCE,
 	type SandboxLogOrigin,

@@ -70,6 +70,7 @@ function createdFixture(opts: {
 	sessionId: string;
 	issue: { id: string; identifier: string; title: string };
 	creator: Creator;
+	commentId?: string;
 }): AgentEvent {
 	return {
 		type: "AgentSessionEvent",
@@ -78,6 +79,7 @@ function createdFixture(opts: {
 		createdAt: new Date().toISOString(),
 		agentSession: {
 			id: opts.sessionId,
+			...(opts.commentId ? { sourceCommentId: opts.commentId } : {}),
 			organizationId: WORKSPACE,
 			status: "active",
 			type: "issue",
@@ -102,6 +104,7 @@ function promptedFixture(opts: {
 	creator: Creator;
 	issue: { id: string; identifier: string; title: string };
 	body: string;
+	commentId?: string;
 }): AgentEvent {
 	return {
 		type: "AgentSessionEvent",
@@ -110,6 +113,7 @@ function promptedFixture(opts: {
 		createdAt: new Date().toISOString(),
 		agentActivity: {
 			id: `act-${opts.sessionId}-${opts.actorUserId}`,
+			...(opts.commentId ? { sourceCommentId: opts.commentId } : {}),
 			userId: opts.actorUserId,
 			content: { type: "prompt", body: opts.body },
 		},
@@ -456,6 +460,7 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 				creator: ALICE,
 				issue: promptIssue,
 				body: "please also add tests",
+				commentId: "comment-prompt",
 			}),
 		);
 		await waitUntil(
@@ -521,5 +526,47 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 				},
 			}),
 		).rejects.toBeInstanceOf(RouterRpcError);
+	});
+
+	it("7. exposes routed input, activity, liveness, and terminal state through authenticated HTTP", async () => {
+		const query = async () => {
+			const response = await fetch(
+				`http://127.0.0.1:${server.port}/runs?issueKey=DEF-12&commentId=comment-prompt`,
+				{ headers: { authorization: `Bearer ${deviceToken}` } },
+			);
+			expect(response.status).toBe(200);
+			return (await response.json()) as {
+				runs: Array<{
+					state: string;
+					lastAgentActivityAt?: string;
+					workerOnline: boolean;
+					executorKind: string;
+					inputs: Array<{ commentId?: string }>;
+				}>;
+			};
+		};
+
+		const active = await query();
+		expect(active.runs).toHaveLength(1);
+		expect(active.runs[0]).toMatchObject({
+			state: "active",
+			workerOnline: true,
+			executorKind: "device",
+		});
+		expect(active.runs[0]?.inputs).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ commentId: "comment-prompt" }),
+			]),
+		);
+		expect(active.runs[0]?.lastAgentActivityAt).toBeDefined();
+
+		stack.connection.sendSessionState("sess-prompt", "complete");
+		await waitUntil(
+			() =>
+				server.store.listAgentRuns({ userId: 1, issueKey: "DEF-12" })[0]
+					?.state === "complete",
+			"terminal run observation",
+		);
+		expect((await query()).runs[0]?.state).toBe("complete");
 	});
 });

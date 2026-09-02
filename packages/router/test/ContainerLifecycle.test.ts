@@ -822,6 +822,14 @@ describe("ContainerLifecycle", () => {
 				state: "stopped",
 				sessions: 0,
 			});
+			expect(lifecycle.getSandboxObservation(pinned.deviceId)).toEqual({
+				state: "running",
+				observedMs: pinned.createdMs + 60_000,
+			});
+			expect(lifecycle.getSandboxObservation(idle.deviceId)).toEqual({
+				state: "stopped",
+				observedMs: pinned.createdMs + 60_000,
+			});
 		});
 
 		/**

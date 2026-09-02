@@ -217,6 +217,22 @@ export class LinearExecutor {
 				);
 			}
 
+			if (method === "createAgentActivity" && agentActivitySucceeded(result)) {
+				const sessionId = extractSessionId(method, rest);
+				if (sessionId) {
+					try {
+						this.store.recordAgentRunActivity(sessionId, Date.now());
+					} catch (error) {
+						// The Linear post already succeeded. Observation must never turn that
+						// success into a retry that could duplicate user-visible activity.
+						this.logger.warn(
+							`Could not update run activity for session ${sessionId}`,
+							error,
+						);
+					}
+				}
+			}
+
 			return response;
 		} catch (err) {
 			// The device only ever sees the flattened message in the rpc_response
@@ -500,6 +516,14 @@ function isLinearAttachmentHost(hostname: string): boolean {
 
 function fail(id: string, error: string): RpcResponseFrame {
 	return { type: "rpc_response", id, ok: false, error };
+}
+
+function agentActivitySucceeded(result: unknown): boolean {
+	return (
+		typeof result === "object" &&
+		result !== null &&
+		(result as { success?: unknown }).success === true
+	);
 }
 
 /**

@@ -73,6 +73,11 @@ export interface ContainerLifecycleOptions {
 	now?: () => number;
 }
 
+export interface SandboxObservation {
+	state: SandboxGaugeState;
+	observedMs: number;
+}
+
 /**
  * Periodic sweep that keeps ephemeral containers bounded in cost and disk:
  *
@@ -132,6 +137,7 @@ export class ContainerLifecycle {
 	private readonly strandedDevices = new Set<number>();
 	private readonly logger: ILogger;
 	private readonly now: () => number;
+	private readonly observations = new Map<number, SandboxObservation>();
 	/** Non-undefined while a tick is running; see {@link sweep}. */
 	private inFlight: Promise<void> | undefined;
 
@@ -146,6 +152,11 @@ export class ContainerLifecycle {
 		this.sessionReconciler = opts.sessionReconciler;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
+	}
+
+	/** Latest provider-backed sample, collected by the existing lifecycle sweep. */
+	getSandboxObservation(deviceId: number): SandboxObservation | undefined {
+		return this.observations.get(deviceId);
 	}
 
 	/**
@@ -345,6 +356,10 @@ export class ContainerLifecycle {
 		const gaugeState: SandboxGaugeState = !listing?.states
 			? "unknown"
 			: (state?.status ?? "absent");
+		this.observations.set(row.deviceId, {
+			state: gaugeState,
+			observedMs: now,
+		});
 
 		let runningSinceMs = row.runningSinceMs;
 		if (gaugeState === "running" && runningSinceMs === undefined) {
@@ -514,6 +529,10 @@ export class ContainerLifecycle {
 				);
 				if (now - lastTouch > this.staleDestroyMs) {
 					await executor.destroy(row.issueKey);
+					this.observations.set(row.deviceId, {
+						state: "absent",
+						observedMs: this.now(),
+					});
 					this.store.deleteContainerDevice(row.deviceId);
 					emitSandboxEvent(
 						this.logger,
@@ -595,6 +614,10 @@ export class ContainerLifecycle {
 					}
 					if (status === "running") {
 						await executor.stop(row.issueKey);
+						this.observations.set(row.deviceId, {
+							state: "stopped",
+							observedMs: this.now(),
+						});
 						// The container is no longer running, so its continuous-uptime
 						// clock stops here. Read before clearing so the event can report
 						// how long the run it ends actually lasted — the single most

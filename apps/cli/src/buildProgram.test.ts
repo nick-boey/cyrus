@@ -21,6 +21,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  */
 
 const routerExecute = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const runsExecute = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const applicationDisposeWatchers = vi.hoisted(() => vi.fn());
 const containerBootExecute = vi.hoisted(() =>
 	vi.fn().mockResolvedValue(undefined),
@@ -48,6 +49,12 @@ vi.mock("./commands/ContainerBootCommand.js", () => ({
 		}),
 }));
 
+vi.mock("./commands/RunsCommand.js", () => ({
+	RunsCommand: vi.fn().mockImplementation(function FakeRunsCommand() {
+		return { execute: runsExecute };
+	}),
+}));
+
 const { buildProgram } = await import("./buildProgram.js");
 
 function newProgram() {
@@ -61,6 +68,7 @@ async function run(argv: string[]) {
 describe("buildProgram — Commander wiring for the container subcommands", () => {
 	beforeEach(() => {
 		routerExecute.mockClear();
+		runsExecute.mockClear();
 		applicationDisposeWatchers.mockClear();
 		containerBootExecute.mockClear();
 	});
@@ -257,6 +265,34 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		await run(["container-boot", "--restore-only"]);
 
 		expect(containerBootExecute).toHaveBeenCalledWith(["--restore-only"]);
+	});
+
+	it("registers `runs` beside `connect` and forwards its filters", async () => {
+		await run([
+			"runs",
+			"NOR-402",
+			"--comment",
+			"comment-1",
+			"--after",
+			"2026-09-02T00:00:00.000Z",
+			"--watch",
+			"--timeout",
+			"600",
+			"--json",
+		]);
+
+		expect(runsExecute).toHaveBeenCalledWith([
+			"NOR-402",
+			"--comment",
+			"comment-1",
+			"--after",
+			"2026-09-02T00:00:00.000Z",
+			"--watch",
+			"--timeout",
+			"600",
+			"--json",
+		]);
+		expect(applicationDisposeWatchers).toHaveBeenCalledTimes(1);
 	});
 
 	it("still rejects a genuinely unregistered router subcommand", async () => {

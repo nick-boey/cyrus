@@ -85,7 +85,8 @@ Optional fields (with defaults):
 - `verificationMode: "direct"` verifies Linear's webhook signature with `secret`.
   Use `"proxy"` (Bearer token) if the router sits behind the Cyrus proxy.
 - The database lives at `~/.cyrus/router/router.db` (SQLite, WAL mode). It holds
-  the user/device registry, the per-device event queue, and issue locks.
+  the user/device registry, the per-device event queue, issue locks, and recent
+  agent-run observations.
 
 ### 2. Start the router
 
@@ -1397,6 +1398,10 @@ an ephemeral container's is — for example so a session can later be migrated
 from your laptop onto a container — add `"floorSync": true` to the `router`
 block in your `config.json` by hand.
 
+The same saved connection is used by `cyrus runs`; there is no second login or
+router URL to configure. The CLI converts the stored WebSocket URL back to the
+matching HTTP(S) origin and sends the device token as a bearer token.
+
 ### 2. Install and OAuth the official Linear MCP locally
 
 In router-client mode Cyrus does **not** configure the app-token Linear MCP —
@@ -1454,6 +1459,42 @@ cyrus start
 Your device dials the router, authenticates with its token, and begins receiving
 the agent sessions **you** create in Linear. Sessions run locally in isolated
 git worktrees exactly as in single-host mode.
+
+### Observe agent runs
+
+Use the connection created by `cyrus connect` to see what the router currently
+knows about your runs:
+
+```bash
+cyrus runs                         # recent runs owned by this user
+cyrus runs NOR-402                 # runs for one issue
+cyrus runs NOR-402 --comment <id>  # the run that received a Linear comment
+cyrus runs NOR-402 --watch         # wait for a terminal outcome
+```
+
+`--after <ISO timestamp>` narrows the result by the time input was last routed.
+It is a fallback for clients that did not retain the Linear comment ID.
+`--json` emits one JSON object per observation (NDJSON while watching), and
+`--timeout <seconds>` bounds a watch. A watch exits successfully only for
+`complete`; `error`, `stopped`, `unknown`, timeout, and connection failure are
+non-zero outcomes. A watch requires an issue or comment filter.
+
+The router records a stable run ID, issue and agent-session IDs, routed input
+references, lifecycle timestamps, the latest successfully published Linear
+agent activity, worker heartbeat/liveness, and the executor's last sampled
+state. It does not persist the comment body or its first line: `commentId` and
+`activityId` are the correlation keys. Executor state is sampled by the normal
+one-minute lifecycle sweep, so `sandboxStateObservedAt` tells callers how fresh
+that fact is. The endpoint deliberately reports facts rather than guessing that
+a run is healthy or stalled.
+
+Terminal observations are retained for 24 hours. If the router loses ownership
+without receiving an exact terminal result, the run becomes `unknown`; that
+means the outcome is unavailable, not necessarily that the work failed.
+
+The underlying `GET /runs` route uses the same device bearer token. A physical
+device token may query its owner's runs; a container token is restricted to its
+own issue. Query parameters are `issueKey`, `commentId`, and `since`.
 
 ---
 
@@ -1623,4 +1664,5 @@ handoff mechanism.
 | `cyrus router secrets list <email> [--check-scopes]` | host | List stored secret keys (values masked) + any missing required keys. `--check-scopes` additionally reports the stored `GH_TOKEN`/`GIT_TOKEN` OAuth scopes — advisory only, never rejects a usable token, never prints values. |
 | `cyrus router secrets migrate --from keyvault --to table [--dry-run]` | host | Copy every user's per-user secrets from the Key Vault backend to the Table backend named in `containers`. Never prints values; `--dry-run` lists what would move without writing anything. |
 | `cyrus connect <url> --code <code> [--entra <audience>]` | device | Enroll this device, optionally using an Azure CLI Entra token. |
+| `cyrus runs [issue] [--comment <id>] [--after <time>] [--watch] [--timeout <seconds>] [--json]` | device | Query or watch owner-scoped agent runs using the connection saved by `cyrus connect`. |
 | `cyrus start` | device | Begin receiving and running your routed sessions. |

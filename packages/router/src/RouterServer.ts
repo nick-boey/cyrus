@@ -56,6 +56,7 @@ import {
 } from "./RepositoryRegistry.js";
 import { RepositoryResolver } from "./RepositoryResolver.js";
 import { RouterStore } from "./RouterStore.js";
+import { registerRunsRoute } from "./runs.js";
 import { SandboxLogRelay } from "./SandboxLogRelay.js";
 import { SandboxSpanRelay } from "./SandboxSpanRelay.js";
 import {
@@ -628,6 +629,11 @@ export class RouterServer {
 			Object.keys(config.workspaces),
 		);
 		registerArtifactsRoute(this.fastify, this.store, artifactsDir);
+		registerRunsRoute(this.fastify, this.store, {
+			isDeviceOnline: (deviceId) => this.gateway.isOnline(deviceId),
+			getSandboxObservation: (deviceId) =>
+				this.containerLifecycle?.getSandboxObservation(deviceId),
+		});
 
 		// Liveness probe for container orchestrators (Docker HEALTHCHECK,
 		// serverless platforms). Registered in the constructor because Fastify

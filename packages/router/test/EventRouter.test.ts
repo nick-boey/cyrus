@@ -44,6 +44,7 @@ function createdEvent(opts: {
 	creator?: Creator;
 	organizationId?: string;
 	parentIssueId?: string;
+	commentId?: string;
 }): AgentEvent {
 	const org = opts.organizationId ?? "ws-1";
 	return {
@@ -62,6 +63,7 @@ function createdEvent(opts: {
 					}
 				: undefined,
 			creator: opts.creator,
+			commentId: opts.commentId,
 		},
 	} as unknown as AgentEvent;
 }
@@ -140,6 +142,7 @@ function promptedEvent(opts: {
 	 */
 	identifier?: string;
 	organizationId?: string;
+	commentId?: string;
 }): AgentEvent {
 	const org = opts.organizationId ?? "ws-1";
 	return {
@@ -147,7 +150,12 @@ function promptedEvent(opts: {
 		action: "prompted",
 		organizationId: org,
 		agentActivity: opts.actorUserId
-			? { id: "act-1", userId: opts.actorUserId, content: {} }
+			? {
+					id: "act-1",
+					userId: opts.actorUserId,
+					sourceCommentId: opts.commentId,
+					content: {},
+				}
 			: undefined,
 		agentSession: {
 			id: opts.sessionId,
@@ -317,6 +325,56 @@ describe("EventRouter", () => {
 			"ws-1",
 			"sess-1",
 			offlineWaitingMessage("alice@example.com"),
+		]);
+	});
+
+	it("records routed input ids and the exact terminal run outcome", async () => {
+		const deviceId = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, clock } = makeRouter(store);
+
+		await router.route(
+			createdEvent({
+				sessionId: "sess-observed",
+				issueId: "issue-observed",
+				identifier: "NOR-402",
+				creator: ALICE,
+				commentId: "comment-created",
+			}),
+		);
+		clock.value += 100;
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-observed",
+				issueId: "issue-observed",
+				identifier: "NOR-402",
+				creator: ALICE,
+				actorUserId: "lin-alice",
+				commentId: "comment-prompted",
+			}),
+		);
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "terminal-1",
+			sessionId: "sess-observed",
+			state: "complete",
+		});
+
+		const [run] = store.listAgentRuns({ userId: 1 });
+		expect(run).toMatchObject({
+			issueKey: "NOR-402",
+			sessionId: "sess-observed",
+			state: "complete",
+			endedMs: ROUTE_NOW + 100,
+		});
+		expect(run?.inputs).toEqual([
+			{ commentId: "comment-created", routedMs: ROUTE_NOW },
+			{
+				activityId: "act-1",
+				commentId: "comment-prompted",
+				routedMs: ROUTE_NOW + 100,
+			},
 		]);
 	});
 
