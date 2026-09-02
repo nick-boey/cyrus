@@ -280,6 +280,7 @@ const RouterConfigFileSchema = z.object({
 			offlineAgeOutMs: z.number().optional(),
 			strandedSessionGraceMs: z.number().optional(),
 			sessionsQueryTimeoutMs: z.number().optional(),
+			terminalSettleMs: z.number().optional(),
 			requiredSecretKeys: z
 				.array(
 					z.string().refine(isStorableSecretKey, {

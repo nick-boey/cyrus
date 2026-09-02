@@ -195,6 +195,10 @@ export interface RouterContainersConfig {
 	strandedSessionGraceMs?: number;
 	/** Default 5_000 (5 seconds). */
 	sessionsQueryTimeoutMs?: number;
+	/** Default 120_000 (2 minutes). How long after an agent run on a container
+	 *  ends the lifecycle sweep leaves that container alone, so its worker can
+	 *  flush and get its terminal frame acked before being parked. */
+	terminalSettleMs?: number;
 	/**
 	 * Per-repository devcontainer images (NOR-309). Omit it and every container
 	 * boots {@link RouterContainersConfig.image} — today's behaviour, unchanged.
@@ -1202,6 +1206,9 @@ export class RouterServer {
 			offlineAgeOutMs: containers.offlineAgeOutMs ?? DEFAULT_OFFLINE_AGE_OUT_MS,
 			...(containers.strandedSessionGraceMs !== undefined
 				? { strandedSessionGraceMs: containers.strandedSessionGraceMs }
+				: {}),
+			...(containers.terminalSettleMs !== undefined
+				? { terminalSettleMs: containers.terminalSettleMs }
 				: {}),
 			logger: this.logger,
 			sessionReconciler: {

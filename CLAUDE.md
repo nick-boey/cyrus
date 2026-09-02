@@ -485,6 +485,32 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      `offlineAgeOutMs` — so a "block if any affinity exists" re-check silently
      restores the permanent pin PAR-146 removed. Only session ids absent from
      the pre-gate snapshot may veto a stop.
+   - **`sweepOnce`'s opening `listContainerDevices()` and `now()` are a WORK
+     LIST, not data to decide from.** The loop is sequential and blocks on
+     provider control-plane calls, so a tick routinely outlives its own 60s
+     interval — one measured 392s. Deciding a row at 07:51:54 from 07:45:22's
+     clock and row makes `idleForMs = now - lastRoutedMs` arithmetic on two
+     numbers that no longer relate, and the route stamped at 07:51:39 is
+     invisible to every check, NOR-366's `claimedMidSweep` guard included: that
+     guard compares affinity against a snapshot taken *after* the claim, so it
+     correctly sees nothing new (NOR-406 — stopped 4s after the session started,
+     issue stuck 37 minutes). Every value a decision uses is re-read inside the
+     row's own iteration via `getContainerDevice(deviceId)` + `this.now()`, and
+     re-derived once more immediately before `stop()`. Keyed by device id, never
+     issue key: a destroyed-and-recreated row is a different container. The one
+     thing that stays tick-level is the provider listing — one call per provider
+     per tick is its whole cost model.
+   - **The dangerous moment to stop a container is the seconds AFTER a run
+     ends.** The worker's `session_state` frame is durably buffered and replayed
+     until acked, and its artifact bundle is still uploading — stop it there and
+     the frame never lands, so the affinity row and the issue lock survive with
+     nothing left alive to release them. `getLastAgentRunActivityMs` (over
+     `agent_runs.ended_ms` / `last_agent_activity_ms`) vetoes a stop within
+     `terminalSettleMs`. It covers the reconciler's `markAgentRunUnknown` reclaim
+     too, which is precisely "the device is done and the router never saw a
+     frame". The veto is CLAMPED to `idleStopMs`: it must cover seconds, never
+     become the dominant term in the parking policy, or it is PAR-146's
+     permanent pin under another name.
    - **`state=stopped && sessions>0 && online=false` is an impossible state that
      produces no signal on its own.** No lifecycle transition fires, the gauge
      records it as three unremarkable fields, and Linear keeps rendering a live

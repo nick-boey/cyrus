@@ -39,6 +39,25 @@ interface ProviderListing {
 const DEFAULT_STRANDED_SESSION_GRACE_MS = 600_000;
 
 /**
+ * 2 minutes — default {@link ContainerLifecycleOptions.terminalSettleMs}.
+ *
+ * The window after a run ends in which a container is left alone so its worker
+ * can finish saying so. A `session_state` frame is durably buffered on the
+ * device and replayed until the router acks it, and the artifact bundle is
+ * still uploading — but the process that would do either had been stopped
+ * (NOR-406: the stop landed 3.8s after the completion, the frame never
+ * arrived, and the affinity row plus the issue lock survived for 37 minutes
+ * while Linear rendered a live session).
+ *
+ * Generous on purpose, and close to free: after the sweep's clock is read
+ * fresh, a container whose run just ended is not idle by any measure, so this
+ * veto only ever fires in the pathological case where the idle clock's inputs
+ * are somehow older than the completion. It is bounded — a stop deferred here
+ * happens on a later tick — so it can never become a permanent pin.
+ */
+const DEFAULT_TERMINAL_SETTLE_MS = 120_000;
+
+/**
  * Lets the sweep re-derive a device's affinity from the device itself rather
  * than trusting rows that only ever clear on a frame the worker may never
  * send. Injected so the sweep stays unit-testable without a gateway.
@@ -66,6 +85,9 @@ export interface ContainerLifecycleOptions {
 	 *  hold before it is reported. Must comfortably exceed a cold boot, during
 	 *  which those same three facts are the EXPECTED state. Default: 10 minutes. */
 	strandedSessionGraceMs?: number;
+	/** How long after an agent run on a device ends the container is left alone,
+	 *  so the worker can flush and get its terminal frame acked. Default: 2 minutes. */
+	terminalSettleMs?: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
 	sessionReconciler?: SessionReconciler;
 	logger: ILogger;
@@ -117,6 +139,15 @@ export interface SandboxObservation {
  * is NOT running — is reported by {@link noteStranded}; it is the only state
  * here that should be impossible.
  *
+ * EVERY value a decision is made from is read inside the row's own iteration,
+ * never from the tick's opening snapshot. A tick is sequential and blocks on
+ * provider control-plane calls, so it routinely outlives its own 60s interval —
+ * one measured 392 seconds. Deciding from the top-of-tick clock and row set
+ * then means deciding from data minutes old, which stopped a container four
+ * seconds after a new session started on it and left the issue stuck for 37
+ * minutes (NOR-406). The snapshot is a work list; `getContainerDevice` and
+ * `this.now()` inside the loop are the truth.
+ *
  * Executor errors are logged and skipped, never thrown: one unreachable
  * provider (e.g. a dead Docker daemon) must not stop the sweep from
  * reclaiming every other container.
@@ -128,6 +159,7 @@ export class ContainerLifecycle {
 	private readonly staleDestroyMs: number;
 	private readonly offlineAgeOutMs: number;
 	private readonly strandedSessionGraceMs: number;
+	private readonly terminalSettleMs: number;
 	private readonly sessionReconciler: SessionReconciler | undefined;
 	/** Devices already reported as pinned, so the 60s tick logs on transition only. */
 	private readonly pinnedDevices = new Set<number>();
@@ -149,6 +181,15 @@ export class ContainerLifecycle {
 		this.offlineAgeOutMs = opts.offlineAgeOutMs;
 		this.strandedSessionGraceMs =
 			opts.strandedSessionGraceMs ?? DEFAULT_STRANDED_SESSION_GRACE_MS;
+		// Clamped to the idle window. The settle veto exists to cover the
+		// SECONDS between a run ending and its worker finishing saying so; it
+		// must never be the dominant term in the stop decision. Left unclamped,
+		// a deployment (or a test rig) with a short `idleStopMs` would have its
+		// parking policy quietly replaced by this constant.
+		this.terminalSettleMs = Math.min(
+			opts.terminalSettleMs ?? DEFAULT_TERMINAL_SETTLE_MS,
+			opts.idleStopMs,
+		);
 		this.sessionReconciler = opts.sessionReconciler;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
@@ -181,6 +222,74 @@ export class ContainerLifecycle {
 		return this.store
 			.listSessionAffinityForDevice(deviceId)
 			.filter((r) => now - r.establishedMs <= this.offlineAgeOutMs).length;
+	}
+
+	/**
+	 * When this container's idle clock last moved.
+	 *
+	 * Three inputs, each covering a way the others go stale:
+	 *  - `lastRoutedMs`: the router handed this device an event.
+	 *  - `parkedAtMs`: a session on it blocked on a user answer. Without it the
+	 *    clock is `lastRoutedMs`, so an agent that worked for twenty minutes and
+	 *    only then asked a question would be suspended on the very next tick, the
+	 *    clock having expired while it was legitimately busy.
+	 *  - `lastActiveMs`: the device last held a live session (see
+	 *    `RouterStore.markDeviceActive`). The only one stamped by the AGENT
+	 *    working rather than by the router doing something TO the agent, and so
+	 *    the only one that moves during a long session. Without it a 40-minute
+	 *    session leaves the other two frozen at its start and the container reads
+	 *    as idle for 35 of those minutes.
+	 *
+	 * Pure, and takes the row as an argument, precisely so every caller has to
+	 * decide WHICH row it is passing — the whole of NOR-406 was this arithmetic
+	 * being done once against a row read minutes earlier.
+	 */
+	private idleSince(row: ContainerDeviceInfo): number {
+		return Math.max(
+			row.lastRoutedMs ?? 0,
+			row.parkedAtMs ?? 0,
+			row.lastActiveMs ?? 0,
+			row.createdMs,
+		);
+	}
+
+	/**
+	 * Reasons to abandon an idle-stop, re-derived from the store AS IT STANDS.
+	 * Returns a human-readable reason, or undefined to proceed with the stop.
+	 *
+	 * Called twice per candidate: once at the decision, and again immediately
+	 * before `stop()` — the two are separated by `status()`, a provider round
+	 * trip that has measured in the tens of seconds.
+	 */
+	private idleStopVeto(
+		deviceId: number,
+		nowMs: number,
+	): { reason: string } | undefined {
+		const fresh = this.store.getContainerDevice(deviceId);
+		if (!fresh) {
+			return { reason: "its device row no longer exists" };
+		}
+		const idleForMs = nowMs - this.idleSince(fresh);
+		if (idleForMs <= this.idleStopMs) {
+			// The backstop the issue asks for by name: a stop is a no-op once the
+			// row's own clock has moved past the value the decision was made from.
+			return {
+				reason:
+					`its idle clock moved while the sweep was deciding ` +
+					`(idleForMs=${idleForMs} idleStopMs=${this.idleStopMs} ` +
+					`lastRoutedMs=${fresh.lastRoutedMs ?? "none"} ` +
+					`lastActiveMs=${fresh.lastActiveMs ?? "none"})`,
+			};
+		}
+		const lastRunMs = this.store.getLastAgentRunActivityMs(deviceId);
+		if (lastRunMs !== undefined && nowMs - lastRunMs <= this.terminalSettleMs) {
+			return {
+				reason:
+					`an agent run on it ended ${nowMs - lastRunMs}ms ago and its worker ` +
+					`may still be flushing (terminalSettleMs=${this.terminalSettleMs})`,
+			};
+		}
+		return undefined;
 	}
 
 	private notePinned(deviceId: number, issueKey: string): void {
@@ -474,10 +583,28 @@ export class ContainerLifecycle {
 		const counts = { running: 0, stopped: 0, absent: 0, unknown: 0 };
 		let pinned = 0;
 
-		for (const row of rows) {
-			const executor = this.executors.get(row.provider);
+		for (const snapshot of rows) {
+			const executor = this.executors.get(snapshot.provider);
 			if (!executor) continue;
 			try {
+				// Re-read the row and re-take the clock PER ROW, not once per tick.
+				//
+				// `rows` and `now` above are a tick-level snapshot, and this loop is
+				// sequential and blocks on provider control-plane calls: a tick that
+				// began at 07:45:22 reached one row at 07:51:54 and decided from
+				// 07:45:22's timestamps, so the session routed to that container at
+				// 07:51:39 was invisible to every check below — including NOR-366's
+				// mid-sweep guard, which compares against a snapshot taken after the
+				// claim and therefore saw nothing new (NOR-406). The tick snapshot is
+				// now only a WORK LIST; every value a decision is made from is read
+				// here. Two cheap indexed SQLite reads per row against minutes of
+				// provider latency.
+				const rowNow = this.now();
+				const row = this.store.getContainerDevice(snapshot.deviceId);
+				// Gone since the snapshot — a terminal teardown destroyed it mid-tick.
+				// Acting on it now would be acting on a container that no longer
+				// exists, or worse, on its successor.
+				if (!row) continue;
 				// Snapshot of the sessions the affinity gate below is about to make
 				// its decision from, so the pre-stop re-check can tell a session that
 				// claimed this device DURING the decision from one the gate already
@@ -489,7 +616,7 @@ export class ContainerLifecycle {
 						.listSessionAffinityForDevice(row.deviceId)
 						.map((r) => r.sessionId),
 				);
-				const affinity = await this.resolveAffinity(row.deviceId, now);
+				const affinity = await this.resolveAffinity(row.deviceId, rowNow);
 				// Sampled for EVERY row, before the pinned early-return below.
 				// The pinned rows are the ones the operational questions are
 				// actually about — a sandbox held by session affinity is one that
@@ -499,7 +626,7 @@ export class ContainerLifecycle {
 					row,
 					listings.get(row.provider),
 					affinity,
-					now,
+					rowNow,
 				);
 				counts[state] += 1;
 				if (affinity > 0) {
@@ -515,9 +642,9 @@ export class ContainerLifecycle {
 					// clock fired (NOR-366). Stamping here means a container that was
 					// busy on the previous tick gets a FULL idle window once its
 					// session ends, which is what the threshold was always meant to be.
-					this.store.markDeviceActive(row.deviceId, now);
+					this.store.markDeviceActive(row.deviceId, rowNow);
 					this.notePinned(row.deviceId, row.issueKey);
-					this.noteStranded(row, state, affinity, now);
+					this.noteStranded(row, state, affinity, rowNow);
 					continue;
 				}
 				this.noteUnpinned(row.deviceId);
@@ -527,7 +654,7 @@ export class ContainerLifecycle {
 					row.lastSeenMs ?? 0,
 					row.createdMs,
 				);
-				if (now - lastTouch > this.staleDestroyMs) {
+				if (rowNow - lastTouch > this.staleDestroyMs) {
 					await executor.destroy(row.issueKey);
 					this.observations.set(row.deviceId, {
 						state: "absent",
@@ -544,9 +671,9 @@ export class ContainerLifecycle {
 						},
 						{
 							reason: "stale" satisfies SandboxDestroyReason,
-							stale_for_ms: now - lastTouch,
+							stale_for_ms: rowNow - lastTouch,
 							stale_destroy_ms: this.staleDestroyMs,
-							age_ms: now - row.createdMs,
+							age_ms: rowNow - row.createdMs,
 						},
 					);
 					this.logger.info(
@@ -555,31 +682,27 @@ export class ContainerLifecycle {
 							`lastRoutedMs=${row.lastRoutedMs ?? "none"} ` +
 							`lastSeenMs=${row.lastSeenMs ?? "none"} ` +
 							`createdMs=${row.createdMs} ` +
-							`staleForMs=${now - lastTouch} staleDestroyMs=${this.staleDestroyMs})`,
+							`staleForMs=${rowNow - lastTouch} staleDestroyMs=${this.staleDestroyMs})`,
 					);
 					continue;
 				}
-				// Three inputs, each covering a way the others go stale:
-				//  - `lastRoutedMs`: the router handed this device an event.
-				//  - `parkedAtMs`: a session on it blocked on a user answer. Without
-				//    it the clock is `lastRoutedMs`, so an agent that worked for
-				//    twenty minutes and only then asked a question would be suspended
-				//    on the very next tick, the clock having expired while it was
-				//    legitimately busy.
-				//  - `lastActiveMs`: the device last held a live session (see
-				//    `RouterStore.markDeviceActive`). The only one stamped by the
-				//    AGENT working rather than by the router doing something TO the
-				//    agent, and so the only one that moves during a long session.
-				//    Without it a 40-minute session leaves the other two frozen at its
-				//    start and the container reads as idle for 35 of those minutes.
-				const idleSince = Math.max(
-					row.lastRoutedMs ?? 0,
-					row.parkedAtMs ?? 0,
-					row.lastActiveMs ?? 0,
-					row.createdMs,
-				);
-				const idleForMs = now - idleSince;
+				// See `idleSince` for what feeds this clock. `row` is the row as it
+				// stands right now, not as the tick found it — that distinction IS
+				// the fix for NOR-406.
+				const idleForMs = rowNow - this.idleSince(row);
 				if (idleForMs > this.idleStopMs) {
+					// The settle veto, before the provider round trip rather than after
+					// it: a container whose run ended moments ago is not going to become
+					// a better stop candidate during a `status()` call, and asking ARM
+					// about it is a request we would rather not spend.
+					const settleVeto = this.idleStopVeto(row.deviceId, rowNow);
+					if (settleVeto) {
+						this.logger.info(
+							`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
+								settleVeto.reason,
+						);
+						continue;
+					}
 					// `status` is read only once the clock already qualifies, so the
 					// logged value is the same one the decision used.
 					const status = await executor.status(row.issueKey);
@@ -604,11 +727,24 @@ export class ContainerLifecycle {
 					if (claimedMidSweep.length > 0) {
 						// Activity, and the reason this device must keep its idle window:
 						// the stop is being abandoned precisely because work arrived.
-						this.store.markDeviceActive(row.deviceId, now);
+						this.store.markDeviceActive(row.deviceId, rowNow);
 						this.logger.info(
 							`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
 								`session(s) ${claimedMidSweep.map((r) => r.sessionId).join(", ")} ` +
 								`claimed it while the sweep was deciding`,
+						);
+						continue;
+					}
+					// The same veto again, now against the clock as it stands after
+					// `status()`. `claimedMidSweep` above catches only a session that
+					// took AFFINITY during the round trip; a session can also be routed
+					// (moving `lastRoutedMs`) or complete (arming the settle window)
+					// without ever adding a row this loop has not already seen.
+					const preStopVeto = this.idleStopVeto(row.deviceId, this.now());
+					if (preStopVeto) {
+						this.logger.info(
+							`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
+								preStopVeto.reason,
 						);
 						continue;
 					}
@@ -623,7 +759,7 @@ export class ContainerLifecycle {
 						// how long the run it ends actually lasted — the single most
 						// useful number for tuning `idleStopMs`.
 						const uptimeMs = row.runningSinceMs
-							? now - row.runningSinceMs
+							? rowNow - row.runningSinceMs
 							: undefined;
 						this.store.clearDeviceRunningSince(row.deviceId);
 						emitSandboxEvent(
@@ -638,7 +774,7 @@ export class ContainerLifecycle {
 								idle_for_ms: idleForMs,
 								idle_stop_ms: this.idleStopMs,
 								uptime_ms: uptimeMs ?? null,
-								age_ms: now - row.createdMs,
+								age_ms: rowNow - row.createdMs,
 							},
 						);
 						// Every input behind the decision, so a stop that looks wrong
@@ -657,7 +793,10 @@ export class ContainerLifecycle {
 					}
 				}
 			} catch (err) {
-				this.logger.error(`Lifecycle sweep failed for ${row.issueKey}`, err);
+				this.logger.error(
+					`Lifecycle sweep failed for ${snapshot.issueKey}`,
+					err,
+				);
 			}
 		}
 
