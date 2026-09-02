@@ -20,7 +20,13 @@ import type {
 	WipRestoreOutcome,
 	Workspace,
 } from "cyrus-core";
-import { createLogger, getDefaultWorktreesDir, type ILogger } from "cyrus-core";
+import {
+	createLogger,
+	DEVCONTAINER_PATHS,
+	getDefaultWorktreesDir,
+	type ILogger,
+	parseJsonc,
+} from "cyrus-core";
 import { WorktreeIncludeService } from "./WorktreeIncludeService.js";
 
 export interface CreateGitWorktreeOptions {
@@ -1412,6 +1418,12 @@ export class GitService {
 				);
 			}
 
+			// Then the repository's devcontainer `postCreateCommand`, if it has
+			// one, and then its setup script. Devcontainer first: a repository
+			// declaring both is describing a base environment plus Cyrus-specific
+			// steps on top, in that order.
+			await this.runDevcontainerPostCreate(workspacePath);
+
 			// Then, check for repository setup scripts (cross-platform)
 			await this.runRepoSetupScript(
 				workspacePath,
@@ -1738,6 +1750,97 @@ export class GitService {
 			return existsSync(mainRepoDir) ? mainRepoDir : null;
 		} catch {
 			return null;
+		}
+	}
+
+	/**
+	 * Run the repository devcontainer's `postCreateCommand`, if it declares one.
+	 *
+	 * This is the ONLY devcontainer lifecycle command Cyrus honours, and it runs
+	 * here rather than at image build time because the source is cloned at boot
+	 * and never baked into the image. `onCreateCommand` and
+	 * `updateContentCommand` cannot be honoured faithfully for that same reason,
+	 * and `postStartCommand` is actively wrong: a parked container resumes many
+	 * times per issue and would re-run it on every unpark.
+	 *
+	 * Read from the CLONE rather than passed down from the router, because the
+	 * clone is where the file actually is — and because a command read from the
+	 * issue's own branch is what the person editing that branch expects to run.
+	 *
+	 * Failure is non-blocking, matching `cyrus-setup.sh`: a repository whose
+	 * post-create step fails is still worth working in, and a hard failure here
+	 * would strand the issue with no session at all.
+	 */
+	private async runDevcontainerPostCreate(
+		workspacePath: string,
+	): Promise<void> {
+		// Sandbox workers only. `devcontainer.json` is a general-purpose file
+		// written for VS Code, not for Cyrus — unlike `cyrus-setup.sh`, whose
+		// presence IS the opt-in — so honouring its `postCreateCommand` on a
+		// teammate's own machine would run uninvited shell for every repository
+		// that happens to carry one, on a deployment that never enabled the
+		// feature. `CYRUS_REPOS_JSON` is set by `ContainerTargets.buildEnv` and
+		// required by `container-boot`; a physical device never has it.
+		if (!process.env.CYRUS_REPOS_JSON) return;
+
+		let command: string | string[] | Record<string, string | string[]>;
+		try {
+			const found = DEVCONTAINER_PATHS.map((rel) =>
+				join(workspacePath, rel),
+			).find((abs) => existsSync(abs));
+			if (!found) return;
+			const config = parseJsonc(readFileSync(found, "utf8")) as {
+				postCreateCommand?:
+					| string
+					| string[]
+					| Record<string, string | string[]>;
+			};
+			if (!config.postCreateCommand) return;
+			command = config.postCreateCommand;
+		} catch (error) {
+			// A devcontainer we cannot parse is not a reason to refuse the issue;
+			// the router already reported it when it went to build the image.
+			this.logger.warn(
+				`Could not read the devcontainer's postCreateCommand: ${(error as Error).message}`,
+			);
+			return;
+		}
+
+		// The spec's three shapes. A STRING runs through a shell (so `a && b`
+		// works); an ARRAY is argv and deliberately does not; an OBJECT is named
+		// parallel commands, which we run sequentially — the sandbox is one
+		// container and ordering is the safer reading of "parallel".
+		const entries: Array<{ name: string; value: string | string[] }> =
+			Array.isArray(command) || typeof command === "string"
+				? [{ name: "postCreateCommand", value: command }]
+				: Object.entries(command).map(([name, value]) => ({ name, value }));
+
+		for (const entry of entries) {
+			this.logger.info(
+				`Running devcontainer ${entry.name} in ${workspacePath}`,
+			);
+			try {
+				if (Array.isArray(entry.value)) {
+					const [file, ...args] = entry.value;
+					if (!file) continue;
+					await execFileAsync(file, args, {
+						cwd: workspacePath,
+						timeout: SETUP_TIMEOUT_MS,
+					});
+				} else {
+					await execFileAsync(
+						process.platform === "win32" ? "cmd" : "/bin/sh",
+						process.platform === "win32"
+							? ["/c", entry.value]
+							: ["-c", entry.value],
+						{ cwd: workspacePath, timeout: SETUP_TIMEOUT_MS },
+					);
+				}
+			} catch (error) {
+				this.logger.warn(
+					`devcontainer ${entry.name} failed (continuing): ${(error as Error).message}`,
+				);
+			}
 		}
 	}
 

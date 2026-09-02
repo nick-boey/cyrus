@@ -1,0 +1,59 @@
+{
+	// NOR-309 Task 0 spike: docker/worker/Dockerfile expressed as a devcontainer.
+	//
+	// This is the hardest available test of ADR 0006's assumption that an
+	// arbitrary base plus a self-contained worker feature can boot Cyrus. It is
+	// a falsification exercise, not a product artifact — see
+	// docs/spikes/2026-09-01-nor-309-devcontainer-spike.md for the verdict and
+	// for what remains unverified.
+	"name": "cyrus-default-worker",
+	// node:22-slim, matching the Dockerfile's runtime stage. Deliberately NOT an
+	// mcr.microsoft.com/devcontainers/* base: those already carry a non-root
+	// `vscode` user, git, gh and a Node, which would hide exactly the gaps the
+	// worker feature is supposed to close on a base that knows nothing about us.
+	"image": "node:22-slim",
+	"features": {
+		// MUST be first — see overrideFeatureInstallOrder below.
+		"./features/cyrus-worker": {
+			"tarball": "${localEnv:CYRUS_WORKER_TARBALL}"
+		},
+		"ghcr.io/devcontainers/features/dotnet:2": {
+			"version": "10.0"
+		},
+		"ghcr.io/devcontainers/features/powershell:2": {},
+		"ghcr.io/devcontainers/features/rust:1": {
+			"version": "stable",
+			"profile": "minimal",
+			"components": "rustfmt,clippy"
+		},
+		"./features/fleece-cli": {},
+		"./features/actionlint": {
+			"version": "1.7.12"
+		},
+		"./features/agent-clis": {
+			"codexVersion": "0.144.6",
+			"opencodeVersion": "1.18.13"
+		},
+		"./features/playwright-chromium": {
+			"version": "1.62.0"
+		}
+	},
+	// The worker feature creates the `cyrus` user, and rust/github-cli/node all
+	// resolve `_REMOTE_USER` and silently fall back to `USERNAME=root` when
+	// `id -u` fails — producing a CARGO_HOME the agent cannot write to, with no
+	// error at build time. Ordering is therefore load-bearing, not cosmetic.
+	"overrideFeatureInstallOrder": ["./features/cyrus-worker"],
+	// Both are metadata only. `devcontainer build` emits
+	// `USER $_DEV_CONTAINERS_IMAGE_USER`, where that build arg is the BASE
+	// image's user — never containerUser — and emits no ENTRYPOINT at all. The
+	// built image therefore still runs as root with node:22-slim's entrypoint;
+	// the final USER/ENTRYPOINT must be applied over it by the build pipeline
+	// (see Dockerfile.finalize).
+	"containerUser": "cyrus",
+	"remoteUser": "cyrus",
+	"containerEnv": {
+		"DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+		"DOTNET_NOLOGO": "1",
+		"DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1"
+	}
+}

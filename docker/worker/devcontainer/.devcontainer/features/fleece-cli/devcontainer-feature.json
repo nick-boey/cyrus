@@ -1,0 +1,17 @@
+{
+	"id": "fleece-cli",
+	"version": "0.1.0",
+	"name": "Fleece CLI",
+	"description": "Installs the Fleece CLI to a shared --tool-path. Exists as a Feature rather than a build.dockerfile step because it needs `dotnet`, which arrives from a Feature — and Features install strictly after the base image is built, so a Dockerfile step could never see it.",
+	"options": {
+		"version": {
+			"type": "string",
+			"default": "latest",
+			"description": "Fleece.Cli version, or 'latest'."
+		}
+	},
+	"containerEnv": {
+		"PATH": "/usr/local/dotnet-tools:${PATH}"
+	},
+	"installsAfter": ["ghcr.io/devcontainers/features/dotnet"]
+}

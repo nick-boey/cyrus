@@ -665,20 +665,102 @@ export class AcaSandboxClient {
 		return this.listAll<AcaDiskImage>(`${this.root}/diskimages`);
 	}
 
+	/**
+	 * Registers a disk image, in the shape `aca sandboxgroup disk create`
+	 * itself sends. Three details are load-bearing and each fails in a way that
+	 * names something other than itself (NOR-337):
+	 *
+	 * - `registryCredentials` is a SIBLING of `image`, never a member of it.
+	 *   Nested inside `image` the field is never read, an anonymous pull is
+	 *   attempted against a private ACR, and the answer is `401
+	 *   RegistryAuthFailed` asking for the very field that was sent — so every
+	 *   credential VALUE gets tried in turn and all fail identically.
+	 * - the requested name goes in `labels.name`, not at the top level: the
+	 *   server assigns its own GUID as `name`, and the label is what it
+	 *   preserves and what every lookup here matches on.
+	 * - the credential field is `token`, NOT `password`, which returns a fast
+	 *   400 naming the required property and reads like a malformed body.
+	 *
+	 * The import is SYNCHRONOUS and scales with image size (measured: 1.7 GB in
+	 * 99s), which is why this uses the slow-operation deadline. A 2xx says the
+	 * request was accepted, not that the image imported — gate on
+	 * {@link waitForDiskImageReady}, never on the status code.
+	 */
 	async createDiskImage(
 		name: string,
 		image: string,
-		opts?: { isPublic?: boolean },
+		opts?: {
+			isPublic?: boolean;
+			registryCredentials?: { username: string; token: string };
+		},
 	): Promise<AcaDiskImage> {
 		const img: Record<string, unknown> = { base: image };
 		if (opts?.isPublic !== undefined) img.isPublic = opts.isPublic;
-		const body = { name, image: img };
+		const body: Record<string, unknown> = { labels: { name }, image: img };
+		if (opts?.registryCredentials) {
+			body.registryCredentials = opts.registryCredentials;
+		}
 		const r = await this.request<AcaDiskImage>(
 			"PUT",
 			`${this.root}/diskimages`,
 			body,
+			{ timeoutMs: SLOW_OPERATION_TIMEOUT_MS },
 		);
 		return r ?? ({} as AcaDiskImage);
+	}
+
+	/** Disk-image DELETE returns 202 (async); 2xx + 404 both OK. */
+	async deleteDiskImage(id: string): Promise<void> {
+		await this.request("DELETE", `${this.root}/diskimages/${id}`, undefined, {
+			okOn404: true,
+		});
+	}
+
+	/**
+	 * Polls until the named disk reports `Ready`.
+	 *
+	 * The authoritative signal is the disk appearing in the list with that
+	 * state — a 2xx on the PUT only says the request was accepted, and the
+	 * import can still fail server-side minutes later.
+	 */
+	async waitForDiskImageReady(
+		name: string,
+		opts: {
+			timeoutMs: number;
+			pollMs: number;
+			sleepFn?: (ms: number) => Promise<void>;
+			now?: () => number;
+		},
+	): Promise<AcaDiskImage> {
+		const sleep =
+			opts.sleepFn ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+		const now = opts.now ?? (() => Date.now());
+		const deadline = now() + opts.timeoutMs;
+		let lastState = "";
+		while (now() < deadline) {
+			const found = (await this.listDiskImages()).find(
+				(d) => d.name === name || d.labels?.name === name,
+			);
+			const state =
+				typeof found?.status === "string"
+					? found.status
+					: (found?.status?.state ?? "");
+			if (found && state === "Ready") return found;
+			if (state === "Failed" || state === "Error") {
+				throw new Error(
+					`disk image ${name} reached state '${state}'${
+						typeof found?.status === "object" && found.status?.errorMessage
+							? `: ${found.status.errorMessage}`
+							: ""
+					}`,
+				);
+			}
+			lastState = state;
+			await sleep(opts.pollMs);
+		}
+		throw new Error(
+			`disk image ${name} did not reach Ready within ${opts.timeoutMs}ms (last state: '${lastState || "absent"}')`,
+		);
 	}
 }
 

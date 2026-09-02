@@ -215,12 +215,14 @@ function ctx(
 		env: Record<string, string>;
 		mintDeviceToken: () => string;
 		deviceId: string | undefined;
+		disk: string;
 	}> = {},
 ): {
 	issueKey: string;
 	env: Record<string, string>;
 	mintDeviceToken: () => string;
 	deviceId?: string;
+	disk?: string;
 } {
 	let mintCount = 0;
 	return {
@@ -233,6 +235,7 @@ function ctx(
 				return `tok-${mintCount}`;
 			}),
 		deviceId: overrides.deviceId,
+		...(overrides.disk ? { disk: overrides.disk } : {}),
 	};
 }
 
@@ -1707,5 +1710,124 @@ describe("AcaSandboxesProvider", () => {
 			).rejects.toThrow("cyrus.issue must be at most 63 characters");
 			expect(calls.listSandboxes).toHaveLength(0);
 		});
+	});
+});
+
+/**
+ * NOR-309 Task 5: `ctx.disk` is the per-issue PIN, and it is the value the
+ * `cyrus.disk` label is compared against.
+ *
+ * The split this encodes: a repository author editing their devcontainer must
+ * NOT retro-replace live containers (the replace rule also deletes the
+ * sandbox's snapshots, so it would cold-restart every in-flight issue AND
+ * destroy the warm path that would have made the restore cheap), while a move
+ * of the DEPLOYMENT's own worker image still must. The router keeps the pin
+ * fixed for the first case and invalidates it for the second, so this layer
+ * only has to compare against whatever it is handed.
+ */
+describe("per-issue disk pin (NOR-309)", () => {
+	it("creates the sandbox from the pinned disk, not the deployment default", async () => {
+		const { client, calls } = fakeClient({
+			diskImages: [{ name: "repo-disk-a" } as AcaDiskImage],
+		});
+		const p = new AcaSandboxesProvider({
+			client,
+			image: "img:1",
+			disk: "deployment-v1",
+		});
+		await p.ensureRunning(ctx({ deviceId: "dev-1", disk: "repo-disk-a" }));
+		expect(calls.createSandbox[0]?.labels?.["cyrus.disk"]).toBe("repo-disk-a");
+	});
+
+	it("leaves a sandbox alone when its label matches the pin", async () => {
+		const { client, calls } = fakeClient({
+			listSandboxesResult: [
+				sb("CYPACK-1", { labels: { "cyrus.disk": "repo-disk-a" } }),
+			],
+			diskImages: [{ name: "repo-disk-a" } as AcaDiskImage],
+		});
+		const p = new AcaSandboxesProvider({
+			client,
+			image: "img:1",
+			disk: "deployment-v1",
+		});
+		await p.ensureRunning(ctx({ deviceId: "dev-1", disk: "repo-disk-a" }));
+		expect(calls.deleteSandbox).toEqual([]);
+		expect(calls.createSandbox).toHaveLength(0);
+	});
+
+	it("replaces a sandbox whose label no longer matches the pin", async () => {
+		const { client, calls } = fakeClient({
+			listSandboxesResult: [
+				sb("CYPACK-1", {
+					id: "sb-old",
+					labels: { "cyrus.disk": "repo-disk-a" },
+				}),
+			],
+			diskImages: [{ name: "repo-disk-b" } as AcaDiskImage],
+		});
+		const p = new AcaSandboxesProvider({
+			client,
+			image: "img:1",
+			disk: "deployment-v1",
+		});
+		await p.ensureRunning(ctx({ deviceId: "dev-1", disk: "repo-disk-b" }));
+		expect(calls.deleteSandbox).toContain("sb-old");
+		expect(calls.createSandbox[0]?.labels?.["cyrus.disk"]).toBe("repo-disk-b");
+	});
+
+	it("refuses to invent a registration for an unregistered repository disk", async () => {
+		// `ensureDisk`'s failsafe knows only the DEPLOYMENT's image ref. Using it
+		// for a repository disk would import the wrong environment under the
+		// right name — a sandbox that boots something else and reports success.
+		const { client } = fakeClient({ diskImages: [] });
+		const p = new AcaSandboxesProvider({
+			client,
+			image: "img:1",
+			disk: "deployment-v1",
+		});
+		await expect(
+			p.ensureRunning(ctx({ deviceId: "dev-1", disk: "repo-disk-a" })),
+		).rejects.toThrow(/is not registered/);
+	});
+
+	it("still registers the DEPLOYMENT disk best-effort when no pin is given", async () => {
+		const { client, calls } = fakeClient({ diskImages: [] });
+		const p = new AcaSandboxesProvider({
+			client,
+			image: "img:1",
+			disk: "deployment-v1",
+		});
+		await p.ensureRunning(ctx({ deviceId: "dev-1" }));
+		expect(calls.createDiskImage).toEqual([
+			{ name: "deployment-v1", image: "img:1" },
+		]);
+	});
+
+	it("restores a snapshot only when it shares the pinned disk lineage", async () => {
+		// A snapshot always restores the image lineage it was taken from, so one
+		// taken on another disk would resurrect that image.
+		const { client, calls } = fakeClient({
+			listSandboxesResult: [],
+			snapshotsByLabels: [
+				{
+					id: "snap-old",
+					labels: {
+						"cyrus.managed": "true",
+						"cyrus.issue": "CYPACK-1",
+						"cyrus.device-id": "dev-1",
+						"cyrus.disk": "repo-disk-a",
+					},
+				} as AcaSnapshot,
+			],
+			diskImages: [{ name: "repo-disk-b" } as AcaDiskImage],
+		});
+		const p = new AcaSandboxesProvider({
+			client,
+			image: "img:1",
+			disk: "deployment-v1",
+		});
+		await p.ensureRunning(ctx({ deviceId: "dev-1", disk: "repo-disk-b" }));
+		expect(calls.createSandbox[0]?.snapshotId).toBeUndefined();
 	});
 });

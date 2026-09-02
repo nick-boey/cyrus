@@ -19,6 +19,8 @@ import type {
 } from "cyrus-router-executors";
 import {
 	type AcaEgressPolicy,
+	AcaSandboxClient,
+	createDefaultTokenProvider,
 	LocalDockerProvider,
 } from "cyrus-router-executors";
 import type {
@@ -34,6 +36,12 @@ import { CodexTokenStore } from "./CodexTokenStore.js";
 import { ContainerLifecycle } from "./ContainerLifecycle.js";
 import { ContainerTargetService } from "./ContainerTargets.js";
 import { DeviceGateway } from "./DeviceGateway.js";
+import {
+	AcrDevcontainerBuilder,
+	createArmRequestFn,
+	createArmTokenProvider,
+} from "./devcontainer/AcrDevcontainerBuilder.js";
+import { DevcontainerImageService } from "./devcontainer/DevcontainerImageService.js";
 import { EventRouter } from "./EventRouter.js";
 import {
 	type EntraTokenVerifier,
@@ -186,6 +194,46 @@ export interface RouterContainersConfig {
 	strandedSessionGraceMs?: number;
 	/** Default 5_000 (5 seconds). */
 	sessionsQueryTimeoutMs?: number;
+	/**
+	 * Per-repository devcontainer images (NOR-309). Omit it and every container
+	 * boots {@link RouterContainersConfig.image} — today's behaviour, unchanged.
+	 *
+	 * Requires {@link RouterContainersConfig.aca}: the whole feature is a
+	 * per-repository ACA disk image, and there is nothing for it to do on a
+	 * provider with no concept of one.
+	 */
+	devcontainers?: {
+		/**
+		 * GitHub credential the ROUTER uses to read devcontainer files and that
+		 * the ACR build uses to clone. Router-level rather than per-user because
+		 * the repository registry is global: the environment a repository
+		 * declares is a property of the repository, not of whoever delegated the
+		 * issue.
+		 */
+		githubToken: string;
+		/** Registry name, e.g. "cyrusacr" — not the login server. */
+		registry: string;
+		/** Login server, e.g. "cyrusacr.azurecr.io". */
+		loginServer: string;
+		/** Default "cyrus/devcontainers". Build identity is scoped to this path. */
+		imageRepository?: string;
+		/** OCI ref of the `cyrus-worker` Feature. */
+		workerFeatureRef: string;
+		/** Worker feature version. Part of every cache key — bump it to rebuild all. */
+		workerFeatureVersion: string;
+		/** URL of the worker payload tarball the feature extracts. */
+		workerPayloadTarball: string;
+		/** Non-root user the finalize stage drops to. Default "cyrus". */
+		workerUser?: string;
+		/** Seconds. Default 5400 (90 minutes); ACR's own ceiling is 6 hours. */
+		buildTimeoutSeconds?: number;
+		/**
+		 * How often unreferenced disk images are collected. Default 6 hours —
+		 * deliberately far away from the 60s lifecycle sweep, which is
+		 * non-reentrant by contract.
+		 */
+		gcIntervalMs?: number;
+	};
 	/**
 	 * Extra env-var names a user must have stored before any container boots
 	 * for them, on top of the always-required Claude token. Each entry must be
@@ -429,6 +477,9 @@ export class RouterServer {
 	private readonly logger: ILogger;
 	private transport: IAgentEventTransport | undefined;
 	private sweepInterval: NodeJS.Timeout | undefined;
+	/** Per-repository devcontainer images (NOR-309), when configured. */
+	private devcontainerImages: DevcontainerImageService | undefined;
+	private devcontainerGcInterval: NodeJS.Timeout | undefined;
 	private stateBackup: StateBackup | undefined;
 	private constructedAfterRestore = false;
 
@@ -532,6 +583,12 @@ export class RouterServer {
 				this.executor.moveIssueToStartedState(workspaceId, issueId),
 			containerTargets,
 			terminalTeardown: this.terminalTeardown,
+			...(built?.devcontainers
+				? {
+						devcontainers: built.devcontainers,
+						registry: this.repositoryRegistry,
+					}
+				: {}),
 			config: {
 				eventTtlMs: config.eventTtlMs ?? DEFAULT_EVENT_TTL_MS,
 				issueLock: config.issueLock ?? true,
@@ -671,6 +728,9 @@ export class RouterServer {
 					csrf: setupCsrf,
 					...(setupIdTokenVerifier
 						? { verifyIdToken: setupIdTokenVerifier }
+						: {}),
+					...(this.devcontainerImages
+						? { devcontainers: this.devcontainerImages }
 						: {}),
 					logger: this.logger,
 				});
@@ -855,6 +915,12 @@ export class RouterServer {
 		// listener — safe to add after listen()).
 		this.gateway.attach(this.fastify.server, "/device");
 
+		// A build in flight when the previous process exited left a durable
+		// `building` row that nothing alive can now clear, and `created` webhooks
+		// held behind it. Reschedule and release them; the router is
+		// single-replica and restarts on every deploy, so this is routine.
+		this.devcontainerImages?.recoverInterruptedBuilds();
+
 		this.sweepInterval = setInterval(() => {
 			// Both sweeps run detached from any caller that could catch a
 			// rejection, so each needs its own .catch(): with none, a transient
@@ -875,6 +941,10 @@ export class RouterServer {
 	}
 
 	async stop(): Promise<void> {
+		if (this.devcontainerGcInterval) {
+			clearInterval(this.devcontainerGcInterval);
+			this.devcontainerGcInterval = undefined;
+		}
 		if (this.sweepInterval) {
 			clearInterval(this.sweepInterval);
 			this.sweepInterval = undefined;
@@ -913,6 +983,7 @@ export class RouterServer {
 				secrets: SecretStoreBackend;
 				kind: "file" | "keyvault" | "table";
 				repositoryResolver: RepositoryResolver;
+				devcontainers?: DevcontainerImageService;
 		  }
 		| undefined {
 		if (!containers) return undefined;
@@ -1080,11 +1151,16 @@ export class RouterServer {
 			this.logger.error("Could not seed the repository registry", error);
 		});
 
+		this.devcontainerImages = this.buildDevcontainerImages(containers);
+
 		const containerTargets = new ContainerTargetService({
 			store: this.store,
 			secrets,
 			executors,
 			registry: repositoryRegistry,
+			...(this.devcontainerImages
+				? { devcontainers: this.devcontainerImages }
+				: {}),
 			containersConfig: {
 				routerUrlForContainers: containers.routerUrlForContainers,
 				requiredSecretKeys: containers.requiredSecretKeys,
@@ -1152,7 +1228,93 @@ export class RouterServer {
 			this.terminalTeardown,
 		);
 
-		return { service: containerTargets, secrets, kind, repositoryResolver };
+		return {
+			service: containerTargets,
+			secrets,
+			kind,
+			repositoryResolver,
+			...(this.devcontainerImages
+				? { devcontainers: this.devcontainerImages }
+				: {}),
+		};
+	}
+
+	/**
+	 * Per-repository devcontainer images (NOR-309), when configured.
+	 *
+	 * Built inside {@link buildContainerTargets} rather than beside it because
+	 * it needs the ACA client and the repository registry that method creates,
+	 * and because it must not exist at all for a deployment with no `containers`
+	 * block.
+	 */
+	private buildDevcontainerImages(
+		containers: RouterContainersConfig,
+	): DevcontainerImageService | undefined {
+		const cfg = containers.devcontainers;
+		if (!cfg) return undefined;
+		if (!containers.aca) {
+			// A per-repository image is a per-repository ACA DISK. Silently doing
+			// nothing here would present as "my devcontainer is ignored" with no
+			// line anywhere saying why.
+			this.logger.warn(
+				"containers.devcontainers is configured but containers.aca is not; per-repository images need an ACA sandbox group and will be ignored",
+			);
+			return undefined;
+		}
+		const client = new AcaSandboxClient({
+			subscriptionId: containers.aca.subscriptionId,
+			resourceGroup: containers.aca.resourceGroup,
+			sandboxGroup: containers.aca.sandboxGroup,
+			region: containers.aca.region,
+			tokenProvider: createDefaultTokenProvider(),
+			apiVersion: containers.aca.apiVersion,
+			baseUrl: containers.aca.managementEndpoint,
+		});
+		const getArmToken = createArmTokenProvider();
+		const builder = new AcrDevcontainerBuilder(
+			{
+				subscriptionId: containers.aca.subscriptionId,
+				resourceGroup: containers.aca.resourceGroup,
+				registry: cfg.registry,
+				loginServer: cfg.loginServer,
+				...(cfg.imageRepository
+					? { imageRepository: cfg.imageRepository }
+					: {}),
+				...(cfg.buildTimeoutSeconds
+					? { timeoutSeconds: cfg.buildTimeoutSeconds }
+					: {}),
+			},
+			createArmRequestFn(this.logger, getArmToken),
+			this.logger,
+		);
+		const service = new DevcontainerImageService({
+			store: this.store,
+			logger: this.logger,
+			builder,
+			aca: client,
+			getArmToken,
+			githubToken: cfg.githubToken,
+			deploymentDisk: containers.aca.disk,
+			workerFeatureRef: cfg.workerFeatureRef,
+			workerFeatureVersion: cfg.workerFeatureVersion,
+			workerPayloadTarball: cfg.workerPayloadTarball,
+			...(cfg.workerUser ? { workerUser: cfg.workerUser } : {}),
+			registryLoginServer: cfg.loginServer,
+		});
+		// Slow by design and well away from the 60s lifecycle sweep: a disk
+		// deletion is cheap, but listing snapshots and disk images is not, and
+		// getting a reference count wrong is expensive in exactly one direction.
+		const gcIntervalMs = cfg.gcIntervalMs ?? 6 * 60 * 60 * 1000;
+		this.devcontainerGcInterval = setInterval(() => {
+			void service.collectGarbage().catch((error: unknown) => {
+				this.logger.error("Devcontainer disk-image GC failed", error);
+			});
+		}, gcIntervalMs);
+		this.devcontainerGcInterval.unref?.();
+		this.logger.info(
+			`Per-repository devcontainer images enabled (registry ${cfg.loginServer}, worker feature ${cfg.workerFeatureRef})`,
+		);
+		return service;
 	}
 
 	/**

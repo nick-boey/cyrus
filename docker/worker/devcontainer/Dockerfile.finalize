@@ -1,0 +1,38 @@
+# The two instructions `devcontainer build` structurally cannot emit.
+#
+# A Feature contributes RUN layers only. The CLI's generated Dockerfile ends
+# with `ARG _DEV_CONTAINERS_IMAGE_USER=root` / `USER $_DEV_CONTAINERS_IMAGE_USER`
+# where that arg is bound to the BASE image's user (spec-node/containerFeatures.ts
+# passes `imageBuildInfo.user`, which is `imageDetails.Config.User || 'root'`),
+# and it emits no ENTRYPOINT anywhere. `containerUser` and `remoteUser` become
+# a `devcontainer.metadata` LABEL that only the devcontainer CLI reads when it
+# execs into a container — ACA does not read it, and boots the image's own
+# OCI ENTRYPOINT as the image's own USER.
+#
+# So the boot contract's last two clauses are applied here, over whatever
+# `devcontainer build` produced. This stage is UNIFORM: it does not vary with
+# the shape of the repository's base, which is why it is not the "bespoke
+# grafting logic" ADR 0006 rejects. It grafts onto the built image, not into
+# the repository's Dockerfile.
+ARG BUILT_IMAGE
+FROM ${BUILT_IMAGE}
+
+ARG WORKER_USER=cyrus
+
+# Fails the build rather than the boot if the worker feature was omitted or its
+# username option disagrees with this one. Without it the image builds happily
+# and dies in ACA with an entrypoint that does not exist — a failure that
+# surfaces as a sandbox stuck Running with no worker attached, which is the
+# single hardest symptom to trace back here.
+RUN set -eu; \
+	if [ ! -x /entrypoint.sh ]; then \
+		echo "cyrus-worker feature did not install an executable /entrypoint.sh" >&2; \
+		exit 1; \
+	fi; \
+	if ! id -u "${WORKER_USER}" >/dev/null 2>&1; then \
+		echo "worker user '${WORKER_USER}' does not exist in the built image" >&2; \
+		exit 1; \
+	fi
+
+USER ${WORKER_USER}
+ENTRYPOINT ["/entrypoint.sh"]

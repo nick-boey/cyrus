@@ -490,7 +490,13 @@ describe("AcaSandboxClient snapshots + disk images", () => {
 		expect(calls[1]?.url).toBe(next);
 	});
 
-	it("createDiskImage uses PUT /diskimages with the image base", async () => {
+	// The three details below each fail in a way that names something other
+	// than itself (NOR-337): the requested name goes in `labels.name` (the
+	// server assigns its own GUID as `name`), `registryCredentials` is a
+	// SIBLING of `image` (nested inside it the field is never read, an
+	// anonymous pull is attempted, and the 401 asks for the very field that was
+	// sent), and the credential field is `token`, not `password`.
+	it("createDiskImage puts the requested name in labels.name", async () => {
 		const { fetch, calls } = fakeFetch([res(200, diskImage)]);
 		const c = client({ fetchFn: fetch });
 		const out = await c.createDiskImage(
@@ -503,12 +509,60 @@ describe("AcaSandboxClient snapshots + disk images", () => {
 		expect(call?.init?.method).toBe("PUT");
 		expect(call?.url).toBe(`${BASE}${ROOT}/diskimages?api-version=${AV}`);
 		expect(JSON.parse(call?.init?.body as string)).toEqual({
-			name: "cyrus-worker:latest",
+			labels: { name: "cyrus-worker:latest" },
 			image: {
 				base: "ghcr.io/ceedar/cyrus-worker:latest",
 				isPublic: true,
 			},
 		});
+	});
+
+	it("createDiskImage sends registryCredentials as a sibling of image", async () => {
+		const { fetch, calls } = fakeFetch([res(200, diskImage)]);
+		const c = client({ fetchFn: fetch });
+		await c.createDiskImage("d", "acr.azurecr.io/app:1", {
+			registryCredentials: { username: "00000000", token: "refresh" },
+		});
+		expect(JSON.parse(calls[0]?.init?.body as string)).toEqual({
+			labels: { name: "d" },
+			image: { base: "acr.azurecr.io/app:1" },
+			registryCredentials: { username: "00000000", token: "refresh" },
+		});
+	});
+
+	it("waitForDiskImageReady gates on Ready, not on the PUT's status code", async () => {
+		const { fetch } = fakeFetch([
+			res(200, { value: [{ labels: { name: "d" }, status: "Importing" }] }),
+			res(200, { value: [{ labels: { name: "d" }, status: "Ready" }] }),
+		]);
+		const c = client({ fetchFn: fetch });
+		const found = await c.waitForDiskImageReady("d", {
+			timeoutMs: 10_000,
+			pollMs: 0,
+			sleepFn: async () => {},
+		});
+		expect(found.labels?.name).toBe("d");
+	});
+
+	it("waitForDiskImageReady surfaces a failed import rather than timing out", async () => {
+		const { fetch } = fakeFetch([
+			res(200, {
+				value: [
+					{
+						labels: { name: "d" },
+						status: { state: "Failed", errorMessage: "manifest is an index" },
+					},
+				],
+			}),
+		]);
+		const c = client({ fetchFn: fetch });
+		await expect(
+			c.waitForDiskImageReady("d", {
+				timeoutMs: 10_000,
+				pollMs: 0,
+				sleepFn: async () => {},
+			}),
+		).rejects.toThrow(/manifest is an index/);
 	});
 });
 

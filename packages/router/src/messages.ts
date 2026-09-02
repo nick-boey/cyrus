@@ -133,3 +133,40 @@ export function fillTemplate(
 		(_match, key: string) => vars[key] ?? `{{${key}}}`,
 	);
 }
+
+/**
+ * Posted when an issue's repository declares its own devcontainer and the image
+ * for it is not built yet.
+ *
+ * The `created` event is held while this build runs, so nothing boots — which
+ * means this notice is the ONLY thing the user sees for what can be several
+ * minutes. A "Building…" that never visibly resolves is the same debugging
+ * problem as saying nothing at all, which is why the two messages below always
+ * follow it.
+ */
+export const DEVCONTAINER_BUILDING_MESSAGE = `Building the workspace image for {{repository}} from its devcontainer. This takes a few minutes the first time, and is cached afterwards — I'll start as soon as it's ready.`;
+
+export const DEVCONTAINER_READY_MESSAGE =
+	"The workspace image for {{repository}} is ready. Starting now.";
+
+/**
+ * `{{runId}}` is the load-bearing half of this message (ADR 0007): the build ran
+ * with unrestricted egress over repository-controlled content, so the log is
+ * behind Azure's own authorization and this id is what makes
+ * `az acr task logs --run-id` possible for someone allowed to read it.
+ */
+export const DEVCONTAINER_BUILD_FAILED_MESSAGE = `I couldn't build the workspace image for {{repository}} from its devcontainer, so I'm using the default environment instead — the toolchains that devcontainer asks for may be missing.
+
+{{detail}}`;
+
+/**
+ * Posted when an issue spans several repositories, which the plan's Task 8
+ * leaves as an open question.
+ *
+ * The default worker image is the plan's own recommended answer for this case:
+ * it is the only image carrying every toolchain, and a deliberate multi-repo
+ * fan-out is exactly the polyglot case. What the user gives up is named
+ * explicitly, because choosing silently is what makes a missing toolchain look
+ * like a Cyrus bug rather than a consequence of the fan-out.
+ */
+export const DEVCONTAINER_MULTI_REPO_MESSAGE = `This issue spans several repositories ({{repositories}}), so I'm using the default environment rather than any one repository's devcontainer. It carries every toolchain Cyrus knows about, but not the specific versions those devcontainers pin.`;

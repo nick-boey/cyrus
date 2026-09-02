@@ -79,6 +79,22 @@ export interface RepositoryRouteDeps {
 	verifyIdToken?: SetupIdTokenVerifier;
 	logger: ILogger;
 	maxFormBodyBytes?: number;
+	/**
+	 * Per-repository devcontainer images (NOR-309). Supplies the Environment
+	 * column and warms a newly-registered repository's image.
+	 */
+	devcontainers?: {
+		statusFor(repositoryName: string):
+			| {
+					state: "building" | "ready" | "failed";
+					runId?: string;
+					error?: string;
+			  }
+			| undefined;
+		warmBuild(repo: RegisteredRepository): void;
+		/** A devcontainer we cannot honour, refused at registration. */
+		rejectionFor(repo: RegisteredRepository): Promise<string | undefined>;
+	};
 }
 
 function lastValue(raw: unknown): string | undefined {
@@ -143,7 +159,11 @@ function secureHtml(reply: FastifyReply): FastifyReply {
  * views layer treats that field as an already-formatted string and never
  * calls it itself, so this is the sole reformation point for `p=`/`t=` syntax.
  */
-function toView(repo: RegisteredRepository): RepositoryView {
+function toView(
+	repo: RegisteredRepository,
+	deps: RepositoryRouteDeps,
+): RepositoryView {
+	const status = deps.devcontainers?.statusFor(repo.name);
 	return {
 		name: repo.name,
 		githubSlug: repo.githubSlug,
@@ -153,6 +173,18 @@ function toView(repo: RegisteredRepository): RepositoryView {
 			...(repo.teamKeys ? { teamKeys: repo.teamKeys } : {}),
 		}),
 		isDefault: repo.isDefault === true,
+		...(status
+			? {
+					environment: {
+						state: status.state,
+						...(status.error
+							? { detail: status.error }
+							: status.runId
+								? { detail: `ACR run ${status.runId}` }
+								: {}),
+					},
+				}
+			: {}),
 	};
 }
 
@@ -228,7 +260,7 @@ async function buildModel(
 	message?: SetupMessage,
 ): Promise<RepositoriesPageModel> {
 	const { repositories, version } = await deps.registry.list();
-	const views = repositories.map(toView);
+	const views = repositories.map((repo) => toView(repo, deps));
 	return {
 		email: principal.email,
 		repositories: views,
@@ -502,6 +534,18 @@ export function registerRepositoryRoutes(
 			});
 		}
 
+		// Loudly, and BEFORE the repository is registered: a devcontainer we
+		// cannot honour has to be refused where a human is looking at the form.
+		// Inside the fire-and-forget warm build below it could only ever be a log
+		// line, which is the "half-work" the plan rules out.
+		const rejection = await deps.devcontainers?.rejectionFor(repo);
+		if (rejection) {
+			return respond(reply, deps, guard.principal, 400, {
+				kind: "error",
+				text: rejection,
+			});
+		}
+
 		const { repositories, version } = await deps.registry.list();
 		if (
 			repositories.some(
@@ -529,6 +573,10 @@ export function registerRepositoryRoutes(
 		deps.logger.info(
 			`${guard.principal.email} registered repository ${name} (${githubSlug})`,
 		);
+		// Fire-and-forget by contract: registration must never block on a build
+		// (they take minutes) and must never fail because one did. The outcome
+		// lands on the Environment column of this same page.
+		deps.devcontainers?.warmBuild(repo);
 		return respond(reply, deps, guard.principal, 200, {
 			kind: "ok",
 			text: `Added ${name}. New sessions will use it; a session already running keeps the repository it started with.`,

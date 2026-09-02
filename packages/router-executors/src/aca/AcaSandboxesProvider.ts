@@ -348,9 +348,10 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 
 	private async ensureRunningLocked(ctx: IssueExecutionContext): Promise<void> {
 		const deviceId = ctx.deviceId;
+		const disk = this.diskFor(ctx);
 		const existing = await this.listByIssue(ctx.issueKey);
 		const valid = existing
-			.filter((sandbox) => (sandbox.labels?.[LABEL_DISK] ?? "") === this.disk)
+			.filter((sandbox) => (sandbox.labels?.[LABEL_DISK] ?? "") === disk)
 			.sort(
 				(a, b) =>
 					this.sandboxRank(a) - this.sandboxRank(b) || a.id.localeCompare(b.id),
@@ -394,27 +395,29 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 		const snap =
 			deviceId === undefined
 				? undefined
-				: await this.pickLineageSnapshot(ctx.issueKey, deviceId);
+				: await this.pickLineageSnapshot(ctx.issueKey, deviceId, disk);
 		if (snap) {
 			await this.client.createSandbox({
 				snapshotId: snap.id,
 				lifecycle: this.lifecyclePolicy(),
-				labels: this.labels(ctx.issueKey, deviceId),
+				labels: this.labels(ctx.issueKey, deviceId, disk),
 			});
 			// No re-mint: env/token inherited (spike S3b), AND the device-id
 			// label matches the live row (lineage filter above).
 		} else {
-			const disk = await this.ensureDisk();
+			const registered = await this.ensureDisk(disk);
 			// Token rotation invalidates every prior memory snapshot, including
 			// same-device snapshots. Remove them durably before minting.
 			await this.deleteIssueSnapshots(ctx.issueKey);
 			const deviceToken = ctx.mintDeviceToken();
 			await this.client.createSandbox({
-				...(disk.id ? { diskImageId: disk.id } : { diskImageName: this.disk }),
+				...(registered.id
+					? { diskImageId: registered.id }
+					: { diskImageName: disk }),
 				environment: { ...ctx.env, CYRUS_DEVICE_TOKEN: deviceToken },
 				resources: this.resources(),
 				lifecycle: this.lifecyclePolicy(),
-				labels: this.labels(ctx.issueKey, deviceId),
+				labels: this.labels(ctx.issueKey, deviceId, disk),
 				egressPolicy: this.egressPolicy,
 			});
 		}
@@ -545,6 +548,7 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 	private async pickLineageSnapshot(
 		issueKey: string,
 		deviceId: string,
+		disk: string,
 	): Promise<AcaSnapshot | undefined> {
 		const snaps = await this.client.listSnapshots({
 			[LABEL_MANAGED]: "true",
@@ -552,7 +556,7 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 			[LABEL_DEVICE_ID]: deviceId,
 		});
 		const matching = snaps.filter(
-			(s) => (s.labels?.[LABEL_DISK] ?? "") === this.disk,
+			(s) => (s.labels?.[LABEL_DISK] ?? "") === disk,
 		);
 		if (matching.length === 0) return undefined;
 		// Newest by createdAtUtc; a missing createdAtUtc falls back to `now`
@@ -866,28 +870,53 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 	 * Operators SHOULD pre-register the disk image (S1); this is a
 	 * failsafe for first-boot in dev.
 	 */
-	private async ensureDisk(): Promise<AcaDiskImage> {
+	private async ensureDisk(name: string): Promise<AcaDiskImage> {
 		const existing = await this.client.listDiskImages();
 		const registered = existing.find(
-			(d) => d.name === this.disk || d.labels?.name === this.disk,
+			(d) => d.name === name || d.labels?.name === name,
 		);
 		if (registered) return registered;
+		if (name !== this.disk) {
+			// A per-repository disk is registered by the router's devcontainer
+			// pipeline, which knows the image ref it built and the registry
+			// credential to pull it with. This failsafe knows neither, so
+			// inventing a registration here would import the DEPLOYMENT's image
+			// under a repository's disk name — a sandbox that boots the wrong
+			// environment and reports success.
+			throw new Error(
+				`disk image '${name}' is not registered; the devcontainer build that owns it has not completed`,
+			);
+		}
 		try {
-			return await this.client.createDiskImage(this.disk, this.image);
+			return await this.client.createDiskImage(name, this.image);
 		} catch (err: unknown) {
 			// A concurrent caller may have won the registration race. Confirm that
 			// before continuing; otherwise preserve the real registry/auth failure.
 			const afterFailure = await this.client.listDiskImages();
 			const concurrent = afterFailure.find(
-				(d) => d.name === this.disk || d.labels?.name === this.disk,
+				(d) => d.name === name || d.labels?.name === name,
 			);
 			if (concurrent) {
 				this.logger.warn(
-					`ensureDisk: createDiskImage(${this.disk}) failed, but the disk now exists: ${String(err)}`,
+					`ensureDisk: createDiskImage(${name}) failed, but the disk now exists: ${String(err)}`,
 				);
 				return concurrent;
 			}
 			throw err;
 		}
+	}
+
+	/**
+	 * The disk this issue boots from: its pin when it has one, the deployment's
+	 * default otherwise.
+	 *
+	 * Validated here rather than at the label call site so an over-long
+	 * repository-derived name fails the boot with a message naming the label,
+	 * instead of reaching ACA as a rejected create.
+	 */
+	private diskFor(ctx: IssueExecutionContext): string {
+		const disk = ctx.disk ?? this.disk;
+		validateLabelValue(LABEL_DISK, disk);
+		return disk;
 	}
 }

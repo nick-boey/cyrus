@@ -1,0 +1,13 @@
+{
+	"id": "actionlint",
+	"version": "0.1.0",
+	"name": "actionlint",
+	"description": "GitHub Actions workflow linter, from the checksum-verified release tarball. No published Feature and no distro package exists.",
+	"options": {
+		"version": {
+			"type": "string",
+			"default": "1.7.12",
+			"description": "actionlint release version."
+		}
+	}
+}
