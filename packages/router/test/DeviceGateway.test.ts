@@ -651,6 +651,47 @@ describe("DeviceGateway", () => {
 		gateway.close();
 		httpServer.close();
 	});
+
+	it("stamps the device's progress clock on every rpc frame", async () => {
+		// The stranded-session detector's only proof that an agent is still
+		// working (NOR-402). Every activity a sandbox posts arrives as an RPC, so
+		// this stamp is what separates a session running a long turn from one that
+		// finished hours ago and never went terminal — the heartbeat and the
+		// sweep's own `last_active_ms` move identically for both.
+		const { gateway, device, port, httpServer, store } = await setup();
+		const markProgress = vi.spyOn(store, "markDeviceProgress");
+		const before = Date.now();
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+		await nextMessage(); // hello_ack
+
+		const rpcPromise = new Promise((r) => gateway.once("rpc", () => r(null)));
+		ws.send(
+			JSON.stringify({
+				type: "rpc_request",
+				id: "r1",
+				method: "createAgentActivity",
+				params: [],
+			}),
+		);
+		await rpcPromise;
+
+		expect(markProgress).toHaveBeenCalledTimes(1);
+		const [stampedDeviceId, stampedMs] = markProgress.mock.calls[0] ?? [];
+		expect(stampedDeviceId).toBe(device.deviceId);
+		expect(stampedMs).toBeGreaterThanOrEqual(before);
+		gateway.close();
+		httpServer.close();
+	});
 });
 
 describe("DeviceGateway.querySessions", () => {

@@ -39,6 +39,31 @@ interface ProviderListing {
 const DEFAULT_STRANDED_SESSION_GRACE_MS = 600_000;
 
 /**
+ * 1 hour — default {@link ContainerLifecycleOptions.sessionNoProgressMs}.
+ *
+ * The window a device may hold session affinity while doing nothing the router
+ * can observe. Sized against the longest plausible gap between two consecutive
+ * agent activities, NOT against a turn: an agent posts a thought or an action
+ * for every step it takes and each is an RPC through the router, so a busy
+ * session stamps its progress clock every few seconds no matter how long the
+ * turn runs. The gap this has to clear is a single blocking tool call — a long
+ * build, a full test suite — which is minutes, an order of magnitude under this.
+ *
+ * Erring long is the cheap direction: this is DETECTION ONLY, so a false
+ * positive costs one alert and a false negative costs hours of a sandbox
+ * burning 4 vCPU on an issue nobody can reach (CAN-133: 5h17m).
+ */
+const DEFAULT_SESSION_NO_PROGRESS_MS = 3_600_000;
+
+/**
+ * Why a device is stranded. Two genuinely different faults, kept as one event
+ * with a dimension rather than two events: an operator's question is "which
+ * sandboxes are holding an issue hostage", and the answer should not depend on
+ * remembering to union two queries.
+ */
+export type StrandedReason = "offline_pinned" | "no_progress";
+
+/**
  * Lets the sweep re-derive a device's affinity from the device itself rather
  * than trusting rows that only ever clear on a frame the worker may never
  * send. Injected so the sweep stays unit-testable without a gateway.
@@ -66,6 +91,11 @@ export interface ContainerLifecycleOptions {
 	 *  hold before it is reported. Must comfortably exceed a cold boot, during
 	 *  which those same three facts are the EXPECTED state. Default: 10 minutes. */
 	strandedSessionGraceMs?: number;
+	/** How long a device may hold session affinity with NO observable progress —
+	 *  nothing routed to it and nothing posted by its agent — before it is
+	 *  reported as stranded. Independent of the container's infrastructure state:
+	 *  the fault this catches looks perfectly healthy (NOR-402). Default: 1 hour. */
+	sessionNoProgressMs?: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
 	sessionReconciler?: SessionReconciler;
 	logger: ILogger;
@@ -113,9 +143,11 @@ export interface SandboxObservation {
  * immediately before the stop as well as at the gate, because the gate's
  * decision is separated from the stop by two provider round trips, and a
  * session that claims the device in between would otherwise be killed within
- * seconds of starting. The converse — affinity held against a container that
- * is NOT running — is reported by {@link noteStranded}; it is the only state
- * here that should be impossible.
+ * seconds of starting. Affinity that is NOT backed by progress — held against a
+ * container that is not running, or held while neither the router nor the agent
+ * does anything for an hour — is reported by {@link noteStranded}. That is the
+ * price of the invariant: the pin is unconditional, so the only defence against
+ * a pin that should have been released is seeing it.
  *
  * Executor errors are logged and skipped, never thrown: one unreachable
  * provider (e.g. a dead Docker daemon) must not stop the sweep from
@@ -128,13 +160,18 @@ export class ContainerLifecycle {
 	private readonly staleDestroyMs: number;
 	private readonly offlineAgeOutMs: number;
 	private readonly strandedSessionGraceMs: number;
+	private readonly sessionNoProgressMs: number;
 	private readonly sessionReconciler: SessionReconciler | undefined;
 	/** Devices already reported as pinned, so the 60s tick logs on transition only. */
 	private readonly pinnedDevices = new Set<number>();
 	/** Same idea for the stranded-session invariant: the EVENT is emitted every
 	 *  tick (an alert rule needs a non-zero count in its window) but the
-	 *  human-readable ERROR line is logged once per entry into the state. */
-	private readonly strandedDevices = new Set<number>();
+	 *  human-readable ERROR line is logged once per entry into the state.
+	 *
+	 *  Keyed by REASON, not merely by membership: a device that goes from
+	 *  "no progress" to "stopped and offline" is a different diagnosis with a
+	 *  different remedy, and a plain Set would swallow the second one. */
+	private readonly strandedDevices = new Map<number, StrandedReason>();
 	private readonly logger: ILogger;
 	private readonly now: () => number;
 	private readonly observations = new Map<number, SandboxObservation>();
@@ -149,6 +186,8 @@ export class ContainerLifecycle {
 		this.offlineAgeOutMs = opts.offlineAgeOutMs;
 		this.strandedSessionGraceMs =
 			opts.strandedSessionGraceMs ?? DEFAULT_STRANDED_SESSION_GRACE_MS;
+		this.sessionNoProgressMs =
+			opts.sessionNoProgressMs ?? DEFAULT_SESSION_NO_PROGRESS_MS;
 		this.sessionReconciler = opts.sessionReconciler;
 		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
@@ -207,28 +246,47 @@ export class ContainerLifecycle {
 	}
 
 	/**
-	 * Report the one sandbox state that is not supposed to be reachable: the
-	 * router holds live session affinity for a container that is NOT running and
-	 * whose worker is NOT connected.
+	 * Report a device that holds live session affinity but is not making
+	 * progress on it. Two shapes, one event, distinguished by `reason`:
 	 *
-	 * Nothing else surfaces it. The gauge samples it as three unremarkable
-	 * fields, no lifecycle transition fires, and Linear goes on rendering an
-	 * in-progress agent session for as long as it lasts — which is why NOR-366's
-	 * five killed sessions sat unnoticed for nine hours. The whole value of this
-	 * method is turning that silence into one queryable event.
+	 * **`offline_pinned`** — affinity held for a container that is NOT running
+	 * and whose worker is NOT connected. Structurally impossible: no lifecycle
+	 * transition fires, the gauge samples it as three unremarkable fields, and
+	 * Linear goes on rendering an in-progress agent session for as long as it
+	 * lasts, which is why NOR-366's five killed sessions sat unnoticed for nine
+	 * hours.
 	 *
-	 * Detection only. It deliberately does NOT boot the container back up: the
-	 * same three facts also describe a container legitimately parked while a
-	 * leaked affinity row (PAR-146's shape) outlives the session that made it,
-	 * and auto-resuming those would undo idle-stop for exactly the sandboxes
-	 * idle-stop exists for. Recovery stays a prompt away — cold-booting from a
-	 * new comment is reliable — while the fixes above stop the state being
-	 * produced in the first place.
+	 * **`no_progress`** — affinity held while nothing is routed TO the device and
+	 * the device posts nothing. This one looks perfectly healthy, and that is the
+	 * point: CAN-133 read `state=running online=true sessions=1` once a minute for
+	 * 5h17m while its issue was unreachable, and the old detector's `notRunning &&
+	 * !online` gate excluded it BY DEFINITION — the severity-1 rule named after
+	 * this failure could not fire for it (NOR-402). "Looks healthy" cannot be the
+	 * exclusion when a healthy-looking container is what the fault produces.
 	 *
-	 * Three exclusions keep this specific enough to alert on:
-	 *  - `unknown` state: a provider we could not read this tick says nothing.
-	 *  - within {@link strandedSessionGraceMs} of the last route or heartbeat: a
-	 *    cold boot presents identically and is the expected path, not a fault.
+	 * The `no_progress` clock is `max(lastProgressMs, lastRoutedMs, parkedAtMs,
+	 * createdMs)` and the omissions matter more than the inclusions:
+	 *  - NOT `lastSeenMs`: that is the heartbeat, which a wedged worker sends
+	 *    just as faithfully as a working one.
+	 *  - NOT `lastActiveMs`: the sweep stamps it on every tick a device is
+	 *    pinned, so the detector would reset its own clock and never fire.
+	 * `lastProgressMs` is the only clock moved by the AGENT (an `rpc_request`
+	 * carrying an activity it posted) rather than by something the router did.
+	 *
+	 * Detection only, both shapes. Neither boots a container nor releases
+	 * affinity: `offline_pinned` also describes a container legitimately parked
+	 * while a leaked affinity row (PAR-146's shape) outlives its session, and
+	 * auto-resuming those would undo idle-stop for exactly the sandboxes
+	 * idle-stop exists for. Note that `no_progress`'s recovery is NOT "prompt the
+	 * thread again" — the whole of NOR-402 is that a top-level comment on such an
+	 * issue is rejected at the issue lock — so its remedy line says so.
+	 *
+	 * Exclusions:
+	 *  - `unknown` state (`offline_pinned` only): a provider we could not read
+	 *    this tick says nothing about whether it is running. Irrelevant to
+	 *    `no_progress`, which is a clock, not a state.
+	 *  - within the relevant grace window: a cold boot presents exactly like
+	 *    `offline_pinned` and is the expected path, not a fault.
 	 *  - a pending terminal teardown: that container is meant to be going away,
 	 *    and TerminalTeardown's own grace deadline is what covers it.
 	 */
@@ -238,6 +296,10 @@ export class ContainerLifecycle {
 		affinity: number,
 		now: number,
 	): void {
+		if (this.store.getPendingTeardown(row.issueKey) !== undefined) {
+			this.strandedDevices.delete(row.deviceId);
+			return;
+		}
 		const notRunning = state === "stopped" || state === "absent";
 		const online = this.sessionReconciler?.isOnline(row.deviceId) ?? false;
 		const lastContact = Math.max(
@@ -246,12 +308,27 @@ export class ContainerLifecycle {
 			row.createdMs,
 		);
 		const strandedForMs = now - lastContact;
-		if (
-			!notRunning ||
-			online ||
-			strandedForMs <= this.strandedSessionGraceMs ||
-			this.store.getPendingTeardown(row.issueKey) !== undefined
-		) {
+		const offlinePinned =
+			notRunning && !online && strandedForMs > this.strandedSessionGraceMs;
+
+		const lastProgress = Math.max(
+			row.lastProgressMs ?? 0,
+			row.lastRoutedMs ?? 0,
+			row.parkedAtMs ?? 0,
+			row.createdMs,
+		);
+		const noProgressForMs = now - lastProgress;
+		const noProgress = noProgressForMs > this.sessionNoProgressMs;
+
+		// `offline_pinned` wins when both hold: it is the more specific diagnosis
+		// and the one with a known remedy, and a device should produce one event
+		// per tick rather than two views of the same stall.
+		const reason: StrandedReason | undefined = offlinePinned
+			? "offline_pinned"
+			: noProgress
+				? "no_progress"
+				: undefined;
+		if (reason === undefined) {
 			this.strandedDevices.delete(row.deviceId);
 			return;
 		}
@@ -265,20 +342,32 @@ export class ContainerLifecycle {
 				provider: row.provider,
 			},
 			{
+				reason,
 				state,
+				online,
 				sessions: affinity,
 				stranded_for_ms: strandedForMs,
 				stranded_grace_ms: this.strandedSessionGraceMs,
+				no_progress_for_ms: noProgressForMs,
+				no_progress_ms: this.sessionNoProgressMs,
 				age_ms: now - row.createdMs,
 			},
 		);
-		if (this.strandedDevices.has(row.deviceId)) return;
-		this.strandedDevices.add(row.deviceId);
+		if (this.strandedDevices.get(row.deviceId) === reason) return;
+		this.strandedDevices.set(row.deviceId, reason);
 		this.logger.error(
-			`Container for ${row.issueKey} (device=${row.deviceId}) is ${state} and offline ` +
-				`but still holds ${affinity} session affinity row(s): Linear is showing a live ` +
-				`agent session against a sandbox that cannot make progress. Prompt the thread ` +
-				`again to cold-boot it. (strandedForMs=${strandedForMs} state=${state})`,
+			reason === "offline_pinned"
+				? `Container for ${row.issueKey} (device=${row.deviceId}) is ${state} and offline ` +
+						`but still holds ${affinity} session affinity row(s): Linear is showing a live ` +
+						`agent session against a sandbox that cannot make progress. Prompt the thread ` +
+						`again to cold-boot it. (strandedForMs=${strandedForMs} state=${state})`
+				: `Container for ${row.issueKey} (device=${row.deviceId}) holds ${affinity} session ` +
+						`affinity row(s) but has made no observable progress for ${noProgressForMs}ms ` +
+						`(threshold ${this.sessionNoProgressMs}ms, state=${state} online=${online}): its ` +
+						`agent session never reached a terminal state, so the issue is locked to a ` +
+						`session that has stopped working. A new top-level comment will be REJECTED at ` +
+						`the issue lock — reply inside the existing session's thread, or run ` +
+						`\`cyrus router unlock\` for the issue.`,
 		);
 	}
 

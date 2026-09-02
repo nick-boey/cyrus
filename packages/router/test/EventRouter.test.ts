@@ -24,7 +24,7 @@ import {
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
 import { TerminalTeardown } from "../src/TerminalTeardown.js";
-import { silentLogger, testLogger } from "./helpers/logger.js";
+import { eventsNamed, silentLogger, testLogger } from "./helpers/logger.js";
 
 const ROUTE_NOW = 1_000_000;
 const TTL_MS = 60_000;
@@ -429,6 +429,68 @@ describe("EventRouter", () => {
 			sessionId: "sess-a",
 			deviceId: aliceDevice,
 		});
+	});
+
+	it("(c2) makes a lock rejection observable, naming the session that holds the issue", async () => {
+		// NOR-402's third acceptance criterion. A rejection here leaves the ISSUE
+		// unreachable — the reply goes only into the rejected session's own
+		// thread, which nobody reads — and it used to be an `info` line among 220
+		// near-identical ones, indistinguishable from a webhook that never came.
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		enroll(store, "bob@example.com", { linearId: "lin-bob" });
+		const logger = testLogger();
+		const { router } = makeRouter(store, { logger });
+
+		await router.route(
+			createdEvent({ sessionId: "sess-a", issueId: "ISS-2", creator: ALICE }),
+		);
+		await router.route(
+			createdEvent({ sessionId: "sess-b", issueId: "ISS-2", creator: BOB }),
+		);
+
+		expect(eventsNamed(logger, "routing.rejected")).toEqual([
+			{
+				reason: "issue_locked",
+				agent_session_id: "sess-b",
+				issue_id: "ISS-2",
+				issue_key: null,
+				held_by_session_id: "sess-a",
+				held_by_device_id: aliceDevice,
+			},
+		]);
+		// WARN, so it survives a sink whose threshold is WARN+ and stands out on a
+		// console full of routine routing lines.
+		expect(
+			logger.warn.mock.calls.filter(([m]) =>
+				String(m).includes("The prompt did NOT reach an agent"),
+			),
+		).toHaveLength(1);
+	});
+
+	it("(c3) makes an unenrolled-creator refusal observable too", async () => {
+		const logger = testLogger();
+		const { router } = makeRouter(store, { logger });
+
+		await router.route(
+			createdEvent({
+				sessionId: "sess-u",
+				issueId: "ISS-3",
+				creator: { name: "Charlie", email: "charlie@example.com" },
+			}),
+		);
+
+		expect(eventsNamed(logger, "routing.rejected")).toEqual([
+			{
+				reason: "unenrolled_creator",
+				agent_session_id: "sess-u",
+				issue_id: "ISS-3",
+				issue_key: null,
+				held_by_session_id: null,
+				held_by_device_id: null,
+			},
+		]);
 	});
 
 	it("(d) enforces creator-only prompting using the activity actor field", async () => {

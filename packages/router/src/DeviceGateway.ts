@@ -309,6 +309,21 @@ export class DeviceGateway extends EventEmitter {
 				this.emit("eventAck", deviceId, frame.seq);
 				break;
 			case "rpc_request":
+				// The device's PROGRESS stamp, and the only proof-of-work signal the
+				// router has. A sandbox holds no Linear token, so every thought,
+				// action and response its agent posts arrives as one of these: a
+				// working session stamps this every few seconds, and one that has
+				// silently stopped working never stamps it again.
+				// `ContainerLifecycle.noteStranded` thresholds on it (NOR-402).
+				//
+				// Sits next to the `touchDevice` heartbeat stamps above deliberately —
+				// both are "what did this device just do", and keeping them in one
+				// place is what stops a future frame type being added with liveness
+				// bookkeeping half-done. Stamped for the ATTEMPT, before dispatch: a
+				// refused or failed RPC is still an agent that is awake and trying,
+				// and counting it as no progress would report a session stuck in a
+				// retry loop as stranded.
+				this.store.markDeviceProgress(deviceId, Date.now());
 				this.emit("rpc", deviceId, frame);
 				break;
 			case "session_state":

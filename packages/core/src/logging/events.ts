@@ -53,6 +53,25 @@ export const CYRUS_EVENTS = {
 	sessionPendingWorkRecorded: "session.pending_work_recorded",
 	/** The set of in-flight background tasks changed. */
 	sessionBackgroundTasksChanged: "session.background_tasks_changed",
+	/**
+	 * The session reached a terminal state and told its observers. In router mode
+	 * this is what releases the issue lock and the session affinity, so its
+	 * ABSENCE is the signature of an issue that has become unreachable — pair it
+	 * with {@link sessionTerminalDeferred} to see where a session stopped.
+	 */
+	sessionTerminalSignalled: "session.terminal_signalled",
+	/**
+	 * A turn ended but the terminal signal was WITHHELD, because the runner still
+	 * reports work that will wake the session later. Unbounded by design: the
+	 * signal is retried only when a wakeup or a background task produces another
+	 * result, so a task that never exits holds the issue lock forever.
+	 *
+	 * An `event`, not the `info` line it used to be, and that distinction is the
+	 * whole point: a sandbox worker's log forwarder is WARN+ by default, so the
+	 * `info` never left the container and the one state that can strand an issue
+	 * indefinitely was absent from the logs it had to be diagnosed from (NOR-402).
+	 */
+	sessionTerminalDeferred: "session.terminal_deferred",
 
 	/**
 	 * A `/<skill>` command leading a user's comment was echoed onto line 1 of

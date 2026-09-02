@@ -264,19 +264,26 @@ resource sandboxBootHealth 'Microsoft.OperationalInsights/workspaces/savedSearch
   }
 }
 
-// Sandboxes stopped out from under a live session, newest first.
+// Sandboxes holding an issue they are not working on, newest first.
 //
 // The companion to the `-stranded-sessions` alert: the alert says an issue is
-// affected, this says how it got there. Each stranded sandbox is joined back to
-// the `sandbox.idle_stopped` that preceded it, so `killed_after` shows how long
-// the session that was killed had been running — a value of seconds is the
-// NOR-366 handoff race, and a large one is something else.
+// affected, this says how it got there. `reason` splits the two shapes and they
+// want reading differently:
+//
+//  - `offline_pinned` — the sandbox stopped out from under a live session. Joined
+//    back to the `sandbox.idle_stopped` that preceded it, so `killed_after` shows
+//    how long the killed session had been running: seconds is the NOR-366 handoff
+//    race, a large value is something else.
+//  - `no_progress` — the sandbox is up and connected and doing nothing.
+//    `killed_after` is empty (there was no stop) and `no_progress_for` is the
+//    number that matters: how long the issue has been locked to a session that
+//    stopped working (NOR-402).
 resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
   parent: logAnalytics
   name: 'Cyrus-Sandbox-Stranded-Sessions'
   properties: {
     category: 'Cyrus Sandboxes'
-    displayName: 'Stranded sessions (stopped sandbox still holding affinity)'
+    displayName: 'Stranded sessions (sandbox holding an issue it is not working on)'
     query: join(
       [
         'let stops ='
@@ -293,6 +300,10 @@ resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches
         '| extend p = parse_json(Log_s)'
         '| where tostring(p.event) == "sandbox.stranded_session"'
         '| extend device_id = tostring(p["cyrus.device_id"])'
+        // Grouped by reason as well as device: a device that goes from
+        // `no_progress` to `offline_pinned` is two diagnoses with two remedies,
+        // and collapsing them onto one row hides the transition.
+        '| extend reason = tostring(p["cyrus.reason"])'
         '| summarize'
         '    first_reported = min(TimeGenerated),'
         '    last_reported  = max(TimeGenerated),'
@@ -300,26 +311,118 @@ resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches
         '    issue_key      = any(tostring(p["cyrus.issue_key"])),'
         '    provider       = any(tostring(p["cyrus.provider"])),'
         '    sessions       = max(toint(p["cyrus.sessions"])),'
-        '    state          = any(tostring(p["cyrus.state"]))'
-        '  by device_id'
+        '    state          = any(tostring(p["cyrus.state"])),'
+        '    online         = any(tobool(p["cyrus.online"])),'
+        '    no_progress_for = max(tolong(p["cyrus.no_progress_for_ms"])) * 1ms'
+        '  by device_id, reason'
         // The stop that produced this, if there was one: the newest idle-stop for
-        // the same device at or before we first reported it. `absent` sandboxes and
-        // stops older than the window simply have no match, hence the left join.
+        // the same device at or before we first reported it. `absent` sandboxes,
+        // `no_progress` rows, and stops older than the window simply have no
+        // match, hence the left join.
         '| join kind=leftouter ('
         '    stops | summarize arg_max(stopped_at, *) by device_id'
         '  ) on device_id'
         '| project'
         '    issue_key,'
         '    device_id,'
+        '    reason,'
         '    provider,'
         '    state,'
+        '    online,'
         '    sessions,'
+        '    no_progress_for,'
         '    stopped_at,'
         '    killed_after = uptime,'
         '    stranded_for = last_reported - first_reported,'
         '    ticks,'
         '    first_reported'
         '| order by first_reported desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Session termination and routing refusals (NOR-402)
+////////////////////////////////////////////////////////////////////////////////
+//
+// The two signals NOR-402 added, and the reason it added them: a session that
+// never reaches a terminal state holds its issue lock forever, and until these
+// existed the state was unfalsifiable from the logs. `session.terminal_*` is
+// emitted by the sandbox WORKER and reaches this table via SandboxLogRelay,
+// exactly like `skill.slash_invoked` below. Note both are `event()` records
+// rather than `info` lines on purpose: a worker's log forwarder is WARN+ by
+// default, so the `info` this replaced never left the container.
+
+// Sessions whose terminal signal was withheld and never sent. Each row is one
+// issue that is still locked to a session that has finished its work — the
+// CAN-133 shape. `deferred_for` is how long the issue has been unreachable.
+resource sessionsNeverTerminal 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sessions-Never-Terminal'
+  properties: {
+    category: 'Cyrus Sessions'
+    displayName: 'Sessions deferred and never terminated'
+    query: join(
+      [
+        'let signalled ='
+        '    ContainerAppConsoleLogs_CL'
+        appFilter
+        '    | extend p = parse_json(Log_s)'
+        '    | where tostring(p.event) == "session.terminal_signalled"'
+        '    | distinct session_id = tostring(p["cyrus.agent_session_id"]);'
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "session.terminal_deferred"'
+        '| extend session_id = tostring(p["cyrus.agent_session_id"])'
+        '| summarize'
+        '    first_deferred = min(TimeGenerated),'
+        '    last_deferred  = max(TimeGenerated),'
+        '    defers         = count(),'
+        '    issue_key      = any(tostring(p["cyrus.issue_key"])),'
+        '    crons          = max(toint(p["cyrus.session_cron_count"])),'
+        '    background     = max(toint(p["cyrus.background_task_count"])),'
+        '    live_background = max(toint(p["cyrus.live_background_task_count"])),'
+        '    pending_work   = any(tostring(p["cyrus.pending_work"]))'
+        '  by session_id'
+        // Anti-join: what is left is every session that deferred and never came
+        // back. That set IS the population of permanently locked issues.
+        '| join kind=leftanti signalled on session_id'
+        '| extend deferred_for = now() - last_deferred'
+        '| order by first_deferred asc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// Prompts the router refused to deliver. `issue_locked` rows are the ones that
+// leave an issue write-only: the user's comment produced an agent session, the
+// router routed it, and it was rejected — with the explanation posted only into
+// the rejected session's own thread, where nobody is looking.
+resource routingRejections 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Routing-Rejections'
+  properties: {
+    category: 'Cyrus Sessions'
+    displayName: 'Refused prompts (comments that never reached an agent)'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "routing.rejected"'
+        '| project'
+        '    TimeGenerated,'
+        '    reason      = tostring(p["cyrus.reason"]),'
+        '    issue_id    = tostring(p["cyrus.issue_id"]),'
+        '    issue_key   = tostring(p["cyrus.issue_key"]),'
+        '    session_id  = tostring(p["cyrus.agent_session_id"]),'
+        '    held_by     = tostring(p["cyrus.held_by_session_id"]),'
+        '    held_device = tostring(p["cyrus.held_by_device_id"])'
+        '| order by TimeGenerated desc'
       ],
       '\n'
     )
@@ -843,27 +946,43 @@ resource sandboxBootFailures 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
 // rather than on a threshold.
 //
 // `sandbox.stranded_session` means the router still holds session affinity for a
-// sandbox that is neither running nor connected. Nothing about it is visible
-// anywhere else: Linear renders a normal in-progress agent session for as long
-// as it lasts, the gauge records it as three unremarkable fields, and none of the
-// other rules here cover it — `-long-running` needs a running sandbox,
-// `-boot-failures` needs a boot that failed, and `-sweep-stalled` needs the sweep
-// to stop. That combined blind spot is what turned NOR-366's 38-second race into
-// a nine-hour outage across five agent sessions.
+// sandbox that is not making progress on it. `cyrus.reason` splits two shapes:
+//
+//  - `offline_pinned` — neither running nor connected. NOR-366's 38-second
+//    handoff race, which ran for nine hours across five agent sessions.
+//  - `no_progress` — running, connected, and idle: nothing routed to it and
+//    nothing posted by its agent for over an hour. CAN-133 held an issue
+//    unreachable for 5h17m in exactly this state (NOR-402), and the previous
+//    version of THIS RULE could not fire for it: the detector required
+//    `stopped && !online`, so the shape that actually blocks work was excluded
+//    by definition. An alert that exists but cannot fire for the failure it
+//    names is worse than none, because it is read as coverage.
+//
+// Nothing about either shape is visible anywhere else: Linear renders a normal
+// in-progress agent session for as long as it lasts, the gauge records it as
+// three unremarkable fields, and none of the other rules here cover it —
+// `-long-running` needs a sandbox up past its own (much longer) threshold,
+// `-boot-failures` needs a boot that failed, and `-sweep-stalled` needs the
+// sweep to stop.
 //
 // Severity 1, not 2: every event is one Linear issue whose agent has silently
-// stopped making progress, and the user has no way to tell. Recovery is a prompt
-// into the thread, which cold-boots the sandbox.
+// stopped making progress, and the user has no way to tell.
 //
-// ContainerLifecycle already applies its own grace window before emitting (a cold
-// boot presents identically), so this rule needs no threshold beyond "any".
+// `reason` is a dimension so the two shapes alert separately — their remedies
+// differ, and for `no_progress` the remedy is NOT "comment again": a new
+// top-level comment on a locked issue is rejected at the issue lock, which is
+// the trap NOR-402 documents.
+//
+// ContainerLifecycle already applies its own grace window before emitting (a
+// cold boot presents identically to `offline_pinned`), so this rule needs no
+// threshold beyond "any".
 resource sandboxStrandedSessions 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = if (enableAlerts) {
   name: 'alert-${namePrefix}-sandbox-stranded-sessions'
   location: location
   tags: tags
   properties: {
     displayName: 'alert-${namePrefix}-sandbox-stranded-sessions'
-    description: 'A Cyrus sandbox is stopped and offline but still holds session affinity. Linear is showing a live agent session against a sandbox that cannot make progress. Prompt the thread again to cold-boot it, then check the "cyrus.stranded_for_ms" attribute for how long it was lost.'
+    description: 'A Cyrus sandbox holds session affinity for an issue it is not working on. Check "cyrus.reason": "offline_pinned" means the sandbox is stopped and disconnected — prompt the thread again to cold-boot it. "no_progress" means it is running and connected but nothing has been routed to it and its agent has posted nothing for over an hour: its session never went terminal, so the issue is locked and a NEW top-level comment will be rejected — reply inside the running session\'s thread, or run "cyrus router unlock" for the issue. "cyrus.no_progress_for_ms" and "cyrus.stranded_for_ms" give the duration.'
     severity: 1
     enabled: true
     evaluationFrequency: 'PT15M'
@@ -881,7 +1000,11 @@ resource sandboxStrandedSessions 'Microsoft.Insights/scheduledQueryRules@2023-03
               appFilter
               '| extend p = parse_json(Log_s)'
               '| where tostring(p.event) == "sandbox.stranded_session"'
-              '| summarize stranded = count() by issue_key = tostring(p["cyrus.issue_key"]), provider = tostring(p["cyrus.provider"])'
+              // `reason` is missing on records emitted by a router predating
+              // NOR-402; coalescing keeps those grouped rather than silently
+              // dropped into an empty dimension during a rollout.
+              '| extend reason = coalesce(tostring(p["cyrus.reason"]), "offline_pinned")'
+              '| summarize stranded = count() by issue_key = tostring(p["cyrus.issue_key"]), provider = tostring(p["cyrus.provider"]), reason'
             ],
             '\n'
           )
@@ -899,6 +1022,13 @@ resource sandboxStrandedSessions 'Microsoft.Insights/scheduledQueryRules@2023-03
             }
             {
               name: 'provider'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+            {
+              name: 'reason'
               operator: 'Include'
               values: [
                 '*'
