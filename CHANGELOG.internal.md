@@ -5,7 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
-- **Owner-scoped agent-run observations (related to [NOR-402](https://linear.app/northrop-digital/issue/NOR-402/a-never-terminating-agent-session-makes-an-issue-permanently)).** The router now retains each
+- **Owner-scoped agent-run observations (related to [NOR-402](https://linear.app/northrop-digital/issue/NOR-402/a-never-terminating-agent-session-makes-an-issue-permanently), [#44](https://github.com/nick-boey/cyrus/pull/44)).** The router now retains each
   routed work episode, its Linear activity/comment references, latest published
   agent activity, exact or unknown terminal outcome, worker liveness, and the
   lifecycle sweep's cached executor state for 24 hours. Authenticated clients
