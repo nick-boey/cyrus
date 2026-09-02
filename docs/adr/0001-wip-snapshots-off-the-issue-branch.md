@@ -77,6 +77,24 @@ whose issue branch has never been pushed is indistinguishable from an orphan
 from the remote alone, and deleting one would destroy the only copy of another
 device's uncommitted work.
 
+That deletion did not actually happen for the first several months this shipped.
+Teardown resolved the checkout it reaped from as `<cyrusHome>/worktrees/<ISSUE>`
+while creation used the repository's configured `workspaceBaseDir`; the two agree
+on a default self-host install and differ on every container sandbox, so the
+reaper spawned `git` in a directory that had never existed and gave up. NOR-411
+fixed it by reaping from the repository's main checkout — ref deletion is a
+remote operation, so any checkout carrying the same `origin` will do, and the
+main checkout is the one that outlives teardown and so makes the sweep's retry
+retryable at all.
+
+The refs already leaked are **not** cleaned up by that fix, and deliberately are
+not cleaned up automatically: the paragraph above is exactly why a namespace
+sweep is unsafe. The decision recorded here is that they are removed by hand,
+per remote, by an operator who can confirm the issue is closed —
+`git ls-remote origin 'refs/cyrus-wip/*'` to enumerate, `git push origin
+--delete <ref>` to remove. On `nick-boey/cyrus` the audit at the time of the fix
+found 11 such refs, of which 2 belonged to issues still open.
+
 Capture keeps a local `refs/cyrus-wip/<branch>` recording the last snapshot that
 actually reached the remote, which is what lets an idle session skip the push
 entirely. A consequence is that the ref IS visible to `git log --all` inside

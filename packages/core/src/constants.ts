@@ -71,6 +71,11 @@ export interface WorkspaceBaseDirCarrier {
  * default is a last resort for callers that have no repository to resolve
  * from; `source` reports which one applied so a caller can say so when the
  * resolved path turns out not to exist.
+ *
+ * Every path in is joined verbatim — run config-supplied values through
+ * `resolvePath` first. cyrus-hosted emits self-host paths with a literal `~/`
+ * prefix, and `fs` does not expand it, so an unresolved `workspaceBaseDir`
+ * produces exactly the ENOENT this function exists to make legible.
  */
 export function resolveIssueWorkspacePath(params: {
 	issueIdentifier: string;

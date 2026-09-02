@@ -17,14 +17,12 @@ import type {
 	Issue,
 	RepoSetupHookEventHandler,
 	RepositoryConfig,
-	ResolvedWorkspacePath,
 	WipRestoreOutcome,
 	Workspace,
 } from "cyrus-core";
 import {
 	createLogger,
 	DEVCONTAINER_PATHS,
-	getDefaultWorktreesDir,
 	type ILogger,
 	parseJsonc,
 	resolveIssueWorkspacePath,
@@ -1520,19 +1518,20 @@ export class GitService {
 		if (!existsSync(workspacePath)) {
 			// "Nothing to delete" reads as benign, and for a workspace that was
 			// already cleaned up it is. But it read exactly the same way when
-			// teardown was resolving the path from the wrong base directory and
-			// leaving real worktrees behind, which is how NOR-411 went unnoticed.
-			// So before reporting nothing to do, look wherever else this issue's
-			// workspace could plausibly be and say so if one is actually there.
-			const strays = this.findStrayWorkspacePaths(issueIdentifier, resolved);
-			if (strays.length > 0) {
+			// teardown resolved the path from the wrong base directory and left
+			// real worktrees behind, which is how NOR-411 went unnoticed for as
+			// long as it did. The two cases are only distinguishable if the
+			// message says where the path came from, so it always does — and
+			// says so at `warn` when it came from the fallback, which is the one
+			// case where nothing here knows whether the path was even right.
+			if (resolved.source === "default") {
 				this.logger.warn(
-					`Worktree cleanup for ${issueIdentifier} resolved to ${workspacePath} (from ${resolved.source === "repository" ? "the repository's workspaceBaseDir" : "the default worktrees directory"}), which does not exist — but a workspace for it does exist at ${strays.join(", ")}. Nothing was cleaned up; check the repository's workspaceBaseDir and remove the stray workspace by hand.`,
+					`Found no worktree for ${issueIdentifier} at ${workspacePath}, and had no repository to resolve that path from — it is the default worktrees directory, not necessarily where this issue's workspace was created. If its repository configures a custom workspaceBaseDir, the worktree has NOT been cleaned up.`,
 				);
 				return;
 			}
 			this.logger.info(
-				`Worktree directory does not exist for ${issueIdentifier} at ${workspacePath}, nothing to delete`,
+				`Worktree directory does not exist for ${issueIdentifier} at ${workspacePath} (resolved from the repository's workspaceBaseDir ${resolved.baseDir}), nothing to delete`,
 			);
 			return;
 		}
@@ -1604,27 +1603,6 @@ export class GitService {
 				// Best-effort: prune failure is not critical
 			}
 		}
-	}
-
-	/**
-	 * Other directories this issue's workspace could be sitting in, that it
-	 * actually is sitting in. Used only to turn a silent "nothing to delete"
-	 * into a loud "we looked in the wrong place" — deliberately reports rather
-	 * than deletes, because a directory we did not resolve to is one we cannot
-	 * be sure belongs to this issue.
-	 */
-	private findStrayWorkspacePaths(
-		issueIdentifier: string,
-		resolved: ResolvedWorkspacePath,
-	): string[] {
-		const candidateBaseDirs = new Set<string>([
-			getDefaultWorktreesDir(this.cyrusHome),
-		]);
-		candidateBaseDirs.delete(resolved.baseDir);
-
-		return [...candidateBaseDirs]
-			.map((baseDir) => join(baseDir, issueIdentifier))
-			.filter((candidate) => existsSync(candidate));
 	}
 
 	/**

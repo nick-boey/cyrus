@@ -4041,14 +4041,33 @@ ${taskSection}`;
 			this.agentSessionManager.removeSession(session.id);
 		}
 
-		// Build the set of repositories involved with this issue so per-repo
-		// cyrus-teardown.sh scripts (if present) can run before worktrees are
-		// removed. Source-of-truth is the session manager: each session's
-		// repositoryId maps to a configured RepositoryConfig.
+		// Build the set of repositories involved with this issue. Everything
+		// below is driven off it: which `cyrus-teardown.sh` scripts run, which
+		// remotes have a WIP snapshot deleted, and — since NOR-411 — which
+		// `workspaceBaseDir` the workspace itself is resolved from. That last
+		// one makes an incomplete list silently destructive rather than merely
+		// incomplete, and there are two ways it used to come up short.
+		//
+		// A session records only its PRIMARY repository (`sessionRepositories`
+		// is set from `repositories[0]`), so a multi-repo issue lost every
+		// secondary repository's snapshot. And on a REDELIVERED terminal
+		// webhook there are no sessions left at all — the first delivery calls
+		// `removeSession` above, and the router replays unacked events by
+		// design — leaving the list empty, the workspace resolved from the
+		// default base directory, and a real worktree neither cleaned up nor
+		// reported.
+		//
+		// The issue's own routing decision covers both: it is the same list
+		// worktree creation was handed, and it outlives the sessions. Sessions
+		// still go first so the primary repository stays first, which is the
+		// one `resolveIssueWorkspacePath` takes the base directory from.
 		const repoIds = new Set<string>();
 		for (const session of sessions) {
 			const repoId = this.sessionRepositories.get(session.id);
 			if (repoId) repoIds.add(repoId);
+		}
+		for (const repo of this.getCachedRepositories(issueId) ?? []) {
+			repoIds.add(repo.id);
 		}
 		const teardownRepositories: RepositoryConfig[] = [];
 		for (const repoId of repoIds) {
@@ -4103,6 +4122,15 @@ ${taskSection}`;
 				// failed to delete, so one unreachable remote at the wrong
 				// moment doesn't leak a ref permanently.
 				await this.wipSnapshotReaper.sweep();
+			} else if (sessions.length === 0) {
+				// A redelivered terminal webhook: the first delivery removed the
+				// sessions, and with them the only source of a branch name. It
+				// also already reaped, so there is nothing owed here — the
+				// repositories are still worth carrying for the worktree
+				// deletion below, which is what an idempotent replay is for.
+				this.logger.info(
+					`No sessions remain for ${message.workItemIdentifier}; its WIP snapshots were reaped on an earlier delivery`,
+				);
 			} else {
 				// No session carries any issue data at all (e.g. only
 				// standalone/no-issue sessions were found for this issueId) —

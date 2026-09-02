@@ -925,14 +925,31 @@ describe("GitService", () => {
 	});
 
 	describe("deleteWorktree", () => {
-		it("does nothing when workspace directory does not exist", async () => {
+		it("does nothing when the resolved workspace directory does not exist", async () => {
+			mockExistsSync.mockReturnValue(false);
+
+			await gitService.deleteWorktree("DEF-123", {
+				repositories: [makeRepository()],
+			});
+
+			expect(mockRmSync).not.toHaveBeenCalled();
+			expect(mockLogger.info).toHaveBeenCalledWith(
+				expect.stringContaining("does not exist"),
+			);
+		});
+
+		it("warns rather than reporting nothing to do when it had no repository to resolve the path from", async () => {
+			// With no repository the path is the default worktrees directory,
+			// which is only where the workspace is if nobody configured
+			// otherwise — and reporting that as "nothing to delete" is exactly
+			// how NOR-411 stayed invisible.
 			mockExistsSync.mockReturnValue(false);
 
 			await gitService.deleteWorktree("DEF-123");
 
 			expect(mockRmSync).not.toHaveBeenCalled();
-			expect(mockLogger.info).toHaveBeenCalledWith(
-				expect.stringContaining("does not exist"),
+			expect(mockLogger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("had no repository to resolve that path from"),
 			);
 		});
 
@@ -957,20 +974,43 @@ describe("GitService", () => {
 			const makeContainerRepo = () =>
 				makeRepository({ workspaceBaseDir: WORKSPACE_BASE_DIR });
 
-			it("creates the worktree under the repository's workspaceBaseDir", async () => {
+			/**
+			 * Deliberately asserts teardown against the path CREATION returned
+			 * rather than against a constant: a constant would let both sides
+			 * move together and still pass, which is the whole failure mode.
+			 */
+			it("deletes exactly the directory creation produced", async () => {
+				const gitServiceUnderTest = makeContainerGitService();
 				mockExecSync.mockReturnValue(Buffer.from(""));
 
-				const result = await makeContainerGitService().createGitWorktree(
+				const created = await gitServiceUnderTest.createGitWorktree(
 					makeIssue(),
 					[makeContainerRepo()],
 				);
+				expect(created.path).toBe(CREATED_PATH);
 
-				expect(result.path).toBe(CREATED_PATH);
+				mockExistsSync.mockImplementation(
+					(path: any) => String(path) === created.path,
+				);
+				mockReaddirSync.mockReturnValue([] as any);
+
+				await gitServiceUnderTest.deleteWorktree("ENG-97", {
+					repositories: [makeContainerRepo()],
+				});
+
+				expect(mockRmSync).toHaveBeenCalledWith(created.path, {
+					recursive: true,
+					force: true,
+				});
 			});
 
-			it("deletes the worktree the creation path actually produced", async () => {
+			it("does not fall back to <cyrusHome>/worktrees when a repository says otherwise", async () => {
+				// The pre-fix behaviour: the workspace is at the hardcoded path
+				// and nowhere else, and teardown must NOT find it there — a
+				// container sandbox's workspace never lives there, so a
+				// teardown that matched it would be matching by luck.
 				mockExistsSync.mockImplementation(
-					(path: any) => String(path) === CREATED_PATH,
+					(path: any) => String(path) === HARDCODED_PATH,
 				);
 				mockReaddirSync.mockReturnValue([] as any);
 
@@ -978,35 +1018,9 @@ describe("GitService", () => {
 					repositories: [makeContainerRepo()],
 				});
 
-				expect(mockRmSync).toHaveBeenCalledWith(CREATED_PATH, {
-					recursive: true,
-					force: true,
-				});
-				// The pre-fix path must not be consulted at all.
-				expect(mockRmSync).not.toHaveBeenCalledWith(
-					HARDCODED_PATH,
-					expect.anything(),
-				);
-			});
-
-			it("says so loudly when the resolved path is empty but a workspace exists elsewhere", async () => {
-				// The pre-fix leftovers: a workspace sitting under the default
-				// worktrees directory that the resolved path knows nothing about.
-				// Reporting this as "nothing to delete" is how the bug hid.
-				mockExistsSync.mockImplementation(
-					(path: any) => String(path) === HARDCODED_PATH,
-				);
-
-				await makeContainerGitService().deleteWorktree("ENG-97", {
-					repositories: [makeContainerRepo()],
-				});
-
 				expect(mockRmSync).not.toHaveBeenCalled();
-				expect(mockLogger.warn).toHaveBeenCalledWith(
-					expect.stringContaining(HARDCODED_PATH),
-				);
-				expect(mockLogger.warn).toHaveBeenCalledWith(
-					expect.stringContaining("Nothing was cleaned up"),
+				expect(mockLogger.info).toHaveBeenCalledWith(
+					expect.stringContaining(CREATED_PATH),
 				);
 			});
 		});

@@ -151,6 +151,7 @@ describe("EdgeWorker terminal teardown ordering", () => {
 				},
 			},
 			sessionRepositories: new Map(),
+			getCachedRepositories: () => null,
 			repositories: new Map(),
 			gitService: {
 				deleteWorktree: async () => {
@@ -201,6 +202,66 @@ describe("EdgeWorker terminal teardown ordering", () => {
 		]);
 	});
 
+	// A container sandbox: clones live under the shared workspaces root,
+	// nowhere near `<cyrusHome>/worktrees`.
+	const REPO_A = {
+		id: "repo-a",
+		name: "repo-a",
+		repositoryPath: "/workspaces/repos/repo-a",
+		workspaceBaseDir: "/workspaces",
+	};
+	const REPO_B = {
+		id: "repo-b",
+		name: "repo-b",
+		repositoryPath: "/workspaces/repos/repo-b",
+		workspaceBaseDir: "/workspaces",
+	};
+
+	const makeTeardownWorker = (opts: {
+		sessions: unknown[];
+		sessionRepositories?: Map<string, string>;
+		cachedRepositories?: unknown[];
+		reaped: Array<[string, string]>;
+	}) => ({
+		logger: { info: vi.fn(), warn: vi.fn() },
+		cyrusHome: "/workspaces/.cyrus",
+		agentSessionManager: {
+			getSessionsByIssueId: () => opts.sessions,
+			requestSessionStop: vi.fn(),
+			createResponseActivity: vi.fn(),
+			removeSession: vi.fn(),
+		},
+		sessionRepositories: opts.sessionRepositories ?? new Map(),
+		repositories: new Map([
+			["repo-a", REPO_A],
+			["repo-b", REPO_B],
+		]),
+		getCachedRepositories: () => opts.cachedRepositories ?? null,
+		deriveWorktreeBranchName: (issue: { branchName: string }) =>
+			issue.branchName,
+		wipSnapshotReaper: {
+			reap: async (repoPath: string, branch: string) => {
+				opts.reaped.push([repoPath, branch]);
+			},
+			sweep: vi.fn(),
+		},
+		gitService: { deleteWorktree: vi.fn() },
+		config: { platform: "cli" },
+	});
+
+	const runTeardown = (worker: unknown) =>
+		(
+			EdgeWorker.prototype as unknown as {
+				handleIssueStateChangeMessage(message: {
+					workItemId: string;
+					workItemIdentifier: string;
+				}): Promise<void>;
+			}
+		).handleIssueStateChangeMessage.call(worker, {
+			workItemId: "issue-1",
+			workItemIdentifier: "CAN-129",
+		});
+
 	/**
 	 * NOR-411: the WIP snapshot was reaped from a worktree path reconstructed
 	 * as `<cyrusHome>/worktrees/<ISSUE>`, which is not where a container
@@ -212,64 +273,85 @@ describe("EdgeWorker terminal teardown ordering", () => {
 	 */
 	it("reaps WIP snapshots from each repository's main checkout, not a reconstructed worktree path", async () => {
 		const reaped: Array<[string, string]> = [];
-		const session = {
-			id: "sess-1",
-			issue: { identifier: "CAN-129", branchName: "cyrus1/can-129-do-it" },
-			agentRunner: { stop: vi.fn() },
-		};
-		const repository = {
-			id: "repo-a",
-			name: "repo-a",
-			// A container sandbox: the clone lives under the shared workspaces
-			// root, nowhere near `<cyrusHome>/worktrees`.
-			repositoryPath: "/workspaces/repos/repo-a",
-			workspaceBaseDir: "/workspaces",
-		};
-		const fakeWorker = {
-			logger: { info: vi.fn(), warn: vi.fn() },
-			cyrusHome: "/workspaces/.cyrus",
-			agentSessionManager: {
-				getSessionsByIssueId: () => [session],
-				requestSessionStop: vi.fn(),
-				createResponseActivity: vi.fn(),
-				removeSession: vi.fn(),
-			},
-			sessionRepositories: new Map([["sess-1", "repo-a"]]),
-			repositories: new Map([["repo-a", repository]]),
-			deriveWorktreeBranchName: (issue: { branchName: string }) =>
-				issue.branchName,
-			wipSnapshotReaper: {
-				reap: async (repoPath: string, branch: string) => {
-					reaped.push([repoPath, branch]);
+		const fakeWorker = makeTeardownWorker({
+			sessions: [
+				{
+					id: "sess-1",
+					issue: { identifier: "CAN-129", branchName: "cyrus1/can-129-do-it" },
+					agentRunner: { stop: vi.fn() },
 				},
-				sweep: vi.fn(),
-			},
-			gitService: { deleteWorktree: vi.fn() },
-			config: { platform: "cli" },
-		};
-		const handler = (
-			EdgeWorker.prototype as unknown as {
-				handleIssueStateChangeMessage(message: {
-					workItemId: string;
-					workItemIdentifier: string;
-				}): Promise<void>;
-			}
-		).handleIssueStateChangeMessage;
-
-		await handler.call(fakeWorker, {
-			workItemId: "issue-1",
-			workItemIdentifier: "CAN-129",
+			],
+			sessionRepositories: new Map([["sess-1", "repo-a"]]),
+			cachedRepositories: [REPO_A],
+			reaped,
 		});
+
+		await runTeardown(fakeWorker);
 
 		expect(reaped).toEqual([
 			["/workspaces/repos/repo-a", "cyrus1/can-129-do-it"],
 		]);
-		// Teardown gets the repository so it can resolve the same workspace
-		// path creation used.
 		expect(fakeWorker.gitService.deleteWorktree).toHaveBeenCalledWith(
 			"CAN-129",
-			{ repositories: [repository] },
+			{ repositories: [REPO_A] },
 		);
+	});
+
+	/**
+	 * A session records only its PRIMARY repository, but `WorkspaceSyncService`
+	 * pushes a snapshot to every repository in the workspace. Reaping only the
+	 * repositories the sessions name leaves every secondary repository's ref on
+	 * its remote forever, with nothing recorded that would ever retry it.
+	 */
+	it("reaps every repository the issue was routed to, not just the session's primary", async () => {
+		const reaped: Array<[string, string]> = [];
+		const fakeWorker = makeTeardownWorker({
+			sessions: [
+				{
+					id: "sess-1",
+					issue: { identifier: "CAN-129", branchName: "cyrus1/can-129-do-it" },
+					agentRunner: { stop: vi.fn() },
+				},
+			],
+			sessionRepositories: new Map([["sess-1", "repo-a"]]),
+			cachedRepositories: [REPO_A, REPO_B],
+			reaped,
+		});
+
+		await runTeardown(fakeWorker);
+
+		expect(reaped).toEqual([
+			["/workspaces/repos/repo-a", "cyrus1/can-129-do-it"],
+			["/workspaces/repos/repo-b", "cyrus1/can-129-do-it"],
+		]);
+	});
+
+	/**
+	 * The router replays unacked terminal webhooks on purpose, and the first
+	 * delivery removed the sessions — so the second has nothing to derive
+	 * repositories from. Without the issue's own routing decision the workspace
+	 * would resolve to `<cyrusHome>/worktrees`, which in a container sandbox is
+	 * a directory that has never existed: NOR-411 all over again, on the path
+	 * whose whole purpose is to be a safe retry.
+	 */
+	it("still resolves the workspace on a redelivered webhook, when no sessions remain", async () => {
+		const reaped: Array<[string, string]> = [];
+		const fakeWorker = makeTeardownWorker({
+			sessions: [],
+			cachedRepositories: [REPO_A],
+			reaped,
+		});
+
+		await runTeardown(fakeWorker);
+
+		expect(fakeWorker.gitService.deleteWorktree).toHaveBeenCalledWith(
+			"CAN-129",
+			{ repositories: [REPO_A] },
+		);
+		// Nothing left to derive a branch name from, and the first delivery
+		// already reaped — so this is a no-op, not a warning.
+		expect(reaped).toEqual([]);
+		expect(fakeWorker.logger.warn).not.toHaveBeenCalled();
 	});
 
 	it("skips the callback queue entirely outside router platform mode", async () => {
@@ -283,6 +365,7 @@ describe("EdgeWorker terminal teardown ordering", () => {
 				removeSession: vi.fn(),
 			},
 			sessionRepositories: new Map(),
+			getCachedRepositories: () => null,
 			repositories: new Map(),
 			gitService: {
 				deleteWorktree: async () => {
