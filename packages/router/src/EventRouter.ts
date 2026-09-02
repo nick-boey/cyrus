@@ -162,6 +162,20 @@ export interface EventRouterOptions {
 const DEFAULT_EMAIL = "the delegating user";
 
 /**
+ * 5 minutes — how long a device may keep making session-scoped RPCs for a
+ * session after it reported that session terminal.
+ *
+ * Sized to cover the tail of a finishing run, not to keep a dead session alive:
+ * the worker posts its closing summary and then sends the terminal frame, so
+ * the posts that need to survive this window are seconds behind it, and the
+ * observed straggler bursts that motivated it were minutes long at most within
+ * the part worth keeping. A session still emitting an hour after it completed
+ * (NOR-405 saw one at 88 minutes) is the bug itself, and should still be
+ * refused — loudly.
+ */
+export const TERMINAL_OWNERSHIP_GRACE_MS = 5 * 60 * 1000;
+
+/**
  * 7 days — how long a claimed webhook idempotency key is kept.
  *
  * The bound only has to outlive every window in which the SAME delivery can
@@ -585,13 +599,26 @@ export class EventRouter {
 			return;
 		}
 		this.parkedSessionCreators.delete(frame.sessionId);
-		this.store.finishAgentRun(frame.sessionId, frame.state, this.now());
+		const now = this.now();
+		this.store.finishAgentRun(frame.sessionId, frame.state, now);
+		// Granted BEFORE the two releases below, so there is no instant in which
+		// the device owns the session by none of the three routes
+		// `LinearExecutor.ownsSession` checks. Unlike the park path, which keeps
+		// the issue lock, this frame drops every durable claim the device has —
+		// and the activities still in flight when it lands are the session's
+		// closing summary, which is the part of a run a user most wants to read
+		// (NOR-405).
+		this.store.grantSessionOwnershipGrace(
+			frame.sessionId,
+			deviceId,
+			now + TERMINAL_OWNERSHIP_GRACE_MS,
+		);
 		this.store.releaseIssueLockForSession(frame.sessionId);
 		this.store.clearSessionAffinity(frame.sessionId);
 		this.notifiedSessions.delete(frame.sessionId);
 		this.sessionWorkspace.delete(frame.sessionId);
 		this.logger.info(
-			`Session ${frame.sessionId} reached terminal state '${frame.state}' on device ${deviceId}; released lock and affinity`,
+			`Session ${frame.sessionId} reached terminal state '${frame.state}' on device ${deviceId}; released lock and affinity (${TERMINAL_OWNERSHIP_GRACE_MS}ms posting grace)`,
 		);
 	}
 

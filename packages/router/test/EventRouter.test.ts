@@ -8,7 +8,10 @@ import type {
 } from "cyrus-router-executors";
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { ContainerTargetService } from "../src/ContainerTargets.js";
-import { EventRouter } from "../src/EventRouter.js";
+import {
+	EventRouter,
+	TERMINAL_OWNERSHIP_GRACE_MS,
+} from "../src/EventRouter.js";
 import {
 	expiredMessage,
 	fillTemplate,
@@ -870,6 +873,37 @@ describe("EventRouter", () => {
 
 		// Unparking is a resumption, not a completion.
 		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(false);
+	});
+
+	it("(e8) handleSessionState(terminal) grants a posting grace to the reporting device", async () => {
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, clock } = makeRouter(store);
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		router.handleSessionState(aliceDevice, {
+			type: "session_state",
+			id: "ss-1",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+
+		// The lock and affinity are both gone, so the grace is the ONLY thing
+		// still authorizing the closing summary the worker is mid-flight with.
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+		expect(store.getIssueLockDeviceForSession("sess-1")).toBeUndefined();
+		expect(store.getSessionOwnershipGrace("sess-1", clock.value)).toBe(
+			aliceDevice,
+		);
+		expect(
+			store.getSessionOwnershipGrace(
+				"sess-1",
+				clock.value + TERMINAL_OWNERSHIP_GRACE_MS,
+			),
+		).toBeUndefined();
 	});
 
 	it("(e9) a replayed active after a terminal state cannot resurrect affinity", async () => {
