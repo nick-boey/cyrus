@@ -862,8 +862,8 @@ a payload from a different commit builds cleanly and dies at boot.
 | -- | -- |
 | `image`, `build.dockerfile`, `build.context`, `build.args` | Used |
 | `features`, `overrideFeatureInstallOrder` | Used. The Cyrus worker feature is always installed **first** |
-| `containerEnv` | Used |
-| `postCreateCommand` | Run at boot after the clone, alongside `cyrus-setup.sh` — devcontainer first, then the script |
+| `containerEnv` | Used. Applied as real image `ENV`, since ACA boots the image's own OCI config and reads no devcontainer metadata. `${containerEnv:VAR}` becomes Docker's own `${VAR}` expansion, so extending `PATH` works |
+| `postCreateCommand` | Run at boot after the clone, alongside `cyrus-setup.sh` — devcontainer first, then the script. **Sandbox workers only**: a `devcontainer.json` is written for VS Code rather than for Cyrus, so it is not treated as consent to run shell on a teammate's own machine the way `cyrus-setup.sh` is |
 | `dockerComposeFile` | **Rejected at registration.** A Compose devcontainer is several containers; a sandbox is one, with no Docker daemon inside it |
 | `mounts`, `forwardPorts`, `customizations`, `remoteUser`, `containerUser` | Silently ignored |
 | `onCreateCommand`, `updateContentCommand` | Ignored — the source is cloned at boot, never baked into the image |
@@ -894,6 +894,10 @@ nowhere to ask. The reference CLI does not implement that discovery either.
   says so on the issue. It is the only image carrying every toolchain, and a
   deliberate multi-repository fan-out is exactly the polyglot case. Asking the
   user which environment they want is a possible future refinement.
+- **The cache key covers `devcontainer.json` and the `build.dockerfile` it
+  references, and nothing else.** A repository whose Dockerfile `COPY`s or
+  `ADD`s another file in the repository will not rebuild when only that file
+  changes; bump something in the devcontainer to force it.
 - **Builds are not verified inside an ACR task yet.** The mechanism exists (ACR
   `cmd` steps accept `docker run` parameters, and the agent has a Docker socket)
   and the build has been proven on an ordinary Docker host, but not on an ACR
@@ -907,10 +911,20 @@ is what makes `az acr task logs --run-id` possible. The full build log is never
 relayed: that build ran with unrestricted egress over repository-controlled
 content, so it stays behind Azure's own authorization.
 
-A repository registered through the setup UI gets a **warm build** immediately,
-fire-and-forget. It never blocks or fails registration; its status appears in the
-Environment column of `/setup/repositories`, which is the only place a
-fire-and-forget failure is visible at all.
+A repository registered through the setup UI is **validated before it is
+registered** — a `dockerComposeFile` devcontainer is refused on the form, with
+the reason, rather than half-working. That is one GitHub API call; a devcontainer
+that cannot be read (GitHub unreachable) is not treated as a rejection.
+
+Registration then gets a **warm build**, fire-and-forget. It never blocks or
+fails registration; its status appears in the Environment column of
+`/setup/repositories`, which is the only place a fire-and-forget failure is
+visible at all.
+
+A build interrupted by a router restart is **rescheduled on the next start**, and
+anything held on it released. The `building` marker is durable but the callback
+that clears it is not, so without this an issue would wait on "Building image…"
+that nothing alive could ever resolve.
 
 Unreferenced disk images are collected every 6 hours. Nothing is deleted while
 any issue is pinned to it, while any snapshot was taken from it, while it is the

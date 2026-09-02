@@ -1774,6 +1774,15 @@ export class GitService {
 	private async runDevcontainerPostCreate(
 		workspacePath: string,
 	): Promise<void> {
+		// Sandbox workers only. `devcontainer.json` is a general-purpose file
+		// written for VS Code, not for Cyrus — unlike `cyrus-setup.sh`, whose
+		// presence IS the opt-in — so honouring its `postCreateCommand` on a
+		// teammate's own machine would run uninvited shell for every repository
+		// that happens to carry one, on a deployment that never enabled the
+		// feature. `CYRUS_REPOS_JSON` is set by `ContainerTargets.buildEnv` and
+		// required by `container-boot`; a physical device never has it.
+		if (!process.env.CYRUS_REPOS_JSON) return;
+
 		let command: string | string[] | Record<string, string | string[]>;
 		try {
 			const found = DEVCONTAINER_PATHS.map((rel) =>

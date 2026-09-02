@@ -36,6 +36,16 @@ const TERMINAL: ReadonlySet<string> = new Set([
 	"Timeout",
 ]);
 
+/**
+ * Per-request deadline for ARM and log-blob reads.
+ *
+ * Matches `AcaSandboxClient`'s `DEFAULT_REQUEST_TIMEOUT_MS`, and for the same
+ * reason: `fetch` has none of its own. Every call here is a control-plane
+ * request that either answers in seconds or is not going to — the minutes-long
+ * work happens on the ACR agent, which `waitForRun` polls for.
+ */
+const ARM_REQUEST_TIMEOUT_MS = 120_000;
+
 export interface AcrBuilderConfig {
 	subscriptionId: string;
 	resourceGroup: string;
@@ -115,10 +125,38 @@ export type ArmRequestFn = (
  * stuck `Running` with no worker attached — per the ACA invariants in CLAUDE.md,
  * the single hardest symptom to trace back to its cause.
  */
-export function finalizeDockerfile(workerUser: string): string {
+export function finalizeDockerfile(
+	workerUser: string,
+	containerEnv?: Record<string, string>,
+): string {
+	// `containerEnv` is honoured HERE for the same reason `USER`/`ENTRYPOINT`
+	// are: `devcontainer build` records it as a `devcontainer.metadata` label
+	// that only the devcontainer CLI reads when it execs in. ACA boots the
+	// image's own OCI config and reads no such label, so a field we document as
+	// "Used" would otherwise be silently dropped — exactly the failure mode ADR
+	// 0005 calls worse than not supporting the field at all.
+	const env = Object.entries(containerEnv ?? {})
+		// A key that is not a shell identifier cannot be an `ENV` name; emitting
+		// it would break the build with a Dockerfile parse error rather than
+		// naming the offending key. Repository content is trusted (ADR 0006), so
+		// this is a legibility guard, not a security boundary.
+		.filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
+		.map(([key, value]) => {
+			// `${containerEnv:PATH}` is the spec's way of extending a variable the
+			// base image already set, and PATH extension is what almost every real
+			// `containerEnv` does. Docker's own `$VAR` expansion is the equivalent,
+			// so translate rather than emitting a literal that lands in the
+			// environment verbatim.
+			const expanded = String(value).replace(
+				/\$\{containerEnv:([A-Za-z_][A-Za-z0-9_]*)\}/g,
+				"${$1}",
+			);
+			return `ENV ${key}=${JSON.stringify(expanded)}`;
+		})
+		.join("\n");
 	return `ARG BUILT_IMAGE
 FROM \${BUILT_IMAGE}
-RUN set -eu; \\
+${env}${env ? "\n" : ""}RUN set -eu; \\
 	if [ ! -x /entrypoint.sh ]; then \\
 		echo "cyrus-worker feature did not install an executable /entrypoint.sh" >&2; \\
 		exit 1; \\
@@ -360,7 +398,7 @@ export class AcrDevcontainerBuilder {
 				{
 					name: "finalize",
 					value: Buffer.from(
-						finalizeDockerfile(req.workerUser),
+						finalizeDockerfile(req.workerUser, req.file.config.containerEnv),
 						"utf8",
 					).toString("base64"),
 					isSecret: false,
@@ -427,7 +465,9 @@ export class AcrDevcontainerBuilder {
 			);
 			const url = (sas.json as { logLink?: string } | null)?.logLink;
 			if (!url) return undefined;
-			const res = await fetch(url);
+			const res = await fetch(url, {
+				signal: AbortSignal.timeout(ARM_REQUEST_TIMEOUT_MS),
+			});
 			if (!res.ok) return undefined;
 			return buildLogTail(await res.text());
 		} catch (error) {
@@ -482,6 +522,11 @@ export function createArmRequestFn(
 				Authorization: `Bearer ${await getToken()}`,
 				"Content-Type": "application/json",
 			},
+			// Node's `fetch` has no default deadline, and `waitForRun`'s own
+			// deadline only fires BETWEEN polls — so one hung ARM call holds a
+			// build slot (and the webhooks held behind it) open indefinitely.
+			// Same reasoning as `AcaSandboxClient`'s `requestTimeoutMs`.
+			signal: AbortSignal.timeout(ARM_REQUEST_TIMEOUT_MS),
 			...(body === undefined ? {} : { body: JSON.stringify(body) }),
 		});
 		const text = await res.text();

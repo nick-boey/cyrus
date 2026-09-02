@@ -1,11 +1,10 @@
+import { DEVCONTAINER_PATHS, parseJsonc } from "cyrus-core";
 import { describe, expect, it } from "vitest";
 import {
-	DEVCONTAINER_PATHS,
 	devcontainerCacheKey,
 	diskNameFor,
 	fetchDevcontainer,
 	ignoredFieldsIn,
-	parseJsonc,
 	validateDevcontainer,
 } from "../src/devcontainer/config.js";
 
@@ -47,6 +46,16 @@ describe("parseJsonc", () => {
 		expect(parseJsonc('{"a":"say \\"hi\\" // not a comment"}')).toEqual({
 			a: 'say "hi" // not a comment',
 		});
+	});
+
+	it("does NOT strip a comma inside a string literal", () => {
+		// A trailing-comma pass that runs as a regex over the finished text has
+		// no idea it is inside a string: `,\s*]` matches here, and rewriting it
+		// silently corrupts the command in a file that parses without error.
+		expect(parseJsonc('{"postCreateCommand":"npm i, ]"}')).toEqual({
+			postCreateCommand: "npm i, ]",
+		});
+		expect(parseJsonc('{"a":"x, }","b":1}')).toEqual({ a: "x, }", b: 1 });
 	});
 });
 
@@ -113,6 +122,23 @@ describe("devcontainerCacheKey", () => {
 		).not.toBe(devcontainerCacheKey(KEY));
 	});
 
+	it("changes when a referenced build.dockerfile changes", () => {
+		// The plan keys a build on the devcontainer fileS. A repository that
+		// edits only its Dockerfile has changed what the image contains; if the
+		// key does not move, it boots the stale image indefinitely.
+		const base = {
+			...KEY,
+			dockerfile: { path: ".devcontainer/Dockerfile", raw: "FROM node:22" },
+		};
+		expect(
+			devcontainerCacheKey({
+				...base,
+				dockerfile: { ...base.dockerfile, raw: "FROM node:24" },
+			}),
+		).not.toBe(devcontainerCacheKey(base));
+		expect(devcontainerCacheKey(base)).not.toBe(devcontainerCacheKey(KEY));
+	});
+
 	it("cannot be collided by shifting a boundary between fields", () => {
 		// The length-prefixed join is what makes this true: with a delimiter,
 		// (repo "a", path "b:c") and (repo "a:b", path "c") would hash the same.
@@ -177,6 +203,56 @@ describe("fetchDevcontainer", () => {
 		});
 		expect(file?.path).toBe(".devcontainer.json");
 		expect(seen).toHaveLength(2);
+	});
+
+	it("reads a referenced build.dockerfile, resolved against the config's folder", async () => {
+		const seen: string[] = [];
+		const bodies: Record<string, string> = {
+			".devcontainer/devcontainer.json":
+				'{"build":{"dockerfile":"Dockerfile"}}',
+			".devcontainer/Dockerfile": "FROM node:22",
+		};
+		const fetchFn = (async (url: string) => {
+			const path = Object.keys(bodies).find((k) =>
+				url.includes(`contents/${k}?`),
+			);
+			if (path) seen.push(path);
+			return path
+				? { status: 200, ok: true, text: async () => bodies[path] }
+				: { status: 404, ok: false, text: async () => "" };
+		}) as unknown as typeof fetch;
+
+		const file = await fetchDevcontainer("acme/api", "main", {
+			token: "t",
+			fetchFn,
+		});
+		expect(file?.dockerfile).toEqual({
+			path: ".devcontainer/Dockerfile",
+			raw: "FROM node:22",
+		});
+		expect(seen).toContain(".devcontainer/Dockerfile");
+	});
+
+	it("does not fail the read when the referenced Dockerfile is missing", async () => {
+		// The build will fail and report it with a run id, which is a better
+		// error than refusing to route the issue at all.
+		const fetchFn = (async (url: string) =>
+			url.includes("contents/.devcontainer/devcontainer.json?")
+				? {
+						status: 200,
+						ok: true,
+						text: async () => '{"build":{"dockerfile":"Dockerfile"}}',
+					}
+				: {
+						status: 404,
+						ok: false,
+						text: async () => "",
+					}) as unknown as typeof fetch;
+		const file = await fetchDevcontainer("acme/api", "main", {
+			token: "t",
+			fetchFn,
+		});
+		expect(file?.dockerfile).toBeUndefined();
 	});
 
 	it("returns undefined — the common case — when neither file exists", async () => {

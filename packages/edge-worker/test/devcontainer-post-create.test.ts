@@ -25,16 +25,31 @@ describe("devcontainer postCreateCommand", () => {
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "cyrus-devc-pcc-"));
 		service = new GitService({} as never);
+		// The boot path only honours `postCreateCommand` inside a sandbox worker,
+		// which `CYRUS_REPOS_JSON` is the marker for. Stand in for it.
+		process.env.CYRUS_REPOS_JSON = "[]";
 	});
 
 	afterEach(() => {
 		rmSync(dir, { recursive: true, force: true });
+		delete process.env.CYRUS_REPOS_JSON;
 	});
 
 	const run = () => (service as any).runDevcontainerPostCreate(dir);
 
 	it("does nothing when the repository has no devcontainer", async () => {
 		await expect(run()).resolves.toBeUndefined();
+	});
+
+	it("does not run on a physical device, which never opted into devcontainers", async () => {
+		delete process.env.CYRUS_REPOS_JSON;
+		mkdirSync(join(dir, ".devcontainer"), { recursive: true });
+		writeFileSync(
+			join(dir, ".devcontainer/devcontainer.json"),
+			'{"image":"node:22","postCreateCommand":"touch ran-on-device"}',
+		);
+		await run();
+		expect(existsSync(join(dir, "ran-on-device"))).toBe(false);
 	});
 
 	it("runs a string command through a shell, so `&&` works", async () => {

@@ -92,6 +92,8 @@ export interface RepositoryRouteDeps {
 			  }
 			| undefined;
 		warmBuild(repo: RegisteredRepository): void;
+		/** A devcontainer we cannot honour, refused at registration. */
+		rejectionFor(repo: RegisteredRepository): Promise<string | undefined>;
 	};
 }
 
@@ -529,6 +531,18 @@ export function registerRepositoryRoutes(
 			return respond(reply, deps, guard.principal, 400, {
 				kind: "error",
 				text: message,
+			});
+		}
+
+		// Loudly, and BEFORE the repository is registered: a devcontainer we
+		// cannot honour has to be refused where a human is looking at the form.
+		// Inside the fire-and-forget warm build below it could only ever be a log
+		// line, which is the "half-work" the plan rules out.
+		const rejection = await deps.devcontainers?.rejectionFor(repo);
+		if (rejection) {
+			return respond(reply, deps, guard.principal, 400, {
+				kind: "error",
+				text: rejection,
 			});
 		}
 

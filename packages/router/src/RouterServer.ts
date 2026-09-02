@@ -846,6 +846,12 @@ export class RouterServer {
 		// listener — safe to add after listen()).
 		this.gateway.attach(this.fastify.server, "/device");
 
+		// A build in flight when the previous process exited left a durable
+		// `building` row that nothing alive can now clear, and `created` webhooks
+		// held behind it. Reschedule and release them; the router is
+		// single-replica and restarts on every deploy, so this is routine.
+		this.devcontainerImages?.recoverInterruptedBuilds();
+
 		this.sweepInterval = setInterval(() => {
 			// Both sweeps run detached from any caller that could catch a
 			// rejection, so each needs its own .catch(): with none, a transient

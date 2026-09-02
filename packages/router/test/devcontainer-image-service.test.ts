@@ -179,6 +179,44 @@ describe("ensureForIssue", () => {
 		expect(second).toMatchObject({ kind: "ready", repositoryName: "api" });
 	});
 
+	it("reschedules a build the previous process did not finish, and releases it", async () => {
+		// The `building` row is durable but the callback that clears it is not.
+		// Without recovery, a router restart mid-build leaves the row `building`
+		// forever — `claimDevcontainerBuild` re-claims only `failed` — and every
+		// issue on that repository stalls on "Building image…" with nothing
+		// alive to release it. The router restarts on every deploy.
+		const first = harness({ devcontainer: '{"image":"node:22-slim"}' });
+		expect((await first.service.ensureForIssue("NOR-1", REPO)).kind).toBe(
+			"building",
+		);
+
+		// A NEW service over the SAME store is what a restart looks like.
+		const restarted = harness({ devcontainer: '{"image":"node:22-slim"}' });
+		const released: string[] = [];
+		restarted.service.setOnBuildFinished((key) => released.push(key));
+		restarted.service.recoverInterruptedBuilds();
+
+		expect(released).toHaveLength(1);
+		// The row is gone, so the replayed webhook schedules a real build again
+		// rather than falling back to the default image forever.
+		expect((await restarted.service.ensureForIssue("NOR-1", REPO)).kind).toBe(
+			"building",
+		);
+		expect(restarted.builds).toEqual(["api"]);
+		await restarted.settle();
+		await first.settle();
+	});
+
+	it("leaves a build this process is still running alone", async () => {
+		const h = harness({ devcontainer: '{"image":"node:22-slim"}' });
+		await h.service.ensureForIssue("NOR-1", REPO);
+		const released: string[] = [];
+		h.service.setOnBuildFinished((key) => released.push(key));
+		h.service.recoverInterruptedBuilds();
+		expect(released).toEqual([]);
+		await h.settle();
+	});
+
 	it("is single-flight: a second issue joins the running build", async () => {
 		const h = harness({ devcontainer: '{"image":"node:22-slim"}' });
 		await h.service.ensureForIssue("NOR-1", REPO);

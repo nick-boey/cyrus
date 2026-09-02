@@ -97,6 +97,29 @@ describe("finalizeDockerfile", () => {
 		expect(df).toContain("-x /entrypoint.sh");
 		expect(df).toContain('id -u "cyrus"');
 	});
+
+	it("emits containerEnv as real ENV, since ACA reads no devcontainer metadata", () => {
+		// `devcontainer build` records containerEnv as a `devcontainer.metadata`
+		// label only the devcontainer CLI reads. ACA boots the image's own OCI
+		// config, so a field documented as "Used" would otherwise be dropped.
+		const df = finalizeDockerfile("cyrus", { FOO: "bar" });
+		expect(df).toMatch(/^ENV FOO="bar"$/m);
+	});
+
+	it("translates ${containerEnv:VAR} into Docker's own expansion", () => {
+		// PATH extension is what almost every real containerEnv does; emitted
+		// literally it would land in the environment verbatim.
+		const df = finalizeDockerfile("cyrus", {
+			PATH: "/opt/bin:${containerEnv:PATH}",
+		});
+		expect(df).toMatch(/^ENV PATH="\/opt\/bin:\$\{PATH\}"$/m);
+	});
+
+	it("drops a key that cannot be an ENV name rather than breaking the build", () => {
+		const df = finalizeDockerfile("cyrus", { "not a key": "x", OK: "y" });
+		expect(df).not.toContain("not a key");
+		expect(df).toMatch(/^ENV OK="y"$/m);
+	});
 });
 
 describe("buildScript", () => {

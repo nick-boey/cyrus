@@ -22,6 +22,9 @@ import {
  * on the same invariants by convention.
  */
 
+/** Per-request deadline for the ACR token exchange; `fetch` supplies none. */
+const REGISTRY_REQUEST_TIMEOUT_MS = 30_000;
+
 export type EnsureOutcome =
 	/** No devcontainer, or the feature is off: boot the default worker image. */
 	| { kind: "default" }
@@ -57,12 +60,6 @@ export interface DevcontainerImageServiceDeps {
 	workerUser?: string;
 	/** ACR login server, for the pull credential exchange. */
 	registryLoginServer: string;
-	/**
-	 * Called when a build reaches a terminal state, to release held webhooks.
-	 * Usually registered afterwards via {@link DevcontainerImageService.setOnBuildFinished},
-	 * because the router and this service are constructed in the other order.
-	 */
-	onBuildFinished?: (cacheKey: string) => void;
 	now?: () => number;
 	/** Deadline for the synchronous ACA disk import. Default 900s. */
 	diskReadyTimeoutMs?: number;
@@ -74,11 +71,49 @@ const ACR_TOKEN_USERNAME = "00000000-0000-0000-0000-000000000000";
 
 export class DevcontainerImageService {
 	private readonly workerUser: string;
-	/** Builds this process started, so a restart never leaves two in flight. */
+	/**
+	 * Builds THIS process started.
+	 *
+	 * Deliberately narrower than the `building` cache row, which is durable and
+	 * shared: this set is what {@link recoverInterruptedBuilds} uses to tell a
+	 * row its own process is still working on from one abandoned by a restart.
+	 */
 	private readonly inFlight = new Set<string>();
 
 	constructor(private readonly deps: DevcontainerImageServiceDeps) {
 		this.workerUser = deps.workerUser ?? "cyrus";
+	}
+
+	/**
+	 * Clears builds that were in flight when the process died, and releases the
+	 * webhooks held on them. Call once at startup, after
+	 * {@link setOnBuildFinished}.
+	 *
+	 * A `building` row is only ever cleared by `runBuild`'s `finally`, and the
+	 * webhooks held behind it only by the in-process completion callback — both
+	 * of which die with the process. `claimDevcontainerBuild` re-claims only a
+	 * `failed` row, so without this a router restart mid-build leaves the row
+	 * `building` forever and every issue on that repository stalls on
+	 * "Building image…" with nothing left alive to release it. The router is
+	 * single-replica and restarts on every deploy, so this is the ordinary case,
+	 * not an edge one.
+	 *
+	 * The row is DELETED rather than failed: an interrupted build says nothing
+	 * about whether the devcontainer builds, and a `failed` row would send every
+	 * issue to the default worker image until someone edited the repository. The
+	 * replay re-enters `ensureForIssue`, finds no row, and schedules the build
+	 * again.
+	 */
+	recoverInterruptedBuilds(): void {
+		for (const row of this.deps.store.listDevcontainerImages()) {
+			if (row.state !== "building") continue;
+			if (this.inFlight.has(row.cacheKey)) continue;
+			this.deps.store.deleteDevcontainerImage(row.cacheKey);
+			this.deps.logger.warn(
+				`Devcontainer image build for ${row.repositoryName} did not survive a router restart; rescheduling it and releasing anything held on it`,
+			);
+			this.onBuildFinished?.(row.cacheKey);
+		}
 	}
 
 	/**
@@ -205,6 +240,39 @@ export class DevcontainerImageService {
 		})();
 	}
 
+	/**
+	 * Why this repository's devcontainer cannot be honoured, if it cannot.
+	 *
+	 * Registration asks two different things of us and they need two different
+	 * answers. The BUILD is fire-and-forget — it takes minutes and "must never
+	 * block or fail registration". The VALIDATION is the opposite: a
+	 * `dockerComposeFile` devcontainer "must fail loudly at registration rather
+	 * than half-work", and inside {@link warmBuild} it can only ever become a
+	 * log line nobody reads. This is one GitHub API call, which is what the plan
+	 * budgets for deciding what a sandbox is.
+	 *
+	 * A read that FAILS is not a rejection. GitHub being unreachable says
+	 * nothing about the repository's devcontainer, and refusing the registration
+	 * over it would make an outage look like a bad configuration.
+	 */
+	async rejectionFor(repo: RegisteredRepository): Promise<string | undefined> {
+		try {
+			const file = await fetchDevcontainer(
+				repo.githubSlug,
+				repo.baseBranch ?? "HEAD",
+				{ token: this.deps.githubToken },
+			);
+			if (!file) return undefined;
+			return validateDevcontainer(file.config)?.reason;
+		} catch (error) {
+			this.deps.logger.warn(
+				`Could not read ${repo.name}'s devcontainer while registering it`,
+				error,
+			);
+			return undefined;
+		}
+	}
+
 	/** The cache row an operator sees on `/setup/repositories`, if any. */
 	statusFor(repositoryName: string) {
 		return this.deps.store
@@ -244,6 +312,7 @@ export class DevcontainerImageService {
 			path: file.path,
 			workerFeatureVersion: this.deps.workerFeatureVersion,
 			workerPayload: this.deps.workerPayloadTarball,
+			...(file.dockerfile ? { dockerfile: file.dockerfile } : {}),
 		});
 		return { cacheKey, diskName: diskNameFor(repo.name, cacheKey), file };
 	}
@@ -289,7 +358,7 @@ export class DevcontainerImageService {
 		void this.runBuild({ repo, cacheKey, diskName, imageRef, file }).finally(
 			() => {
 				this.inFlight.delete(cacheKey);
-				(this.onBuildFinished ?? this.deps.onBuildFinished)?.(cacheKey);
+				this.onBuildFinished?.(cacheKey);
 			},
 		);
 	}
@@ -369,8 +438,9 @@ export class DevcontainerImageService {
 	 * build reported success.
 	 */
 	private async registerDisk(diskName: string, image: string): Promise<void> {
-		const existing = (await this.deps.aca.listDiskImages()).find(
-			(d) => d.name === diskName || d.labels?.name === diskName,
+		const existing = findDiskImage(
+			await this.deps.aca.listDiskImages(),
+			diskName,
 		);
 		if (!existing) {
 			await this.deps.aca.createDiskImage(diskName, image, {
@@ -407,6 +477,9 @@ export class DevcontainerImageService {
 					tenant: tenantFromJwt(armToken),
 					access_token: armToken,
 				}).toString(),
+				// `fetch` has no default deadline; without one a hung registry
+				// holds the build — and every webhook held behind it — open.
+				signal: AbortSignal.timeout(REGISTRY_REQUEST_TIMEOUT_MS),
 			},
 		);
 		if (!res.ok) {
@@ -424,7 +497,7 @@ export class DevcontainerImageService {
 	/**
 	 * Task 6: deletes disk images and cache rows that nothing references.
 	 *
-	 * Three floors, and none of them is optional:
+	 * Four floors, and none of them is optional:
 	 *  - a disk any live issue is pinned to, whether or not its container is up;
 	 *  - a disk any snapshot was taken from, since a snapshot restores the image
 	 *    lineage it came from and would resurrect a deleted one;
@@ -469,12 +542,13 @@ export class DevcontainerImageService {
 			}
 		}
 
+		// Listed ONCE, outside the loop: this is an ARM call, and a sweep over a
+		// deployment's worth of rows made one per row.
+		const registeredDisks = await this.deps.aca.listDiskImages();
 		for (const row of this.deps.store.listDevcontainerImages()) {
 			if (row.state === "building") continue;
 			if (keep.has(row.diskName)) continue;
-			const registered = (await this.deps.aca.listDiskImages()).find(
-				(d) => d.name === row.diskName || d.labels?.name === row.diskName,
-			);
+			const registered = findDiskImage(registeredDisks, row.diskName);
 			if (registered?.id) {
 				await this.deps.aca.deleteDiskImage(registered.id).catch((error) => {
 					this.deps.logger.warn(
@@ -489,6 +563,20 @@ export class DevcontainerImageService {
 			);
 		}
 	}
+}
+
+/**
+ * A registered disk by name.
+ *
+ * Both fields are checked because ACA assigns its own GUID as `name` and keeps
+ * the name we asked for in `labels.name` — so which one matches depends on how
+ * the disk was registered, and neither alone is reliable.
+ */
+function findDiskImage<T extends { name?: string; labels?: { name?: string } }>(
+	disks: readonly T[],
+	name: string,
+): T | undefined {
+	return disks.find((d) => d.name === name || d.labels?.name === name);
 }
 
 /**

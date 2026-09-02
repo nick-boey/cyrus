@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -46,14 +46,34 @@ jobs:
           ls -l worker-payload.tgz
           echo "digest=$(sha256sum worker-payload.tgz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
-      # ~256 MB compressed. Kept as a release artifact rather than a container
-      # layer because the feature fetches it with curl at build time, from
-      # inside somebody else's base image, with no registry credential.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: worker-payload
-          path: worker-payload.tgz
-          retention-days: 90
+      # ~256 MB compressed, published as a RELEASE ASSET.
+      #
+      # It has to be anonymously fetchable and it has to not expire: the feature
+      # pulls it with a bare `curl -fsSL "${TARBALL}"` from inside somebody
+      # else's base image, on an ACR agent that holds no GitHub credential.
+      # `actions/upload-artifact` satisfies neither — its download needs an
+      # authenticated API call, and it is deleted on a retention clock — so a
+      # feature published against one builds cleanly and dies at boot, which is
+      # the exact failure this job's own header says the two must move together
+      # to avoid.
+      #
+      # Tags publish to their own release; `main` republishes the rolling
+      # `worker-payload-main` prerelease, so the URL a deployment configures as
+      # `workerPayloadTarball` is stable.
+      - name: Publish the payload as a release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes "Worker payload for the cyrus-worker devcontainer Feature."
+          else
+            tag="worker-payload-main"
+            gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --prerelease --title "Worker payload (main)" --notes "Rolling worker payload built from main. Replaced on every push."
+          fi
+          gh release upload "$tag" worker-payload.tgz --clobber
+          echo "Payload: https://github.com/${GITHUB_REPOSITORY}/releases/download/$tag/worker-payload.tgz"
 
   publish-feature:
     needs: payload

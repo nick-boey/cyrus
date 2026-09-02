@@ -41,6 +41,16 @@ export function parseJsonc(text: string): unknown {
 	let out = "";
 	let i = 0;
 	let inString = false;
+	/**
+	 * Index in `out` of a `,` that is still a candidate trailing comma, i.e. one
+	 * with only comments and whitespace after it so far.
+	 *
+	 * Tracked here rather than by a regex over the finished text because a regex
+	 * has no way to know it is inside a string literal — `"echo a, ]"` matches
+	 * `,\s*]` and would be silently rewritten to `"echo a ]"`, corrupting a
+	 * `postCreateCommand` in a file that parses without error.
+	 */
+	let pendingComma = -1;
 	while (i < text.length) {
 		const ch = text[i];
 		if (inString) {
@@ -58,6 +68,7 @@ export function parseJsonc(text: string): unknown {
 		}
 		if (ch === '"') {
 			inString = true;
+			pendingComma = -1;
 			out += ch;
 			i += 1;
 			continue;
@@ -73,12 +84,20 @@ export function parseJsonc(text: string): unknown {
 			i += 2;
 			continue;
 		}
+		// Trailing commas, decided in the same pass so the `inString` state above
+		// is actually consulted. A `,` is provisional until the next
+		// non-whitespace, non-comment character says whether it closed a value or
+		// merely dangled before a `}` / `]`.
+		if (ch === ",") {
+			pendingComma = out.length;
+		} else if (ch === "}" || ch === "]") {
+			if (pendingComma >= 0) out = out.slice(0, pendingComma);
+			pendingComma = -1;
+		} else if (!/\s/.test(ch as string)) {
+			pendingComma = -1;
+		}
 		out += ch;
 		i += 1;
 	}
-	// Trailing commas, once comments are gone and outside string literals. The
-	// stripper above already dropped every comment, so a `,` followed only by
-	// whitespace and a closer is unambiguous here.
-	out = out.replace(/,(\s*[}\]])/g, "$1");
 	return JSON.parse(out);
 }
