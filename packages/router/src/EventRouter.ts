@@ -171,6 +171,8 @@ const DEFAULT_EMAIL = "the delegating user";
  * router-scale webhook volumes the table stays tiny.
  */
 export const DEFAULT_WEBHOOK_CLAIM_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/** Completed run observations remain queryable for one day. */
+export const DEFAULT_AGENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Routes Linear agent-session webhooks to the creator's enrolled device.
@@ -537,6 +539,7 @@ export class EventRouter {
 
 	handleSessionState(deviceId: number, frame: SessionStateFrame): void {
 		if (frame.state === "parked") {
+			const now = this.now();
 			// Stashed, not dropped: `clearSessionAffinity` deletes the row that
 			// carries `creator_json`, and that field is the gate on who may prompt
 			// this session. Holding it here lets `active` put it back intact.
@@ -549,7 +552,8 @@ export class EventRouter {
 				this.store.getSessionCreator(frame.sessionId),
 			);
 			this.store.clearSessionAffinity(frame.sessionId);
-			this.store.setDeviceParkedAt(deviceId, this.now());
+			this.store.setDeviceParkedAt(deviceId, now);
+			this.store.setAgentRunState(frame.sessionId, "parked");
 			this.logger.info(
 				`Session ${frame.sessionId} parked on device ${deviceId}; released affinity, retained the issue lock`,
 			);
@@ -571,6 +575,7 @@ export class EventRouter {
 			this.parkedSessionCreators.delete(frame.sessionId);
 			// setSessionAffinity clears the device's park stamp as a side effect.
 			this.store.setSessionAffinity(frame.sessionId, deviceId, creator);
+			this.store.setAgentRunState(frame.sessionId, "active");
 			this.logger.info(
 				`Session ${frame.sessionId} unparked on device ${deviceId}; restored affinity and cleared the idle stamp`,
 			);
@@ -580,6 +585,7 @@ export class EventRouter {
 			return;
 		}
 		this.parkedSessionCreators.delete(frame.sessionId);
+		this.store.finishAgentRun(frame.sessionId, frame.state, this.now());
 		this.store.releaseIssueLockForSession(frame.sessionId);
 		this.store.clearSessionAffinity(frame.sessionId);
 		this.notifiedSessions.delete(frame.sessionId);
@@ -639,6 +645,7 @@ export class EventRouter {
 		}> = [];
 		for (const { issueId, sessionId } of locks) {
 			if (declared.has(sessionId)) continue;
+			this.store.markAgentRunUnknown(sessionId, this.now());
 			this.store.releaseIssueLockForSession(sessionId);
 			this.store.clearSessionAffinity(sessionId);
 			const workspaceId = this.sessionWorkspace.get(sessionId);
@@ -702,6 +709,7 @@ export class EventRouter {
 				remaining++;
 				continue;
 			}
+			this.store.markAgentRunUnknown(sessionId, nowMs);
 			this.store.clearSessionAffinity(sessionId);
 			this.logger.info(
 				`Reclaimed stale affinity for session ${sessionId} on device ${deviceId}: ` +
@@ -735,6 +743,7 @@ export class EventRouter {
 			// An undelivered created event never started work — free its issue so
 			// it isn't held by a session that will never run.
 			if (isAgentSessionCreatedWebhook(session)) {
+				this.store.markAgentRunUnknown(sessionId, now);
 				this.store.releaseIssueLockForSession(sessionId);
 				this.store.clearSessionAffinity(sessionId);
 			}
@@ -748,6 +757,7 @@ export class EventRouter {
 		for (const device of this.store.devicesOfflineSince(cutoff)) {
 			const released = this.store.releaseLocksAndAffinityForDevice(
 				device.deviceId,
+				now,
 			);
 			for (const { sessionId } of released) {
 				const workspaceId = this.sessionWorkspace.get(sessionId) ?? "";
@@ -775,6 +785,7 @@ export class EventRouter {
 				`Swept ${claimsSwept} webhook idempotency claim(s) older than ${this.webhookClaimRetentionMs}ms`,
 			);
 		}
+		this.store.sweepTerminalAgentRuns(now - DEFAULT_AGENT_RUN_RETENTION_MS);
 
 		// 4. A selection nobody ever answered. `eventTtlMs` is the right bound: it
 		// is already how long a queued event may wait for its device. Pass 1
@@ -1907,6 +1918,7 @@ export class EventRouter {
 			// container was destroyed and replaced under a different device
 			// id). Clear it and fall through the chain below instead of
 			// routing into the void.
+			this.store.markAgentRunUnknown(sessionId, this.now());
 			this.store.clearSessionAffinity(sessionId);
 			this.logger.warn(
 				`Session ${sessionId} affinity pointed at deleted device ${affinityDevice}; clearing and re-resolving`,
@@ -2075,13 +2087,21 @@ export class EventRouter {
 		// sandbox — and `deliverPending` runs from a socket callback with no
 		// relation to this call stack, so a context derived at send time would
 		// attach the event to the wrong thing entirely.
+		const routedMs = this.now();
 		this.store.enqueueEvent(
 			target.deviceId,
 			JSON.stringify(event),
-			this.now(),
+			routedMs,
 			this.config.eventTtlMs,
 			injectTraceContext(),
 		);
+		const input = extractRunInput(event, routedMs);
+		this.store.recordAgentRunRouted({
+			deviceId: target.deviceId,
+			issueKey: extractIssueKey(event) ?? target.issueKey ?? "unknown",
+			sessionId,
+			...input,
+		});
 
 		if (this.gateway.isOnline(target.deviceId)) {
 			this.gateway.deliverPending(target.deviceId);
@@ -2214,4 +2234,32 @@ function extractIssueKey(webhook: SessionEvent): string | undefined {
 	return typeof identifier === "string" && identifier.length > 0
 		? identifier
 		: undefined;
+}
+
+/** Stable Linear references for the input that caused this routing decision. */
+function extractRunInput(
+	webhook: SessionEvent,
+	routedMs: number,
+): { activityId?: string; commentId?: string; routedMs: number } {
+	const activity = webhook.agentActivity as unknown as
+		| Record<string, unknown>
+		| null
+		| undefined;
+	const session = webhook.agentSession as unknown as Record<string, unknown>;
+	const sessionComment = session.comment as Record<string, unknown> | undefined;
+	const activityId = readNonEmptyString(activity?.id);
+	const commentId = isAgentSessionPromptedWebhook(webhook)
+		? readNonEmptyString(activity?.sourceCommentId)
+		: (readNonEmptyString(session.sourceCommentId) ??
+			readNonEmptyString(session.commentId) ??
+			readNonEmptyString(sessionComment?.id));
+	return {
+		...(activityId ? { activityId } : {}),
+		...(commentId ? { commentId } : {}),
+		routedMs,
+	};
+}
+
+function readNonEmptyString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
 }

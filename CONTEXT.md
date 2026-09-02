@@ -14,6 +14,22 @@ The unit of work Cyrus acts on. One issue maps to one workspace, one branch, and
 one conversation thread.
 _Avoid_: ticket, task, card
 
+**Agent session**:
+The conversation thread through which Cyrus works an issue. It can contain
+several agent runs and become active again after a run ends.
+_Avoid_: run, agent
+
+**Agent run**:
+A continuous episode of work within an agent session. Prompts received while it
+is active join the same run; it moves from routed to active, may park for user
+input, and ends as complete, error, stopped, or unknown.
+_Avoid_: session, turn
+
+**Unknown run**:
+An agent run whose ownership ended without Cyrus receiving a terminal outcome.
+It is not evidence that the run failed or succeeded.
+_Avoid_: failed run, stopped run
+
 **Issue branch**:
 The branch named for an issue, which an issue's pull request is opened from. It
 is written by the agent and by nobody else — Cyrus's own machinery never commits
@@ -34,6 +50,21 @@ router happened to return them in.
 **Subroutine**:
 A named stage in an agent's run for an issue — implementing, verifying, shipping,
 summarizing. A procedure is an ordered sequence of them.
+
+**Agent activity**:
+A progress update, action, question, or response successfully published from an
+agent run to its issue's session timeline.
+_Avoid_: message, heartbeat, log
+
+**Run observation**:
+The router's durable facts about an agent run: its inputs, lifecycle state,
+latest published agent activity, worker liveness, and last sampled executor
+state. It reports evidence, not a healthy/stalled verdict.
+
+**Router connection**:
+The router origin and device bearer token written by `cyrus connect` to the
+device's Cyrus config. The CLI reuses this connection for both the worker
+WebSocket and authenticated HTTP queries such as `cyrus runs`.
 
 ### Persistence
 

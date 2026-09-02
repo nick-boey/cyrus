@@ -129,6 +129,7 @@ describe("LinearExecutor.dispatch", () => {
 
 	it("allows a session-scoped call for a session owned by the calling device", async () => {
 		store.setSessionAffinity("s1", DEVICE_A);
+		const activityObserved = vi.spyOn(store, "recordAgentRunActivity");
 		const activityFrame = frame("createAgentActivity", [
 			{ agentSessionId: "s1", content: { type: "thought", body: "hi" } },
 		]);
@@ -139,6 +140,22 @@ describe("LinearExecutor.dispatch", () => {
 			agentSessionId: "s1",
 			content: { type: "thought", body: "hi" },
 		});
+		expect(activityObserved).toHaveBeenCalledWith("s1", expect.any(Number));
+	});
+
+	it("does not count an activity payload that Linear reports unsuccessful", async () => {
+		store.setSessionAffinity("s1", DEVICE_A);
+		tracker.createAgentActivity.mockResolvedValueOnce({ success: false });
+		const activityObserved = vi.spyOn(store, "recordAgentRunActivity");
+
+		await executor.dispatch(
+			DEVICE_A,
+			frame("createAgentActivity", [
+				{ agentSessionId: "s1", content: { type: "thought", body: "hi" } },
+			]),
+		);
+
+		expect(activityObserved).not.toHaveBeenCalled();
 	});
 
 	it("converts a tracker throw into an ok:false response with the message", async () => {
@@ -157,6 +174,7 @@ describe("LinearExecutor.dispatch", () => {
 
 	it("dedupes a mutation: same mutationId invokes the tracker exactly once", async () => {
 		store.setSessionAffinity("s1", DEVICE_A);
+		const activityObserved = vi.spyOn(store, "recordAgentRunActivity");
 		const activityFrame = frame(
 			"createAgentActivity",
 			[{ agentSessionId: "s1", content: { type: "thought", body: "hi" } }],
@@ -165,6 +183,7 @@ describe("LinearExecutor.dispatch", () => {
 		const first = await executor.dispatch(DEVICE_A, activityFrame);
 		const second = await executor.dispatch(DEVICE_A, activityFrame);
 		expect(tracker.createAgentActivity).toHaveBeenCalledTimes(1);
+		expect(activityObserved).toHaveBeenCalledTimes(1);
 		expect(first.ok).toBe(true);
 		expect(second).toEqual(first);
 	});

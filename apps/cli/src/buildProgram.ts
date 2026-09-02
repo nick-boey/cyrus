@@ -9,6 +9,7 @@ import { ConnectCommand } from "./commands/ConnectCommand.js";
 import { ContainerBootCommand } from "./commands/ContainerBootCommand.js";
 import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
 import { RouterCommand } from "./commands/RouterCommand.js";
+import { RunsCommand } from "./commands/RunsCommand.js";
 import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
 import { SelfAuthCommand } from "./commands/SelfAuthCommand.js";
 import { StartCommand } from "./commands/StartCommand.js";
@@ -461,6 +462,53 @@ export function buildProgram(
 				app.disposeWatchers();
 			}
 		});
+
+	// Runs command - inspect work through the connection created above
+	program
+		.command("runs [issue]")
+		.description("List or watch agent runs on the connected Cyrus Router")
+		.option(
+			"--comment <id>",
+			"Filter by the Linear comment that started or joined a run",
+		)
+		.option(
+			"--after <timestamp>",
+			"Only include runs routed at or after this ISO timestamp",
+		)
+		.option("--watch", "Poll until the matching run finishes")
+		.option("--timeout <seconds>", "Stop waiting after this many seconds")
+		.option("--json", "Print JSON; watch mode emits newline-delimited JSON")
+		.action(
+			async (
+				issue: string | undefined,
+				cmdOpts: {
+					comment?: string;
+					after?: string;
+					watch?: boolean;
+					timeout?: string;
+					json?: boolean;
+				},
+			) => {
+				const opts = program.opts();
+				const app = new Application(
+					opts.cyrusHome,
+					opts.envFile,
+					packageJson.version,
+					errorReporter,
+				);
+				const args: string[] = issue ? [issue] : [];
+				if (cmdOpts.comment) args.push("--comment", cmdOpts.comment);
+				if (cmdOpts.after) args.push("--after", cmdOpts.after);
+				if (cmdOpts.watch) args.push("--watch");
+				if (cmdOpts.timeout) args.push("--timeout", cmdOpts.timeout);
+				if (cmdOpts.json) args.push("--json");
+				try {
+					await new RunsCommand(app).execute(args);
+				} finally {
+					app.disposeWatchers();
+				}
+			},
+		);
 
 	return program;
 }

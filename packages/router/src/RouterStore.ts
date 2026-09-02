@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 
 const ENROLLMENT_CODE_TTL_MS = 15 * 60_000;
@@ -115,6 +115,21 @@ CREATE TABLE IF NOT EXISTS pending_devcontainer_builds (
   created_event TEXT NOT NULL,
   created_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agent_runs (
+  run_id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  device_id INTEGER NOT NULL,
+  issue_key TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  started_ms INTEGER NOT NULL,
+  last_routed_ms INTEGER NOT NULL,
+  last_agent_activity_ms INTEGER,
+  ended_ms INTEGER,
+  inputs_json TEXT NOT NULL,
+  executor_kind TEXT NOT NULL,
+  provider TEXT
+);
 `;
 
 // A user may have at most one physical device row, and an issue may have at
@@ -133,6 +148,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_container_issue ON devices(issue_k
 CREATE INDEX IF NOT EXISTS idx_webhook_claims_claimed_ms ON webhook_claims(claimed_ms);
 CREATE INDEX IF NOT EXISTS idx_pending_devcontainer_builds_cache_key ON pending_devcontainer_builds(cache_key);
 CREATE INDEX IF NOT EXISTS idx_issue_disk_images_cache_key ON issue_disk_images(cache_key);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_user_routed ON agent_runs(user_id, last_routed_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_session_started ON agent_runs(session_id, started_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_ended ON agent_runs(ended_ms);
 `;
 
 function sha256Hex(value: string): string {
@@ -337,6 +355,92 @@ export interface SessionInfo {
 	issueKey?: string;
 	creatorEmail?: string;
 	creatorName?: string;
+}
+
+export type AgentRunState =
+	| "routed"
+	| "active"
+	| "parked"
+	| "complete"
+	| "error"
+	| "stopped"
+	| "unknown";
+
+export interface AgentRunInput {
+	activityId?: string;
+	commentId?: string;
+	routedMs: number;
+}
+
+/** Durable run facts. Device liveness and sandbox state are joined at query time. */
+export interface AgentRunInfo {
+	runId: string;
+	userId: number;
+	deviceId: number;
+	issueKey: string;
+	sessionId: string;
+	state: AgentRunState;
+	startedMs: number;
+	lastRoutedMs: number;
+	lastAgentActivityMs?: number;
+	endedMs?: number;
+	inputs: AgentRunInput[];
+	executorKind: "device" | "container";
+	provider?: string;
+	lastHeartbeatMs?: number;
+}
+
+interface AgentRunRow {
+	run_id: string;
+	user_id: number;
+	device_id: number;
+	issue_key: string;
+	session_id: string;
+	state: string;
+	started_ms: number;
+	last_routed_ms: number;
+	last_agent_activity_ms: number | null;
+	ended_ms: number | null;
+	inputs_json: string;
+	executor_kind: string;
+	provider: string | null;
+	last_seen_ms?: number | null;
+}
+
+const NON_TERMINAL_RUN_STATES = ["routed", "active", "parked"] as const;
+
+function parseRunInputs(value: string): AgentRunInput[] {
+	try {
+		const parsed = JSON.parse(value) as unknown;
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter(
+			(input): input is AgentRunInput =>
+				typeof input === "object" &&
+				input !== null &&
+				typeof (input as AgentRunInput).routedMs === "number",
+		);
+	} catch {
+		return [];
+	}
+}
+
+function toAgentRunInfo(row: AgentRunRow): AgentRunInfo {
+	return {
+		runId: row.run_id,
+		userId: row.user_id,
+		deviceId: row.device_id,
+		issueKey: row.issue_key,
+		sessionId: row.session_id,
+		state: row.state as AgentRunState,
+		startedMs: row.started_ms,
+		lastRoutedMs: row.last_routed_ms,
+		lastAgentActivityMs: row.last_agent_activity_ms ?? undefined,
+		endedMs: row.ended_ms ?? undefined,
+		inputs: parseRunInputs(row.inputs_json),
+		executorKind: row.executor_kind as "device" | "container",
+		provider: row.provider ?? undefined,
+		lastHeartbeatMs: row.last_seen_ms ?? undefined,
+	};
 }
 
 function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
@@ -770,7 +874,13 @@ export class RouterStore {
 	 * or via cascading a user delete) MUST call this first/atomically so
 	 * those rows don't strand pointing at a device_id that no longer exists.
 	 */
-	private purgeDeviceScopedRows(deviceId: number): void {
+	private purgeDeviceScopedRows(deviceId: number, nowMs = Date.now()): void {
+		this.db
+			.prepare(
+				`UPDATE agent_runs SET state = 'unknown', ended_ms = ?
+				 WHERE device_id = ? AND state IN ('routed', 'active', 'parked')`,
+			)
+			.run(nowMs, deviceId);
 		this.db
 			.prepare("DELETE FROM issue_locks WHERE device_id = ?")
 			.run(deviceId);
@@ -1339,6 +1449,196 @@ export class RouterStore {
 		}
 
 		return sessions;
+	}
+
+	/**
+	 * Records one input delivered into the current run, or starts a new run when
+	 * the reusable Linear session's previous run is terminal.
+	 */
+	recordAgentRunRouted(input: {
+		deviceId: number;
+		issueKey: string;
+		sessionId: string;
+		activityId?: string;
+		commentId?: string;
+		routedMs: number;
+	}): string {
+		const txn = this.db.transaction(() => {
+			const device = this.db
+				.prepare(
+					"SELECT user_id, kind, provider FROM devices WHERE device_id = ?",
+				)
+				.get(input.deviceId) as
+				| Pick<DeviceRow, "user_id" | "kind" | "provider">
+				| undefined;
+			if (!device) throw new Error(`Unknown device: ${input.deviceId}`);
+
+			const latest = this.db
+				.prepare(
+					`SELECT run_id, state, inputs_json FROM agent_runs
+					 WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1`,
+				)
+				.get(input.sessionId) as
+				| Pick<AgentRunRow, "run_id" | "state" | "inputs_json">
+				| undefined;
+			const runInput: AgentRunInput = {
+				...(input.activityId ? { activityId: input.activityId } : {}),
+				...(input.commentId ? { commentId: input.commentId } : {}),
+				routedMs: input.routedMs,
+			};
+
+			if (
+				latest &&
+				(NON_TERMINAL_RUN_STATES as readonly string[]).includes(latest.state)
+			) {
+				const inputs = parseRunInputs(latest.inputs_json);
+				inputs.push(runInput);
+				this.db
+					.prepare(
+						`UPDATE agent_runs SET user_id = ?, device_id = ?, issue_key = ?,
+						 last_routed_ms = ?, inputs_json = ?, executor_kind = ?, provider = ?
+						 WHERE run_id = ?`,
+					)
+					.run(
+						device.user_id,
+						input.deviceId,
+						input.issueKey,
+						input.routedMs,
+						JSON.stringify(inputs),
+						device.kind,
+						device.provider,
+						latest.run_id,
+					);
+				return latest.run_id;
+			}
+
+			const runId = randomUUID();
+			this.db
+				.prepare(
+					`INSERT INTO agent_runs
+					 (run_id, user_id, device_id, issue_key, session_id, state,
+					  started_ms, last_routed_ms, inputs_json, executor_kind, provider)
+					 VALUES (?, ?, ?, ?, ?, 'routed', ?, ?, ?, ?, ?)`,
+				)
+				.run(
+					runId,
+					device.user_id,
+					input.deviceId,
+					input.issueKey,
+					input.sessionId,
+					input.routedMs,
+					input.routedMs,
+					JSON.stringify([runInput]),
+					device.kind,
+					device.provider,
+				);
+			return runId;
+		});
+		return txn();
+	}
+
+	/** The first successfully posted worker activity proves the routed run is active. */
+	recordAgentRunActivity(sessionId: string, nowMs: number): void {
+		const runId = this.latestNonTerminalRunId(sessionId);
+		if (!runId) return;
+		this.db
+			.prepare(
+				"UPDATE agent_runs SET state = 'active', last_agent_activity_ms = ? WHERE run_id = ?",
+			)
+			.run(nowMs, runId);
+	}
+
+	setAgentRunState(sessionId: string, state: "active" | "parked"): void {
+		const runId = this.latestNonTerminalRunId(sessionId);
+		if (!runId) return;
+		this.db
+			.prepare("UPDATE agent_runs SET state = ? WHERE run_id = ?")
+			.run(state, runId);
+	}
+
+	finishAgentRun(
+		sessionId: string,
+		state: "complete" | "error" | "stopped",
+		nowMs: number,
+	): void {
+		const latest = this.db
+			.prepare(
+				"SELECT run_id, state FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
+			)
+			.get(sessionId) as Pick<AgentRunRow, "run_id" | "state"> | undefined;
+		if (
+			!latest ||
+			(!NON_TERMINAL_RUN_STATES.includes(
+				latest.state as (typeof NON_TERMINAL_RUN_STATES)[number],
+			) &&
+				latest.state !== "unknown")
+		) {
+			return;
+		}
+		this.db
+			.prepare("UPDATE agent_runs SET state = ?, ended_ms = ? WHERE run_id = ?")
+			.run(state, nowMs, latest.run_id);
+	}
+
+	markAgentRunUnknown(sessionId: string, nowMs: number): void {
+		const runId = this.latestNonTerminalRunId(sessionId);
+		if (!runId) return;
+		this.db
+			.prepare(
+				"UPDATE agent_runs SET state = 'unknown', ended_ms = ? WHERE run_id = ?",
+			)
+			.run(nowMs, runId);
+	}
+
+	listAgentRuns(input: {
+		userId: number;
+		issueKey?: string;
+		commentId?: string;
+		sinceMs?: number;
+	}): AgentRunInfo[] {
+		const clauses = ["ar.user_id = ?"];
+		const params: Array<string | number> = [input.userId];
+		if (input.issueKey) {
+			clauses.push("ar.issue_key = ? COLLATE NOCASE");
+			params.push(input.issueKey);
+		}
+		if (input.sinceMs !== undefined) {
+			clauses.push("ar.last_routed_ms >= ?");
+			params.push(input.sinceMs);
+		}
+		const rows = this.db
+			.prepare(
+				`SELECT ar.*, d.last_seen_ms FROM agent_runs ar
+				 LEFT JOIN devices d ON d.device_id = ar.device_id
+				 WHERE ${clauses.join(" AND ")}
+				 ORDER BY ar.started_ms DESC, ar.rowid DESC`,
+			)
+			.all(...params) as AgentRunRow[];
+		const runs = rows.map(toAgentRunInfo);
+		return input.commentId
+			? runs.filter((run) =>
+					run.inputs.some((item) => item.commentId === input.commentId),
+				)
+			: runs;
+	}
+
+	sweepTerminalAgentRuns(cutoffMs: number): number {
+		return this.db
+			.prepare(
+				`DELETE FROM agent_runs WHERE ended_ms IS NOT NULL AND ended_ms < ?`,
+			)
+			.run(cutoffMs).changes;
+	}
+
+	private latestNonTerminalRunId(sessionId: string): string | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT run_id FROM agent_runs WHERE session_id = ?
+				 AND state IN ('routed', 'active', 'parked')
+				 ORDER BY started_ms DESC, rowid DESC LIMIT 1`,
+			)
+			.get(sessionId) as Pick<AgentRunRow, "run_id"> | undefined;
+		return row?.run_id;
 	}
 
 	countSessionAffinityForDevice(deviceId: number): number {
@@ -1985,6 +2285,7 @@ export class RouterStore {
 
 	releaseLocksAndAffinityForDevice(
 		deviceId: number,
+		nowMs = Date.now(),
 	): Array<{ issueId: string; sessionId: string }> {
 		const txn = this.db.transaction(() => {
 			const rows = this.db
@@ -1992,7 +2293,7 @@ export class RouterStore {
 					"SELECT issue_id, session_id FROM issue_locks WHERE device_id = ?",
 				)
 				.all(deviceId) as Array<Pick<IssueLockRow, "issue_id" | "session_id">>;
-			this.purgeDeviceScopedRows(deviceId);
+			this.purgeDeviceScopedRows(deviceId, nowMs);
 			return rows.map((row) => ({
 				issueId: row.issue_id,
 				sessionId: row.session_id,

@@ -1360,3 +1360,124 @@ describe("RouterStore trace context on queued events", () => {
 		);
 	});
 });
+
+describe("RouterStore agent runs", () => {
+	it("tracks multiple inputs through one run, then creates a new run after terminal", () => {
+		const { store, device } = storeWithDevice();
+		const firstRunId = store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			activityId: "activity-1",
+			commentId: "comment-1",
+			routedMs: NOW,
+		});
+		expect(
+			store.recordAgentRunRouted({
+				deviceId: device.deviceId,
+				issueKey: "NOR-402",
+				sessionId: "session-1",
+				activityId: "activity-2",
+				commentId: "comment-2",
+				routedMs: NOW + 100,
+			}),
+		).toBe(firstRunId);
+
+		store.recordAgentRunActivity("session-1", NOW + 200);
+		store.setAgentRunState("session-1", "parked");
+		store.finishAgentRun("session-1", "complete", NOW + 300);
+		const first = store.listAgentRuns({
+			userId: 1,
+			commentId: "comment-1",
+		})[0];
+		expect(first).toMatchObject({
+			runId: firstRunId,
+			state: "complete",
+			lastRoutedMs: NOW + 100,
+			lastAgentActivityMs: NOW + 200,
+			endedMs: NOW + 300,
+		});
+		expect(first?.inputs).toEqual([
+			{ activityId: "activity-1", commentId: "comment-1", routedMs: NOW },
+			{
+				activityId: "activity-2",
+				commentId: "comment-2",
+				routedMs: NOW + 100,
+			},
+		]);
+
+		const secondRunId = store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			commentId: "comment-3",
+			routedMs: NOW + 400,
+		});
+		expect(secondRunId).not.toBe(firstRunId);
+		expect(store.listAgentRuns({ userId: 1 })[0]?.state).toBe("routed");
+	});
+
+	it("marks work unknown when its device identity is replaced", () => {
+		const { store, device } = storeWithDevice();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			routedMs: NOW,
+		});
+
+		const code = store.mintEnrollmentCode("alice@example.com", NOW);
+		store.redeemEnrollmentCode(code, NOW);
+
+		expect(store.listAgentRuns({ userId: 1 })[0]?.state).toBe("unknown");
+	});
+
+	it("keeps same-millisecond input on the newly started run", () => {
+		const { store, device } = storeWithDevice();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			routedMs: NOW,
+		});
+		store.finishAgentRun("session-1", "complete", NOW);
+
+		const second = store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			routedMs: NOW,
+		});
+		expect(
+			store.recordAgentRunRouted({
+				deviceId: device.deviceId,
+				issueKey: "NOR-402",
+				sessionId: "session-1",
+				routedMs: NOW,
+			}),
+		).toBe(second);
+		expect(store.listAgentRuns({ userId: 1 })).toHaveLength(2);
+	});
+
+	it("retains active runs while sweeping terminal runs older than the cutoff", () => {
+		const { store, device } = storeWithDevice();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-1",
+			sessionId: "active",
+			routedMs: 1,
+		});
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-2",
+			sessionId: "old",
+			routedMs: 2,
+		});
+		store.finishAgentRun("old", "error", 3);
+
+		expect(store.sweepTerminalAgentRuns(4)).toBe(1);
+		expect(
+			store.listAgentRuns({ userId: 1 }).map((run) => run.sessionId),
+		).toEqual(["active"]);
+	});
+});
