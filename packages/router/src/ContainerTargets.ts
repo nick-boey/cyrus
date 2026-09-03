@@ -733,9 +733,18 @@ export class ContainerTargetService {
 	 * boundary those do not already cross, and `ContainerBootCommand.writeCodexAuth`
 	 * scrubs the variable once the file exists. What widens is *exposure over
 	 * time*, not who can reach it: a Claude session now has a Codex credential on
-	 * disk it will never use. That is bounded by the token being short-lived and
-	 * router-refreshed (ADR 0005) and is the accepted cost of the alternative
-	 * being a session that dies on `401 Unauthorized` from `/v1/responses`.
+	 * disk it will never use, at 0600, for as long as that sandbox lives.
+	 *
+	 * Note what does NOT bound that, despite reading like it should: the router is
+	 * the sole refresher, but it only ever writes a container's `auth.json` at
+	 * COLD create — `AcaSandboxesProvider` discards the env this method builds on
+	 * the resume and snapshot-restore paths, which inherit the frozen state. So a
+	 * long-lived sandbox keeps the copy it booted with. The same asymmetry is why
+	 * a mint on a resume can rotate a refresh token whose old value is still on
+	 * that sandbox's disk; it predates CYR-79 for Codex-default users and is
+	 * widened by unconditional delivery, and re-delivering to a live sandbox needs
+	 * a router→worker channel that does not exist yet. Recorded rather than
+	 * claimed away.
 	 *
 	 * When Codex is NOT the default, every failure is best-effort: a user with no
 	 * ChatGPT subscription, or one whose refresh token has lapsed, must still be

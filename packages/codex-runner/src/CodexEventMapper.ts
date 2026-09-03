@@ -20,7 +20,7 @@ import type {
  * disagreed, which meant a Linear activity could name a model the session never
  * ran on.
  */
-export const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+export const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const EMPTY_FALLBACK_CREDIT = { fallback_credit: null };
 const NOT_APPLIED_FALLBACK_CREDIT = {
 	fallback_credit: {

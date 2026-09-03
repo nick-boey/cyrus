@@ -1004,12 +1004,26 @@ export class ContainerBootCommand implements ICommand {
 			delete process.env.CODEX_AUTH_JSON;
 			this.logger.info(`Wrote Codex credentials to ${authPath}`);
 		} catch (error) {
-			// Fatal, unlike dotfiles: the session was routed to Codex precisely
-			// because the user chose it, and continuing would start an
-			// unauthenticated Codex that fails at its first request with an error
-			// nothing connects back to this step.
-			throw new Error(
-				`Could not write the Codex credential to ${codexHome}/auth.json: ${(error as Error).message}`,
+			const message = `Could not write the Codex credential to ${codexHome}/auth.json: ${(error as Error).message}`;
+			// Fatal only when Codex is the runner this container is actually going
+			// to start. Then it is right: continuing would start an unauthenticated
+			// Codex that fails at its first request with an error nothing connects
+			// back to this step.
+			//
+			// Since CYR-79 the router attaches the credential to EVERY container a
+			// subscribed user owns, so this method now runs on Claude containers
+			// too — and there, throwing would let a root-owned `~/.codex` left on a
+			// warm volume, or a full disk, kill a session that was never going to
+			// touch Codex. That is precisely the coupling the router-side
+			// best-effort handling exists to prevent, and the same rule has to hold
+			// on both sides or they disagree about what a bootable container is. If
+			// the issue later selects Codex, `assertCodexCredentialAvailable` in
+			// `cyrus-codex-runner` reports it with its own remedy.
+			if (this.env.CYRUS_DEFAULT_RUNNER === "codex") {
+				throw new Error(message);
+			}
+			this.logger.warn(
+				`${message}. Continuing: this container's default runner is not Codex. A session that selects Codex will report the problem.`,
 			);
 		}
 	}

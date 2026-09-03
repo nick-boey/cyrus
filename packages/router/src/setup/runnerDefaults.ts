@@ -91,25 +91,38 @@ export const RUNNER_CATALOG: readonly RunnerCatalogEntry[] = [
 		// Re-run the probe when OpenAI ships a model — a name that works here is
 		// a one-line addition, and one that does not must stay out.
 		//
-		// `gpt-5.6-sol` added for CYR-79. It is the CANONICAL id, not the
-		// `gpt-5.6` alias, and that choice is deliberate: codex-cli 0.144.6 has
-		// `gpt-5.6-sol`, `gpt-5.6-luna` and `gpt-5.6-terra` compiled into it and
-		// no bare `gpt-5.6`, so the alias is a server-side courtesy the CLI's own
-		// per-model metadata lookup does not necessarily share. `gpt-5.5` is kept
-		// below it rather than retired — it is the name the 2026-08-31 probe
-		// actually answered on, so it stays as the option a user can fall back to
-		// by hand, and keeping it means no stored selection has to migrate.
+		// `gpt-5.6-sol` added for CYR-79, and it is deliberately SECOND. It is the
+		// canonical id rather than the `gpt-5.6` alias, because codex-cli 0.144.6
+		// has `gpt-5.6-sol`, `gpt-5.6-luna` and `gpt-5.6-terra` compiled into it
+		// and no bare `gpt-5.6` — the alias is a server-side courtesy the CLI's
+		// own per-model metadata lookup does not necessarily share.
 		//
-		// This entry is the ONE thing in this change that could not be verified
-		// from a sandbox: the container this was written in reports `Not logged
-		// in`, so the live subscription probe above has not been re-run for
-		// `gpt-5.6-sol`. If it comes back rejected, delete this line — the
-		// `gpt-5.5` entry below is what a retired selection degrades onto (see
-		// `resolveDefaultRunner`), so removing it is safe.
+		// **It has not been through the probe above**: the container CYR-79 was
+		// implemented in reports `Not logged in`, so there was no subscription to
+		// run it against. Order is how that uncertainty is contained, and it is
+		// load-bearing in two places at once — `resolveDefaultRunner` degrades a
+		// RETIRED stored selection onto `models[0]`, and the built-in Codex
+		// default in `RunnerSelectionService` is kept in step with `models[0]` by
+		// hand. Putting an unprobed name first would therefore hand it to two
+		// populations who never chose it: every existing user whose stored model
+		// has since left this list, and every session that names no model at all.
+		// A rejection is not a downgrade — per the paragraph above, the session
+		// simply dies — so that is a silent, un-opted-into break.
+		//
+		// Offering it as an explicit second option is a different bet, and a
+		// defensible one: the user picks it, sees it in the picker, and finds out
+		// immediately. The curated rule is "render nothing that is GUARANTEED to
+		// fail", not "render nothing unproven" — and this is OpenAI's current
+		// flagship Codex model, not a guess.
+		//
+		// To promote it once the probe passes: move it above `gpt-5.5` here, and
+		// move `CODEX_DEFAULT_MODEL` (edge-worker `RunnerSelectionService`) and
+		// `DEFAULT_CODEX_MODEL` (`cyrus-codex-runner`) with it. If it fails,
+		// delete the line; nothing degrades onto it.
 		label: "Codex",
 		models: [
-			{ model: "gpt-5.6-sol", label: "GPT-5.6 Sol — most capable" },
 			{ model: "gpt-5.5", label: "GPT-5.5" },
+			{ model: "gpt-5.6-sol", label: "GPT-5.6 Sol — newest, unverified" },
 		],
 	},
 ] as const;
@@ -265,16 +278,43 @@ export function resolveDefaultRunner(
 }
 
 /**
+ * The Codex model a container should use when an issue selects Codex without
+ * naming a model — the catalog's preferred Codex entry.
+ *
+ * Exists because {@link defaultRunnerEnv} emits it unconditionally; see there.
+ */
+export const PREFERRED_CODEX_MODEL: string =
+	RUNNER_CATALOG.find((entry) => entry.runner === "codex")?.models[0]?.model ??
+	"gpt-5.5";
+
+/**
  * The env a container inherits from a stored selection.
  *
- * Both keys are in `RESERVED_ENV_KEYS`: once the router owns a key, a stale
+ * Every key here is in `RESERVED_ENV_KEYS`: once the router owns a key, a stale
  * hand-typed variable in the user's secret bundle must not shadow the picker.
+ *
+ * **`CYRUS_CODEX_DEFAULT_MODEL` is emitted whatever the selected runner is**,
+ * and that is the counterpart to CYR-79's unconditional credential delivery.
+ * Emitting only `MODEL_ENV_BY_RUNNER[selection.runner]` meant a Claude-default
+ * container carried no Codex model at all, so an `[agent=codex]` issue on it —
+ * exactly the case CYR-79 exists to make work — fell through to the constant
+ * compiled into the worker image. Two consequences, both bad: the model a user
+ * sees in the `/setup` picker is not the one that path runs on, and changing
+ * the catalog cannot fix a bad Codex model without rebuilding and redeploying
+ * the worker image (`workerImage` + `acaDiskName` as a pair, see `CLAUDE.md`).
+ * With this, the router's catalog is the single authority for both paths and a
+ * bad model is a one-line rollback again.
+ *
+ * It does NOT emit the other runners' model vars: nothing else has a deferred,
+ * per-issue selection whose credential the router must pre-stage, so widening
+ * further would be shipping env for its own sake.
  */
 export function defaultRunnerEnv(
 	selection: DefaultRunnerSelection | undefined,
 ): Record<string, string> {
-	if (!selection) return {};
+	if (!selection) return { [MODEL_ENV_BY_RUNNER.codex]: PREFERRED_CODEX_MODEL };
 	return {
+		[MODEL_ENV_BY_RUNNER.codex]: PREFERRED_CODEX_MODEL,
 		[DEFAULT_RUNNER_ENV]: selection.runner,
 		[MODEL_ENV_BY_RUNNER[selection.runner]]: selection.model,
 	};

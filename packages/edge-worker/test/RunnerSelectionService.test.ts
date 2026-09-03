@@ -134,12 +134,20 @@ describe("RunnerSelectionService", () => {
 		expect(selection.modelOverride).toBe("sonnet");
 	});
 
-	// CYR-79. This is the selection half of the defect: the runner an issue gets
-	// is decided HERE, inside the sandbox, from tags and labels — long after the
-	// router built the container's environment from the user's workspace-wide
-	// default. The router used to attach the ChatGPT-subscription credential only
-	// when that default was Codex, so every selection below started a Codex
-	// session with nothing to authenticate with.
+	// CYR-79 context, and an honest note about what these do and do not prove.
+	//
+	// This precedence is NOT what the defect broke — it worked before CYR-79 and
+	// is unchanged by it. What these pin is the CONTRACT the fix has to serve:
+	// the runner an issue gets is decided here, inside the sandbox, per turn,
+	// from tags and labels the router never sees — which is why the credential
+	// could not be delivered on the router's workspace-wide default. If this
+	// precedence were ever changed to consult the default first, the reason the
+	// router now delivers unconditionally would quietly evaporate.
+	//
+	// The defect itself is reproduced in
+	// `packages/router/test/ContainerTargets.test.ts` ("the Codex credential is
+	// delivered independently of the default"). The two halves live in different
+	// packages and there is no single test spanning both.
 	describe("an issue-level Codex selection under a non-Codex default", () => {
 		const claudeDefault = {
 			defaultRunner: "claude",
@@ -152,6 +160,20 @@ describe("RunnerSelectionService", () => {
 			const selection = service.determineRunnerSelection([], "[agent=codex]");
 
 			expect(service.getDefaultRunner()).toBe("claude");
+			expect(selection.runnerType).toBe("codex");
+			// Whatever the container was told the Codex default is — which since
+			// CYR-79 the router sets from its catalog even on a Claude container.
+			expect(selection.modelOverride).toBe("gpt-5.5");
+		});
+
+		it("takes the Codex default the container was given, not the Claude one", () => {
+			const service = new RunnerSelectionService({
+				...claudeDefault,
+				codexDefaultModel: "gpt-5.6-sol",
+			} as EdgeWorkerConfig);
+
+			const selection = service.determineRunnerSelection([], "[agent=codex]");
+
 			expect(selection.runnerType).toBe("codex");
 			expect(selection.modelOverride).toBe("gpt-5.6-sol");
 		});
@@ -177,23 +199,26 @@ describe("RunnerSelectionService", () => {
 		});
 	});
 
-	// The catalog in `/setup` (`RUNNER_CATALOG`), this service, and
-	// `cyrus-codex-runner`'s `DEFAULT_CODEX_MODEL` are three independent copies
-	// of one decision, and CYR-79 found them disagreeing — so a container whose
-	// picker said one model could silently run another.
+	// The built-in below is a LAST resort: since CYR-79 the router emits
+	// `CYRUS_CODEX_DEFAULT_MODEL` on every container from its own catalog, so
+	// `codexDefaultModel` is normally set and this constant is reached only on a
+	// deployment that predates that. It is deliberately the probe-verified
+	// `gpt-5.5` and not the newer `gpt-5.6-sol`, because this value is baked into
+	// the worker image and changing it costs a rebuild — the opposite of the
+	// one-line rollback an unverified model needs.
 	describe("Codex model defaults", () => {
-		it("defaults to the same model the /setup picker prefers", () => {
+		it("falls back to the probe-verified model when the container names none", () => {
 			const service = new RunnerSelectionService({} as EdgeWorkerConfig);
 
-			expect(service.getDefaultModelForRunner("codex")).toBe("gpt-5.6-sol");
+			expect(service.getDefaultModelForRunner("codex")).toBe("gpt-5.5");
 		});
 
-		it("lets an explicit config value win", () => {
+		it("lets the value the router delivered win", () => {
 			const service = new RunnerSelectionService({
-				codexDefaultModel: "gpt-5.5",
+				codexDefaultModel: "gpt-5.6-sol",
 			} as EdgeWorkerConfig);
 
-			expect(service.getDefaultModelForRunner("codex")).toBe("gpt-5.5");
+			expect(service.getDefaultModelForRunner("codex")).toBe("gpt-5.6-sol");
 		});
 
 		it("falls back to a model subscription auth actually serves", () => {
@@ -203,6 +228,24 @@ describe("RunnerSelectionService", () => {
 			const service = new RunnerSelectionService({} as EdgeWorkerConfig);
 
 			expect(service.getDefaultFallbackModelForRunner("codex")).toBe("gpt-5.5");
+		});
+
+		it("does not hand a Codex model to a Cursor session", () => {
+			// Cursor used to reach the same catch-all as Codex in
+			// `inferFallbackModel` and take `gpt-5.5` — and because
+			// `fallbackModelOverride` is always truthy, that shadowed the
+			// configured Cursor fallback downstream.
+			const service = new RunnerSelectionService({
+				cursorDefaultFallbackModel: "composer-2",
+			} as EdgeWorkerConfig);
+
+			const selection = service.determineRunnerSelection(
+				[],
+				"[agent=cursor]\n[model=composer-2]",
+			);
+
+			expect(selection.runnerType).toBe("cursor");
+			expect(selection.fallbackModelOverride).toBe("composer-2");
 		});
 	});
 });

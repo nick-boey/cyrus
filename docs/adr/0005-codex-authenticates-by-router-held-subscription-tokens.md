@@ -116,9 +116,23 @@ alongside the rest of their bundle — `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`,
 `LINEAR_API_TOKEN` — with the same lifetime and the same reachability. Nobody
 gains access to a credential they could not already reach, and the per-user rule
 above is untouched. What widens is exposure *over time*: a Claude session now has
-a Codex credential on disk it will never use. That is bounded by the token being
-short-lived and router-refreshed, and by `writeCodexAuth` scrubbing the variable
-from the environment once the 0600 file exists.
+a Codex credential on disk it will never use, at 0600, for as long as that
+sandbox lives. `writeCodexAuth` scrubs the variable from the environment once
+the file exists, so it is not also in every command the agent runs.
+
+Two limits on how far that is bounded are worth stating rather than glossing.
+First, the router writes a container's `auth.json` only at COLD create:
+`AcaSandboxesProvider` discards the env `buildEnv` produces on the resume and
+snapshot-restore paths, which inherit the frozen state — so "short-lived and
+router-refreshed" describes the router's stored credential, not the copy a
+long-lived sandbox is holding. Second, and from the same asymmetry, a mint that
+fires on a resume rotates a refresh token whose superseded value is still on
+that sandbox's disk. Neither is introduced here — both already applied to
+Codex-default users — but unconditional delivery widens who meets them, and
+closing them properly needs a router-to-worker channel for re-delivering a
+credential to a live sandbox, which does not exist yet. Concurrent mints for one
+user are serialized in `CodexTokenStore.mint`, which removes the rotation race
+between simultaneous boots but not this one.
 
 Delivery being unconditional means its failures must be, too. When Codex is the
 user's default, an absent or unrefreshable credential still fails the boot with
