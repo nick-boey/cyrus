@@ -22,6 +22,7 @@ import {
 	SESSION_SCOPED_RPC_METHODS,
 } from "cyrus-router-protocol";
 import type { RouterStore } from "./RouterStore.js";
+import { emitSessionOwnershipRefusal } from "./RouterTelemetry.js";
 import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
 /** 20 MiB — default ceiling for token-authenticated attachment downloads. */
@@ -182,11 +183,18 @@ export class LinearExecutor {
 					sessionId === undefined ||
 					this.store.getSessionOwner(sessionId) !== deviceId
 				) {
-					// Logged router-side, at WARN, because a refusal here is
-					// user-visible data loss: the device's activity never reaches
-					// Linear, and until now the only trace of it was the sandbox's own
-					// relayed console. That is how 161 dropped posts in a single day
-					// went unnoticed (NOR-405).
+					// Logged router-side, at WARN and as a queryable event, because a
+					// refusal here is user-visible data loss: the device's activity
+					// never reaches Linear, and until now the only trace of it was the
+					// sandbox's own relayed console — below the WARN threshold a
+					// worker's forwarder ships by default. That is how 161 dropped
+					// posts in a single day went unnoticed (NOR-405).
+					emitSessionOwnershipRefusal(this.logger, {
+						reason: "rpc_not_owned",
+						sessionId,
+						deviceId,
+						rpcMethod: method,
+					});
 					this.logger
 						.withContext({
 							...(sessionId !== undefined ? { sessionId } : {}),

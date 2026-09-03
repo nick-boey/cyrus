@@ -482,6 +482,46 @@ resource routingRejections 'Microsoft.OperationalInsights/workspaces/savedSearch
   }
 }
 
+// Session-ownership refusals (NOR-405). `rpc_not_owned` is the data-loss row:
+// an activity the agent posted that never reached Linear, refused because the
+// device owned the session by none of affinity / issue lock / posting grace.
+// 161 of these in one day were invisible because the only trace was the
+// sandbox's own relayed console, below the WARN threshold a worker forwards by
+// default.
+//
+// The other three reasons are frame-level refusals and should be RARE. A
+// `park_not_owned` or `unpark_not_parker` row means a device sent a
+// `session_state` frame naming a session it has no claim on — either a genuine
+// bug or a device attempting to act on someone else's session, since
+// `frame.sessionId` is device-supplied. Group by `device_id` before concluding
+// which.
+resource sessionOwnershipRefusals 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Session-Ownership-Refusals'
+  properties: {
+    category: 'Cyrus Sessions'
+    displayName: 'Refused session claims (dropped activities and stray frames)'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "session.ownership_refused"'
+        '| project'
+        '    TimeGenerated,'
+        '    reason       = tostring(p["cyrus.reason"]),'
+        '    session_id   = tostring(p["cyrus.agent_session_id"]),'
+        '    device_id    = tostring(p["cyrus.device_id"]),'
+        '    owner_device = tostring(p["cyrus.owner_device_id"]),'
+        '    rpc_method   = tostring(p["cyrus.rpc_method"]),'
+        '    frame_state  = tostring(p["cyrus.session_state"])'
+        '| order by TimeGenerated desc'
+      ],
+      '\n'
+    )
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Skills (NOR-368)
 ////////////////////////////////////////////////////////////////////////////////
@@ -1169,6 +1209,75 @@ resource sandboxDeferredIndefinitely 'Microsoft.Insights/scheduledQueryRules@202
             }
             {
               name: 'device_id'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+          ]
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: actionGroupIds
+    }
+  }
+}
+
+// Agent output that never reached Linear (NOR-405).
+//
+// Scoped to `rpc_not_owned` alone, because that reason is the only one of the
+// four that is silent user-visible DATA LOSS: the agent believes it posted, the
+// Linear thread shows nothing, and no error surfaces anywhere the user looks.
+// The three frame reasons are refusals working as designed — a stray frame from
+// a restarting device is ordinary — so they stay in the saved search and out of
+// the pager.
+//
+// The threshold is a count, not a rate, and deliberately above 1: a session
+// whose posting grace lapsed a second before its last activity produces one or
+// two of these and is not worth waking anyone. The failure this exists to catch
+// produced 62 against a single session, and 161 in a day.
+resource sessionActivitiesDropped 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = if (enableAlerts) {
+  name: 'alert-${namePrefix}-session-activities-dropped'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'alert-${namePrefix}-session-activities-dropped'
+    description: 'Cyrus refused session-scoped RPCs because the calling device owned the session by none of affinity, the issue lock, or a posting grace. Each refusal is one agent activity the user will never see. Open the "Refused session claims" saved search and group by session_id — a burst against one session means that run is losing its output now.'
+    severity: 2
+    enabled: true
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT1H'
+    scopes: [
+      logAnalytics.id
+    ]
+    autoMitigate: true
+    criteria: {
+      allOf: [
+        {
+          query: join(
+            [
+              'ContainerAppConsoleLogs_CL'
+              appFilter
+              '| extend p = parse_json(Log_s)'
+              '| where tostring(p.event) == "session.ownership_refused"'
+              '| where tostring(p["cyrus.reason"]) == "rpc_not_owned"'
+              '| extend session_id = tostring(p["cyrus.agent_session_id"])'
+              '| summarize dropped = count() by session_id'
+            ],
+            '\n'
+          )
+          timeAggregation: 'Maximum'
+          metricMeasureColumn: 'dropped'
+          threshold: 10
+          operator: 'GreaterThan'
+          dimensions: [
+            {
+              name: 'session_id'
               operator: 'Include'
               values: [
                 '*'

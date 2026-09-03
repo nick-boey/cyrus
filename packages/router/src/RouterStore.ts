@@ -1707,6 +1707,35 @@ export class RouterStore {
 	}
 
 	/**
+	 * The device and state of the most recent run recorded for a session.
+	 *
+	 * Exists to tell a REPLAY apart from an intrusion on the terminal frame.
+	 * `RouterServer` applies a `session_state` frame before acking it, so a
+	 * device that dies in between replays a frame the router already applied —
+	 * and once the posting grace has lapsed that replay arrives owning nothing,
+	 * looking exactly like a device reporting a terminal state for someone
+	 * else's session. The run row remembers which device the session actually
+	 * belonged to for as long as the row survives retention, which is far longer
+	 * than any grace, so it can answer the question the ownership routes no
+	 * longer can.
+	 *
+	 * Ordered the same way {@link finishAgentRun} orders it, so both see the same
+	 * row for a session that has been routed more than once.
+	 */
+	getLatestAgentRunForSession(
+		sessionId: string,
+	): { deviceId: number; state: string } | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT device_id, state FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
+			)
+			.get(sessionId) as Pick<AgentRunRow, "device_id" | "state"> | undefined;
+		return row === undefined
+			? undefined
+			: { deviceId: row.device_id, state: row.state };
+	}
+
+	/**
 	 * The most recent moment the router observed anything about an agent run on
 	 * this device — a worker activity, or a run ending.
 	 *
@@ -2523,6 +2552,12 @@ export class RouterStore {
 	 * and by {@link EventRouter} to decide whether a device may be granted a
 	 * post-terminal grace. Those two must never disagree — a device that can be
 	 * granted ownership it does not have is an escalation, not a lenient check.
+	 *
+	 * The same rule binds every branch of `handleSessionState`, not only the
+	 * grants: `parked` records an in-memory authorization for the later `active`
+	 * frame, and `active` writes affinity — the strongest route here — so both
+	 * are gated too. Ungating either one re-opens the escalation in two frames
+	 * rather than one.
 	 *
 	 * The three routes, and why one is not enough:
 	 *  - **affinity**: the session is actively routed here. Cleared on park.

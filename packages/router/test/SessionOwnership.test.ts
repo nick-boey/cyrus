@@ -84,6 +84,7 @@ interface Harness {
 
 function makeHarness(opts?: {
 	executorLogger?: ILogger;
+	routerLogger?: ILogger;
 	/** Deployments can turn issue locking off; the park window must survive it. */
 	issueLock?: boolean;
 }): Harness {
@@ -110,7 +111,7 @@ function makeHarness(opts?: {
 			creatorOnlyPrompting: false,
 			affinityGraceMs: 600_000,
 		},
-		logger: silentLogger(),
+		logger: opts?.routerLogger ?? silentLogger(),
 		now: () => clock.value,
 	});
 
@@ -251,9 +252,10 @@ describe("session-scoped RPC authorization (NOR-405)", () => {
 	 * `frame.sessionId` is device-supplied and validated only as a non-empty
 	 * string, so a grant keyed on the SENDER rather than on the current owner
 	 * would let any enrolled device buy itself authorization over any session id
-	 * — turning a stray frame from a denial of service into an escalation. The
-	 * `active` branch already refuses to "mint ownership out of nothing"; the
-	 * park and terminal branches must too.
+	 * — turning a stray frame from a denial of service into an escalation. Every
+	 * branch that creates a claim is gated: `parked` (which records the in-memory
+	 * authorization `active` later redeems), `active` (which writes affinity
+	 * outright), and the terminal grace.
 	 */
 	it("does not let a non-owner mint a grace by forging a terminal frame", async () => {
 		const mallory = h.deviceId + 1;
@@ -286,6 +288,109 @@ describe("session-scoped RPC authorization (NOR-405)", () => {
 		const response = await h.executor.dispatch(mallory, activityFrame());
 		expect(response.ok).toBe(false);
 		expect(response.error).toBe("session not owned by this device");
+	});
+
+	/**
+	 * The escalation the grace gate alone does NOT close, because it takes two
+	 * frames. `parked` records an in-memory entry that `active` later redeems for
+	 * full session affinity — the strongest ownership route there is, stronger
+	 * than the grace the gate refuses. So a forged `parked` that merely seeds
+	 * that entry is itself the primitive, and gating only the grant leaves the
+	 * door open one frame further along.
+	 */
+	it("does not let a non-owner take affinity by forging a park then an unpark", async () => {
+		const mallory = h.deviceId + 1;
+
+		for (const state of ["parked", "active"] as const) {
+			h.router.handleSessionState(mallory, {
+				type: "session_state",
+				id: `ss-forged-${state}`,
+				sessionId: SESSION,
+				state,
+			});
+		}
+
+		// The victim's affinity is untouched — not merely "mallory got no grace".
+		expect(h.store.getSessionAffinity(SESSION)).toBe(h.deviceId);
+		expect(h.store.getSessionOwnershipGrace(SESSION)).toBeUndefined();
+		expect(h.store.getSessionOwner(SESSION, h.clock.value)).toBe(h.deviceId);
+
+		const response = await h.executor.dispatch(mallory, activityFrame());
+		expect(response.ok).toBe(false);
+		expect(response.error).toBe("session not owned by this device");
+
+		// And the rightful owner is still able to work.
+		expect(
+			await h.executor.dispatch(h.deviceId, activityFrame()),
+		).toMatchObject({ ok: true });
+	});
+
+	/**
+	 * The park was genuine this time, so the in-memory entry exists — but it is
+	 * keyed by session id, and matching on that alone would let any enrolled
+	 * device redeem another device's park and walk off with its affinity.
+	 */
+	it("does not let a non-owner redeem another device's park", async () => {
+		const mallory = h.deviceId + 1;
+
+		h.router.handleSessionState(h.deviceId, {
+			type: "session_state",
+			id: "ss-park",
+			sessionId: SESSION,
+			state: "parked",
+		});
+		h.router.handleSessionState(mallory, {
+			type: "session_state",
+			id: "ss-steal",
+			sessionId: SESSION,
+			state: "active",
+		});
+
+		expect(h.store.getSessionAffinity(SESSION)).toBeUndefined();
+		expect(await h.executor.dispatch(mallory, activityFrame())).toMatchObject({
+			ok: false,
+		});
+
+		// The refusal must not consume the park entry: dropping it would trade the
+		// escalation for a denial of service against the owner's own unpark.
+		h.router.handleSessionState(h.deviceId, {
+			type: "session_state",
+			id: "ss-unpark",
+			sessionId: SESSION,
+			state: "active",
+		});
+		expect(h.store.getSessionAffinity(SESSION)).toBe(h.deviceId);
+	});
+
+	/**
+	 * The mirror image of a grant: a non-owner's terminal frame must not be able
+	 * to DELETE the window the real owner is posting its closing summary into.
+	 * The releases beside it are deliberately ungated — refusing those would
+	 * strand the issue lock — but the grace expires on its own, so clearing it
+	 * can only ever destroy a legitimate claim.
+	 */
+	it("does not let a non-owner's terminal frame cancel the owner's grace", async () => {
+		const mallory = h.deviceId + 1;
+
+		h.router.handleSessionState(h.deviceId, {
+			type: "session_state",
+			id: "ss-complete",
+			sessionId: SESSION,
+			state: "complete",
+		});
+		expect(h.store.getSessionOwnershipGrace(SESSION)).toBe(h.deviceId);
+
+		h.router.handleSessionState(mallory, {
+			type: "session_state",
+			id: "ss-forged-complete",
+			sessionId: SESSION,
+			state: "complete",
+		});
+
+		expect(h.store.getSessionOwnershipGrace(SESSION)).toBe(h.deviceId);
+		expect(
+			await h.executor.dispatch(h.deviceId, activityFrame()),
+		).toMatchObject({ ok: true });
 	});
 
 	it("drops the park grace once an unpark restores affinity", async () => {
@@ -391,5 +496,115 @@ describe("session-scoped RPC rejection logging (NOR-405)", () => {
 			"cyrus.device_id": 4242,
 			"cyrus.session_id": "sess-not-ours",
 		});
+	});
+
+	/**
+	 * The WARN is what an operator SEES; the event is what a query can GROUP BY.
+	 * Both are required and neither substitutes for the other — the WARN alone is
+	 * prose, and `event()` alone is below the console threshold. This asserts the
+	 * wire format verbatim because `infra/azure/bicep/modules/monitoring.bicep`
+	 * keys its saved search and its alert on these literal strings, and a dotted
+	 * attribute renamed here silently returns null there rather than erroring.
+	 */
+	it("emits a queryable session.ownership_refused event beside the WARN", async () => {
+		const h = makeHarness({
+			executorLogger: createLogger({
+				component: "LinearExecutor",
+				level: LogLevel.SILENT,
+			}),
+		});
+
+		await h.executor.dispatch(4242, activityFrame("sess-not-ours"));
+
+		const event = recorder.sink.find({ event: "session.ownership_refused" });
+		expect(event).toBeDefined();
+		expect(event?.attributes).toEqual({
+			"cyrus.reason": "rpc_not_owned",
+			"cyrus.agent_session_id": "sess-not-ours",
+			"cyrus.device_id": 4242,
+			"cyrus.owner_device_id": null,
+			"cyrus.rpc_method": "createAgentActivity",
+			"cyrus.session_state": null,
+		});
+	});
+
+	function routerRecordingLogger(): ILogger {
+		return createLogger({
+			component: "EventRouter",
+			level: LogLevel.SILENT,
+		});
+	}
+
+	it("logs a non-owner's terminal frame at WARN with cyrus.* attributes", async () => {
+		const h = makeHarness({ routerLogger: routerRecordingLogger() });
+		await h.router.route(createdEvent());
+		const mallory = h.deviceId + 1;
+
+		h.router.handleSessionState(mallory, {
+			type: "session_state",
+			id: "ss-forged",
+			sessionId: SESSION,
+			state: "complete",
+		});
+
+		const record = recorder.sink.find({
+			level: LogLevel.WARN,
+			message: "reported terminal state",
+		});
+		expect(record).toBeDefined();
+		expect(record?.attributes).toEqual({
+			"cyrus.reason": "terminal_not_owned",
+			"cyrus.device_id": mallory,
+			"cyrus.session_id": SESSION,
+			"cyrus.session_state": "complete",
+			"cyrus.owner_device_id": h.deviceId,
+		});
+	});
+
+	/**
+	 * `RouterServer` applies a `session_state` frame BEFORE acking it, so a
+	 * process death in between leaves the device replaying a frame the router
+	 * already applied — a case its comment documents as safe precisely because
+	 * `handleSessionState` is idempotent. Once the grace has lapsed that replay
+	 * owns nothing and is shape-identical to a forged frame, so warning about it
+	 * would seed the ONE detector for genuine forgery with routine noise.
+	 */
+	it("does not warn when a device replays its own terminal frame after the grace lapses", async () => {
+		const h = makeHarness({ routerLogger: routerRecordingLogger() });
+		await h.router.route(createdEvent());
+
+		const terminalFrame = {
+			type: "session_state",
+			id: "ss-complete",
+			sessionId: SESSION,
+			state: "complete",
+		} as const;
+
+		h.router.handleSessionState(h.deviceId, terminalFrame);
+		// Past the posting window, so every ownership route is gone and the replay
+		// arrives looking exactly like a stray frame.
+		h.clock.value += TERMINAL_OWNERSHIP_GRACE_MS + 1;
+		expect(h.store.getSessionOwner(SESSION, h.clock.value)).toBeUndefined();
+
+		h.router.handleSessionState(h.deviceId, terminalFrame);
+
+		expect(
+			recorder.sink.find({
+				level: LogLevel.WARN,
+				message: "reported terminal state",
+			}),
+		).toBeUndefined();
+		// Recognised as a replay rather than silently ignored.
+		expect(
+			recorder.sink.find({
+				level: LogLevel.INFO,
+				message: "Ignoring replayed terminal state",
+			}),
+		).toBeDefined();
+		// And it does NOT re-open the window: the grace is measured from the
+		// terminal instant, not from whenever the ack happened to land.
+		expect(h.store.getSessionOwnershipGrace(SESSION, h.clock.value)).toBe(
+			undefined,
+		);
 	});
 });

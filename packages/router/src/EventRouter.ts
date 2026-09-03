@@ -1,6 +1,7 @@
 import {
 	type AgentEvent,
 	type AgentSessionCreatedWebhook,
+	cyrusAttributes,
 	type ILogger,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
@@ -53,7 +54,11 @@ import type {
 	RepositoryResolver,
 } from "./RepositoryResolver.js";
 import type { RouterStore } from "./RouterStore.js";
-import { emitRoutingRejection } from "./RouterTelemetry.js";
+import {
+	emitRoutingRejection,
+	emitSessionOwnershipRefusal,
+	type SessionOwnershipRefusal,
+} from "./RouterTelemetry.js";
 import {
 	emitSandboxEvent,
 	SANDBOX_EVENTS,
@@ -258,14 +263,22 @@ export class EventRouter {
 	 */
 	private readonly sessionWorkspace = new Map<string, string>();
 	/**
-	 * Sessions currently parked, mapped to the `creator_json` their affinity row
-	 * carried before the park deleted it (`undefined` when they had none).
+	 * Sessions currently parked, mapped to the device that parked them and the
+	 * `creator_json` their affinity row carried before the park deleted it
+	 * (`undefined` when they had none).
 	 *
-	 * Two jobs. Membership authorizes an `active` frame — only a session this
-	 * router saw park may have its affinity restored, so a stray or replayed
-	 * frame cannot mint ownership. The value restores `creator_json` intact,
-	 * which matters because that field gates who may prompt the session; writing
-	 * it back as NULL would quietly discard the record.
+	 * Two jobs. The entry authorizes an `active` frame — only a session this
+	 * router saw park, *from the device that parked it*, may have its affinity
+	 * restored. The value restores `creator_json` intact, which matters because
+	 * that field gates who may prompt the session; writing it back as NULL would
+	 * quietly discard the record.
+	 *
+	 * `deviceId` is load-bearing, not bookkeeping. `active` writes full session
+	 * affinity — the strongest of the three ownership routes — and this map is
+	 * the only thing it consults first. Keyed by session id alone, any enrolled
+	 * device could unpark a session another device parked and take its affinity;
+	 * the park branch's ownership gate stops a forged entry being created, and
+	 * this field stops a genuine entry being redeemed by the wrong device.
 	 *
 	 * In-memory for the same reason as {@link sessionWorkspace}: a router
 	 * restart loses the hint, and the creator check falls back to the webhook's
@@ -273,7 +286,7 @@ export class EventRouter {
 	 */
 	private readonly parkedSessionCreators = new Map<
 		string,
-		string | undefined
+		{ deviceId: number; creator: string | undefined }
 	>();
 
 	constructor(opts: EventRouterOptions) {
@@ -570,40 +583,97 @@ export class EventRouter {
 		}
 	}
 
+	/**
+	 * Refuse a device's claim on a session: one queryable event plus one WARN.
+	 *
+	 * Both halves are needed and neither substitutes for the other — `event()`
+	 * carries the closed-set `cyrus.reason` a KQL `summarize` groups on and
+	 * bypasses the sink's level threshold, WARN is what an operator reading a
+	 * console actually sees. NOR-405 was invisible for a day for want of exactly
+	 * this pair on the RPC path.
+	 */
+	private refuseSessionOwnership(
+		refusal: SessionOwnershipRefusal,
+		message: string,
+	): void {
+		emitSessionOwnershipRefusal(this.logger, refusal);
+		this.logger
+			.withContext({
+				...(refusal.sessionId !== undefined
+					? { sessionId: refusal.sessionId }
+					: {}),
+				attributes: cyrusAttributes({
+					reason: refusal.reason,
+					device_id: refusal.deviceId,
+					session_id: refusal.sessionId ?? null,
+					session_state: refusal.sessionState ?? null,
+					owner_device_id: refusal.ownerDeviceId ?? null,
+				}),
+			})
+			.warn(message);
+	}
+
 	handleSessionState(deviceId: number, frame: SessionStateFrame): void {
 		// Read BEFORE any branch mutates the rows it is derived from. `deviceId`
 		// is the authenticated socket's device, but `frame.sessionId` is
 		// device-supplied and unvalidated beyond being a non-empty string — so
 		// every grant below must be gated on this, never on the sender alone.
 		// Granting on the sender would turn a stray or forged terminal frame into
-		// a way to MINT authorization over someone else's session, which is the
-		// hazard the `active` branch below already refuses to allow.
+		// a way to MINT authorization over someone else's session.
+		//
+		// "Grant" means every claim a branch can create, not just the grace rows:
+		// the `parked` branch's in-memory entry authorizes a later `active`, and
+		// `active` writes affinity outright. All three are gated. What is NOT
+		// gated is the terminal branch's RELEASES — see there for why.
 		const owner = this.store.getSessionOwner(frame.sessionId, this.now());
 		if (frame.state === "parked") {
 			const now = this.now();
+			// Gated as a WHOLE, not just the grace grant below. `parkedSessionCreators`
+			// is the only thing the `active` branch consults before writing full
+			// session affinity, so an ungated `set` here is itself an escalation
+			// primitive: a forged `parked` that merely seeds the map lets a following
+			// forged `active` mint affinity over someone else's session — a strictly
+			// stronger claim than the grace this gate refuses. Two frames, not one.
+			//
+			// Refusing outright is safe here in a way it is NOT on the terminal path.
+			// A park deliberately RETAINS the issue lock, so declining to act strands
+			// nothing: the rightful owner keeps every claim it already had, and the
+			// issue stays delegatable. The terminal branch must still run its
+			// releases for exactly the opposite reason.
+			if (owner !== deviceId) {
+				this.refuseSessionOwnership(
+					{
+						reason: "park_not_owned",
+						sessionId: frame.sessionId,
+						deviceId,
+						ownerDeviceId: owner,
+						sessionState: frame.state,
+					},
+					`Device ${deviceId} reported 'parked' for session ${frame.sessionId}, which it does not own (owner: ${owner ?? "none"}); ignored`,
+				);
+				return;
+			}
 			// Stashed, not dropped: `clearSessionAffinity` deletes the row that
 			// carries `creator_json`, and that field is the gate on who may prompt
 			// this session. Holding it here lets `active` put it back intact.
 			// In-memory by the same reasoning as `notifiedSessions` below — a
 			// router restart re-derives it from the webhook's `agentSession.creator`.
-			// Always recorded, even when the creator is absent: membership is what
+			// Always recorded, even when the creator is absent: the entry is what
 			// tells `active` this device really parked the session.
-			this.parkedSessionCreators.set(
-				frame.sessionId,
-				this.store.getSessionCreator(frame.sessionId),
-			);
+			this.parkedSessionCreators.set(frame.sessionId, {
+				deviceId,
+				creator: this.store.getSessionCreator(frame.sessionId),
+			});
 			// The issue lock covers this window and outlasts any park — but ONLY on
 			// a deployment with `issueLock` enabled. With it off no lock row is ever
 			// taken, so without this grant the park drops the device's last claim
 			// and every activity a parked session posts is rejected: precisely the
 			// 40-post PAR-275 burst, unfixed (NOR-405).
-			if (owner === deviceId) {
-				this.store.grantSessionOwnershipGrace(
-					frame.sessionId,
-					deviceId,
-					now + PARK_OWNERSHIP_GRACE_MS,
-				);
-			}
+			this.store.grantSessionOwnershipGrace(
+				frame.sessionId,
+				deviceId,
+				now + PARK_OWNERSHIP_GRACE_MS,
+			);
 			this.store.clearSessionAffinity(frame.sessionId);
 			this.store.setDeviceParkedAt(deviceId, now);
 			this.store.setAgentRunState(frame.sessionId, "parked");
@@ -618,13 +688,35 @@ export class EventRouter {
 		if (frame.state === "active") {
 			// Only for a session this device actually parked. A replayed or stray
 			// `active` must not mint ownership out of nothing.
-			if (!this.parkedSessionCreators.has(frame.sessionId)) {
+			const parked = this.parkedSessionCreators.get(frame.sessionId);
+			if (parked === undefined) {
 				this.logger.info(
 					`Ignoring 'active' for session ${frame.sessionId} on device ${deviceId}: no park on record`,
 				);
 				return;
 			}
-			const creator = this.parkedSessionCreators.get(frame.sessionId);
+			// The park was genuine, but this is not the device that made it. Below
+			// this line is `setSessionAffinity` — the strongest ownership route
+			// there is — so matching on the session id alone would let any enrolled
+			// device redeem another device's park and take its session.
+			//
+			// The entry is deliberately NOT deleted on this path: dropping it would
+			// turn a forged `active` into a denial of service against the rightful
+			// owner's own unpark, trading an escalation for a hang.
+			if (parked.deviceId !== deviceId) {
+				this.refuseSessionOwnership(
+					{
+						reason: "unpark_not_parker",
+						sessionId: frame.sessionId,
+						deviceId,
+						ownerDeviceId: parked.deviceId,
+						sessionState: frame.state,
+					},
+					`Device ${deviceId} reported 'active' for session ${frame.sessionId}, which device ${parked.deviceId} parked; ignored`,
+				);
+				return;
+			}
+			const creator = parked.creator;
 			this.parkedSessionCreators.delete(frame.sessionId);
 			// setSessionAffinity clears the device's park stamp as a side effect.
 			this.store.setSessionAffinity(frame.sessionId, deviceId, creator);
@@ -642,8 +734,19 @@ export class EventRouter {
 			});
 			return;
 		}
-		this.parkedSessionCreators.delete(frame.sessionId);
+		// Same reasoning as the `active` branch: only the device that parked a
+		// session may retire its entry. The releases below are deliberately
+		// ungated, but this map is an authorization record, and clearing another
+		// device's park would strand its unpark behind "no park on record".
+		const parkedBySender =
+			this.parkedSessionCreators.get(frame.sessionId)?.deviceId === deviceId;
+		if (parkedBySender) {
+			this.parkedSessionCreators.delete(frame.sessionId);
+		}
 		const now = this.now();
+		// Read before `finishAgentRun` moves the row to a terminal state, so a
+		// replay can still be told apart from a stray frame afterwards.
+		const priorRun = this.store.getLatestAgentRunForSession(frame.sessionId);
 		this.store.finishAgentRun(frame.sessionId, frame.state, now);
 		// Granted BEFORE the two releases below, so there is no instant in which
 		// the terminating device owns the session by none of the routes
@@ -661,6 +764,21 @@ export class EventRouter {
 				deviceId,
 				now + TERMINAL_OWNERSHIP_GRACE_MS,
 			);
+		} else if (priorRun?.deviceId === deviceId) {
+			// A replay, not an intrusion. `RouterServer` applies a `session_state`
+			// frame BEFORE acking it, so a process death in between leaves the device
+			// replaying a frame the router already applied; that design is documented
+			// as safe because `handleSessionState` is idempotent. Once the grace has
+			// lapsed the replay arrives owning nothing, and warning about it would
+			// seed the one detector for genuine frame forgery with routine false
+			// positives — the same signal-quality failure the sandbox sweep's
+			// `idle_stop_skipped` reasons exist to avoid.
+			//
+			// Grants nothing: the window is measured from the terminal instant, not
+			// from whenever the ack happened to land, so a replay must not re-open it.
+			this.logger.info(
+				`Ignoring replayed terminal state '${frame.state}' for session ${frame.sessionId} from device ${deviceId}: run already ended, grace lapsed`,
+			);
 		} else {
 			// Not fatal — the releases below still run, because refusing them would
 			// strand the issue lock and leave the issue permanently undelegatable,
@@ -668,8 +786,20 @@ export class EventRouter {
 			// terminal state for a session it does not own is either a bug or an
 			// attempt to act on someone else's session, and neither should be
 			// silent.
-			this.store.clearSessionOwnershipGrace(frame.sessionId);
-			this.logger.warn(
+			//
+			// The grace row is deliberately NOT cleared. It belongs to whichever
+			// device does own the session, it expires on its own, and deleting it
+			// here would let any enrolled device cancel another's posting window
+			// with a single frame — destroying the protection this PR added, one
+			// line after refusing to grant that same device anything.
+			this.refuseSessionOwnership(
+				{
+					reason: "terminal_not_owned",
+					sessionId: frame.sessionId,
+					deviceId,
+					ownerDeviceId: owner,
+					sessionState: frame.state,
+				},
 				`Device ${deviceId} reported terminal state '${frame.state}' for session ${frame.sessionId}, which it does not own (owner: ${owner ?? "none"}); released the session's rows but granted no posting grace`,
 			);
 		}
