@@ -187,6 +187,12 @@ export class WorkspaceSyncService {
 	/** Refcount of live sessions per issue — see the class doc's "Touched-set lifecycle" section. */
 	private readonly liveSessionsByIssue = new Map<string, Set<string>>();
 	private readonly inFlight = new Map<string, Promise<boolean>>();
+	/**
+	 * Issues whose terminal cleanup has taken ownership of the WIP snapshot —
+	 * see {@link abandonIssue}. Capture is suppressed for these until a new
+	 * session {@link touch}es the issue again.
+	 */
+	private readonly abandonedIssues = new Set<string>();
 	private timer?: NodeJS.Timeout;
 
 	constructor(opts: WorkspaceSyncServiceOptions) {
@@ -214,6 +220,12 @@ export class WorkspaceSyncService {
 	 * succeeds (see {@link syncIssue}).
 	 */
 	touch(issueKey: string, sessionId: string): void {
+		// A new session on the issue lifts the terminal latch: the issue was
+		// reopened (or re-prompted after a terminal state), so its work needs
+		// protecting again and there is a live workspace to protect. Without
+		// this the latch would be permanent for the life of the process and a
+		// reopened issue would silently run with no persistence floor.
+		this.abandonedIssues.delete(issueKey);
 		this.touchedIssues.add(issueKey);
 		let sessions = this.liveSessionsByIssue.get(issueKey);
 		if (!sessions) {
@@ -298,6 +310,39 @@ export class WorkspaceSyncService {
 	}
 
 	/**
+	 * Hands ownership of `issueKey`'s WIP snapshot to terminal cleanup: no
+	 * further capture will run for it until a new session {@link touch}es it.
+	 * Returns once any sync already in flight has finished, so the caller can
+	 * be sure nothing is still pushing when it returns.
+	 *
+	 * Terminal cleanup deletes the snapshot ref, and `deleteWipSnapshot`
+	 * deletes the LOCAL ref first and unconditionally — which is exactly the
+	 * state {@link GitService.captureWipSnapshot}'s "already up to date" check
+	 * reads. So a capture that lands after a reap does not merely race it: it
+	 * is *guaranteed* to take the push branch and put the ref back on the
+	 * remote, permanently and with nothing recorded as failed for `sweep()` to
+	 * retry. Stopping the runners does not close this — `requestSessionStop`
+	 * only sets a flag, the runner's real terminal arrives later and fires
+	 * `syncIssueOnTermination` from a listener, and the periodic tick keeps
+	 * firing throughout the seconds-to-minutes that teardown scripts and
+	 * `git worktree remove` take. The latch is the load-bearing part; it is set
+	 * synchronously so no new capture can start, and only then does this await
+	 * the in-flight one.
+	 */
+	async abandonIssue(issueKey: string): Promise<void> {
+		this.abandonedIssues.add(issueKey);
+		this.touchedIssues.delete(issueKey);
+		this.liveSessionsByIssue.delete(issueKey);
+		const existing = this.inFlight.get(issueKey);
+		if (existing) await existing.catch(() => undefined);
+	}
+
+	/** Whether {@link abandonIssue} has latched this issue. Test seam. */
+	isAbandoned(issueKey: string): boolean {
+		return this.abandonedIssues.has(issueKey);
+	}
+
+	/**
 	 * Snapshot capture + bundle + upload for one issue. Serialized per issue; never
 	 * throws. Resolves `true` on success, `false` on failure (the failure is
 	 * already logged).
@@ -311,6 +356,10 @@ export class WorkspaceSyncService {
 	 * the removal.
 	 */
 	syncIssue(issueKey: string, options?: { force?: boolean }): Promise<boolean> {
+		// Terminal cleanup owns this issue's snapshot now — see abandonIssue().
+		// Reported as failure, not success: nothing was captured, and `false` is
+		// what every caller already treats as "did not sync".
+		if (this.abandonedIssues.has(issueKey)) return Promise.resolve(false);
 		const existing = this.inFlight.get(issueKey);
 		if (existing) {
 			if (!options?.force) return existing;
