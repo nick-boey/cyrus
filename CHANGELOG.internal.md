@@ -53,7 +53,8 @@ This changelog documents internal development changes, refactors, tooling update
 
 ### Changed
 - **`AgentRunObservation` and `AgentRunsResponse` now live in `cyrus-operator-protocol`
-  ([CYR-64](https://linear.app/northrop-digital/issue/CYR-64/define-versioned-remote-operator-contracts)).**
+  ([CYR-64](https://linear.app/northrop-digital/issue/CYR-64/define-versioned-remote-operator-contracts),
+  [#57](https://github.com/nick-boey/cyrus/pull/57)).**
   The unversioned `GET /runs` shapes moved out of `cyrus-router` so that
   `RunsCommand` stops importing a router implementation module for a wire type.
   `cyrus-router` re-exports them, so existing importers are unaffected, and
