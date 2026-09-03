@@ -4,6 +4,28 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Added
+- **Adopted the observability domain language and decisions ([CYR-63](https://linear.app/northrop-digital/issue/CYR-63/migrate-cyr-62-domain-context-and-adrs-into-the-repository),
+  planned on [CYR-62](https://linear.app/northrop-digital/issue/CYR-62/create-plan-for-project)).**
+  Migrated the approved planning artifacts into the repository ahead of any
+  implementation code, so the observability work argues from versioned, reviewed
+  terms. `CONTEXT.md` gains **Waiting run**, **Elicitation**, **Run observation
+  change**, **Command profile**, **Fleet operator**, **Log source**, **Run
+  recovery**, and **Recovery operation**; **Agent run**, **Run observation**,
+  **Router connection**, and **Park** were revised to match. ADRs 0009–0016
+  record the decisions: separate user and fleet-operator principals, clients
+  querying router-described log sources, role-specific command profiles,
+  event-time run facts, ownership-reconciling run recovery, discovered and
+  versioned operator HTTP capabilities, the resource-interface/workflow-CLI
+  split, and durable material change feeds for watches.
+- **Separated agent-run waiting from container parking.** The glossary previously
+  let *park* name both an idle container being stopped and an agent run blocked
+  on a user answer. *Park* is now the container fact only; the run fact is a
+  **waiting run**. `docs/ROUTER.md` and ADR-0008 were amended to say so and to
+  note that the wire and store still spell the run state `parked` — ADR-0012
+  replaces that with an explicitly worker-reported wait reason, and the rename
+  ships with that work, not here. No production code changed.
+
 ### Changed
 - **Merged `cyrusagents/cyrus` main into the fork ([CYR-24](https://linear.app/northrop-digital/issue/CYR-24/bring-our-fork-up-to-date-with-the-upstream-cyrus-repo)).** The fork had diverged 33 ahead / 21 behind
   since 2026-08-08. Merged rather than rebased: `cyrus-deploy` pins a 40-character

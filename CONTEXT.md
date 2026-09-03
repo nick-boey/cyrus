@@ -21,9 +21,20 @@ _Avoid_: run, agent
 
 **Agent run**:
 A continuous episode of work within an agent session. Prompts received while it
-is active join the same run; it moves from routed to active, may park for user
-input, and ends as complete, error, stopped, or unknown.
+is active join the same run; it moves from routed to active, may wait when it
+cannot progress, and ends as complete, error, stopped, or unknown.
 _Avoid_: session, turn
+
+**Waiting run**:
+A non-terminal agent run that cannot currently progress until a stated condition
+changes. Its wait reason and the time it began waiting are observable facts;
+waiting alone is not evidence that the run has failed or stalled.
+_Avoid_: parked run, paused runner, stalled run
+
+**Elicitation**:
+A user decision or answer that an agent run has explicitly requested before it
+can continue. It is a wait reason, not an executor state.
+_Avoid_: pause, park, generic prompt
 
 **Unknown run**:
 An agent run whose ownership ended without Cyrus receiving a terminal outcome.
@@ -57,14 +68,53 @@ agent run to its issue's session timeline.
 _Avoid_: message, heartbeat, log
 
 **Run observation**:
-The router's durable facts about an agent run: its inputs, lifecycle state,
-latest published agent activity, worker liveness, and last sampled executor
-state. It reports evidence, not a healthy/stalled verdict.
+The router's durable facts about an agent run: its routing-time context, inputs,
+lifecycle and waiting state, latest published agent activity, worker liveness,
+and last sampled executor state. It reports evidence, not a healthy/stalled
+verdict.
+
+**Run observation change**:
+A durable record that a material fact in a run observation changed. It carries
+no prompt or activity content and is distinct from an agent activity or log
+record.
+_Avoid_: agent activity, log event, heartbeat
 
 **Router connection**:
-The router origin and device bearer token written by `cyrus connect` to the
-device's Cyrus config. The CLI reuses this connection for both the worker
-WebSocket and authenticated HTTP queries such as `cyrus runs`.
+A named relationship between a Cyrus CLI and a router, including how that CLI
+authenticates and which workspaces and capabilities the router advertises. One
+connection may serve several workspaces.
+_Avoid_: endpoint, environment, command profile
+
+**Command profile**:
+The set of commands a Cyrus CLI presents for a particular role. It limits the
+visible product surface but grants no authority; the router still authorizes
+every remote operation.
+_Avoid_: permission, role, security profile
+
+**Fleet operator**:
+A human or orchestrating agent authorized to observe agent runs across users and
+request guarded recovery through a router. It is a principal role, not a runner,
+executor, or device.
+_Avoid_: runner, device, administrator
+
+**Log source**:
+The configured system in which a router's and its devices' log records can be
+searched. A router connection advertises how to locate it; the querying client
+authenticates to it independently.
+_Avoid_: log stream, telemetry sink
+
+**Run recovery**:
+A router-owned reconciliation of a non-terminal agent run whose ownership,
+worker, or executor evidence no longer agrees. It may restore execution or
+release ownership proven stale, but it does not answer an elicitation or
+forcibly end live work.
+_Avoid_: unlock, restart, retry, unstick
+
+**Recovery operation**:
+The durable record of one run-recovery attempt, including its target, progress,
+actor, and outcome. Retrying the same request joins the same operation rather
+than starting competing recovery work.
+_Avoid_: agent run, job, session
 
 ### Persistence
 
@@ -127,8 +177,9 @@ never hold workspace-wide credentials.
 
 **Park**:
 Stopping an idle container without ending the work — the issue stays live and
-resumes on the next prompt. Distinct from teardown, which ends the issue.
-_Avoid_: pause, suspend, sleep
+resumes on the next prompt. Distinct from a waiting run and from teardown, which
+ends the issue.
+_Avoid_: wait, pause, suspend, sleep
 
 **Terminal teardown**:
 The end of an issue's life — the workspace is removed, the container destroyed,
