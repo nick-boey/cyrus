@@ -13,6 +13,13 @@ import type {
 	GeminiStreamEvent,
 } from "./types.js";
 
+const EMPTY_FALLBACK_CREDIT = { fallback_credit: null };
+const NOT_APPLIED_FALLBACK_CREDIT = {
+	fallback_credit: {
+		status: { type: "not_applied", reason: "not_enabled" },
+	},
+} as const;
+
 /**
  * Create a minimal BetaMessage for assistant responses
  *
@@ -44,6 +51,7 @@ function createBetaMessage(
 			output_tokens: 0,
 			cache_creation_input_tokens: 0,
 			cache_read_input_tokens: 0,
+			...EMPTY_FALLBACK_CREDIT,
 			output_tokens_details: null,
 			cache_creation: null,
 			// Anthropic-only billing field; Gemini never performs a fallback-credit reprice.
@@ -229,6 +237,7 @@ export function geminiEventToSDKMessage(
 						output_tokens: stats.output_tokens || 0,
 						cache_creation_input_tokens: 0,
 						cache_read_input_tokens: 0,
+						...NOT_APPLIED_FALLBACK_CREDIT,
 						cache_creation: {
 							ephemeral_1h_input_tokens: 0,
 							ephemeral_5m_input_tokens: 0,
@@ -270,6 +279,7 @@ export function geminiEventToSDKMessage(
 						output_tokens: stats.output_tokens || 0,
 						cache_creation_input_tokens: 0,
 						cache_read_input_tokens: 0,
+						...NOT_APPLIED_FALLBACK_CREDIT,
 						cache_creation: {
 							ephemeral_1h_input_tokens: 0,
 							ephemeral_5m_input_tokens: 0,
@@ -314,6 +324,7 @@ export function geminiEventToSDKMessage(
 					output_tokens: 0,
 					cache_creation_input_tokens: 0,
 					cache_read_input_tokens: 0,
+					...NOT_APPLIED_FALLBACK_CREDIT,
 					cache_creation: {
 						ephemeral_1h_input_tokens: 0,
 						ephemeral_5m_input_tokens: 0,

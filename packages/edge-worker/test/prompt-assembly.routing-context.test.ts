@@ -184,6 +184,8 @@ The system evaluates routing methods in this strict priority order. The FIRST ma
    - Multiple repos: \`[repo=repo1]\` and \`[repo=repo2]\`, or \`repos=repo1,repo2\`
    - Base branch override: \`[repo=repo-name#branch-name]\` to target a specific branch instead of the default
    - Unbracketed syntax also works: \`repo=repo-name\` or \`repo=repo-name#branch\`
+   - Agent selector: \`[agent=claude|gemini|codex|cursor|opencode]\` to choose the execution harness
+   - Linear label selector: \`<provider>/<model>\` (for example \`openai/gpt-5.5\`) to choose both harness and model. For OpenCode, use \`opencode/<provider>/<model>\` (for example \`opencode/openai/gpt-5.5\`).
 2. **Routing Labels (Priority 2)**: Apply a label configured to route to the target repository.
 3. **Project Assignment (Priority 3)**: Add the issue to a project whose name matches, case-insensitively, one of the repository's configured project names.
 4. **Team Selection (Priority 4)**: Create the issue in a Linear team whose key matches, case-insensitively, one of the repository's configured team keys.

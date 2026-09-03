@@ -7,7 +7,9 @@ import type {
 	CyrusAgentSession,
 	IAgentRunner,
 	ILogger,
+	OpenCodeConfigOverrides,
 	RepositoryConfig,
+	RunnerType,
 } from "cyrus-core";
 import { createLogger } from "cyrus-core";
 import { AgentSessionManager } from "./AgentSessionManager.js";
@@ -92,8 +94,11 @@ export interface ChatSessionHandlerDeps {
 	chatRepositoryProvider: ChatRepositoryProvider;
 	/** Shared RunnerConfigBuilder for constructing runner configs */
 	runnerConfigBuilder: RunnerConfigBuilder;
-	/** Factory function that creates the appropriate runner based on config.defaultRunner */
-	createRunner: (config: AgentRunnerConfig) => IAgentRunner;
+	/** Factory function that creates the appropriate runner for the chat session */
+	createRunner: (
+		config: AgentRunnerConfig,
+		runnerType?: RunnerType,
+	) => IAgentRunner;
 	/**
 	 * Live read of the workspace-level custom-integration MCP config paths
 	 * for the chat platform this handler is bound to (e.g.
@@ -103,11 +108,19 @@ export interface ChatSessionHandlerDeps {
 	 * no custom files load (native MCP servers still run as usual).
 	 */
 	getPlatformMcpConfigOverrides?: () => readonly string[] | undefined;
+	/** Live read of whether Claude should ignore ambient MCP configuration. */
+	getStrictMcpConfig?: () => boolean | undefined;
 	/** Resolve managed skill plugins and scoped skill names for a chat session. */
 	resolveSkillsConfig?: (input: {
 		repository?: RepositoryConfig;
 		repositoryPaths: string[];
 	}) => Promise<{ plugins?: SdkPluginConfig[]; skills?: string[] | "all" }>;
+	/** Read live global OpenCode config overrides at session-build time */
+	getOpenCodeGlobalConfig?: () => OpenCodeConfigOverrides["config"] | undefined;
+	/** Read live global OpenCode CLI state scope at session-build time */
+	getOpenCodeGlobalStateScope?: () =>
+		| OpenCodeConfigOverrides["stateScope"]
+		| undefined;
 	onWebhookStart: () => void;
 	onWebhookEnd: () => void;
 	onStateChange: () => Promise<void>;
@@ -235,19 +248,16 @@ export class ChatSessionHandler<TEvent> {
 						`Resuming completed ${this.adapter.platformName} session ${existingSessionId} (thread ${threadKey})`,
 					);
 
-					const resumeSessionId =
-						existingSession.claudeSessionId ||
-						existingSession.geminiSessionId ||
-						existingSession.codexSessionId ||
-						existingSession.cursorSessionId;
+					const resumeInfo = this.getResumeInfo(existingSession);
 
-					if (resumeSessionId) {
+					if (resumeInfo) {
 						try {
 							await this.resumeSession(
 								event,
 								existingSession,
 								existingSessionId,
-								resumeSessionId,
+								resumeInfo.sessionId,
+								resumeInfo.runnerType,
 								taskInstructions,
 							);
 						} catch (error) {
@@ -329,7 +339,11 @@ export class ChatSessionHandler<TEvent> {
 				sessionId,
 			);
 
-			const runner = this.deps.createRunner(runnerConfig);
+			const runner = this.deps.createRunner(
+				runnerConfig,
+				(runnerConfig as AgentRunnerConfig & { runnerType?: RunnerType })
+					.runnerType,
+			);
 
 			// Store the runner in the session manager
 			this.sessionManager.addAgentRunner(sessionId, runner);
@@ -518,6 +532,7 @@ export class ChatSessionHandler<TEvent> {
 		existingSession: CyrusAgentSession,
 		sessionId: string,
 		resumeSessionId: string,
+		runnerType: RunnerType,
 		taskInstructions: string,
 	): Promise<void> {
 		const systemPrompt = this.adapter.buildSystemPrompt(event);
@@ -528,9 +543,10 @@ export class ChatSessionHandler<TEvent> {
 			systemPrompt,
 			sessionId,
 			resumeSessionId,
+			runnerType,
 		);
 
-		const runner = this.deps.createRunner(runnerConfig);
+		const runner = this.deps.createRunner(runnerConfig, runnerType);
 		this.sessionManager.addAgentRunner(sessionId, runner);
 
 		const resumePrompt = await this.withThreadCatchup(
@@ -561,6 +577,27 @@ export class ChatSessionHandler<TEvent> {
 				);
 				this.clearPendingReplies(sessionId);
 			});
+	}
+
+	private getResumeInfo(
+		session: CyrusAgentSession,
+	): { sessionId: string; runnerType: RunnerType } | undefined {
+		if (session.claudeSessionId) {
+			return { sessionId: session.claudeSessionId, runnerType: "claude" };
+		}
+		if (session.geminiSessionId) {
+			return { sessionId: session.geminiSessionId, runnerType: "gemini" };
+		}
+		if (session.codexSessionId) {
+			return { sessionId: session.codexSessionId, runnerType: "codex" };
+		}
+		if (session.cursorSessionId) {
+			return { sessionId: session.cursorSessionId, runnerType: "cursor" };
+		}
+		if (session.opencodeSessionId) {
+			return { sessionId: session.opencodeSessionId, runnerType: "opencode" };
+		}
+		return undefined;
 	}
 
 	/**
@@ -725,6 +762,7 @@ export class ChatSessionHandler<TEvent> {
 		systemPrompt: string,
 		sessionId: string,
 		resumeSessionId?: string,
+		runnerType?: RunnerType,
 	): Promise<AgentRunnerConfig> {
 		const sessionLogger = this.logger.withContext({
 			sessionId,
@@ -745,14 +783,18 @@ export class ChatSessionHandler<TEvent> {
 			systemPrompt,
 			sessionId,
 			resumeSessionId,
+			runnerType,
 			cyrusHome: this.deps.cyrusHome,
 			platformName: this.adapter.platformName,
 			linearWorkspaceId: provider.getDefaultLinearWorkspaceId(),
 			repository,
 			repositoryPaths,
 			platformMcpConfigOverrides: this.deps.getPlatformMcpConfigOverrides?.(),
+			strictMcpConfig: this.deps.getStrictMcpConfig?.(),
 			plugins: skillsConfig.plugins,
 			skills: skillsConfig.skills,
+			opencodeGlobalConfig: this.deps.getOpenCodeGlobalConfig?.(),
+			opencodeGlobalStateScope: this.deps.getOpenCodeGlobalStateScope?.(),
 			logger: sessionLogger,
 			onMessage: (message: SDKMessage) =>
 				this.handleAgentMessage(sessionId, message),

@@ -99,6 +99,11 @@ export const RESERVED_ENV_KEYS = [
  * the readiness banner can meaningfully demand. A Codex user with no usable
  * credential fails at boot with a message naming the remedy, which is the
  * failure this table cannot express and {@link CodexTokenService} can.
+ *
+ * OpenCode requires nothing here for a different reason: it is a multi-provider
+ * harness whose credential depends on the provider the chosen model names, so
+ * there is no single key to demand. It is also not selectable in the cloud
+ * picker, so this entry is not reached today.
  */
 export const RUNNER_REQUIRED_SECRET_KEYS: Record<
 	RunnerType,
@@ -108,6 +113,7 @@ export const RUNNER_REQUIRED_SECRET_KEYS: Record<
 	codex: [],
 	gemini: [],
 	cursor: [],
+	opencode: [],
 };
 
 /**
