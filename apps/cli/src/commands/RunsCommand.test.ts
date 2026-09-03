@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentRunsResponse } from "cyrus-router";
+import type { AgentRunsResponse } from "cyrus-operator-protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigService } from "../services/ConfigService.js";
 import { Logger } from "../services/Logger.js";

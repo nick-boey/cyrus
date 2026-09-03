@@ -27,6 +27,7 @@
 		"better-sqlite3": "^12.11.1",
 		"cyrus-core": "workspace:*",
 		"cyrus-linear-event-transport": "workspace:*",
+		"cyrus-operator-protocol": "workspace:*",
 		"cyrus-otel-logs": "workspace:*",
 		"cyrus-otel-traces": "workspace:*",
 		"cyrus-router-executors": "workspace:*",

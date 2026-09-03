@@ -5,6 +5,42 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Defined versioned remote-operator contracts ([CYR-64](https://linear.app/northrop-digital/issue/CYR-64/define-versioned-remote-operator-contracts),
+  [#57](https://github.com/nick-boey/cyrus/pull/57)).**
+  New `cyrus-operator-protocol` package holding the v1 wire contracts the router's
+  fleet-operations API and the CLI's remote-operator commands will both depend on,
+  so neither side imports the other's implementation modules. Exports
+  `PublicRouterMetadataV1`, `OperatorContextV1`/`OperatorRoleV1`/`OperatorCapabilityV1`,
+  `LogSourceDescriptorV1`/`LogQueryV1`/`LogRecordV1`,
+  `RunObservationV1`/`RunObservationPageV1`/`RunObservationChangeV1`/`RunChangePageV1`,
+  and `RecoveryRequestV1`/`RecoveryPhaseV1`/`RecoveryOperationV1` — each a Zod
+  schema with a literal `schemaVersion: 1` and an inferred type. Dependencies are
+  Zod and nothing else: no router, Fastify, Commander, Azure, or filesystem
+  imports. No HTTP route or user-visible command is added yet.
+
+  The schemas encode the approved distinctions as cross-field rules rather than
+  leaving them to prose, so a violation is a test failure: run lifecycle is a
+  separate closed enum from executor state and only a container carries a sampled
+  one; `waiting` and its worker-reported evidence travel together; a captured
+  routing name may not appear without its canonical ID; change cursors are opaque
+  and carry the router-start stream epoch, and a page may not mix epochs; the
+  log-source descriptor is strict so it cannot carry a credential; and recovery is
+  asynchronous, with a `RecoveryRequestV1` that is strict — silently stripping a
+  misspelled `expectedRevision` would turn a conditional recovery into an
+  unconditional one.
+
+  Where a rule would have been tighter than the router's real data, it is
+  deliberately not: pending work is refused only on a run that has ENDED, not on
+  a waiting one, because a session blocked on a user answer with a live
+  background build is the state the worker's own "safe to park?" gate exists for
+  (`pending_work` stays distinct from a wait reason by `waitReasonV1Schema` being
+  a closed enum, not by forbidding the two to coexist); and a run input may carry
+  neither an activity nor a comment ID, because a delegation produces exactly
+  that and requiring one would make the run it started unrepresentable. Emitting
+  `RunObservationV1` still requires a store migration — `agent_runs` today has no
+  `issue_id`, `runner`, or routing snapshot — which the schema documents rather
+  than papering over with optional identity.
+
 - **Adopted the observability domain language and decisions ([CYR-63](https://linear.app/northrop-digital/issue/CYR-63/migrate-cyr-62-domain-context-and-adrs-into-the-repository),
   planned on [CYR-62](https://linear.app/northrop-digital/issue/CYR-62/create-plan-for-project),
   [#56](https://github.com/nick-boey/cyrus/pull/56)).**
@@ -28,6 +64,16 @@ This changelog documents internal development changes, refactors, tooling update
   ships with that work, not here. No production code changed.
 
 ### Changed
+- **`AgentRunObservation` and `AgentRunsResponse` now live in `cyrus-operator-protocol`
+  ([CYR-64](https://linear.app/northrop-digital/issue/CYR-64/define-versioned-remote-operator-contracts),
+  [#57](https://github.com/nick-boey/cyrus/pull/57)).**
+  The unversioned `GET /runs` shapes moved out of `cyrus-router` so that
+  `RunsCommand` stops importing a router implementation module for a wire type.
+  `cyrus-router` re-exports them, so existing importers are unaffected, and
+  `observeRun` is annotated with the published type — which makes a drift between
+  the router's own `AgentRunState`/`SandboxGaugeState` unions and the wire contract
+  a compile error rather than a silent wire change. Shipped `cyrus runs` behavior
+  is unchanged; the types are marked deprecated and go away with their route.
 - **Merged `cyrusagents/cyrus` main into the fork ([CYR-24](https://linear.app/northrop-digital/issue/CYR-24/bring-our-fork-up-to-date-with-the-upstream-cyrus-repo)).** The fork had diverged 33 ahead / 21 behind
   since 2026-08-08. Merged rather than rebased: `cyrus-deploy` pins a 40-character
   SHA of this branch and derives the router image tag from it, so rewriting these

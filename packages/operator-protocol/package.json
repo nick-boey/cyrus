@@ -1,0 +1,34 @@
+{
+	"name": "cyrus-operator-protocol",
+	"version": "0.2.66",
+	"description": "Versioned wire contracts shared by the Cyrus router's fleet-operations API and the Cyrus CLI's remote-operator commands",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/cyrusagents/cyrus.git",
+		"directory": "packages/operator-protocol"
+	},
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsc",
+		"dev": "tsc --watch",
+		"test": "vitest",
+		"test:run": "vitest run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"zod": "4.3.6"
+	},
+	"devDependencies": {
+		"@types/node": "^20.19.43",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.10"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
