@@ -278,6 +278,78 @@ describe("RouterStore", () => {
 		);
 	});
 
+	it("resolves the issue lock's device from the session that holds it", () => {
+		const { store, device } = storeWithDevice();
+		store.acquireIssueLock("ISS-1", "sess-1", device.deviceId);
+
+		expect(store.getIssueLockDeviceForSession("sess-1")).toBe(device.deviceId);
+		expect(store.getIssueLockDeviceForSession("sess-unknown")).toBeUndefined();
+
+		store.releaseIssueLockForSession("sess-1");
+		expect(store.getIssueLockDeviceForSession("sess-1")).toBeUndefined();
+	});
+
+	describe("post-terminal session ownership grace", () => {
+		it("authorizes the granted device until the expiry and not after", () => {
+			const { store, device } = storeWithDevice();
+			store.grantSessionOwnershipGrace("sess-1", device.deviceId, NOW + 1000);
+
+			expect(store.getSessionOwnershipGrace("sess-1", NOW)).toBe(
+				device.deviceId,
+			);
+			expect(store.getSessionOwnershipGrace("sess-1", NOW + 999)).toBe(
+				device.deviceId,
+			);
+			// Boundary is exclusive: at the expiry the grace is over.
+			expect(
+				store.getSessionOwnershipGrace("sess-1", NOW + 1000),
+			).toBeUndefined();
+		});
+
+		it("deletes a lapsed row on read so nothing has to sweep it", () => {
+			const { store, device } = storeWithDevice();
+			store.grantSessionOwnershipGrace("sess-1", device.deviceId, NOW + 1000);
+
+			store.getSessionOwnershipGrace("sess-1", NOW + 5000);
+
+			// Re-reading BEFORE the original expiry must still find nothing: the
+			// row is gone, not merely filtered out by the clock.
+			expect(store.getSessionOwnershipGrace("sess-1", NOW)).toBeUndefined();
+		});
+
+		it("sweeps lapsed rows without anyone reading their session id", () => {
+			const { store, device } = storeWithDevice();
+			store.grantSessionOwnershipGrace("sess-old", device.deviceId, NOW + 100);
+			store.grantSessionOwnershipGrace(
+				"sess-live",
+				device.deviceId,
+				NOW + 600_000,
+			);
+
+			expect(store.sweepSessionOwnershipGrace(NOW + 1000)).toBe(1);
+			expect(store.getSessionOwnershipGrace("sess-live", NOW)).toBe(
+				device.deviceId,
+			);
+		});
+
+		it("is dropped when the device's scoped rows are purged", () => {
+			const { store, device } = storeWithDevice();
+			store.grantSessionOwnershipGrace(
+				"sess-1",
+				device.deviceId,
+				NOW + 600_000,
+			);
+
+			// Re-enrollment replaces the device row and purges everything keyed to
+			// the old device_id. A surviving grace would keep authorizing a
+			// device_id that no longer exists.
+			const code2 = store.mintEnrollmentCode("alice@example.com", NOW);
+			expect(store.redeemEnrollmentCode(code2, NOW)).toBeDefined();
+
+			expect(store.getSessionOwnershipGrace("sess-1", NOW)).toBeUndefined();
+		});
+	});
+
 	it("stores session and issue affinity", () => {
 		const { store, device } = storeWithDevice();
 		store.setSessionAffinity("sess-1", device.deviceId);
