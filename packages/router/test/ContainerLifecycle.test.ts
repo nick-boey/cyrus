@@ -1377,17 +1377,24 @@ describe("ContainerLifecycle", () => {
 			aca: ContainerExecutor,
 			now: () => number,
 			graceMs = 600_000,
+			noProgressMs = 3_600_000,
+			online = false,
+			/** Raise it when an OFFLINE fixture is swept far past the default hour,
+			 *  or its affinity ages out and the assertion passes for the wrong
+			 *  reason without ever reaching the branch under test. */
+			offlineAgeOutMs = 3_600_000,
 		) {
 			return new ContainerLifecycle({
 				store,
 				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
 				idleStopMs: 300_000,
 				staleDestroyMs: 14 * 24 * 60 * 60_000,
-				offlineAgeOutMs: 3_600_000,
+				offlineAgeOutMs,
 				strandedSessionGraceMs: graceMs,
+				sessionNoProgressMs: noProgressMs,
 				logger,
 				now,
-				sessionReconciler: { isOnline: () => false, reconcile: async () => 1 },
+				sessionReconciler: { isOnline: () => online, reconcile: async () => 1 },
 			});
 		}
 
@@ -1529,6 +1536,304 @@ describe("ContainerLifecycle", () => {
 			await strandedLifecycle(aca, () => createdMs + PAST_GRACE_MS).sweep();
 
 			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+		});
+
+		it("reports a running, online sandbox whose session has made no progress for hours", async () => {
+			// NOR-402 / CAN-133. The agent posted its report and the session never
+			// went terminal, so affinity was never released. The sandbox stayed
+			// `state=running online=true sessions=1` for 5h17m with nothing routed to
+			// it — the exact shape the old detector excluded by definition, and the
+			// reason a severity-1 alert that named this failure could never fire.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-133", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-133", status: "running" }],
+			});
+			store.setSessionAffinity("fc6005cf", deviceId, undefined, createdMs);
+			// The agent worked, then fell silent. Everything after this is the
+			// router's own bookkeeping, which moves whether or not work happens.
+			store.markDeviceProgress(deviceId, createdMs + 2_400_000);
+			const noProgressMs = 3_600_000;
+			const now = createdMs + 2_400_000 + noProgressMs + 1;
+
+			await strandedLifecycle(
+				aca,
+				() => now,
+				600_000,
+				noProgressMs,
+				true,
+			).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")[0]).toMatchObject({
+				issue_key: "CAN-133",
+				device_id: deviceId,
+				provider: "aca",
+				reason: "no_progress",
+				state: "running",
+				online: true,
+				sessions: 1,
+				no_progress_for_ms: noProgressMs + 1,
+			});
+			expect(
+				logger.error.mock.calls.filter(([m]) =>
+					String(m).includes("has made no observable progress"),
+				),
+			).toHaveLength(1);
+		});
+
+		it("stays silent while the agent is still posting activities", async () => {
+			// A long turn is not a strand. The agent posts a thought or action for
+			// every step it takes, and each of those is an RPC through the router, so
+			// a genuinely busy session keeps its progress clock moving even though
+			// nothing is being routed TO it. Thresholding on `last_routed_age_ms`
+			// alone — which is what the gauge showed and what the ticket proposed —
+			// would report every long-running session in the fleet.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-134", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-134", status: "running" }],
+			});
+			store.setSessionAffinity("busy", deviceId, undefined, createdMs);
+			const noProgressMs = 3_600_000;
+			// Four hours in, still working: nothing routed since the session started,
+			// but the agent posted an activity a minute ago.
+			const now = createdMs + 4 * 3_600_000;
+			store.markDeviceProgress(deviceId, now - 60_000);
+
+			await strandedLifecycle(
+				aca,
+				() => now,
+				600_000,
+				noProgressMs,
+				true,
+			).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+			expect(logger.error).not.toHaveBeenCalled();
+		});
+
+		it("counts a routed event as progress, so a freshly prompted session is never reported", async () => {
+			const { deviceId, createdMs } = makeContainerDevice("CAN-135", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-135", status: "running" }],
+			});
+			store.setSessionAffinity("prompted", deviceId, undefined, createdMs);
+			const noProgressMs = 3_600_000;
+			const now = createdMs + 10 * 3_600_000;
+			// Never posted anything — but the router handed it an event a minute ago,
+			// so it has not had time to fail to make progress yet.
+			store.markDeviceRouted(deviceId, now - 60_000);
+
+			await strandedLifecycle(
+				aca,
+				() => now,
+				600_000,
+				noProgressMs,
+				true,
+			).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+		});
+
+		it("does not let the sweep's own pinned-tick stamp reset the progress clock", async () => {
+			// `markDeviceActive` fires on EVERY tick a device is pinned, so if the
+			// progress clock read it the detector would be reset by its own sweep and
+			// could never fire. This is the trap the whole `last_progress_ms` column
+			// exists to avoid.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-136", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-136", status: "running" }],
+			});
+			store.setSessionAffinity("stuck", deviceId, undefined, createdMs);
+			store.markDeviceProgress(deviceId, createdMs);
+			const noProgressMs = 3_600_000;
+			let now = createdMs + noProgressMs + 1;
+			const lifecycle = strandedLifecycle(
+				aca,
+				() => now,
+				600_000,
+				noProgressMs,
+				true,
+			);
+
+			await lifecycle.sweep();
+			now += 60_000;
+			await lifecycle.sweep();
+
+			// Both ticks report, despite each having stamped `last_active_ms`.
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(2);
+			expect(
+				store.getContainerDeviceForIssue("CAN-136")?.lastActiveMs,
+			).toBeGreaterThanOrEqual(createdMs + noProgressMs + 1);
+		});
+
+		it("does not report a session waiting on the longest possible scheduled wakeup, but does report CAN-133", async () => {
+			// The default threshold has one job the unit tests above cannot check,
+			// because they all pass an explicit one: separating a strand from a
+			// session that is DELIBERATELY idle. `completeSession` withholds the
+			// terminal signal while the runner reports pending work, so a session
+			// waiting on a wakeup keeps its affinity and posts nothing — identical
+			// to a strand from the router's side. `ScheduleWakeup` is clamped to an
+			// hour, so the default must clear that outright; a sev-1 page for a
+			// healthy waiting session is how a rule gets muted, which is the same
+			// failure NOR-402 is about, inverted.
+			const HOUR = 3_600_000;
+			function sweepAfter(issueKey: string, idleMs: number) {
+				const { deviceId, createdMs } = makeContainerDevice(issueKey, "aca");
+				const aca = fakeExecutor("aca", {
+					status: "running",
+					listStates: [{ issueKey, status: "running" }],
+				});
+				store.setSessionAffinity(issueKey, deviceId, undefined, createdMs);
+				store.markDeviceProgress(deviceId, createdMs);
+				return new ContainerLifecycle({
+					store,
+					executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+					idleStopMs: 300_000,
+					staleDestroyMs: 14 * 24 * 60 * 60_000,
+					offlineAgeOutMs: 3_600_000,
+					// sessionNoProgressMs deliberately OMITTED — the default is the
+					// thing under test.
+					logger,
+					now: () => createdMs + idleMs,
+					sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+				}).sweep();
+			}
+
+			// One device per sweep: the store outlives a single lifecycle, so a
+			// second device swept at a later clock would also re-sweep the first
+			// and the assertion would pass for the wrong reason.
+			await sweepAfter("WAKEUP-1H", HOUR + 1);
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+			store.deleteContainerDevice(
+				store.getContainerDeviceForIssue("WAKEUP-1H")!.deviceId,
+			);
+
+			// CAN-133 held its issue for 5h17m.
+			await sweepAfter("CAN-133-REAL", 5 * HOUR + 17 * 60_000);
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toMatchObject([
+				{ issue_key: "CAN-133-REAL", reason: "no_progress" },
+			]);
+		});
+
+		it("never advises `cyrus router unlock` without saying the router cannot tell a strand from a wait", async () => {
+			// Unlocking a session that is merely waiting on a wakeup strips the lock
+			// from a run that is about to resume, which manufactures the
+			// lock-without-affinity leak rather than fixing anything. The router
+			// cannot distinguish the two, so the remedy line must not assert that it
+			// can.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-140", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-140", status: "running" }],
+			});
+			store.setSessionAffinity("stuck", deviceId, undefined, createdMs);
+			store.markDeviceProgress(deviceId, createdMs);
+
+			await strandedLifecycle(
+				aca,
+				() => createdMs + 3_600_001,
+				600_000,
+				3_600_000,
+				true,
+			).sweep();
+
+			const line = String(logger.error.mock.calls[0]?.[0] ?? "");
+			expect(line).toContain("session.terminal_deferred");
+			expect(line).toContain("cannot tell these apart");
+			expect(line).not.toMatch(/never reached a terminal state,? so the issue/);
+		});
+
+		it("prefers the offline_pinned reason when both shapes hold", async () => {
+			// A stopped, offline, long-idle sandbox satisfies both rules. The offline
+			// one is the more specific diagnosis and the one with a known remedy, so
+			// it must win rather than produce two events for one device.
+			const { createdMs, aca } = strandedFixture("CAN-137", "stopped");
+
+			await strandedLifecycle(
+				aca,
+				() => createdMs + 10 * 3_600_000,
+				600_000,
+				3_600_000,
+				false,
+				100 * 3_600_000,
+			).sweep();
+
+			const events = eventsNamed(logger, "sandbox.stranded_session");
+			expect(events).toHaveLength(1);
+			expect(events[0]).toMatchObject({ reason: "offline_pinned" });
+		});
+
+		it("stays silent for a no-progress container with a terminal teardown pending", async () => {
+			const { deviceId, createdMs } = makeContainerDevice("CAN-138", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-138", status: "running" }],
+			});
+			store.setSessionAffinity("dying", deviceId, undefined, createdMs);
+			store.markDeviceProgress(deviceId, createdMs);
+			store.upsertPendingTeardown({
+				issueKey: "CAN-138",
+				deviceId,
+				action: "closed",
+				registeredMs: createdMs,
+				deadlineMs: createdMs + 600_000,
+			});
+
+			await strandedLifecycle(
+				aca,
+				() => createdMs + 10 * 3_600_000,
+				600_000,
+				3_600_000,
+				true,
+			).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+		});
+
+		it("re-logs the error line when a device's stranded reason changes", async () => {
+			// The once-per-entry latch is keyed on the reason, not just the device:
+			// a sandbox that goes from "no progress" to "stopped and offline" is a
+			// new diagnosis with a different remedy and must not be swallowed.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-139", "aca");
+			let state: "running" | "stopped" = "running";
+			const aca = fakeExecutor("aca", {
+				status: "stopped",
+				listStates: () => [{ issueKey: "CAN-139", status: state }],
+			});
+			store.setSessionAffinity("stuck", deviceId, undefined, createdMs);
+			store.markDeviceProgress(deviceId, createdMs);
+			let online = true;
+			let now = createdMs + 3_600_001;
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 100 * 3_600_000,
+				strandedSessionGraceMs: 600_000,
+				sessionNoProgressMs: 3_600_000,
+				logger,
+				now: () => now,
+				sessionReconciler: {
+					isOnline: () => online,
+					reconcile: async () => 1,
+				},
+			});
+
+			await lifecycle.sweep();
+			state = "stopped";
+			online = false;
+			now += 60_000;
+			await lifecycle.sweep();
+
+			const reasons = eventsNamed(logger, "sandbox.stranded_session").map(
+				(e) => e.reason,
+			);
+			expect(reasons).toEqual(["no_progress", "offline_pinned"]);
+			expect(logger.error.mock.calls).toHaveLength(2);
 		});
 
 		it("clears its once-only error latch when the sandbox recovers, so a recurrence is reported again", async () => {
