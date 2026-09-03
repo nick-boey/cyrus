@@ -386,7 +386,7 @@ lookup and silently returns null — so read them with bracket syntax:
 | `sandbox.boot_started` | the router asked a provider to boot or resume a sandbox |
 | `sandbox.running` | the provider reported it running (`transitioned` is false for a re-route that found it already up) |
 | `sandbox.boot_failed` | `ensureRunning` rejected; `reason` carries the message |
-| `sandbox.parked` | a session blocked on a user answer and released affinity |
+| `sandbox.parked` | a session blocked on a user answer and released affinity. Despite the name this is the **run** waiting, not a container stop — nothing is stopped here, and the container keeps running (and billing) until the idle sweep stops it as `sandbox.idle_stopped`. See [Observe agent runs](#observe-agent-runs) |
 | `sandbox.unparked` | a park was reversed and the agent went back to work |
 | `sandbox.idle_stopped` | the lifecycle sweep parked an affinity-free sandbox past `idleStopMs` |
 | `sandbox.destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
@@ -646,6 +646,11 @@ NOR-279     aca       alice@example.com 2026-08-…    2026-08-…  3d4h  6h13m 
 `AGE 3d4h` with `UPTIME 6h13m` is a three-day-old issue whose sandbox has been
 up continuously for six hours — not a sandbox that has been running for
 three days.
+
+`PARKED` renders `devices.parked_at_ms`, which is stamped when a *run* blocks on
+a user answer — so it measures how long the run has been waiting, not how long
+the container has been stopped. A row can show a `PARKED` duration while the
+container is still running; `UPTIME` is what says whether it is up.
 
 On every start, if the required variables are set the entrypoint regenerates
 `/data/router-config.json` from them. With no config variables set, an existing
@@ -1496,6 +1501,42 @@ means the outcome is unavailable, not necessarily that the work failed.
 The underlying `GET /runs` route uses the same device bearer token. A physical
 device token may query its owner's runs; a container token is restricted to its
 own issue. Query parameters are `issueKey`, `commentId`, and `since`.
+
+**An agent run waiting is not the same fact as its container being parked.** A
+run waits when it cannot progress until a stated condition changes — today the
+only such condition is an elicitation, a user decision the run explicitly asked
+for. A container is parked when it is stopped while idle to save money. They
+usually coincide, because a run that blocks on a user answer releases affinity
+and lets the idle sweep park the container, but either can happen without the
+other: a container is parked for plain idleness with no run waiting on anything,
+and a run on a physical device waits with no container to park. The wire and
+store still spell the waiting run state `parked`, which is the older name for
+it; [ADR-0012](adr/0012-run-observations-preserve-event-time-facts.md) replaces
+that with an explicitly worker-reported wait reason, and the rename lands with
+that work rather than here.
+
+Neither fact is a verdict. A waiting run has not failed and has not stalled, and
+elapsed waiting time is reported so callers can apply their own thresholds —
+`CONTEXT.md` fixes this vocabulary under *Waiting run*, *Elicitation*, and
+*Park*. The decisions behind the observability surface this route is growing
+into are recorded in
+[ADR-0009](adr/0009-separate-remote-observability-principals.md) (user and fleet
+operator are separate principals),
+[ADR-0010](adr/0010-clients-query-log-sources-described-by-router.md) (clients
+query the log source the router describes; logs are never proxied),
+[ADR-0011](adr/0011-one-cli-exposes-role-specific-command-profiles.md) (one CLI,
+role-specific command profiles),
+[ADR-0012](adr/0012-run-observations-preserve-event-time-facts.md),
+[ADR-0013](adr/0013-run-recovery-reconciles-ownership-before-releasing-it.md)
+(recovery reconciles ownership before releasing it),
+[ADR-0014](adr/0014-operator-http-capabilities-are-discovered-and-versioned.md)
+(operator HTTP capabilities are discovered and versioned),
+[ADR-0015](adr/0015-remote-operations-use-a-resource-interface-and-workflow-cli.md)
+(resource interface on the router, workflow CLI on the client), and
+[ADR-0016](adr/0016-run-watches-consume-durable-material-changes.md) (watches
+consume a durable change feed). They extend
+[ADR-0008](adr/0008-router-retains-agent-run-observations.md), which established
+that these observations report evidence rather than policy.
 
 ---
 

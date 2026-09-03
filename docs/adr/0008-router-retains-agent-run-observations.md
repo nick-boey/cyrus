@@ -17,6 +17,12 @@ work in an agent session. A run starts when input is routed, may move between
 a failure verdict. New input joins the current non-terminal run, while input
 after a terminal outcome starts a new run with a stable ID.
 
+The non-terminal `parked` state above is a **waiting run** — amended for
+CYR-63, which reserved *park* for stopping an idle container and named the
+run-level concept separately. The wire and store still spell it `parked`;
+[ADR-0012](0012-run-observations-preserve-event-time-facts.md) replaces it with
+an explicitly worker-reported wait reason.
+
 Each observation stores only correlation and lifecycle facts: issue and session
 IDs, Linear activity/comment IDs, routed and terminal times, the latest
 successfully published agent activity, executor kind/provider, worker heartbeat,
