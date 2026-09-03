@@ -1023,3 +1023,89 @@ describe("WorkspaceSyncService.stop bounded flush", () => {
 		}
 	});
 });
+
+/**
+ * NOR-411 follow-up. Terminal cleanup deletes the WIP snapshot ref, and
+ * `deleteWipSnapshot` drops the LOCAL ref first and unconditionally — which is
+ * precisely the state `captureWipSnapshot` reads to decide the remote is
+ * already up to date. So a capture landing after the reap does not merely race
+ * it: it is *guaranteed* to take the push branch and put the ref back on the
+ * remote, permanently, with nothing recorded as failed for `sweep()` to retry
+ * and no log line anywhere saying so.
+ *
+ * Stopping the runners does not close the window — `requestSessionStop` only
+ * sets a flag, the runner's real terminal arrives later and fires
+ * `syncIssueOnTermination` from a listener, and the 5-minute periodic tick
+ * keeps firing across the seconds-to-minutes that teardown scripts and
+ * `git worktree remove` take. The latch is what closes it.
+ */
+describe("WorkspaceSyncService.abandonIssue", () => {
+	it("stops a later terminal sync from re-pushing the snapshot the reaper just deleted", async () => {
+		const cyrusHome = mkCyrusHome();
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
+		stubFetchOk();
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService: {
+				captureWipSnapshot,
+				deriveWorktreeBranchName: vi.fn(() => "cypack-9-branch"),
+			},
+			logger: makeLogger(),
+		});
+
+		// The forced sync terminal cleanup performs before it reaps.
+		await service.syncIssue("CYPACK-9", { force: true });
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(1);
+
+		await service.abandonIssue("CYPACK-9");
+		expect(service.isAbandoned("CYPACK-9")).toBe(true);
+
+		// The runner's real terminal lands after the reap has already run.
+		await service.syncIssueOnTermination("CYPACK-9", "sess-1");
+		// ...as does the next periodic tick.
+		await service.syncIssue("CYPACK-9");
+		await service.syncIssue("CYPACK-9", { force: true });
+
+		// Still one — the capture from before the reap. Any further call would
+		// have re-created the ref on the remote.
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(1);
+	});
+
+	it("lifts the latch when a new session touches the issue, so a reopened issue is protected again", async () => {
+		const cyrusHome = mkCyrusHome();
+		const workspacePath = mkGitRepo();
+		writeState(cyrusHome, { "sess-1": makeSession("CYPACK-9", workspacePath) });
+
+		const captureWipSnapshot = vi.fn(async () => ({
+			status: "captured" as const,
+			commit: "deadbeef",
+		}));
+		stubFetchOk();
+		const service = new WorkspaceSyncService({
+			...baseOpts(cyrusHome),
+			gitService: {
+				captureWipSnapshot,
+				deriveWorktreeBranchName: vi.fn(() => "cypack-9-branch"),
+			},
+			logger: makeLogger(),
+		});
+
+		await service.abandonIssue("CYPACK-9");
+		await service.syncIssue("CYPACK-9");
+		expect(captureWipSnapshot).not.toHaveBeenCalled();
+
+		// The issue is reopened and a new session starts on it. A permanent
+		// latch would leave that session with no persistence floor at all.
+		service.touch("CYPACK-9", "sess-2");
+		expect(service.isAbandoned("CYPACK-9")).toBe(false);
+
+		await service.syncIssue("CYPACK-9");
+		expect(captureWipSnapshot).toHaveBeenCalledTimes(1);
+	});
+});

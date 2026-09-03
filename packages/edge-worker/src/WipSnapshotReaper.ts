@@ -1,5 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+// Pure ref-name helper only — the reaper stays decoupled from GitService
+// itself, which it reaches through the injected `deleteSnapshot` callback.
+import { wipSnapshotRef } from "./GitService.js";
 
 /** One `refs/cyrus-wip/<branch>` that still needs deleting from a remote. */
 interface PendingDeletion {
@@ -77,8 +80,15 @@ export class WipSnapshotReaper {
 			await this.deleteSnapshot(repoPath, branch);
 			this.forget(repoPath, branch);
 		} catch (error) {
+			// "It will be retried" was an overpromise. The retry needs a later
+			// `sweep()` in a process that can still read this state file, and in a
+			// container sandbox there is no such process: the file lives under
+			// `cyrusHome` inside the per-issue sandbox, and a failure here happens
+			// during the teardown that destroys it. Say what is actually recorded
+			// and name the manual remedy, so a log line that outlives the container
+			// is enough to act on.
 			this.logger.warn(
-				`WipSnapshotReaper: could not delete the WIP snapshot for ${branch} in ${repoPath} (${String(error)}); it will be retried`,
+				`WipSnapshotReaper: could not delete the WIP snapshot for ${branch} in ${repoPath} (${String(error)}); recorded for retry on the next sweep. If this checkout does not outlive the current teardown — it does not in a container sandbox — remove the ref by hand with \`git push origin --delete ${wipSnapshotRef(branch)}\``,
 			);
 			this.record(repoPath, branch);
 		}

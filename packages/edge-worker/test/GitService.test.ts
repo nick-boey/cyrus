@@ -949,7 +949,9 @@ describe("GitService", () => {
 
 			expect(mockRmSync).not.toHaveBeenCalled();
 			expect(mockLogger.warn).toHaveBeenCalledWith(
-				expect.stringContaining("had no repository to resolve that path from"),
+				expect.stringContaining(
+					"had no repository or recorded workspace path to resolve that path from",
+				),
 			);
 		});
 
@@ -1022,6 +1024,77 @@ describe("GitService", () => {
 				expect(mockLogger.info).toHaveBeenCalledWith(
 					expect.stringContaining(CREATED_PATH),
 				);
+			});
+
+			/**
+			 * Re-deriving the path is only correct while the configuration that
+			 * produced it is still the one on disk. An operator editing
+			 * `workspaceBaseDir` while issues are in flight — `EdgeWorker`
+			 * hot-reloads it — moves the derivation out from under a workspace
+			 * that is still there, and the miss then looks exactly like a
+			 * workspace that was already cleaned up. The path creation recorded
+			 * on the session has no such dependency, so it wins.
+			 */
+			it("prefers the path creation recorded over one re-derived from changed configuration", async () => {
+				const gitServiceUnderTest = makeContainerGitService();
+				mockExistsSync.mockImplementation(
+					(path: any) => String(path) === CREATED_PATH,
+				);
+				mockReaddirSync.mockReturnValue([] as any);
+
+				// The repository's workspaceBaseDir has since been repointed, so
+				// deriving now gives an answer that was never right for this
+				// workspace.
+				await gitServiceUnderTest.deleteWorktree("ENG-97", {
+					repositories: [
+						makeRepository({ workspaceBaseDir: "/somewhere/else" }),
+					],
+					recordedWorkspacePaths: [CREATED_PATH],
+				});
+
+				expect(mockRmSync).toHaveBeenCalledWith(CREATED_PATH, {
+					recursive: true,
+					force: true,
+				});
+				// And it says so, rather than deleting the right thing silently.
+				expect(mockLogger.warn).toHaveBeenCalledWith(
+					expect.stringContaining("differs from the one resolved"),
+				);
+			});
+
+			/**
+			 * `CreateGitWorktreeOptions.workspaceBaseDir` was honoured only by
+			 * the N-repo layout and silently discarded for a single repository,
+			 * while `DeleteWorktreeOptions` could not express it at all — so any
+			 * caller that started passing it would have reinstated exactly the
+			 * creation/teardown divergence this all exists to remove.
+			 */
+			it("honours a base-directory override on both creation and teardown", async () => {
+				const gitServiceUnderTest = makeContainerGitService();
+				mockExecSync.mockReturnValue(Buffer.from(""));
+				const OVERRIDE_BASE = "/custom/base";
+
+				const created = await gitServiceUnderTest.createGitWorktree(
+					makeIssue(),
+					[makeContainerRepo()],
+					{ workspaceBaseDir: OVERRIDE_BASE },
+				);
+				expect(created.path).toBe(`${OVERRIDE_BASE}/ENG-97`);
+
+				mockExistsSync.mockImplementation(
+					(path: any) => String(path) === created.path,
+				);
+				mockReaddirSync.mockReturnValue([] as any);
+
+				await gitServiceUnderTest.deleteWorktree("ENG-97", {
+					repositories: [makeContainerRepo()],
+					workspaceBaseDir: OVERRIDE_BASE,
+				});
+
+				expect(mockRmSync).toHaveBeenCalledWith(created.path, {
+					recursive: true,
+					force: true,
+				});
 			});
 		});
 

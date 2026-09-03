@@ -407,4 +407,48 @@ describe("GitService.deleteWipSnapshot", () => {
 			false,
 		);
 	});
+
+	/**
+	 * Terminal cleanup reaps from each repository's MAIN checkout, while the
+	 * capture that created the ref ran in the issue's linked WORKTREE (NOR-411).
+	 * That rests on two properties of git that nothing else here pins:
+	 * `refs/cyrus-wip/*` is a shared ref rather than a per-worktree one (only
+	 * `HEAD`, `refs/bisect/*`, `refs/worktree/*` and `refs/rewritten/*` are
+	 * per-worktree), and the deletion is a remote operation that any checkout
+	 * sharing the `origin` can perform.
+	 *
+	 * Every other test in this file captures and deletes from the same clone, so
+	 * a regression that made deletion worktree-local would pass all of them and
+	 * leak the ref in production — the exact shape of the original bug.
+	 */
+	it("deletes a snapshot captured in a linked worktree when reaping from the main checkout", async () => {
+		const { origin } = makeDirtyIssueWorkspace();
+		const service = newService();
+
+		// Exactly the production shape: the repository's main checkout sits on
+		// the base branch, and the issue's workspace is a linked worktree off it
+		// on the issue branch.
+		const clone = freshClone(origin, "main-checkout");
+		const worktree = join(clone, "..", "issue-worktree");
+		git(clone, ["worktree", "add", "-b", BRANCH, worktree]);
+		writeFileSync(join(worktree, "agent-work.txt"), "uncommitted\n");
+
+		await service.captureWipSnapshot(worktree, BRANCH);
+		expect(service.wipSnapshotExists(worktree, BRANCH)).toBe(true);
+		expect(git(origin, "for-each-ref --format=%(refname)")).toContain(
+			"cyrus-wip",
+		);
+
+		// Reap from the main checkout — a different working directory entirely.
+		await expect(service.deleteWipSnapshot(clone, BRANCH)).resolves.toBe(true);
+
+		// Gone from the remote, which is what actually costs every contributor...
+		expect(git(origin, "for-each-ref --format=%(refname)")).not.toContain(
+			"cyrus-wip",
+		);
+		// ...and gone locally as seen from BOTH checkouts, which is what proves
+		// the ref was shared rather than worktree-local.
+		expect(service.wipSnapshotExists(clone, BRANCH)).toBe(false);
+		expect(service.wipSnapshotExists(worktree, BRANCH)).toBe(false);
+	});
 });

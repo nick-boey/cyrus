@@ -59,6 +59,29 @@ export interface DeleteWorktreeOptions {
 	 * In multi-repo layouts, it is `<workspace>/<repository.name>/`.
 	 */
 	repositories?: RepositoryConfig[];
+	/**
+	 * Workspace paths as *recorded by creation* (`session.workspace.path`),
+	 * preferred over re-deriving them from `repositories`.
+	 *
+	 * Re-deriving is a reconstruction, and it is only correct while the
+	 * repository config that produced the path is still present and unchanged.
+	 * An operator editing `workspaceBaseDir` while issues are in flight, or a
+	 * repository being removed from the config, both move the derivation out
+	 * from under a workspace that is still on disk — which is NOR-411 again,
+	 * from a different direction. The recorded path is the authoritative
+	 * answer and is what `WorkspaceSyncService` already uses.
+	 *
+	 * Empty on a redelivered terminal webhook, where the sessions carrying it
+	 * are already gone; derivation is the fallback for exactly that case.
+	 */
+	recordedWorkspacePaths?: string[];
+	/**
+	 * The `workspaceBaseDir` override creation was given, if any. Without this,
+	 * teardown cannot express the `override` source at all, so any caller that
+	 * starts passing `CreateGitWorktreeOptions.workspaceBaseDir` silently
+	 * reinstates the creation/teardown divergence this all exists to remove.
+	 */
+	workspaceBaseDir?: string;
 }
 
 /** Timeout for repo setup scripts (cyrus-setup.*). */
@@ -1012,6 +1035,13 @@ export class GitService {
 	 * - **0 repos**: Creates a plain folder at `workspaceBaseDir/ISSUE-ID/` (no git worktree)
 	 * - **1 repo**: Git worktree directly at `repo.workspaceBaseDir/ISSUE-ID/` (preserves current behavior)
 	 * - **N repos**: Parent folder at `workspaceBaseDir/ISSUE-ID/` with per-repo worktree subdirs
+	 *
+	 * All three derive the workspace through {@link resolveIssueWorkspacePath},
+	 * which is also what {@link deleteWorktree} uses — that shared derivation is
+	 * the whole point (NOR-411), so a new creation path must go through it too.
+	 * `options.workspaceBaseDir` overrides the base directory on every one of
+	 * them; a caller that passes it must pass the same value to
+	 * `deleteWorktree`, which cannot otherwise know about it.
 	 */
 	async createGitWorktree(
 		issue: Issue,
@@ -1033,7 +1063,14 @@ export class GitService {
 					"workspaceBaseDir is required in options when no repositories are provided",
 				);
 			}
-			const workspacePath = join(baseDir, issue.identifier);
+			// Through the shared helper like every other creation path, so all
+			// four derive the workspace the same way and teardown's derivation
+			// cannot drift from any one of them.
+			const { path: workspacePath } = resolveIssueWorkspacePath({
+				issueIdentifier: issue.identifier,
+				cyrusHome: this.cyrusHome,
+				overrideBaseDir: baseDir,
+			});
 			mkdirSync(workspacePath, { recursive: true });
 			this.logger.info(
 				`Created plain workspace (no repos) at ${workspacePath}`,
@@ -1069,6 +1106,7 @@ export class GitService {
 				undefined,
 				overrideValue,
 				onRepoSetupHookEvent,
+				overrideBaseDir,
 			);
 		}
 
@@ -1145,6 +1183,11 @@ export class GitService {
 	 * single-repo and multi-repo cases.
 	 *
 	 * @param workspacePathOverride - Override the workspace path (used for N-repo subdirectories)
+	 * @param overrideBaseDir - Override the workspace *base* directory, i.e.
+	 *   `CreateGitWorktreeOptions.workspaceBaseDir`. Distinct from
+	 *   `workspacePathOverride`, which names the whole path. Forwarded so the
+	 *   1-repo path honours the option its own docstring promises; without it
+	 *   the option was silently discarded for every single-repo workspace.
 	 */
 	private async createSingleRepoWorktree(
 		issue: Issue,
@@ -1153,6 +1196,7 @@ export class GitService {
 		workspacePathOverride?: string,
 		baseBranchOverride?: string,
 		onRepoSetupHookEvent?: RepoSetupHookEventHandler,
+		overrideBaseDir?: string,
 	): Promise<Workspace> {
 		this.logger.info(
 			`createSingleRepoWorktree for ${repository.name} (id=${repository.id}): baseBranchOverride=${baseBranchOverride ?? "undefined"}`,
@@ -1186,6 +1230,7 @@ export class GitService {
 				issueIdentifier: issue.identifier,
 				cyrusHome: this.cyrusHome,
 				repositories: [repository],
+				overrideBaseDir,
 			});
 			const workspacePath = workspacePathOverride ?? resolvedWorkspace.path;
 
@@ -1472,6 +1517,7 @@ export class GitService {
 					issueIdentifier: issue.identifier,
 					cyrusHome: this.cyrusHome,
 					repositories: [repository],
+					overrideBaseDir,
 				}).path;
 			mkdirSync(fallbackPath, { recursive: true });
 			return {
@@ -1512,8 +1558,27 @@ export class GitService {
 			issueIdentifier,
 			cyrusHome: this.cyrusHome,
 			repositories: options.repositories,
+			overrideBaseDir: options.workspaceBaseDir,
 		});
-		const workspacePath = resolved.path;
+
+		// Creation's own answer wins over re-deriving it. The derivation is only
+		// as good as the repository config still being the one that produced the
+		// path — an operator editing `workspaceBaseDir` mid-flight, or a
+		// repository leaving the config, moves it out from under a workspace
+		// that is still on disk, and the miss then looks exactly like a
+		// workspace that was already cleaned up.
+		const recorded = (options.recordedWorkspacePaths ?? []).filter(Boolean);
+		const recordedOnDisk = recorded.find((path) => existsSync(path));
+		const workspacePath = recordedOnDisk ?? resolved.path;
+
+		if (recordedOnDisk && recordedOnDisk !== resolved.path) {
+			// Loud on purpose: the two disagreed, the recorded one existed, and
+			// deriving alone would have deleted nothing and said "nothing to
+			// delete". That is the NOR-411 failure mode with a different cause.
+			this.logger.warn(
+				`Workspace path for ${issueIdentifier} recorded at creation (${recordedOnDisk}) differs from the one resolved from configuration now (${resolved.path}, from ${resolved.source}). Using the recorded path — the repository's workspaceBaseDir has probably changed since this workspace was created.`,
+			);
+		}
 
 		if (!existsSync(workspacePath)) {
 			// "Nothing to delete" reads as benign, and for a workspace that was
@@ -1524,14 +1589,23 @@ export class GitService {
 			// message says where the path came from, so it always does — and
 			// says so at `warn` when it came from the fallback, which is the one
 			// case where nothing here knows whether the path was even right.
+			if (recorded.length > 0) {
+				// The strongest "already cleaned up" there is: creation told us
+				// where it put the workspace and nothing is there. No derivation
+				// was involved, so there is nothing to be wrong about.
+				this.logger.info(
+					`Worktree directory does not exist for ${issueIdentifier} at the path creation recorded (${recorded.join(", ")}), nothing to delete`,
+				);
+				return;
+			}
 			if (resolved.source === "default") {
 				this.logger.warn(
-					`Found no worktree for ${issueIdentifier} at ${workspacePath}, and had no repository to resolve that path from — it is the default worktrees directory, not necessarily where this issue's workspace was created. If its repository configures a custom workspaceBaseDir, the worktree has NOT been cleaned up.`,
+					`Found no worktree for ${issueIdentifier} at ${workspacePath}, and had no repository or recorded workspace path to resolve that path from — it is the default worktrees directory, not necessarily where this issue's workspace was created. If its repository configures a custom workspaceBaseDir, the worktree has NOT been cleaned up.`,
 				);
 				return;
 			}
 			this.logger.info(
-				`Worktree directory does not exist for ${issueIdentifier} at ${workspacePath} (resolved from the repository's workspaceBaseDir ${resolved.baseDir}), nothing to delete`,
+				`Worktree directory does not exist for ${issueIdentifier} at ${workspacePath} (resolved from the ${resolved.source === "override" ? "supplied override base directory" : "repository's workspaceBaseDir"} ${resolved.baseDir}), nothing to delete`,
 			);
 			return;
 		}

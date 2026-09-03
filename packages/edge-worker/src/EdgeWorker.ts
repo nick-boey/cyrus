@@ -4031,6 +4031,36 @@ ${taskSection}`;
 			force: true,
 		});
 
+		// That was the last snapshot this issue gets. From here the WIP refs are
+		// terminal cleanup's to delete, and a capture landing after the reap
+		// would not merely race it — `deleteWipSnapshot` drops the LOCAL ref
+		// unconditionally, and that local ref is exactly what `captureWipSnapshot`
+		// reads to decide the remote is already current, so the next capture is
+		// GUARANTEED to push the ref back. It would then look like a success on
+		// both sides: nothing recorded as failed for `sweep()` to retry, and the
+		// ref back on the remote permanently. Stopping the runners above does not
+		// prevent this (`requestSessionStop` only sets a flag; the runner's real
+		// terminal arrives later and fires `syncIssueOnTermination` from a
+		// listener), and the 5-minute periodic tick keeps firing across the
+		// seconds-to-minutes that teardown scripts and `git worktree remove`
+		// take. Awaits any capture already in flight before returning.
+		await this.workspaceSync?.abandonIssue(message.workItemIdentifier);
+
+		// The path creation actually returned, recorded on the session and
+		// captured before `removeSession` erases it. Re-deriving it from config
+		// is a reconstruction — correct only while the repository config that
+		// produced it is still present and unchanged — whereas this is the
+		// authoritative answer, and is what `WorkspaceSyncService` already uses.
+		// `deleteWorktree` falls back to re-deriving when this is empty, which is
+		// the redelivered-webhook case.
+		const recordedWorkspacePaths = [
+			...new Set(
+				sessions
+					.map((session) => session.workspace?.path)
+					.filter((path): path is string => Boolean(path)),
+			),
+		];
+
 		// Post a response activity to each stopped session's Linear thread,
 		// then remove the session so subsequent prompts don't find stale state.
 		for (const session of sessions) {
@@ -4106,30 +4136,45 @@ ${taskSection}`;
 				// looking for a worktree at a path that was reconstructed
 				// rather than resolved, which is how every container sandbox
 				// ended up reaping a directory that had never existed
-				// (NOR-411). And the path outlives this teardown, so the
-				// reaper's durable retry is actually retryable: `sweep()`
-				// discards any entry whose path has since disappeared, which a
-				// worktree always has by the time the next sweep runs. Each
-				// repository carries its own snapshot under the same ref name,
-				// so every one of them has to be deleted.
+				// (NOR-411). And the path outlives this teardown, so `sweep()`
+				// — which discards any entry whose path has since disappeared,
+				// as a worktree always has by the next sweep — can still retry
+				// it. Each repository carries its own snapshot under the same
+				// ref name, so every one of them has to be deleted.
+				//
+				// That retry is a PHYSICAL-DEVICE guarantee only, and it is
+				// worth being exact about because the mode this bug was
+				// reported from is the one it does not cover. The reaper's
+				// durable file lives under `cyrusHome`, which in a container
+				// sandbox is `$CYRUS_WORKSPACES_DIR/.cyrus` — inside the same
+				// per-issue sandbox as `repositoryPath`, and this handler is
+				// the last thing that sandbox does before it is destroyed. A
+				// sandbox serves one issue, so neither trigger for `sweep()`
+				// (the next terminal teardown, or process start) ever fires for
+				// it again. A remote that is unreachable for the duration of a
+				// container teardown therefore still leaks the ref, and the
+				// only signal is the reaper's warning in logs that outlive the
+				// container.
 				for (const repository of teardownRepositories) {
 					await this.wipSnapshotReaper.reap(
 						repository.repositoryPath,
 						branchName,
 					);
 				}
-				// Same trip, same remotes: retry anything a previous teardown
-				// failed to delete, so one unreachable remote at the wrong
-				// moment doesn't leak a ref permanently.
-				await this.wipSnapshotReaper.sweep();
 			} else if (sessions.length === 0) {
 				// A redelivered terminal webhook: the first delivery removed the
-				// sessions, and with them the only source of a branch name. It
-				// also already reaped, so there is nothing owed here — the
-				// repositories are still worth carrying for the worktree
-				// deletion below, which is what an idempotent replay is for.
-				this.logger.info(
-					`No sessions remain for ${message.workItemIdentifier}; its WIP snapshots were reaped on an earlier delivery`,
+				// sessions, and with them the only source of a branch name. The
+				// repositories are still worth carrying for the worktree deletion
+				// below, which is what an idempotent replay is for.
+				//
+				// Deliberately NOT phrased as "already reaped on an earlier
+				// delivery". Nothing records that a reap SUCCEEDED — the reaper's
+				// durable file records only failures — so that would be an
+				// assumption stated as fact, and stating it at `info` is the same
+				// benign-looking silent miss this issue was about on the worktree
+				// half. Say what is actually known instead.
+				this.logger.warn(
+					`No sessions remain for ${message.workItemIdentifier}, so there is no branch name to derive and its WIP snapshots cannot be reaped on this delivery. If an earlier delivery did not complete the reap, any refs/cyrus-wip/* for this issue are still on its remotes and must be removed by hand`,
 				);
 			} else {
 				// No session carries any issue data at all (e.g. only
@@ -4140,11 +4185,29 @@ ${taskSection}`;
 					`Skipping WIP snapshot deletion for ${message.workItemIdentifier}: no session has issue data to derive a branch name from`,
 				);
 			}
+		} else {
+			// Neither a live session nor the cached routing decision knows which
+			// repositories this issue used, so there is no remote to delete from.
+			// Reachable on a cold container that restored no state (the router
+			// 404s the floor bundle) while the remote still carries refs the
+			// sandbox's previous incarnation pushed. Previously this skipped the
+			// whole block with no output at all.
+			this.logger.warn(
+				`Skipping WIP snapshot deletion for ${message.workItemIdentifier}: no repository is known for this issue, from either a live session or the cached routing decision, so any refs/cyrus-wip/* it has must be removed by hand`,
+			);
 		}
+
+		// Unconditional, and outside every branch above: this retries snapshots
+		// that a PREVIOUS teardown failed to delete, which has nothing to do with
+		// whether this issue got as far as reaping its own. Gating it on the reap
+		// branch meant the one delivery that admits it is a retry — a redelivered
+		// webhook with no sessions left — was also the one that declined to retry.
+		await this.wipSnapshotReaper.sweep();
 
 		// Delete worktrees for this issue, keyed by the Linear issue identifier.
 		await this.gitService.deleteWorktree(message.workItemIdentifier, {
 			repositories: teardownRepositories,
+			recordedWorkspacePaths,
 		});
 
 		// Last by design: provider destruction is only safe after all in-container

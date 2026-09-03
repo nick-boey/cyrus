@@ -149,7 +149,15 @@ describe("EdgeWorker terminal teardown ordering", () => {
 					expect(options).toEqual({ force: true });
 					order.push("force-sync");
 				},
+				// Must land immediately after the forced sync and before the reap:
+				// after this point a capture would re-push the ref the reaper is
+				// about to delete, because deleteWipSnapshot drops the local ref
+				// that captureWipSnapshot uses as its "already current" check.
+				abandonIssue: async () => {
+					order.push("abandon-sync");
+				},
 			},
+			wipSnapshotReaper: { reap: vi.fn(), sweep: vi.fn() },
 			sessionRepositories: new Map(),
 			getCachedRepositories: () => null,
 			repositories: new Map(),
@@ -195,6 +203,7 @@ describe("EdgeWorker terminal teardown ordering", () => {
 			"request-stop",
 			"runner-stop",
 			"force-sync",
+			"abandon-sync",
 			"response",
 			"remove-session",
 			"delete-worktree",
@@ -279,6 +288,7 @@ describe("EdgeWorker terminal teardown ordering", () => {
 					id: "sess-1",
 					issue: { identifier: "CAN-129", branchName: "cyrus1/can-129-do-it" },
 					agentRunner: { stop: vi.fn() },
+					workspace: { path: "/workspaces/CAN-129", isGitWorktree: true },
 				},
 			],
 			sessionRepositories: new Map([["sess-1", "repo-a"]]),
@@ -293,7 +303,12 @@ describe("EdgeWorker terminal teardown ordering", () => {
 		]);
 		expect(fakeWorker.gitService.deleteWorktree).toHaveBeenCalledWith(
 			"CAN-129",
-			{ repositories: [REPO_A] },
+			{
+				repositories: [REPO_A],
+				// The path creation actually returned, carried through from the
+				// session rather than re-derived from configuration.
+				recordedWorkspacePaths: ["/workspaces/CAN-129"],
+			},
 		);
 	});
 
@@ -346,12 +361,20 @@ describe("EdgeWorker terminal teardown ordering", () => {
 
 		expect(fakeWorker.gitService.deleteWorktree).toHaveBeenCalledWith(
 			"CAN-129",
-			{ repositories: [REPO_A] },
+			{ repositories: [REPO_A], recordedWorkspacePaths: [] },
 		);
-		// Nothing left to derive a branch name from, and the first delivery
-		// already reaped — so this is a no-op, not a warning.
+		// Nothing left to derive a branch name from, so nothing is reaped on
+		// this delivery. That is reported at `warn` naming the manual remedy,
+		// NOT as a reassuring "already reaped earlier" — nothing records that a
+		// reap ever succeeded (the reaper's durable file records only failures),
+		// so the reassurance would have been an assumption stated as fact.
 		expect(reaped).toEqual([]);
-		expect(fakeWorker.logger.warn).not.toHaveBeenCalled();
+		expect(fakeWorker.logger.warn).toHaveBeenCalledWith(
+			expect.stringContaining("cannot be reaped on this delivery"),
+		);
+		// The retry of PREVIOUSLY-failed deletions is unrelated to whether this
+		// issue reached its own reap, so it still runs on the redelivery path.
+		expect(fakeWorker.wipSnapshotReaper.sweep).toHaveBeenCalledTimes(1);
 	});
 
 	it("skips the callback queue entirely outside router platform mode", async () => {
@@ -367,6 +390,7 @@ describe("EdgeWorker terminal teardown ordering", () => {
 			sessionRepositories: new Map(),
 			getCachedRepositories: () => null,
 			repositories: new Map(),
+			wipSnapshotReaper: { reap: vi.fn(), sweep: vi.fn() },
 			gitService: {
 				deleteWorktree: async () => {
 					order.push("delete-worktree");
