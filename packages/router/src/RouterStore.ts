@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS issue_affinity (
 CREATE TABLE IF NOT EXISTS issue_locks (
   issue_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, device_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS session_ownership_grace (
+  session_id TEXT PRIMARY KEY, device_id INTEGER NOT NULL, expires_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS webhook_claims (
   idempotency_key TEXT PRIMARY KEY, claimed_ms INTEGER NOT NULL
 );
@@ -526,6 +529,12 @@ interface IssueLockRow {
 	device_id: number;
 }
 
+interface SessionOwnershipGraceRow {
+	session_id: string;
+	device_id: number;
+	expires_ms: number;
+}
+
 /**
  * Which repositories an issue routes to, decided once by the router and reused
  * for every later event on that issue.
@@ -911,7 +920,8 @@ export class RouterStore {
 	/**
 	 * Deletes all rows keyed by device_id in the tables that have no foreign
 	 * key back to `devices` (session_affinity, issue_affinity, issue_locks,
-	 * rpc_mutations). Callers that delete or replace a device row (directly
+	 * session_ownership_grace, rpc_mutations). Callers that delete or replace a
+	 * device row (directly
 	 * or via cascading a user delete) MUST call this first/atomically so
 	 * those rows don't strand pointing at a device_id that no longer exists.
 	 */
@@ -930,6 +940,11 @@ export class RouterStore {
 			.run(deviceId);
 		this.db
 			.prepare("DELETE FROM session_affinity WHERE device_id = ?")
+			.run(deviceId);
+		// A revoked/replaced device must lose its post-terminal grace too, or a
+		// stale row would keep authorizing RPCs for a device_id that is gone.
+		this.db
+			.prepare("DELETE FROM session_ownership_grace WHERE device_id = ?")
 			.run(deviceId);
 		this.db
 			.prepare("DELETE FROM rpc_mutations WHERE device_id = ?")
@@ -1692,6 +1707,35 @@ export class RouterStore {
 	}
 
 	/**
+	 * The device and state of the most recent run recorded for a session.
+	 *
+	 * Exists to tell a REPLAY apart from an intrusion on the terminal frame.
+	 * `RouterServer` applies a `session_state` frame before acking it, so a
+	 * device that dies in between replays a frame the router already applied —
+	 * and once the posting grace has lapsed that replay arrives owning nothing,
+	 * looking exactly like a device reporting a terminal state for someone
+	 * else's session. The run row remembers which device the session actually
+	 * belonged to for as long as the row survives retention, which is far longer
+	 * than any grace, so it can answer the question the ownership routes no
+	 * longer can.
+	 *
+	 * Ordered the same way {@link finishAgentRun} orders it, so both see the same
+	 * row for a session that has been routed more than once.
+	 */
+	getLatestAgentRunForSession(
+		sessionId: string,
+	): { deviceId: number; state: string } | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT device_id, state FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
+			)
+			.get(sessionId) as Pick<AgentRunRow, "device_id" | "state"> | undefined;
+		return row === undefined
+			? undefined
+			: { deviceId: row.device_id, state: row.state };
+	}
+
+	/**
 	 * The most recent moment the router observed anything about an agent run on
 	 * this device — a worker activity, or a run ending.
 	 *
@@ -2407,6 +2451,131 @@ export class RouterStore {
 		this.db
 			.prepare("DELETE FROM issue_locks WHERE session_id = ?")
 			.run(sessionId);
+	}
+
+	/**
+	 * The device holding the issue lock taken out on behalf of `sessionId`, if
+	 * any. Distinct from {@link getSessionAffinity}: the lock models "this device
+	 * owns this issue's work" and deliberately SURVIVES a park, whereas affinity
+	 * is released the moment the worker parks. Session-scoped RPC authorization
+	 * reads this so a parked session's activities are not rejected (NOR-405).
+	 */
+	getIssueLockDeviceForSession(sessionId: string): number | undefined {
+		const row = this.db
+			.prepare("SELECT device_id FROM issue_locks WHERE session_id = ?")
+			.get(sessionId) as Pick<IssueLockRow, "device_id"> | undefined;
+		return row?.device_id;
+	}
+
+	/**
+	 * Records that `deviceId` may keep making session-scoped calls for
+	 * `sessionId` until `expiresMs`, even though it holds neither affinity nor
+	 * the issue lock any more.
+	 *
+	 * This exists for exactly one window: the terminal frame releases the lock
+	 * AND affinity in the same call, but a worker's last activities — typically
+	 * the completion summary the user most wants to see — are still in flight
+	 * when it lands. Bounded rather than permanent: a session that keeps
+	 * emitting long after it completed is the bug in NOR-405's title, not
+	 * something to authorize forever.
+	 */
+	grantSessionOwnershipGrace(
+		sessionId: string,
+		deviceId: number,
+		expiresMs: number,
+	): void {
+		this.db
+			.prepare(
+				`INSERT INTO session_ownership_grace (session_id, device_id, expires_ms)
+				 VALUES (?, ?, ?)
+				 ON CONFLICT(session_id) DO UPDATE SET
+					device_id = excluded.device_id,
+					expires_ms = excluded.expires_ms`,
+			)
+			.run(sessionId, deviceId, expiresMs);
+	}
+
+	/**
+	 * The device still inside its post-terminal grace for `sessionId`, or
+	 * `undefined` if there is none or it has lapsed. Expired rows are deleted on
+	 * read: the read is the only thing that cares about them, so there is no
+	 * separate sweep to fall behind.
+	 */
+	getSessionOwnershipGrace(
+		sessionId: string,
+		nowMs: number = Date.now(),
+	): number | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT device_id, expires_ms FROM session_ownership_grace WHERE session_id = ?",
+			)
+			.get(sessionId) as
+			| Pick<SessionOwnershipGraceRow, "device_id" | "expires_ms">
+			| undefined;
+		if (!row) return undefined;
+		if (row.expires_ms <= nowMs) {
+			this.db
+				.prepare("DELETE FROM session_ownership_grace WHERE session_id = ?")
+				.run(sessionId);
+			return undefined;
+		}
+		return row.device_id;
+	}
+
+	clearSessionOwnershipGrace(sessionId: string): void {
+		this.db
+			.prepare("DELETE FROM session_ownership_grace WHERE session_id = ?")
+			.run(sessionId);
+	}
+
+	/**
+	 * Bounded retention for lapsed grace rows.
+	 *
+	 * {@link getSessionOwnershipGrace} already deletes a row it finds expired, so
+	 * this is not needed for authorization to be correct — but that read only
+	 * happens when the session id comes up again, and the overwhelmingly common
+	 * case is a session that completes and is never asked about. Without a sweep
+	 * every terminal session leaves a permanent row, and `StateBackup` pays for
+	 * all of them on every upload. Same reasoning as `sweepWebhookClaims`.
+	 */
+	sweepSessionOwnershipGrace(cutoffMs: number): number {
+		return this.db
+			.prepare("DELETE FROM session_ownership_grace WHERE expires_ms <= ?")
+			.run(cutoffMs).changes;
+	}
+
+	/**
+	 * The device entitled to act on `sessionId`, or `undefined` if no device is.
+	 *
+	 * THE single definition of session ownership, deliberately in one place: it
+	 * is read both by {@link LinearExecutor} to authorize a session-scoped RPC
+	 * and by {@link EventRouter} to decide whether a device may be granted a
+	 * post-terminal grace. Those two must never disagree — a device that can be
+	 * granted ownership it does not have is an escalation, not a lenient check.
+	 *
+	 * The same rule binds every branch of `handleSessionState`, not only the
+	 * grants: `parked` records an in-memory authorization for the later `active`
+	 * frame, and `active` writes affinity — the strongest route here — so both
+	 * are gated too. Ungating either one re-opens the escalation in two frames
+	 * rather than one.
+	 *
+	 * The three routes, and why one is not enough:
+	 *  - **affinity**: the session is actively routed here. Cleared on park.
+	 *  - **the issue lock**: survives a park, which is the whole reason the park
+	 *    path retains it. Absent entirely when `config.issueLock` is off.
+	 *  - **a bounded grace**: covers the windows the other two cannot — a park on
+	 *    a deployment without issue locking, and the terminal frame, which drops
+	 *    both of the above while the worker's closing summary is in flight.
+	 */
+	getSessionOwner(
+		sessionId: string,
+		nowMs: number = Date.now(),
+	): number | undefined {
+		return (
+			this.getSessionAffinity(sessionId) ??
+			this.getIssueLockDeviceForSession(sessionId) ??
+			this.getSessionOwnershipGrace(sessionId, nowMs)
+		);
 	}
 
 	/**
