@@ -1,4 +1,7 @@
-import type { AgentRunObservation, AgentRunsResponse } from "cyrus-router";
+import type {
+	AgentRunObservation,
+	AgentRunsResponse,
+} from "cyrus-operator-protocol";
 import type { Application } from "../Application.js";
 import { BaseCommand } from "./ICommand.js";
 

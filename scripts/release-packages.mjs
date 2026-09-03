@@ -55,6 +55,12 @@ export const releasePackages = [
 	// consumers: edge-worker depends on router-client and workspace-sync, and
 	// apps/cli on router and workspace-sync.
 	{ directory: "packages/router-protocol", name: "cyrus-router-protocol" },
+	// The operator wire contract is depended on by BOTH router and apps/cli, so
+	// it precedes both. It depends on nothing in the workspace.
+	{
+		directory: "packages/operator-protocol",
+		name: "cyrus-operator-protocol",
+	},
 	{ directory: "packages/router-executors", name: "cyrus-router-executors" },
 	{ directory: "packages/workspace-sync", name: "cyrus-workspace-sync" },
 	{ directory: "packages/router-client", name: "cyrus-router-client" },

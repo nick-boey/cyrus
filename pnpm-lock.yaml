@@ -93,6 +93,9 @@ importers:
       cyrus-edge-worker:
         specifier: workspace:*
         version: link:../../packages/edge-worker
+      cyrus-operator-protocol:
+        specifier: workspace:*
+        version: link:../../packages/operator-protocol
       cyrus-otel-logs:
         specifier: workspace:*
         version: link:../../packages/otel-logs
@@ -616,6 +619,22 @@ importers:
         specifier: ^3.1.4
         version: 3.2.7(@types/node@20.19.43)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0)
 
+  packages/operator-protocol:
+    dependencies:
+      zod:
+        specifier: 4.3.6
+        version: 4.3.6
+    devDependencies:
+      '@types/node':
+        specifier: ^20.19.43
+        version: 20.19.43
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^4.1.10
+        version: 4.1.10(@opentelemetry/api@1.9.1)(@types/node@20.19.43)(@vitest/coverage-v8@4.1.10)(@vitest/ui@4.1.10)(vite@8.0.16(@types/node@20.19.43)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0))
+
   packages/otel-logs:
     dependencies:
       '@opentelemetry/api':
@@ -695,6 +714,9 @@ importers:
       cyrus-linear-event-transport:
         specifier: workspace:*
         version: link:../linear-event-transport
+      cyrus-operator-protocol:
+        specifier: workspace:*
+        version: link:../operator-protocol
       cyrus-otel-logs:
         specifier: workspace:*
         version: link:../otel-logs

@@ -1,36 +1,22 @@
-import type { FastifyInstance } from "fastify";
 import type {
-	AgentRunInfo,
-	AgentRunInput,
-	AgentRunState,
-	RouterStore,
-} from "./RouterStore.js";
+	AgentRunObservation,
+	AgentRunsResponse,
+} from "cyrus-operator-protocol";
+import type { FastifyInstance } from "fastify";
+import type { AgentRunInfo, RouterStore } from "./RouterStore.js";
 import type { SandboxGaugeState } from "./SandboxTelemetry.js";
 
 const ISSUE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
-export interface AgentRunObservation {
-	runId: string;
-	issueKey: string;
-	sessionId: string;
-	state: AgentRunState;
-	startedAt: string;
-	lastRoutedAt: string;
-	lastAgentActivityAt?: string;
-	endedAt?: string;
-	inputs: Array<Omit<AgentRunInput, "routedMs"> & { routedAt: string }>;
-	executorKind: "device" | "container";
-	provider?: string;
-	workerOnline: boolean;
-	lastHeartbeatAt?: string;
-	sandboxState?: SandboxGaugeState;
-	sandboxStateObservedAt?: string;
-}
-
-export interface AgentRunsResponse {
-	observedAt: string;
-	runs: AgentRunObservation[];
-}
+/**
+ * The wire shape of this route now lives in `cyrus-operator-protocol` so the
+ * CLI can consume it without importing a router implementation module. It is
+ * re-exported here so existing importers of `cyrus-router` keep working, and
+ * `observeRun` below is annotated with it — which is what makes a drift
+ * between the router's own `AgentRunState`/`SandboxGaugeState` unions and the
+ * published contract a compile error rather than a silent wire change.
+ */
+export type { AgentRunObservation, AgentRunsResponse };
 
 export interface RegisterRunsRouteOptions {
 	isDeviceOnline(deviceId: number): boolean;
