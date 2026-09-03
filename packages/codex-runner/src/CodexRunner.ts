@@ -10,6 +10,7 @@ import type {
 import { CodexEventMapper, type MapperContext } from "./CodexEventMapper.js";
 import { CodexSkillStager } from "./CodexSkillStager.js";
 import { CodexConfigBuilder } from "./config/CodexConfigBuilder.js";
+import { assertCodexCredentialAvailable } from "./config/codexCredentials.js";
 import { CodexMessageFormatter } from "./formatter.js";
 import type {
 	CodexRunnerConfig,
@@ -160,15 +161,23 @@ export class CodexRunner extends EventEmitter implements IAgentRunner {
 		this.backend = backend;
 		backend.on("event", (event) => this.handleBackendEvent(event));
 
-		const resolved = await new CodexConfigBuilder(this.config).build();
-		this.skillStager.stage();
-
 		const input: CodexUserInput[] = prompt?.trim()
 			? [{ type: "text", text: prompt.trim() }]
 			: [];
 
 		let caughtError: unknown;
 		try {
+			// Inside the try, so a configuration or credential failure is finalized
+			// into an error result message the timeline renders — rather than
+			// escaping `start()` as a raw rejection that the caller only logs,
+			// which a user experiences as a session that silently never began.
+			const resolved = await new CodexConfigBuilder(this.config).build();
+			assertCodexCredentialAvailable({
+				codexHome: resolved.codexHome,
+				env: resolved.env,
+			});
+			this.skillStager.stage();
+
 			await backend.open(resolved);
 			await backend.runTurn(input);
 		} catch (error) {

@@ -1,5 +1,28 @@
 import type { EdgeWorkerConfig, RunnerType } from "cyrus-core";
 
+/**
+ * Codex's built-in default, when neither config nor an issue-level selector
+ * names a model. One constant rather than four literals: the `/setup` picker,
+ * this service and `cyrus-codex-runner`'s `DEFAULT_CODEX_MODEL` are three
+ * independent copies of the same decision, and CYR-79 found them disagreeing.
+ */
+const CODEX_DEFAULT_MODEL = "gpt-5.6-sol";
+
+/**
+ * What a failed Codex model resolves to.
+ *
+ * `gpt-5.5` rather than the older `gpt-5.2-codex` this used to be: under the
+ * ChatGPT-subscription auth Cyrus mandates (ADR 0005), OpenAI rejected
+ * `gpt-5.2-codex` outright on a live account, so the fallback was a name that
+ * could only ever fail for the credential most sessions run on. `gpt-5.5` is
+ * the name that probe actually answered on.
+ *
+ * Note the fallback only ever applies in `OPENAI_API_KEY` mode anyway —
+ * `CodexConfigBuilder`'s 404 probe returns early without a key — which is
+ * exactly why the wrong value here went unnoticed.
+ */
+const CODEX_FALLBACK_MODEL = "gpt-5.5";
+
 const isOpenCodeProviderModel = (model: string): boolean =>
 	/^[a-z0-9_.-]+\/[a-z0-9_.:/-]+$/i.test(model);
 
@@ -70,7 +93,11 @@ export class RunnerSelectionService {
 		if (runnerType === "opencode") {
 			return this.config.opencodeDefaultModel;
 		}
-		return this.config.codexDefaultModel || "gpt-5.5";
+		// Kept in step with the `/setup` picker's preferred Codex model
+		// (`RUNNER_CATALOG` in `packages/router/src/setup/runnerDefaults.ts`) and
+		// with `DEFAULT_CODEX_MODEL` in `cyrus-codex-runner`. When these disagree,
+		// a container whose picker said one thing silently runs another.
+		return this.config.codexDefaultModel || CODEX_DEFAULT_MODEL;
 	}
 
 	/**
@@ -91,7 +118,7 @@ export class RunnerSelectionService {
 			return "gemini-2.5-flash";
 		}
 		if (runnerType === "codex") {
-			return "gpt-5.2-codex";
+			return CODEX_FALLBACK_MODEL;
 		}
 		if (runnerType === "cursor") {
 			return this.config.cursorDefaultFallbackModel || "composer-2";
@@ -99,7 +126,7 @@ export class RunnerSelectionService {
 		if (runnerType === "opencode") {
 			return this.config.opencodeDefaultFallbackModel;
 		}
-		return "gpt-5";
+		return CODEX_FALLBACK_MODEL;
 	}
 
 	/**
@@ -269,10 +296,11 @@ export class RunnerSelectionService {
 			if (runnerType === "opencode") {
 				return defaultFallbackByRunner.opencode;
 			}
-			if (isCodexModel(normalizedModel)) {
-				return "gpt-5.2-codex";
-			}
-			return "gpt-5";
+			// Codex, and anything that reached here without a runner claiming it.
+			// The two used to differ (`gpt-5.2-codex` vs `gpt-5`); both were names
+			// OpenAI rejects under subscription auth, so there was nothing to
+			// preserve in the distinction.
+			return CODEX_FALLBACK_MODEL;
 		};
 
 		const resolveRunnerFromName = (name?: string): RunnerType | undefined => {

@@ -54,9 +54,14 @@ export const REQUIRED_ENV_VARS = [
  *
  * Codex requires nothing at this layer: its credential arrives as
  * `CODEX_AUTH_JSON` (a router-minted subscription token, ADR 0005) or as
- * `OPENAI_API_KEY`, and the router has already refused the boot when neither is
- * available. Re-checking here would only turn the router's specific,
- * remedy-naming message into a generic "missing env var".
+ * `OPENAI_API_KEY`. When Codex is the container's DEFAULT runner the router has
+ * already refused the boot if neither is available, and re-checking here would
+ * only turn its specific, remedy-naming message into a generic "missing env
+ * var". When Codex is reached by an issue-level `[agent=]`/`[model=]` selection
+ * instead (CYR-79), the container legitimately boots for another runner and may
+ * hold no Codex credential at all — so a check here would fail boots that are
+ * fine. That case is reported by `assertCodexCredentialAvailable` in
+ * `cyrus-codex-runner`, at the only point where the runner is actually known.
  */
 const RUNNER_REQUIRED_ENV_VARS: Record<string, readonly string[]> = {
 	claude: ["CLAUDE_CODE_OAUTH_TOKEN"],
@@ -948,8 +953,13 @@ export class ContainerBootCommand implements ICommand {
 	 * session, which is what dissolves the rotation race between one user's
 	 * concurrent issues (ADR 0005).
 	 *
-	 * A no-op when `CODEX_AUTH_JSON` is unset, which is every Claude session and
-	 * every Codex session running on `OPENAI_API_KEY` instead.
+	 * A no-op when `CODEX_AUTH_JSON` is unset — a user who has connected no
+	 * ChatGPT subscription, or a Codex session running on `OPENAI_API_KEY`
+	 * instead. Since CYR-79 the router attaches the credential to every container
+	 * a subscribed user owns, not only to those whose default runner is Codex, so
+	 * this now runs on Claude sessions too: the runner an issue actually gets is
+	 * chosen inside the sandbox, per turn, from `[agent=]`/`[model=]` tags and
+	 * labels the router never sees.
 	 *
 	 * **The variable is deleted once the file exists.** Two reasons, and the
 	 * second is not hypothetical:

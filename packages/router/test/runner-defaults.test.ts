@@ -25,6 +25,27 @@ describe("the runner catalog", () => {
 		expect([...SELECTABLE_RUNNERS].sort()).toEqual(["claude", "codex"]);
 	});
 
+	it("offers the current flagship Codex model, and prefers it", () => {
+		// CYR-79: the picker hard-coded `gpt-5.5` while the edge worker had its
+		// own idea of the default, so `/setup` and the session could disagree
+		// about which model a container was going to run. The FIRST entry is the
+		// load-bearing one — `resolveDefaultRunner` degrades a retired selection
+		// onto it — so this asserts order, not just membership.
+		const codex = RUNNER_CATALOG.find((entry) => entry.runner === "codex");
+		expect(codex?.models[0]?.model).toBe("gpt-5.6-sol");
+		expect(codex?.models.map((option) => option.model)).toContain("gpt-5.5");
+	});
+
+	it("keeps a stored selection for a model still in the catalog", () => {
+		// The migration half of CYR-79: adding GPT-5.6 must not disturb anyone
+		// already on GPT-5.5 — no warning, no silent model change.
+		const warn = vi.fn();
+		expect(
+			resolveDefaultRunner('{"runner":"codex","model":"gpt-5.5"}', { warn }),
+		).toEqual({ runner: "codex", model: "gpt-5.5" });
+		expect(warn).not.toHaveBeenCalled();
+	});
+
 	it("has at least one model per runner and no duplicate values", () => {
 		const seen = new Set<string>();
 		for (const entry of RUNNER_CATALOG) {
@@ -113,7 +134,7 @@ describe("resolveDefaultRunner", () => {
 	// edit must never be able to revoke "Codex needs no Anthropic subscription".
 	it.each([
 		['{"runner":"claude","model":"opus-4"}', "claude", "opus"],
-		['{"runner":"codex","model":"gpt-5.5-codex"}', "codex", "gpt-5.5"],
+		['{"runner":"codex","model":"gpt-5.5-codex"}', "codex", "gpt-5.6-sol"],
 	])(
 		"keeps the runner in %j and falls back to its first catalog model",
 		(stored, runner, model) => {

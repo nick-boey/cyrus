@@ -90,8 +90,27 @@ export const RUNNER_CATALOG: readonly RunnerCatalogEntry[] = [
 		//
 		// Re-run the probe when OpenAI ships a model — a name that works here is
 		// a one-line addition, and one that does not must stay out.
+		//
+		// `gpt-5.6-sol` added for CYR-79. It is the CANONICAL id, not the
+		// `gpt-5.6` alias, and that choice is deliberate: codex-cli 0.144.6 has
+		// `gpt-5.6-sol`, `gpt-5.6-luna` and `gpt-5.6-terra` compiled into it and
+		// no bare `gpt-5.6`, so the alias is a server-side courtesy the CLI's own
+		// per-model metadata lookup does not necessarily share. `gpt-5.5` is kept
+		// below it rather than retired — it is the name the 2026-08-31 probe
+		// actually answered on, so it stays as the option a user can fall back to
+		// by hand, and keeping it means no stored selection has to migrate.
+		//
+		// This entry is the ONE thing in this change that could not be verified
+		// from a sandbox: the container this was written in reports `Not logged
+		// in`, so the live subscription probe above has not been re-run for
+		// `gpt-5.6-sol`. If it comes back rejected, delete this line — the
+		// `gpt-5.5` entry below is what a retired selection degrades onto (see
+		// `resolveDefaultRunner`), so removing it is safe.
 		label: "Codex",
-		models: [{ model: "gpt-5.5", label: "GPT-5.5" }],
+		models: [
+			{ model: "gpt-5.6-sol", label: "GPT-5.6 Sol — most capable" },
+			{ model: "gpt-5.5", label: "GPT-5.5" },
+		],
 	},
 ] as const;
 

@@ -12,7 +12,15 @@ import type {
 	NormalizedUsage,
 } from "./backend/types.js";
 
-export const DEFAULT_CODEX_MODEL = "gpt-5.5";
+/**
+ * The model named in a message when the session did not carry one. Kept in step
+ * with the `/setup` catalog's preferred Codex model
+ * (`RUNNER_CATALOG` in `packages/router/src/setup/runnerDefaults.ts`) and with
+ * `RunnerSelectionService.getDefaultModelForRunner` — three places that once
+ * disagreed, which meant a Linear activity could name a model the session never
+ * ran on.
+ */
+export const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 const EMPTY_FALLBACK_CREDIT = { fallback_credit: null };
 const NOT_APPLIED_FALLBACK_CREDIT = {
 	fallback_credit: {

@@ -135,7 +135,7 @@ describe("repository.model / repository.fallbackModel", () => {
 			repository: repository({ model: "haiku" }),
 			labels: ["codex"],
 		});
-		expect(config.model).toBe("gpt-5.5");
+		expect(config.model).toBe("gpt-5.6-sol");
 	});
 
 	it("applies when it does belong to the resolved runner", () => {
