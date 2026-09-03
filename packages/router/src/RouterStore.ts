@@ -152,6 +152,7 @@ CREATE INDEX IF NOT EXISTS idx_issue_disk_images_cache_key ON issue_disk_images(
 CREATE INDEX IF NOT EXISTS idx_agent_runs_user_routed ON agent_runs(user_id, last_routed_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_session_started ON agent_runs(session_id, started_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_ended ON agent_runs(ended_ms);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_device ON agent_runs(device_id);
 `;
 
 function sha256Hex(value: string): string {
@@ -1101,6 +1102,32 @@ export class RouterStore {
 		return { deviceId: Number(result.lastInsertRowid), deviceToken: token };
 	}
 
+	/**
+	 * Re-read ONE container device row by id.
+	 *
+	 * {@link listContainerDevices} takes the whole fleet in a single query, which
+	 * is right for starting a sweep and wrong for deciding anything at the end of
+	 * one: a lifecycle tick is sequential and blocks on provider control-plane
+	 * calls, so by the time it reaches a given row that row can be many minutes
+	 * old. NOR-406 is exactly that — a tick that began at 07:45:22 stopped a
+	 * container at 07:51:54 using timestamps from 07:45:22, and so never saw the
+	 * session routed to it at 07:51:39. Anything acting on a row rather than
+	 * merely counting it re-reads it through here first.
+	 *
+	 * Keyed by device id rather than issue key on purpose: a row destroyed and
+	 * recreated for the same issue is a DIFFERENT container, and a stale sweep
+	 * must not act on its successor.
+	 */
+	getContainerDevice(deviceId: number): ContainerDeviceInfo | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms, last_progress_ms
+				 FROM devices WHERE kind = 'container' AND device_id = ?`,
+			)
+			.get(deviceId) as ContainerDeviceRow | undefined;
+		return row ? toContainerDeviceInfo(row) : undefined;
+	}
+
 	getContainerDeviceForIssue(
 		issueKey: string,
 	): ContainerDeviceInfo | undefined {
@@ -1662,6 +1689,43 @@ export class RouterStore {
 		this.db
 			.prepare("UPDATE agent_runs SET state = ?, ended_ms = ? WHERE run_id = ?")
 			.run(state, nowMs, latest.run_id);
+	}
+
+	/**
+	 * The most recent moment the router observed anything about an agent run on
+	 * this device — a worker activity, or a run ending.
+	 *
+	 * Read by {@link ContainerLifecycle} as a stop veto, not as an idle clock.
+	 * A run that ended seconds ago is the single most dangerous moment to stop a
+	 * container: the worker is still flushing (its `session_state` frame is
+	 * durably buffered and replayed until acked, and its artifact bundle is still
+	 * uploading), and killing it there converts a harmless park into a stranded
+	 * sandbox whose issue lock nothing will ever release — NOR-406.
+	 *
+	 * `ended_ms` covers both ways a run finishes as far as the router is
+	 * concerned: `finishAgentRun` on the terminal frame, and `markAgentRunUnknown`
+	 * when the affinity reconciler reclaims a row for a session the device no
+	 * longer reports. The second is precisely the "the device is done but the
+	 * router never got the frame" case, so it earns the same settle window.
+	 *
+	 * Deliberately ignores `started_ms`/`last_routed_ms`: those are router-side
+	 * stamps already mirrored on the device row's `last_routed_ms`, and folding
+	 * them in here would only duplicate the idle clock.
+	 *
+	 * Served by `idx_agent_runs_device`. Without it this is a full scan of every
+	 * run in the fleet's 24h retention window, run synchronously on the router's
+	 * event loop up to twice per idle candidate per tick — a cost that scales
+	 * with total run volume rather than with the number of candidates.
+	 */
+	getLastAgentRunActivityMs(deviceId: number): number | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT MAX(MAX(COALESCE(last_agent_activity_ms, 0), COALESCE(ended_ms, 0))) AS latest
+				 FROM agent_runs WHERE device_id = ?`,
+			)
+			.get(deviceId) as { latest: number | null } | undefined;
+		const latest = row?.latest ?? 0;
+		return latest > 0 ? latest : undefined;
 	}
 
 	markAgentRunUnknown(sessionId: string, nowMs: number): void {

@@ -1129,6 +1129,161 @@ describe("container devices (schema v2)", () => {
 		});
 	});
 
+	describe("getContainerDevice", () => {
+		it("re-reads one row by device id, so a stale caller can refresh it", () => {
+			// NOR-406: the lifecycle sweep decided from `listContainerDevices()`
+			// taken minutes earlier and never saw the route that had landed since.
+			const store = new RouterStore(":memory:");
+			const { userId } = store.addUser({ email: "fresh@example.com" });
+			const { deviceId } = store.createContainerDevice(
+				userId,
+				"NOR-406-a",
+				"aca",
+			);
+			const stale = store.listContainerDevices()[0];
+			expect(stale?.lastRoutedMs).toBeUndefined();
+
+			store.enqueueEvent(deviceId, "{}", 7_777, 60_000);
+
+			expect(store.getContainerDevice(deviceId)?.lastRoutedMs).toBe(7_777);
+			store.close();
+		});
+
+		it("returns undefined for a deleted row, and never its successor", () => {
+			// Keyed by device id rather than issue key on purpose: a destroyed and
+			// recreated container is a DIFFERENT container, and a mid-tick sweep
+			// must not act on the replacement.
+			const store = new RouterStore(":memory:");
+			const { userId } = store.addUser({ email: "gone@example.com" });
+			const first = store.createContainerDevice(userId, "NOR-406-b", "aca");
+			store.deleteContainerDevice(first.deviceId);
+			const second = store.createContainerDevice(userId, "NOR-406-b", "aca");
+
+			expect(store.getContainerDevice(first.deviceId)).toBeUndefined();
+			expect(store.getContainerDevice(second.deviceId)?.issueKey).toBe(
+				"NOR-406-b",
+			);
+			store.close();
+		});
+
+		it("ignores physical device rows", () => {
+			const { store, device } = storeWithDevice();
+
+			expect(store.getContainerDevice(device.deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		/**
+		 * Every clock the sweep reads, not merely the ones this method was written
+		 * for. It is the per-row re-read that NOR-406 routed all the lifecycle
+		 * DECISIONS through, and NOR-402 then made `noteStranded` a consumer of the
+		 * same row — so a column missing from this SELECT does not fail, it silently
+		 * reads as "never happened". Dropping `last_progress_ms` in particular
+		 * leaves the `no_progress` detector with no agent-driven clock at all, and
+		 * it reports a sandbox whose agent is posting normally as stranded.
+		 *
+		 * Asserted against `listContainerDevices` rather than against literals: the
+		 * failure mode is the two queries drifting apart, so the fleet read is the
+		 * oracle and this stays correct as columns are added.
+		 */
+		it("reads the same columns as the fleet listing it re-reads rows for", () => {
+			const store = new RouterStore(":memory:");
+			const { userId } = store.addUser({ email: "cols@example.com" });
+			const { deviceId } = store.createContainerDevice(
+				userId,
+				"NOR-406-h",
+				"aca",
+			);
+			store.enqueueEvent(deviceId, "{}", 1_000, 60_000);
+			store.markDeviceActive(deviceId, 2_000);
+			store.markDeviceProgress(deviceId, 3_000);
+			store.setDeviceParkedAt(deviceId, 4_000);
+			store.markDeviceRunning(deviceId, 5_000);
+
+			const listed = store
+				.listContainerDevices()
+				.find((d) => d.deviceId === deviceId);
+
+			expect(store.getContainerDevice(deviceId)).toEqual(listed);
+			expect(listed?.lastProgressMs).toBe(3_000);
+			store.close();
+		});
+	});
+
+	describe("getLastAgentRunActivityMs", () => {
+		const seedRun = (store: RouterStore, issueKey: string) => {
+			const { userId } = store.addUser({ email: `${issueKey}@example.com` });
+			const { deviceId } = store.createContainerDevice(userId, issueKey, "aca");
+			store.recordAgentRunRouted({
+				deviceId,
+				issueKey,
+				sessionId: `s-${issueKey}`,
+				routedMs: 1_000,
+			});
+			return deviceId;
+		};
+
+		it("is undefined for a device whose runs have neither reported nor ended", () => {
+			// Routing alone must not arm the settle window: `last_routed_ms` on the
+			// device row already covers it, and duplicating it here would turn the
+			// veto into a second idle clock.
+			const store = new RouterStore(":memory:");
+			const deviceId = seedRun(store, "NOR-406-c");
+
+			expect(store.getLastAgentRunActivityMs(deviceId)).toBeUndefined();
+			store.close();
+		});
+
+		it("reports when a run ended", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = seedRun(store, "NOR-406-d");
+
+			store.finishAgentRun(`s-NOR-406-d`, "complete", 50_000);
+
+			expect(store.getLastAgentRunActivityMs(deviceId)).toBe(50_000);
+			store.close();
+		});
+
+		it("reports a reconciler reclaim too — the router never saw a terminal frame", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = seedRun(store, "NOR-406-e");
+
+			store.markAgentRunUnknown(`s-NOR-406-e`, 60_000);
+
+			expect(store.getLastAgentRunActivityMs(deviceId)).toBe(60_000);
+			store.close();
+		});
+
+		it("takes the latest across every run on the device", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = seedRun(store, "NOR-406-f");
+			store.finishAgentRun(`s-NOR-406-f`, "complete", 20_000);
+			store.recordAgentRunRouted({
+				deviceId,
+				issueKey: "NOR-406-f",
+				sessionId: "s-second",
+				routedMs: 30_000,
+			});
+			store.recordAgentRunActivity("s-second", 40_000);
+
+			expect(store.getLastAgentRunActivityMs(deviceId)).toBe(40_000);
+			store.close();
+		});
+
+		it("is undefined for a device with no runs at all", () => {
+			const store = new RouterStore(":memory:");
+			const { userId } = store.addUser({ email: "none@example.com" });
+			const { deviceId } = store.createContainerDevice(
+				userId,
+				"NOR-406-g",
+				"aca",
+			);
+
+			expect(store.getLastAgentRunActivityMs(deviceId)).toBeUndefined();
+			store.close();
+		});
+	});
+
 	describe("last_progress_ms", () => {
 		const makeContainerDevice = (store: RouterStore, issueKey: string) => {
 			const { userId } = store.addUser({ email: `${issueKey}@example.com` });

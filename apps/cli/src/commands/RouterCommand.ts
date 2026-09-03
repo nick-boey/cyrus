@@ -280,6 +280,16 @@ const RouterConfigFileSchema = z.object({
 			offlineAgeOutMs: z.number().optional(),
 			strandedSessionGraceMs: z.number().optional(),
 			sessionsQueryTimeoutMs: z.number().optional(),
+			/**
+			 * Rejected rather than coerced when it is not a positive integer of
+			 * MILLISECONDS. Every degenerate value — 0, negative, fractional —
+			 * makes the settle veto unsatisfiable, which is indistinguishable from
+			 * it working, so the failure has to happen at startup where someone is
+			 * looking. The likely mistake is units (`120` meaning two minutes gives
+			 * a 120-millisecond window); {@link RouterServer} warns separately when
+			 * the value is shorter than a sweep interval, which no flush fits in.
+			 */
+			terminalSettleMs: z.number().int().positive().optional(),
 			requiredSecretKeys: z
 				.array(
 					z.string().refine(isStorableSecretKey, {

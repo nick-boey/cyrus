@@ -119,6 +119,10 @@ param acaMemory string = '8192Mi'
 @minValue(1)
 param idleStopMs int = 300000
 
+@description('How long after an agent run ends the sweep leaves that container alone, so its worker can flush its artifact bundle and get its terminal frame acked before being parked. Stopping a container in that window is what turns a harmless park into a stranded sandbox plus a stuck issue lock (NOR-406). MILLISECONDS: the default of 120000 is two minutes. The router clamps this to idleStopMs — it must cover seconds, never become the dominant term in the parking policy — and warns if it is set shorter than the 60s sweep interval, which no flush fits in.')
+@minValue(1)
+param terminalSettleMs int = 120000
+
 @description('ACA-side auto-suspend interval in seconds. 0 = DISABLED (the Cyrus default, spike N5/F2). ACA-side suspend has NO session-affinity gate and can freeze a live session mid-task; the router\'s affinity-aware idleStopMs is the sole idle controller. Leave this at 0.')
 @minValue(0)
 param acaAutoSuspendSeconds int = 0
@@ -604,6 +608,10 @@ var routerContainersConfig = union(
     // to. The router's sweep is affinity-aware and park-aware, so this never
     // suspends a session that is working or has background work in flight.
     idleStopMs: idleStopMs
+    // Stated here for the same reason, and because the two are a pair: this one
+    // is only meaningful relative to idleStopMs, and the router clamps it to
+    // that value. Reading one without the other tells you nothing.
+    terminalSettleMs: terminalSettleMs
     aca: {
       subscriptionId: subscription().subscriptionId
       resourceGroup: effectiveResourceGroupName

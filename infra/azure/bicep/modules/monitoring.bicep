@@ -162,12 +162,18 @@ resource sandboxesOverTime 'Microsoft.OperationalInsights/workspaces/savedSearch
         '    running   = toint(p["cyrus.running"]),'
         '    stopped   = toint(p["cyrus.stopped"]),'
         '    pinned    = toint(p["cyrus.pinned"]),'
-        '    unknown   = toint(p["cyrus.unknown"])'
+        '    unknown   = toint(p["cyrus.unknown"]),'
+        // Sandboxes that qualified for parking and were spared anyway. A
+        // persistently non-zero series here is idle cost being deferred, which
+        // is otherwise invisible: a deferred sandbox buckets as a plain
+        // `running` in every other column.
+        '    deferred  = toint(p["cyrus.deferred"])'
         '| summarize'
         '    sandboxes = max(sandboxes),'
         '    running   = max(running),'
         '    pinned    = max(pinned),'
-        '    unknown   = max(unknown)'
+        '    unknown   = max(unknown),'
+        '    deferred  = max(deferred)'
         '  by bin(TimeGenerated, 5m)'
         '| order by TimeGenerated asc'
       ],
@@ -258,6 +264,53 @@ resource sandboxBootHealth 'Microsoft.OperationalInsights/workspaces/savedSearch
         '| extend unresolved = started - reached_running - failed'
         '| where failed > 0 or unresolved > 0'
         '| order by unresolved desc, failed desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// The idle-stops that did NOT happen, and why.
+//
+// The counterpart to `sandbox.idle_stopped`, and the query that makes the
+// NOR-406 fix observable at all: without it, "we stopped killing live
+// containers" and "the sweep has stalled" are the same observation — an absence
+// of idle-stops. Each guard is a distinct story, so the interesting column is
+// the reason breakdown per device rather than the total:
+//
+//   clock_moved        the row's idle clock advanced while the sweep was
+//                      deciding. Expected on a slow tick; this IS the fix
+//                      working, and a rising count means ticks are getting long.
+//   claimed_mid_sweep  a session took affinity during the provider round trip.
+//   terminal_settle    a run ended moments ago and its worker may still be
+//                      flushing. Only reachable when ticks run long.
+//   row_deleted        terminal teardown removed the row mid-tick. Benign.
+//
+// A device with a high `ticks` and no eventual `sandbox.idle_stopped` is the
+// shape to worry about: a deferral is meant to be bounded, and an unbounded one
+// is a sandbox billing indefinitely (PAR-146's permanent pin, in a new guise).
+resource sandboxIdleStopSkipped 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sandbox-Idle-Stop-Skipped'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Idle-stops the sweep abandoned, by reason'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "sandbox.idle_stop_skipped"'
+        '| summarize'
+        '    ticks      = count(),'
+        '    first_seen = min(TimeGenerated),'
+        '    last_seen  = max(TimeGenerated),'
+        '    max_idle   = max(tolong(p["cyrus.idle_for_ms"])) * 1ms,'
+        '    provider   = any(tostring(p["cyrus.provider"])),'
+        '    issue_key  = any(tostring(p["cyrus.issue_key"]))'
+        '  by device_id = tostring(p["cyrus.device_id"]), reason = tostring(p["cyrus.reason"])'
+        '| extend deferred_for = last_seen - first_seen'
+        '| order by ticks desc, deferred_for desc'
       ],
       '\n'
     )
@@ -1037,6 +1090,85 @@ resource sandboxStrandedSessions 'Microsoft.Insights/scheduledQueryRules@2023-03
             }
             {
               name: 'reason'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+          ]
+          failingPeriods: {
+            minFailingPeriodsToAlert: 1
+            numberOfEvaluationPeriods: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: actionGroupIds
+    }
+  }
+}
+
+// A sandbox the sweep has declined to park on essentially every tick for an
+// hour.
+//
+// Each individual deferral is correct and intended — the NOR-406 guards exist to
+// produce them. What is not intended is a deferral that never ends: every guard
+// is written to be bounded (the settle window is clamped to idleStopMs, a moved
+// clock is re-evaluated next tick), so a device stuck deferring is a bounded
+// mechanism that has stopped being bounded — PAR-146's permanent pin in a new
+// guise, and a 4 vCPU sandbox billing the whole time.
+//
+// The sweep fires every 60s, so ~60 ticks fit the window; 45 is "almost every
+// tick" with room for the tick-skip warning and for genuinely long ticks. This
+// alert deliberately does NOT fire on a busy fleet deferring many DIFFERENT
+// sandboxes once each — it is dimensioned by device_id.
+resource sandboxDeferredIndefinitely 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = if (enableAlerts) {
+  name: 'alert-${namePrefix}-sandbox-idle-stop-deferred'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'alert-${namePrefix}-sandbox-idle-stop-deferred'
+    description: 'A Cyrus sandbox has been spared from idle-stop on nearly every sweep tick for an hour. Every deferral guard is meant to be bounded, so this is a sandbox billing indefinitely. Check the "cyrus.reason" attribute: a stuck "terminal_settle" means a worker never finished flushing, and a stuck "clock_moved" means something is stamping the idle clock without the container doing work. Open the Cyrus-Sandbox-Idle-Stop-Skipped saved search for the breakdown.'
+    severity: 2
+    enabled: true
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT1H'
+    scopes: [
+      logAnalytics.id
+    ]
+    autoMitigate: true
+    criteria: {
+      allOf: [
+        {
+          query: join(
+            [
+              'ContainerAppConsoleLogs_CL'
+              appFilter
+              '| extend p = parse_json(Log_s)'
+              '| where tostring(p.event) == "sandbox.idle_stop_skipped"'
+              // row_deleted is the benign one: the row is already gone, so there
+              // is no sandbox left to keep billing.
+              '| where tostring(p["cyrus.reason"]) != "row_deleted"'
+              '| summarize ticks = count() by issue_key = tostring(p["cyrus.issue_key"]), device_id = tostring(p["cyrus.device_id"])'
+              '| where ticks >= 45'
+            ],
+            '\n'
+          )
+          timeAggregation: 'Total'
+          metricMeasureColumn: 'ticks'
+          threshold: 0
+          operator: 'GreaterThan'
+          dimensions: [
+            {
+              name: 'issue_key'
+              operator: 'Include'
+              values: [
+                '*'
+              ]
+            }
+            {
+              name: 'device_id'
               operator: 'Include'
               values: [
                 '*'

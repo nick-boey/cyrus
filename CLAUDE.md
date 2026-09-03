@@ -485,6 +485,65 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      `offlineAgeOutMs` — so a "block if any affinity exists" re-check silently
      restores the permanent pin PAR-146 removed. Only session ids absent from
      the pre-gate snapshot may veto a stop.
+   - **`sweepOnce`'s opening `listContainerDevices()` and `now()` are a WORK
+     LIST, not data to decide from.** The loop is sequential and blocks on
+     provider control-plane calls, so a tick routinely outlives its own 60s
+     interval — one measured 392s. Deciding a row at 07:51:54 from 07:45:22's
+     clock and row makes `idleForMs = now - lastRoutedMs` arithmetic on two
+     numbers that no longer relate, and the route stamped at 07:51:39 is
+     invisible to every check, NOR-366's `claimedMidSweep` guard included: that
+     guard compares affinity against a snapshot taken *after* the claim, so it
+     correctly sees nothing new (NOR-406 — stopped 4s after the session started,
+     issue stuck 37 minutes). Every value a decision uses is re-read inside the
+     row's own iteration via `getContainerDevice(deviceId)` + `this.now()`, and
+     re-derived once more immediately before `stop()`. Keyed by device id, never
+     issue key: a destroyed-and-recreated row is a different container. The one
+     thing that stays tick-level is the provider listing — one call per provider
+     per tick is its whole cost model — so the claim is scoped to the STOP and
+     DESTROY decisions, and the gauge state is up to one tick stale. That
+     listing is not read-only input, which is the part the cost argument does
+     not cover: `sampleSandbox` writes `running_since_ms` off it, and a
+     container booted after the listing was taken would have the clock its boot
+     just stamped cleared by a listing that predates it — silently resetting the
+     6-hour long-running-sandbox alert for exactly the sandboxes that were busy
+     through a slow tick. The listing carries its `capturedMs` and the clear is
+     refused when `running_since_ms` is newer; every gauge sample reports its
+     own `listing_age_ms` so the staleness is a number rather than an
+     assumption.
+   - **Every idle-stop the sweep abandons emits `sandbox.idle_stop_skipped`
+     with a closed-set `cyrus.reason`** (`row_deleted` | `clock_moved` |
+     `claimed_mid_sweep` | `terminal_settle`), and the `sandbox.sweep_completed`
+     rollup carries a `deferred` count. Without it the success signal for this
+     whole fix is an ABSENCE of `sandbox.idle_stopped`, which is
+     indistinguishable from a stalled sweep, and a container held out of
+     parking indefinitely buckets as an unremarkable `running` — the same
+     three-plain-fields silence that let NOR-366 run for nine hours. Every guard
+     is written to be bounded, so a device deferring on essentially every tick
+     is a bounded mechanism that stopped being bounded; that is what
+     `alert-*-sandbox-idle-stop-deferred` fires on. A new skip path must add a
+     `reason` and be emitted through `noteIdleStopSkipped`, never logged in
+     prose alone.
+   - **The dangerous moment to stop a container is the seconds AFTER a run
+     ends.** The worker's `session_state` frame is durably buffered and replayed
+     until acked, and its artifact bundle is still uploading — stop it there and
+     the frame never lands, so the affinity row and the issue lock survive with
+     nothing left alive to release them. `getLastAgentRunActivityMs` (over
+     `agent_runs.ended_ms` / `last_agent_activity_ms`) vetoes a stop within
+     `terminalSettleMs`. It covers the reconciler's `markAgentRunUnknown` reclaim
+     too, which is precisely "the device is done and the router never saw a
+     frame". The veto's LOOKBACK is CLAMPED to `idleStopMs` — how old a run
+     stamp may be and still veto, not the cumulative deferral, which is bounded
+     instead by `lastRunMs` freezing once a run goes terminal. It must cover
+     seconds, never become the dominant term in the parking policy, or it is
+     PAR-146's permanent pin under another name; a deferral that does not end is
+     what `alert-*-sandbox-idle-stop-deferred` exists to catch. Know its real
+     reach before relying on it:
+     `last_active_ms` is stamped by the SWEEP, so it is itself up to one tick
+     stale, and with the clamp a veto needs the newest run stamp to beat the
+     whole idle clock by `idleStopMs - terminalSettleMs` (180s at defaults). On a
+     healthy 60s tick it CANNOT fire and the fresh per-row read is doing all the
+     work; it goes live exactly in the 392s-tick regime, which is the residue the
+     fresh read cannot cover.
    - **`state=stopped && sessions>0 && online=false` is an impossible state that
      produces no signal on its own.** No lifecycle transition fires, the gauge
      records it as three unremarkable fields, and Linear keeps rendering a live

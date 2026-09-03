@@ -195,6 +195,10 @@ export interface RouterContainersConfig {
 	strandedSessionGraceMs?: number;
 	/** Default 5_000 (5 seconds). */
 	sessionsQueryTimeoutMs?: number;
+	/** Default 120_000 (2 minutes). How long after an agent run on a container
+	 *  ends the lifecycle sweep leaves that container alone, so its worker can
+	 *  flush and get its terminal frame acked before being parked. */
+	terminalSettleMs?: number;
 	/**
 	 * Per-repository devcontainer images (NOR-309). Omit it and every container
 	 * boots {@link RouterContainersConfig.image} — today's behaviour, unchanged.
@@ -1194,6 +1198,23 @@ export class RouterServer {
 
 		const sessionsQueryTimeoutMs =
 			containers.sessionsQueryTimeoutMs ?? DEFAULT_SESSIONS_QUERY_TIMEOUT_MS;
+		// A settle window shorter than the interval between the ticks that would
+		// observe it cannot do its job: the veto reads a run-end stamp that is
+		// itself up to one tick old, so anything under a tick is off in practice
+		// while reading as configured. The overwhelmingly likely cause is units —
+		// `terminalSettleMs: 120` meant as two minutes. Warn rather than reject:
+		// this is the one knob a test rig legitimately turns right down.
+		if (
+			containers.terminalSettleMs !== undefined &&
+			containers.terminalSettleMs < SWEEP_INTERVAL_MS
+		) {
+			this.logger.warn(
+				`terminalSettleMs (${containers.terminalSettleMs}ms) is shorter than the ` +
+					`${SWEEP_INTERVAL_MS}ms sweep interval, so it will effectively never ` +
+					`defer a stop. This value is in MILLISECONDS — did you mean ` +
+					`${containers.terminalSettleMs * 1000}?`,
+			);
+		}
 		this.containerLifecycle = new ContainerLifecycle({
 			store: this.store,
 			executors,
@@ -1202,6 +1223,9 @@ export class RouterServer {
 			offlineAgeOutMs: containers.offlineAgeOutMs ?? DEFAULT_OFFLINE_AGE_OUT_MS,
 			...(containers.strandedSessionGraceMs !== undefined
 				? { strandedSessionGraceMs: containers.strandedSessionGraceMs }
+				: {}),
+			...(containers.terminalSettleMs !== undefined
+				? { terminalSettleMs: containers.terminalSettleMs }
 				: {}),
 			logger: this.logger,
 			sessionReconciler: {
