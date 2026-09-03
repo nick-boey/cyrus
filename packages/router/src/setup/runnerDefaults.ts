@@ -110,14 +110,16 @@ export interface DefaultRunnerSelection {
  * The env var each runner reads its default model from, as consumed by
  * `WorkerService` when it builds the in-sandbox `EdgeWorkerConfig`.
  *
- * Gemini and Cursor appear here for completeness only — neither is selectable
- * (see {@link RUNNER_CATALOG}) so neither name is ever emitted today.
+ * Gemini, Cursor and OpenCode appear here for completeness only — none is
+ * selectable (see {@link RUNNER_CATALOG}) so none of those names is ever
+ * emitted today.
  */
 export const MODEL_ENV_BY_RUNNER: Record<RunnerType, string> = {
 	claude: "CYRUS_CLAUDE_DEFAULT_MODEL",
 	codex: "CYRUS_CODEX_DEFAULT_MODEL",
 	gemini: "CYRUS_GEMINI_DEFAULT_MODEL",
 	cursor: "CYRUS_CURSOR_DEFAULT_MODEL",
+	opencode: "CYRUS_OPENCODE_DEFAULT_MODEL",
 };
 
 /** `CYRUS_DEFAULT_RUNNER` — the runner half of the picker, as delivered. */

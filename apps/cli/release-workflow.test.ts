@@ -147,7 +147,9 @@ describe("trusted Cyrus release workflow", () => {
 	it("recovers safely from partially published npm releases", () => {
 		expect(workflow).toContain("verify_registry_version() {");
 		expect(workflow).toContain("tarball_integrity() {");
-		expect(workflow).toContain("for attempt in {1..12}; do");
+		expect(workflow).toContain("local deadline=$((SECONDS + 600))");
+		expect(workflow).toContain('if [[ "$SECONDS" -ge "$deadline" ]]');
+		expect(workflow).toContain("sleep 10");
 		expect(workflow).toContain("dist.integrity");
 		expect(workflow).toContain('createHash("sha512")');
 		expect(workflow).toContain(
@@ -160,7 +162,26 @@ describe("trusted Cyrus release workflow", () => {
 			`Dry run would publish \${package_name}@\${REQUESTED_VERSION} with npm tag \${DIST_TAG}.`,
 		);
 		expect(workflow).toContain(
-			`\${package_name}@\${REQUESTED_VERSION} is not consistently visible with npm tag \${DIST_TAG}.`,
+			`\${package_name}@\${REQUESTED_VERSION} is not consistently visible with npm tag \${DIST_TAG} after 10 minutes.`,
+		);
+	});
+
+	it("preflights package existence before any release work or publishing", () => {
+		expect(workflow).toContain("missing_packages=()");
+		expect(workflow).toContain(
+			'npm view "$package_name" version >/dev/null 2>&1',
+		);
+		expect(workflow).toContain(
+			"Every release package must already exist on npm before this workflow runs.",
+		);
+		expect(workflow).toContain(
+			"npm trust github <package> --repo cyrusagents/cyrus --file release-cli.yml --allow-publish --yes",
+		);
+		expect(workflow.indexOf("missing_packages=()")).toBeLessThan(
+			workflow.indexOf("Install locked dependencies"),
+		);
+		expect(workflow.indexOf("missing_packages=()")).toBeLessThan(
+			workflow.indexOf('npm publish "$tarball"'),
 		);
 	});
 

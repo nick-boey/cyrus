@@ -15,6 +15,7 @@ import type {
 	CyrusAgentSession,
 	ILogger,
 	OnAskUserQuestion,
+	OpenCodeConfigOverrides,
 	RepositoryConfig,
 	RunnerType,
 } from "cyrus-core";
@@ -24,6 +25,7 @@ import { buildPrMarkerHook } from "./hooks/PrMarkerHook.js";
 import { appendBrowserUseAddendum } from "./prompts/browserUsePromptAddendum.js";
 import { appendCloudRuntimeAddendum } from "./prompts/cloudRuntimePromptAddendum.js";
 import { appendFailureModeAddendum } from "./prompts/failureModePromptAddendum.js";
+import { appendGitHubCliMediaAddendum } from "./prompts/githubCliMediaPromptAddendum.js";
 
 /**
  * Subset of McpConfigService consumed by RunnerConfigBuilder.
@@ -53,6 +55,7 @@ export interface IChatToolResolver {
  * Subset of RunnerSelectionService consumed by RunnerConfigBuilder.
  */
 export interface IRunnerSelector {
+	getDefaultRunner(): RunnerType;
 	determineRunnerSelection(
 		labels: string[],
 		issueDescription?: string,
@@ -64,8 +67,8 @@ export interface IRunnerSelector {
 		explicitModel?: string;
 		explicitFallbackModel?: string;
 	};
-	getDefaultModelForRunner(runnerType: RunnerType): string;
-	getDefaultFallbackModelForRunner(runnerType: RunnerType): string;
+	getDefaultModelForRunner(runnerType: RunnerType): string | undefined;
+	getDefaultFallbackModelForRunner(runnerType: RunnerType): string | undefined;
 	inferRunnerFromModel(model?: string): RunnerType | undefined;
 }
 
@@ -99,6 +102,8 @@ export interface ChatRunnerConfigInput {
 	 * run as usual).
 	 */
 	platformMcpConfigOverrides?: readonly string[];
+	/** Whether Claude should ignore ambient MCP configuration. Defaults to true. */
+	strictMcpConfig?: boolean;
 	/** Plugins to load for the chat session (provides managed skills). */
 	plugins?: SdkPluginConfig[];
 	/**
@@ -107,6 +112,12 @@ export interface ChatRunnerConfigInput {
 	 * these skills into its repository discovery layout.
 	 */
 	skills?: string[] | "all";
+	/** Global OpenCode runtime config overrides from Cyrus config */
+	opencodeGlobalConfig?: OpenCodeConfigOverrides["config"];
+	/** Global OpenCode CLI state scope from Cyrus config */
+	opencodeGlobalStateScope?: OpenCodeConfigOverrides["stateScope"];
+	/** Existing runner type to preserve when resuming a completed chat session */
+	runnerType?: RunnerType;
 	logger: ILogger;
 	onMessage: (message: SDKMessage) => void | Promise<void>;
 	onError: (error: Error) => void;
@@ -138,6 +149,8 @@ export interface IssueRunnerConfigInput {
 	 * (see `buildIssueConfig`).
 	 */
 	platformMcpConfigOverrides?: readonly string[];
+	/** Whether Claude should ignore ambient MCP configuration. Defaults to true. */
+	strictMcpConfig?: boolean;
 	linearWorkspaceId?: string;
 	cyrusHome: string;
 	logger: ILogger;
@@ -152,11 +165,15 @@ export interface IssueRunnerConfigInput {
 	requireLinearWorkspaceId: (repo: RepositoryConfig) => string;
 	/** Plugins to load for the session (provides skills, hooks, etc.) */
 	plugins?: SdkPluginConfig[];
+	/** Global OpenCode runtime config overrides from Cyrus config */
+	opencodeGlobalConfig?: OpenCodeConfigOverrides["config"];
+	/** Global OpenCode CLI state scope from Cyrus config */
+	opencodeGlobalStateScope?: OpenCodeConfigOverrides["stateScope"];
 	/**
 	 * Allow-list of skill names enabled for the session (after scope filtering),
 	 * or `"all"` to enable every discovered skill, or `undefined` to defer to
-	 * provider defaults. Claude passes this to the SDK directly; Codex uses it
-	 * to stage the same scoped skills into its native repository discovery layout.
+	 * provider defaults. Managed-skill runners consume this according to their
+	 * native discovery layout.
 	 */
 	skills?: string[] | "all";
 	/** SDK sandbox settings (enabled, network proxy ports) for Claude runner */
@@ -261,6 +278,8 @@ export class RunnerConfigBuilder {
 		);
 
 		input.logger.debug("Chat session allowed tools:", allowedTools);
+		const runnerType =
+			input.runnerType ?? this.runnerSelector.getDefaultRunner();
 
 		// Shared auto-memory across all chat threads on this platform. Lives
 		// under cyrusHome (not the per-thread workspace) so memory built up in
@@ -271,6 +290,7 @@ export class RunnerConfigBuilder {
 		);
 
 		return {
+			runnerType,
 			workingDirectory: input.workspacePath,
 			allowedTools,
 			disallowedTools: [] as string[],
@@ -283,15 +303,28 @@ export class RunnerConfigBuilder {
 			cyrusHome: input.cyrusHome,
 			autoMemoryDirectory,
 			appendSystemPrompt: appendCloudRuntimeAddendum(
-				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
+				appendGitHubCliMediaAddendum(
+					appendBrowserUseAddendum(
+						appendFailureModeAddendum(input.systemPrompt),
+					),
+				),
 			),
 			...(mcpConfig ? { mcpConfig } : {}),
 			...(mcpConfigPath ? { mcpConfigPath } : {}),
+			strictMcpConfig: input.strictMcpConfig ?? true,
 			...(input.resumeSessionId
 				? { resumeSessionId: input.resumeSessionId }
 				: {}),
 			...(input.plugins?.length ? { plugins: input.plugins } : {}),
 			...(input.skills !== undefined ? { skills: input.skills } : {}),
+			...(runnerType === "opencode" && {
+				opencodeGlobalConfig: input.opencodeGlobalConfig,
+				opencodeRepositoryConfig: input.repository?.opencode?.config,
+				opencodeStateScope:
+					input.repository?.opencode?.stateScope ??
+					input.opencodeGlobalStateScope,
+				opencodeStateKey: input.repository?.id,
+			}),
 			logger: input.logger,
 			maxTurns: 200,
 			onMessage: input.onMessage,
@@ -372,6 +405,13 @@ export class RunnerConfigBuilder {
 				this.runnerSelector.getDefaultFallbackModelForRunner("cursor");
 			explicitModel = undefined;
 			explicitFallbackModel = undefined;
+		} else if (input.session.opencodeSessionId && runnerType !== "opencode") {
+			runnerType = "opencode";
+			modelOverride = this.runnerSelector.getDefaultModelForRunner("opencode");
+			fallbackModelOverride =
+				this.runnerSelector.getDefaultFallbackModelForRunner("opencode");
+			explicitModel = undefined;
+			explicitFallbackModel = undefined;
 		}
 
 		// Log model override if found
@@ -447,8 +487,13 @@ export class RunnerConfigBuilder {
 			cyrusHome: input.cyrusHome,
 			mcpConfigPath,
 			mcpConfig,
+			strictMcpConfig: input.strictMcpConfig ?? true,
 			appendSystemPrompt: appendCloudRuntimeAddendum(
-				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
+				appendGitHubCliMediaAddendum(
+					appendBrowserUseAddendum(
+						appendFailureModeAddendum(input.systemPrompt),
+					),
+				),
 			),
 			// Priority order: label override > repository config > global default
 			model: finalModel,
@@ -462,9 +507,8 @@ export class RunnerConfigBuilder {
 			// Plugins providing managed skills.
 			...(this.runnerSupportsManagedSkills(runnerType) &&
 				input.plugins?.length && { plugins: input.plugins }),
-			// Skill scope allow-list. Claude passes this through to the SDK's
-			// `query()` `skills` option; Codex uses it to stage only allowed skill
-			// directories into the session worktree for repository-scope discovery.
+			// Skill scope allow-list. Each managed-skill runner maps this into its
+			// native skill discovery mechanism.
 			...(this.runnerSupportsManagedSkills(runnerType) &&
 				input.skills !== undefined && { skills: input.skills }),
 			// SDK sandbox settings (Claude runner only):
@@ -481,6 +525,14 @@ export class RunnerConfigBuilder {
 						resolvedWorkspaceId,
 					),
 				}),
+			...(runnerType === "opencode" && {
+				opencodeGlobalConfig: input.opencodeGlobalConfig,
+				opencodeRepositoryConfig: input.repository.opencode?.config,
+				opencodeStateScope:
+					input.repository.opencode?.stateScope ??
+					input.opencodeGlobalStateScope,
+				opencodeStateKey: input.repository.id,
+			}),
 			onMessage: input.onMessage,
 			onError: input.onError,
 		};
