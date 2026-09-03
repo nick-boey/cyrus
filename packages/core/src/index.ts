@@ -105,6 +105,8 @@ export type {
 	LinearWorkspaceConfig,
 	NetworkPolicy,
 	OAuthCallbackHandler,
+	OpenCodeConfigOverrides,
+	OpenCodeStateScope,
 	RepoSetupHookEvent,
 	RepoSetupHookEventHandler,
 	RepoSetupHookStatus,
@@ -122,6 +124,7 @@ export {
 	LinearWorkspaceConfigSchema,
 	migrateEdgeConfig,
 	NetworkPolicySchema,
+	OpenCodeConfigSchema,
 	RepositoryConfigPayloadSchema,
 	RepositoryConfigSchema,
 	RunnerTypeSchema,
@@ -141,6 +144,10 @@ export {
 	DEFAULT_WORKTREES_DIR,
 	getDefaultReposDir,
 	getDefaultWorktreesDir,
+	type ResolvedWorkspacePath,
+	resolveIssueWorkspacePath,
+	type WorkspaceBaseDirCarrier,
+	type WorkspaceBaseDirSource,
 } from "./constants.js";
 export { DEVCONTAINER_PATHS, parseJsonc } from "./devcontainer.js";
 // Issue Tracker Abstraction

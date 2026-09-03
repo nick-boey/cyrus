@@ -61,7 +61,6 @@ import {
 	createLogger,
 	cyrusAttributes,
 	DEFAULT_PROXY_URL,
-	getDefaultWorktreesDir,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isContentUpdateMessage,
@@ -144,6 +143,7 @@ import {
 	type FailureModesHttpClient,
 	type ResolvedSession,
 } from "cyrus-mcp-tools";
+import { OpenCodeRunner } from "cyrus-opencode-runner";
 import { buildResourceAttributes } from "cyrus-otel-logs";
 import {
 	isOtelTracingEnabled,
@@ -303,6 +303,9 @@ export class EdgeWorker extends EventEmitter {
 	public repositoryRouter: RepositoryRouter; // Repository routing and selection
 	private gitService: GitService;
 	private activeWebhookCount = 0; // Track number of webhooks currently being processed
+	// GitHub webhook handlers share a PR worktree, so only one may run per PR.
+	private activeGitHubPrSessions = new Set<string>();
+	private queuedGitHubPrEvents = new Map<string, GitHubCommentWebhookEvent[]>();
 	/** Handler for AskUserQuestion tool invocations via Linear select signal */
 	private askUserQuestionHandler: AskUserQuestionHandler;
 	/** User access control for whitelisting/blacklisting Linear users */
@@ -991,6 +994,15 @@ export class EdgeWorker extends EventEmitter {
 		this.configManager.on(
 			"configChanged",
 			async (changes: RepositoryChanges) => {
+				const strictMcpConfigChanged =
+					(this.config.strictMcpConfig ?? true) !==
+					(changes.newConfig.strictMcpConfig ?? true);
+				if (strictMcpConfigChanged) {
+					for (const warmSession of this.warmInstances.values()) {
+						warmSession.close();
+					}
+					this.warmInstances.clear();
+				}
 				this.updateLinearWorkspaceTokens(changes.newConfig);
 				await this.removeDeletedRepositories(changes.removed);
 				await this.updateModifiedRepositories(changes.modified);
@@ -1576,8 +1588,9 @@ export class EdgeWorker extends EventEmitter {
 				cyrusHome: this.cyrusHome,
 				chatRepositoryProvider,
 				runnerConfigBuilder: this.runnerConfigBuilder,
-				createRunner: (config) => {
-					const runnerType = this.runnerSelectionService.getDefaultRunner();
+				createRunner: (config, chatRunnerType) => {
+					const runnerType =
+						chatRunnerType ?? this.runnerSelectionService.getDefaultRunner();
 					return this.createRunnerForType(runnerType, {
 						...config,
 						model: this.getDefaultModelForRunner(runnerType),
@@ -1587,6 +1600,7 @@ export class EdgeWorker extends EventEmitter {
 				// Live read so hot-reloaded config (`setConfig`) picks up new
 				// per-platform MCP paths without rebuilding the handler.
 				getPlatformMcpConfigOverrides: () => this.config.slackMcpConfigs,
+				getStrictMcpConfig: () => this.config.strictMcpConfig,
 				resolveSkillsConfig: async ({ repository, repositoryPaths }) => {
 					const plugins = await this.skillsPluginResolver.resolve();
 					const skills = await this.skillsPluginResolver.discoverSkillNames(
@@ -1598,6 +1612,8 @@ export class EdgeWorker extends EventEmitter {
 					);
 					return { plugins, skills };
 				},
+				getOpenCodeGlobalConfig: () => this.config.opencode?.config,
+				getOpenCodeGlobalStateScope: () => this.config.opencode?.stateScope,
 				onWebhookStart: () => {
 					this.activeWebhookCount++;
 				},
@@ -1689,8 +1705,12 @@ export class EdgeWorker extends EventEmitter {
 
 	private async handleGitHubWebhook(
 		event: GitHubCommentWebhookEvent,
+		reservedGitHubPrSlot = false,
 	): Promise<void> {
 		this.activeWebhookCount++;
+		let githubPrQueueKey: string | undefined;
+		let hasReservedGitHubPrSlot = reservedGitHubPrSlot;
+		let githubPrSlotReleased = false;
 
 		try {
 			// Only handle comments on pull requests
@@ -1705,6 +1725,7 @@ export class EdgeWorker extends EventEmitter {
 			const commentAuthor = extractCommentAuthor(event);
 			const prTitle = extractPRTitle(event);
 			const sessionKey = extractSessionKey(event);
+			githubPrQueueKey = sessionKey;
 
 			const isPullRequestReview = isPullRequestReviewPayload(event.payload);
 
@@ -1831,6 +1852,37 @@ export class EdgeWorker extends EventEmitter {
 
 			const agentSessionManager = this.agentSessionManager;
 
+			if (!reservedGitHubPrSlot) {
+				if (this.activeGitHubPrSessions.has(sessionKey)) {
+					const queue = this.queuedGitHubPrEvents.get(sessionKey) ?? [];
+					queue.push(event);
+					this.queuedGitHubPrEvents.set(sessionKey, queue);
+					this.logger.info(
+						`Queued GitHub webhook for ${repoFullName}#${prNumber}; ${queue.length} event(s) waiting`,
+					);
+
+					if (reactionToken && prNumber) {
+						this.gitHubCommentService
+							.postIssueComment({
+								token: reactionToken,
+								owner: extractRepoOwner(event),
+								repo: extractRepoName(event),
+								issueNumber: prNumber,
+								body: "Received your request. It is queued and will start after Cyrus finishes the current task on this PR.",
+							})
+							.catch((err: unknown) => {
+								this.logger.warn(
+									`Failed to post queued acknowledgement: ${err instanceof Error ? err.message : err}`,
+								);
+							});
+					}
+					return;
+				}
+
+				this.activeGitHubPrSessions.add(sessionKey);
+				hasReservedGitHubPrSlot = true;
+			}
+
 			// For pull_request_review events, post an instant acknowledgement comment
 			if (isPullRequestReview && reactionToken && prNumber) {
 				this.gitHubCommentService
@@ -1918,16 +1970,6 @@ export class EdgeWorker extends EventEmitter {
 
 			this.logger.info(`GitHub workspace created at: ${workspace.path}`);
 
-			// Check if another active session is already using this branch/workspace
-			const existingSessions =
-				agentSessionManager.getActiveSessionsByBranchName(branchRef);
-			const firstExisting = existingSessions[0];
-			if (firstExisting) {
-				this.logger.warn(
-					`Reusing workspace from active session ${firstExisting.id} — concurrent writes possible`,
-				);
-			}
-
 			// Create a synthetic session for this GitHub PR comment
 			const issueMinimal: IssueMinimal = {
 				id: sessionKey,
@@ -2013,7 +2055,35 @@ export class EdgeWorker extends EventEmitter {
 					"github", // sessionPlatform → uses githubMcpConfigs override
 				);
 
-			const runner = this.createRunnerForType(runnerType, runnerConfig);
+			// A runner's start() promise can remain open after a successful turn
+			// (for example, warm Claude sessions). Advance the PR queue on the
+			// terminal result instead, so one held-open process cannot block later
+			// GitHub requests for the same worktree indefinitely.
+			const onMessage = runnerConfig.onMessage;
+			let githubReplyPosted = false;
+			let runner: IAgentRunner;
+			runnerConfig.onMessage = async (message: SDKMessage) => {
+				try {
+					await onMessage?.(message);
+				} finally {
+					if (message.type === "result" && !githubReplyPosted) {
+						githubReplyPosted = true;
+						this.postGitHubReply(event, runner, repository).catch((error) => {
+							this.logger.error(
+								`Failed to post GitHub reply to ${repoFullName}#${prNumber}`,
+								error instanceof Error ? error : new Error(String(error)),
+							);
+						});
+						runner.completeStream?.();
+						if (hasReservedGitHubPrSlot && githubPrQueueKey) {
+							this.advanceGitHubPrQueue(githubPrQueueKey);
+							githubPrSlotReleased = true;
+						}
+					}
+				}
+			};
+
+			runner = this.createRunnerForType(runnerType, runnerConfig);
 
 			// Store the runner in the session manager
 			agentSessionManager.addAgentRunner(githubSessionId, runner);
@@ -2037,8 +2107,11 @@ export class EdgeWorker extends EventEmitter {
 				const sessionInfo = await runner.start(taskInstructions);
 				this.logger.info(`GitHub session started: ${sessionInfo.sessionId}`);
 
-				// When session completes, post the reply back to GitHub
-				await this.postGitHubReply(event, runner, repository);
+				// A runner that exits before emitting a result still needs a reply.
+				if (!githubReplyPosted) {
+					githubReplyPosted = true;
+					await this.postGitHubReply(event, runner, repository);
+				}
 			} catch (error) {
 				this.logger.error(
 					`GitHub session error for ${repoFullName}#${prNumber}`,
@@ -2053,7 +2126,35 @@ export class EdgeWorker extends EventEmitter {
 				error instanceof Error ? error : new Error(String(error)),
 			);
 		} finally {
+			if (
+				hasReservedGitHubPrSlot &&
+				githubPrQueueKey &&
+				!githubPrSlotReleased
+			) {
+				this.advanceGitHubPrQueue(githubPrQueueKey);
+			}
 			this.activeWebhookCount--;
+		}
+	}
+
+	private advanceGitHubPrQueue(sessionKey: string): void {
+		const queue = this.queuedGitHubPrEvents.get(sessionKey);
+		const nextEvent = queue?.shift();
+		if (queue && queue.length === 0) {
+			this.queuedGitHubPrEvents.delete(sessionKey);
+		}
+
+		if (nextEvent) {
+			// Keep the slot reserved while the next event starts to prevent a newly
+			// arrived webhook from overtaking the FIFO queue.
+			this.handleGitHubWebhook(nextEvent, true).catch((error) => {
+				this.logger.error(
+					"Failed to process queued GitHub webhook",
+					error instanceof Error ? error : new Error(String(error)),
+				);
+			});
+		} else {
+			this.activeGitHubPrSessions.delete(sessionKey);
 		}
 	}
 
@@ -4033,6 +4134,36 @@ ${taskSection}`;
 			force: true,
 		});
 
+		// That was the last snapshot this issue gets. From here the WIP refs are
+		// terminal cleanup's to delete, and a capture landing after the reap
+		// would not merely race it — `deleteWipSnapshot` drops the LOCAL ref
+		// unconditionally, and that local ref is exactly what `captureWipSnapshot`
+		// reads to decide the remote is already current, so the next capture is
+		// GUARANTEED to push the ref back. It would then look like a success on
+		// both sides: nothing recorded as failed for `sweep()` to retry, and the
+		// ref back on the remote permanently. Stopping the runners above does not
+		// prevent this (`requestSessionStop` only sets a flag; the runner's real
+		// terminal arrives later and fires `syncIssueOnTermination` from a
+		// listener), and the 5-minute periodic tick keeps firing across the
+		// seconds-to-minutes that teardown scripts and `git worktree remove`
+		// take. Awaits any capture already in flight before returning.
+		await this.workspaceSync?.abandonIssue(message.workItemIdentifier);
+
+		// The path creation actually returned, recorded on the session and
+		// captured before `removeSession` erases it. Re-deriving it from config
+		// is a reconstruction — correct only while the repository config that
+		// produced it is still present and unchanged — whereas this is the
+		// authoritative answer, and is what `WorkspaceSyncService` already uses.
+		// `deleteWorktree` falls back to re-deriving when this is empty, which is
+		// the redelivered-webhook case.
+		const recordedWorkspacePaths = [
+			...new Set(
+				sessions
+					.map((session) => session.workspace?.path)
+					.filter((path): path is string => Boolean(path)),
+			),
+		];
+
 		// Post a response activity to each stopped session's Linear thread,
 		// then remove the session so subsequent prompts don't find stale state.
 		for (const session of sessions) {
@@ -4043,14 +4174,33 @@ ${taskSection}`;
 			this.agentSessionManager.removeSession(session.id);
 		}
 
-		// Build the set of repositories involved with this issue so per-repo
-		// cyrus-teardown.sh scripts (if present) can run before worktrees are
-		// removed. Source-of-truth is the session manager: each session's
-		// repositoryId maps to a configured RepositoryConfig.
+		// Build the set of repositories involved with this issue. Everything
+		// below is driven off it: which `cyrus-teardown.sh` scripts run, which
+		// remotes have a WIP snapshot deleted, and — since NOR-411 — which
+		// `workspaceBaseDir` the workspace itself is resolved from. That last
+		// one makes an incomplete list silently destructive rather than merely
+		// incomplete, and there are two ways it used to come up short.
+		//
+		// A session records only its PRIMARY repository (`sessionRepositories`
+		// is set from `repositories[0]`), so a multi-repo issue lost every
+		// secondary repository's snapshot. And on a REDELIVERED terminal
+		// webhook there are no sessions left at all — the first delivery calls
+		// `removeSession` above, and the router replays unacked events by
+		// design — leaving the list empty, the workspace resolved from the
+		// default base directory, and a real worktree neither cleaned up nor
+		// reported.
+		//
+		// The issue's own routing decision covers both: it is the same list
+		// worktree creation was handed, and it outlives the sessions. Sessions
+		// still go first so the primary repository stays first, which is the
+		// one `resolveIssueWorkspacePath` takes the base directory from.
 		const repoIds = new Set<string>();
 		for (const session of sessions) {
 			const repoId = this.sessionRepositories.get(session.id);
 			if (repoId) repoIds.add(repoId);
+		}
+		for (const repo of this.getCachedRepositories(issueId) ?? []) {
+			repoIds.add(repo.id);
 		}
 		const teardownRepositories: RepositoryConfig[] = [];
 		for (const repoId of repoIds) {
@@ -4082,26 +4232,53 @@ ${taskSection}`;
 				const branchName = this.deriveWorktreeBranchName(
 					sessionWithIssue.issue,
 				);
-				// Mirrors the worktree layout GitService.deleteWorktree resolves
-				// internally: single repo -> workspace root IS the worktree;
-				// multi-repo -> each repo's worktree is a named subdirectory.
-				// Each repository carries its own snapshot under the same ref
-				// name, so every one of them has to be deleted.
-				const workspacePath = join(
-					getDefaultWorktreesDir(this.cyrusHome),
-					message.workItemIdentifier,
-				);
-				const worktreePaths =
-					teardownRepositories.length > 1
-						? teardownRepositories.map((repo) => join(workspacePath, repo.name))
-						: [workspacePath];
-				for (const worktreePath of worktreePaths) {
-					await this.wipSnapshotReaper.reap(worktreePath, branchName);
+				// Reaped from each repository's MAIN checkout, not from the
+				// issue's worktree. Deleting the ref is a remote operation —
+				// any checkout whose `origin` carries it will do — and two
+				// things follow from preferring the durable one. It cannot go
+				// looking for a worktree at a path that was reconstructed
+				// rather than resolved, which is how every container sandbox
+				// ended up reaping a directory that had never existed
+				// (NOR-411). And the path outlives this teardown, so `sweep()`
+				// — which discards any entry whose path has since disappeared,
+				// as a worktree always has by the next sweep — can still retry
+				// it. Each repository carries its own snapshot under the same
+				// ref name, so every one of them has to be deleted.
+				//
+				// That retry is a PHYSICAL-DEVICE guarantee only, and it is
+				// worth being exact about because the mode this bug was
+				// reported from is the one it does not cover. The reaper's
+				// durable file lives under `cyrusHome`, which in a container
+				// sandbox is `$CYRUS_WORKSPACES_DIR/.cyrus` — inside the same
+				// per-issue sandbox as `repositoryPath`, and this handler is
+				// the last thing that sandbox does before it is destroyed. A
+				// sandbox serves one issue, so neither trigger for `sweep()`
+				// (the next terminal teardown, or process start) ever fires for
+				// it again. A remote that is unreachable for the duration of a
+				// container teardown therefore still leaks the ref, and the
+				// only signal is the reaper's warning in logs that outlive the
+				// container.
+				for (const repository of teardownRepositories) {
+					await this.wipSnapshotReaper.reap(
+						repository.repositoryPath,
+						branchName,
+					);
 				}
-				// Same trip, same remotes: retry anything a previous teardown
-				// failed to delete, so one unreachable remote at the wrong
-				// moment doesn't leak a ref permanently.
-				await this.wipSnapshotReaper.sweep();
+			} else if (sessions.length === 0) {
+				// A redelivered terminal webhook: the first delivery removed the
+				// sessions, and with them the only source of a branch name. The
+				// repositories are still worth carrying for the worktree deletion
+				// below, which is what an idempotent replay is for.
+				//
+				// Deliberately NOT phrased as "already reaped on an earlier
+				// delivery". Nothing records that a reap SUCCEEDED — the reaper's
+				// durable file records only failures — so that would be an
+				// assumption stated as fact, and stating it at `info` is the same
+				// benign-looking silent miss this issue was about on the worktree
+				// half. Say what is actually known instead.
+				this.logger.warn(
+					`No sessions remain for ${message.workItemIdentifier}, so there is no branch name to derive and its WIP snapshots cannot be reaped on this delivery. If an earlier delivery did not complete the reap, any refs/cyrus-wip/* for this issue are still on its remotes and must be removed by hand`,
+				);
 			} else {
 				// No session carries any issue data at all (e.g. only
 				// standalone/no-issue sessions were found for this issueId) —
@@ -4111,11 +4288,29 @@ ${taskSection}`;
 					`Skipping WIP snapshot deletion for ${message.workItemIdentifier}: no session has issue data to derive a branch name from`,
 				);
 			}
+		} else {
+			// Neither a live session nor the cached routing decision knows which
+			// repositories this issue used, so there is no remote to delete from.
+			// Reachable on a cold container that restored no state (the router
+			// 404s the floor bundle) while the remote still carries refs the
+			// sandbox's previous incarnation pushed. Previously this skipped the
+			// whole block with no output at all.
+			this.logger.warn(
+				`Skipping WIP snapshot deletion for ${message.workItemIdentifier}: no repository is known for this issue, from either a live session or the cached routing decision, so any refs/cyrus-wip/* it has must be removed by hand`,
+			);
 		}
+
+		// Unconditional, and outside every branch above: this retries snapshots
+		// that a PREVIOUS teardown failed to delete, which has nothing to do with
+		// whether this issue got as far as reaping its own. Gating it on the reap
+		// branch meant the one delivery that admits it is a retry — a redelivered
+		// webhook with no sessions left — was also the one that declined to retry.
+		await this.wipSnapshotReaper.sweep();
 
 		// Delete worktrees for this issue, keyed by the Linear issue identifier.
 		await this.gitService.deleteWorktree(message.workItemIdentifier, {
 			repositories: teardownRepositories,
+			recordedWorkspacePaths,
 		});
 
 		// Last by design: provider destruction is only safe after all in-container
@@ -5074,6 +5269,15 @@ ${taskSection}`;
 		const { agentSession, guidance } = webhook;
 		const commentBody = agentSession.comment?.body;
 
+		// If this issue is a sub-issue of an issue Cyrus has a session on, link the
+		// two so the parent is resumed when this session completes. Done before the
+		// blocked-by check so a parked child is linked as well.
+		await this.linkChildSessionToParentIssueSession(
+			agentSession.id,
+			agentSession.issue,
+			linearWorkspaceId,
+		);
+
 		// Check for blocked-by dependencies before starting work
 		const blockResult = await this.checkBlockedByDependencies(
 			agentSession,
@@ -5586,6 +5790,14 @@ ${taskSection}`;
 
 		log.debug(
 			`Initializing agent runner after repository selection: ${agentSession.issue.identifier} -> ${repository.name}`,
+		);
+
+		// The created webhook returned early to ask for a repository, so the
+		// parent-issue link has not been established yet for this session.
+		await this.linkChildSessionToParentIssueSession(
+			agentSessionId,
+			agentSession.issue,
+			webhook.organizationId,
 		);
 
 		// Initialize agent runner with the selected repository (wrapped in array)
@@ -6224,7 +6436,7 @@ ${taskSection}`;
 	 * Resolve default model for a given runner from config with sensible built-in defaults.
 	 * Supports legacy config keys for backwards compatibility.
 	 */
-	private getDefaultModelForRunner(runnerType: RunnerType): string {
+	private getDefaultModelForRunner(runnerType: RunnerType): string | undefined {
 		return this.runnerSelectionService.getDefaultModelForRunner(runnerType);
 	}
 
@@ -6232,7 +6444,9 @@ ${taskSection}`;
 	 * Resolve default fallback model for a given runner from config with sensible built-in defaults.
 	 * Supports legacy Claude fallback key for backwards compatibility.
 	 */
-	private getDefaultFallbackModelForRunner(runnerType: RunnerType): string {
+	private getDefaultFallbackModelForRunner(
+		runnerType: RunnerType,
+	): string | undefined {
 		return this.runnerSelectionService.getDefaultFallbackModelForRunner(
 			runnerType,
 		);
@@ -6242,7 +6456,7 @@ ${taskSection}`;
 	 * Instantiate the appropriate runner for the given type.
 	 */
 	private createRunnerForType(
-		runnerType: "claude" | "gemini" | "codex" | "cursor",
+		runnerType: RunnerType,
 		config: AgentRunnerConfig,
 	): IAgentRunner {
 		switch (runnerType) {
@@ -6260,6 +6474,8 @@ ${taskSection}`;
 				return new CodexRunner(config);
 			case "cursor":
 				return new CursorRunner(config);
+			case "opencode":
+				return new OpenCodeRunner(config);
 			default:
 				throw new Error(`Unknown runner type: ${runnerType satisfies never}`);
 		}
@@ -6768,12 +6984,15 @@ ${taskSection}`;
 					? "codex"
 					: session.cursorSessionId
 						? "cursor"
-						: null;
+						: session.opencodeSessionId
+							? "opencode"
+							: null;
 		const runnerSessionId =
 			session.claudeSessionId ??
 			session.geminiSessionId ??
 			session.codexSessionId ??
 			session.cursorSessionId ??
+			session.opencodeSessionId ??
 			null;
 
 		const sessionSource = session.id.startsWith("github-")
@@ -6840,6 +7059,86 @@ ${taskSection}`;
 		this.logger.debug(
 			`Parent-child mapping registered in GlobalSessionRegistry`,
 		);
+	}
+
+	/**
+	 * Link a newly created agent session to the most recent Cyrus session on its
+	 * parent issue, so that when this (child) session completes, the parent
+	 * session is resumed with the child's result.
+	 *
+	 * Parent-child *issue* relationships are the channel for child completion
+	 * messages. Any issue whose parent has a Cyrus session is linked, regardless
+	 * of whether that parent session is currently running: an orchestrator that
+	 * has halted to wait for its sub-issue has status "complete" and is exactly
+	 * the parent that must be woken, so this deliberately does not filter to
+	 * active sessions. The resume path handles both a still-running parent
+	 * (streams the message in) and an exited one (resumes from its stored
+	 * runner session id).
+	 *
+	 * This replaces the mapping that used to be established by the removed
+	 * `linear_agent_session_create*` cyrus-tools. Linear delegation creates
+	 * exactly one session per issue, so deriving the link from the issue
+	 * hierarchy does not reintroduce concurrent child sessions on one issue.
+	 *
+	 * Never throws: a failed lookup only means the parent is not notified.
+	 */
+	private async linkChildSessionToParentIssueSession(
+		agentSessionId: string,
+		issue: { id: string; identifier: string } | null | undefined,
+		linearWorkspaceId: string,
+	): Promise<void> {
+		if (!issue) {
+			return;
+		}
+
+		// Already mapped (e.g. restored from persisted state) — leave it alone.
+		if (this.globalSessionRegistry.getParentSessionId(agentSessionId)) {
+			return;
+		}
+
+		const log = this.logger.withContext({
+			sessionId: agentSessionId,
+			issueIdentifier: issue.identifier,
+		});
+
+		try {
+			// The webhook's issue payload does not carry the parent, so fetch it.
+			const fullIssue = await this.fetchFullIssueDetails(
+				issue.id,
+				linearWorkspaceId,
+			);
+			const parentIssue = await fullIssue?.parent;
+			const parentIssueId = parentIssue?.id;
+			if (!parentIssueId) {
+				return;
+			}
+
+			const parentSessions =
+				this.agentSessionManager.getSessionsByIssueId(parentIssueId);
+			if (parentSessions.length === 0) {
+				log.debug(
+					`Parent issue ${parentIssueId} has no Cyrus session; no parent callback will be sent`,
+				);
+				return;
+			}
+
+			const parentSession = parentSessions.reduce((latest, candidate) =>
+				candidate.updatedAt > latest.updatedAt ? candidate : latest,
+			);
+
+			this.globalSessionRegistry.setParentSession(
+				agentSessionId,
+				parentSession.id,
+			);
+			log.info(
+				`Linked to parent session ${parentSession.id} via parent issue ${parentIssueId}; parent will be resumed when this session completes`,
+			);
+		} catch (error) {
+			log.warn(
+				`Failed to link session to a parent issue session; continuing without parent callback`,
+				error,
+			);
+		}
 	}
 
 	private async handleFeedbackDeliveryToChildSession(
@@ -7509,10 +7808,13 @@ ${input.userComment}
 				sessionPlatform === "linear"
 					? this.config.linearMcpConfigs
 					: this.config.githubMcpConfigs,
+			strictMcpConfig: this.config.strictMcpConfig,
 			linearWorkspaceId,
 			cyrusHome: this.cyrusHome,
 			logger: log,
 			plugins,
+			opencodeGlobalConfig: this.config.opencode?.config,
+			opencodeGlobalStateScope: this.config.opencode?.stateScope,
 			skills: allowedSkillNames,
 			sandboxSettings: this.sdkSandboxSettings ?? undefined,
 			egressCaCertPath: this.egressCaCertPath ?? undefined,
@@ -7953,6 +8255,7 @@ ${input.userComment}
 							...(allowedTools.length > 0 && { allowedTools }),
 							...(disallowedTools.length > 0 && { disallowedTools }),
 							settingSources: ["user", "project", "local"],
+							strictMcpConfig: this.config.strictMcpConfig ?? true,
 							// Must match what ClaudeRunner.start() decides, or a session
 							// that lands on a warm instance runs with a different scrub
 							// posture than the same session started cold. A throw here is
@@ -8522,12 +8825,15 @@ ${input.userComment}
 		const hasGeminiSession = !isNewSession && Boolean(session.geminiSessionId);
 		const hasCodexSession = !isNewSession && Boolean(session.codexSessionId);
 		const hasCursorSession = !isNewSession && Boolean(session.cursorSessionId);
+		const hasOpenCodeSession =
+			!isNewSession && Boolean(session.opencodeSessionId);
 		const needsNewSession =
 			isNewSession ||
 			(!hasClaudeSession &&
 				!hasGeminiSession &&
 				!hasCodexSession &&
-				!hasCursorSession);
+				!hasCursorSession &&
+				!hasOpenCodeSession);
 
 		// Fetch system prompt based on labels
 
@@ -8570,7 +8876,9 @@ ${input.userComment}
 					? session.geminiSessionId
 					: session.codexSessionId
 						? session.codexSessionId
-						: session.cursorSessionId;
+						: session.cursorSessionId
+							? session.cursorSessionId
+							: session.opencodeSessionId;
 
 		this.logger.debug(
 			`resumeAgentSession: needsNewSession=${needsNewSession}, resumeSessionId=${resumeSessionId ?? "none"}`,

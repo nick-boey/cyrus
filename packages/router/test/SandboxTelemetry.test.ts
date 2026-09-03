@@ -70,6 +70,7 @@ describe("SandboxTelemetry", () => {
 			uptimeMs: 60_000,
 			lastSeenAgeMs: 5_000,
 			lastRoutedAgeMs: 30_000,
+			listingAgeMs: 400,
 		});
 
 		expect(logger.event).toHaveBeenCalledWith("sandbox.gauge", {
@@ -84,6 +85,9 @@ describe("SandboxTelemetry", () => {
 			"cyrus.last_seen_age_ms": 5_000,
 			"cyrus.parked_for_ms": null,
 			"cyrus.last_routed_age_ms": 30_000,
+			// How stale the `state` above is. The one field on the sample not read
+			// per-row: the listing is taken once per provider per tick.
+			"cyrus.listing_age_ms": 400,
 		});
 	});
 

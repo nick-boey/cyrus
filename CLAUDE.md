@@ -436,13 +436,12 @@ The agent automatically moves issues to the "started" state when assigned. Linea
    - `packages/edge-worker/src/SlackChatAdapter.ts` — Builds the Slack chat system prompt including orchestration notes with repo routing syntax
    - `packages/edge-worker/src/ActivityPoster.ts` — Posts routing activities to Linear timeline (method display names, formatting)
 
-9. **Adding a new top-level `EdgeWorkerConfig` field**: Adding a property to the `EdgeWorkerConfig` Zod schema in `packages/core/src/config-schemas.ts` is **not enough** to make it available at runtime. `ConfigManager.loadConfigSafely()` in `packages/edge-worker/src/ConfigManager.ts` reads `config.json`, then explicitly merges a **hardcoded whitelist** of fields onto its in-memory config — every field not on that list is silently dropped on each reload. Likewise, `detectGlobalConfigChanges()` only fires a `configChanged` event when one of a hardcoded list of keys differs from the previous reload.
+9. **Adding a new top-level `EdgeWorkerConfig` field**: Adding a property to the `EdgeConfigSchema` Zod schema in `packages/core/src/config-schemas.ts` is **not enough** to make it available at runtime. Two hand-maintained copy sites exist, and both now have guardrails that fail fast when a field is missed (added after `strictMcpConfig` was silently dropped in CYPACK-1478; `slackAllowedTools` & friends were dropped the same way in CYHOST-967):
 
-   When you add a new top-level field you **must update both lists**:
-   - The merge in `loadConfigSafely()` (around line ~200) — add `<newField>: parsedConfig.<newField> || this.config.<newField>`.
-   - The `globalKeys` array in `detectGlobalConfigChanges()` — add the field name so changes to it trigger downstream `setConfig` calls on dependent services (e.g., `ToolPermissionResolver`).
+   - **Cold start** — `WorkerService.startEdgeWorker()` in `apps/cli/src/services/WorkerService.ts` spreads the entire file config (`...edgeConfig`) into the `EdgeWorkerConfig`, so plain pass-through fields flow automatically and need **no** code change. Only add an explicit line below the spread if the field needs env-var precedence or a computed/param override — never add a redundant pass-through line. The `"forwards every EdgeConfig field"` test in `WorkerService.test.ts` has a schema-complete fixture that fails when a new schema field isn't covered.
+   - **Hot reload** — `ConfigManager` in `packages/edge-worker/src/ConfigManager.ts` merges a hardcoded list of fields in `loadConfigSafely()` and watches the same list in `detectGlobalConfigChanges()`. Both are driven by the `RELOAD_MERGED_KEYS` const at the top of the file, which has a **compile-time exhaustiveness check**: adding a schema field without classifying it into `RELOAD_MERGED_KEYS` (plus a merge line in `loadConfigSafely()`) or `RELOAD_EXEMPT_KEYS` is a `tsc` error that names the missing key.
 
-   Symptom of forgetting this: the field appears in `~/.cyrus/config.json`, the cyrus process is restarted, but downstream code keeps seeing the default (or never picks up hot-reloads). This bit us with `slackAllowedTools` / `githubAllowedTools` / `slackMcpConfigs` / `linearMcpConfigs` / `githubMcpConfigs` during CYHOST-967.
+   So the workflow for a new field is: add it to `EdgeConfigSchema`, let `tsc` and the CLI test point at the two sites, add the merge line + `RELOAD_MERGED_KEYS` entry (hot reload) and — only if it needs env precedence — an explicit override in `startEdgeWorker()`.
 
 10. **Changing the `cyrus-tools` MCP server's exposed tools**: When you add or remove a tool from the inline `cyrus-tools` MCP server (the one served by `apps/proxy` / wired up in `McpConfigService.buildMcpConfig`), you **must also update the catalog `cyrus-hosted` keeps for the `/settings/tools` UI**. cyrus-hosted maintains a per-server tool list so its grid can render a row per tool (with the right per-platform toggle) without having to introspect a live MCP server. Today that catalog lives in `apps/app/src/lib/cyrus-config/builder.ts` under the `KNOWN_MCP_TOOLS` map (look for the `"mcp__cyrus-tools"` key); update that array in the same PR — the same constants are also imported by the platform-default lists in `packages/core/src/allowed-tools-defaults.ts` when a particular `cyrus-tools` tool is enabled by default, so reflect that there too if the new tool should be on out of the box.
 
@@ -485,15 +484,125 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      `offlineAgeOutMs` — so a "block if any affinity exists" re-check silently
      restores the permanent pin PAR-146 removed. Only session ids absent from
      the pre-gate snapshot may veto a stop.
+   - **`sweepOnce`'s opening `listContainerDevices()` and `now()` are a WORK
+     LIST, not data to decide from.** The loop is sequential and blocks on
+     provider control-plane calls, so a tick routinely outlives its own 60s
+     interval — one measured 392s. Deciding a row at 07:51:54 from 07:45:22's
+     clock and row makes `idleForMs = now - lastRoutedMs` arithmetic on two
+     numbers that no longer relate, and the route stamped at 07:51:39 is
+     invisible to every check, NOR-366's `claimedMidSweep` guard included: that
+     guard compares affinity against a snapshot taken *after* the claim, so it
+     correctly sees nothing new (NOR-406 — stopped 4s after the session started,
+     issue stuck 37 minutes). Every value a decision uses is re-read inside the
+     row's own iteration via `getContainerDevice(deviceId)` + `this.now()`, and
+     re-derived once more immediately before `stop()`. Keyed by device id, never
+     issue key: a destroyed-and-recreated row is a different container. The one
+     thing that stays tick-level is the provider listing — one call per provider
+     per tick is its whole cost model — so the claim is scoped to the STOP and
+     DESTROY decisions, and the gauge state is up to one tick stale. That
+     listing is not read-only input, which is the part the cost argument does
+     not cover: `sampleSandbox` writes `running_since_ms` off it, and a
+     container booted after the listing was taken would have the clock its boot
+     just stamped cleared by a listing that predates it — silently resetting the
+     6-hour long-running-sandbox alert for exactly the sandboxes that were busy
+     through a slow tick. The listing carries its `capturedMs` and the clear is
+     refused when `running_since_ms` is newer; every gauge sample reports its
+     own `listing_age_ms` so the staleness is a number rather than an
+     assumption.
+   - **Every idle-stop the sweep abandons emits `sandbox.idle_stop_skipped`
+     with a closed-set `cyrus.reason`** (`row_deleted` | `clock_moved` |
+     `claimed_mid_sweep` | `terminal_settle`), and the `sandbox.sweep_completed`
+     rollup carries a `deferred` count. Without it the success signal for this
+     whole fix is an ABSENCE of `sandbox.idle_stopped`, which is
+     indistinguishable from a stalled sweep, and a container held out of
+     parking indefinitely buckets as an unremarkable `running` — the same
+     three-plain-fields silence that let NOR-366 run for nine hours. Every guard
+     is written to be bounded, so a device deferring on essentially every tick
+     is a bounded mechanism that stopped being bounded; that is what
+     `alert-*-sandbox-idle-stop-deferred` fires on. A new skip path must add a
+     `reason` and be emitted through `noteIdleStopSkipped`, never logged in
+     prose alone.
+   - **The dangerous moment to stop a container is the seconds AFTER a run
+     ends.** The worker's `session_state` frame is durably buffered and replayed
+     until acked, and its artifact bundle is still uploading — stop it there and
+     the frame never lands, so the affinity row and the issue lock survive with
+     nothing left alive to release them. `getLastAgentRunActivityMs` (over
+     `agent_runs.ended_ms` / `last_agent_activity_ms`) vetoes a stop within
+     `terminalSettleMs`. It covers the reconciler's `markAgentRunUnknown` reclaim
+     too, which is precisely "the device is done and the router never saw a
+     frame". The veto's LOOKBACK is CLAMPED to `idleStopMs` — how old a run
+     stamp may be and still veto, not the cumulative deferral, which is bounded
+     instead by `lastRunMs` freezing once a run goes terminal. It must cover
+     seconds, never become the dominant term in the parking policy, or it is
+     PAR-146's permanent pin under another name; a deferral that does not end is
+     what `alert-*-sandbox-idle-stop-deferred` exists to catch. Know its real
+     reach before relying on it:
+     `last_active_ms` is stamped by the SWEEP, so it is itself up to one tick
+     stale, and with the clamp a veto needs the newest run stamp to beat the
+     whole idle clock by `idleStopMs - terminalSettleMs` (180s at defaults). On a
+     healthy 60s tick it CANNOT fire and the fresh per-row read is doing all the
+     work; it goes live exactly in the 392s-tick regime, which is the residue the
+     fresh read cannot cover.
    - **`state=stopped && sessions>0 && online=false` is an impossible state that
      produces no signal on its own.** No lifecycle transition fires, the gauge
      records it as three unremarkable fields, and Linear keeps rendering a live
      agent session — which is why NOR-366 ran for nine hours. `noteStranded`
-     emits `sandbox.stranded_session` for it, and it is DETECTION ONLY: waking
-     the container would also resurrect leaked-affinity rows and undo idle-stop
-     for the sandboxes idle-stop exists for. It must stay excluded during the
-     cold-boot window (`strandedSessionGraceMs`, sized against an ACA boot, which
-     presents identically) and for issues with a pending terminal teardown.
+     emits `sandbox.stranded_session` with `reason=offline_pinned` for it, and it
+     is DETECTION ONLY: waking the container would also resurrect leaked-affinity
+     rows and undo idle-stop for the sandboxes idle-stop exists for. It must stay
+     excluded during the cold-boot window (`strandedSessionGraceMs`, sized against
+     an ACA boot, which presents identically) and for issues with a pending
+     terminal teardown.
+   - **The OTHER stranded shape looks completely healthy, and "looks healthy"
+     cannot be the exclusion.** `running && online && sessions>0` with nothing
+     routed and nothing posted is what a session that never reached a terminal
+     state produces: it holds the issue lock forever, and a new top-level comment
+     on that issue is then rejected at the lock, so the issue is write-only.
+     CAN-133 sat in it for 5h17m while the severity-1 rule named after this
+     failure could not fire, because the old detector required
+     `stopped && !online` (NOR-402). `noteStranded` now also emits
+     `reason=no_progress`, and the clock it uses is the whole point:
+     `max(last_progress_ms, last_routed_ms, parked_at_ms, created_ms)`.
+     `last_seen_ms` is excluded (a wedged worker heartbeats normally) and
+     `last_active_ms` is excluded (the sweep stamps it on every pinned tick, so
+     the detector would reset its own clock). **`devices.last_progress_ms` is
+     stamped ONLY from a device-originated `rpc_request`** in `DeviceGateway` — a
+     sandbox holds no Linear token, so every activity its agent posts arrives as
+     one, which makes it the only clock moved by the agent working rather than by
+     something the router did. Do not feed it into the idle clock: idle-stop must
+     keep erring toward keeping a container alive (NOR-366).
+   - **`no_progress` cannot tell a strand from a session deliberately waiting,
+     and the honest move is to say so, not to tune the threshold until it looks
+     like it can.** A session held open by pending work keeps its affinity and
+     posts nothing, so it is byte-for-byte the same shape — the deferral is
+     decided on the DEVICE and never reaches the router's store. So the report
+     names both possibilities, sends the operator to the
+     `session.terminal_deferred` / `session.terminal_signalled` pair to
+     disambiguate, and gates `cyrus router unlock` on having confirmed it is not
+     waiting: unlocking a run that is about to resume manufactures the
+     lock-without-affinity leak instead of fixing anything.
+     `sessionNoProgressMs` is 4h to clear `ScheduleWakeup`'s 1h clamp outright;
+     a longer-period cron is a known false-positive class. Anything that lowers
+     it must first give the router a way to see the deferral.
+   - **Neither stranded shape covers a locked issue with NO affinity.** Both are
+     reached only from the sweep's `affinity > 0` gate, but a `parked` session
+     releases affinity and RETAINS its lock — so an elicitation nobody answers
+     locks an issue invisibly to `noteStranded`, surfacing only in
+     `RouterStore.listSessions`' orphan-lock query behind
+     `cyrus router sessions list`. Do not read the detector as covering every
+     unreachable issue.
+   - **A session's terminal signal can be withheld indefinitely, and that is the
+     leading suspect whenever an issue goes unreachable.**
+     `AgentSessionManager.completeSession` defers `emitTerminalOnce` while the
+     runner reports pending work (crons, background tasks, live background
+     tasks), and retries only when a later `result` arrives — so a background
+     task that never exits holds the router's issue lock forever. It is now
+     `session.terminal_deferred` / `session.terminal_signalled` rather than an
+     `info` line, and that change is load-bearing: **a sandbox worker's
+     `RouterLogForwarder` is WARN+ by default**, so the `info` never left the
+     container and the one state that can strand an issue was absent from the
+     logs it had to be diagnosed from. Any new diagnostic on a worker code path
+     must be `logger.event`, which bypasses the threshold, not `logger.info`.
    - `ContainerLifecycle.sweep()` is **non-reentrant by contract** — a tick still
      running makes the next one a logged no-op. `RouterServer` fires it on a bare
      60s `setInterval` and the loop is sequential, so without that guard a single
@@ -900,19 +1009,18 @@ transitive-dependency vulnerabilities:
    transitive. Regenerate the lockfile and let pnpm's natural resolution do the
    work.
 
-2. **Only use the root `overrides` map in `pnpm-workspace.yaml` when a
-   direct-dep bump cannot reach the vulnerable transitive.** This is the
-   fallback for deep transitives (3+ levels deep) whose owning direct dep has no
-   released version that resolves to the patched transitive — typically because
-   upstream hasn't released yet or pins its transitive too loosely for us to
-   reach. Document the reason inline with a brief comment or commit message.
+2. **Only use workspace-level overrides in `pnpm-workspace.yaml` when a direct-dep bump cannot reach the
+   vulnerable transitive.** This is the fallback for deep transitives (3+
+   levels deep) whose owning direct dep has no released version that resolves
+   to the patched transitive — typically because upstream hasn't released yet
+   or pins its transitive too loosely for us to reach. Document the reason
+   inline with a brief comment or commit message.
 
 3. **Always clean up overrides when a future dep bump makes them redundant.**
    When you update a direct dependency (security or otherwise), check whether
-   any existing entry in `pnpm-workspace.yaml`'s `overrides` is now satisfied
-   naturally by the new resolution. If so, **remove that override in the same
-   change**. Verify with `pnpm install && pnpm audit` that the removal is safe
-   before committing.
+   any existing override entry is now satisfied naturally by the
+   new resolution. If so, **remove that override in the same change**. Verify
+   with `pnpm install && pnpm audit` that the removal is safe before committing.
 
 4. **Verify with `pnpm audit`.** After any dependency change, `pnpm audit`
    must report zero advisories. Commit the regenerated `pnpm-lock.yaml`

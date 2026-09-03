@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS devices (
   last_routed_ms INTEGER,
   parked_at_ms INTEGER,
   running_since_ms INTEGER,
-  last_active_ms INTEGER
+  last_active_ms INTEGER,
+  last_progress_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS enrollment_codes (
   code_hash TEXT PRIMARY KEY,
@@ -59,6 +60,9 @@ CREATE TABLE IF NOT EXISTS issue_affinity (
 );
 CREATE TABLE IF NOT EXISTS issue_locks (
   issue_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, device_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_ownership_grace (
+  session_id TEXT PRIMARY KEY, device_id INTEGER NOT NULL, expires_ms INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS webhook_claims (
   idempotency_key TEXT PRIMARY KEY, claimed_ms INTEGER NOT NULL
@@ -151,6 +155,7 @@ CREATE INDEX IF NOT EXISTS idx_issue_disk_images_cache_key ON issue_disk_images(
 CREATE INDEX IF NOT EXISTS idx_agent_runs_user_routed ON agent_runs(user_id, last_routed_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_session_started ON agent_runs(session_id, started_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_ended ON agent_runs(ended_ms);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_device ON agent_runs(device_id);
 `;
 
 function sha256Hex(value: string): string {
@@ -205,6 +210,7 @@ interface DeviceRow {
 	parked_at_ms: number | null;
 	running_since_ms: number | null;
 	last_active_ms: number | null;
+	last_progress_ms: number | null;
 }
 
 interface ContainerDeviceRow {
@@ -218,6 +224,7 @@ interface ContainerDeviceRow {
 	parked_at_ms: number | null;
 	running_since_ms: number | null;
 	last_active_ms: number | null;
+	last_progress_ms: number | null;
 }
 
 export interface ContainerDeviceInfo {
@@ -266,6 +273,23 @@ export interface ContainerDeviceInfo {
 	 * the clock then falls back to the older inputs exactly as before.
 	 */
 	lastActiveMs?: number;
+	/**
+	 * When this device last did work the router could OBSERVE — the last device-
+	 * originated RPC frame it sent (see {@link RouterStore.markDeviceProgress}).
+	 *
+	 * Deliberately a fourth clock rather than a reuse of {@link lastActiveMs},
+	 * even though both claim to mean "doing work". `lastActiveMs` is stamped by
+	 * the lifecycle sweep on every tick a device holds affinity, so it is really
+	 * "still pinned at time T" and moves at exactly the same rate for a working
+	 * sandbox and for one whose session finished hours ago and never went
+	 * terminal. It cannot distinguish them, which is the whole of NOR-402. Only
+	 * an agent posting activities moves THIS one.
+	 *
+	 * Read by `ContainerLifecycle.noteStranded` and by nothing else — in
+	 * particular NOT by the idle clock, which must keep its own (deliberately
+	 * generous) inputs.
+	 */
+	lastProgressMs?: number;
 }
 
 interface ContainerTeardownRow {
@@ -455,6 +479,7 @@ function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
 		parkedAtMs: row.parked_at_ms ?? undefined,
 		runningSinceMs: row.running_since_ms ?? undefined,
 		lastActiveMs: row.last_active_ms ?? undefined,
+		lastProgressMs: row.last_progress_ms ?? undefined,
 	};
 }
 
@@ -502,6 +527,12 @@ interface IssueLockRow {
 	issue_id: string;
 	session_id: string;
 	device_id: number;
+}
+
+interface SessionOwnershipGraceRow {
+	session_id: string;
+	device_id: number;
+	expires_ms: number;
 }
 
 /**
@@ -738,6 +769,25 @@ export class RouterStore {
 				.run(Date.now());
 		}
 
+		// Backfilled to migration time for the same asymmetry as `last_active_ms`
+		// above, though the cost of getting it wrong is different: this column only
+		// feeds the stranded-session DETECTOR, so a NULL would not stop or destroy
+		// anything — it would report every pre-upgrade sandbox that happens to hold
+		// affinity as stranded the moment the router restarts. A sev-1 alert that
+		// storms on deploy is how a rule gets muted, so start every existing row's
+		// progress clock at the upgrade instead.
+		if (
+			deviceColsNow.length > 0 &&
+			!deviceColsNow.some((c) => c.name === "last_progress_ms")
+		) {
+			this.db.exec("ALTER TABLE devices ADD COLUMN last_progress_ms INTEGER");
+			this.db
+				.prepare(
+					"UPDATE devices SET last_progress_ms = ? WHERE kind = 'container'",
+				)
+				.run(Date.now());
+		}
+
 		// Deliberately NOT backfilled, and there is nothing sensible to backfill
 		// with: a row enqueued before this column existed was produced by a
 		// router that had no trace to record. NULL is the honest answer and the
@@ -870,7 +920,8 @@ export class RouterStore {
 	/**
 	 * Deletes all rows keyed by device_id in the tables that have no foreign
 	 * key back to `devices` (session_affinity, issue_affinity, issue_locks,
-	 * rpc_mutations). Callers that delete or replace a device row (directly
+	 * session_ownership_grace, rpc_mutations). Callers that delete or replace a
+	 * device row (directly
 	 * or via cascading a user delete) MUST call this first/atomically so
 	 * those rows don't strand pointing at a device_id that no longer exists.
 	 */
@@ -889,6 +940,11 @@ export class RouterStore {
 			.run(deviceId);
 		this.db
 			.prepare("DELETE FROM session_affinity WHERE device_id = ?")
+			.run(deviceId);
+		// A revoked/replaced device must lose its post-terminal grace too, or a
+		// stale row would keep authorizing RPCs for a device_id that is gone.
+		this.db
+			.prepare("DELETE FROM session_ownership_grace WHERE device_id = ?")
 			.run(deviceId);
 		this.db
 			.prepare("DELETE FROM rpc_mutations WHERE device_id = ?")
@@ -1061,12 +1117,38 @@ export class RouterStore {
 		return { deviceId: Number(result.lastInsertRowid), deviceToken: token };
 	}
 
+	/**
+	 * Re-read ONE container device row by id.
+	 *
+	 * {@link listContainerDevices} takes the whole fleet in a single query, which
+	 * is right for starting a sweep and wrong for deciding anything at the end of
+	 * one: a lifecycle tick is sequential and blocks on provider control-plane
+	 * calls, so by the time it reaches a given row that row can be many minutes
+	 * old. NOR-406 is exactly that — a tick that began at 07:45:22 stopped a
+	 * container at 07:51:54 using timestamps from 07:45:22, and so never saw the
+	 * session routed to it at 07:51:39. Anything acting on a row rather than
+	 * merely counting it re-reads it through here first.
+	 *
+	 * Keyed by device id rather than issue key on purpose: a row destroyed and
+	 * recreated for the same issue is a DIFFERENT container, and a stale sweep
+	 * must not act on its successor.
+	 */
+	getContainerDevice(deviceId: number): ContainerDeviceInfo | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms, last_progress_ms
+				 FROM devices WHERE kind = 'container' AND device_id = ?`,
+			)
+			.get(deviceId) as ContainerDeviceRow | undefined;
+		return row ? toContainerDeviceInfo(row) : undefined;
+	}
+
 	getContainerDeviceForIssue(
 		issueKey: string,
 	): ContainerDeviceInfo | undefined {
 		const row = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms, last_progress_ms
 				 FROM devices WHERE kind = 'container' AND issue_key = ?`,
 			)
 			.get(issueKey) as ContainerDeviceRow | undefined;
@@ -1150,7 +1232,7 @@ export class RouterStore {
 	listContainerDevices(): ContainerDeviceInfo[] {
 		const rows = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms, last_progress_ms
 				 FROM devices WHERE kind = 'container'`,
 			)
 			.all() as ContainerDeviceRow[];
@@ -1223,6 +1305,50 @@ export class RouterStore {
 	markDeviceActive(deviceId: number, nowMs: number): void {
 		this.db
 			.prepare("UPDATE devices SET last_active_ms = ? WHERE device_id = ?")
+			.run(nowMs, deviceId);
+	}
+
+	/**
+	 * Stamp the device's PROGRESS clock: it just did work the router could see.
+	 *
+	 * Called from the one device→router frame that is evidence of an agent
+	 * actually working — an `rpc_request`. In container mode a sandbox holds no
+	 * Linear token, so every thought, action, and response the agent posts
+	 * arrives here as an RPC; a working session stamps this every few seconds,
+	 * and a session that has stopped working stamps it never again.
+	 *
+	 * That is the property the stranded-session detector needs and no existing
+	 * column has:
+	 *  - `last_seen_ms` is the heartbeat — it moves for a wedged worker.
+	 *  - `last_routed_ms` is the router routing TO the device — frozen for the
+	 *    whole of a long turn, which is why it cannot be thresholded on its own.
+	 *  - `last_active_ms` is stamped by the sweep itself on every pinned tick, so
+	 *    it moves identically for a busy sandbox and a stuck one.
+	 *
+	 * Deliberately NOT an input to the idle clock. Idle-stop errs toward keeping
+	 * a container alive and already has `last_active_ms` for that; feeding a
+	 * tighter signal into it would resurrect NOR-366's stop-a-busy-sandbox
+	 * failure from the other direction.
+	 *
+	 * Harmless for physical devices — nothing reads it for them.
+	 */
+	markDeviceProgress(deviceId: number, nowMs: number): void {
+		this.db
+			.prepare("UPDATE devices SET last_progress_ms = ? WHERE device_id = ?")
+			.run(nowMs, deviceId);
+	}
+
+	/**
+	 * Stamp when the router last handed this device an event.
+	 *
+	 * Called from {@link enqueueEvent}, inside its transaction. Drives the
+	 * container idle-stop policy and (with {@link markDeviceProgress}) the
+	 * stranded-session detector's no-progress clock. Harmless for physical
+	 * devices, which ignore `last_routed_ms`.
+	 */
+	markDeviceRouted(deviceId: number, nowMs: number): void {
+		this.db
+			.prepare("UPDATE devices SET last_routed_ms = ? WHERE device_id = ?")
 			.run(nowMs, deviceId);
 	}
 
@@ -1580,6 +1706,72 @@ export class RouterStore {
 			.run(state, nowMs, latest.run_id);
 	}
 
+	/**
+	 * The device and state of the most recent run recorded for a session.
+	 *
+	 * Exists to tell a REPLAY apart from an intrusion on the terminal frame.
+	 * `RouterServer` applies a `session_state` frame before acking it, so a
+	 * device that dies in between replays a frame the router already applied —
+	 * and once the posting grace has lapsed that replay arrives owning nothing,
+	 * looking exactly like a device reporting a terminal state for someone
+	 * else's session. The run row remembers which device the session actually
+	 * belonged to for as long as the row survives retention, which is far longer
+	 * than any grace, so it can answer the question the ownership routes no
+	 * longer can.
+	 *
+	 * Ordered the same way {@link finishAgentRun} orders it, so both see the same
+	 * row for a session that has been routed more than once.
+	 */
+	getLatestAgentRunForSession(
+		sessionId: string,
+	): { deviceId: number; state: string } | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT device_id, state FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
+			)
+			.get(sessionId) as Pick<AgentRunRow, "device_id" | "state"> | undefined;
+		return row === undefined
+			? undefined
+			: { deviceId: row.device_id, state: row.state };
+	}
+
+	/**
+	 * The most recent moment the router observed anything about an agent run on
+	 * this device — a worker activity, or a run ending.
+	 *
+	 * Read by {@link ContainerLifecycle} as a stop veto, not as an idle clock.
+	 * A run that ended seconds ago is the single most dangerous moment to stop a
+	 * container: the worker is still flushing (its `session_state` frame is
+	 * durably buffered and replayed until acked, and its artifact bundle is still
+	 * uploading), and killing it there converts a harmless park into a stranded
+	 * sandbox whose issue lock nothing will ever release — NOR-406.
+	 *
+	 * `ended_ms` covers both ways a run finishes as far as the router is
+	 * concerned: `finishAgentRun` on the terminal frame, and `markAgentRunUnknown`
+	 * when the affinity reconciler reclaims a row for a session the device no
+	 * longer reports. The second is precisely the "the device is done but the
+	 * router never got the frame" case, so it earns the same settle window.
+	 *
+	 * Deliberately ignores `started_ms`/`last_routed_ms`: those are router-side
+	 * stamps already mirrored on the device row's `last_routed_ms`, and folding
+	 * them in here would only duplicate the idle clock.
+	 *
+	 * Served by `idx_agent_runs_device`. Without it this is a full scan of every
+	 * run in the fleet's 24h retention window, run synchronously on the router's
+	 * event loop up to twice per idle candidate per tick — a cost that scales
+	 * with total run volume rather than with the number of candidates.
+	 */
+	getLastAgentRunActivityMs(deviceId: number): number | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT MAX(MAX(COALESCE(last_agent_activity_ms, 0), COALESCE(ended_ms, 0))) AS latest
+				 FROM agent_runs WHERE device_id = ?`,
+			)
+			.get(deviceId) as { latest: number | null } | undefined;
+		const latest = row?.latest ?? 0;
+		return latest > 0 ? latest : undefined;
+	}
+
 	markAgentRunUnknown(sessionId: string, nowMs: number): void {
 		const runId = this.latestNonTerminalRunId(sessionId);
 		if (!runId) return;
@@ -1856,11 +2048,7 @@ export class RouterStore {
 					traceContext?.traceparent ?? null,
 					traceContext?.tracestate ?? null,
 				);
-			// Drives the container idle-stop policy (Task 8); harmless for
-			// physical devices, which ignore last_routed_ms.
-			this.db
-				.prepare("UPDATE devices SET last_routed_ms = ? WHERE device_id = ?")
-				.run(nowMs, deviceId);
+			this.markDeviceRouted(deviceId, nowMs);
 			return seq;
 		});
 		return txn();
@@ -2263,6 +2451,131 @@ export class RouterStore {
 		this.db
 			.prepare("DELETE FROM issue_locks WHERE session_id = ?")
 			.run(sessionId);
+	}
+
+	/**
+	 * The device holding the issue lock taken out on behalf of `sessionId`, if
+	 * any. Distinct from {@link getSessionAffinity}: the lock models "this device
+	 * owns this issue's work" and deliberately SURVIVES a park, whereas affinity
+	 * is released the moment the worker parks. Session-scoped RPC authorization
+	 * reads this so a parked session's activities are not rejected (NOR-405).
+	 */
+	getIssueLockDeviceForSession(sessionId: string): number | undefined {
+		const row = this.db
+			.prepare("SELECT device_id FROM issue_locks WHERE session_id = ?")
+			.get(sessionId) as Pick<IssueLockRow, "device_id"> | undefined;
+		return row?.device_id;
+	}
+
+	/**
+	 * Records that `deviceId` may keep making session-scoped calls for
+	 * `sessionId` until `expiresMs`, even though it holds neither affinity nor
+	 * the issue lock any more.
+	 *
+	 * This exists for exactly one window: the terminal frame releases the lock
+	 * AND affinity in the same call, but a worker's last activities — typically
+	 * the completion summary the user most wants to see — are still in flight
+	 * when it lands. Bounded rather than permanent: a session that keeps
+	 * emitting long after it completed is the bug in NOR-405's title, not
+	 * something to authorize forever.
+	 */
+	grantSessionOwnershipGrace(
+		sessionId: string,
+		deviceId: number,
+		expiresMs: number,
+	): void {
+		this.db
+			.prepare(
+				`INSERT INTO session_ownership_grace (session_id, device_id, expires_ms)
+				 VALUES (?, ?, ?)
+				 ON CONFLICT(session_id) DO UPDATE SET
+					device_id = excluded.device_id,
+					expires_ms = excluded.expires_ms`,
+			)
+			.run(sessionId, deviceId, expiresMs);
+	}
+
+	/**
+	 * The device still inside its post-terminal grace for `sessionId`, or
+	 * `undefined` if there is none or it has lapsed. Expired rows are deleted on
+	 * read: the read is the only thing that cares about them, so there is no
+	 * separate sweep to fall behind.
+	 */
+	getSessionOwnershipGrace(
+		sessionId: string,
+		nowMs: number = Date.now(),
+	): number | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT device_id, expires_ms FROM session_ownership_grace WHERE session_id = ?",
+			)
+			.get(sessionId) as
+			| Pick<SessionOwnershipGraceRow, "device_id" | "expires_ms">
+			| undefined;
+		if (!row) return undefined;
+		if (row.expires_ms <= nowMs) {
+			this.db
+				.prepare("DELETE FROM session_ownership_grace WHERE session_id = ?")
+				.run(sessionId);
+			return undefined;
+		}
+		return row.device_id;
+	}
+
+	clearSessionOwnershipGrace(sessionId: string): void {
+		this.db
+			.prepare("DELETE FROM session_ownership_grace WHERE session_id = ?")
+			.run(sessionId);
+	}
+
+	/**
+	 * Bounded retention for lapsed grace rows.
+	 *
+	 * {@link getSessionOwnershipGrace} already deletes a row it finds expired, so
+	 * this is not needed for authorization to be correct — but that read only
+	 * happens when the session id comes up again, and the overwhelmingly common
+	 * case is a session that completes and is never asked about. Without a sweep
+	 * every terminal session leaves a permanent row, and `StateBackup` pays for
+	 * all of them on every upload. Same reasoning as `sweepWebhookClaims`.
+	 */
+	sweepSessionOwnershipGrace(cutoffMs: number): number {
+		return this.db
+			.prepare("DELETE FROM session_ownership_grace WHERE expires_ms <= ?")
+			.run(cutoffMs).changes;
+	}
+
+	/**
+	 * The device entitled to act on `sessionId`, or `undefined` if no device is.
+	 *
+	 * THE single definition of session ownership, deliberately in one place: it
+	 * is read both by {@link LinearExecutor} to authorize a session-scoped RPC
+	 * and by {@link EventRouter} to decide whether a device may be granted a
+	 * post-terminal grace. Those two must never disagree — a device that can be
+	 * granted ownership it does not have is an escalation, not a lenient check.
+	 *
+	 * The same rule binds every branch of `handleSessionState`, not only the
+	 * grants: `parked` records an in-memory authorization for the later `active`
+	 * frame, and `active` writes affinity — the strongest route here — so both
+	 * are gated too. Ungating either one re-opens the escalation in two frames
+	 * rather than one.
+	 *
+	 * The three routes, and why one is not enough:
+	 *  - **affinity**: the session is actively routed here. Cleared on park.
+	 *  - **the issue lock**: survives a park, which is the whole reason the park
+	 *    path retains it. Absent entirely when `config.issueLock` is off.
+	 *  - **a bounded grace**: covers the windows the other two cannot — a park on
+	 *    a deployment without issue locking, and the terminal frame, which drops
+	 *    both of the above while the worker's closing summary is in flight.
+	 */
+	getSessionOwner(
+		sessionId: string,
+		nowMs: number = Date.now(),
+	): number | undefined {
+		return (
+			this.getSessionAffinity(sessionId) ??
+			this.getIssueLockDeviceForSession(sessionId) ??
+			this.getSessionOwnershipGrace(sessionId, nowMs)
+		);
 	}
 
 	/**

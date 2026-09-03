@@ -71,6 +71,13 @@ export {
 	type SessionInfo,
 } from "./RouterStore.js";
 export {
+	emitRoutingRejection,
+	ROUTING_EVENTS,
+	type RoutingEventName,
+	type RoutingRejection,
+	type RoutingRejectReason,
+} from "./RouterTelemetry.js";
+export {
 	type AgentRunObservation,
 	type AgentRunsResponse,
 	type RegisterRunsRouteOptions,

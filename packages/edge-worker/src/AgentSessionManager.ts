@@ -14,13 +14,16 @@ import {
 	type AgentPendingWork,
 	AgentSessionStatus,
 	AgentSessionType,
+	CYRUS_EVENTS,
 	type CyrusAgentSession,
 	type CyrusAgentSessionEntry,
 	createLogger,
+	cyrusAttributes,
 	type IAgentRunner,
 	type ILogger,
 	type IssueMinimal,
 	type RepositoryContext,
+	type RunnerType,
 	type SerializedCyrusAgentSession,
 	type SerializedCyrusAgentSessionEntry,
 	type SessionCreator,
@@ -28,6 +31,7 @@ import {
 } from "cyrus-core";
 
 import {
+	formatPendingWorkSummary,
 	formatPendingWorkThought,
 	formatScheduleWakeupResponse,
 	tryParseScheduleWakeupInput,
@@ -314,7 +318,9 @@ export class AgentSessionManager extends EventEmitter {
 					? "codex"
 					: runner?.constructor.name === "CursorRunner"
 						? "cursor"
-						: "claude";
+						: runner?.constructor.name === "OpenCodeRunner"
+							? "opencode"
+							: "claude";
 
 		// Update the appropriate session ID based on runner type
 		if (runnerType === "gemini") {
@@ -323,6 +329,8 @@ export class AgentSessionManager extends EventEmitter {
 			linearSession.codexSessionId = claudeSystemMessage.session_id;
 		} else if (runnerType === "cursor") {
 			linearSession.cursorSessionId = claudeSystemMessage.session_id;
+		} else if (runnerType === "opencode") {
+			linearSession.opencodeSessionId = claudeSystemMessage.session_id;
 		} else {
 			linearSession.claudeSessionId = claudeSystemMessage.session_id;
 		}
@@ -370,7 +378,9 @@ export class AgentSessionManager extends EventEmitter {
 					? "codex"
 					: runner?.constructor.name === "CursorRunner"
 						? "cursor"
-						: "claude";
+						: runner?.constructor.name === "OpenCodeRunner"
+							? "opencode"
+							: "claude";
 
 		const sessionEntry: CyrusAgentSessionEntry = {
 			// Set the appropriate session ID based on runner type
@@ -380,7 +390,9 @@ export class AgentSessionManager extends EventEmitter {
 					? { codexSessionId: sdkMessage.session_id }
 					: runnerType === "cursor"
 						? { cursorSessionId: sdkMessage.session_id }
-						: { claudeSessionId: sdkMessage.session_id }),
+						: runnerType === "opencode"
+							? { opencodeSessionId: sdkMessage.session_id }
+							: { claudeSessionId: sdkMessage.session_id }),
 			type: sdkMessage.type,
 			content: this.extractContent(sdkMessage),
 			metadata: {
@@ -497,9 +509,21 @@ export class AgentSessionManager extends EventEmitter {
 			// never to this one, so it does not strictly need to precede the
 			// terminal signal — but keeping it inside the `try` means a throw here
 			// still releases this session's lock.
+			//
+			// A session held open for pending work is not done yet: the wakeup or
+			// background task will stream more messages in, ending in another
+			// result. Resuming the parent now would hand it a non-final result and
+			// resume it again later, so defer to the result that actually ends the
+			// session — the same condition that defers the terminal signal below.
 			const parentSessionId = this.getParentSessionId?.(sessionId);
 			if (parentSessionId && this.resumeParentSession) {
-				await this.handleChildSessionCompletion(sessionId, resultMessage);
+				if (pendingWork) {
+					log.info(
+						`Child session has pending work; deferring parent ${parentSessionId} resume until the session finishes`,
+					);
+				} else {
+					await this.handleChildSessionCompletion(sessionId, resultMessage);
+				}
 			}
 		} finally {
 			// Notify terminal-state observers (router mode releases the issue lock +
@@ -527,6 +551,35 @@ export class AgentSessionManager extends EventEmitter {
 			if (!pendingWork) {
 				await this.emitTerminalOnce(sessionId, terminalState);
 			} else {
+				// An EVENT, not the `info` it was. This branch withholds the only
+				// thing that releases the router's issue lock, and it does so with no
+				// bound: the signal is retried only if a wakeup or a background task
+				// yields another result, so a background task that never exits holds
+				// the issue forever. That made it the prime suspect for CAN-133 —
+				// and it was unfalsifiable, because a sandbox worker forwards WARN+
+				// by default, so the `info` never left the container while `event()`
+				// bypasses that threshold entirely (NOR-402).
+				log.event(
+					CYRUS_EVENTS.sessionTerminalDeferred,
+					cyrusAttributes({
+						agent_session_id: sessionId,
+						terminal_state: terminalState,
+						session_cron_count: pendingWork.sessionCrons.length,
+						background_task_count: pendingWork.backgroundTasks.length,
+						live_background_task_count:
+							pendingWork.liveBackgroundTasks?.length ?? 0,
+						// The identity of what is holding the session open. Without it
+						// the event says a session is deferred and gives an operator
+						// nothing to act on.
+						//
+						// NOT `formatPendingWorkThought`: that renders the user-facing
+						// "standing by" message, which lists only scheduled wakeups and
+						// returns null for a session held open solely by a LIVE
+						// background task — i.e. it is null for precisely the case that
+						// is the leading suspect for a session that never terminates.
+						pending_work: formatPendingWorkSummary(pendingWork),
+					}),
+				);
 				log.info(
 					`Deferring terminal signal: runner has pending work (${pendingWork.sessionCrons.length} crons, ${pendingWork.backgroundTasks.length} background tasks)`,
 				);
@@ -657,6 +710,18 @@ export class AgentSessionManager extends EventEmitter {
 			}
 		}
 
+		// The counterpart to `session.terminal_deferred`. Between them an operator
+		// can answer "did this session ever finish?" from the log stream alone —
+		// which for CAN-133 took reading five hours of gauge samples and inferring
+		// it from an affinity count that never dropped.
+		this.sessionLog(sessionId).event(
+			CYRUS_EVENTS.sessionTerminalSignalled,
+			cyrusAttributes({
+				agent_session_id: sessionId,
+				terminal_state: state,
+				forced: opts?.force ?? false,
+			}),
+		);
 		this.emit("sessionTerminal", sessionId, state);
 	}
 
@@ -967,7 +1032,9 @@ export class AgentSessionManager extends EventEmitter {
 					? "codex"
 					: runner?.constructor.name === "CursorRunner"
 						? "cursor"
-						: "claude";
+						: runner?.constructor.name === "OpenCodeRunner"
+							? "opencode"
+							: "claude";
 
 		// For error results, content may be in errors[] rather than result.
 		const resultText =
@@ -1044,7 +1111,9 @@ export class AgentSessionManager extends EventEmitter {
 					? { codexSessionId: resultMessage.session_id }
 					: runnerType === "cursor"
 						? { cursorSessionId: resultMessage.session_id }
-						: { claudeSessionId: resultMessage.session_id }),
+						: runnerType === "opencode"
+							? { opencodeSessionId: resultMessage.session_id }
+							: { claudeSessionId: resultMessage.session_id }),
 			type: "result",
 			content,
 			metadata: {
@@ -2178,11 +2247,33 @@ export class AgentSessionManager extends EventEmitter {
 		sessionId: string,
 		model: string,
 	): Promise<void> {
+		const displayModel = this.formatModelNotification(sessionId, model);
 		await this.postActivity(
 			sessionId,
-			{ content: { type: "thought", body: `Using model: ${model}` } },
+			{ content: { type: "thought", body: `Using model: ${displayModel}` } },
 			"model notification",
 		);
+	}
+
+	private formatModelNotification(sessionId: string, model: string): string {
+		const runnerType = this.getSessionRunnerType(sessionId);
+		if (model.startsWith(`${runnerType}/`)) {
+			return model;
+		}
+		return `${runnerType}/${model}`;
+	}
+
+	private getSessionRunnerType(sessionId: string): RunnerType {
+		const runner = this.sessions.get(sessionId)?.agentRunner;
+		return runner?.constructor.name === "GeminiRunner"
+			? "gemini"
+			: runner?.constructor.name === "CodexRunner"
+				? "codex"
+				: runner?.constructor.name === "CursorRunner"
+					? "cursor"
+					: runner?.constructor.name === "OpenCodeRunner"
+						? "opencode"
+						: "claude";
 	}
 
 	/**

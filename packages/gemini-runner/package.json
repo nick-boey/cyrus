@@ -1,6 +1,6 @@
 {
 	"name": "cyrus-gemini-runner",
-	"version": "0.2.68",
+	"version": "0.2.70",
 	"description": "Gemini CLI process spawning and management for Cyrus",
 	"repository": {
 		"type": "git",
@@ -30,7 +30,6 @@
 		"zod": "4.3.6"
 	},
 	"devDependencies": {
-		"@google/gemini-cli-core": "0.52.0",
 		"@types/fs-extra": "^11.0.4",
 		"@types/node": "^20.19.43",
 		"typescript": "^5.9.3",

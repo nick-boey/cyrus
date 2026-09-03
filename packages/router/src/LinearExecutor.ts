@@ -2,6 +2,7 @@ import {
 	AgentActivityContentType,
 	AgentActivitySignal,
 	createNoopLogger,
+	cyrusAttributes,
 	type IIssueTrackerService,
 	type ILogger,
 	type IssueFacts,
@@ -21,6 +22,7 @@ import {
 	SESSION_SCOPED_RPC_METHODS,
 } from "cyrus-router-protocol";
 import type { RouterStore } from "./RouterStore.js";
+import { emitSessionOwnershipRefusal } from "./RouterTelemetry.js";
 import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
 /** 20 MiB — default ceiling for token-authenticated attachment downloads. */
@@ -170,13 +172,41 @@ export class LinearExecutor {
 			}
 
 			// 4. Session-scoped authorization: the target session must belong to the
-			//    calling device.
+			//    calling device. `getSessionOwner` is the single definition of that
+			//    — affinity, or the issue lock (which survives a park), or a bounded
+			//    grace (which covers the terminal frame, where the other two are
+			//    dropped while the closing summary is still in flight). Reading
+			//    affinity alone is what silently discarded 161 posts in a day.
 			if ((SESSION_SCOPED_RPC_METHODS as readonly string[]).includes(method)) {
 				const sessionId = extractSessionId(method, rest);
 				if (
 					sessionId === undefined ||
-					this.store.getSessionAffinity(sessionId) !== deviceId
+					this.store.getSessionOwner(sessionId) !== deviceId
 				) {
+					// Logged router-side, at WARN and as a queryable event, because a
+					// refusal here is user-visible data loss: the device's activity
+					// never reaches Linear, and until now the only trace of it was the
+					// sandbox's own relayed console — below the WARN threshold a
+					// worker's forwarder ships by default. That is how 161 dropped
+					// posts in a single day went unnoticed (NOR-405).
+					emitSessionOwnershipRefusal(this.logger, {
+						reason: "rpc_not_owned",
+						sessionId,
+						deviceId,
+						rpcMethod: method,
+					});
+					this.logger
+						.withContext({
+							...(sessionId !== undefined ? { sessionId } : {}),
+							attributes: cyrusAttributes({
+								rpc_method: method,
+								device_id: deviceId,
+								session_id: sessionId ?? null,
+							}),
+						})
+						.warn(
+							`Rejected session-scoped RPC '${method}' from device ${deviceId} for session ${sessionId ?? "<missing>"}: session not owned by this device`,
+						);
 					return fail(id, "session not owned by this device");
 				}
 			}

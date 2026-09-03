@@ -97,6 +97,28 @@ describe("WipSnapshotReaper", () => {
 		expect(deleteSnapshot).toHaveBeenCalledWith(dir, "ISS-1");
 	});
 
+	/**
+	 * NOR-411: teardown handed the reaper a worktree path that had never
+	 * existed, and `execFileAsync` reported the missing `cwd` as
+	 * `spawn git ENOENT` — which reads as "git is not installed on this image",
+	 * and is what the first investigation concluded. Check before spawning so
+	 * the log names the real problem.
+	 */
+	it("names the missing checkout rather than letting git report ENOENT", async () => {
+		const deleteSnapshot = vi.fn(async () => true);
+		const { reaper, dir, logger, stateFile } = makeReaper(deleteSnapshot);
+		rmSync(dir, { recursive: true, force: true });
+
+		await reaper.reap(dir, "ISS-1");
+
+		expect(deleteSnapshot).not.toHaveBeenCalled();
+		expect(logger.warn).toHaveBeenCalledWith(
+			expect.stringContaining(`the checkout at ${dir} does not exist`),
+		);
+		// Nothing to retry without a checkout, so nothing is recorded either.
+		expect(existsSync(stateFile)).toBe(false);
+	});
+
 	it("gives up on an entry whose repository is gone, rather than retrying it forever", async () => {
 		const deleteSnapshot = vi.fn(async () => {
 			throw new Error("remote unreachable");

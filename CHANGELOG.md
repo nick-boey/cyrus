@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - A session that fails before the agent starts now reports the failure on the issue and ends, instead of sitting at "Working…" forever. Startup failures were logged where only an operator would see them, so from the issue the session looked alive indefinitely and the issue stayed locked against further work. ([NOR-412](https://linear.app/northrop-digital/issue/NOR-412/subprocess-env-scrubbing-is-off-in-every-sandbox-socat-and-bubblewrap), [#46](https://github.com/nick-boey/cyrus/pull/46))
 - You can now pick your own default coding agent and model, under **Session defaults** on the `/setup` page. Previously every issue ran Claude unless you remembered to put a label on it, which made a label mandatory rather than optional — so the label was carrying a preference that never changes instead of an exception. Your choice is per-person and applies across the workspace. Labels and `[agent=…]`/`[model=…]` tags keep working exactly as before and still win for the issue they are on. The list offers Claude and Codex; Gemini and Cursor are not offered because neither runs in a cloud container yet, and they remain available as a per-issue label on your own machine. Changing your default applies to issues that start a container after you save — an issue that already has one keeps the agent it started with until you run `cyrus router containers destroy <issueKey>` and re-prompt it, which the page now tells you. ([NOR-364](https://linear.app/northrop-digital/issue/NOR-364/allow-users-to-select-default-runners), [#41](https://github.com/nick-boey/cyrus/pull/41))
 - Codex sessions can now run on your own ChatGPT subscription instead of a separately-billed API key. Connect it once under **Codex account** on `/setup`: run `codex login --device-auth` on your own machine and paste the file it writes. Cyrus keeps it signed in for you and hands each session a fresh short-lived copy, so you never have to sign in from inside a session and your concurrent issues do not fight over the credential. Your paste is checked when you submit it, so a wrong file is rejected there and then with a message saying what is wrong, rather than becoming a session that dies hours later. If the credential stops working — a lapsed subscription, or a `codex logout` on your laptop, which revokes every copy — the session fails with a message naming the fix rather than quietly running a different agent than you chose. `OPENAI_API_KEY` still works if you would rather use metered billing. ([NOR-364](https://linear.app/northrop-digital/issue/NOR-364/allow-users-to-select-default-runners), [#41](https://github.com/nick-boey/cyrus/pull/41))
+- Every agent session now explains how to attach local images and videos to GitHub issues, pull requests, and comments with GitHub CLI v2.99.0 or newer, independently of optional browser tooling. ([CYPACK-1490](https://linear.app/ceedar/issue/CYPACK-1490/add-this-to-the-system-prompt), [#1453](https://github.com/cyrusagents/cyrus/pull/1453))
 
 ### Changed
 - Skills you install into `~/.claude/skills` now also work in Codex sessions, not just Claude ones. Codex has no user-level skill discovery of its own, so Cyrus stages those directories alongside your repository's and Cyrus's own before each run — previously a Codex session was told it had such a skill and then could not find it. ([NOR-365](https://linear.app/northrop-digital/issue/NOR-365/install-the-mattpocock-plugin-for-claude-code-in-the-sandboxes), [#39](https://github.com/nick-boey/cyrus/pull/39))
@@ -21,10 +22,17 @@ All notable changes to this project will be documented in this file.
 - Cloud container startup output and a handful of remaining log lines now go through the same logging path as everything else, so they respect `CYRUS_LOG_LEVEL` and `CYRUS_LOG_FORMAT` and reach any configured log backend instead of only the terminal. Startup output is still also written to `~/cyrus-boot.log`. Interactive command output — setup prompts, the OAuth walkthrough, status tables — is unchanged and stays plain text. ([NOR-282](https://linear.app/northrop-digital/issue/NOR-282/telemetry-phase-4-semantic-conventions-where-they-pay), [#31](https://github.com/nick-boey/cyrus/pull/31))
 - Azure runtime role assignments can now be bootstrapped separately from routine deployments. Run `./scripts/bootstrap-azure-role-assignments.sh` with an authorized operator, then set `manageRoleAssignments = false`; subsequent Bicep deployments need Contributor rather than permission to grant roles. Existing Bicep environments keep their current deterministic assignments under Incremental mode, so this is a reconciliation step rather than a migration. ([NOR-299](https://linear.app/northrop-digital/issue/NOR-299/establish-private-northrop-bicep-cd-and-retire-terraform), [#30](https://github.com/nick-boey/cyrus/pull/30))
 - Deploying the Azure-hosted router no longer keeps a state file. The deployment is now described in Bicep and applied with `./scripts/deploy-azure.sh`, which previews every change before you accept it; Azure itself is the record of what is deployed. For operators this removes the whole state apparatus — no storage account to create before the first deploy, nothing to initialise, no lock to break, and no second copy of your Linear credentials sitting in a state file on disk. Routine deployments are secretless and cannot overwrite credentials rotated directly in Key Vault; a bootstrap or deliberate rotation now requires both an opt-in Bicep flag and `--allow-secret-writes`. Existing early-Bicep deployments should set both write flags false and clear the eight value fields before their next run; Incremental mode keeps the already-created Key Vault secrets. Two long-standing annoyances go with it: getting the router's public URL into its own configuration no longer takes a second deploy, and turning the per-user secret store's feature flag back off no longer fails with an error about a protected resource — the stored secrets and their encryption key simply stay where they are. Private deployment automation can pass an external environment parameter file and override the immutable router image without rewriting the public checkout. If you were deploying with Terraform, copy `infra/azure/bicep/main.bicepparam.example`, transfer your values into it, and follow the runbook in `infra/azure/README.md`; your existing resources are adopted as they are, with no import step. ([#29](https://github.com/nick-boey/cyrus/pull/29))
-- Pull requests Cyrus opens now contain only the commits the agent actually wrote, with the messages it wrote. Cyrus used to protect in-progress work by committing it to the issue branch every five minutes as `wip: auto-saved by cyrus`, which meant every PR carried a run of those commits — and on any session longer than five minutes the timer beat the agent to its own commit, so the PR's entire history became auto-generated `wip:` commits with no real message and no meaningful authorship. Work is now saved to a hidden ref instead: it never touches your branches, never triggers CI, and is not fetched by an ordinary `git clone`. Durability is unchanged — an issue's work still survives losing the machine it was running on, with the same five-minute worst case. Two knock-on effects you will notice: the agent's workspace now stays dirty until it commits, so the guardrail that stops a session ending with uncommitted or unpushed work starts doing its job again; and if saving that work ever fails, Cyrus now says so on the issue instead of only in its logs, because the branch is no longer a fallback copy. No configuration needed, and existing `wip:` commits on open PRs are left exactly as they are. ([#26](https://github.com/nick-boey/cyrus/pull/26))
+- Pull requests Cyrus opens now contain only the commits the agent actually wrote, with the messages it wrote. Cyrus used to protect in-progress work by committing it to the issue branch every five minutes as `wip: auto-saved by cyrus`, which meant every PR carried a run of those commits — and on any session longer than five minutes the timer beat the agent to its own commit, so the PR's entire history became auto-generated `wip:` commits with no real message and no meaningful authorship. Work is now saved to a hidden ref instead: it never touches your branches, never triggers CI, and is not fetched by an ordinary `git clone`. The ref is deleted from your remote when the issue is marked Done or Canceled, so these don't accumulate — hidden refs are still advertised on every clone and fetch and count against a repository's size limit, so one left behind per issue would be a cost every contributor pays. Durability is unchanged — an issue's work still survives losing the machine it was running on, with the same five-minute worst case. Two knock-on effects you will notice: the agent's workspace now stays dirty until it commits, so the guardrail that stops a session ending with uncommitted or unpushed work starts doing its job again; and if saving that work ever fails, Cyrus now says so on the issue instead of only in its logs, because the branch is no longer a fallback copy. No configuration needed, and existing `wip:` commits on open PRs are left exactly as they are. ([#26](https://github.com/nick-boey/cyrus/pull/26))
 
 ### Fixed
 - Sessions no longer open with a warning that Linux sandbox requirements are not met. Every session logged it, and it was misleading twice over: it said a security setting was being skipped because packages were missing, when in fact nothing would have switched that setting on regardless, and it kept saying so on machines where the setting was never wanted. Cyrus now checks for those packages only when you have actually asked for the protection they support — see `CYRUS_SUBPROCESS_ENV_SCRUB` above — and otherwise notes once, at info level, that the setting is off. ([NOR-412](https://linear.app/northrop-digital/issue/NOR-412/subprocess-env-scrubbing-is-off-in-every-sandbox-socat-and-bubblewrap), [#46](https://github.com/nick-boey/cyrus/pull/46))
+- Agent output no longer vanishes from an issue when a session pauses to ask you something or finishes its work. A session that stops to wait for your answer, and a session posting the summary it writes as it wraps up, were both treated as no longer owning the issue they were working on — so every comment they posted from that moment on was rejected and thrown away, with nothing on the issue to say anything had gone missing. The closing summary was the most common casualty, which is the part of a run most worth reading. On one day this silently discarded 161 posts across seventeen issues. A session that genuinely does not belong to the machine posting for it is still refused, and that refusal is now recorded in the router's own logs with the session, machine and operation involved, so a recurrence is visible rather than invisible. If you deploy the Azure router, this comes with a new saved query ("Refused session claims") and an alert that fires when activities are being dropped against a single session, so the failure this fixes cannot recur unnoticed. ([NOR-405](https://linear.app/northrop-digital/issue/NOR-405/a-parked-or-completed-session-keeps-emitting-and-every-linear-activity), [#47](https://github.com/nick-boey/cyrus/pull/47))
+- One machine can no longer claim another machine's agent session. A machine enrolled on your router could report that it had paused, resumed, or finished a session belonging to someone else, and on resuming take that session over — letting it post comments as that agent and stop the real one's work, on an issue it was never given. The router now checks that a machine actually holds a session before acting on anything it says about it, and refuses and records the attempt otherwise. A machine reporting the end of its *own* session after a restart is recognised as the ordinary repeat it is, rather than being reported as an intrusion. ([NOR-405](https://linear.app/northrop-digital/issue/NOR-405/a-parked-or-completed-session-keeps-emitting-and-every-linear-activity), [#47](https://github.com/nick-boey/cyrus/pull/47))
+- A cloud sandbox is no longer shut down because of what it looked like several minutes ago. The routine sweep that parks idle sandboxes read the clock and each sandbox's record once when it started, then worked through them one at a time — and because each one can involve a slow call to Azure, the sweep could still be running six minutes later, deciding from figures that old. In one case it shut down a sandbox four seconds after a new session had started on it, having never seen the session arrive; the session's completion message never reached the router, so the issue stayed locked and Linear went on showing a live agent for 37 minutes. Each sandbox is now judged on its state at the moment of the decision, and re-checked once more immediately before anything is shut down. As a second line of defence for when the sweep itself is running slowly — the only situation in which the first is not enough — a sandbox is also left alone for a couple of minutes after a session on it ends, so its worker can finish reporting in. Sandboxes that are genuinely idle are still parked on the same schedule. Every sandbox the sweep decides *not* to park now says so in the log stream with a reason, and the per-sweep summary counts them — previously the only evidence that any of this was working was an absence of shutdowns, which looks exactly like a sweep that has stopped running. If you deploy the Azure router, this comes with a new saved query ("Idle-stops the sweep abandoned, by reason") and an alert for a sandbox that has been spared on nearly every sweep for an hour, which is a sandbox billing indefinitely. The settle window is configurable as `terminalSettleMs` and is now stated explicitly in the Bicep template alongside `idleStopMs`; the router rejects a value that is not a positive whole number of milliseconds at startup, and warns if you set one shorter than a sweep interval or longer than `idleStopMs`. ([NOR-406](https://linear.app/northrop-digital/issue/NOR-406/the-lifecycle-sweep-decides-idle-stop-from-a-snapshot-minutes-stale), [#45](https://github.com/nick-boey/cyrus/pull/45))
+- A cloud sandbox booted while a slow sweep was still in progress no longer has its uptime clock reset. The sweep asks each provider once per pass how its sandboxes are doing — the cost of asking per sandbox would be prohibitive — but then used that answer to decide whether a sandbox was still running, even minutes later. A sandbox that started up after the question was asked looked stopped, and the clock behind the "running for six hours" alert was cleared out from under it, under-reporting exactly the sandboxes that had been busy throughout. That reading is now ignored when it predates the sandbox's own start, and each sandbox's status line records how old the reading was. ([NOR-406](https://linear.app/northrop-digital/issue/NOR-406/the-lifecycle-sweep-decides-idle-stop-from-a-snapshot-minutes-stale), [#45](https://github.com/nick-boey/cyrus/pull/45))
+- A workspace on your own machine is no longer left on disk when an issue is closed, if you had pointed Cyrus's worktrees somewhere other than its default directory. Cleanup looked for the workspace under that default rather than where it had actually created it, found nothing, and said so in a way that read like success. When Cyrus now finds nothing to clean up it names the directory it looked in and where that came from, so "already tidy" and "looked in the wrong place" stop being indistinguishable. ([NOR-411](https://linear.app/northrop-digital/issue/NOR-411/wip-snapshot-refs-leak-permanently-teardown-looks-for-the-worktree), [#48](https://github.com/nick-boey/cyrus/pull/48))
+- An issue whose agent session stopped working is no longer silently unreachable. When a session never reaches a terminal state — most often because the agent left a background task running, which withholds the completion signal indefinitely — it keeps holding the issue, and a new top-level `@cyrus1` comment on that issue is rejected rather than delivered. That rejection now says so plainly on the issue: it tells you the comment did not reach the running session and that replying **inside the running session's thread** will, instead of the previous message claiming the session belonged to another user, which was usually the same person. Operators also get a warning in the logs naming the session that holds the issue, so a dropped comment is distinguishable from a webhook that never arrived. ([NOR-402](https://linear.app/northrop-digital/issue/NOR-402/a-never-terminating-agent-session-makes-an-issue-permanently), [#49](https://github.com/nick-boey/cyrus/pull/49))
+- A cloud sandbox that is running and connected but has had nothing routed to it and has posted nothing for several hours is now reported as stranded, so the stranded-session alert can cover it. Previously that alert could only fire for a sandbox that was stopped and disconnected — so the failure that actually blocks work, where everything looks healthy while an issue is locked to a session that quietly stopped, was excluded by definition. One such sandbox held an issue for five hours and seventeen minutes and ran the whole time doing nothing. The report names both possibilities rather than guessing: a session waiting on a scheduled wakeup looks the same from outside the sandbox, and the alert tells an operator how to tell them apart before acting. ([NOR-402](https://linear.app/northrop-digital/issue/NOR-402/a-never-terminating-agent-session-makes-an-issue-permanently), [#49](https://github.com/nick-boey/cyrus/pull/49))
 - A slash command at the start of a comment now actually invokes the skill. Writing `@cyrus1 /tdd add a failing test` on an issue used to reach the agent as ordinary prose, and it would reply that no such skill was available, quietly pick a different one, or go hunting through the filesystem for the skill's definition. This mattered most for skills that declare themselves user-invocable only, which are reachable *only* this way — over half of a typical installed skill set — so they could not be used from Linear at all. Cyrus now repeats the command on the first line of what it sends the agent, which is the only form the agent recognises; your comment is passed along unchanged underneath it, so nothing is lost and the words after the command still reach the skill. A slash further into a sentence is still treated as prose, and so is a command that does not name a skill you actually have — Cyrus checks before acting on it, because an unrecognised command is rejected outright rather than read as text, which would have discarded the rest of your comment. Each such invocation is recorded in the log stream as `skill.slash_invoked` with the skill's name, which is the only trace these leave — a slash-invoked skill bypasses the ordinary tool machinery and so produces no tool activity to watch. ([NOR-368](https://linear.app/northrop-digital/issue/NOR-368/make-skill-in-a-linear-comment-actually-invoke-the-skill), [#42](https://github.com/nick-boey/cyrus/pull/42))
 - Connecting a ChatGPT subscription for Codex now works on an Azure-hosted router. The credential store was never switched on there, so the **Codex account** section never appeared on `/setup` — while the runner picker still offered Codex, leaving anyone who chose it with a session that refused to start and a message pointing at a page section that did not exist. Selecting Codex on a router that cannot store subscription credentials now says so and names `OPENAI_API_KEY` as the way to run it, instead of sending you looking for a control you do not have. ([NOR-364](https://linear.app/northrop-digital/issue/NOR-364/allow-users-to-select-default-runners), [#41](https://github.com/nick-boey/cyrus/pull/41))
 - A connected Codex account can no longer quietly stop working after a router restart. The key that encrypts stored subscription credentials could be written to disk that does not survive a restart, and it was never included in the router's backups — so the credential came back unreadable while the page kept showing the account as connected, and the only clue was a session failing days later. Credentials are now encrypted with a durable key wherever one is available, and a router that has to fall back to a local key says so at startup. ([NOR-364](https://linear.app/northrop-digital/issue/NOR-364/allow-users-to-select-default-runners), [#41](https://github.com/nick-boey/cyrus/pull/41))
@@ -84,8 +92,145 @@ All notable changes to this project will be documented in this file.
 - Project and team routing now match names case-insensitively. ([#13](https://github.com/nick-boey/cyrus/pull/13))
 - `containers.repositories` entries now have their `baseBranch` validated before the repository registry is seeded (letters, digits, dots, dashes, underscores, and slashes only — no leading dash, no `..`). `main`, `master`, and version-style branches like `release/1.2.x` are unaffected. If any entry's `baseBranch` fails validation, the whole seed is skipped and the router reports "No repositories are registered" for every issue until it's fixed — the router logs exactly which repository and branch failed and why. Operators upgrading with an unusual branch name (containing `+`, `~`, `%`, `@`, `#`, or similar) in `containers.repositories` should check their logs after upgrading. ([#13](https://github.com/nick-boey/cyrus/pull/13))
 
+### Fixed
+- Orchestrator sessions are resumed again as soon as a delegated sub-issue's session completes. Since v0.2.69 the parent-to-child link was never created for sub-issues started through Linear delegation, so orchestrators only advanced when their own scheduled wake-up fired, paying the full timer interval on every hand-off. Cyrus now links a new session to the most recent session on its parent issue, whether or not that parent session is still running, so parent-child issue relationships carry child completion results in general. ([#1454](https://github.com/cyrusagents/cyrus/pull/1454))
+- A child session that ends a turn with a scheduled wake-up or a background task still pending no longer resumes its parent early. Previously the parent received a non-final result and was resumed a second time when the child actually finished; the callback now waits for the result that ends the child session. ([#1454](https://github.com/cyrusagents/cyrus/pull/1454))
+
+### Changed
+- The `orchestrator` and `graphite-orchestrator` prompts now instruct Cyrus to delegate each sub-issue to itself when creating it. The previous guidance said the inherited assignee was enough to start the child session, which stopped being true once the explicit session-creation tools were removed in v0.2.69. ([#1454](https://github.com/cyrusagents/cyrus/pull/1454))
+- EdgeWorker state saves are now atomic, preventing a process interrupted during a save from leaving a truncated state file that strands in-flight sessions; empty and legacy-truncated state files also recover cleanly. Thanks @connor-tembo for the contribution. ([CYPACK-1486](https://linear.app/ceedar/issue/CYPACK-1486/can-you-add-a-changelog-entry-for-this), [#1444](https://github.com/cyrusagents/cyrus/pull/1444))
+
+### Changed
+- Updated `@anthropic-ai/claude-agent-sdk` from `0.3.252` to [`0.3.258`](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md#03258), bringing Claude sessions to parity with Claude Code 2.1.258 plus MCP resource-link and reconnection fixes. Updated `@anthropic-ai/sdk` from `^0.122.0` to [`^0.123.0`](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/CHANGELOG.md#01230-2026-09-01); the refreshed 31-tool Claude allowance lists are unchanged. ([CYPACK-1489](https://linear.app/ceedar/issue/CYPACK-1489/update-anthropic-aiclaude-agent-sdk-and-anthropic-aisdk-to-the-latest), [#1451](https://github.com/cyrusagents/cyrus/pull/1451), [cyrus-hosted#1056](https://github.com/cyrusagents/cyrus-hosted/pull/1056))
+- Updated `@anthropic-ai/claude-agent-sdk` from `0.3.251` to [`0.3.252`](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md#03252), bringing Claude sessions to parity with Claude Code 2.1.252. `@anthropic-ai/sdk` remains current at [`^0.122.0`](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/CHANGELOG.md#01220-2026-08-27), and the refreshed Claude tool allowance lists are unchanged. ([CYPACK-1488](https://linear.app/ceedar/issue/CYPACK-1488/update-anthropic-aiclaude-agent-sdk-and-anthropic-aisdk-to-the-latest), [#1449](https://github.com/cyrusagents/cyrus/pull/1449))
+- Updated `@anthropic-ai/claude-agent-sdk` from `0.3.250` to [`0.3.251`](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md#03251), bringing Claude sessions to parity with Claude Code 2.1.251. `@anthropic-ai/sdk` remains current at [`^0.122.0`](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/CHANGELOG.md#01220-2026-08-27), and the refreshed Claude tool allowances remove the retired MCP resource-discovery tools. ([CYPACK-1482](https://linear.app/ceedar/issue/CYPACK-1482/update-anthropic-aiclaude-agent-sdk-and-anthropic-aisdk-to-the-latest), [#1446](https://github.com/cyrusagents/cyrus/pull/1446))
+- Updated `@anthropic-ai/claude-agent-sdk` from `0.3.247` to [`0.3.250`](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md#03250), adding per-server SDK-hosted MCP timeouts and parity with Claude Code 2.1.250. Updated `@anthropic-ai/sdk` from `^0.121.0` to [`^0.122.0`](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/CHANGELOG.md#01220-2026-08-27), and refreshed the Claude tool allowances to add agent/resource discovery tools and remove the retired onboarding-guide tool. ([CYPACK-1481](https://linear.app/ceedar/issue/CYPACK-1481/update-anthropic-aiclaude-agent-sdk-and-anthropic-aisdk-to-the-latest), [#1443](https://github.com/cyrusagents/cyrus/pull/1443))
+
+## [0.2.70] - 2026-08-27
+
+### Fixed
+- `strictMcpConfig: false` in `~/.cyrus/config.json` now actually takes effect at startup. Previously the CLI dropped the setting when assembling the worker configuration, so sessions were still launched in strict MCP mode and ambient MCP sources (claude.ai connectors, settings-file servers, plugins) never loaded despite the opt-out. ([CYPACK-1478](https://linear.app/ceedar/issue/CYPACK-1478/if-a-mcp-server-has-no-enabled-tools-will-it-not-be-allowed-as-an-mcp), [#1440](https://github.com/cyrusagents/cyrus/pull/1440))
+- An audit prompted by the same bug found and fixed other silently dropped settings: `cursorDefaultModel` / `cursorDefaultFallbackModel` were ignored at startup, and edits to `userAccessControl`, `global_setup_script`, and Cursor model defaults in `~/.cyrus/config.json` were not picked up by live config reloads. ([CYPACK-1478](https://linear.app/ceedar/issue/CYPACK-1478/if-a-mcp-server-has-no-enabled-tools-will-it-not-be-allowed-as-an-mcp), [#1440](https://github.com/cyrusagents/cyrus/pull/1440))
+
+### Changed
+- Updated `@anthropic-ai/claude-agent-sdk` from `0.3.245` to [`0.3.247`](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md#03247), adding per-turn message correlation, managed model pricing, per-task stop control, ambient task metadata, and live permission-mode reporting fixes. Updated `@anthropic-ai/sdk` from `^0.120.0` to [`^0.121.0`](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/CHANGELOG.md#01210-2026-08-26); the Claude tool allowance lists are unchanged. ([CYPACK-1476](https://linear.app/ceedar/issue/CYPACK-1476/update-anthropic-aiclaude-agent-sdk-and-anthropic-aisdk-to-the-latest), [#1438](https://github.com/cyrusagents/cyrus/pull/1438))
+
+### Packages
+
+#### cyrus-cloudflare-tunnel-client
+- cyrus-cloudflare-tunnel-client@0.2.70
+
+#### cyrus-mcp-tools
+- cyrus-mcp-tools@0.2.70
+
+#### cyrus-core
+- cyrus-core@0.2.70
+
+#### cyrus-claude-runner
+- cyrus-claude-runner@0.2.70
+
+#### cyrus-config-updater
+- cyrus-config-updater@0.2.70
+
+#### cyrus-linear-event-transport
+- cyrus-linear-event-transport@0.2.70
+
+#### cyrus-github-event-transport
+- cyrus-github-event-transport@0.2.70
+
+#### cyrus-gitlab-event-transport
+- cyrus-gitlab-event-transport@0.2.70
+
+#### cyrus-slack-event-transport
+- cyrus-slack-event-transport@0.2.70
+
+#### cyrus-simple-agent-runner
+- cyrus-simple-agent-runner@0.2.70
+
+#### cyrus-opencode-runner
+- cyrus-opencode-runner@0.2.70
+
+#### cyrus-codex-runner
+- cyrus-codex-runner@0.2.70
+
+#### cyrus-cursor-runner
+- cyrus-cursor-runner@0.2.70
+
+#### cyrus-gemini-runner
+- cyrus-gemini-runner@0.2.70
+
+#### cyrus-edge-worker
+- cyrus-edge-worker@0.2.70
+
+#### cyrus-ai
+- cyrus-ai@0.2.70
+
+## [0.2.69] - 2026-08-26
+
+### Added
+- Added an enabled-by-default `strictMcpConfig` setting for Claude sessions. Set it to `false` to make ambient MCP sources—including authenticated claude.ai connectors, project and user settings, and plugins—available alongside Cyrus-configured servers; config reloads and pre-warmed sessions honor changes. ([CYHOST-1245](https://linear.app/ceedar/issue/CYHOST-1245/can-u-add-a-bevahiours-settings-page-setting-for-strict-mcp-config), [#1434](https://github.com/cyrusagents/cyrus/pull/1434))
+- OpenCode is now a supported Cyrus runner for self-hosted sessions, including `opencode` labels and `[agent=opencode]` selectors, provider/model defaults, runtime config overrides, MCP and tool permission translation, CLI-managed auth/state handling, readable Linear activity, session resume/follow-up handling, and stalled-runner recovery. Thanks @JappyMondo and @jappyjan for the original contribution. ([CYPACK-1466](https://linear.app/ceedar/issue/CYPACK-1466/create-clean-opencode-support-pr-from-pr-1263-tip), [#1426](https://github.com/cyrusagents/cyrus/pull/1426))
+
+### Changed
+- Updated `@anthropic-ai/claude-agent-sdk` from `0.3.241` to [`0.3.245`](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md#03245), bringing Claude sessions to parity with Claude Code 2.1.245 and incorporating the 0.3.243 queued-turn, MCP reconnect, managed-hook, and PDF result fixes. `@anthropic-ai/sdk` remains current at [`^0.120.0`](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/CHANGELOG.md#01200-2026-08-19), and the Claude tool allowance lists are unchanged. ([CYPACK-1467](https://linear.app/ceedar/issue/CYPACK-1467/update-anthropic-aiclaude-agent-sdk-and-anthropic-aisdk-to-the-latest), [#1427](https://github.com/cyrusagents/cyrus/pull/1427))
+
+### Fixed
+- **OpenCode sessions no longer terminate during quiet work** — The inactivity watchdog is disabled by default so provider requests and context compaction can complete; deployments may still configure an explicit timeout. ([#1428](https://github.com/cyrusagents/cyrus/pull/1428))
+- The self-hosted GitHub App setup flow (`cyrus-setup-github` skill, "enable @mentions") no longer fails with "Default events are not supported by permissions: organization". The generated App manifest subscribed to an event with no matching permission, so GitHub rejected the submission and no App was ever created. ([#1406](https://github.com/cyrusagents/cyrus/issues/1406), [#1407](https://github.com/cyrusagents/cyrus/pull/1407))
+
 ### Security
 - Patched newly reported Cyrus CLI dependency advisories so `pnpm audit` reports no known vulnerabilities. ([CYPACK-1431](https://linear.app/ceedar/issue/CYPACK-1431/address-open-security-patches-for-cyrus-cli), [#1404](https://github.com/cyrusagents/cyrus/pull/1404))
+- Removed an unused Gemini runner reference dependency so `pnpm audit` no longer reports the `extract-zip` advisory. ([CYPACK-1443](https://linear.app/ceedar/issue/CYPACK-1443/address-open-security-patches-for-cyrus-cli), [#1409](https://github.com/cyrusagents/cyrus/pull/1409))
+
+### Packages
+
+#### cyrus-cloudflare-tunnel-client
+- cyrus-cloudflare-tunnel-client@0.2.69
+
+#### cyrus-mcp-tools
+- cyrus-mcp-tools@0.2.69
+
+#### cyrus-core
+- cyrus-core@0.2.69
+
+#### cyrus-claude-runner
+- cyrus-claude-runner@0.2.69
+
+#### cyrus-config-updater
+- cyrus-config-updater@0.2.69
+
+#### cyrus-linear-event-transport
+- cyrus-linear-event-transport@0.2.69
+
+#### cyrus-github-event-transport
+- cyrus-github-event-transport@0.2.69
+
+#### cyrus-gitlab-event-transport
+- cyrus-gitlab-event-transport@0.2.69
+
+#### cyrus-slack-event-transport
+- cyrus-slack-event-transport@0.2.69
+
+#### cyrus-simple-agent-runner
+- cyrus-simple-agent-runner@0.2.69
+
+#### cyrus-opencode-runner
+- cyrus-opencode-runner@0.2.69
+
+#### cyrus-codex-runner
+- cyrus-codex-runner@0.2.69
+
+#### cyrus-cursor-runner
+- cyrus-cursor-runner@0.2.69
+
+#### cyrus-gemini-runner
+- cyrus-gemini-runner@0.2.69
+
+#### cyrus-edge-worker
+- cyrus-edge-worker@0.2.69
+
+#### cyrus-ai (CLI)
+- cyrus-ai@0.2.69
 
 ## [0.2.68] - 2026-08-05
 

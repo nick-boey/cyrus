@@ -1,6 +1,6 @@
 {
 	"name": "cyrus-edge-worker",
-	"version": "0.2.68",
+	"version": "0.2.70",
 	"description": "Unified edge worker for processing Linear issues with Claude",
 	"repository": {
 		"type": "git",
@@ -28,7 +28,7 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@anthropic-ai/claude-agent-sdk": "0.3.220",
+		"@anthropic-ai/claude-agent-sdk": "0.3.258",
 		"@linear/sdk": "^64.0.0",
 		"@ngrok/ngrok": "^1.7.0",
 		"chokidar": "^4.0.3",
@@ -43,6 +43,7 @@
 		"cyrus-gitlab-event-transport": "workspace:*",
 		"cyrus-linear-event-transport": "workspace:*",
 		"cyrus-mcp-tools": "workspace:*",
+		"cyrus-opencode-runner": "workspace:*",
 		"cyrus-otel-logs": "workspace:*",
 		"cyrus-otel-traces": "workspace:*",
 		"cyrus-simple-agent-runner": "workspace:*",
