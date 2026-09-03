@@ -111,7 +111,10 @@ export interface ContainerLifecycleOptions {
 	/** How long a device may hold session affinity with NO observable progress —
 	 *  nothing routed to it and nothing posted by its agent — before it is
 	 *  reported as stranded. Independent of the container's infrastructure state:
-	 *  the fault this catches looks perfectly healthy (NOR-402). Default: 1 hour. */
+	 *  the fault this catches looks perfectly healthy (NOR-402).
+	 *  Default: {@link DEFAULT_SESSION_NO_PROGRESS_MS} (4 hours) — read its doc
+	 *  block before changing this, the value is load-bearing and lowering it is
+	 *  the specific regression that block exists to prevent. */
 	sessionNoProgressMs?: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
 	sessionReconciler?: SessionReconciler;
@@ -162,9 +165,10 @@ export interface SandboxObservation {
  * session that claims the device in between would otherwise be killed within
  * seconds of starting. Affinity that is NOT backed by progress — held against a
  * container that is not running, or held while neither the router nor the agent
- * does anything for an hour — is reported by {@link noteStranded}. That is the
- * price of the invariant: the pin is unconditional, so the only defence against
- * a pin that should have been released is seeing it.
+ * does anything for {@link ContainerLifecycleOptions.sessionNoProgressMs} — is
+ * reported by {@link noteStranded}. That is the price of the invariant: the pin
+ * is unconditional, so the only defence against a pin that should have been
+ * released is seeing it.
  *
  * Executor errors are logged and skipped, never thrown: one unreachable
  * provider (e.g. a dead Docker daemon) must not stop the sweep from
@@ -305,13 +309,14 @@ export class ContainerLifecycle {
 	 * decided in `AgentSessionManager.completeSession` and recorded only in the
 	 * device's own `session.terminal_deferred` event, which reaches Log Analytics
 	 * but never the router's store. So this reports both, and its message names
-	 * both rather than asserting the diagnosis it cannot make — and in particular
-	 * does NOT advise `cyrus router unlock`, which on a waiting session would
-	 * strip the lock from a run that is about to resume and manufacture the
-	 * lock-without-affinity leak. `sessionNoProgressMs` is then set high enough to
-	 * clear every bounded wakeup (see its default). The real fix is to propagate
-	 * the deferral to the router so this branch can exclude it; until then the
-	 * honest thing is to report the ambiguity, not to hide it behind a threshold.
+	 * both rather than asserting the diagnosis it cannot make — and it gates
+	 * `cyrus router unlock` on the operator having ruled the waiting case out
+	 * first, because that command ends the session's claim outright: on a run
+	 * that is about to resume it kills live work. `sessionNoProgressMs` is then
+	 * set high enough to clear every bounded wakeup (see its default). The real
+	 * fix is to propagate the deferral to the router so this branch can exclude
+	 * it; until then the honest thing is to report the ambiguity, not to hide it
+	 * behind a threshold.
 	 *
 	 * ── WHAT NEITHER SHAPE COVERS ──
 	 * Both are reached only from the sweep's `affinity > 0` gate, but what makes
@@ -326,7 +331,9 @@ export class ContainerLifecycle {
 	 * Exclusions:
 	 *  - `unknown` state (`offline_pinned` only): a provider we could not read
 	 *    this tick says nothing about whether it is running. Irrelevant to
-	 *    `no_progress`, which is a clock, not a state.
+	 *    `no_progress`, which is a clock, not a state — but it must not be
+	 *    allowed to REWRITE an existing diagnosis either, so an already-reported
+	 *    device keeps its latched reason for as long as the read is degraded.
 	 *  - within the relevant grace window: a cold boot presents exactly like
 	 *    `offline_pinned` and is the expected path, not a fault.
 	 *  - a pending terminal teardown: that container is meant to be going away,
@@ -365,15 +372,36 @@ export class ContainerLifecycle {
 		// `offline_pinned` wins when both hold: it is the more specific diagnosis
 		// and the one with a known remedy, and a device should produce one event
 		// per tick rather than two views of the same stall.
-		const reason: StrandedReason | undefined = offlinePinned
+		const observedReason: StrandedReason | undefined = offlinePinned
 			? "offline_pinned"
 			: noProgress
 				? "no_progress"
 				: undefined;
-		if (reason === undefined) {
+		if (observedReason === undefined) {
 			this.strandedDevices.delete(row.deviceId);
 			return;
 		}
+
+		// `unknown` means we could not READ the provider this tick — a throttled
+		// ARM listing, a dead Docker daemon — not that the container changed.
+		// `readProviderListings` swallows that error by design, and `sampleSandbox`
+		// then maps every device of that provider to `unknown` for the tick.
+		//
+		// Left alone that silently rewrites the diagnosis: `notRunning` is false
+		// for `unknown`, so `offlinePinned` collapses, and a device that has been
+		// offline and pinned for hours (its progress clock long past the threshold
+		// too) reports `no_progress` for one tick and `offline_pinned` again on the
+		// next. Because the latch is keyed by reason, each flip re-fires the
+		// once-per-entry ERROR with a contradictory remedy, and the alert — which
+		// now groups by `reason` — gains a spurious second severity-1 instance
+		// pointing the operator at `cyrus router unlock` for a sandbox that is
+		// simply stopped. Keep the diagnosis we already made until we can read the
+		// provider again; a degraded read is not evidence of anything.
+		const latchedReason = this.strandedDevices.get(row.deviceId);
+		const reason: StrandedReason =
+			state === "unknown" && latchedReason !== undefined
+				? latchedReason
+				: observedReason;
 
 		emitSandboxEvent(
 			this.logger,
@@ -410,12 +438,13 @@ export class ContainerLifecycle {
 						`to a session that has stopped working, or it is deliberately idle waiting on a ` +
 						`scheduled wakeup — the router cannot tell these apart, because the deferral is ` +
 						`only ever recorded on the device. Check for a 'session.terminal_deferred' ` +
-						`record for this issue with no matching 'session.terminal_signalled': that is ` +
+						`record for this session with no LATER 'session.terminal_signalled': that is ` +
 						`what says which, and what it is waiting on. Either way a new top-level comment ` +
 						`will be REJECTED at the issue lock, so reply inside the existing session's ` +
 						`thread. Only once you have confirmed it is NOT waiting is \`cyrus router ` +
-						`unlock\` the right move — unlocking a session that is about to resume strands ` +
-						`the lock instead of freeing it.`,
+						`unlock\` the right move: it ends the session's claim, releasing the lock AND ` +
+						`the affinity that pins this container out of idle-stop, so run it on a session ` +
+						`that is about to resume and you kill a live run.`,
 		);
 	}
 

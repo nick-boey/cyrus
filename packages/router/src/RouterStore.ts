@@ -766,16 +766,37 @@ export class RouterStore {
 		// affinity as stranded the moment the router restarts. A sev-1 alert that
 		// storms on deploy is how a rule gets muted, so start every existing row's
 		// progress clock at the upgrade instead.
-		if (
-			deviceColsNow.length > 0 &&
-			!deviceColsNow.some((c) => c.name === "last_progress_ms")
-		) {
-			this.db.exec("ALTER TABLE devices ADD COLUMN last_progress_ms INTEGER");
-			this.db
-				.prepare(
-					"UPDATE devices SET last_progress_ms = ? WHERE kind = 'container'",
-				)
-				.run(Date.now());
+		//
+		// The ALTER and the backfill are one transaction, and the backfill is
+		// additionally re-run on EVERY open under an `IS NULL` guard. Both halves
+		// are needed and they cover different failures. Without the transaction, a
+		// process death or a `SQLITE_BUSY` between the two statements — this file
+		// already documents that a rolling deployment briefly overlaps two router
+		// processes on one database, with a 5s busy timeout — commits the column
+		// with all-NULL values, after which a presence-guarded backfill can never
+		// run again. Without the `IS NULL` sweep, a database already left in that
+		// state by an earlier build stays broken forever. Either way the symptom
+		// is the fleet-wide sev-1 storm on deploy that the backfill exists to
+		// prevent, so the repair must be idempotent rather than one-shot.
+		//
+		// Re-stamping on every open is safe in the only direction that matters: it
+		// can delay a report by one `sessionNoProgressMs`, never suppress one
+		// permanently, because a genuinely stranded device stops moving the clock
+		// again the moment the router is up.
+		if (deviceColsNow.length > 0) {
+			const addProgressColumn = this.db.transaction(() => {
+				if (!deviceColsNow.some((c) => c.name === "last_progress_ms")) {
+					this.db.exec(
+						"ALTER TABLE devices ADD COLUMN last_progress_ms INTEGER",
+					);
+				}
+				this.db
+					.prepare(
+						"UPDATE devices SET last_progress_ms = ? WHERE kind = 'container' AND last_progress_ms IS NULL",
+					)
+					.run(Date.now());
+			});
+			addProgressColumn();
 		}
 
 		// Deliberately NOT backfilled, and there is nothing sensible to backfill
@@ -2343,6 +2364,48 @@ export class RouterStore {
 		this.db
 			.prepare("DELETE FROM issue_locks WHERE session_id = ?")
 			.run(sessionId);
+	}
+
+	/**
+	 * Release a stuck session's issue lock AND its session affinity, together.
+	 *
+	 * The pair is the point. `releaseIssueLockForSession` alone makes the ISSUE
+	 * reachable again, which is all an operator unlocking a leaked lock used to
+	 * need — but it leaves `session_affinity` intact, and affinity is what pins a
+	 * container out of both idle-stop and stale-destroy (`ContainerLifecycle`'s
+	 * sweep `continue`s on `affinity > 0` before either can run). For the
+	 * `no_progress` strand that is a dead end rather than a fix: none of that
+	 * detector's clocks can move again on their own — the worker still declares
+	 * the session, so reconciliation reclaims nothing; the agent posts nothing;
+	 * nothing is routed — so `sandbox.stranded_session` keeps firing every tick
+	 * against a severity-1 rule with no action left that could silence it, while
+	 * the sandbox bills indefinitely. A remedy that cannot clear the state it is
+	 * prescribed for is how a rule gets muted, which is the failure NOR-402 is
+	 * about, one layer down.
+	 *
+	 * Dropping affinity returns the device to the sweep's `affinity === 0` branch,
+	 * where the pre-existing idle-stop and stale-destroy paths reclaim it exactly
+	 * as they would for any finished session. Safe precisely because it is
+	 * operator-initiated and issue-scoped: this is not the sweep guessing that a
+	 * claim is stale (the trap PAR-146 and NOR-366 guard against), it is a human
+	 * asserting that this specific session is done.
+	 *
+	 * Returns whether an affinity row was actually removed, so the command can
+	 * tell the operator whether the container was also freed or only the issue.
+	 */
+	releaseIssueLockAndAffinityForSession(sessionId: string): {
+		affinityCleared: boolean;
+	} {
+		const txn = this.db.transaction(() => {
+			this.db
+				.prepare("DELETE FROM issue_locks WHERE session_id = ?")
+				.run(sessionId);
+			const result = this.db
+				.prepare("DELETE FROM session_affinity WHERE session_id = ?")
+				.run(sessionId);
+			return { affinityCleared: result.changes > 0 };
+		});
+		return txn();
 	}
 
 	/**

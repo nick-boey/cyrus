@@ -278,6 +278,46 @@ describe("RouterStore", () => {
 		);
 	});
 
+	// The remedy `noteStranded` prescribes for a `no_progress` strand has to
+	// clear the state that produced it. Releasing the lock alone reopens the
+	// issue but leaves affinity, and affinity is what pins the container out of
+	// idle-stop AND stale-destroy — so the detector would keep firing its
+	// severity-1 alert every tick with nothing left for the operator to try.
+	it("releaseIssueLockAndAffinityForSession clears the affinity that pins the container, not just the lock", () => {
+		const { store, device } = storeWithDevice();
+		store.setSessionAffinity("sess-1", device.deviceId);
+		expect(store.acquireIssueLock("ISS-1", "sess-1", device.deviceId)).toBe(
+			true,
+		);
+
+		// Lock-only release: the issue reopens, but the pin survives — this is
+		// the shape that made the alert unclearable.
+		store.releaseIssueLockForSession("sess-1");
+		expect(store.getSessionAffinity("sess-1")).toBe(device.deviceId);
+
+		expect(store.acquireIssueLock("ISS-1", "sess-2", device.deviceId)).toBe(
+			true,
+		);
+		const { affinityCleared } =
+			store.releaseIssueLockAndAffinityForSession("sess-1");
+		expect(affinityCleared).toBe(true);
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
+		expect(store.listSessionAffinityForDevice(device.deviceId)).toHaveLength(0);
+	});
+
+	it("releaseIssueLockAndAffinityForSession reports when the session pinned nothing", () => {
+		const { store, device } = storeWithDevice();
+		expect(store.acquireIssueLock("ISS-1", "sess-1", device.deviceId)).toBe(
+			true,
+		);
+		const { affinityCleared } =
+			store.releaseIssueLockAndAffinityForSession("sess-1");
+		expect(affinityCleared).toBe(false);
+		expect(store.acquireIssueLock("ISS-1", "sess-2", device.deviceId)).toBe(
+			true,
+		);
+	});
+
 	it("stores session and issue affinity", () => {
 		const { store, device } = storeWithDevice();
 		store.setSessionAffinity("sess-1", device.deviceId);

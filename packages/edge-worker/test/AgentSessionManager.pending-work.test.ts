@@ -7,6 +7,7 @@ import type { AgentPendingWork } from "cyrus-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
 import {
+	formatPendingWorkSummary,
 	formatPendingWorkThought,
 	formatScheduleWakeupResponse,
 	tryParseScheduleWakeupInput,
@@ -96,6 +97,140 @@ describe("PendingWorkFormatter", () => {
 		expect(
 			formatPendingWorkThought({ sessionCrons: [], backgroundTasks: [] }),
 		).toBeNull();
+	});
+});
+
+// The telemetry counterpart. Asserted as WHOLE strings rather than with
+// `toContain`, because what this function must not emit matters as much as what
+// it must: the attribute rides `session.terminal_deferred`, which bypasses the
+// sink threshold and leaves the sandbox for a billed backend.
+describe("formatPendingWorkSummary", () => {
+	it("names all three lists by identity, in order, joined with '; '", () => {
+		expect(
+			formatPendingWorkSummary({
+				sessionCrons: [
+					{
+						id: "cron-2",
+						schedule: "0 9 * * 1-5",
+						recurring: true,
+						prompt: "daily standup",
+					},
+				],
+				backgroundTasks: [
+					{
+						id: "task-1",
+						type: "shell",
+						status: "running",
+						description: "Dev server",
+						command: "pnpm dev",
+					},
+				],
+				liveBackgroundTasks: [
+					{
+						taskId: "bash-9",
+						taskType: "shell",
+						description: "vitest --watch",
+					},
+				],
+			}),
+		).toBe(
+			"cron(cron-2 recurring 0 9 * * 1-5); " +
+				"background(task-1 shell/running); " +
+				"live-background(bash-9 shell)",
+		);
+	});
+
+	it("carries no free text from any of the three lists", () => {
+		// `command` is documented by the SDK as the shell command line, and argv
+		// routinely holds credentials. `prompt` and `description` are user- and
+		// agent-authored. None of them may be exported.
+		const summary = formatPendingWorkSummary({
+			sessionCrons: [
+				{
+					id: "cron-3",
+					schedule: "in 5 minutes",
+					recurring: false,
+					prompt: "SECRET-PROMPT",
+				},
+			],
+			backgroundTasks: [
+				{
+					id: "task-2",
+					type: "shell",
+					status: "running",
+					description: "SECRET-DESCRIPTION",
+					command: "curl -H 'Authorization: Bearer SECRET-TOKEN'",
+				},
+			],
+			liveBackgroundTasks: [
+				{
+					taskId: "bash-1",
+					taskType: "shell",
+					description: "SECRET-LIVE-DESCRIPTION",
+				},
+			],
+		});
+		for (const secret of [
+			"SECRET-PROMPT",
+			"SECRET-DESCRIPTION",
+			"SECRET-TOKEN",
+			"SECRET-LIVE-DESCRIPTION",
+			"Authorization",
+		]) {
+			expect(summary).not.toContain(secret);
+		}
+	});
+
+	it("renders a non-shell background task the same way, with no fallback to its description", () => {
+		// The `command` field is absent for anything that is not a shell task.
+		// This branch had no coverage at all and was the only one with a fallback.
+		expect(
+			formatPendingWorkSummary({
+				sessionCrons: [],
+				backgroundTasks: [
+					{
+						id: "task-3",
+						type: "subagent",
+						status: "pending",
+						description: "Investigate the flake",
+					},
+				],
+			}),
+		).toBe("background(task-3 subagent/pending)");
+	});
+
+	it("caps the item list so a session holding hundreds of tasks cannot ship an unbounded attribute", () => {
+		// `Logger.forwardEvent` hands the merged attributes to the error reporter
+		// with no truncation, so the transports' 512/1000-char clips do not cover
+		// this path.
+		const summary = formatPendingWorkSummary({
+			sessionCrons: [],
+			backgroundTasks: Array.from({ length: 50 }, (_, i) => ({
+				id: `task-${i}`,
+				type: "shell",
+				status: "running",
+				description: "x",
+			})),
+		});
+		expect(summary.endsWith("; +30 more")).toBe(true);
+		expect(summary.split("; ")).toHaveLength(21);
+	});
+
+	it("never returns null, even for an empty-but-present pending-work object", () => {
+		expect(
+			formatPendingWorkSummary({ sessionCrons: [], backgroundTasks: [] }),
+		).toBe("unspecified pending work");
+	});
+
+	it("treats an absent liveBackgroundTasks list as empty", () => {
+		expect(
+			formatPendingWorkSummary({
+				sessionCrons: [
+					{ id: "c", schedule: "in 1 minute", recurring: false, prompt: "p" },
+				],
+				backgroundTasks: [],
+			}),
+		).toBe("cron(c once in 1 minute)");
 	});
 });
 

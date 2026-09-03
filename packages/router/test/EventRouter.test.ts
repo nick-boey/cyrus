@@ -14,6 +14,7 @@ import {
 	fillTemplate,
 	INVALID_ISSUE_KEY_MESSAGE,
 	ISSUE_LOCKED_MESSAGE,
+	ISSUE_LOCKED_OTHER_USER_MESSAGE,
 	ORPHANED_LOCK_RECLAIMED_MESSAGE,
 	offlineReleaseMessage,
 	offlineWaitingMessage,
@@ -417,10 +418,13 @@ describe("EventRouter", () => {
 			createdEvent({ sessionId: "sess-b", issueId: "ISS-1", creator: BOB }),
 		);
 
+		// Alice holds it, Bob is rejected — so Bob must NOT be told to reply in
+		// her thread. `creatorOnlyPrompting` would reject that reply and send him
+		// to start his own session, which lands back on this lock: a closed loop.
 		expect(postActivity).toHaveBeenCalledWith(
 			"ws-1",
 			"sess-b",
-			ISSUE_LOCKED_MESSAGE,
+			fillTemplate(ISSUE_LOCKED_OTHER_USER_MESSAGE, { holderName: ALICE.name }),
 		);
 		// Bob's device must not have received the event.
 		expect(store.pendingEvents(bobDevice, 0, ROUTE_NOW)).toHaveLength(0);
@@ -429,6 +433,32 @@ describe("EventRouter", () => {
 			sessionId: "sess-a",
 			deviceId: aliceDevice,
 		});
+	});
+
+	it("(c1) tells a user who holds the issue themselves to reply in their own session's thread", async () => {
+		// The CAN-133 case, and the common one: the same person comments again at
+		// the top level on an issue their own session still holds. Here replying
+		// in-thread genuinely does work, so this is the message that leads with it.
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		const { router, postActivity } = makeRouter(store);
+
+		await router.route(
+			createdEvent({ sessionId: "sess-a", issueId: "ISS-1b", creator: ALICE }),
+		);
+		postActivity.mockClear();
+
+		await router.route(
+			createdEvent({ sessionId: "sess-a2", issueId: "ISS-1b", creator: ALICE }),
+		);
+
+		expect(postActivity).toHaveBeenCalledWith(
+			"ws-1",
+			"sess-a2",
+			ISSUE_LOCKED_MESSAGE,
+		);
+		// Operator-only recovery must not be advertised to an end user: it now
+		// clears the session's affinity too, so it kills live work.
+		expect(ISSUE_LOCKED_MESSAGE).not.toContain("cyrus router unlock");
 	});
 
 	it("(c2) makes a lock rejection observable, naming the session that holds the issue", async () => {
@@ -491,6 +521,43 @@ describe("EventRouter", () => {
 				held_by_device_id: null,
 			},
 		]);
+	});
+
+	it("(c3) makes a refusal on the PROMPTED path observable too", async () => {
+		// The prompted path is the recovery we send a locked-out user to, so a
+		// refusal here is the same "the comment did not reach an agent" failure
+		// one step further along. It used to log `info` and emit nothing, which
+		// made `event startswith "routing."` — advertised as selecting the whole
+		// family — return zero rows for a prompt that was genuinely dropped.
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		const logger = testLogger();
+		const { router } = makeRouter(store, {
+			logger,
+			config: { creatorOnlyPrompting: true },
+		});
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-3", creator: ALICE }),
+		);
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				actorUserId: "lin-bob",
+				creator: ALICE,
+			}),
+		);
+
+		expect(eventsNamed(logger, "routing.rejected")).toContainEqual(
+			expect.objectContaining({
+				reason: "non_creator_prompt",
+				agent_session_id: "sess-1",
+			}),
+		);
+		expect(
+			logger.warn.mock.calls.filter(([m]) =>
+				String(m).includes("Rejected non-creator prompt"),
+			),
+		).toHaveLength(1);
 	});
 
 	it("(d) enforces creator-only prompting using the activity actor field", async () => {

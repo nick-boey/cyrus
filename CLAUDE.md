@@ -512,20 +512,36 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      sandbox holds no Linear token, so every activity its agent posts arrives as
      one, which makes it the only clock moved by the agent working rather than by
      something the router did. Do not feed it into the idle clock: idle-stop must
-     keep erring toward keeping a container alive (NOR-366).
+     keep erring toward keeping a container alive (NOR-366). The stamp is
+     **coalesced to 30s** and its failure warning **latched per device**: every
+     activity a sandbox posts is an `rpc_request`, so this is the hottest
+     device→router path there is, and the reader thresholds at hours. A `state`
+     of `unknown` (a swallowed provider-listing error) must never be allowed to
+     REWRITE a latched diagnosis either — `unknown` is not `stopped`, so it
+     collapses `offlinePinned` and would flip a long-stranded device to
+     `no_progress` for one tick and back, re-firing the once-per-entry error with
+     a contradictory remedy and adding a spurious severity-1 alert instance.
    - **`no_progress` cannot tell a strand from a session deliberately waiting,
      and the honest move is to say so, not to tune the threshold until it looks
      like it can.** A session held open by pending work keeps its affinity and
      posts nothing, so it is byte-for-byte the same shape — the deferral is
      decided on the DEVICE and never reaches the router's store. So the report
      names both possibilities, sends the operator to the
-     `session.terminal_deferred` / `session.terminal_signalled` pair to
-     disambiguate, and gates `cyrus router unlock` on having confirmed it is not
-     waiting: unlocking a run that is about to resume manufactures the
-     lock-without-affinity leak instead of fixing anything.
-     `sessionNoProgressMs` is 4h to clear `ScheduleWakeup`'s 1h clamp outright;
-     a longer-period cron is a known false-positive class. Anything that lowers
-     it must first give the router a way to see the deferral.
+     `session.terminal_deferred` / `session.terminal_signalled` /
+     `session.terminal_abandoned` triple to disambiguate, and gates
+     `cyrus router unlock` on having confirmed it is not waiting — that command
+     now clears the session's AFFINITY as well as its lock, so on a run about to
+     resume it kills live work. Clearing affinity is also what makes it a
+     complete remedy: lock-only left the container pinned out of idle-stop and
+     stale-destroy, so the detector kept firing every tick with nothing left to
+     try. **Every `terminal_deferred` needs a terminating counterpart on every
+     lifecycle path, not just the in-process one** — `completeSession` sets the
+     status terminal BEFORE deferring, so a deferred session that loses its host
+     restores reconciled by nobody, which is what `terminal_abandoned` covers.
+     `sessionNoProgressMs` is 4h to clear `ScheduleWakeup`'s 1h clamp outright
+     and is settable via `containers.sessionNoProgressMs`; a longer-period cron
+     is a known false-positive class. Anything that lowers it must first give the
+     router a way to see the deferral.
    - **Neither stranded shape covers a locked issue with NO affinity.** Both are
      reached only from the sweep's `affinity > 0` gate, but a `parked` session
      releases affinity and RETAINS its lock — so an elicitation nobody answers
@@ -728,6 +744,25 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      syntax: `p["cyrus.issue_key"]`. Renaming an event or attribute therefore
      means editing `infra/azure/bicep/modules/monitoring.bicep` in the same
      change; its saved searches and alert rules key on those literal strings.
+   - **NOTHING in this repository validates KQL, and a green CI run says only
+     that the Bicep compiled.** `scripts/check-bicep.sh` runs in CI's `infra`
+     job on every PR, but the queries are opaque string literals to
+     `bicep build` — an aliased expression inside `distinct` (invalid Kusto;
+     `distinct` takes bare column names, use `summarize by` for an expression)
+     shipped through a fully green run on NOR-402. Run a new or edited saved
+     search once against `log-cyrus-dev` before anything is allowed to depend on
+     it, and be especially wary of the failures KQL does not raise: a dotted key
+     read with dot syntax returns null, and `tostring()` of a missing field
+     returns `""`, which `coalesce` treats as null for strings — useful for a
+     fallback, silent when it is not what you meant.
+   - **A query that reads an attribute the emitter does not send fails silently
+     and looks like an empty column.** `session.terminal_deferred` is emitted on
+     a session-scoped logger, whose issue identifier is the STRUCTURAL field
+     `issueIdentifier`, not `cyrus.issue_key` — so a report projecting the latter
+     rendered a blank issue column, which was the one column naming the locked
+     issue. Check that each `cyrus.*` key in a query is actually in the emitting
+     call's `cyrusAttributes(...)`; structural fields keep their Phase 0 names
+     and are reachable with plain dot syntax.
    - **GenAI semconv (`gen_ai.*`) is evaluated and deliberately NOT adopted** —
      still pre-stable, moved to `open-telemetry/semantic-conventions-genai` with
      no tagged release or schema URL to pin against. See

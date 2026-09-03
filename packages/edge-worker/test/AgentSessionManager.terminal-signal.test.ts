@@ -170,11 +170,14 @@ describe("AgentSessionManager terminal signal ordering", () => {
 			"cyrus.background_task_count": 0,
 			"cyrus.live_background_task_count": 0,
 		});
-		// The identity of what is holding the session open, so the event gives an
-		// operator something to act on rather than just a count.
-		expect(deferred?.attributes?.["cyrus.pending_work"]).toEqual(
-			expect.stringContaining("check"),
+		// The IDENTITY of what is holding the session open, so the event gives an
+		// operator something to act on rather than just a count — but identity
+		// only. The cron's prompt text is user content and this attribute leaves
+		// the sandbox for a billed backend, so it must not be carried.
+		expect(deferred?.attributes?.["cyrus.pending_work"]).toBe(
+			"cron(cron-1 once in 5 minutes)",
 		);
+		expect(deferred?.attributes?.["cyrus.pending_work"]).not.toContain("check");
 		// The pair is what makes "did this session ever finish?" answerable.
 		expect(logs.sink.find({ event: "session.terminal_signalled" })).toBe(
 			undefined,
@@ -204,10 +207,71 @@ describe("AgentSessionManager terminal signal ordering", () => {
 			"cyrus.background_task_count": 0,
 			"cyrus.live_background_task_count": 1,
 		});
-		expect(deferred?.attributes?.["cyrus.pending_work"]).toEqual(
-			expect.stringContaining("pnpm dev"),
+		// Named by task id and type. The description is free text — for a shell
+		// task the SDK's sibling `command` field is the literal command line — so
+		// it stays on the device.
+		expect(deferred?.attributes?.["cyrus.pending_work"]).toBe(
+			"live-background(bash-7 shell)",
+		);
+		expect(deferred?.attributes?.["cyrus.pending_work"]).not.toContain(
+			"pnpm dev",
 		);
 		expect(logs.sink.find({ event: "session.terminal_signalled" })).toBe(
+			undefined,
+		);
+	});
+
+	// The third outcome of a deferral, and the one that made the never-terminal
+	// report wrong in the benign direction. `completeSession` sets the status to
+	// Complete BEFORE deciding to defer, so a deferred session restores with a
+	// terminal status, no runner and no terminalState — reconciled by nobody,
+	// because the interrupt loop only looks at Active/Pending and `restoreState`
+	// only arms the one-shot when terminalState is set. The router releases the
+	// lock at hello regardless, but nothing recorded that, so the session would
+	// sit in `Cyrus-Sessions-Never-Terminal` forever claiming a locked issue.
+	it("closes the pairing for a deferred session whose host went away", async () => {
+		setup(PENDING);
+		await manager.completeSession(sessionId, result());
+		expect(
+			logs.sink.find({ event: "session.terminal_deferred" }),
+		).toBeDefined();
+		expect(logs.sink.find({ event: "session.terminal_signalled" })).toBe(
+			undefined,
+		);
+
+		// Host restart: state is persisted and reloaded into a fresh manager, and
+		// `agentRunner` is deliberately not serializable.
+		const persisted = manager.serializeState();
+		const revived = new AgentSessionManager();
+		revived.restoreState(persisted.sessions, persisted.entries);
+		logs.sink.clear();
+
+		await revived.reconcileInterruptedSessions();
+
+		const abandoned = logs.sink.find({
+			event: "session.terminal_abandoned",
+		});
+		expect(abandoned?.attributes).toMatchObject({
+			"cyrus.agent_session_id": sessionId,
+			"cyrus.issue_key": "PAR-98",
+		});
+	});
+
+	it("does not report an abandoned deferral for a session that signalled normally", async () => {
+		setup();
+		await manager.completeSession(sessionId, result());
+		expect(
+			logs.sink.find({ event: "session.terminal_signalled" }),
+		).toBeDefined();
+
+		const persisted = manager.serializeState();
+		const revived = new AgentSessionManager();
+		revived.restoreState(persisted.sessions, persisted.entries);
+		logs.sink.clear();
+
+		await revived.reconcileInterruptedSessions();
+
+		expect(logs.sink.find({ event: "session.terminal_abandoned" })).toBe(
 			undefined,
 		);
 	});

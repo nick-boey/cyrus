@@ -1836,6 +1836,129 @@ describe("ContainerLifecycle", () => {
 			expect(logger.error.mock.calls).toHaveLength(2);
 		});
 
+		it("keeps its diagnosis when the provider listing fails, rather than flipping reason", async () => {
+			// `readProviderListings` swallows a provider error by design and every
+			// device of that provider samples as `unknown` for the tick. `unknown`
+			// is not `stopped`, so `offlinePinned` collapses — and an offline,
+			// pinned device is ALSO long past its progress threshold, so without a
+			// guard it would report `no_progress` for one tick and `offline_pinned`
+			// again on the next. Each flip re-fires the once-per-entry ERROR with a
+			// contradictory remedy, and the alert (grouped by reason) gains a
+			// spurious second severity-1 instance pointing at `cyrus router unlock`
+			// for a sandbox that is merely stopped.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-140", "aca");
+			let listThrows = false;
+			const aca = fakeExecutor("aca", {
+				status: "stopped",
+				listStates: () => {
+					if (listThrows) throw new Error("ARM throttled this listing");
+					return [{ issueKey: "CAN-140", status: "stopped" }];
+				},
+			});
+			store.setSessionAffinity("stuck", deviceId, undefined, createdMs);
+			store.markDeviceProgress(deviceId, createdMs);
+			let now = createdMs + 3_600_001;
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 100 * 3_600_000,
+				strandedSessionGraceMs: 600_000,
+				sessionNoProgressMs: 3_600_000,
+				logger,
+				now: () => now,
+				sessionReconciler: {
+					isOnline: () => false,
+					reconcile: async () => 1,
+				},
+			});
+
+			await lifecycle.sweep();
+			listThrows = true;
+			now += 60_000;
+			await lifecycle.sweep();
+			listThrows = false;
+			now += 60_000;
+			await lifecycle.sweep();
+
+			const reasons = eventsNamed(logger, "sandbox.stranded_session").map(
+				(e) => e.reason,
+			);
+			// Three ticks, one unbroken diagnosis — and crucially only ONE stranded
+			// error line, because nothing about the device changed. (The failed
+			// listing logs its own error; that one is expected and is not the
+			// once-per-entry line under test.)
+			expect(reasons).toEqual([
+				"offline_pinned",
+				"offline_pinned",
+				"offline_pinned",
+			]);
+			expect(
+				logger.error.mock.calls.filter(([m]) =>
+					String(m).includes("still holds"),
+				),
+			).toHaveLength(1);
+			expect(
+				logger.error.mock.calls.filter(([m]) =>
+					String(m).includes("has made no observable progress"),
+				),
+			).toHaveLength(0);
+		});
+
+		it("does not report a device whose progress clock was never stamped but was created recently", async () => {
+			// The migration backfills `last_progress_ms` so a pre-upgrade fleet does
+			// not all report at once on the first restart. This pins the fallback
+			// that makes that safe: with the column NULL the clock falls back to
+			// `createdMs`, so a fresh device is under threshold and silent.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-141", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-141", status: "running" }],
+			});
+			store.setSessionAffinity("fresh", deviceId, undefined, createdMs);
+			expect(
+				store.getContainerDeviceForIssue("CAN-141")?.lastProgressMs,
+			).toBeUndefined();
+
+			await strandedLifecycle(
+				aca,
+				() => createdMs + 60_000,
+				600_000,
+				3_600_000,
+				true,
+			).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+		});
+
+		it("reports a device whose progress clock was never stamped and whose creation is long past", async () => {
+			// The other half: an all-NULL `last_progress_ms` on an OLD row is exactly
+			// what a failed backfill leaves behind, and it makes every pinned sandbox
+			// in the fleet report at once. The migration is now self-healing so this
+			// should not arise, but the detector's behaviour in that state is worth
+			// pinning rather than assuming.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-142", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-142", status: "running" }],
+			});
+			store.setSessionAffinity("old", deviceId, undefined, createdMs);
+
+			await strandedLifecycle(
+				aca,
+				() => createdMs + 3_600_001,
+				600_000,
+				3_600_000,
+				true,
+			).sweep();
+
+			expect(eventsNamed(logger, "sandbox.stranded_session")[0]).toMatchObject({
+				issue_key: "CAN-142",
+				reason: "no_progress",
+			});
+		});
+
 		it("clears its once-only error latch when the sandbox recovers, so a recurrence is reported again", async () => {
 			const { deviceId, createdMs } = makeContainerDevice("CAN-102", "aca");
 			let state: "running" | "stopped" = "stopped";

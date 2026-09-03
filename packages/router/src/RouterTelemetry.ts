@@ -34,11 +34,24 @@ export type RoutingEventName =
 /**
  * Why the router refused to route a session. Kept closed so a KQL
  * `summarize by reason` has a bounded set of values.
+ *
+ * Every path that ends with a user's prompt undelivered belongs here, on BOTH
+ * the created and the prompted side. The prompted side matters as much as the
+ * created one: replying inside the running session's thread is the recovery
+ * `ISSUE_LOCKED_MESSAGE` and the stranded-session alert both direct users to,
+ * so a refusal there is the same "the comment did not reach an agent" failure
+ * one step further along — and `ROUTING_EVENTS`' own promise that
+ * `event startswith "routing."` selects the whole family is what makes a
+ * partial vocabulary actively misleading rather than merely incomplete.
  */
 export type RoutingRejectReason =
 	| "issue_locked"
 	| "unenrolled_creator"
-	| "invalid_issue_key";
+	| "invalid_issue_key"
+	/** A prompt for a session with no device left to route it to. */
+	| "unroutable_prompt"
+	/** `creatorOnlyPrompting` rejected a prompt from someone else. */
+	| "non_creator_prompt";
 
 export interface RoutingRejection {
 	reason: RoutingRejectReason;

@@ -86,6 +86,10 @@ export function formatPendingWorkThought(
 	].join("\n");
 }
 
+/** Items past this are collapsed into a `+N more` marker — see
+ *  {@link formatPendingWorkSummary}. */
+const MAX_SUMMARY_ITEMS = 20;
+
 /**
  * A compact, single-line rendering of everything holding a session open, for
  * TELEMETRY rather than for Linear.
@@ -104,6 +108,29 @@ export function formatPendingWorkThought(
  * `background_tasks_changed` level signal and is populated independently of the
  * Stop hook that fills the other two, so it has to be read separately.
  *
+ * ── IDENTITY AND STRUCTURE ONLY, NEVER CONTENT ──
+ * Every field here is an id, an enum-like label or a schedule. The free-text
+ * ones the SDK also offers — `cron.prompt`, `task.description` and especially
+ * `task.command`, which is documented as the shell command line — are
+ * deliberately NOT included. This string is an attribute on
+ * `session.terminal_deferred`, which is an `event` and therefore bypasses the
+ * sink's level threshold and leaves the sandbox; a backgrounded command line is
+ * exactly the shape that carries credentials in argv (`curl -H "Authorization:
+ * Bearer …"`, `PGPASSWORD=… psql`), and a secret that reaches a telemetry
+ * backend is disclosed. It would also have been the first Cyrus event to carry
+ * a payload at all: the pre-existing `session.pending_work_recorded` and
+ * `session.background_tasks_changed` both carry counts only.
+ *
+ * The ids are what make that sufficient. Each one appears in the session's own
+ * Linear timeline, so an operator can correlate from here without the content
+ * ever being exported.
+ *
+ * Length is capped for the same reason: the transports clip an attribute at
+ * 512/1000 chars, but `Logger.forwardEvent` passes the merged attributes
+ * straight to the error reporter with no truncation at all, so a session
+ * holding hundreds of tasks would ship an unbounded string to a second billed
+ * backend.
+ *
  * Never returns null: this is only called when something IS pending.
  */
 export function formatPendingWorkSummary(
@@ -112,20 +139,19 @@ export function formatPendingWorkSummary(
 	const items = [
 		...pendingWork.sessionCrons.map(
 			(cron) =>
-				`cron(${cron.recurring ? "recurring " : ""}${cron.schedule})` +
-				(cron.prompt ? `: ${truncate(cron.prompt, 80)}` : ""),
+				`cron(${cron.id} ${cron.recurring ? "recurring" : "once"} ${cron.schedule})`,
 		),
 		...pendingWork.backgroundTasks.map(
-			(task) =>
-				`background(${task.type}/${task.status}: ` +
-				`${truncate(task.command ?? task.description, 80)})`,
+			(task) => `background(${task.id} ${task.type}/${task.status})`,
 		),
 		...(pendingWork.liveBackgroundTasks ?? []).map(
-			(task) =>
-				`live-background(${task.taskType}: ${truncate(task.description, 80)})`,
+			(task) => `live-background(${task.taskId} ${task.taskType})`,
 		),
 	];
-	return items.length > 0 ? items.join("; ") : "unspecified pending work";
+	if (items.length === 0) return "unspecified pending work";
+	if (items.length <= MAX_SUMMARY_ITEMS) return items.join("; ");
+	const shown = items.slice(0, MAX_SUMMARY_ITEMS);
+	return `${shown.join("; ")}; +${items.length - MAX_SUMMARY_ITEMS} more`;
 }
 
 function formatSessionCron(cron: SessionCronSummary): string {

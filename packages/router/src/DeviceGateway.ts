@@ -19,6 +19,17 @@ import type { RouterStore } from "./RouterStore.js";
 
 const HELLO_TIMEOUT_MS = 10_000;
 
+/**
+ * Minimum gap between writes of a device's progress clock — see
+ * {@link DeviceGateway.stampDeviceProgress}.
+ *
+ * Sized against the READER, not the writer. `ContainerLifecycle`'s
+ * `sessionNoProgressMs` is four hours and its sweep ticks once a minute, so 30s
+ * is finer than anything that can observe it, while bounding a per-activity
+ * SQLite write down to at most twice a sweep tick.
+ */
+const PROGRESS_STAMP_INTERVAL_MS = 30_000;
+
 interface SocketState {
 	deviceId?: number;
 	isAlive: boolean;
@@ -51,6 +62,13 @@ export class DeviceGateway extends EventEmitter {
 		string,
 		{ resolve: (v: string[] | undefined) => void; timer: NodeJS.Timeout }
 	>();
+	/** Last time each device's progress clock was written — see
+	 *  {@link stampDeviceProgress}. Bounded by enrolled devices; cleared on
+	 *  disconnect so a revoked device leaves nothing behind. */
+	private readonly lastProgressStamp = new Map<number, number>();
+	/** Devices whose progress stamp is currently failing, so the warning is
+	 *  logged once per outage instead of once per frame. */
+	private readonly progressStampFailed = new Set<number>();
 	private wss: WebSocketServer | undefined;
 	private heartbeatInterval: NodeJS.Timeout | undefined;
 
@@ -247,6 +265,12 @@ export class DeviceGateway extends EventEmitter {
 			if (this.sockets.get(deviceId) === ws) {
 				this.sockets.delete(deviceId);
 				this.capabilities.delete(deviceId);
+				// Progress bookkeeping is per-connection: a reconnecting device
+				// should stamp immediately rather than serve out a coalescing
+				// window it cannot see, and one that reconnects after a disk-full
+				// outage should be able to report a fresh failure.
+				this.lastProgressStamp.delete(deviceId);
+				this.progressStampFailed.delete(deviceId);
 				this.logger.info(
 					`Device ${deviceId} disconnected (code ${code}${
 						reason.length > 0 ? `, ${reason.toString()}` : ""
@@ -333,15 +357,23 @@ export class DeviceGateway extends EventEmitter {
 				// explicit contract that a device frame must never break the socket it
 				// arrived on; a purely diagnostic stamp has even less business doing
 				// so, and losing one sample only delays the detector by a tick.
-				try {
-					this.store.markDeviceProgress(deviceId, Date.now());
-				} catch (err) {
-					this.logger.warn(
-						`Failed to stamp the progress clock for device ${deviceId}; ` +
-							`the stranded-session detector may report it early`,
-						err,
-					);
-				}
+				//
+				// COALESCED, and the warning is LATCHED, because this is the hottest
+				// device→router frame there is: every Linear call a sandbox makes is
+				// an RPC, and each agent thought, action and result is one. An
+				// unconditional write here would be a synchronous, fsync-ing SQLite
+				// UPDATE per activity — far hotter than the `ackEvent` and
+				// `touchDevice` writes it sits beside — to feed a consumer that
+				// thresholds at four HOURS. A 30s resolution is three orders of
+				// magnitude finer than anything that reads it. The latch matters for
+				// the same reason: the failures this guard exists for (a full disk, a
+				// readonly database) persist until an operator intervenes, so an
+				// unlatched warn would emit at device-traffic rate into a per-GB
+				// billed sink at exactly the moment the host is out of disk — and
+				// this is the only branch of this switch that can turn a device frame
+				// into router log lines at all, which the `log` and `span` branches
+				// below explicitly forbid for themselves.
+				this.stampDeviceProgress(deviceId);
 				this.emit("rpc", deviceId, frame);
 				break;
 			case "session_state":
@@ -367,6 +399,50 @@ export class DeviceGateway extends EventEmitter {
 				pending.resolve(frame.activeSessions);
 				break;
 			}
+		}
+	}
+
+	/**
+	 * Move a device's progress clock, at most once per
+	 * {@link PROGRESS_STAMP_INTERVAL_MS}.
+	 *
+	 * Rate-limiting is safe here and nowhere near lossy: the only consumer,
+	 * `ContainerLifecycle.noteStranded`, thresholds at hours, and the clock is
+	 * read as "when did this device last do ANYTHING", not as a count. Skipping
+	 * a stamp can only ever make the recorded time up to 30s stale, which is
+	 * three orders of magnitude inside the threshold — while writing on every
+	 * frame would put a synchronous, fsync-ing UPDATE on the hottest path the
+	 * router has.
+	 *
+	 * Never throws. It runs from `handleMessage`, straight off `ws.on("message")`
+	 * with only `parseDeviceFrame` in a try, so an escaping store error (a full
+	 * disk, a readonly database after a bad restore) would take the socket — and
+	 * with it every teammate's connection — down over a purely diagnostic write.
+	 * The warning is latched per device because those failures persist until
+	 * someone intervenes, and an unlatched one would amplify a disk-full incident
+	 * into device-rate log volume in a per-GB billed sink.
+	 */
+	private stampDeviceProgress(deviceId: number): void {
+		const now = Date.now();
+		const last = this.lastProgressStamp.get(deviceId);
+		if (last !== undefined && now - last < PROGRESS_STAMP_INTERVAL_MS) return;
+		try {
+			this.store.markDeviceProgress(deviceId, now);
+			this.lastProgressStamp.set(deviceId, now);
+			if (this.progressStampFailed.delete(deviceId)) {
+				this.logger.warn(
+					`Progress clock for device ${deviceId} is being recorded again.`,
+				);
+			}
+		} catch (err) {
+			if (this.progressStampFailed.has(deviceId)) return;
+			this.progressStampFailed.add(deviceId);
+			this.logger.warn(
+				`Failed to stamp the progress clock for device ${deviceId}; ` +
+					`the stranded-session detector may report it early. ` +
+					`Further failures for this device are suppressed until it recovers.`,
+				err,
+			);
 		}
 	}
 

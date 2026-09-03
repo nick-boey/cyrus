@@ -193,6 +193,13 @@ export interface RouterContainersConfig {
 	/** Default 600_000 (10 minutes). How long a stopped-but-still-claimed sandbox
 	 *  must stay that way before `sandbox.stranded_session` is reported. */
 	strandedSessionGraceMs?: number;
+	/** Default 14_400_000 (4 hours). How long a RUNNING, online sandbox may hold
+	 *  session affinity with nothing routed to it and nothing posted by its agent
+	 *  before `sandbox.stranded_session` is reported with `reason=no_progress`.
+	 *  Settable because the default knowingly reports one benign class — a cron
+	 *  whose period exceeds it — and because constructing the state to verify the
+	 *  alert otherwise means waiting four real hours. */
+	sessionNoProgressMs?: number;
 	/** Default 5_000 (5 seconds). */
 	sessionsQueryTimeoutMs?: number;
 	/**
@@ -1202,6 +1209,9 @@ export class RouterServer {
 			offlineAgeOutMs: containers.offlineAgeOutMs ?? DEFAULT_OFFLINE_AGE_OUT_MS,
 			...(containers.strandedSessionGraceMs !== undefined
 				? { strandedSessionGraceMs: containers.strandedSessionGraceMs }
+				: {}),
+			...(containers.sessionNoProgressMs !== undefined
+				? { sessionNoProgressMs: containers.sessionNoProgressMs }
 				: {}),
 			logger: this.logger,
 			sessionReconciler: {

@@ -391,6 +391,7 @@ lookup and silently returns null — so read them with bracket syntax:
 | `sandbox.idle_stopped` | the lifecycle sweep parked an affinity-free sandbox past `idleStopMs` |
 | `sandbox.destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
 | `sandbox.teardown_completed` | a terminal teardown finished; carries `action` and whether the worker's callback or the grace deadline triggered it |
+| `sandbox.stranded_session` | a sandbox holds session affinity for an issue it is not working on. `cyrus.reason` is `offline_pinned` (stopped and disconnected, past `strandedSessionGraceMs`) or `no_progress` (running and connected, but nothing routed to it and nothing posted by its agent past `containers.sessionNoProgressMs`, default 4h). Detection only — neither boots a container nor releases affinity |
 | `sandbox.gauge` | once per sandbox per 60s lifecycle sweep — the point-in-time inventory |
 | `sandbox.sweep_completed` | once per completed sweep, even with zero sandboxes — the fleet rollup. The sweep is non-reentrant, so a tick that fires while the previous one is still running is skipped and logs a warning instead |
 
@@ -1586,7 +1587,11 @@ is the natural enforcement point against two machines diverging on one issue.
 
 A lock is released when: the session reaches a terminal state (complete / error /
 stopped), the device's token is revoked, the device stays offline past the TTL,
-or an admin runs `cyrus router unlock <issueId>`.
+or an admin runs `cyrus router unlock <issueId>` — which also clears the
+session's affinity, so the sandbox it was pinning becomes eligible for idle-stop
+again. That pairing is deliberate: releasing the lock alone leaves the container
+pinned out of both idle-stop and stale-destroy, so a stranded session's
+severity-1 alert would keep firing with no action left to silence it.
 
 > **A new top-level `@cyrus1` comment on a locked issue does not start a fresh
 > session.** Linear *does* create an agent session for it and the router *does*
@@ -1595,12 +1600,22 @@ or an admin runs `cyrus router unlock <issueId>`.
 > **Reply inside the running session's thread instead**: that produces
 > `AgentSessionEvent/prompted`, which is not lock-gated and reaches the sandbox.
 >
-> Every rejection now emits `routing.rejected` (`cyrus.reason = issue_locked`,
-> with the holding session and device) and logs at WARN, so an operator can tell
-> a dropped comment from a webhook that never arrived. If the holding session has
-> stopped working, its sandbox is also reported by `sandbox.stranded_session`
-> with `cyrus.reason = no_progress`; `cyrus router unlock <issueId>` frees it.
-> See NOR-402.
+> That advice holds when the running session is **your own**. If someone else
+> started it, replying in their thread is refused too (`creatorOnlyPrompting`
+> is on by default), so the rejection says that instead rather than sending you
+> round a loop back to the lock.
+>
+> Every rejection now emits `routing.rejected` and logs at WARN, so an operator
+> can tell a dropped comment from a webhook that never arrived. The reason is one
+> of `issue_locked` (with the holding session and device), `unenrolled_creator`,
+> `invalid_issue_key`, `unroutable_prompt` or `non_creator_prompt` — the last two
+> cover the *prompted* path, i.e. the in-thread reply this box recommends, so a
+> refusal there is visible too. If the holding session has stopped working, its
+> sandbox is also reported by `sandbox.stranded_session` with
+> `cyrus.reason = no_progress`; `cyrus router unlock <issueId>` frees it. Confirm
+> it is not merely waiting on a scheduled wakeup first — `unlock` releases the
+> session's affinity as well as its lock, so on a run about to resume it kills
+> live work. See NOR-402.
 
 The terminal-state signal is delivered durably. The device writes the
 `session_state` frame to `session-state-buffer.jsonl` before sending it, and
