@@ -34,11 +34,26 @@ export type RoutingEventName =
 /**
  * Why the router refused to route a session. Kept closed so a KQL
  * `summarize by reason` has a bounded set of values.
+ *
+ * The set spans BOTH the `created` and the `prompted` paths, and that is
+ * load-bearing rather than tidy. `ISSUE_LOCKED_MESSAGE` answers a lock rejection
+ * by directing the user to reply inside the holding session's thread — i.e. it
+ * routes every lock-rejected user out of `routeCreated` and into
+ * `routePrompted`. Instrumenting only the first of those leaves the refusal the
+ * product's own recovery advice steers people into as the invisible one, which
+ * reproduces NOR-402's "a comment did not reach an agent and nothing said so" a
+ * step further down the path.
  */
 export type RoutingRejectReason =
 	| "issue_locked"
 	| "unenrolled_creator"
-	| "invalid_issue_key";
+	| "invalid_issue_key"
+	/** A prompt from someone who did not create the session (`routePrompted`). */
+	| "non_creator_prompt"
+	/** A prompt that resolved to no device at all (`routePrompted`). */
+	| "prompt_unroutable"
+	/** A `created` event with no registered repository to route it to. */
+	| "repositories_unavailable";
 
 export interface RoutingRejection {
 	reason: RoutingRejectReason;

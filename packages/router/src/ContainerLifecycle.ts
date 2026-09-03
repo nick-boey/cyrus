@@ -165,7 +165,10 @@ export interface ContainerLifecycleOptions {
 	/** How long a device may hold session affinity with NO observable progress —
 	 *  nothing routed to it and nothing posted by its agent — before it is
 	 *  reported as stranded. Independent of the container's infrastructure state:
-	 *  the fault this catches looks perfectly healthy (NOR-402). Default: 1 hour. */
+	 *  the fault this catches looks perfectly healthy (NOR-402).
+	 *  Default: {@link DEFAULT_SESSION_NO_PROGRESS_MS} (4 hours) — see that
+	 *  constant for why it is that high and what must be true before lowering it.
+	 *  Operator-settable as `containers.sessionNoProgressMs`. */
 	sessionNoProgressMs?: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
 	sessionReconciler?: SessionReconciler;
@@ -216,7 +219,8 @@ export interface SandboxObservation {
  * session that claims the device in between would otherwise be killed within
  * seconds of starting. Affinity that is NOT backed by progress — held against a
  * container that is not running, or held while neither the router nor the agent
- * does anything for an hour — is reported by {@link noteStranded}. That is the
+ * does anything for {@link ContainerLifecycleOptions.sessionNoProgressMs} — is
+ * reported by {@link noteStranded}. That is the
  * price of the invariant: the pin is unconditional, so the only defence against
  * a pin that should have been released is seeing it.
  *

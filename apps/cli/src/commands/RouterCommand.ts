@@ -289,6 +289,14 @@ const RouterConfigFileSchema = z.object({
 			affinityGraceMs: z.number().optional(),
 			offlineAgeOutMs: z.number().optional(),
 			strandedSessionGraceMs: z.number().optional(),
+			/**
+			 * Rejected rather than coerced when it is not a positive integer of
+			 * MILLISECONDS, for the same reason as {@link terminalSettleMs}: a
+			 * degenerate value silently turns a severity-1 detector into one that
+			 * reports every pinned sandbox on every tick (0 or negative) — an alert
+			 * storm that reads as a fleet-wide outage.
+			 */
+			sessionNoProgressMs: z.number().int().positive().optional(),
 			sessionsQueryTimeoutMs: z.number().optional(),
 			/**
 			 * Rejected rather than coerced when it is not a positive integer of

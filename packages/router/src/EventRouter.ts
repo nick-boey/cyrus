@@ -33,6 +33,7 @@ import {
 	expiredMessage,
 	fillTemplate,
 	INVALID_ISSUE_KEY_MESSAGE,
+	ISSUE_LOCKED_BY_OTHER_MESSAGE,
 	ISSUE_LOCKED_MESSAGE,
 	NO_REPOSITORIES_MESSAGE,
 	ORPHANED_LOCK_RECLAIMED_MESSAGE,
@@ -1181,6 +1182,12 @@ export class EventRouter {
 				sessionId,
 				fillTemplate(NO_REPOSITORIES_MESSAGE, { reason: outcome.reason }),
 			);
+			emitRoutingRejection(this.logger, {
+				reason: "repositories_unavailable",
+				sessionId,
+				...(issueId !== undefined ? { issueId } : {}),
+				issueKey,
+			});
 			this.logger.warn(`Cannot route session ${sessionId}: ${outcome.reason}`);
 			// Stash the ORIGINAL `created` webhook rather than dropping it.
 			// "unavailable" covers two causes — a transient registry read
@@ -1630,7 +1637,32 @@ export class EventRouter {
 				// is a live session (reply in its thread) or a strand that needs
 				// `cyrus router unlock`.
 				const holder = this.store.getIssueLock(issueId);
-				await this.postActivity(workspaceId, sessionId, ISSUE_LOCKED_MESSAGE);
+				// Which message depends on WHOSE session holds the lock, because
+				// the recovery differs and the wrong one is a closed loop: with
+				// `creatorOnlyPrompting` on (the default), telling a non-creator to
+				// "reply in the running session's thread" sends them into a gate
+				// that rejects them and tells them to start their own session,
+				// which lands back here. Only claim same-user recovery when we can
+				// positively establish it — an unknown holder creator falls back to
+				// the neutral message rather than promising something that fails.
+				const holderCreator = holder
+					? this.storedCreator(holder.sessionId)
+					: undefined;
+				const lockedByOther =
+					this.config.creatorOnlyPrompting &&
+					holderCreator?.id !== undefined &&
+					creator?.id !== undefined &&
+					holderCreator.id !== creator.id;
+				await this.postActivity(
+					workspaceId,
+					sessionId,
+					lockedByOther
+						? fillTemplate(ISSUE_LOCKED_BY_OTHER_MESSAGE, {
+								holderName:
+									holderCreator?.name ?? holderCreator?.email ?? "someone else",
+							})
+						: ISSUE_LOCKED_MESSAGE,
+				);
 				emitRoutingRejection(this.logger, {
 					reason: "issue_locked",
 					sessionId,
@@ -1769,7 +1801,11 @@ export class EventRouter {
 					sessionId,
 					PROMPT_REJECTION_MESSAGE,
 				);
-				this.logger.info(
+				emitRoutingRejection(this.logger, {
+					reason: "non_creator_prompt",
+					sessionId,
+				});
+				this.logger.warn(
 					`Rejected a non-creator's answer to the repository selection for session ${sessionId} (actor ${actorId ?? "unknown"} != creator ${creatorId}); the pending selection is untouched`,
 				);
 				return true;
@@ -2000,7 +2036,13 @@ export class EventRouter {
 				sessionId,
 				fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: invalidIssueKey }),
 			);
-			this.logger.info(
+			emitRoutingRejection(this.logger, {
+				reason: "invalid_issue_key",
+				sessionId,
+				...(issueId !== undefined ? { issueId } : {}),
+				issueKey: invalidIssueKey,
+			});
+			this.logger.warn(
 				`Refused to route prompted session ${sessionId}: issue key ${JSON.stringify(invalidIssueKey)} can't be used for a container workspace`,
 			);
 			return;
@@ -2011,6 +2053,11 @@ export class EventRouter {
 				sessionId,
 				PROMPT_UNROUTABLE_MESSAGE,
 			);
+			emitRoutingRejection(this.logger, {
+				reason: "prompt_unroutable",
+				sessionId,
+				...(issueId !== undefined ? { issueId } : {}),
+			});
 			this.logger.warn(
 				`Prompted event for session ${sessionId} resolved to no device; notified and dropping`,
 			);
@@ -2044,7 +2091,17 @@ export class EventRouter {
 						sessionId,
 						PROMPT_REJECTION_MESSAGE,
 					);
-					this.logger.info(
+					// This is the refusal `ISSUE_LOCKED_MESSAGE` steers people
+					// into: it tells a lock-rejected user to reply in the holding
+					// session's thread, and if they are not that session's creator
+					// this gate rejects them again. Left at `info` with no event,
+					// that loop was invisible from both ends (NOR-402).
+					emitRoutingRejection(this.logger, {
+						reason: "non_creator_prompt",
+						sessionId,
+						...(issueId !== undefined ? { issueId } : {}),
+					});
+					this.logger.warn(
 						`Rejected non-creator prompt on session ${sessionId} (actor ${actorId ?? "unknown"} != creator ${creatorId})`,
 					);
 					return;
@@ -2396,10 +2453,18 @@ export class EventRouter {
 	}
 
 	private storedCreatorId(sessionId: string): string | undefined {
+		return this.storedCreator(sessionId)?.id;
+	}
+
+	/**
+	 * The full stored creator, not just the id: a lock rejection needs the NAME
+	 * to say whose session is holding the issue, and it is the same stored blob.
+	 */
+	private storedCreator(sessionId: string): StoredCreator | undefined {
 		const json = this.store.getSessionCreator(sessionId);
 		if (!json) return undefined;
 		try {
-			return (JSON.parse(json) as StoredCreator).id;
+			return JSON.parse(json) as StoredCreator;
 		} catch {
 			this.logger.warn(
 				`Corrupt stored creator for session ${sessionId}; skipping creator check`,

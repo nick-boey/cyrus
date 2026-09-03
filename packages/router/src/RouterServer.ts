@@ -193,6 +193,22 @@ export interface RouterContainersConfig {
 	/** Default 600_000 (10 minutes). How long a stopped-but-still-claimed sandbox
 	 *  must stay that way before `sandbox.stranded_session` is reported. */
 	strandedSessionGraceMs?: number;
+	/**
+	 * Default 14_400_000 (4 hours). How long a sandbox may hold session affinity
+	 * with nothing routed to it and nothing posted by it before
+	 * `sandbox.stranded_session` is reported with `cyrus.reason = no_progress`.
+	 *
+	 * Exposed because the detector knowingly cannot separate a strand from a
+	 * session deliberately waiting (the deferral is recorded only on the device),
+	 * so a deployment running a cron with a period above the threshold will be
+	 * reported. This alert is severity 1: without a knob the only remedy for that
+	 * false positive is muting the rule — which also mutes `offline_pinned`, and
+	 * is the alert-fatigue failure NOR-402 is about. Raise it rather than mute.
+	 *
+	 * Do not LOWER it below `ScheduleWakeup`'s 1-hour clamp without first giving
+	 * the router a way to see the deferral.
+	 */
+	sessionNoProgressMs?: number;
 	/** Default 5_000 (5 seconds). */
 	sessionsQueryTimeoutMs?: number;
 	/** Default 120_000 (2 minutes). How long after an agent run on a container
@@ -1223,6 +1239,9 @@ export class RouterServer {
 			offlineAgeOutMs: containers.offlineAgeOutMs ?? DEFAULT_OFFLINE_AGE_OUT_MS,
 			...(containers.strandedSessionGraceMs !== undefined
 				? { strandedSessionGraceMs: containers.strandedSessionGraceMs }
+				: {}),
+			...(containers.sessionNoProgressMs !== undefined
+				? { sessionNoProgressMs: containers.sessionNoProgressMs }
 				: {}),
 			...(containers.terminalSettleMs !== undefined
 				? { terminalSettleMs: containers.terminalSettleMs }
