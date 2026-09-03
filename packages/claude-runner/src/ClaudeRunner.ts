@@ -927,6 +927,15 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 								reason: "pending_work",
 								session_cron_count: this.pendingSessionCrons.length,
 								background_task_count: this.pendingBackgroundTasks.length,
+								// WARNING: this is the Claude SDK's session id, like every
+								// other `agent_session_id` emitted from this file. It is
+								// NOT the Linear agent session id that
+								// `session.terminal_deferred`/`session.terminal_signalled`
+								// carry under the same attribute name from
+								// AgentSessionManager, so the two families do NOT join
+								// (NOR-402). Renaming this one alone would be worse than
+								// the collision; the whole runner vocabulary has to move
+								// together, which is its own change.
 								agent_session_id: this.sessionInfo?.sessionId,
 							}),
 						);
@@ -1198,6 +1207,8 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 							cyrusAttributes({
 								session_cron_count: this.pendingSessionCrons.length,
 								background_task_count: this.pendingBackgroundTasks.length,
+								// See `session.held_open` above: this is the Claude SDK
+								// session id, not the Linear agent session id.
 								agent_session_id: this.sessionInfo?.sessionId,
 							}),
 						);

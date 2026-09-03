@@ -408,9 +408,39 @@ resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches
 // rather than `info` lines on purpose: a worker's log forwarder is WARN+ by
 // default, so the `info` this replaced never left the container.
 
-// Sessions whose terminal signal was withheld and never sent. Each row is one
-// issue that is still locked to a session that has finished its work — the
-// CAN-133 shape. `deferred_for` is how long the issue has been unreachable.
+// Sessions whose most recent turn deferred its terminal signal and has not yet
+// sent one. The CAN-133 shape, and the disambiguation step the stranded-session
+// alert sends an operator to before it will let them run `cyrus router unlock`.
+//
+// ── WHY THIS COMPARES TIMES RATHER THAN MEMBERSHIP ──
+// A Linear agent session id spans TURNS. `AgentSessionManager.addAgentRunner`
+// clears the session from `terminalEmittedSessions` on every runner re-attach,
+// so `emitTerminalOnce` re-arms and each cleanly finished turn emits its own
+// `session.terminal_signalled` under the SAME `cyrus.agent_session_id`. The
+// first cut anti-joined on set membership, which deleted from the result any
+// session that had EVER signalled — i.e. every session that completed a turn
+// normally and then deferred forever on a later one. That is the ordinary
+// multi-turn case, not a corner: replying in-thread is the documented recovery
+// for a lock rejection, so the workaround for NOR-402 manufactured exactly the
+// shape the query could not see. An operator would then read zero rows as "not
+// deferred" and take the unlock this query exists to gate.
+//
+// ── WHAT A ROW DOES AND DOES NOT PROVE ──
+// A row means the newest deferral for that session postdates its newest signal.
+// It does NOT prove the issue is still locked: `EventRouter.reconcileDeviceLocks`
+// (fed by `getLiveSessionIds`, which deliberately omits a deferred session whose
+// runner died with a previous process), terminal teardown, `cyrus router unlock`
+// and event-TTL expiry all release a lock without the device ever emitting a
+// signal. Cross-check against `cyrus router sessions list` before acting.
+// Equally, ZERO rows does not mean healthy — it means no unmatched deferral was
+// recorded in this window, which is also what a worker that died before it could
+// emit anything looks like.
+//
+// ── DO NOT JOIN THIS TO `session.held_open` / `session.pending_work_recorded` ──
+// Those are emitted by ClaudeRunner and their `cyrus.agent_session_id` is the
+// CLAUDE SDK session id, a different identifier that happens to share the
+// attribute name with the LINEAR agent session id used here. The join silently
+// returns nothing rather than erroring. Correlate on `cyrus.issue_key` instead.
 resource sessionsNeverTerminal 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
   parent: logAnalytics
   name: 'Cyrus-Sessions-Never-Terminal'
@@ -419,31 +449,43 @@ resource sessionsNeverTerminal 'Microsoft.OperationalInsights/workspaces/savedSe
     displayName: 'Sessions deferred and never terminated'
     query: join(
       [
+        // `distinct` takes column NAMES, not aliased expressions — `distinct x =
+        // expr` does not parse, and ARM stores a saved search as an opaque string
+        // without ever validating it, so the failure surfaces only when a human
+        // opens the query. Project first, then aggregate.
         'let signalled ='
         '    ContainerAppConsoleLogs_CL'
         appFilter
         '    | extend p = parse_json(Log_s)'
         '    | where tostring(p.event) == "session.terminal_signalled"'
-        '    | distinct session_id = tostring(p["cyrus.agent_session_id"]);'
+        '    | extend session_id = tostring(p["cyrus.agent_session_id"])'
+        '    | summarize last_signalled = max(TimeGenerated) by session_id;'
         'ContainerAppConsoleLogs_CL'
         appFilter
         '| extend p = parse_json(Log_s)'
         '| where tostring(p.event) == "session.terminal_deferred"'
         '| extend session_id = tostring(p["cyrus.agent_session_id"])'
+        // `arg_max`, not `any()`/`max()`: the whole point of the pending-work
+        // columns is to name what THIS stall is waiting on, and aggregating
+        // across every deferral the session ever emitted would answer with an
+        // unrelated earlier turn's.
         '| summarize'
         '    first_deferred = min(TimeGenerated),'
-        '    last_deferred  = max(TimeGenerated),'
         '    defers         = count(),'
-        '    issue_key      = any(tostring(p["cyrus.issue_key"])),'
-        '    crons          = max(toint(p["cyrus.session_cron_count"])),'
-        '    background     = max(toint(p["cyrus.background_task_count"])),'
-        '    live_background = max(toint(p["cyrus.live_background_task_count"])),'
-        '    pending_work   = any(tostring(p["cyrus.pending_work"]))'
+        '    (last_deferred, issue_key, crons, background, live_background, pending_work) ='
+        '      arg_max('
+        '        TimeGenerated,'
+        '        tostring(p["cyrus.issue_key"]),'
+        '        toint(p["cyrus.session_cron_count"]),'
+        '        toint(p["cyrus.background_task_count"]),'
+        '        toint(p["cyrus.live_background_task_count"]),'
+        '        tostring(p["cyrus.pending_work"])'
+        '      )'
         '  by session_id'
-        // Anti-join: what is left is every session that deferred and never came
-        // back. That set IS the population of permanently locked issues.
-        '| join kind=leftanti signalled on session_id'
+        '| join kind=leftouter signalled on session_id'
+        '| where isnull(last_signalled) or last_deferred > last_signalled'
         '| extend deferred_for = now() - last_deferred'
+        '| project-away session_id1'
         '| order by first_deferred asc'
       ],
       '\n'
@@ -1043,7 +1085,7 @@ resource sandboxStrandedSessions 'Microsoft.Insights/scheduledQueryRules@2023-03
   tags: tags
   properties: {
     displayName: 'alert-${namePrefix}-sandbox-stranded-sessions'
-    description: 'A Cyrus sandbox holds session affinity for an issue it is not working on. Check "cyrus.reason". "offline_pinned": the sandbox is stopped and disconnected — prompt the thread again to cold-boot it. "no_progress": it is running and connected, but nothing has been routed to it and its agent has posted nothing for over "cyrus.no_progress_ms". That is EITHER a session that never went terminal (the issue is now locked to a session that stopped working) OR one deliberately idle on a scheduled wakeup — the router cannot tell, because the deferral is recorded only on the device. Run the "Cyrus-Sessions-Never-Terminal" saved search for this issue: a "session.terminal_deferred" with no matching "session.terminal_signalled" says it is waiting and names what for. Either way a new top-level comment is rejected at the issue lock, so reply inside the running session\'s thread; use "cyrus router unlock" ONLY after confirming it is not waiting, since unlocking a session that is about to resume strands the lock instead of freeing it.'
+    description: 'A Cyrus sandbox holds session affinity for an issue it is not working on. Check "cyrus.reason". "offline_pinned": the sandbox is stopped and disconnected — prompt the thread again to cold-boot it. "no_progress": it is running and connected, but nothing has been routed to it and its agent has posted nothing for over "cyrus.no_progress_ms". That is EITHER a session that never went terminal (the issue is now locked to a session that stopped working) OR one deliberately idle on a scheduled wakeup — the router cannot tell, because the deferral is recorded only on the device. Run the "Cyrus-Sessions-Never-Terminal" saved search for this issue: a row means this session\'s newest deferral postdates its newest terminal signal, and "pending_work" names what it is waiting on. NOTE that zero rows does NOT mean healthy — it also matches a worker that died before emitting anything, and a lock already reclaimed by reconcile/teardown/unlock; cross-check with "cyrus router sessions list". Either way a new top-level comment is rejected at the issue lock, so reply inside the running session\'s thread; use "cyrus router unlock" ONLY after confirming it is not waiting, since unlocking a session that is about to resume strands the lock instead of freeing it.'
     severity: 1
     enabled: true
     evaluationFrequency: 'PT15M'

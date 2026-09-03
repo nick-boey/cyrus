@@ -583,7 +583,37 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      lock-without-affinity leak instead of fixing anything.
      `sessionNoProgressMs` is 4h to clear `ScheduleWakeup`'s 1h clamp outright;
      a longer-period cron is a known false-positive class. Anything that lowers
-     it must first give the router a way to see the deferral.
+     it must first give the router a way to see the deferral. It is settable as
+     `containers.sessionNoProgressMs`, and that is not a nicety: this is a
+     severity-1 rule that knowingly fires for a legitimate long cron, so without
+     a knob the only remedy is muting it — which also mutes `offline_pinned` and
+     is the exact alert-fatigue failure the detector exists to end. Any new
+     threshold on this rule needs the same reachability from `router-config.json`.
+   - **The `deferred`/`signalled` pair must be compared by TIME, never by
+     membership, and the query that does it is load-bearing.** A Linear agent
+     session id spans turns: `AgentSessionManager.addAgentRunner` clears
+     `terminalEmittedSessions` on every runner re-attach, so each cleanly
+     finished turn emits its own `session.terminal_signalled` under the SAME id.
+     An anti-join on "has this id ever signalled" therefore deletes exactly the
+     sessions that completed once and then deferred forever — and since replying
+     in-thread is the documented recovery for a lock rejection, the workaround
+     for NOR-402 MANUFACTURES that shape. Worse than a blind spot: the alert
+     tells the operator to run this query before `cyrus router unlock`, so an
+     empty result reads as "not waiting" and licenses the unlock. Compare
+     `last_deferred > last_signalled`, use `arg_max` so the pending-work columns
+     describe the current stall, and remember a row does NOT prove the lock is
+     still held (reconcile, teardown, unlock and TTL expiry all release without a
+     signal) while zero rows does NOT prove health. Note also that
+     `session.held_open` / `session.pending_work_recorded` carry
+     `cyrus.agent_session_id` too, but theirs is the CLAUDE SDK session id — the
+     two families do not join, and KQL returns nothing rather than erroring.
+   - **`check-bicep.sh` compiles the template; it does not evaluate the KQL
+     inside it.** ARM stores a saved search as an opaque string and never
+     validates it, so a query that does not parse (`distinct x = expr` is the one
+     that got through) deploys green and fails the first time a human opens it —
+     mid-incident, which is the only time anyone opens it. A new or edited saved
+     search has to be run against the workspace; a green `infra` check is not
+     evidence about the query.
    - **Neither stranded shape covers a locked issue with NO affinity.** Both are
      reached only from the sweep's `affinity > 0` gate, but a `parked` session
      releases affinity and RETAINS its lock — so an elicitation nobody answers

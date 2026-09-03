@@ -47,6 +47,11 @@ export class DeviceGateway extends EventEmitter {
 	private readonly sockets = new Map<number, WebSocket>();
 	private readonly socketState = new WeakMap<WebSocket, SocketState>();
 	private readonly capabilities = new Map<number, Set<string>>();
+	/**
+	 * Devices whose progress-clock stamp is currently failing, so the warning is
+	 * logged once per device per outage rather than once per `rpc_request`.
+	 */
+	private readonly progressStampFailed = new Set<number>();
 	private readonly pendingSessionQueries = new Map<
 		string,
 		{ resolve: (v: string[] | undefined) => void; timer: NodeJS.Timeout }
@@ -333,14 +338,26 @@ export class DeviceGateway extends EventEmitter {
 				// explicit contract that a device frame must never break the socket it
 				// arrived on; a purely diagnostic stamp has even less business doing
 				// so, and losing one sample only delays the detector by a tick.
+				//
+				// Latched. `rpc_request` is the highest-frequency device->router
+				// frame there is — every thought, action and response an agent posts
+				// — and the failures named above are persistent, not transient, so
+				// an unlatched warn turns one full disk into a per-frame log storm
+				// billed per GB. Reported once per device, re-armed on the next
+				// success so a recovered store reports again if it breaks later.
 				try {
 					this.store.markDeviceProgress(deviceId, Date.now());
+					this.progressStampFailed.delete(deviceId);
 				} catch (err) {
-					this.logger.warn(
-						`Failed to stamp the progress clock for device ${deviceId}; ` +
-							`the stranded-session detector may report it early`,
-						err,
-					);
+					if (!this.progressStampFailed.has(deviceId)) {
+						this.progressStampFailed.add(deviceId);
+						this.logger.warn(
+							`Failed to stamp the progress clock for device ${deviceId}; ` +
+								`the stranded-session detector may report it early. ` +
+								`Further failures for this device are suppressed until one succeeds.`,
+							err,
+						);
+					}
 				}
 				this.emit("rpc", deviceId, frame);
 				break;

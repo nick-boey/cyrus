@@ -493,6 +493,92 @@ describe("EventRouter", () => {
 		]);
 	});
 
+	it("(c4) makes a non-creator PROMPT refusal observable — the path the lock message steers users into", async () => {
+		// The gap that made AC3 only half true. `ISSUE_LOCKED_MESSAGE` answers a
+		// lock rejection by telling the user to reply inside the holding session's
+		// thread, i.e. it routes every lock-rejected user out of `routeCreated`
+		// and into `routePrompted` — whose refusals emitted nothing and logged at
+		// `info`. A user following the product's own advice and being refused
+		// there reproduced NOR-402 exactly: a comment that reached no agent, with
+		// nothing in the log stream saying so.
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		const logger = testLogger();
+		const { router } = makeRouter(store, {
+			logger,
+			config: { creatorOnlyPrompting: true },
+		});
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				actorUserId: "lin-bob",
+				creator: ALICE,
+			}),
+		);
+
+		expect(eventsNamed(logger, "routing.rejected")).toContainEqual({
+			reason: "non_creator_prompt",
+			agent_session_id: "sess-1",
+			issue_id: "ISS-1",
+			issue_key: null,
+			held_by_session_id: null,
+			held_by_device_id: null,
+		});
+	});
+
+	it("(c5) tells a different user that the holder is someone else's session, instead of looping them", async () => {
+		// With `creatorOnlyPrompting` on (the default), "reply in the running
+		// session's thread" is FALSE advice for a non-creator: that reply is
+		// rejected and tells them to start their own session, which lands back on
+		// the lock. The old single message dropped the one fact that explains the
+		// loop.
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		enroll(store, "bob@example.com", { linearId: "lin-bob" });
+		const { router, postActivity } = makeRouter(store, {
+			config: { creatorOnlyPrompting: true },
+		});
+
+		await router.route(
+			createdEvent({ sessionId: "sess-a", issueId: "ISS-9", creator: ALICE }),
+		);
+		postActivity.mockClear();
+		await router.route(
+			createdEvent({ sessionId: "sess-b", issueId: "ISS-9", creator: BOB }),
+		);
+
+		const [, , body] = postActivity.mock.calls[0] as [string, string, string];
+		expect(body).toContain("Alice");
+		expect(body).not.toContain("Reply inside the running session's thread");
+		// Never hand the destructive remedy to a Linear reader: the router itself
+		// cannot tell a strand from a session waiting on a scheduled wakeup.
+		expect(body).not.toContain("cyrus router unlock");
+	});
+
+	it("(c6) keeps the same-user lock message, which is the verified recovery", async () => {
+		// CAN-133 was a self-collision. Telling that user the holder belongs to
+		// "another user" sent them looking for a colleague who did not exist.
+		enroll(store, "alice@example.com", { linearId: "lin-alice" });
+		const { router, postActivity } = makeRouter(store, {
+			config: { creatorOnlyPrompting: true },
+		});
+
+		await router.route(
+			createdEvent({ sessionId: "sess-a", issueId: "ISS-8", creator: ALICE }),
+		);
+		postActivity.mockClear();
+		await router.route(
+			createdEvent({ sessionId: "sess-b", issueId: "ISS-8", creator: ALICE }),
+		);
+
+		const [, , body] = postActivity.mock.calls[0] as [string, string, string];
+		expect(body).toContain("Reply inside the running session's thread");
+		expect(body).not.toContain("cyrus router unlock");
+	});
+
 	it("(d) enforces creator-only prompting using the activity actor field", async () => {
 		// creatorOnlyPrompting: true → a prompt from a non-creator actor is rejected.
 		const aliceDevice = enroll(store, "alice@example.com", {
