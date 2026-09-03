@@ -6,7 +6,8 @@ This changelog documents internal development changes, refactors, tooling update
 
 ### Added
 - **Adopted the observability domain language and decisions ([CYR-63](https://linear.app/northrop-digital/issue/CYR-63/migrate-cyr-62-domain-context-and-adrs-into-the-repository),
-  planned on [CYR-62](https://linear.app/northrop-digital/issue/CYR-62/create-plan-for-project)).**
+  planned on [CYR-62](https://linear.app/northrop-digital/issue/CYR-62/create-plan-for-project),
+  [#56](https://github.com/nick-boey/cyrus/pull/56)).**
   Migrated the approved planning artifacts into the repository ahead of any
   implementation code, so the observability work argues from versioned, reviewed
   terms. `CONTEXT.md` gains **Waiting run**, **Elicitation**, **Run observation
