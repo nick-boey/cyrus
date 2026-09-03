@@ -105,17 +105,26 @@ export function formatPendingWorkThought(
  * Stop hook that fills the other two, so it has to be read separately.
  *
  * Never returns null: this is only called when something IS pending.
+ *
+ * Bounded at BOTH axes on purpose. Each item is truncated, and the item COUNT is
+ * capped at {@link PENDING_WORK_SUMMARY_MAX_ITEMS} with a `+N more` suffix, so
+ * the emitted value is bounded where it is produced rather than by whatever
+ * clamp the sink downstream happens to apply (`RouterLogForwarder` truncates
+ * attributes at 512 chars, `SandboxLogRelay` at 1000 — neither is this
+ * function's contract, and a change to either would silently change what this
+ * emits). This attribute goes to a per-GB backend on the highest-frequency
+ * terminal path there is.
  */
 export function formatPendingWorkSummary(
 	pendingWork: AgentPendingWork,
 ): string {
 	const items = [
-		...pendingWork.sessionCrons.map(
+		...(pendingWork.sessionCrons ?? []).map(
 			(cron) =>
 				`cron(${cron.recurring ? "recurring " : ""}${cron.schedule})` +
 				(cron.prompt ? `: ${truncate(cron.prompt, 80)}` : ""),
 		),
-		...pendingWork.backgroundTasks.map(
+		...(pendingWork.backgroundTasks ?? []).map(
 			(task) =>
 				`background(${task.type}/${task.status}: ` +
 				`${truncate(task.command ?? task.description, 80)})`,
@@ -125,8 +134,18 @@ export function formatPendingWorkSummary(
 				`live-background(${task.taskType}: ${truncate(task.description, 80)})`,
 		),
 	];
-	return items.length > 0 ? items.join("; ") : "unspecified pending work";
+	if (items.length === 0) return "unspecified pending work";
+	if (items.length <= PENDING_WORK_SUMMARY_MAX_ITEMS) return items.join("; ");
+	const shown = items.slice(0, PENDING_WORK_SUMMARY_MAX_ITEMS);
+	return `${shown.join("; ")}; +${items.length - PENDING_WORK_SUMMARY_MAX_ITEMS} more`;
 }
+
+/**
+ * How many pending-work items the telemetry summary names before collapsing the
+ * rest into a count. Enough to diagnose a stuck session; short of letting a
+ * runaway cron list become the log volume.
+ */
+export const PENDING_WORK_SUMMARY_MAX_ITEMS = 10;
 
 function formatSessionCron(cron: SessionCronSummary): string {
 	const when = cron.recurring
@@ -178,8 +197,18 @@ function formatDuration(seconds: number): string {
 	return `~${Math.round(minutes / 60)}h`;
 }
 
-function truncate(text: string, max: number): string {
+/**
+ * `text` is typed as `string` but is not always one at runtime: it comes from a
+ * runner-supplied payload, and `task.command ?? task.description` yields
+ * `undefined` for a background task carrying neither. This is called from
+ * `completeSession`'s `finally`, where a TypeError would reject the terminal
+ * path itself — the one path whose whole job is to release the router's issue
+ * lock. Degrading to a placeholder is strictly better than that.
+ */
+function truncate(text: string | undefined, max: number): string {
+	if (typeof text !== "string") return "(unnamed)";
 	const collapsed = text.replace(/\s+/g, " ").trim();
+	if (collapsed.length === 0) return "(unnamed)";
 	return collapsed.length <= max ? collapsed : `${collapsed.slice(0, max)}…`;
 }
 

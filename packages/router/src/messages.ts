@@ -38,7 +38,8 @@ export const INVALID_ISSUE_KEY_MESSAGE = `I can't start a container workspace fo
 This is unusual — Linear issue identifiers are normally safe for this. An operator should check the router logs for the exact key that was rejected.`;
 
 /**
- * Posted when an issue is already locked by another agent session.
+ * Posted when an issue is already locked by an agent session the SAME user
+ * started.
  *
  * Deliberately does NOT claim the holder belongs to another user: it is
  * routinely the SAME person, prompting their own issue from a new top-level
@@ -47,11 +48,43 @@ This is unusual — Linear issue identifiers are normally safe for this. An oper
  * verified — replying inside the running session's thread produces
  * `AgentSessionEvent/prompted`, which is not lock-gated and reached a cold
  * sandbox in 21 seconds — so lead with it.
+ *
+ * The unlock advice this used to carry is GONE, and its absence is deliberate.
+ * It read "if that session is no longer doing anything, it is stranded" — a
+ * precondition the router itself cannot evaluate (see
+ * `ContainerLifecycle.noteStranded`: a session waiting on a scheduled wakeup is
+ * byte-for-byte identical to a strand, because the deferral is recorded only on
+ * the device). Every operator-facing surface gates `cyrus router unlock` on
+ * confirming the session is NOT waiting; this is the one surface read by a
+ * Linear user, who has strictly less information than the router and no way to
+ * run the check. `cyrus router unlock` also releases only the lock, not session
+ * affinity, so acting on it against a waiting session manufactures exactly the
+ * lock-without-affinity divergence the detector cannot see.
  */
 export const ISSUE_LOCKED_MESSAGE =
 	"An agent session is already running on this issue, and it holds the issue lock — so this comment did not reach it.\n\n" +
 	"**Reply inside the running session's thread instead**, and your prompt will be delivered to it.\n\n" +
-	"If that session is no longer doing anything, it is stranded: an operator can free the issue with `cyrus router unlock`.";
+	"If that session looks stuck, ask an operator to check it — they can tell whether it is genuinely stranded or just waiting on scheduled work.";
+
+/**
+ * Posted when the issue is locked by a session someone ELSE started, and
+ * `creatorOnlyPrompting` is on (the default).
+ *
+ * Exists because {@link ISSUE_LOCKED_MESSAGE}'s advice is FALSE for this reader,
+ * and following it produces a closed loop with no event on either hop: reply
+ * in the holder's thread and `routePrompted`'s creator-only gate rejects you
+ * with {@link PROMPT_REJECTION_MESSAGE} ("start your own session"), which is a
+ * new `created` event on the same issue, which is rejected here again. The old
+ * single message dropped the "(session owned by another user)" fact that was the
+ * only thing explaining why the loop exists — correct for CAN-133's self-
+ * collision, wrong for the multi-user collision the issue lock was built for.
+ *
+ * Templated with `{{holderName}}` — render with {@link fillTemplate}.
+ */
+export const ISSUE_LOCKED_BY_OTHER_MESSAGE =
+	"An agent session started by {{holderName}} is already running on this issue and holds the issue lock, so this comment did not reach it.\n\n" +
+	"Only the person who started a session can send it new instructions, so replying in its thread will not work either. Wait for that session to finish, or ask {{holderName}} to pass on what you need.\n\n" +
+	"If it looks stuck, ask an operator to check it — they can tell whether it is genuinely stranded or just waiting on scheduled work.";
 
 /**
  * Posted when a prompt arrives for a session we cannot route to any device:

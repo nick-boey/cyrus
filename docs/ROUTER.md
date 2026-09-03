@@ -391,6 +391,7 @@ lookup and silently returns null — so read them with bracket syntax:
 | `sandbox.idle_stopped` | the lifecycle sweep parked an affinity-free sandbox past `idleStopMs` |
 | `sandbox.destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
 | `sandbox.teardown_completed` | a terminal teardown finished; carries `action` and whether the worker's callback or the grace deadline triggered it |
+| `sandbox.stranded_session` | a sandbox holds session affinity it is not working on. `cyrus.reason` is `offline_pinned` (stopped and disconnected, past `strandedSessionGraceMs`) or `no_progress` (running and connected, but nothing routed to it and nothing posted by it past `containers.sessionNoProgressMs`, default 4h). Detection only — neither boots nor releases anything |
 | `sandbox.gauge` | once per sandbox per 60s lifecycle sweep — the point-in-time inventory |
 | `sandbox.sweep_completed` | once per completed sweep, even with zero sandboxes — the fleet rollup. The sweep is non-reentrant, so a tick that fires while the previous one is still running is skipped and logs a warning instead |
 
@@ -1595,11 +1596,27 @@ or an admin runs `cyrus router unlock <issueId>`.
 > **Reply inside the running session's thread instead**: that produces
 > `AgentSessionEvent/prompted`, which is not lock-gated and reaches the sandbox.
 >
-> Every rejection now emits `routing.rejected` (`cyrus.reason = issue_locked`,
-> with the holding session and device) and logs at WARN, so an operator can tell
-> a dropped comment from a webhook that never arrived. If the holding session has
-> stopped working, its sandbox is also reported by `sandbox.stranded_session`
-> with `cyrus.reason = no_progress`; `cyrus router unlock <issueId>` frees it.
+> If the holder is someone ELSE's session and `creatorOnlyPrompting` is on (the
+> default), replying in its thread will not work either — the creator-only gate
+> rejects it — so the rejection says so instead of sending you round a loop.
+>
+> Every refusal emits `routing.rejected` and logs at WARN, on both the `created`
+> and the `prompted` path: `issue_locked`, `unenrolled_creator`,
+> `invalid_issue_key`, `non_creator_prompt`, `prompt_unroutable`,
+> `repositories_unavailable`. That is what lets an operator tell a dropped
+> comment from a webhook that never arrived — see the `Cyrus-Routing-Rejections`
+> saved search.
+>
+> If the holding session has stopped working, its sandbox is also reported by
+> `sandbox.stranded_session` with `cyrus.reason = no_progress`. **Do not run
+> `cyrus router unlock` on the strength of that alone**: the router cannot
+> distinguish a strand from a session deliberately waiting on a scheduled
+> wakeup, because the deferral is recorded only on the device. Establish which
+> it is from the `Cyrus-Sessions-Never-Terminal` saved search (a row means the
+> newest deferral postdates the newest terminal signal, and names what it is
+> waiting on) and from `cyrus router sessions list`. Unlocking a session that is
+> about to resume releases the lock but NOT its session affinity, which
+> manufactures the lock-without-affinity divergence the detector cannot see.
 > See NOR-402.
 
 The terminal-state signal is delivered durably. The device writes the

@@ -43,7 +43,8 @@ import {
 } from "cyrus-router-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-	ISSUE_LOCKED_MESSAGE,
+	fillTemplate,
+	ISSUE_LOCKED_BY_OTHER_MESSAGE,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
 } from "../src/messages.js";
@@ -406,7 +407,14 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 			}),
 		);
 
-		expect(activityBodies("sess-lock2")).toContain(ISSUE_LOCKED_MESSAGE);
+		// Bob's session is rejected by a lock Alice's session holds, so he gets
+		// the holder-aware message. Telling him to "reply in the running
+		// session's thread" would be false advice: with `creatorOnlyPrompting`
+		// on, that reply is rejected too, and its rejection tells him to start
+		// his own session — which lands right back here (NOR-402).
+		expect(activityBodies("sess-lock2")).toContain(
+			fillTemplate(ISSUE_LOCKED_BY_OTHER_MESSAGE, { holderName: "Alice" }),
+		);
 		// Empty queue delta: nothing enqueued, nothing delivered.
 		expect(pending()).toBe(0);
 		// Give any (erroneous) delivery a chance to arrive before asserting none.
