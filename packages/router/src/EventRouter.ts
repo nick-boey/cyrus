@@ -53,6 +53,7 @@ import type {
 	RepositoryResolver,
 } from "./RepositoryResolver.js";
 import type { RouterStore } from "./RouterStore.js";
+import { emitRoutingRejection } from "./RouterTelemetry.js";
 import {
 	emitSandboxEvent,
 	SANDBOX_EVENTS,
@@ -1459,7 +1460,13 @@ export class EventRouter {
 				sessionId,
 				fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: invalidIssueKey }),
 			);
-			this.logger.info(
+			emitRoutingRejection(this.logger, {
+				reason: "invalid_issue_key",
+				sessionId,
+				...(issueId !== undefined ? { issueId } : {}),
+				issueKey: invalidIssueKey,
+			});
+			this.logger.warn(
 				`Refused to route session ${sessionId}: issue key ${JSON.stringify(invalidIssueKey)} can't be used for a container workspace`,
 			);
 			return;
@@ -1471,7 +1478,13 @@ export class EventRouter {
 				sessionId,
 				fillTemplate(UNENROLLED_CREATOR_MESSAGE, { userName }),
 			);
-			this.logger.info(
+			emitRoutingRejection(this.logger, {
+				reason: "unenrolled_creator",
+				sessionId,
+				...(issueId !== undefined ? { issueId } : {}),
+				...(issueKey !== undefined ? { issueKey } : {}),
+			});
+			this.logger.warn(
 				`No enrolled Cyrus device for creator of session ${sessionId}`,
 			);
 			return;
@@ -1481,9 +1494,32 @@ export class EventRouter {
 		// the issue rejects this one.
 		if (this.config.issueLock && issueId !== undefined) {
 			if (!this.store.acquireIssueLock(issueId, sessionId, target.deviceId)) {
+				// Read the holder BEFORE posting: this is the one fact that turns
+				// "a comment did not reach an agent" from a guess into something an
+				// operator can act on, and it is what tells them whether the holder
+				// is a live session (reply in its thread) or a strand that needs
+				// `cyrus router unlock`.
+				const holder = this.store.getIssueLock(issueId);
 				await this.postActivity(workspaceId, sessionId, ISSUE_LOCKED_MESSAGE);
-				this.logger.info(
-					`Issue ${issueId} already locked by another session; rejected session ${sessionId}`,
+				emitRoutingRejection(this.logger, {
+					reason: "issue_locked",
+					sessionId,
+					issueId,
+					...(issueKey !== undefined ? { issueKey } : {}),
+					...(holder ? { heldBySessionId: holder.sessionId } : {}),
+					...(holder ? { heldByDeviceId: holder.deviceId } : {}),
+				});
+				// WARN, not the INFO it was. A rejection here makes the ISSUE
+				// unreachable — the user's prompt is answered only inside the
+				// abandoned session's own thread, which nobody is reading — and it
+				// sat at INFO among 220 near-identical "ignoring non-agent-session
+				// webhook" lines while CAN-133 was write-only for 5h17m (NOR-402).
+				this.logger.warn(
+					`Issue ${issueId} is already locked by session ${holder?.sessionId ?? "unknown"} ` +
+						`(device ${holder?.deviceId ?? "unknown"}); rejected session ${sessionId}. ` +
+						`The prompt did NOT reach an agent: the reply is posted only in the rejected ` +
+						`session's own thread. If the holding session is no longer working, it is ` +
+						`stranded — see sandbox.stranded_session — and needs \`cyrus router unlock\`.`,
 				);
 				return;
 			}

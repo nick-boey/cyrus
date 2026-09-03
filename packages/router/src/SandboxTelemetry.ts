@@ -33,6 +33,9 @@ import {
  *                      │  └──► stranded_session   (invariant violation)
  *                      ▼
  *   teardown_completed / destroyed
+ *
+ *   (idle_stop_skipped is the branch NOT taken at `idle_stopped`: the sweep
+ *    considered this sandbox and decided against parking it this tick.)
  * ```
  */
 export const SANDBOX_EVENTS = {
@@ -51,15 +54,40 @@ export const SANDBOX_EVENTS = {
 	/** The lifecycle sweep stopped an affinity-free sandbox past `idleStopMs`. */
 	idleStopped: "sandbox.idle_stopped",
 	/**
-	 * The impossible state: the router still holds session affinity for a sandbox
-	 * that is not running and whose worker is not connected. Linear shows a live
-	 * agent session the whole time, so this is invisible from every other angle —
-	 * which is how NOR-366 turned a 38-second race into a nine-hour outage.
+	 * The sweep reached an affinity-free sandbox past `idleStopMs` and abandoned
+	 * the stop anyway. `reason` says which guard fired.
+	 *
+	 * The counterpart to {@link idleStopped}, and needed for the same reason the
+	 * gauge is: without it, "we stopped killing live containers" and "the sweep
+	 * stalled" are the same observation — an absence of `sandbox.idle_stopped`.
+	 * A container held out of parking indefinitely otherwise buckets as an
+	 * unremarkable `running` in the rollup, which is precisely the three-plain-
+	 * fields silence that let NOR-366 run for nine hours.
+	 *
+	 * Emitted every tick the guard fires, so an alert rule can key on a device
+	 * deferred over many consecutive ticks — a bounded deferral is the design,
+	 * an unbounded one is PAR-146's permanent pin returning.
+	 */
+	idleStopSkipped: "sandbox.idle_stop_skipped",
+	/**
+	 * The router holds session affinity for a sandbox that is not making progress
+	 * on it. `cyrus.reason` says which of two shapes:
+	 *
+	 *  - `offline_pinned` — the sandbox is not running and its worker is not
+	 *    connected. Structurally impossible, and how NOR-366 turned a 38-second
+	 *    race into a nine-hour outage.
+	 *  - `no_progress` — nothing routed to it and nothing posted by it for
+	 *    {@link ContainerLifecycleOptions.sessionNoProgressMs}. Looks entirely
+	 *    healthy from every other angle, which is why CAN-133 held an issue
+	 *    unreachable for 5h17m while reporting `running`/`online` (NOR-402).
+	 *
+	 * Either way Linear shows a live agent session the whole time, so this is
+	 * invisible from every other angle.
 	 *
 	 * Emitted once per sweep tick for as long as it holds, so an alert rule can
 	 * key on a non-zero count in its window. Deliberately NOT emitted during the
-	 * cold-boot window, when the same three facts are the expected state of a
-	 * container that was just routed to and has not dialled back yet.
+	 * cold-boot window, when `offline_pinned`'s three facts are the expected state
+	 * of a container that was just routed to and has not dialled back yet.
 	 */
 	strandedSession: "sandbox.stranded_session",
 	/** The sandbox (and its disk/volume) was destroyed. `reason` says why. */
@@ -82,6 +110,24 @@ export type SandboxDestroyReason =
 	| "orphan"
 	| "terminal_teardown"
 	| "provider_switch";
+
+/**
+ * Why an idle-stop was abandoned. Closed for the same reason
+ * {@link SandboxDestroyReason} is: `summarize by reason` needs a bounded set.
+ *
+ *  - `row_deleted`: the device row went away mid-tick (terminal teardown).
+ *  - `clock_moved`: the row's own idle clock advanced past `idleStopMs` since
+ *    the decision was taken — the NOR-406 backstop.
+ *  - `claimed_mid_sweep`: a session took affinity during the provider round
+ *    trip — the NOR-366 guard.
+ *  - `terminal_settle`: an agent run ended within `terminalSettleMs` and its
+ *    worker may still be flushing its terminal frame.
+ */
+export type SandboxIdleStopSkipReason =
+	| "row_deleted"
+	| "clock_moved"
+	| "claimed_mid_sweep"
+	| "terminal_settle";
 
 /**
  * The subset of a container device row every sandbox event carries, so an
@@ -160,6 +206,18 @@ export interface SandboxGaugeSample extends SandboxIdentity {
 	parkedForMs?: number;
 	/** Time since the router last routed an event to this device. */
 	lastRoutedAgeMs?: number;
+	/**
+	 * How old the provider listing `state` was read from is, at the moment this
+	 * row was sampled.
+	 *
+	 * The one field on this sample that is NOT read per-row: the listing is
+	 * taken once per provider per tick, because a per-sandbox `status()` fan-out
+	 * is the gauge's whole cost. On a healthy 60s tick this is a few hundred
+	 * milliseconds; in the 392-second regime NOR-406 happened in it is minutes,
+	 * and `state` should be read as "what the provider said that long ago".
+	 * Undefined when the provider could not be listed at all (`state=unknown`).
+	 */
+	listingAgeMs?: number;
 }
 
 export function emitSandboxGauge(
@@ -175,5 +233,6 @@ export function emitSandboxGauge(
 		last_seen_age_ms: sample.lastSeenAgeMs ?? null,
 		parked_for_ms: sample.parkedForMs ?? null,
 		last_routed_age_ms: sample.lastRoutedAgeMs ?? null,
+		listing_age_ms: sample.listingAgeMs ?? null,
 	});
 }

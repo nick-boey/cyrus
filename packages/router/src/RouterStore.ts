@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS devices (
   last_routed_ms INTEGER,
   parked_at_ms INTEGER,
   running_since_ms INTEGER,
-  last_active_ms INTEGER
+  last_active_ms INTEGER,
+  last_progress_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS enrollment_codes (
   code_hash TEXT PRIMARY KEY,
@@ -154,6 +155,7 @@ CREATE INDEX IF NOT EXISTS idx_issue_disk_images_cache_key ON issue_disk_images(
 CREATE INDEX IF NOT EXISTS idx_agent_runs_user_routed ON agent_runs(user_id, last_routed_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_session_started ON agent_runs(session_id, started_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_ended ON agent_runs(ended_ms);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_device ON agent_runs(device_id);
 `;
 
 function sha256Hex(value: string): string {
@@ -208,6 +210,7 @@ interface DeviceRow {
 	parked_at_ms: number | null;
 	running_since_ms: number | null;
 	last_active_ms: number | null;
+	last_progress_ms: number | null;
 }
 
 interface ContainerDeviceRow {
@@ -221,6 +224,7 @@ interface ContainerDeviceRow {
 	parked_at_ms: number | null;
 	running_since_ms: number | null;
 	last_active_ms: number | null;
+	last_progress_ms: number | null;
 }
 
 export interface ContainerDeviceInfo {
@@ -269,6 +273,23 @@ export interface ContainerDeviceInfo {
 	 * the clock then falls back to the older inputs exactly as before.
 	 */
 	lastActiveMs?: number;
+	/**
+	 * When this device last did work the router could OBSERVE — the last device-
+	 * originated RPC frame it sent (see {@link RouterStore.markDeviceProgress}).
+	 *
+	 * Deliberately a fourth clock rather than a reuse of {@link lastActiveMs},
+	 * even though both claim to mean "doing work". `lastActiveMs` is stamped by
+	 * the lifecycle sweep on every tick a device holds affinity, so it is really
+	 * "still pinned at time T" and moves at exactly the same rate for a working
+	 * sandbox and for one whose session finished hours ago and never went
+	 * terminal. It cannot distinguish them, which is the whole of NOR-402. Only
+	 * an agent posting activities moves THIS one.
+	 *
+	 * Read by `ContainerLifecycle.noteStranded` and by nothing else — in
+	 * particular NOT by the idle clock, which must keep its own (deliberately
+	 * generous) inputs.
+	 */
+	lastProgressMs?: number;
 }
 
 interface ContainerTeardownRow {
@@ -458,6 +479,7 @@ function toContainerDeviceInfo(row: ContainerDeviceRow): ContainerDeviceInfo {
 		parkedAtMs: row.parked_at_ms ?? undefined,
 		runningSinceMs: row.running_since_ms ?? undefined,
 		lastActiveMs: row.last_active_ms ?? undefined,
+		lastProgressMs: row.last_progress_ms ?? undefined,
 	};
 }
 
@@ -743,6 +765,25 @@ export class RouterStore {
 			this.db
 				.prepare(
 					"UPDATE devices SET last_active_ms = ? WHERE kind = 'container'",
+				)
+				.run(Date.now());
+		}
+
+		// Backfilled to migration time for the same asymmetry as `last_active_ms`
+		// above, though the cost of getting it wrong is different: this column only
+		// feeds the stranded-session DETECTOR, so a NULL would not stop or destroy
+		// anything — it would report every pre-upgrade sandbox that happens to hold
+		// affinity as stranded the moment the router restarts. A sev-1 alert that
+		// storms on deploy is how a rule gets muted, so start every existing row's
+		// progress clock at the upgrade instead.
+		if (
+			deviceColsNow.length > 0 &&
+			!deviceColsNow.some((c) => c.name === "last_progress_ms")
+		) {
+			this.db.exec("ALTER TABLE devices ADD COLUMN last_progress_ms INTEGER");
+			this.db
+				.prepare(
+					"UPDATE devices SET last_progress_ms = ? WHERE kind = 'container'",
 				)
 				.run(Date.now());
 		}
@@ -1076,12 +1117,38 @@ export class RouterStore {
 		return { deviceId: Number(result.lastInsertRowid), deviceToken: token };
 	}
 
+	/**
+	 * Re-read ONE container device row by id.
+	 *
+	 * {@link listContainerDevices} takes the whole fleet in a single query, which
+	 * is right for starting a sweep and wrong for deciding anything at the end of
+	 * one: a lifecycle tick is sequential and blocks on provider control-plane
+	 * calls, so by the time it reaches a given row that row can be many minutes
+	 * old. NOR-406 is exactly that — a tick that began at 07:45:22 stopped a
+	 * container at 07:51:54 using timestamps from 07:45:22, and so never saw the
+	 * session routed to it at 07:51:39. Anything acting on a row rather than
+	 * merely counting it re-reads it through here first.
+	 *
+	 * Keyed by device id rather than issue key on purpose: a row destroyed and
+	 * recreated for the same issue is a DIFFERENT container, and a stale sweep
+	 * must not act on its successor.
+	 */
+	getContainerDevice(deviceId: number): ContainerDeviceInfo | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms, last_progress_ms
+				 FROM devices WHERE kind = 'container' AND device_id = ?`,
+			)
+			.get(deviceId) as ContainerDeviceRow | undefined;
+		return row ? toContainerDeviceInfo(row) : undefined;
+	}
+
 	getContainerDeviceForIssue(
 		issueKey: string,
 	): ContainerDeviceInfo | undefined {
 		const row = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms, last_progress_ms
 				 FROM devices WHERE kind = 'container' AND issue_key = ?`,
 			)
 			.get(issueKey) as ContainerDeviceRow | undefined;
@@ -1165,7 +1232,7 @@ export class RouterStore {
 	listContainerDevices(): ContainerDeviceInfo[] {
 		const rows = this.db
 			.prepare(
-				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms
+				`SELECT device_id, user_id, issue_key, provider, created_ms, last_seen_ms, last_routed_ms, parked_at_ms, running_since_ms, last_active_ms, last_progress_ms
 				 FROM devices WHERE kind = 'container'`,
 			)
 			.all() as ContainerDeviceRow[];
@@ -1238,6 +1305,50 @@ export class RouterStore {
 	markDeviceActive(deviceId: number, nowMs: number): void {
 		this.db
 			.prepare("UPDATE devices SET last_active_ms = ? WHERE device_id = ?")
+			.run(nowMs, deviceId);
+	}
+
+	/**
+	 * Stamp the device's PROGRESS clock: it just did work the router could see.
+	 *
+	 * Called from the one device→router frame that is evidence of an agent
+	 * actually working — an `rpc_request`. In container mode a sandbox holds no
+	 * Linear token, so every thought, action, and response the agent posts
+	 * arrives here as an RPC; a working session stamps this every few seconds,
+	 * and a session that has stopped working stamps it never again.
+	 *
+	 * That is the property the stranded-session detector needs and no existing
+	 * column has:
+	 *  - `last_seen_ms` is the heartbeat — it moves for a wedged worker.
+	 *  - `last_routed_ms` is the router routing TO the device — frozen for the
+	 *    whole of a long turn, which is why it cannot be thresholded on its own.
+	 *  - `last_active_ms` is stamped by the sweep itself on every pinned tick, so
+	 *    it moves identically for a busy sandbox and a stuck one.
+	 *
+	 * Deliberately NOT an input to the idle clock. Idle-stop errs toward keeping
+	 * a container alive and already has `last_active_ms` for that; feeding a
+	 * tighter signal into it would resurrect NOR-366's stop-a-busy-sandbox
+	 * failure from the other direction.
+	 *
+	 * Harmless for physical devices — nothing reads it for them.
+	 */
+	markDeviceProgress(deviceId: number, nowMs: number): void {
+		this.db
+			.prepare("UPDATE devices SET last_progress_ms = ? WHERE device_id = ?")
+			.run(nowMs, deviceId);
+	}
+
+	/**
+	 * Stamp when the router last handed this device an event.
+	 *
+	 * Called from {@link enqueueEvent}, inside its transaction. Drives the
+	 * container idle-stop policy and (with {@link markDeviceProgress}) the
+	 * stranded-session detector's no-progress clock. Harmless for physical
+	 * devices, which ignore `last_routed_ms`.
+	 */
+	markDeviceRouted(deviceId: number, nowMs: number): void {
+		this.db
+			.prepare("UPDATE devices SET last_routed_ms = ? WHERE device_id = ?")
 			.run(nowMs, deviceId);
 	}
 
@@ -1595,6 +1706,43 @@ export class RouterStore {
 			.run(state, nowMs, latest.run_id);
 	}
 
+	/**
+	 * The most recent moment the router observed anything about an agent run on
+	 * this device — a worker activity, or a run ending.
+	 *
+	 * Read by {@link ContainerLifecycle} as a stop veto, not as an idle clock.
+	 * A run that ended seconds ago is the single most dangerous moment to stop a
+	 * container: the worker is still flushing (its `session_state` frame is
+	 * durably buffered and replayed until acked, and its artifact bundle is still
+	 * uploading), and killing it there converts a harmless park into a stranded
+	 * sandbox whose issue lock nothing will ever release — NOR-406.
+	 *
+	 * `ended_ms` covers both ways a run finishes as far as the router is
+	 * concerned: `finishAgentRun` on the terminal frame, and `markAgentRunUnknown`
+	 * when the affinity reconciler reclaims a row for a session the device no
+	 * longer reports. The second is precisely the "the device is done but the
+	 * router never got the frame" case, so it earns the same settle window.
+	 *
+	 * Deliberately ignores `started_ms`/`last_routed_ms`: those are router-side
+	 * stamps already mirrored on the device row's `last_routed_ms`, and folding
+	 * them in here would only duplicate the idle clock.
+	 *
+	 * Served by `idx_agent_runs_device`. Without it this is a full scan of every
+	 * run in the fleet's 24h retention window, run synchronously on the router's
+	 * event loop up to twice per idle candidate per tick — a cost that scales
+	 * with total run volume rather than with the number of candidates.
+	 */
+	getLastAgentRunActivityMs(deviceId: number): number | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT MAX(MAX(COALESCE(last_agent_activity_ms, 0), COALESCE(ended_ms, 0))) AS latest
+				 FROM agent_runs WHERE device_id = ?`,
+			)
+			.get(deviceId) as { latest: number | null } | undefined;
+		const latest = row?.latest ?? 0;
+		return latest > 0 ? latest : undefined;
+	}
+
 	markAgentRunUnknown(sessionId: string, nowMs: number): void {
 		const runId = this.latestNonTerminalRunId(sessionId);
 		if (!runId) return;
@@ -1871,11 +2019,7 @@ export class RouterStore {
 					traceContext?.traceparent ?? null,
 					traceContext?.tracestate ?? null,
 				);
-			// Drives the container idle-stop policy (Task 8); harmless for
-			// physical devices, which ignore last_routed_ms.
-			this.db
-				.prepare("UPDATE devices SET last_routed_ms = ? WHERE device_id = ?")
-				.run(nowMs, deviceId);
+			this.markDeviceRouted(deviceId, nowMs);
 			return seq;
 		});
 		return txn();

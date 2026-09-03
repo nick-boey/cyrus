@@ -11,6 +11,7 @@ import {
 	SANDBOX_EVENTS,
 	type SandboxDestroyReason,
 	type SandboxGaugeState,
+	type SandboxIdleStopSkipReason,
 } from "./SandboxTelemetry.js";
 import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
@@ -20,10 +21,32 @@ import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
  * `states` is absent (rather than empty) for a provider with no
  * {@link ManagedContainerState} bulk seam: its listing proves the containers
  * exist but says nothing about whether they are running.
+ *
+ * `capturedMs` is when the listing was read. It is NOT decoration: the loop
+ * that consumes it is sequential and blocks on provider control-plane calls, so
+ * by the time a late row is reached this snapshot can be minutes old, and any
+ * write made on the strength of it has to be able to tell that.
  */
 interface ProviderListing {
 	keys: Set<string>;
 	states?: Map<string, ManagedContainerState>;
+	capturedMs: number;
+}
+
+/**
+ * A decision to abandon an idle-stop.
+ *
+ * `code` is the closed-set telemetry attribute, `reason` the human-readable
+ * line. The numeric fields are whatever the guard that fired happened to know;
+ * each is emitted as `null` when the guard could not compute it, so the shape
+ * of the event never depends on which branch produced it.
+ */
+interface IdleStopVeto {
+	code: SandboxIdleStopSkipReason;
+	reason: string;
+	idleForMs?: number;
+	runEndedAgoMs?: number;
+	claimedSessions?: number;
 }
 
 /**
@@ -37,6 +60,76 @@ interface ProviderListing {
  * every cold start, which is the fastest way to get an alert rule ignored.
  */
 const DEFAULT_STRANDED_SESSION_GRACE_MS = 600_000;
+
+/**
+ * 2 minutes — default {@link ContainerLifecycleOptions.terminalSettleMs}.
+ *
+ * The window after a run ends in which a container is left alone so its worker
+ * can finish saying so. A `session_state` frame is durably buffered on the
+ * device and replayed until the router acks it, and the artifact bundle is
+ * still uploading — but the process that would do either had been stopped
+ * (NOR-406: the stop landed 3.8s after the completion, the frame never
+ * arrived, and the affinity row plus the issue lock survived for 37 minutes
+ * while Linear rendered a live session).
+ *
+ * Know when this can actually fire, because it is narrower than it looks. The
+ * idle clock's freshest input, `last_active_ms`, is stamped by the SWEEP on
+ * every pinned tick, so it is itself up to one tick-interval stale. Combined
+ * with the clamp below, a veto needs the newest run stamp to beat the whole
+ * idle clock by more than `idleStopMs - terminalSettleMs` — 180s at the shipped
+ * defaults. On a healthy 60s tick that is unreachable, and the fresh per-row
+ * read is doing all the work.
+ *
+ * It becomes live exactly in the regime NOR-406 happened in: 392-second ticks,
+ * where a container's idle clock is minutes stale through no fault of the read
+ * that fetched it, and a run can begin and end entirely between two visits to
+ * the same row. That is the residue the fresh read cannot cover, which is why
+ * the issue asked for both. It is bounded — a stop deferred here happens on a
+ * later tick — so it can never become a permanent pin.
+ */
+const DEFAULT_TERMINAL_SETTLE_MS = 120_000;
+
+/**
+ * 4 hours — default {@link ContainerLifecycleOptions.sessionNoProgressMs}.
+ *
+ * The window a device may hold session affinity while doing nothing the router
+ * can observe. NOT sized against a turn: an agent posts a thought or an action
+ * for every step it takes and each is an RPC through the router, so a busy
+ * session stamps its progress clock every few seconds however long the turn
+ * runs. A single blocking tool call — a long build, a full test suite — is
+ * minutes, two orders of magnitude under this.
+ *
+ * It is sized against the DELIBERATE IDLE instead, and that is the whole
+ * difficulty. `AgentSessionManager.completeSession` withholds the terminal
+ * signal while the runner reports pending work, so a session waiting on a
+ * `ScheduleWakeup` or a cron keeps its affinity and posts nothing for the
+ * duration — every input to the progress clock frozen, and from the router's
+ * side indistinguishable from the strand this detector exists to find. The two
+ * facts only ever meet on the DEVICE, so the router cannot currently tell them
+ * apart at all (see {@link noteStranded}, which says so in what it reports).
+ *
+ * 4 hours clears the bounded case outright: `ScheduleWakeup` is clamped to at
+ * most 1 hour, so no wakeup-pending session can reach this. It does NOT clear a
+ * cron with a period above 4 hours, which will be reported and is a known,
+ * accepted false-positive class until the deferral is propagated to the router.
+ * And it still catches the fault: CAN-133 held its issue for 5h17m.
+ *
+ * Erring long is the cheap direction, but not free — this is DETECTION ONLY, so
+ * a false negative costs hours of a sandbox burning 4 vCPU on an issue nobody
+ * can reach, while a false positive costs a severity-1 page for a healthy
+ * session, which is how a rule gets muted. That is the same failure the ticket
+ * this came from warns about, inverted, so do not lower this without first
+ * giving the router a way to see the deferral.
+ */
+const DEFAULT_SESSION_NO_PROGRESS_MS = 4 * 3_600_000;
+
+/**
+ * Why a device is stranded. Two genuinely different faults, kept as one event
+ * with a dimension rather than two events: an operator's question is "which
+ * sandboxes are holding an issue hostage", and the answer should not depend on
+ * remembering to union two queries.
+ */
+export type StrandedReason = "offline_pinned" | "no_progress";
 
 /**
  * Lets the sweep re-derive a device's affinity from the device itself rather
@@ -66,6 +159,14 @@ export interface ContainerLifecycleOptions {
 	 *  hold before it is reported. Must comfortably exceed a cold boot, during
 	 *  which those same three facts are the EXPECTED state. Default: 10 minutes. */
 	strandedSessionGraceMs?: number;
+	/** How long after an agent run on a device ends the container is left alone,
+	 *  so the worker can flush and get its terminal frame acked. Default: 2 minutes. */
+	terminalSettleMs?: number;
+	/** How long a device may hold session affinity with NO observable progress —
+	 *  nothing routed to it and nothing posted by its agent — before it is
+	 *  reported as stranded. Independent of the container's infrastructure state:
+	 *  the fault this catches looks perfectly healthy (NOR-402). Default: 1 hour. */
+	sessionNoProgressMs?: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
 	sessionReconciler?: SessionReconciler;
 	logger: ILogger;
@@ -113,9 +214,29 @@ export interface SandboxObservation {
  * immediately before the stop as well as at the gate, because the gate's
  * decision is separated from the stop by two provider round trips, and a
  * session that claims the device in between would otherwise be killed within
- * seconds of starting. The converse — affinity held against a container that
- * is NOT running — is reported by {@link noteStranded}; it is the only state
- * here that should be impossible.
+ * seconds of starting. Affinity that is NOT backed by progress — held against a
+ * container that is not running, or held while neither the router nor the agent
+ * does anything for an hour — is reported by {@link noteStranded}. That is the
+ * price of the invariant: the pin is unconditional, so the only defence against
+ * a pin that should have been released is seeing it.
+ *
+ * Every value the STOP and DESTROY decisions are made from is read inside the
+ * row's own iteration, never from the tick's opening snapshot. A tick is
+ * sequential and blocks on provider control-plane calls, so it routinely
+ * outlives its own 60s interval — one measured 392 seconds. Deciding from the
+ * top-of-tick clock and row set then means deciding from data minutes old,
+ * which stopped a container four seconds after a new session started on it and
+ * left the issue stuck for 37 minutes (NOR-406). The snapshot is a work list;
+ * `getContainerDevice` and `this.now()` inside the loop are the truth.
+ *
+ * The ONE deliberate exception is the provider listing, which stays tick-level
+ * because one call per provider per tick is the gauge's entire cost model (see
+ * {@link readProviderListings}). So the gauge state, and the `running_since_ms`
+ * reconciliation derived from it, are up to one tick stale — stated here rather
+ * than left implicit, because that listing is not read-only input: it drives
+ * writes. {@link sampleSandbox} carries its capture time and refuses to clear a
+ * running clock the listing predates, and every sample reports its own
+ * `listing_age_ms` so the staleness is a number rather than an assumption.
  *
  * Executor errors are logged and skipped, never thrown: one unreachable
  * provider (e.g. a dead Docker daemon) must not stop the sweep from
@@ -128,13 +249,19 @@ export class ContainerLifecycle {
 	private readonly staleDestroyMs: number;
 	private readonly offlineAgeOutMs: number;
 	private readonly strandedSessionGraceMs: number;
+	private readonly terminalSettleMs: number;
+	private readonly sessionNoProgressMs: number;
 	private readonly sessionReconciler: SessionReconciler | undefined;
 	/** Devices already reported as pinned, so the 60s tick logs on transition only. */
 	private readonly pinnedDevices = new Set<number>();
 	/** Same idea for the stranded-session invariant: the EVENT is emitted every
 	 *  tick (an alert rule needs a non-zero count in its window) but the
-	 *  human-readable ERROR line is logged once per entry into the state. */
-	private readonly strandedDevices = new Set<number>();
+	 *  human-readable ERROR line is logged once per entry into the state.
+	 *
+	 *  Keyed by REASON, not merely by membership: a device that goes from
+	 *  "no progress" to "stopped and offline" is a different diagnosis with a
+	 *  different remedy, and a plain Set would swallow the second one. */
+	private readonly strandedDevices = new Map<number, StrandedReason>();
 	private readonly logger: ILogger;
 	private readonly now: () => number;
 	private readonly observations = new Map<number, SandboxObservation>();
@@ -142,6 +269,8 @@ export class ContainerLifecycle {
 	private inFlight: Promise<void> | undefined;
 
 	constructor(opts: ContainerLifecycleOptions) {
+		// Assigned first: the clamp check below has to be able to report itself.
+		this.logger = opts.logger;
 		this.store = opts.store;
 		this.executors = opts.executors;
 		this.idleStopMs = opts.idleStopMs;
@@ -149,8 +278,33 @@ export class ContainerLifecycle {
 		this.offlineAgeOutMs = opts.offlineAgeOutMs;
 		this.strandedSessionGraceMs =
 			opts.strandedSessionGraceMs ?? DEFAULT_STRANDED_SESSION_GRACE_MS;
+		// Clamped to the idle window. The settle veto exists to cover the
+		// SECONDS between a run ending and its worker finishing saying so; it
+		// must never be the dominant term in the stop decision. Left unclamped,
+		// a deployment (or a test rig) with a short `idleStopMs` would have its
+		// parking policy quietly replaced by this constant.
+		this.terminalSettleMs = Math.min(
+			opts.terminalSettleMs ?? DEFAULT_TERMINAL_SETTLE_MS,
+			opts.idleStopMs,
+		);
+		// Say so when the clamp actually binds. Silently reducing an operator's
+		// configured value leaves them with a deployment that does not do what
+		// their config file says, and no way to find that out short of reading
+		// this constructor.
+		if (
+			opts.terminalSettleMs !== undefined &&
+			opts.terminalSettleMs > opts.idleStopMs
+		) {
+			this.logger.warn(
+				`terminalSettleMs (${opts.terminalSettleMs}) exceeds idleStopMs ` +
+					`(${opts.idleStopMs}); clamped to ${this.terminalSettleMs}. The settle ` +
+					`veto covers the seconds after a run ends and must never become the ` +
+					`dominant term in the parking policy`,
+			);
+		}
+		this.sessionNoProgressMs =
+			opts.sessionNoProgressMs ?? DEFAULT_SESSION_NO_PROGRESS_MS;
 		this.sessionReconciler = opts.sessionReconciler;
-		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
 	}
 
@@ -183,6 +337,124 @@ export class ContainerLifecycle {
 			.filter((r) => now - r.establishedMs <= this.offlineAgeOutMs).length;
 	}
 
+	/**
+	 * When this container's idle clock last moved.
+	 *
+	 * Three inputs, each covering a way the others go stale:
+	 *  - `lastRoutedMs`: the router handed this device an event.
+	 *  - `parkedAtMs`: a session on it blocked on a user answer. Without it the
+	 *    clock is `lastRoutedMs`, so an agent that worked for twenty minutes and
+	 *    only then asked a question would be suspended on the very next tick, the
+	 *    clock having expired while it was legitimately busy.
+	 *  - `lastActiveMs`: the device last held a live session (see
+	 *    `RouterStore.markDeviceActive`). The only one stamped by the AGENT
+	 *    working rather than by the router doing something TO the agent, and so
+	 *    the only one that moves during a long session. Without it a 40-minute
+	 *    session leaves the other two frozen at its start and the container reads
+	 *    as idle for 35 of those minutes.
+	 *
+	 * Pure, and takes the row as an argument, precisely so every caller has to
+	 * decide WHICH row it is passing — the whole of NOR-406 was this arithmetic
+	 * being done once against a row read minutes earlier.
+	 */
+	private idleSince(row: ContainerDeviceInfo): number {
+		return Math.max(
+			row.lastRoutedMs ?? 0,
+			row.parkedAtMs ?? 0,
+			row.lastActiveMs ?? 0,
+			row.createdMs,
+		);
+	}
+
+	/**
+	 * Reasons to abandon an idle-stop, re-derived from the store AS IT STANDS.
+	 * Returns a `code` for the closed-set telemetry attribute plus a
+	 * human-readable `reason`, or undefined to proceed with the stop.
+	 *
+	 * The two are separate so the call sites never have to re-parse prose to
+	 * find out which guard fired — a `summarize by reason` needs the code.
+	 *
+	 * Called twice per candidate: once at the decision, and again immediately
+	 * before `stop()` — the two are separated by `status()`, a provider round
+	 * trip that has measured in the tens of seconds.
+	 */
+	private idleStopVeto(
+		deviceId: number,
+		nowMs: number,
+	): IdleStopVeto | undefined {
+		const fresh = this.store.getContainerDevice(deviceId);
+		if (!fresh) {
+			return {
+				code: "row_deleted",
+				reason: "its device row no longer exists",
+			};
+		}
+		const idleForMs = nowMs - this.idleSince(fresh);
+		if (idleForMs <= this.idleStopMs) {
+			// The backstop the issue asks for by name: a stop is a no-op once the
+			// row's own clock has moved past the value the decision was made from.
+			return {
+				code: "clock_moved",
+				reason:
+					`its idle clock moved while the sweep was deciding ` +
+					`(idleForMs=${idleForMs} idleStopMs=${this.idleStopMs} ` +
+					`lastRoutedMs=${fresh.lastRoutedMs ?? "none"} ` +
+					`lastActiveMs=${fresh.lastActiveMs ?? "none"})`,
+				idleForMs,
+			};
+		}
+		const lastRunMs = this.store.getLastAgentRunActivityMs(deviceId);
+		if (lastRunMs !== undefined && nowMs - lastRunMs <= this.terminalSettleMs) {
+			return {
+				code: "terminal_settle",
+				reason:
+					`an agent run on it ended ${nowMs - lastRunMs}ms ago and its worker ` +
+					`may still be flushing (terminalSettleMs=${this.terminalSettleMs})`,
+				idleForMs,
+				runEndedAgoMs: nowMs - lastRunMs,
+			};
+		}
+		return undefined;
+	}
+
+	/**
+	 * The one place a skipped idle-stop is reported.
+	 *
+	 * Both halves matter and neither substitutes for the other: the `info` line
+	 * is what a human tailing the router reads, and the event is what every
+	 * saved search and alert rule in `infra/azure/bicep/modules/monitoring.bicep`
+	 * can actually key on. Before this existed, all three skip paths reported
+	 * only in prose, so a container the sweep declined to park produced exactly
+	 * the silence NOR-406 was about — indistinguishable, from a dashboard, from
+	 * a sweep that had stalled.
+	 */
+	private noteIdleStopSkipped(
+		row: ContainerDeviceInfo,
+		veto: IdleStopVeto,
+	): void {
+		emitSandboxEvent(
+			this.logger,
+			SANDBOX_EVENTS.idleStopSkipped,
+			{
+				issueKey: row.issueKey,
+				deviceId: row.deviceId,
+				provider: row.provider,
+			},
+			{
+				reason: veto.code,
+				idle_for_ms: veto.idleForMs ?? null,
+				idle_stop_ms: this.idleStopMs,
+				terminal_settle_ms: this.terminalSettleMs,
+				run_ended_ago_ms: veto.runEndedAgoMs ?? null,
+				claimed_sessions: veto.claimedSessions ?? null,
+			},
+		);
+		this.logger.info(
+			`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
+				veto.reason,
+		);
+	}
+
 	private notePinned(deviceId: number, issueKey: string): void {
 		if (this.pinnedDevices.has(deviceId)) return;
 		this.pinnedDevices.add(deviceId);
@@ -207,28 +479,72 @@ export class ContainerLifecycle {
 	}
 
 	/**
-	 * Report the one sandbox state that is not supposed to be reachable: the
-	 * router holds live session affinity for a container that is NOT running and
-	 * whose worker is NOT connected.
+	 * Report a device that holds live session affinity but is not making
+	 * progress on it. Two shapes, one event, distinguished by `reason`:
 	 *
-	 * Nothing else surfaces it. The gauge samples it as three unremarkable
-	 * fields, no lifecycle transition fires, and Linear goes on rendering an
-	 * in-progress agent session for as long as it lasts — which is why NOR-366's
-	 * five killed sessions sat unnoticed for nine hours. The whole value of this
-	 * method is turning that silence into one queryable event.
+	 * **`offline_pinned`** — affinity held for a container that is NOT running
+	 * and whose worker is NOT connected. Structurally impossible: no lifecycle
+	 * transition fires, the gauge samples it as three unremarkable fields, and
+	 * Linear goes on rendering an in-progress agent session for as long as it
+	 * lasts, which is why NOR-366's five killed sessions sat unnoticed for nine
+	 * hours.
 	 *
-	 * Detection only. It deliberately does NOT boot the container back up: the
-	 * same three facts also describe a container legitimately parked while a
-	 * leaked affinity row (PAR-146's shape) outlives the session that made it,
-	 * and auto-resuming those would undo idle-stop for exactly the sandboxes
-	 * idle-stop exists for. Recovery stays a prompt away — cold-booting from a
-	 * new comment is reliable — while the fixes above stop the state being
-	 * produced in the first place.
+	 * **`no_progress`** — affinity held while nothing is routed TO the device and
+	 * the device posts nothing. This one looks perfectly healthy, and that is the
+	 * point: CAN-133 read `state=running online=true sessions=1` once a minute for
+	 * 5h17m while its issue was unreachable, and the old detector's `notRunning &&
+	 * !online` gate excluded it BY DEFINITION — the severity-1 rule named after
+	 * this failure could not fire for it (NOR-402). "Looks healthy" cannot be the
+	 * exclusion when a healthy-looking container is what the fault produces.
 	 *
-	 * Three exclusions keep this specific enough to alert on:
-	 *  - `unknown` state: a provider we could not read this tick says nothing.
-	 *  - within {@link strandedSessionGraceMs} of the last route or heartbeat: a
-	 *    cold boot presents identically and is the expected path, not a fault.
+	 * The `no_progress` clock is `max(lastProgressMs, lastRoutedMs, parkedAtMs,
+	 * createdMs)` and the omissions matter more than the inclusions:
+	 *  - NOT `lastSeenMs`: that is the heartbeat, which a wedged worker sends
+	 *    just as faithfully as a working one.
+	 *  - NOT `lastActiveMs`: the sweep stamps it on every tick a device is
+	 *    pinned, so the detector would reset its own clock and never fire.
+	 * `lastProgressMs` is the only clock moved by the AGENT (an `rpc_request`
+	 * carrying an activity it posted) rather than by something the router did.
+	 *
+	 * Detection only, both shapes. Neither boots a container nor releases
+	 * affinity: `offline_pinned` also describes a container legitimately parked
+	 * while a leaked affinity row (PAR-146's shape) outlives its session, and
+	 * auto-resuming those would undo idle-stop for exactly the sandboxes
+	 * idle-stop exists for. Note that `no_progress`'s recovery is NOT "prompt the
+	 * thread again" — the whole of NOR-402 is that a top-level comment on such an
+	 * issue is rejected at the issue lock — so its remedy line says so.
+	 *
+	 * ── WHAT `no_progress` CANNOT DISTINGUISH, AND WHY IT SAYS SO ──
+	 * A session held open by pending work (`ScheduleWakeup`, a cron, a background
+	 * task) keeps its affinity and posts nothing while it waits, so it presents
+	 * IDENTICALLY to a strand. The router has no way to tell: the deferral is
+	 * decided in `AgentSessionManager.completeSession` and recorded only in the
+	 * device's own `session.terminal_deferred` event, which reaches Log Analytics
+	 * but never the router's store. So this reports both, and its message names
+	 * both rather than asserting the diagnosis it cannot make — and in particular
+	 * does NOT advise `cyrus router unlock`, which on a waiting session would
+	 * strip the lock from a run that is about to resume and manufacture the
+	 * lock-without-affinity leak. `sessionNoProgressMs` is then set high enough to
+	 * clear every bounded wakeup (see its default). The real fix is to propagate
+	 * the deferral to the router so this branch can exclude it; until then the
+	 * honest thing is to report the ambiguity, not to hide it behind a threshold.
+	 *
+	 * ── WHAT NEITHER SHAPE COVERS ──
+	 * Both are reached only from the sweep's `affinity > 0` gate, but what makes
+	 * an issue unreachable is the ISSUE LOCK, and the two deliberately diverge: a
+	 * `parked` session releases affinity and RETAINS its lock. An elicitation
+	 * nobody answers therefore locks an issue with no affinity, is invisible to
+	 * this method entirely, and shows up only in `RouterStore.listSessions`'
+	 * orphan-lock query behind `cyrus router sessions list`. That class has no
+	 * event and no alert. Do not read this detector as covering every locked
+	 * issue.
+	 *
+	 * Exclusions:
+	 *  - `unknown` state (`offline_pinned` only): a provider we could not read
+	 *    this tick says nothing about whether it is running. Irrelevant to
+	 *    `no_progress`, which is a clock, not a state.
+	 *  - within the relevant grace window: a cold boot presents exactly like
+	 *    `offline_pinned` and is the expected path, not a fault.
 	 *  - a pending terminal teardown: that container is meant to be going away,
 	 *    and TerminalTeardown's own grace deadline is what covers it.
 	 */
@@ -238,6 +554,10 @@ export class ContainerLifecycle {
 		affinity: number,
 		now: number,
 	): void {
+		if (this.store.getPendingTeardown(row.issueKey) !== undefined) {
+			this.strandedDevices.delete(row.deviceId);
+			return;
+		}
 		const notRunning = state === "stopped" || state === "absent";
 		const online = this.sessionReconciler?.isOnline(row.deviceId) ?? false;
 		const lastContact = Math.max(
@@ -246,12 +566,27 @@ export class ContainerLifecycle {
 			row.createdMs,
 		);
 		const strandedForMs = now - lastContact;
-		if (
-			!notRunning ||
-			online ||
-			strandedForMs <= this.strandedSessionGraceMs ||
-			this.store.getPendingTeardown(row.issueKey) !== undefined
-		) {
+		const offlinePinned =
+			notRunning && !online && strandedForMs > this.strandedSessionGraceMs;
+
+		const lastProgress = Math.max(
+			row.lastProgressMs ?? 0,
+			row.lastRoutedMs ?? 0,
+			row.parkedAtMs ?? 0,
+			row.createdMs,
+		);
+		const noProgressForMs = now - lastProgress;
+		const noProgress = noProgressForMs > this.sessionNoProgressMs;
+
+		// `offline_pinned` wins when both hold: it is the more specific diagnosis
+		// and the one with a known remedy, and a device should produce one event
+		// per tick rather than two views of the same stall.
+		const reason: StrandedReason | undefined = offlinePinned
+			? "offline_pinned"
+			: noProgress
+				? "no_progress"
+				: undefined;
+		if (reason === undefined) {
 			this.strandedDevices.delete(row.deviceId);
 			return;
 		}
@@ -265,20 +600,38 @@ export class ContainerLifecycle {
 				provider: row.provider,
 			},
 			{
+				reason,
 				state,
+				online,
 				sessions: affinity,
 				stranded_for_ms: strandedForMs,
 				stranded_grace_ms: this.strandedSessionGraceMs,
+				no_progress_for_ms: noProgressForMs,
+				no_progress_ms: this.sessionNoProgressMs,
 				age_ms: now - row.createdMs,
 			},
 		);
-		if (this.strandedDevices.has(row.deviceId)) return;
-		this.strandedDevices.add(row.deviceId);
+		if (this.strandedDevices.get(row.deviceId) === reason) return;
+		this.strandedDevices.set(row.deviceId, reason);
 		this.logger.error(
-			`Container for ${row.issueKey} (device=${row.deviceId}) is ${state} and offline ` +
-				`but still holds ${affinity} session affinity row(s): Linear is showing a live ` +
-				`agent session against a sandbox that cannot make progress. Prompt the thread ` +
-				`again to cold-boot it. (strandedForMs=${strandedForMs} state=${state})`,
+			reason === "offline_pinned"
+				? `Container for ${row.issueKey} (device=${row.deviceId}) is ${state} and offline ` +
+						`but still holds ${affinity} session affinity row(s): Linear is showing a live ` +
+						`agent session against a sandbox that cannot make progress. Prompt the thread ` +
+						`again to cold-boot it. (strandedForMs=${strandedForMs} state=${state})`
+				: `Container for ${row.issueKey} (device=${row.deviceId}) holds ${affinity} session ` +
+						`affinity row(s) but has made no observable progress for ${noProgressForMs}ms ` +
+						`(threshold ${this.sessionNoProgressMs}ms, state=${state} online=${online}). ` +
+						`Either its session never reached a terminal state and the issue is now locked ` +
+						`to a session that has stopped working, or it is deliberately idle waiting on a ` +
+						`scheduled wakeup — the router cannot tell these apart, because the deferral is ` +
+						`only ever recorded on the device. Check for a 'session.terminal_deferred' ` +
+						`record for this issue with no matching 'session.terminal_signalled': that is ` +
+						`what says which, and what it is waiting on. Either way a new top-level comment ` +
+						`will be REJECTED at the issue lock, so reply inside the existing session's ` +
+						`thread. Only once you have confirmed it is NOT waiting is \`cyrus router ` +
+						`unlock\` the right move — unlocking a session that is about to resume strands ` +
+						`the lock instead of freeing it.`,
 		);
 	}
 
@@ -312,6 +665,7 @@ export class ContainerLifecycle {
 					byProvider.set(provider, {
 						keys: new Set(states.map((s) => s.issueKey)),
 						states: new Map(states.map((s) => [s.issueKey, s])),
+						capturedMs: this.now(),
 					});
 				} else {
 					// A provider predating the bulk-state seam. Its listing proves
@@ -319,6 +673,7 @@ export class ContainerLifecycle {
 					// gauge reports `unknown` rather than guessing at running.
 					byProvider.set(provider, {
 						keys: new Set(await executor.listManaged()),
+						capturedMs: this.now(),
 					});
 				}
 			} catch (err) {
@@ -345,6 +700,19 @@ export class ContainerLifecycle {
 	 * Skipped entirely when the state is `unknown`: a provider we could not read
 	 * must not be allowed to clear a running clock, or one throttled ARM call
 	 * would silently reset every uptime in the fleet.
+	 *
+	 * The SAME principle bounds the clear when the listing is merely OLD. Unlike
+	 * every other input to this loop, the listing is deliberately tick-level —
+	 * one call per provider per tick is the gauge's whole cost model, and a
+	 * per-row `status()` fan-out would throttle exactly when the fleet is
+	 * largest. So it can be minutes stale by the time a late row is reached, and
+	 * a container that was absent when the listing was taken and has been booted
+	 * since would otherwise have the `running_since_ms` its boot just stamped
+	 * cleared out from under it. That column is the sole input to the 6-hour
+	 * long-running-sandbox alert, so the clear would silently reset the uptime of
+	 * precisely the sandboxes that were busy through a slow tick. A clock stamped
+	 * AFTER the listing was captured is a fact the listing cannot speak to; leave
+	 * it alone and let the next tick's fresh listing settle it.
 	 */
 	private sampleSandbox(
 		row: ContainerDeviceInfo,
@@ -366,7 +734,10 @@ export class ContainerLifecycle {
 			if (this.store.markDeviceRunning(row.deviceId, now)) runningSinceMs = now;
 		} else if (
 			(gaugeState === "stopped" || gaugeState === "absent") &&
-			runningSinceMs !== undefined
+			runningSinceMs !== undefined &&
+			// Only when the listing is actually newer than the clock it would erase.
+			listing !== undefined &&
+			runningSinceMs <= listing.capturedMs
 		) {
 			this.store.clearDeviceRunningSince(row.deviceId);
 			runningSinceMs = undefined;
@@ -391,6 +762,9 @@ export class ContainerLifecycle {
 				: {}),
 			...(row.lastRoutedMs !== undefined
 				? { lastRoutedAgeMs: now - row.lastRoutedMs }
+				: {}),
+			...(listing !== undefined
+				? { listingAgeMs: now - listing.capturedMs }
 				: {}),
 		});
 		return gaugeState;
@@ -473,11 +847,48 @@ export class ContainerLifecycle {
 		const listings = await this.readProviderListings();
 		const counts = { running: 0, stopped: 0, absent: 0, unknown: 0 };
 		let pinned = 0;
+		// Sandboxes that qualified for parking and were spared anyway. A
+		// fleet-level number, so a deferral wave is visible on a dashboard without
+		// anyone first suspecting a particular issue and opening its timeline.
+		let deferred = 0;
 
-		for (const row of rows) {
-			const executor = this.executors.get(row.provider);
+		for (const snapshot of rows) {
+			const executor = this.executors.get(snapshot.provider);
 			if (!executor) continue;
 			try {
+				// Re-read the row and re-take the clock PER ROW, not once per tick.
+				//
+				// `rows` and `now` above are a tick-level snapshot, and this loop is
+				// sequential and blocks on provider control-plane calls: a tick that
+				// began at 07:45:22 reached one row at 07:51:54 and decided from
+				// 07:45:22's timestamps, so the session routed to that container at
+				// 07:51:39 was invisible to every check below — including NOR-366's
+				// mid-sweep guard, which compares against a snapshot taken after the
+				// claim and therefore saw nothing new (NOR-406). The tick snapshot is
+				// now only a WORK LIST; every value a decision is made from is read
+				// here. Two indexed point reads per row against minutes of provider
+				// latency.
+				const rowNow = this.now();
+				const row = this.store.getContainerDevice(snapshot.deviceId);
+				// Gone since the snapshot — a terminal teardown destroyed it mid-tick.
+				// Acting on it now would be acting on a container that no longer
+				// exists, or worse, on its successor.
+				//
+				// Skipping the DECISIONS is the point; skipping the BOOKKEEPING is
+				// not. The row still has to leave this object's latches, or a device
+				// torn down while pinned never logs its unpin transition and sits in
+				// `pinnedDevices` for the life of the process. It also still has to be
+				// counted, because the rollup below reports `sandboxes: rows.length`
+				// and a bucket that no longer sums to it is a dashboard that silently
+				// under-reports on exactly the ticks where something was destroyed.
+				// No gauge sample: there is no sandbox left to sample.
+				if (!row) {
+					this.noteUnpinned(snapshot.deviceId);
+					this.strandedDevices.delete(snapshot.deviceId);
+					this.observations.delete(snapshot.deviceId);
+					counts.absent += 1;
+					continue;
+				}
 				// Snapshot of the sessions the affinity gate below is about to make
 				// its decision from, so the pre-stop re-check can tell a session that
 				// claimed this device DURING the decision from one the gate already
@@ -489,7 +900,7 @@ export class ContainerLifecycle {
 						.listSessionAffinityForDevice(row.deviceId)
 						.map((r) => r.sessionId),
 				);
-				const affinity = await this.resolveAffinity(row.deviceId, now);
+				const affinity = await this.resolveAffinity(row.deviceId, rowNow);
 				// Sampled for EVERY row, before the pinned early-return below.
 				// The pinned rows are the ones the operational questions are
 				// actually about — a sandbox held by session affinity is one that
@@ -499,7 +910,7 @@ export class ContainerLifecycle {
 					row,
 					listings.get(row.provider),
 					affinity,
-					now,
+					rowNow,
 				);
 				counts[state] += 1;
 				if (affinity > 0) {
@@ -515,9 +926,9 @@ export class ContainerLifecycle {
 					// clock fired (NOR-366). Stamping here means a container that was
 					// busy on the previous tick gets a FULL idle window once its
 					// session ends, which is what the threshold was always meant to be.
-					this.store.markDeviceActive(row.deviceId, now);
+					this.store.markDeviceActive(row.deviceId, rowNow);
 					this.notePinned(row.deviceId, row.issueKey);
-					this.noteStranded(row, state, affinity, now);
+					this.noteStranded(row, state, affinity, rowNow);
 					continue;
 				}
 				this.noteUnpinned(row.deviceId);
@@ -527,7 +938,7 @@ export class ContainerLifecycle {
 					row.lastSeenMs ?? 0,
 					row.createdMs,
 				);
-				if (now - lastTouch > this.staleDestroyMs) {
+				if (rowNow - lastTouch > this.staleDestroyMs) {
 					await executor.destroy(row.issueKey);
 					this.observations.set(row.deviceId, {
 						state: "absent",
@@ -544,9 +955,9 @@ export class ContainerLifecycle {
 						},
 						{
 							reason: "stale" satisfies SandboxDestroyReason,
-							stale_for_ms: now - lastTouch,
+							stale_for_ms: rowNow - lastTouch,
 							stale_destroy_ms: this.staleDestroyMs,
-							age_ms: now - row.createdMs,
+							age_ms: rowNow - row.createdMs,
 						},
 					);
 					this.logger.info(
@@ -555,31 +966,25 @@ export class ContainerLifecycle {
 							`lastRoutedMs=${row.lastRoutedMs ?? "none"} ` +
 							`lastSeenMs=${row.lastSeenMs ?? "none"} ` +
 							`createdMs=${row.createdMs} ` +
-							`staleForMs=${now - lastTouch} staleDestroyMs=${this.staleDestroyMs})`,
+							`staleForMs=${rowNow - lastTouch} staleDestroyMs=${this.staleDestroyMs})`,
 					);
 					continue;
 				}
-				// Three inputs, each covering a way the others go stale:
-				//  - `lastRoutedMs`: the router handed this device an event.
-				//  - `parkedAtMs`: a session on it blocked on a user answer. Without
-				//    it the clock is `lastRoutedMs`, so an agent that worked for
-				//    twenty minutes and only then asked a question would be suspended
-				//    on the very next tick, the clock having expired while it was
-				//    legitimately busy.
-				//  - `lastActiveMs`: the device last held a live session (see
-				//    `RouterStore.markDeviceActive`). The only one stamped by the
-				//    AGENT working rather than by the router doing something TO the
-				//    agent, and so the only one that moves during a long session.
-				//    Without it a 40-minute session leaves the other two frozen at its
-				//    start and the container reads as idle for 35 of those minutes.
-				const idleSince = Math.max(
-					row.lastRoutedMs ?? 0,
-					row.parkedAtMs ?? 0,
-					row.lastActiveMs ?? 0,
-					row.createdMs,
-				);
-				const idleForMs = now - idleSince;
+				// See `idleSince` for what feeds this clock. `row` is the row as it
+				// stands right now, not as the tick found it — that distinction IS
+				// the fix for NOR-406.
+				const idleForMs = rowNow - this.idleSince(row);
 				if (idleForMs > this.idleStopMs) {
+					// The settle veto, before the provider round trip rather than after
+					// it: a container whose run ended moments ago is not going to become
+					// a better stop candidate during a `status()` call, and asking ARM
+					// about it is a request we would rather not spend.
+					const settleVeto = this.idleStopVeto(row.deviceId, rowNow);
+					if (settleVeto) {
+						this.noteIdleStopSkipped(row, settleVeto);
+						deferred += 1;
+						continue;
+					}
 					// `status` is read only once the clock already qualifies, so the
 					// logged value is the same one the decision used.
 					const status = await executor.status(row.issueKey);
@@ -604,12 +1009,27 @@ export class ContainerLifecycle {
 					if (claimedMidSweep.length > 0) {
 						// Activity, and the reason this device must keep its idle window:
 						// the stop is being abandoned precisely because work arrived.
-						this.store.markDeviceActive(row.deviceId, now);
-						this.logger.info(
-							`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
+						this.store.markDeviceActive(row.deviceId, rowNow);
+						this.noteIdleStopSkipped(row, {
+							code: "claimed_mid_sweep",
+							reason:
 								`session(s) ${claimedMidSweep.map((r) => r.sessionId).join(", ")} ` +
 								`claimed it while the sweep was deciding`,
-						);
+							idleForMs,
+							claimedSessions: claimedMidSweep.length,
+						});
+						deferred += 1;
+						continue;
+					}
+					// The same veto again, now against the clock as it stands after
+					// `status()`. `claimedMidSweep` above catches only a session that
+					// took AFFINITY during the round trip; a session can also be routed
+					// (moving `lastRoutedMs`) or complete (arming the settle window)
+					// without ever adding a row this loop has not already seen.
+					const preStopVeto = this.idleStopVeto(row.deviceId, this.now());
+					if (preStopVeto) {
+						this.noteIdleStopSkipped(row, preStopVeto);
+						deferred += 1;
 						continue;
 					}
 					if (status === "running") {
@@ -623,7 +1043,7 @@ export class ContainerLifecycle {
 						// how long the run it ends actually lasted — the single most
 						// useful number for tuning `idleStopMs`.
 						const uptimeMs = row.runningSinceMs
-							? now - row.runningSinceMs
+							? rowNow - row.runningSinceMs
 							: undefined;
 						this.store.clearDeviceRunningSince(row.deviceId);
 						emitSandboxEvent(
@@ -638,7 +1058,7 @@ export class ContainerLifecycle {
 								idle_for_ms: idleForMs,
 								idle_stop_ms: this.idleStopMs,
 								uptime_ms: uptimeMs ?? null,
-								age_ms: now - row.createdMs,
+								age_ms: rowNow - row.createdMs,
 							},
 						);
 						// Every input behind the decision, so a stop that looks wrong
@@ -657,7 +1077,10 @@ export class ContainerLifecycle {
 					}
 				}
 			} catch (err) {
-				this.logger.error(`Lifecycle sweep failed for ${row.issueKey}`, err);
+				this.logger.error(
+					`Lifecycle sweep failed for ${snapshot.issueKey}`,
+					err,
+				);
 			}
 		}
 
@@ -716,6 +1139,7 @@ export class ContainerLifecycle {
 				absent: counts.absent,
 				unknown: counts.unknown,
 				pinned,
+				deferred,
 				duration_ms: this.now() - now,
 			}),
 		);

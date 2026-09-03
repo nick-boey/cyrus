@@ -77,6 +77,54 @@ whose issue branch has never been pushed is indistinguishable from an orphan
 from the remote alone, and deleting one would destroy the only copy of another
 device's uncommitted work.
 
+That deletion did not actually happen between this shipping (#26, 2026-08-21) and
+NOR-411 (2026-09-03) — the whole time it existed, though that is a fortnight
+rather than the "several months" an earlier draft of this paragraph claimed, and
+none of it in a released version. Teardown resolved the checkout it reaped from
+as `<cyrusHome>/worktrees/<ISSUE>` while creation used the repository's
+configured `workspaceBaseDir`; the two agree on a default self-host install and
+differ on every container sandbox, so the reaper spawned `git` in a directory
+that had never existed and gave up. NOR-411 fixed it by reaping from the
+repository's main checkout — ref deletion is a remote operation, so any checkout
+carrying the same `origin` will do, and the main checkout is the one that
+outlives teardown, so `sweep()` can still retry it.
+
+**That retry is a physical-device guarantee only.** The reaper's durable record
+lives under `cyrusHome`, which in a container sandbox is
+`$CYRUS_WORKSPACES_DIR/.cyrus` — inside the same per-issue sandbox as the
+checkout, and terminal teardown is the last thing that sandbox does before it is
+destroyed. A sandbox serves one issue, so neither trigger for `sweep()` (the next
+terminal teardown, or process start) ever fires for it again. A remote that is
+unreachable for the duration of a container teardown therefore still leaks the
+ref, and the only signal is the reaper's warning in logs that outlive the
+container. Closing that would mean surfacing the failure outside the sandbox
+before it dies — on the teardown callback, or as a Linear activity — which is not
+done here.
+
+A second hazard is specific to the order these two operations run in.
+`deleteWipSnapshot` drops the LOCAL ref first and unconditionally, and that local
+ref is exactly what `captureWipSnapshot` reads to decide the remote is already
+current. So a capture that lands after a reap does not race it — it is
+*guaranteed* to push the ref back, with nothing recorded as failed for `sweep()`
+to retry. Terminal cleanup therefore latches the issue
+(`WorkspaceSyncService.abandonIssue`) between its final forced sync and the reap;
+stopping the runners is not sufficient, because a runner's terminal arrives
+asynchronously and the periodic tick keeps firing throughout teardown.
+
+The refs already leaked are **not** cleaned up by that fix, and deliberately are
+not cleaned up automatically: the paragraph above is exactly why a namespace
+sweep is unsafe. The decision recorded here is that they are removed by hand,
+per remote, by an operator who can confirm the issue is closed —
+`git ls-remote origin 'refs/cyrus-wip/*'` to enumerate, `git push origin
+--delete <ref>` to remove. On `nick-boey/cyrus` the audit at the time of the fix
+found 11 such refs, of which 2 belonged to issues still open.
+
+The Canopy and Parrot remotes are **audited-pending**: they were not reachable
+from the sandbox the fix was written in, and they are the remotes with the
+*confirmed* leaks — the three occurrences that produced NOR-411 were CAN-129,
+CAN-55 and PAR-258, none of them on `nick-boey/cyrus`. They need the same
+enumerate-and-delete pass by an operator who can reach them.
+
 Capture keeps a local `refs/cyrus-wip/<branch>` recording the last snapshot that
 actually reached the remote, which is what lets an idle session skip the push
 entirely. A consequence is that the ref IS visible to `git log --all` inside
