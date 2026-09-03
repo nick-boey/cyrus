@@ -548,11 +548,62 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      produces no signal on its own.** No lifecycle transition fires, the gauge
      records it as three unremarkable fields, and Linear keeps rendering a live
      agent session — which is why NOR-366 ran for nine hours. `noteStranded`
-     emits `sandbox.stranded_session` for it, and it is DETECTION ONLY: waking
-     the container would also resurrect leaked-affinity rows and undo idle-stop
-     for the sandboxes idle-stop exists for. It must stay excluded during the
-     cold-boot window (`strandedSessionGraceMs`, sized against an ACA boot, which
-     presents identically) and for issues with a pending terminal teardown.
+     emits `sandbox.stranded_session` with `reason=offline_pinned` for it, and it
+     is DETECTION ONLY: waking the container would also resurrect leaked-affinity
+     rows and undo idle-stop for the sandboxes idle-stop exists for. It must stay
+     excluded during the cold-boot window (`strandedSessionGraceMs`, sized against
+     an ACA boot, which presents identically) and for issues with a pending
+     terminal teardown.
+   - **The OTHER stranded shape looks completely healthy, and "looks healthy"
+     cannot be the exclusion.** `running && online && sessions>0` with nothing
+     routed and nothing posted is what a session that never reached a terminal
+     state produces: it holds the issue lock forever, and a new top-level comment
+     on that issue is then rejected at the lock, so the issue is write-only.
+     CAN-133 sat in it for 5h17m while the severity-1 rule named after this
+     failure could not fire, because the old detector required
+     `stopped && !online` (NOR-402). `noteStranded` now also emits
+     `reason=no_progress`, and the clock it uses is the whole point:
+     `max(last_progress_ms, last_routed_ms, parked_at_ms, created_ms)`.
+     `last_seen_ms` is excluded (a wedged worker heartbeats normally) and
+     `last_active_ms` is excluded (the sweep stamps it on every pinned tick, so
+     the detector would reset its own clock). **`devices.last_progress_ms` is
+     stamped ONLY from a device-originated `rpc_request`** in `DeviceGateway` — a
+     sandbox holds no Linear token, so every activity its agent posts arrives as
+     one, which makes it the only clock moved by the agent working rather than by
+     something the router did. Do not feed it into the idle clock: idle-stop must
+     keep erring toward keeping a container alive (NOR-366).
+   - **`no_progress` cannot tell a strand from a session deliberately waiting,
+     and the honest move is to say so, not to tune the threshold until it looks
+     like it can.** A session held open by pending work keeps its affinity and
+     posts nothing, so it is byte-for-byte the same shape — the deferral is
+     decided on the DEVICE and never reaches the router's store. So the report
+     names both possibilities, sends the operator to the
+     `session.terminal_deferred` / `session.terminal_signalled` pair to
+     disambiguate, and gates `cyrus router unlock` on having confirmed it is not
+     waiting: unlocking a run that is about to resume manufactures the
+     lock-without-affinity leak instead of fixing anything.
+     `sessionNoProgressMs` is 4h to clear `ScheduleWakeup`'s 1h clamp outright;
+     a longer-period cron is a known false-positive class. Anything that lowers
+     it must first give the router a way to see the deferral.
+   - **Neither stranded shape covers a locked issue with NO affinity.** Both are
+     reached only from the sweep's `affinity > 0` gate, but a `parked` session
+     releases affinity and RETAINS its lock — so an elicitation nobody answers
+     locks an issue invisibly to `noteStranded`, surfacing only in
+     `RouterStore.listSessions`' orphan-lock query behind
+     `cyrus router sessions list`. Do not read the detector as covering every
+     unreachable issue.
+   - **A session's terminal signal can be withheld indefinitely, and that is the
+     leading suspect whenever an issue goes unreachable.**
+     `AgentSessionManager.completeSession` defers `emitTerminalOnce` while the
+     runner reports pending work (crons, background tasks, live background
+     tasks), and retries only when a later `result` arrives — so a background
+     task that never exits holds the router's issue lock forever. It is now
+     `session.terminal_deferred` / `session.terminal_signalled` rather than an
+     `info` line, and that change is load-bearing: **a sandbox worker's
+     `RouterLogForwarder` is WARN+ by default**, so the `info` never left the
+     container and the one state that can strand an issue was absent from the
+     logs it had to be diagnosed from. Any new diagnostic on a worker code path
+     must be `logger.event`, which bypasses the threshold, not `logger.info`.
    - `ContainerLifecycle.sweep()` is **non-reentrant by contract** — a tick still
      running makes the next one a logged no-op. `RouterServer` fires it on a bare
      60s `setInterval` and the loop is sequential, so without that guard a single

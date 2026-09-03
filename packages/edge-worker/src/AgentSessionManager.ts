@@ -14,9 +14,11 @@ import {
 	type AgentPendingWork,
 	AgentSessionStatus,
 	AgentSessionType,
+	CYRUS_EVENTS,
 	type CyrusAgentSession,
 	type CyrusAgentSessionEntry,
 	createLogger,
+	cyrusAttributes,
 	type IAgentRunner,
 	type ILogger,
 	type IssueMinimal,
@@ -28,6 +30,7 @@ import {
 } from "cyrus-core";
 
 import {
+	formatPendingWorkSummary,
 	formatPendingWorkThought,
 	formatScheduleWakeupResponse,
 	tryParseScheduleWakeupInput,
@@ -527,6 +530,35 @@ export class AgentSessionManager extends EventEmitter {
 			if (!pendingWork) {
 				await this.emitTerminalOnce(sessionId, terminalState);
 			} else {
+				// An EVENT, not the `info` it was. This branch withholds the only
+				// thing that releases the router's issue lock, and it does so with no
+				// bound: the signal is retried only if a wakeup or a background task
+				// yields another result, so a background task that never exits holds
+				// the issue forever. That made it the prime suspect for CAN-133 —
+				// and it was unfalsifiable, because a sandbox worker forwards WARN+
+				// by default, so the `info` never left the container while `event()`
+				// bypasses that threshold entirely (NOR-402).
+				log.event(
+					CYRUS_EVENTS.sessionTerminalDeferred,
+					cyrusAttributes({
+						agent_session_id: sessionId,
+						terminal_state: terminalState,
+						session_cron_count: pendingWork.sessionCrons.length,
+						background_task_count: pendingWork.backgroundTasks.length,
+						live_background_task_count:
+							pendingWork.liveBackgroundTasks?.length ?? 0,
+						// The identity of what is holding the session open. Without it
+						// the event says a session is deferred and gives an operator
+						// nothing to act on.
+						//
+						// NOT `formatPendingWorkThought`: that renders the user-facing
+						// "standing by" message, which lists only scheduled wakeups and
+						// returns null for a session held open solely by a LIVE
+						// background task — i.e. it is null for precisely the case that
+						// is the leading suspect for a session that never terminates.
+						pending_work: formatPendingWorkSummary(pendingWork),
+					}),
+				);
 				log.info(
 					`Deferring terminal signal: runner has pending work (${pendingWork.sessionCrons.length} crons, ${pendingWork.backgroundTasks.length} background tasks)`,
 				);
@@ -657,6 +689,18 @@ export class AgentSessionManager extends EventEmitter {
 			}
 		}
 
+		// The counterpart to `session.terminal_deferred`. Between them an operator
+		// can answer "did this session ever finish?" from the log stream alone —
+		// which for CAN-133 took reading five hours of gauge samples and inferring
+		// it from an affinity count that never dropped.
+		this.sessionLog(sessionId).event(
+			CYRUS_EVENTS.sessionTerminalSignalled,
+			cyrusAttributes({
+				agent_session_id: sessionId,
+				terminal_state: state,
+				forced: opts?.force ?? false,
+			}),
+		);
 		this.emit("sessionTerminal", sessionId, state);
 	}
 

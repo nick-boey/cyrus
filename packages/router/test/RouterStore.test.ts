@@ -1172,6 +1172,42 @@ describe("container devices (schema v2)", () => {
 			expect(store.getContainerDevice(device.deviceId)).toBeUndefined();
 			store.close();
 		});
+
+		/**
+		 * Every clock the sweep reads, not merely the ones this method was written
+		 * for. It is the per-row re-read that NOR-406 routed all the lifecycle
+		 * DECISIONS through, and NOR-402 then made `noteStranded` a consumer of the
+		 * same row — so a column missing from this SELECT does not fail, it silently
+		 * reads as "never happened". Dropping `last_progress_ms` in particular
+		 * leaves the `no_progress` detector with no agent-driven clock at all, and
+		 * it reports a sandbox whose agent is posting normally as stranded.
+		 *
+		 * Asserted against `listContainerDevices` rather than against literals: the
+		 * failure mode is the two queries drifting apart, so the fleet read is the
+		 * oracle and this stays correct as columns are added.
+		 */
+		it("reads the same columns as the fleet listing it re-reads rows for", () => {
+			const store = new RouterStore(":memory:");
+			const { userId } = store.addUser({ email: "cols@example.com" });
+			const { deviceId } = store.createContainerDevice(
+				userId,
+				"NOR-406-h",
+				"aca",
+			);
+			store.enqueueEvent(deviceId, "{}", 1_000, 60_000);
+			store.markDeviceActive(deviceId, 2_000);
+			store.markDeviceProgress(deviceId, 3_000);
+			store.setDeviceParkedAt(deviceId, 4_000);
+			store.markDeviceRunning(deviceId, 5_000);
+
+			const listed = store
+				.listContainerDevices()
+				.find((d) => d.deviceId === deviceId);
+
+			expect(store.getContainerDevice(deviceId)).toEqual(listed);
+			expect(listed?.lastProgressMs).toBe(3_000);
+			store.close();
+		});
 	});
 
 	describe("getLastAgentRunActivityMs", () => {
@@ -1244,6 +1280,91 @@ describe("container devices (schema v2)", () => {
 			);
 
 			expect(store.getLastAgentRunActivityMs(deviceId)).toBeUndefined();
+			store.close();
+		});
+	});
+
+	describe("last_progress_ms", () => {
+		const makeContainerDevice = (store: RouterStore, issueKey: string) => {
+			const { userId } = store.addUser({ email: `${issueKey}@example.com` });
+			return store.createContainerDevice(userId, issueKey, "aca").deviceId;
+		};
+
+		it("is undefined for a device whose agent has never posted anything", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-402-a");
+
+			expect(
+				store.listContainerDevices().find((d) => d.deviceId === deviceId)
+					?.lastProgressMs,
+			).toBeUndefined();
+			store.close();
+		});
+
+		/**
+		 * The whole reason this is a fourth column and not a reuse of
+		 * `last_active_ms`. The sweep stamps `last_active_ms` on every tick a
+		 * device holds affinity, so a session that finished hours ago and never
+		 * went terminal keeps it as fresh as a session doing real work — which is
+		 * precisely why the CAN-133 strand was undetectable (NOR-402).
+		 */
+		it("is not moved by markDeviceActive, which the sweep stamps on every pinned tick", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-402-b");
+
+			store.markDeviceProgress(deviceId, 1_000);
+			store.markDeviceActive(deviceId, 9_999);
+			store.setSessionAffinity("s1", deviceId, undefined, 9_999);
+
+			const row = store.getContainerDeviceForIssue("NOR-402-b");
+			expect(row?.lastProgressMs).toBe(1_000);
+			expect(row?.lastActiveMs).toBe(9_999);
+			store.close();
+		});
+
+		it("re-stamps unconditionally, like the activity clock", () => {
+			const store = new RouterStore(":memory:");
+			const deviceId = makeContainerDevice(store, "NOR-402-c");
+
+			store.markDeviceProgress(deviceId, 1_000);
+			store.markDeviceProgress(deviceId, 9_999);
+
+			expect(
+				store.getContainerDeviceForIssue("NOR-402-c")?.lastProgressMs,
+			).toBe(9_999);
+			store.close();
+		});
+
+		/**
+		 * Backfilled for the same asymmetry as `last_active_ms`, though what it
+		 * buys is different: a NULL here would report every pre-upgrade sandbox
+		 * that happens to hold affinity as stranded the moment the router
+		 * restarts, and a severity-1 rule that storms on deploy gets muted.
+		 */
+		it("backfills existing container rows on migration rather than reporting them all stranded", () => {
+			const dir = mkdtempSync(join(tmpdir(), "router-store-progress-"));
+			const dbPath = join(dir, "router.db");
+			const before = Date.now();
+
+			const raw = new Database(dbPath);
+			raw.exec(V1_SCHEMA);
+			raw.prepare("INSERT INTO users (email) VALUES ('p@example.com')").run();
+			raw.close();
+
+			const migrated = new RouterStore(dbPath);
+			const { deviceId } = migrated.createContainerDevice(1, "OLD-2", "aca");
+			migrated.close();
+
+			const stripped = new Database(dbPath);
+			stripped.exec("ALTER TABLE devices DROP COLUMN last_progress_ms");
+			stripped.close();
+
+			const store = new RouterStore(dbPath);
+			const lastProgressMs = store
+				.listContainerDevices()
+				.find((d) => d.deviceId === deviceId)?.lastProgressMs;
+			expect(lastProgressMs).toBeGreaterThanOrEqual(before);
+			expect(lastProgressMs).toBeLessThanOrEqual(Date.now());
 			store.close();
 		});
 	});
