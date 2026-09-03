@@ -449,10 +449,11 @@ resource sessionsNeverTerminal 'Microsoft.OperationalInsights/workspaces/savedSe
     displayName: 'Sessions deferred and never terminated'
     query: join(
       [
-        // `distinct` takes column NAMES, not aliased expressions — `distinct x =
-        // expr` does not parse, and ARM stores a saved search as an opaque string
-        // without ever validating it, so the failure surfaces only when a human
-        // opens the query. Project first, then aggregate.
+        // `summarize max(TimeGenerated)`, not `distinct`: the anti-join below
+        // needs the newest signal per session, not merely the set of ids that
+        // ever signalled. (`distinct x = expr` does parse and join — verified
+        // against this workspace on 2026-09-03 — so the original defect here was
+        // semantic, not syntactic.)
         'let signalled ='
         '    ContainerAppConsoleLogs_CL'
         appFilter

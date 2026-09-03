@@ -609,11 +609,14 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      two families do not join, and KQL returns nothing rather than erroring.
    - **`check-bicep.sh` compiles the template; it does not evaluate the KQL
      inside it.** ARM stores a saved search as an opaque string and never
-     validates it, so a query that does not parse (`distinct x = expr` is the one
-     that got through) deploys green and fails the first time a human opens it —
-     mid-incident, which is the only time anyone opens it. A new or edited saved
-     search has to be run against the workspace; a green `infra` check is not
-     evidence about the query.
+     validates it, so neither a parse error nor a wrong-but-valid query is
+     caught by a green `infra` check — and the first time anyone opens a saved
+     search is mid-incident. A new or edited saved search has to be RUN against
+     the workspace (`az monitor log-analytics query --workspace <customerId>
+     --analytics-query "$(cat q.kql)"`) before it is relied on. Running it is
+     also the only way to catch the semantic half: `Cyrus-Sessions-Never-Terminal`
+     shipped a `leftanti` that was perfectly valid KQL and still answered the
+     wrong question, which no amount of compiling would have shown.
    - **Neither stranded shape covers a locked issue with NO affinity.** Both are
      reached only from the sweep's `affinity > 0` gate, but a `parked` session
      releases affinity and RETAINS its lock — so an elicitation nobody answers
