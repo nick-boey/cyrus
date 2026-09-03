@@ -151,6 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_issue_disk_images_cache_key ON issue_disk_images(
 CREATE INDEX IF NOT EXISTS idx_agent_runs_user_routed ON agent_runs(user_id, last_routed_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_session_started ON agent_runs(session_id, started_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_ended ON agent_runs(ended_ms);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_device ON agent_runs(device_id);
 `;
 
 function sha256Hex(value: string): string {
@@ -1626,6 +1627,11 @@ export class RouterStore {
 	 * Deliberately ignores `started_ms`/`last_routed_ms`: those are router-side
 	 * stamps already mirrored on the device row's `last_routed_ms`, and folding
 	 * them in here would only duplicate the idle clock.
+	 *
+	 * Served by `idx_agent_runs_device`. Without it this is a full scan of every
+	 * run in the fleet's 24h retention window, run synchronously on the router's
+	 * event loop up to twice per idle candidate per tick — a cost that scales
+	 * with total run volume rather than with the number of candidates.
 	 */
 	getLastAgentRunActivityMs(deviceId: number): number | undefined {
 		const row = this.db

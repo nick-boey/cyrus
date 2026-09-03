@@ -1715,6 +1715,73 @@ describe("ContainerLifecycle", () => {
 			expect(aca.stop).toHaveBeenCalledWith("CAN-136");
 			expect(decoy.deviceId).not.toBe(victim.deviceId);
 		});
+
+		it("still counts and unlatches a row it skips, so the rollup keeps summing", async () => {
+			// Skipping the DECISIONS for a vanished row is the point; skipping the
+			// BOOKKEEPING is a different bug. The rollup reports `sandboxes` as the
+			// size of the opening snapshot, so a bucket that stops summing to it
+			// under-reports on exactly the ticks where something was destroyed —
+			// and a device torn down while pinned would never log its unpin.
+			const idleStopMs = 300_000;
+			const alive = makeContainerDevice("CAN-143", "aca");
+			const doomed = makeContainerDevice("CAN-144", "aca");
+			let now = alive.createdMs + 1_000;
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [
+					{ issueKey: "CAN-143", status: "running" },
+					{ issueKey: "CAN-144", status: "running" },
+				],
+			});
+			// CAN-144 is pinned, so it is latched into `pinnedDevices` on tick one.
+			store.setSessionAffinity("held", doomed.deviceId, undefined, now);
+			const lifecycle = new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+			});
+
+			await lifecycle.sweep();
+			expect(
+				logger.info.mock.calls.filter(([m]) =>
+					String(m).includes("is pinned out of idle-stop"),
+				),
+			).toHaveLength(1);
+
+			// Tick two: a terminal teardown removes CAN-144 mid-tick, while the
+			// sweep is inside CAN-143's provider call — so the doomed row IS in
+			// this tick's opening snapshot and the skip path is genuinely reached.
+			now = alive.createdMs + idleStopMs + 1;
+			aca.status.mockImplementation(async (issueKey: string) => {
+				if (issueKey === "CAN-143")
+					store.deleteContainerDevice(doomed.deviceId);
+				return "running";
+			});
+			await lifecycle.sweep();
+
+			const rollup = eventsNamed(logger, "sandbox.sweep_completed").at(-1) as
+				| Record<string, number>
+				| undefined;
+			if (!rollup) throw new Error("expected a rollup");
+			expect(
+				rollup.running + rollup.stopped + rollup.absent + rollup.unknown,
+			).toBe(rollup.sandboxes);
+			expect(rollup.absent).toBe(1);
+			// And the latch was released, so the transition is not lost.
+			expect(
+				logger.info.mock.calls.filter(([m]) =>
+					String(m).includes(
+						`Container device ${doomed.deviceId} is no longer pinned`,
+					),
+				),
+			).toHaveLength(1);
+			expect(alive.deviceId).not.toBe(doomed.deviceId);
+		});
 	});
 
 	describe("a stop that races the worker's terminal frame", () => {
@@ -1750,6 +1817,71 @@ describe("ContainerLifecycle", () => {
 				now,
 			});
 		}
+
+		it("fires in the 392-second-tick regime, driven through the real route -> work -> completion sequence", async () => {
+			// The regime this veto exists for, and the only one it is reachable in.
+			// Every write below is the one the router itself makes: `enqueueEvent`
+			// stamps `last_routed_ms`, `setSessionAffinity` stamps `last_active_ms`,
+			// the sweep re-stamps it on each pinned tick, and the terminal frame
+			// clears affinity and ends the run.
+			//
+			// With ticks 392s apart, `last_active_ms` is up to a full tick stale
+			// through no fault of the read that fetched it, and a session can begin
+			// and end entirely between two visits to the same row. That is the
+			// residue the fresh per-row read cannot cover.
+			const idleStopMs = 300_000;
+			const terminalSettleMs = 120_000;
+			const tickMs = 392_000;
+			const { deviceId, createdMs } = makeContainerDevice("CAN-134b", "aca");
+			const aca = fakeExecutor("aca", { status: "running" });
+			let now = createdMs;
+			const lifecycle = lifecycleFor(
+				aca,
+				() => now,
+				idleStopMs,
+				terminalSettleMs,
+			);
+
+			// A session is routed and claims the device.
+			store.enqueueEvent(deviceId, "{}", now, 48 * 3_600_000);
+			store.setSessionAffinity("s-live", deviceId, undefined, now);
+			store.recordAgentRunRouted({
+				deviceId,
+				issueKey: "CAN-134b",
+				sessionId: "s-live",
+				routedMs: now,
+			});
+
+			// One slow tick sees it pinned and re-stamps the idle clock.
+			now += 10_000;
+			await lifecycle.sweep();
+			expect(store.getContainerDevice(deviceId)?.lastActiveMs).toBe(now);
+			const lastPinnedTickMs = now;
+
+			// The session completes 300s later — five minutes before this row is
+			// looked at again. Its terminal frame arrives; the worker is still
+			// flushing its artifact bundle.
+			now = lastPinnedTickMs + 300_000;
+			store.clearSessionAffinity("s-live");
+			store.finishAgentRun("s-live", "complete", now);
+
+			// The next visit to the row: one tick later, so the idle clock reads
+			// 392s — genuinely past idleStopMs, and not because anything is stale.
+			now = lastPinnedTickMs + tickMs;
+			await lifecycle.sweep();
+
+			expect(aca.stop).not.toHaveBeenCalled();
+			expect(
+				logger.info.mock.calls.filter(([m]) =>
+					String(m).includes("may still be flushing"),
+				),
+			).toHaveLength(1);
+
+			// And still bounded: the tick after that parks it.
+			now += tickMs;
+			await lifecycle.sweep();
+			expect(aca.stop).toHaveBeenCalledWith("CAN-134b");
+		});
 
 		it("defers the stop while the worker may still be flushing its terminal frame", async () => {
 			// The incident: session completed 07:51:50, container stopped 07:51:54.

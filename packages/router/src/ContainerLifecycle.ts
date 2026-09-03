@@ -49,11 +49,20 @@ const DEFAULT_STRANDED_SESSION_GRACE_MS = 600_000;
  * arrived, and the affinity row plus the issue lock survived for 37 minutes
  * while Linear rendered a live session).
  *
- * Generous on purpose, and close to free: after the sweep's clock is read
- * fresh, a container whose run just ended is not idle by any measure, so this
- * veto only ever fires in the pathological case where the idle clock's inputs
- * are somehow older than the completion. It is bounded — a stop deferred here
- * happens on a later tick — so it can never become a permanent pin.
+ * Know when this can actually fire, because it is narrower than it looks. The
+ * idle clock's freshest input, `last_active_ms`, is stamped by the SWEEP on
+ * every pinned tick, so it is itself up to one tick-interval stale. Combined
+ * with the clamp below, a veto needs the newest run stamp to beat the whole
+ * idle clock by more than `idleStopMs - terminalSettleMs` — 180s at the shipped
+ * defaults. On a healthy 60s tick that is unreachable, and the fresh per-row
+ * read is doing all the work.
+ *
+ * It becomes live exactly in the regime NOR-406 happened in: 392-second ticks,
+ * where a container's idle clock is minutes stale through no fault of the read
+ * that fetched it, and a run can begin and end entirely between two visits to
+ * the same row. That is the residue the fresh read cannot cover, which is why
+ * the issue asked for both. It is bounded — a stop deferred here happens on a
+ * later tick — so it can never become a permanent pin.
  */
 const DEFAULT_TERMINAL_SETTLE_MS = 120_000;
 
@@ -597,14 +606,29 @@ export class ContainerLifecycle {
 				// mid-sweep guard, which compares against a snapshot taken after the
 				// claim and therefore saw nothing new (NOR-406). The tick snapshot is
 				// now only a WORK LIST; every value a decision is made from is read
-				// here. Two cheap indexed SQLite reads per row against minutes of
-				// provider latency.
+				// here. Two indexed point reads per row against minutes of provider
+				// latency.
 				const rowNow = this.now();
 				const row = this.store.getContainerDevice(snapshot.deviceId);
 				// Gone since the snapshot — a terminal teardown destroyed it mid-tick.
 				// Acting on it now would be acting on a container that no longer
 				// exists, or worse, on its successor.
-				if (!row) continue;
+				//
+				// Skipping the DECISIONS is the point; skipping the BOOKKEEPING is
+				// not. The row still has to leave this object's latches, or a device
+				// torn down while pinned never logs its unpin transition and sits in
+				// `pinnedDevices` for the life of the process. It also still has to be
+				// counted, because the rollup below reports `sandboxes: rows.length`
+				// and a bucket that no longer sums to it is a dashboard that silently
+				// under-reports on exactly the ticks where something was destroyed.
+				// No gauge sample: there is no sandbox left to sample.
+				if (!row) {
+					this.noteUnpinned(snapshot.deviceId);
+					this.strandedDevices.delete(snapshot.deviceId);
+					this.observations.delete(snapshot.deviceId);
+					counts.absent += 1;
+					continue;
+				}
 				// Snapshot of the sessions the affinity gate below is about to make
 				// its decision from, so the pre-stop re-check can tell a session that
 				// claimed this device DURING the decision from one the gate already

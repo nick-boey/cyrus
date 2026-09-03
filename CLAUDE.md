@@ -510,7 +510,13 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      too, which is precisely "the device is done and the router never saw a
      frame". The veto is CLAMPED to `idleStopMs`: it must cover seconds, never
      become the dominant term in the parking policy, or it is PAR-146's
-     permanent pin under another name.
+     permanent pin under another name. Know its real reach before relying on it:
+     `last_active_ms` is stamped by the SWEEP, so it is itself up to one tick
+     stale, and with the clamp a veto needs the newest run stamp to beat the
+     whole idle clock by `idleStopMs - terminalSettleMs` (180s at defaults). On a
+     healthy 60s tick it CANNOT fire and the fresh per-row read is doing all the
+     work; it goes live exactly in the 392s-tick regime, which is the residue the
+     fresh read cannot cover.
    - **`state=stopped && sessions>0 && online=false` is an impossible state that
      produces no signal on its own.** No lifecycle transition fires, the gauge
      records it as three unremarkable fields, and Linear keeps rendering a live
