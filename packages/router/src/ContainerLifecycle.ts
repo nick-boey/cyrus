@@ -39,21 +39,38 @@ interface ProviderListing {
 const DEFAULT_STRANDED_SESSION_GRACE_MS = 600_000;
 
 /**
- * 1 hour — default {@link ContainerLifecycleOptions.sessionNoProgressMs}.
+ * 4 hours — default {@link ContainerLifecycleOptions.sessionNoProgressMs}.
  *
  * The window a device may hold session affinity while doing nothing the router
- * can observe. Sized against the longest plausible gap between two consecutive
- * agent activities, NOT against a turn: an agent posts a thought or an action
+ * can observe. NOT sized against a turn: an agent posts a thought or an action
  * for every step it takes and each is an RPC through the router, so a busy
- * session stamps its progress clock every few seconds no matter how long the
- * turn runs. The gap this has to clear is a single blocking tool call — a long
- * build, a full test suite — which is minutes, an order of magnitude under this.
+ * session stamps its progress clock every few seconds however long the turn
+ * runs. A single blocking tool call — a long build, a full test suite — is
+ * minutes, two orders of magnitude under this.
  *
- * Erring long is the cheap direction: this is DETECTION ONLY, so a false
- * positive costs one alert and a false negative costs hours of a sandbox
- * burning 4 vCPU on an issue nobody can reach (CAN-133: 5h17m).
+ * It is sized against the DELIBERATE IDLE instead, and that is the whole
+ * difficulty. `AgentSessionManager.completeSession` withholds the terminal
+ * signal while the runner reports pending work, so a session waiting on a
+ * `ScheduleWakeup` or a cron keeps its affinity and posts nothing for the
+ * duration — every input to the progress clock frozen, and from the router's
+ * side indistinguishable from the strand this detector exists to find. The two
+ * facts only ever meet on the DEVICE, so the router cannot currently tell them
+ * apart at all (see {@link noteStranded}, which says so in what it reports).
+ *
+ * 4 hours clears the bounded case outright: `ScheduleWakeup` is clamped to at
+ * most 1 hour, so no wakeup-pending session can reach this. It does NOT clear a
+ * cron with a period above 4 hours, which will be reported and is a known,
+ * accepted false-positive class until the deferral is propagated to the router.
+ * And it still catches the fault: CAN-133 held its issue for 5h17m.
+ *
+ * Erring long is the cheap direction, but not free — this is DETECTION ONLY, so
+ * a false negative costs hours of a sandbox burning 4 vCPU on an issue nobody
+ * can reach, while a false positive costs a severity-1 page for a healthy
+ * session, which is how a rule gets muted. That is the same failure the ticket
+ * this came from warns about, inverted, so do not lower this without first
+ * giving the router a way to see the deferral.
  */
-const DEFAULT_SESSION_NO_PROGRESS_MS = 3_600_000;
+const DEFAULT_SESSION_NO_PROGRESS_MS = 4 * 3_600_000;
 
 /**
  * Why a device is stranded. Two genuinely different faults, kept as one event
@@ -281,6 +298,31 @@ export class ContainerLifecycle {
 	 * thread again" — the whole of NOR-402 is that a top-level comment on such an
 	 * issue is rejected at the issue lock — so its remedy line says so.
 	 *
+	 * ── WHAT `no_progress` CANNOT DISTINGUISH, AND WHY IT SAYS SO ──
+	 * A session held open by pending work (`ScheduleWakeup`, a cron, a background
+	 * task) keeps its affinity and posts nothing while it waits, so it presents
+	 * IDENTICALLY to a strand. The router has no way to tell: the deferral is
+	 * decided in `AgentSessionManager.completeSession` and recorded only in the
+	 * device's own `session.terminal_deferred` event, which reaches Log Analytics
+	 * but never the router's store. So this reports both, and its message names
+	 * both rather than asserting the diagnosis it cannot make — and in particular
+	 * does NOT advise `cyrus router unlock`, which on a waiting session would
+	 * strip the lock from a run that is about to resume and manufacture the
+	 * lock-without-affinity leak. `sessionNoProgressMs` is then set high enough to
+	 * clear every bounded wakeup (see its default). The real fix is to propagate
+	 * the deferral to the router so this branch can exclude it; until then the
+	 * honest thing is to report the ambiguity, not to hide it behind a threshold.
+	 *
+	 * ── WHAT NEITHER SHAPE COVERS ──
+	 * Both are reached only from the sweep's `affinity > 0` gate, but what makes
+	 * an issue unreachable is the ISSUE LOCK, and the two deliberately diverge: a
+	 * `parked` session releases affinity and RETAINS its lock. An elicitation
+	 * nobody answers therefore locks an issue with no affinity, is invisible to
+	 * this method entirely, and shows up only in `RouterStore.listSessions`'
+	 * orphan-lock query behind `cyrus router sessions list`. That class has no
+	 * event and no alert. Do not read this detector as covering every locked
+	 * issue.
+	 *
 	 * Exclusions:
 	 *  - `unknown` state (`offline_pinned` only): a provider we could not read
 	 *    this tick says nothing about whether it is running. Irrelevant to
@@ -363,11 +405,17 @@ export class ContainerLifecycle {
 						`again to cold-boot it. (strandedForMs=${strandedForMs} state=${state})`
 				: `Container for ${row.issueKey} (device=${row.deviceId}) holds ${affinity} session ` +
 						`affinity row(s) but has made no observable progress for ${noProgressForMs}ms ` +
-						`(threshold ${this.sessionNoProgressMs}ms, state=${state} online=${online}): its ` +
-						`agent session never reached a terminal state, so the issue is locked to a ` +
-						`session that has stopped working. A new top-level comment will be REJECTED at ` +
-						`the issue lock — reply inside the existing session's thread, or run ` +
-						`\`cyrus router unlock\` for the issue.`,
+						`(threshold ${this.sessionNoProgressMs}ms, state=${state} online=${online}). ` +
+						`Either its session never reached a terminal state and the issue is now locked ` +
+						`to a session that has stopped working, or it is deliberately idle waiting on a ` +
+						`scheduled wakeup — the router cannot tell these apart, because the deferral is ` +
+						`only ever recorded on the device. Check for a 'session.terminal_deferred' ` +
+						`record for this issue with no matching 'session.terminal_signalled': that is ` +
+						`what says which, and what it is waiting on. Either way a new top-level comment ` +
+						`will be REJECTED at the issue lock, so reply inside the existing session's ` +
+						`thread. Only once you have confirmed it is NOT waiting is \`cyrus router ` +
+						`unlock\` the right move — unlocking a session that is about to resume strands ` +
+						`the lock instead of freeing it.`,
 		);
 	}
 

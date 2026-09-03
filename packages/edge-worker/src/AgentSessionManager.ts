@@ -30,6 +30,7 @@ import {
 } from "cyrus-core";
 
 import {
+	formatPendingWorkSummary,
 	formatPendingWorkThought,
 	formatScheduleWakeupResponse,
 	tryParseScheduleWakeupInput,
@@ -549,7 +550,13 @@ export class AgentSessionManager extends EventEmitter {
 						// The identity of what is holding the session open. Without it
 						// the event says a session is deferred and gives an operator
 						// nothing to act on.
-						pending_work: formatPendingWorkThought(pendingWork) ?? null,
+						//
+						// NOT `formatPendingWorkThought`: that renders the user-facing
+						// "standing by" message, which lists only scheduled wakeups and
+						// returns null for a session held open solely by a LIVE
+						// background task — i.e. it is null for precisely the case that
+						// is the leading suspect for a session that never terminates.
+						pending_work: formatPendingWorkSummary(pendingWork),
 					}),
 				);
 				log.info(

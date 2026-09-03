@@ -181,6 +181,37 @@ describe("AgentSessionManager terminal signal ordering", () => {
 		);
 	});
 
+	// The prime suspect for a session that never terminates is a background task
+	// that never exits — and `formatPendingWorkThought`, which renders the
+	// user-facing "standing by" message, returns null for exactly that case: it
+	// lists only scheduled wakeups. Reporting `pending_work: null` there would
+	// leave the operator with a count and no identity in the one case that
+	// matters most.
+	it("names the live background task when that alone is what defers the session", async () => {
+		setup({
+			sessionCrons: [],
+			backgroundTasks: [],
+			liveBackgroundTasks: [
+				{ taskId: "bash-7", taskType: "shell", description: "pnpm dev" },
+			],
+		});
+
+		await manager.completeSession(sessionId, result());
+
+		const deferred = logs.sink.find({ event: "session.terminal_deferred" });
+		expect(deferred?.attributes).toMatchObject({
+			"cyrus.session_cron_count": 0,
+			"cyrus.background_task_count": 0,
+			"cyrus.live_background_task_count": 1,
+		});
+		expect(deferred?.attributes?.["cyrus.pending_work"]).toEqual(
+			expect.stringContaining("pnpm dev"),
+		);
+		expect(logs.sink.find({ event: "session.terminal_signalled" })).toBe(
+			undefined,
+		);
+	});
+
 	it("emits a queryable event when the terminal signal is actually sent", async () => {
 		setup();
 

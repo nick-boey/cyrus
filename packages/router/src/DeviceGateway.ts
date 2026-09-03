@@ -323,7 +323,25 @@ export class DeviceGateway extends EventEmitter {
 				// refused or failed RPC is still an agent that is awake and trying,
 				// and counting it as no progress would report a session stuck in a
 				// retry loop as stranded.
-				this.store.markDeviceProgress(deviceId, Date.now());
+				//
+				// Guarded, unlike its neighbours: `handleMessage` runs straight off
+				// `ws.on("message")` with only `parseDeviceFrame` inside a try, so a
+				// store throw here (SQLITE_FULL on the router's ephemeral disk, a
+				// readonly database after a bad restore) would escape into the socket
+				// callback as an unhandled exception and take the router down for
+				// every teammate. The `log` and `span` branches below both carry an
+				// explicit contract that a device frame must never break the socket it
+				// arrived on; a purely diagnostic stamp has even less business doing
+				// so, and losing one sample only delays the detector by a tick.
+				try {
+					this.store.markDeviceProgress(deviceId, Date.now());
+				} catch (err) {
+					this.logger.warn(
+						`Failed to stamp the progress clock for device ${deviceId}; ` +
+							`the stranded-session detector may report it early`,
+						err,
+					);
+				}
 				this.emit("rpc", deviceId, frame);
 				break;
 			case "session_state":

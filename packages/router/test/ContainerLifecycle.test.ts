@@ -1669,6 +1669,83 @@ describe("ContainerLifecycle", () => {
 			).toBeGreaterThanOrEqual(createdMs + noProgressMs + 1);
 		});
 
+		it("does not report a session waiting on the longest possible scheduled wakeup, but does report CAN-133", async () => {
+			// The default threshold has one job the unit tests above cannot check,
+			// because they all pass an explicit one: separating a strand from a
+			// session that is DELIBERATELY idle. `completeSession` withholds the
+			// terminal signal while the runner reports pending work, so a session
+			// waiting on a wakeup keeps its affinity and posts nothing — identical
+			// to a strand from the router's side. `ScheduleWakeup` is clamped to an
+			// hour, so the default must clear that outright; a sev-1 page for a
+			// healthy waiting session is how a rule gets muted, which is the same
+			// failure NOR-402 is about, inverted.
+			const HOUR = 3_600_000;
+			function sweepAfter(issueKey: string, idleMs: number) {
+				const { deviceId, createdMs } = makeContainerDevice(issueKey, "aca");
+				const aca = fakeExecutor("aca", {
+					status: "running",
+					listStates: [{ issueKey, status: "running" }],
+				});
+				store.setSessionAffinity(issueKey, deviceId, undefined, createdMs);
+				store.markDeviceProgress(deviceId, createdMs);
+				return new ContainerLifecycle({
+					store,
+					executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+					idleStopMs: 300_000,
+					staleDestroyMs: 14 * 24 * 60 * 60_000,
+					offlineAgeOutMs: 3_600_000,
+					// sessionNoProgressMs deliberately OMITTED — the default is the
+					// thing under test.
+					logger,
+					now: () => createdMs + idleMs,
+					sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+				}).sweep();
+			}
+
+			// One device per sweep: the store outlives a single lifecycle, so a
+			// second device swept at a later clock would also re-sweep the first
+			// and the assertion would pass for the wrong reason.
+			await sweepAfter("WAKEUP-1H", HOUR + 1);
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toHaveLength(0);
+			store.deleteContainerDevice(
+				store.getContainerDeviceForIssue("WAKEUP-1H")!.deviceId,
+			);
+
+			// CAN-133 held its issue for 5h17m.
+			await sweepAfter("CAN-133-REAL", 5 * HOUR + 17 * 60_000);
+			expect(eventsNamed(logger, "sandbox.stranded_session")).toMatchObject([
+				{ issue_key: "CAN-133-REAL", reason: "no_progress" },
+			]);
+		});
+
+		it("never advises `cyrus router unlock` without saying the router cannot tell a strand from a wait", async () => {
+			// Unlocking a session that is merely waiting on a wakeup strips the lock
+			// from a run that is about to resume, which manufactures the
+			// lock-without-affinity leak rather than fixing anything. The router
+			// cannot distinguish the two, so the remedy line must not assert that it
+			// can.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-140", "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-140", status: "running" }],
+			});
+			store.setSessionAffinity("stuck", deviceId, undefined, createdMs);
+			store.markDeviceProgress(deviceId, createdMs);
+
+			await strandedLifecycle(
+				aca,
+				() => createdMs + 3_600_001,
+				600_000,
+				3_600_000,
+				true,
+			).sweep();
+
+			const line = String(logger.error.mock.calls[0]?.[0] ?? "");
+			expect(line).toContain("session.terminal_deferred");
+			expect(line).toContain("cannot tell these apart");
+			expect(line).not.toMatch(/never reached a terminal state,? so the issue/);
+		});
+
 		it("prefers the offline_pinned reason when both shapes hold", async () => {
 			// A stopped, offline, long-idle sandbox satisfies both rules. The offline
 			// one is the more specific diagnosis and the one with a known remedy, so

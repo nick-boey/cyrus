@@ -513,6 +513,26 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      one, which makes it the only clock moved by the agent working rather than by
      something the router did. Do not feed it into the idle clock: idle-stop must
      keep erring toward keeping a container alive (NOR-366).
+   - **`no_progress` cannot tell a strand from a session deliberately waiting,
+     and the honest move is to say so, not to tune the threshold until it looks
+     like it can.** A session held open by pending work keeps its affinity and
+     posts nothing, so it is byte-for-byte the same shape — the deferral is
+     decided on the DEVICE and never reaches the router's store. So the report
+     names both possibilities, sends the operator to the
+     `session.terminal_deferred` / `session.terminal_signalled` pair to
+     disambiguate, and gates `cyrus router unlock` on having confirmed it is not
+     waiting: unlocking a run that is about to resume manufactures the
+     lock-without-affinity leak instead of fixing anything.
+     `sessionNoProgressMs` is 4h to clear `ScheduleWakeup`'s 1h clamp outright;
+     a longer-period cron is a known false-positive class. Anything that lowers
+     it must first give the router a way to see the deferral.
+   - **Neither stranded shape covers a locked issue with NO affinity.** Both are
+     reached only from the sweep's `affinity > 0` gate, but a `parked` session
+     releases affinity and RETAINS its lock — so an elicitation nobody answers
+     locks an issue invisibly to `noteStranded`, surfacing only in
+     `RouterStore.listSessions`' orphan-lock query behind
+     `cyrus router sessions list`. Do not read the detector as covering every
+     unreachable issue.
    - **A session's terminal signal can be withheld indefinitely, and that is the
      leading suspect whenever an issue goes unreachable.**
      `AgentSessionManager.completeSession` defers `emitTerminalOnce` while the

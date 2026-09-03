@@ -951,12 +951,20 @@ resource sandboxBootFailures 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
 //  - `offline_pinned` — neither running nor connected. NOR-366's 38-second
 //    handoff race, which ran for nine hours across five agent sessions.
 //  - `no_progress` — running, connected, and idle: nothing routed to it and
-//    nothing posted by its agent for over an hour. CAN-133 held an issue
-//    unreachable for 5h17m in exactly this state (NOR-402), and the previous
-//    version of THIS RULE could not fire for it: the detector required
-//    `stopped && !online`, so the shape that actually blocks work was excluded
-//    by definition. An alert that exists but cannot fire for the failure it
-//    names is worse than none, because it is read as coverage.
+//    nothing posted by its agent for over `sessionNoProgressMs` (4h). CAN-133
+//    held an issue unreachable for 5h17m in exactly this state (NOR-402), and
+//    the previous version of THIS RULE could not fire for it: the detector
+//    required `stopped && !online`, so the shape that actually blocks work was
+//    excluded by definition. An alert that exists but cannot fire for the
+//    failure it names is worse than none, because it is read as coverage.
+//
+//    `no_progress` has a KNOWN ambiguity, stated in its description rather than
+//    hidden: a session held open by a scheduled wakeup presents identically,
+//    because the deferral is recorded only on the device. The threshold clears
+//    every `ScheduleWakeup` (clamped to 1h) but not a cron with a longer
+//    period. That is why the description sends the operator to
+//    `Cyrus-Sessions-Never-Terminal` to disambiguate before acting, and why it
+//    does NOT lead with `cyrus router unlock`.
 //
 // Nothing about either shape is visible anywhere else: Linear renders a normal
 // in-progress agent session for as long as it lasts, the gauge records it as
@@ -982,7 +990,7 @@ resource sandboxStrandedSessions 'Microsoft.Insights/scheduledQueryRules@2023-03
   tags: tags
   properties: {
     displayName: 'alert-${namePrefix}-sandbox-stranded-sessions'
-    description: 'A Cyrus sandbox holds session affinity for an issue it is not working on. Check "cyrus.reason": "offline_pinned" means the sandbox is stopped and disconnected — prompt the thread again to cold-boot it. "no_progress" means it is running and connected but nothing has been routed to it and its agent has posted nothing for over an hour: its session never went terminal, so the issue is locked and a NEW top-level comment will be rejected — reply inside the running session\'s thread, or run "cyrus router unlock" for the issue. "cyrus.no_progress_for_ms" and "cyrus.stranded_for_ms" give the duration.'
+    description: 'A Cyrus sandbox holds session affinity for an issue it is not working on. Check "cyrus.reason". "offline_pinned": the sandbox is stopped and disconnected — prompt the thread again to cold-boot it. "no_progress": it is running and connected, but nothing has been routed to it and its agent has posted nothing for over "cyrus.no_progress_ms". That is EITHER a session that never went terminal (the issue is now locked to a session that stopped working) OR one deliberately idle on a scheduled wakeup — the router cannot tell, because the deferral is recorded only on the device. Run the "Cyrus-Sessions-Never-Terminal" saved search for this issue: a "session.terminal_deferred" with no matching "session.terminal_signalled" says it is waiting and names what for. Either way a new top-level comment is rejected at the issue lock, so reply inside the running session\'s thread; use "cyrus router unlock" ONLY after confirming it is not waiting, since unlocking a session that is about to resume strands the lock instead of freeing it.'
     severity: 1
     enabled: true
     evaluationFrequency: 'PT15M'
