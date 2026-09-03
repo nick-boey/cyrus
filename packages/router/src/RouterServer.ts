@@ -1198,6 +1198,23 @@ export class RouterServer {
 
 		const sessionsQueryTimeoutMs =
 			containers.sessionsQueryTimeoutMs ?? DEFAULT_SESSIONS_QUERY_TIMEOUT_MS;
+		// A settle window shorter than the interval between the ticks that would
+		// observe it cannot do its job: the veto reads a run-end stamp that is
+		// itself up to one tick old, so anything under a tick is off in practice
+		// while reading as configured. The overwhelmingly likely cause is units —
+		// `terminalSettleMs: 120` meant as two minutes. Warn rather than reject:
+		// this is the one knob a test rig legitimately turns right down.
+		if (
+			containers.terminalSettleMs !== undefined &&
+			containers.terminalSettleMs < SWEEP_INTERVAL_MS
+		) {
+			this.logger.warn(
+				`terminalSettleMs (${containers.terminalSettleMs}ms) is shorter than the ` +
+					`${SWEEP_INTERVAL_MS}ms sweep interval, so it will effectively never ` +
+					`defer a stop. This value is in MILLISECONDS — did you mean ` +
+					`${containers.terminalSettleMs * 1000}?`,
+			);
+		}
 		this.containerLifecycle = new ContainerLifecycle({
 			store: this.store,
 			executors,

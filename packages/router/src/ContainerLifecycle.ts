@@ -11,6 +11,7 @@ import {
 	SANDBOX_EVENTS,
 	type SandboxDestroyReason,
 	type SandboxGaugeState,
+	type SandboxIdleStopSkipReason,
 } from "./SandboxTelemetry.js";
 import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
@@ -20,10 +21,32 @@ import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
  * `states` is absent (rather than empty) for a provider with no
  * {@link ManagedContainerState} bulk seam: its listing proves the containers
  * exist but says nothing about whether they are running.
+ *
+ * `capturedMs` is when the listing was read. It is NOT decoration: the loop
+ * that consumes it is sequential and blocks on provider control-plane calls, so
+ * by the time a late row is reached this snapshot can be minutes old, and any
+ * write made on the strength of it has to be able to tell that.
  */
 interface ProviderListing {
 	keys: Set<string>;
 	states?: Map<string, ManagedContainerState>;
+	capturedMs: number;
+}
+
+/**
+ * A decision to abandon an idle-stop.
+ *
+ * `code` is the closed-set telemetry attribute, `reason` the human-readable
+ * line. The numeric fields are whatever the guard that fired happened to know;
+ * each is emitted as `null` when the guard could not compute it, so the shape
+ * of the event never depends on which branch produced it.
+ */
+interface IdleStopVeto {
+	code: SandboxIdleStopSkipReason;
+	reason: string;
+	idleForMs?: number;
+	runEndedAgoMs?: number;
+	claimedSessions?: number;
 }
 
 /**
@@ -148,14 +171,23 @@ export interface SandboxObservation {
  * is NOT running — is reported by {@link noteStranded}; it is the only state
  * here that should be impossible.
  *
- * EVERY value a decision is made from is read inside the row's own iteration,
- * never from the tick's opening snapshot. A tick is sequential and blocks on
- * provider control-plane calls, so it routinely outlives its own 60s interval —
- * one measured 392 seconds. Deciding from the top-of-tick clock and row set
- * then means deciding from data minutes old, which stopped a container four
- * seconds after a new session started on it and left the issue stuck for 37
- * minutes (NOR-406). The snapshot is a work list; `getContainerDevice` and
- * `this.now()` inside the loop are the truth.
+ * Every value the STOP and DESTROY decisions are made from is read inside the
+ * row's own iteration, never from the tick's opening snapshot. A tick is
+ * sequential and blocks on provider control-plane calls, so it routinely
+ * outlives its own 60s interval — one measured 392 seconds. Deciding from the
+ * top-of-tick clock and row set then means deciding from data minutes old,
+ * which stopped a container four seconds after a new session started on it and
+ * left the issue stuck for 37 minutes (NOR-406). The snapshot is a work list;
+ * `getContainerDevice` and `this.now()` inside the loop are the truth.
+ *
+ * The ONE deliberate exception is the provider listing, which stays tick-level
+ * because one call per provider per tick is the gauge's entire cost model (see
+ * {@link readProviderListings}). So the gauge state, and the `running_since_ms`
+ * reconciliation derived from it, are up to one tick stale — stated here rather
+ * than left implicit, because that listing is not read-only input: it drives
+ * writes. {@link sampleSandbox} carries its capture time and refuses to clear a
+ * running clock the listing predates, and every sample reports its own
+ * `listing_age_ms` so the staleness is a number rather than an assumption.
  *
  * Executor errors are logged and skipped, never thrown: one unreachable
  * provider (e.g. a dead Docker daemon) must not stop the sweep from
@@ -183,6 +215,8 @@ export class ContainerLifecycle {
 	private inFlight: Promise<void> | undefined;
 
 	constructor(opts: ContainerLifecycleOptions) {
+		// Assigned first: the clamp check below has to be able to report itself.
+		this.logger = opts.logger;
 		this.store = opts.store;
 		this.executors = opts.executors;
 		this.idleStopMs = opts.idleStopMs;
@@ -199,8 +233,22 @@ export class ContainerLifecycle {
 			opts.terminalSettleMs ?? DEFAULT_TERMINAL_SETTLE_MS,
 			opts.idleStopMs,
 		);
+		// Say so when the clamp actually binds. Silently reducing an operator's
+		// configured value leaves them with a deployment that does not do what
+		// their config file says, and no way to find that out short of reading
+		// this constructor.
+		if (
+			opts.terminalSettleMs !== undefined &&
+			opts.terminalSettleMs > opts.idleStopMs
+		) {
+			this.logger.warn(
+				`terminalSettleMs (${opts.terminalSettleMs}) exceeds idleStopMs ` +
+					`(${opts.idleStopMs}); clamped to ${this.terminalSettleMs}. The settle ` +
+					`veto covers the seconds after a run ends and must never become the ` +
+					`dominant term in the parking policy`,
+			);
+		}
 		this.sessionReconciler = opts.sessionReconciler;
-		this.logger = opts.logger;
 		this.now = opts.now ?? Date.now;
 	}
 
@@ -264,7 +312,11 @@ export class ContainerLifecycle {
 
 	/**
 	 * Reasons to abandon an idle-stop, re-derived from the store AS IT STANDS.
-	 * Returns a human-readable reason, or undefined to proceed with the stop.
+	 * Returns a `code` for the closed-set telemetry attribute plus a
+	 * human-readable `reason`, or undefined to proceed with the stop.
+	 *
+	 * The two are separate so the call sites never have to re-parse prose to
+	 * find out which guard fired — a `summarize by reason` needs the code.
 	 *
 	 * Called twice per candidate: once at the decision, and again immediately
 	 * before `stop()` — the two are separated by `status()`, a provider round
@@ -273,32 +325,78 @@ export class ContainerLifecycle {
 	private idleStopVeto(
 		deviceId: number,
 		nowMs: number,
-	): { reason: string } | undefined {
+	): IdleStopVeto | undefined {
 		const fresh = this.store.getContainerDevice(deviceId);
 		if (!fresh) {
-			return { reason: "its device row no longer exists" };
+			return {
+				code: "row_deleted",
+				reason: "its device row no longer exists",
+			};
 		}
 		const idleForMs = nowMs - this.idleSince(fresh);
 		if (idleForMs <= this.idleStopMs) {
 			// The backstop the issue asks for by name: a stop is a no-op once the
 			// row's own clock has moved past the value the decision was made from.
 			return {
+				code: "clock_moved",
 				reason:
 					`its idle clock moved while the sweep was deciding ` +
 					`(idleForMs=${idleForMs} idleStopMs=${this.idleStopMs} ` +
 					`lastRoutedMs=${fresh.lastRoutedMs ?? "none"} ` +
 					`lastActiveMs=${fresh.lastActiveMs ?? "none"})`,
+				idleForMs,
 			};
 		}
 		const lastRunMs = this.store.getLastAgentRunActivityMs(deviceId);
 		if (lastRunMs !== undefined && nowMs - lastRunMs <= this.terminalSettleMs) {
 			return {
+				code: "terminal_settle",
 				reason:
 					`an agent run on it ended ${nowMs - lastRunMs}ms ago and its worker ` +
 					`may still be flushing (terminalSettleMs=${this.terminalSettleMs})`,
+				idleForMs,
+				runEndedAgoMs: nowMs - lastRunMs,
 			};
 		}
 		return undefined;
+	}
+
+	/**
+	 * The one place a skipped idle-stop is reported.
+	 *
+	 * Both halves matter and neither substitutes for the other: the `info` line
+	 * is what a human tailing the router reads, and the event is what every
+	 * saved search and alert rule in `infra/azure/bicep/modules/monitoring.bicep`
+	 * can actually key on. Before this existed, all three skip paths reported
+	 * only in prose, so a container the sweep declined to park produced exactly
+	 * the silence NOR-406 was about — indistinguishable, from a dashboard, from
+	 * a sweep that had stalled.
+	 */
+	private noteIdleStopSkipped(
+		row: ContainerDeviceInfo,
+		veto: IdleStopVeto,
+	): void {
+		emitSandboxEvent(
+			this.logger,
+			SANDBOX_EVENTS.idleStopSkipped,
+			{
+				issueKey: row.issueKey,
+				deviceId: row.deviceId,
+				provider: row.provider,
+			},
+			{
+				reason: veto.code,
+				idle_for_ms: veto.idleForMs ?? null,
+				idle_stop_ms: this.idleStopMs,
+				terminal_settle_ms: this.terminalSettleMs,
+				run_ended_ago_ms: veto.runEndedAgoMs ?? null,
+				claimed_sessions: veto.claimedSessions ?? null,
+			},
+		);
+		this.logger.info(
+			`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
+				veto.reason,
+		);
 	}
 
 	private notePinned(deviceId: number, issueKey: string): void {
@@ -430,6 +528,7 @@ export class ContainerLifecycle {
 					byProvider.set(provider, {
 						keys: new Set(states.map((s) => s.issueKey)),
 						states: new Map(states.map((s) => [s.issueKey, s])),
+						capturedMs: this.now(),
 					});
 				} else {
 					// A provider predating the bulk-state seam. Its listing proves
@@ -437,6 +536,7 @@ export class ContainerLifecycle {
 					// gauge reports `unknown` rather than guessing at running.
 					byProvider.set(provider, {
 						keys: new Set(await executor.listManaged()),
+						capturedMs: this.now(),
 					});
 				}
 			} catch (err) {
@@ -463,6 +563,19 @@ export class ContainerLifecycle {
 	 * Skipped entirely when the state is `unknown`: a provider we could not read
 	 * must not be allowed to clear a running clock, or one throttled ARM call
 	 * would silently reset every uptime in the fleet.
+	 *
+	 * The SAME principle bounds the clear when the listing is merely OLD. Unlike
+	 * every other input to this loop, the listing is deliberately tick-level —
+	 * one call per provider per tick is the gauge's whole cost model, and a
+	 * per-row `status()` fan-out would throttle exactly when the fleet is
+	 * largest. So it can be minutes stale by the time a late row is reached, and
+	 * a container that was absent when the listing was taken and has been booted
+	 * since would otherwise have the `running_since_ms` its boot just stamped
+	 * cleared out from under it. That column is the sole input to the 6-hour
+	 * long-running-sandbox alert, so the clear would silently reset the uptime of
+	 * precisely the sandboxes that were busy through a slow tick. A clock stamped
+	 * AFTER the listing was captured is a fact the listing cannot speak to; leave
+	 * it alone and let the next tick's fresh listing settle it.
 	 */
 	private sampleSandbox(
 		row: ContainerDeviceInfo,
@@ -484,7 +597,10 @@ export class ContainerLifecycle {
 			if (this.store.markDeviceRunning(row.deviceId, now)) runningSinceMs = now;
 		} else if (
 			(gaugeState === "stopped" || gaugeState === "absent") &&
-			runningSinceMs !== undefined
+			runningSinceMs !== undefined &&
+			// Only when the listing is actually newer than the clock it would erase.
+			listing !== undefined &&
+			runningSinceMs <= listing.capturedMs
 		) {
 			this.store.clearDeviceRunningSince(row.deviceId);
 			runningSinceMs = undefined;
@@ -509,6 +625,9 @@ export class ContainerLifecycle {
 				: {}),
 			...(row.lastRoutedMs !== undefined
 				? { lastRoutedAgeMs: now - row.lastRoutedMs }
+				: {}),
+			...(listing !== undefined
+				? { listingAgeMs: now - listing.capturedMs }
 				: {}),
 		});
 		return gaugeState;
@@ -591,6 +710,10 @@ export class ContainerLifecycle {
 		const listings = await this.readProviderListings();
 		const counts = { running: 0, stopped: 0, absent: 0, unknown: 0 };
 		let pinned = 0;
+		// Sandboxes that qualified for parking and were spared anyway. A
+		// fleet-level number, so a deferral wave is visible on a dashboard without
+		// anyone first suspecting a particular issue and opening its timeline.
+		let deferred = 0;
 
 		for (const snapshot of rows) {
 			const executor = this.executors.get(snapshot.provider);
@@ -721,10 +844,8 @@ export class ContainerLifecycle {
 					// about it is a request we would rather not spend.
 					const settleVeto = this.idleStopVeto(row.deviceId, rowNow);
 					if (settleVeto) {
-						this.logger.info(
-							`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
-								settleVeto.reason,
-						);
+						this.noteIdleStopSkipped(row, settleVeto);
+						deferred += 1;
 						continue;
 					}
 					// `status` is read only once the clock already qualifies, so the
@@ -752,11 +873,15 @@ export class ContainerLifecycle {
 						// Activity, and the reason this device must keep its idle window:
 						// the stop is being abandoned precisely because work arrived.
 						this.store.markDeviceActive(row.deviceId, rowNow);
-						this.logger.info(
-							`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
+						this.noteIdleStopSkipped(row, {
+							code: "claimed_mid_sweep",
+							reason:
 								`session(s) ${claimedMidSweep.map((r) => r.sessionId).join(", ")} ` +
 								`claimed it while the sweep was deciding`,
-						);
+							idleForMs,
+							claimedSessions: claimedMidSweep.length,
+						});
+						deferred += 1;
 						continue;
 					}
 					// The same veto again, now against the clock as it stands after
@@ -766,10 +891,8 @@ export class ContainerLifecycle {
 					// without ever adding a row this loop has not already seen.
 					const preStopVeto = this.idleStopVeto(row.deviceId, this.now());
 					if (preStopVeto) {
-						this.logger.info(
-							`Skipped idle-stop of ${row.issueKey} (device=${row.deviceId}): ` +
-								preStopVeto.reason,
-						);
+						this.noteIdleStopSkipped(row, preStopVeto);
+						deferred += 1;
 						continue;
 					}
 					if (status === "running") {
@@ -879,6 +1002,7 @@ export class ContainerLifecycle {
 				absent: counts.absent,
 				unknown: counts.unknown,
 				pinned,
+				deferred,
 				duration_ms: this.now() - now,
 			}),
 		);

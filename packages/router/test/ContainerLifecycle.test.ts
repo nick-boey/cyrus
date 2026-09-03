@@ -1947,7 +1947,13 @@ describe("ContainerLifecycle", () => {
 			expect(aca.stop).not.toHaveBeenCalled();
 		});
 
-		it("never delays a stop by more than one idle window", async () => {
+		it("clamps the veto's lookback to one idle window, so a long terminalSettleMs cannot pin", async () => {
+			// What the clamp bounds is each veto's LOOKBACK — how old a run stamp
+			// may be and still veto — not the cumulative deferral, which is bounded
+			// instead by the veto's reference point (`lastRunMs`) being frozen once
+			// a run goes terminal. Named for the former because that is what this
+			// test drives.
+			//
 			// The veto covers the SECONDS between a run ending and its worker
 			// finishing saying so. Unclamped, a deployment with a short
 			// `idleStopMs` would have its parking policy quietly replaced by the
@@ -1976,6 +1982,310 @@ describe("ContainerLifecycle", () => {
 			await lifecycleFor(aca, () => now, idleStopMs, 120_000).sweep();
 
 			expect(aca.stop).toHaveBeenCalledWith("CAN-141");
+		});
+
+		it("warns when the clamp actually binds, rather than silently reducing the configured value", async () => {
+			// Silently applying something other than what the config file says
+			// leaves an operator with no way to discover it short of reading the
+			// constructor.
+			const aca = fakeExecutor("aca", { status: "running" });
+			lifecycleFor(aca, () => 0, 300_000, 600_000);
+
+			expect(
+				logger.warn.mock.calls.filter(([m]) =>
+					String(m).includes("exceeds idleStopMs"),
+				),
+			).toHaveLength(1);
+		});
+
+		it("says nothing when the configured value fits inside the idle window", async () => {
+			const aca = fakeExecutor("aca", { status: "running" });
+			lifecycleFor(aca, () => 0, 300_000, 120_000);
+
+			expect(logger.warn).not.toHaveBeenCalled();
+		});
+	});
+
+	// ── Every abandoned idle-stop has to be queryable ───────────────────────
+	// Reported only in prose, a skipped stop is invisible to every saved search
+	// and alert rule, all of which key on the structured `event` field. That
+	// makes the success signal for the whole NOR-406 fix an ABSENCE of
+	// `sandbox.idle_stopped` — indistinguishable from a sweep that has stalled —
+	// and leaves a container held out of parking indefinitely bucketed as an
+	// unremarkable `running`, which is the three-plain-fields silence that let
+	// NOR-366 run for nine hours.
+	describe("skipped idle-stops are reported as events, not only as log lines", () => {
+		function lifecycleFor(
+			aca: ContainerExecutor,
+			now: () => number,
+			idleStopMs: number,
+			terminalSettleMs?: number,
+		) {
+			return new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				...(terminalSettleMs !== undefined ? { terminalSettleMs } : {}),
+				logger,
+				now,
+			});
+		}
+
+		it("names the guard that fired with a closed-set reason: clock_moved", async () => {
+			const { deviceId, createdMs } = makeContainerDevice("CAN-145", "aca");
+			const idleStopMs = 300_000;
+			const now = createdMs + idleStopMs + 1;
+			const aca = fakeExecutor("aca", { status: "running" });
+			aca.status.mockImplementation(async () => {
+				store.enqueueEvent(deviceId, "{}", now, 48 * 3_600_000);
+				return "running";
+			});
+
+			await lifecycleFor(aca, () => now, idleStopMs).sweep();
+
+			expect(aca.stop).not.toHaveBeenCalled();
+			expect(eventsNamed(logger, "sandbox.idle_stop_skipped")[0]).toMatchObject(
+				{
+					issue_key: "CAN-145",
+					device_id: deviceId,
+					provider: "aca",
+					reason: "clock_moved",
+					idle_stop_ms: idleStopMs,
+				},
+			);
+		});
+
+		it("names the guard that fired with a closed-set reason: claimed_mid_sweep", async () => {
+			const { deviceId, createdMs } = makeContainerDevice("CAN-146", "aca");
+			const idleStopMs = 300_000;
+			const now = createdMs + idleStopMs + 1;
+			const aca = fakeExecutor("aca", { status: "running" });
+			aca.status.mockImplementation(async () => {
+				store.setSessionAffinity("review", deviceId, undefined, now);
+				return "running";
+			});
+
+			await lifecycleFor(aca, () => now, idleStopMs).sweep();
+
+			expect(eventsNamed(logger, "sandbox.idle_stop_skipped")[0]).toMatchObject(
+				{
+					issue_key: "CAN-146",
+					reason: "claimed_mid_sweep",
+					claimed_sessions: 1,
+					idle_for_ms: idleStopMs + 1,
+				},
+			);
+		});
+
+		it("names the guard that fired with a closed-set reason: terminal_settle", async () => {
+			const idleStopMs = 300_000;
+			const { deviceId, createdMs } = makeContainerDevice("CAN-147", "aca");
+			store.recordAgentRunRouted({
+				deviceId,
+				issueKey: "CAN-147",
+				sessionId: "s-1",
+				routedMs: createdMs,
+			});
+			const now = createdMs + idleStopMs + 1;
+			store.finishAgentRun("s-1", "complete", now - 3_800);
+			const aca = fakeExecutor("aca", { status: "running" });
+
+			await lifecycleFor(aca, () => now, idleStopMs, 120_000).sweep();
+
+			expect(eventsNamed(logger, "sandbox.idle_stop_skipped")[0]).toMatchObject(
+				{
+					issue_key: "CAN-147",
+					reason: "terminal_settle",
+					run_ended_ago_ms: 3_800,
+					terminal_settle_ms: 120_000,
+				},
+			);
+		});
+
+		it("names the guard that fired with a closed-set reason: row_deleted", async () => {
+			// Only reachable at the PRE-STOP check: the loop's own re-read already
+			// skips a row that vanished before the decision, so this is a teardown
+			// that landed during the `status()` round trip.
+			const idleStopMs = 300_000;
+			const { deviceId, createdMs } = makeContainerDevice("CAN-148", "aca");
+			const now = createdMs + idleStopMs + 1;
+			const aca = fakeExecutor("aca", { status: "running" });
+			aca.status.mockImplementation(async () => {
+				store.deleteContainerDevice(deviceId);
+				return "running";
+			});
+
+			await lifecycleFor(aca, () => now, idleStopMs).sweep();
+
+			expect(aca.stop).not.toHaveBeenCalled();
+			expect(eventsNamed(logger, "sandbox.idle_stop_skipped")[0]).toMatchObject(
+				{ issue_key: "CAN-148", reason: "row_deleted" },
+			);
+		});
+
+		it("counts deferrals in the per-tick rollup, so a deferral wave shows up fleet-wide", async () => {
+			// Without this the only way to notice is to already suspect a
+			// particular issue and open its timeline.
+			const idleStopMs = 300_000;
+			const { deviceId, createdMs } = makeContainerDevice("CAN-149", "aca");
+			const now = createdMs + idleStopMs + 1;
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey: "CAN-149", status: "running" }],
+			});
+			aca.status.mockImplementation(async () => {
+				store.enqueueEvent(deviceId, "{}", now, 48 * 3_600_000);
+				return "running";
+			});
+
+			await lifecycleFor(aca, () => now, idleStopMs).sweep();
+
+			expect(eventsNamed(logger, "sandbox.sweep_completed")[0]).toMatchObject({
+				sandboxes: 1,
+				deferred: 1,
+			});
+		});
+
+		it("reports nothing when the stop actually happens", async () => {
+			// The guard against reporting a deferral on every ordinary park, which
+			// would make the alert on sustained deferral useless.
+			const idleStopMs = 300_000;
+			const { createdMs } = makeContainerDevice("CAN-150", "aca");
+			const aca = fakeExecutor("aca", { status: "running" });
+
+			await lifecycleFor(
+				aca,
+				() => createdMs + idleStopMs + 1,
+				idleStopMs,
+			).sweep();
+
+			expect(aca.stop).toHaveBeenCalledWith("CAN-150");
+			expect(eventsNamed(logger, "sandbox.idle_stop_skipped")).toHaveLength(0);
+			expect(eventsNamed(logger, "sandbox.sweep_completed")[0]).toMatchObject({
+				deferred: 0,
+			});
+		});
+	});
+
+	// ── The provider listing is tick-level, and it drives WRITES ────────────
+	// One listing per provider per tick is the gauge's whole cost model, so it
+	// is the one input the per-row re-read deliberately does not cover. That is
+	// fine while it only feeds a gauge reading; it is not fine when it decides
+	// whether to erase `running_since_ms`, the sole input to the 6-hour
+	// long-running-sandbox alert.
+	describe("a stale provider listing must not erase a newer running clock", () => {
+		it("keeps a running clock stamped after the listing was taken", async () => {
+			// The shape: absent when the tick's listing was read, booted by a route
+			// while the tick was still grinding through earlier rows, and reached
+			// minutes later. The boot's `running_since_ms` is a fact the listing
+			// cannot speak to.
+			const decoy = makeContainerDevice("CAN-151", "aca");
+			const victim = makeContainerDevice("CAN-152", "aca");
+			const idleStopMs = 300_000;
+			let now = victim.createdMs + idleStopMs + 1;
+			// Neither issue is in the listing, so both read as `absent` — the
+			// state that clears a running clock.
+			const aca = fakeExecutor("aca", { listStates: [] });
+			aca.status.mockImplementation(async (issueKey: string) => {
+				if (issueKey === "CAN-151") {
+					// Six and a half minutes pass inside the decoy's provider call,
+					// and a route boots CAN-152 during them.
+					now += 392_000;
+					store.markDeviceRunning(victim.deviceId, now);
+				}
+				return "running";
+			});
+			// The victim is pinned, so the sweep samples it and parks nothing: this
+			// test is about the gauge's WRITE, not about the stop decision. The
+			// decoy holds no affinity, which is what carries it into `status()`.
+			store.setSessionAffinity("s-2", victim.deviceId, undefined, now);
+
+			await new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+			}).sweep();
+
+			expect(decoy.deviceId).not.toBe(victim.deviceId);
+
+			expect(
+				store.getContainerDevice(victim.deviceId)?.runningSinceMs,
+			).toBeDefined();
+		});
+
+		it("still clears a running clock the listing is genuinely newer than", async () => {
+			// The other half: a sandbox that really did stop must not keep
+			// accumulating uptime, or the 6-hour alert fires on a stopped sandbox.
+			const { deviceId, createdMs } = makeContainerDevice("CAN-153", "aca");
+			store.markDeviceRunning(deviceId, createdMs);
+			const aca = fakeExecutor("aca", {
+				status: "stopped",
+				listStates: [{ issueKey: "CAN-153", status: "stopped" }],
+			});
+			store.setSessionAffinity("s-1", deviceId, undefined, createdMs);
+
+			await new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => createdMs + 60_000,
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+			}).sweep();
+
+			expect(
+				store.getContainerDevice(deviceId)?.runningSinceMs,
+			).toBeUndefined();
+		});
+
+		it("reports how stale the state it sampled was, so the number is not an assumption", async () => {
+			// Every other field on a gauge sample is read per-row; `state` is not.
+			// A reader who does not know that will trust a `stopped` reading taken
+			// six minutes before the row was reached.
+			const decoy = makeContainerDevice("CAN-154", "aca");
+			makeContainerDevice("CAN-155", "aca");
+			const idleStopMs = 300_000;
+			let now = decoy.createdMs + idleStopMs + 1;
+			const aca = fakeExecutor("aca", {
+				listStates: [
+					{ issueKey: "CAN-154", status: "stopped" },
+					{ issueKey: "CAN-155", status: "stopped" },
+				],
+			});
+			// The decoy's provider call is what makes the tick outlive its interval.
+			aca.status.mockImplementation(async (issueKey: string) => {
+				if (issueKey === "CAN-154") now += 392_000;
+				return "stopped";
+			});
+
+			await new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				logger,
+				now: () => now,
+			}).sweep();
+
+			const samples = eventsNamed(logger, "sandbox.gauge");
+			// Sampled first, off a listing read moments earlier.
+			expect(samples.find((s) => s.issue_key === "CAN-154")).toMatchObject({
+				listing_age_ms: 0,
+			});
+			// Sampled after the slow call, off the SAME listing.
+			expect(samples.find((s) => s.issue_key === "CAN-155")).toMatchObject({
+				listing_age_ms: 392_000,
+			});
 		});
 	});
 });
