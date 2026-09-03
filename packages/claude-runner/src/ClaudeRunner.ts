@@ -39,10 +39,7 @@ import { cyrusSpanAttributes, getTracer, type Span } from "cyrus-otel-traces";
 import dotenv from "dotenv";
 import { ClaudeMessageFormatter, type IMessageFormatter } from "./formatter.js";
 import { buildHomeDirectoryDisallowedTools } from "./home-directory-restrictions.js";
-import {
-	checkLinuxSandboxRequirements,
-	logSandboxRequirementFailures,
-} from "./sandbox-requirements.js";
+import { resolveSubprocessEnvScrub } from "./sandbox-requirements.js";
 import { composeSessionEnv, normalizeMcpHttpTransport } from "./session-env.js";
 import type {
 	ClaudeRunnerConfig,
@@ -510,6 +507,25 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			throw new Error("Claude session already running");
 		}
 
+		// Resolved HERE — before the session span, the log streams, and above all
+		// before the `try` below — because the throw is the entire point and the
+		// `try`'s catch does not rethrow. It emits "error" and returns
+		// sessionInfo, and every production caller registers an onError listener
+		// (EdgeWorker does), so a throw raised inside it would resolve `start()`
+		// normally and leave a Linear agent session hanging with no activities
+		// and no terminal state — the NOR-402 shape, and the exact
+		// "off, with a log line nothing alerts on" outcome NOR-412 objected to.
+		// Nothing has been allocated yet at this point, so there is nothing for
+		// the `finally` to clean up.
+		//
+		// On Linux, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 makes the SDK run tool
+		// invocations under a bubblewrap-backed sandbox, keeping this session's
+		// Anthropic credentials out of the env of every Bash subprocess the agent
+		// spawns. Off unless CYRUS_SUBPROCESS_ENV_SCRUB opts in. See NOR-412.
+		const subprocessEnvScrub = resolveSubprocessEnvScrub({
+			logger: this.logger,
+		});
+
 		// Initialize session info without session ID (will be set from first message)
 		this.sessionInfo = {
 			sessionId: null,
@@ -709,16 +725,6 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 
 			const pathToClaudeCodeExecutable = this.config.pathToClaudeCodeExecutable;
 
-			// On Linux, setting CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 causes the SDK
-			// to run tool invocations under a bubblewrap-backed sandbox. If the
-			// host lacks `socat`, `bubblewrap`, or the kernel/AppArmor config
-			// needed to create an unprivileged user namespace, the sandbox will
-			// fail at runtime. Check those requirements up front so we can fall
-			// back to unscrubbed env (and log resolution guidance to stdout)
-			// instead of failing opaquely mid-session.
-			const sandboxRequirements = checkLinuxSandboxRequirements();
-			logSandboxRequirementFailures(sandboxRequirements, this.logger);
-
 			const isDebugLogging = this.logger.getLevel() === LogLevel.DEBUG;
 
 			const queryOptions: Parameters<typeof query>[0] = {
@@ -741,17 +747,30 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					// see: https://docs.claude.com/en/docs/claude-code/sdk/migration-guide#settings-sources-no-longer-loaded-by-default
 					settingSources: ["user", "project", "local"],
 					env: {
-						// CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is intentionally NOT set while
-						// the Linux bubblewrap sandbox side effects it triggers are being
-						// investigated. The sandbox requirements precheck is still run
-						// above so the diagnostics remain available when we re-enable.
-						// See: CYPACK-1108.
 						// composeSessionEnv merges base env → repository .env →
 						// additionalEnv.
 						...composeSessionEnv({
 							repositoryEnv: this.repositoryEnv,
 							additionalEnv: this.config.additionalEnv,
 						}),
+						// Set or unset explicitly. composeSessionEnv spreads the whole
+						// parent process.env, so leaving this to fall through would let
+						// a stray CLAUDE_CODE_SUBPROCESS_ENV_SCRUB in the worker's own
+						// environment enable the SDK sandbox behind resolveSubprocessEnvScrub's
+						// back — on a host it just declined to enable it for.
+						//
+						// INERT when `config.warmSession` is set: the branch below hands
+						// the prompt to `warmSession.query()` and discards `queryOptions`
+						// wholesale, so the operative env is the one
+						// `EdgeWorker.warmupRecentSessions()` passed to `startup()`. The
+						// two agree today only because both call
+						// `resolveSubprocessEnvScrub` against the same `process.env` in
+						// the same process — not because anything reconciles them. The
+						// first thing that makes this decision per-repository or
+						// hot-reloadable will diverge here silently.
+						CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: subprocessEnvScrub.enabled
+							? "1"
+							: undefined,
 						// When logging at DEBUG level, enable the SDK's own debug output so
 						// --debug-to-stderr and DEBUG=1 propagate to the Claude subprocess.
 						// Explicitly set or unset to override any leaked value from process.env.

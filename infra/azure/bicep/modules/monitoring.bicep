@@ -641,6 +641,76 @@ resource skillSlashTimeline 'Microsoft.OperationalInsights/workspaces/savedSearc
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Subprocess env scrubbing (NOR-412)
+////////////////////////////////////////////////////////////////////////////////
+//
+// NOR-412 was filed because a security control was off in every sandbox and the
+// only trace was a prose warning nothing could alert on. `session.env_scrub_
+// resolved` is what makes the posture queryable instead.
+//
+// The row that matters is `requested == true and enabled == false`: the host was
+// asked for the scrub and cannot provide it, which aborts EVERY session on it.
+// `failures` names the unmet requirements (`socat`, `bubblewrap`,
+// `bwrap-sandbox`, `platform`) so the fix is visible from the query.
+resource envScrubPosture 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Env-Scrub-Posture'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Subprocess env scrub posture (requested vs actually enabled)'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "session.env_scrub_resolved"'
+        '| extend'
+        '    requested = tobool(p["cyrus.requested"]),'
+        '    enabled   = tobool(p["cyrus.enabled"]),'
+        '    platform  = tostring(p["cyrus.platform"]),'
+        '    failures  = tostring(p["cyrus.failures"]),'
+        '    issue_key = tostring(p["cyrus.issue_key"])'
+        '| summarize'
+        '    sessions   = count(),'
+        '    issues     = dcount(issue_key),'
+        '    last_seen  = max(TimeGenerated)'
+        '  by requested, enabled, platform, failures'
+        '| order by requested desc, enabled asc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// Requested-and-unavailable, on its own. Every one of these is a session that
+// failed to start; a non-empty result is an outage on that host, not a warning.
+resource envScrubUnavailable 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Env-Scrub-Unavailable'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Env scrub requested but unavailable (sessions aborted)'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "session.env_scrub_resolved"'
+        '| where tobool(p["cyrus.requested"]) and not(tobool(p["cyrus.enabled"]))'
+        '| project'
+        '    TimeGenerated,'
+        '    platform  = tostring(p["cyrus.platform"]),'
+        '    failures  = tostring(p["cyrus.failures"]),'
+        '    issue_key = tostring(p["cyrus.issue_key"]),'
+        '    device_id = tostring(p["cyrus.device_id"])'
+        '| order by TimeGenerated desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Distributed traces (Phase 5 / NOR-283)
 ////////////////////////////////////////////////////////////////////////////////
 //

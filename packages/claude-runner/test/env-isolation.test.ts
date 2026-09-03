@@ -5,8 +5,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 	query: vi.fn(),
 }));
 
-// Mock the sandbox-requirements module so tests can control whether the
-// Linux sandbox precheck reports the host as supported.
+// Mock the sandbox-requirements module so tests can control what the scrub
+// resolution decides without probing the host running the suite.
 vi.mock("../src/sandbox-requirements", () => ({
 	checkLinuxSandboxRequirements: vi.fn(() => ({
 		supported: true,
@@ -15,6 +15,7 @@ vi.mock("../src/sandbox-requirements", () => ({
 	})),
 	logSandboxRequirementFailures: vi.fn(),
 	resetSandboxRequirementsCacheForTesting: vi.fn(),
+	resolveSubprocessEnvScrub: vi.fn(() => ({ enabled: false })),
 }));
 
 // Track readFileSync calls per path so we can change .env contents between sessions
@@ -50,10 +51,7 @@ vi.mock("os", () => ({
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeRunner } from "../src/ClaudeRunner";
-import {
-	checkLinuxSandboxRequirements,
-	logSandboxRequirementFailures,
-} from "../src/sandbox-requirements";
+import { resolveSubprocessEnvScrub } from "../src/sandbox-requirements";
 import type { ClaudeRunnerConfig } from "../src/types";
 
 describe("Environment variable isolation", () => {
@@ -204,7 +202,7 @@ describe("Environment variable isolation", () => {
 		expect(envB.OTHER).toBe("only-in-b");
 	});
 
-	it("should never set CLAUDE_CODE_SUBPROCESS_ENV_SCRUB (disabled pending CYPACK-1108)", async () => {
+	it("should leave CLAUDE_CODE_SUBPROCESS_ENV_SCRUB unset when the scrub resolves to off", async () => {
 		mockSuccessfulQuery();
 		const runner = new ClaudeRunner(makeConfig("/repo-a"));
 		await runner.start("test");
@@ -213,30 +211,111 @@ describe("Environment variable isolation", () => {
 		expect(env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBeUndefined();
 	});
 
-	it("should log sandbox requirement guidance when the Linux sandbox precheck fails", async () => {
-		vi.mocked(checkLinuxSandboxRequirements).mockReturnValueOnce({
-			supported: false,
-			platform: "linux",
-			failures: [
-				{
-					check: "bwrap-sandbox",
-					message:
-						"bubblewrap cannot create an unprivileged user namespace: Permission denied",
-					resolution: "Enable unprivileged user namespaces.",
-				},
-			],
-		});
+	it("should set CLAUDE_CODE_SUBPROCESS_ENV_SCRUB when the scrub resolves to on", async () => {
+		vi.mocked(resolveSubprocessEnvScrub).mockReturnValueOnce({ enabled: true });
 
 		mockSuccessfulQuery();
 		const runner = new ClaudeRunner(makeConfig("/repo-a"));
 		await runner.start("test");
 
-		const env = getQueryEnv();
-		expect(env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBeUndefined();
-		expect(logSandboxRequirementFailures).toHaveBeenCalledWith(
-			expect.objectContaining({ supported: false }),
-			expect.anything(),
+		expect(getQueryEnv().CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe("1");
+	});
+
+	it("should override a CLAUDE_CODE_SUBPROCESS_ENV_SCRUB leaked from the parent process", async () => {
+		// composeSessionEnv spreads the whole parent env, so a stray value here
+		// would otherwise turn the SDK sandbox on for a host that just declined
+		// to enable it.
+		process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = "1";
+		try {
+			mockSuccessfulQuery();
+			const runner = new ClaudeRunner(makeConfig("/repo-a"));
+			await runner.start("test");
+
+			expect(getQueryEnv().CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBeUndefined();
+		} finally {
+			delete process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB;
+		}
+	});
+
+	it("should fail the session, not run unscrubbed, when a requested scrub is unavailable", async () => {
+		vi.mocked(resolveSubprocessEnvScrub).mockImplementationOnce(() => {
+			throw new Error(
+				"CYRUS_SUBPROCESS_ENV_SCRUB is set, but this host cannot support it",
+			);
+		});
+
+		// `onError` is what makes this test worth having. start()'s catch emits
+		// "error" and returns instead of rethrowing, and EventEmitter only
+		// rethrows an unhandled "error" — so with a listener registered, which
+		// every production caller does, a throw raised inside that try would
+		// resolve start() normally and hang the session. Without this line the
+		// assertion below passes for the wrong reason.
+		const onError = vi.fn();
+		mockSuccessfulQuery();
+		const runner = new ClaudeRunner(
+			Object.assign(makeConfig("/repo-a"), { onError }),
 		);
+
+		await expect(runner.start("test")).rejects.toThrow("cannot support");
+		// The whole point: no query was ever issued without the scrub.
+		expect(mockQuery).not.toHaveBeenCalled();
+		// And it surfaced as a rejection, not as a swallowed error event.
+		expect(onError).not.toHaveBeenCalled();
+	});
+
+	it("does not apply its own scrub decision when running on a warm session", async () => {
+		// A warm session discards `queryOptions` entirely — the env that governs
+		// is the one EdgeWorker.warmupRecentSessions() handed to `startup()`
+		// before this runner existed. Pinning that here so the comment at the
+		// assignment site cannot quietly stop being true: anything that makes the
+		// scrub decision per-repository or hot-reloadable has to reconcile the two
+		// call sites rather than assume the runner-side value still applies.
+		vi.mocked(resolveSubprocessEnvScrub).mockReturnValueOnce({ enabled: true });
+
+		const warmQuery = vi.fn(async function* () {
+			yield {
+				type: "assistant",
+				message: { content: [{ type: "text", text: "Done" }] },
+				parent_tool_use_id: null,
+				session_id: "warm-session",
+			} as any;
+		});
+
+		mockSuccessfulQuery();
+		const runner = new ClaudeRunner(
+			Object.assign(makeConfig("/repo-a"), {
+				warmSession: { query: warmQuery },
+			}),
+		);
+		await runner.start("test");
+
+		expect(warmQuery).toHaveBeenCalledTimes(1);
+		// The SDK `query()` — and with it every env var built above — is bypassed.
+		expect(mockQuery).not.toHaveBeenCalled();
+	});
+
+	it("still aborts before reaching a warm session when a requested scrub is unavailable", async () => {
+		// The resolve sits above start()'s try, so it must gate the warm path too
+		// — otherwise opting in on an unsupported host would silently run
+		// unscrubbed for exactly the sessions that got pre-warmed.
+		vi.mocked(resolveSubprocessEnvScrub).mockImplementationOnce(() => {
+			throw new Error("CYRUS_SUBPROCESS_ENV_SCRUB is set, but this host…");
+		});
+
+		const warmQuery = vi.fn();
+		const onError = vi.fn();
+		const runner = new ClaudeRunner(
+			Object.assign(makeConfig("/repo-a"), {
+				warmSession: { query: warmQuery },
+				onError,
+			}),
+		);
+
+		await expect(runner.start("test")).rejects.toThrow(
+			"CYRUS_SUBPROCESS_ENV_SCRUB is set",
+		);
+		expect(warmQuery).not.toHaveBeenCalled();
+		expect(onError).not.toHaveBeenCalled();
 	});
 
 	it("should let repositoryEnv and additionalEnv override process.env", async () => {

@@ -84,12 +84,26 @@ pkg_install() {
 # from Debian's own archive, from Alpine's main repo, and from RHEL's — so a
 # package-per-family approach has no branch that works everywhere. The binary
 # is static Go, so one tarball per arch covers every base here.
+#
+# `socat` and `bubblewrap` are the two host prerequisites of the Claude Code
+# SDK's subprocess env scrub (`CYRUS_SUBPROCESS_ENV_SCRUB`), which keeps the
+# session's Anthropic credentials out of the env of every Bash subprocess the
+# agent spawns. They must be here as well as in docker/worker/Dockerfile: a
+# repository with its own devcontainer gets its image from ADR 0006's path,
+# which never runs that Dockerfile, so installing them there alone would leave
+# every devcontainer-based sandbox without them. The opt-in is per user, not
+# per image (it rides the secret bundle into every container), so a mixed fleet
+# with only half the images equipped means enabling it fails every session on
+# the other half (NOR-412).
+#
+# The third prerequisite — creating an unprivileged user namespace — is a
+# property of the runtime and cannot be installed. Hence the opt-in.
 # ---------------------------------------------------------------------------
 case "${FAMILY}" in
-alpine) pkg_install ca-certificates curl git jq tar xz libstdc++ ;;
-debian) pkg_install ca-certificates curl git jq tar xz-utils ;;
-rhel) pkg_install ca-certificates curl git jq tar xz ;;
-azurelinux) pkg_install ca-certificates curl git jq tar xz ;;
+alpine) pkg_install ca-certificates curl git jq tar xz libstdc++ socat bubblewrap ;;
+debian) pkg_install ca-certificates curl git jq tar xz-utils socat bubblewrap ;;
+rhel) pkg_install ca-certificates curl git jq tar xz socat bubblewrap ;;
+azurelinux) pkg_install ca-certificates curl git jq tar xz socat bubblewrap ;;
 esac
 
 arch="$(uname -m)"

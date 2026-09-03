@@ -902,6 +902,124 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      routes carry tokens in query position, and a secret that reaches a telemetry
      backend is disclosed.
 
+15. **Subprocess env scrubbing (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`)**:
+   - **The SDK flag is not the switch; `CYRUS_SUBPROCESS_ENV_SCRUB` is.** Setting
+     the SDK flag on a host without bubblewrap does nothing at all, which is why
+     it must never be passed straight through from config or inherited from the
+     parent env. `resolveSubprocessEnvScrub`
+     (`packages/claude-runner/src/sandbox-requirements.ts`) is the only place
+     that decides, and both call sites — `ClaudeRunner.start()` and
+     `EdgeWorker.warmupRecentSessions()` — set **or unset** the SDK flag
+     explicitly. `buildBaseSessionEnv` spreads the entire parent `process.env`,
+     so an unset key there means "inherit whatever the worker happened to have",
+     not "off". The runner-side assignment is **inert when `config.warmSession`
+     is set** — that branch discards `queryOptions` and calls
+     `warmSession.query()`, so the warmup's env is what governs. The two agree
+     only because both resolve against the same `process.env` in the same
+     process; nothing reconciles them, so anything that makes this decision
+     per-repository or hot-reloadable must reconcile them explicitly.
+     Because every call site overwrites it, a hand-set
+     `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is discarded — including one from a
+     repository `.env` or a secret bundle. Discarding it silently is
+     indistinguishable from the control working, so the resolver warns once when
+     it sees one.
+   - **Requested-but-unavailable is FATAL, not a warn — and the throw has to be
+     sited OUTSIDE `startWithPrompt`'s `try`.** A security control that degrades
+     to off with a `warn` is off again the next time a dependency goes missing,
+     and nothing alerts on it — which is how the worker image ran for months
+     without `socat` or `bubblewrap` and nobody noticed (NOR-412). But that
+     `catch` **does not rethrow**: it emits `"error"` and returns `sessionInfo`,
+     and `EventEmitter` only rethrows an *unhandled* `"error"`. Every production
+     caller registers an `onError` listener (`EdgeWorker` does), so a throw
+     raised inside the `try` resolves `start()` normally and leaves a Linear
+     agent session hanging with no activities and no terminal state — the
+     NOR-402 shape, and the exact outcome this control exists to prevent. The
+     same trap swallows any future precondition check; put it above the `try`,
+     where nothing has been allocated for the `finally` to clean up. Test it
+     with an `onError` listener registered, or the assertion passes for the
+     wrong reason.
+   - **Rejecting `start()` is necessary and NOT sufficient — nothing above it
+     was listening.** The second half of the same trap: `initializeAgentRunner`
+     rethrows, `handleAgentSessionCreatedWebhook` does not catch, and
+     `handleWebhook`'s catch logs and *deliberately* does not rethrow so a bad
+     webhook cannot take the process down. So the rejection died as one log
+     line while `postInstantAcknowledgment` had already posted a thought — the
+     session read as working forever, and the router's issue lock and affinity
+     stayed pinned, because only `"sessionTerminal"` releases them. The router's
+     stranded-session detector cannot see this either: it keys on
+     `state=stopped && sessions>0 && online=false`, and here the sandbox is
+     running, online, and holds affinity. `AgentSessionManager.failSession()`
+     is the fix and both start sites call it before rethrowing. Treat "throws"
+     as an unfinished sentence: a start-time failure is only fatal if some
+     handler converts it into a terminal Linear state.
+   - **The scrub is Linux-only, and "we found nothing to object to" is not "the
+     control is in place".** `checkLinuxSandboxRequirements` reports every
+     non-Linux host as `supported: true`, which is right for a bubblewrap
+     precheck and wrong as the sole predicate for a credential control — it
+     returned enabled on macOS having probed nothing at all, on the one platform
+     where the undocumented flag is most likely to be a no-op and could never
+     fail loudly. `checkSubprocessEnvScrubRequirements` gates on platform for
+     that reason. Widen it only for a platform where the scrub has actually been
+     observed.
+   - **Never cache a negative probe result.** The error we raise tells the
+     operator to install the missing packages; memoising the failure means the
+     next session after they do fails identically, and every session after that,
+     until the worker restarts — on a long-lived ACA sandbox, a
+     `router containers destroy` and re-prompt to apply a fix we ourselves asked
+     for. `checkLinuxSandboxRequirements` caches only `supported: true`. A test
+     asserting "keeps throwing on every session" will pass on the stale cache
+     alone, so give it fresh probes or it pins nothing.
+   - When the opt-in is absent, the host is **not probed at all** — the
+     requirements of a control nothing would have enabled are not interesting,
+     and probing for them is what produced the misleading
+     "requirements are not met — skipping" warning in every sandbox.
+   - **Three prerequisites, and only two of them live in the image — in TWO
+     image paths.** `socat` and `bubblewrap` are installed by
+     `docker/worker/Dockerfile` (the default image) **and** by
+     `features/src/cyrus-worker/install.sh` (per-repository devcontainer images,
+     ADR 0006, which never run that Dockerfile). Adding them to one path only
+     leaves half the fleet unequipped, and because the opt-in rides the per-user
+     secret bundle into every container rather than being per-image, enabling it
+     then hard-fails every session on the other half. The Feature version in
+     `devcontainer-feature.json` participates in the devcontainer image cache
+     key, so a package change there is invisible until the version is bumped and
+     `workerFeatureRef` + `workerFeatureVersion` move together — the same
+     pairing rule as `workerImage` + `acaDiskName` in §12. The third
+     prerequisite — creating an unprivileged user namespace — is a property of
+     the runtime.
+     Verified to hold inside a live ACA sandbox (the exact probe
+     `runBwrapSandboxProbe` runs exits 0 there), and verified NOT to hold on at
+     least one local Docker daemon (NOR-364 phase 3: `bwrap: No permissions to
+     create a new namespace`). So the scrub stays opt-in per host, and adding the
+     packages to the image is necessary but never sufficient — confirm with the
+     probe, not with `which`.
+   - `CYRUS_SUBPROCESS_ENV_SCRUB` is deliberately **not** in
+     `RESERVED_ENV_KEYS`: a user turning on a security control for their own
+     sessions is not a hijack, and leaving it storable is what lets an operator
+     enable it from their secret bundle without a router deploy. It is read from
+     the **worker's own `process.env`**, never a repository `.env` — it asserts a
+     property of the host, which no single repository is placed to assert.
+   - **`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is undocumented in the SDK, and the
+     scrub itself has never been observed.** The flag appears nowhere in
+     `sdk.d.ts` or the SDK README — only in the bundled env-var registry, read by
+     the CLI binary. What HAS been verified is the bubblewrap prerequisite, which
+     is not the same thing. Before anyone turns this on fleet-wide, observe a
+     Bash subprocess without `ANTHROPIC_API_KEY` in its env. The SDK also exposes
+     a typed, documented alternative — `options.sandbox.credentials.envVars`
+     (`{name, mode: "deny" | "mask"}`), which Cyrus could set from the `sandbox`
+     object `RunnerConfigBuilder` already builds, with no bubblewrap/socat/userns
+     chain and macOS support. That is the likely successor to this switch.
+   - **The posture is an event, not a log line.** `session.env_scrub_resolved`
+     carries `cyrus.requested` / `cyrus.enabled` / `cyrus.platform` /
+     `cyrus.failures`, with two saved searches in
+     `infra/azure/bicep/modules/monitoring.bicep`. The whole complaint in
+     NOR-412 was a control that was off with nothing to alert on, so a posture
+     visible only as rendered prose reproduces the bug it fixes. Alert on
+     `requested and not enabled`: every such record is a session that failed to
+     start. Remember §13's bracket rule — `p["cyrus.enabled"]`, never
+     `p.cyrus.enabled`, which parses as a nested lookup and silently returns
+     null.
+
 ## Dependency Security Policy (MANDATE)
 
 > **Config location (pnpm ≥10):** The root `package.json` `pnpm` field
