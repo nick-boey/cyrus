@@ -5,7 +5,8 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
-- **Defined versioned remote-operator contracts ([CYR-64](https://linear.app/northrop-digital/issue/CYR-64/define-versioned-remote-operator-contracts)).**
+- **Defined versioned remote-operator contracts ([CYR-64](https://linear.app/northrop-digital/issue/CYR-64/define-versioned-remote-operator-contracts),
+  [#57](https://github.com/nick-boey/cyrus/pull/57)).**
   New `cyrus-operator-protocol` package holding the v1 wire contracts the router's
   fleet-operations API and the CLI's remote-operator commands will both depend on,
   so neither side imports the other's implementation modules. Exports
