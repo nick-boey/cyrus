@@ -1579,14 +1579,28 @@ replacement.
 ### Issue lock
 
 **Default on** (`issueLock: true`). While any session is active on an issue — on
-*any* device — new agent sessions on that same issue are rejected with a polite
-activity naming the active session's owner. The router is the only component that
-sees every session across every device, so it is the natural enforcement point
-against two machines diverging on one issue.
+*any* device — new agent sessions on that same issue are rejected with an
+activity explaining that the comment did not reach the running session. The
+router is the only component that sees every session across every device, so it
+is the natural enforcement point against two machines diverging on one issue.
 
 A lock is released when: the session reaches a terminal state (complete / error /
 stopped), the device's token is revoked, the device stays offline past the TTL,
 or an admin runs `cyrus router unlock <issueId>`.
+
+> **A new top-level `@cyrus1` comment on a locked issue does not start a fresh
+> session.** Linear *does* create an agent session for it and the router *does*
+> route it — it is then rejected here, and the explanation is posted into the
+> new (and immediately abandoned) session's own thread, where nobody is looking.
+> **Reply inside the running session's thread instead**: that produces
+> `AgentSessionEvent/prompted`, which is not lock-gated and reaches the sandbox.
+>
+> Every rejection now emits `routing.rejected` (`cyrus.reason = issue_locked`,
+> with the holding session and device) and logs at WARN, so an operator can tell
+> a dropped comment from a webhook that never arrived. If the holding session has
+> stopped working, its sandbox is also reported by `sandbox.stranded_session`
+> with `cyrus.reason = no_progress`; `cyrus router unlock <issueId>` frees it.
+> See NOR-402.
 
 The terminal-state signal is delivered durably. The device writes the
 `session_state` frame to `session-state-buffer.jsonl` before sending it, and

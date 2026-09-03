@@ -1,7 +1,11 @@
 import type { SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeMessageFormatter } from "cyrus-claude-runner";
-import type { AgentPendingWork } from "cyrus-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	type AgentPendingWork,
+	type InstalledRecordingLogSink,
+	installRecordingLogSink,
+} from "cyrus-core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
 import type { IActivitySink } from "../src/sinks/IActivitySink";
 
@@ -96,8 +100,15 @@ describe("AgentSessionManager terminal signal ordering", () => {
 		backgroundTasks: [],
 	};
 
+	let logs: InstalledRecordingLogSink;
+
 	beforeEach(() => {
 		vi.clearAllMocks();
+		logs = installRecordingLogSink();
+	});
+
+	afterEach(() => {
+		logs.restore();
 	});
 
 	// The regression: terminal used to fire before addResultEntry, disowning the
@@ -138,6 +149,81 @@ describe("AgentSessionManager terminal signal ordering", () => {
 		expect(
 			events.filter((e) => e === "activity").length,
 		).toBeGreaterThanOrEqual(2);
+	});
+
+	// NOR-402. Withholding the terminal signal is unbounded — it is retried only
+	// if a wakeup or a background task yields another result — so a task that
+	// never exits holds the issue lock forever. Until this event existed the
+	// state was unfalsifiable from the logs: the branch logged `info`, and a
+	// sandbox worker's log forwarder is WARN+ by default, so the line never left
+	// the container. `event()` records bypass that threshold.
+	it("emits a queryable event when it withholds the terminal signal", async () => {
+		setup(PENDING);
+
+		await manager.completeSession(sessionId, result());
+
+		const deferred = logs.sink.find({ event: "session.terminal_deferred" });
+		expect(deferred?.attributes).toMatchObject({
+			"cyrus.agent_session_id": sessionId,
+			"cyrus.terminal_state": "complete",
+			"cyrus.session_cron_count": 1,
+			"cyrus.background_task_count": 0,
+			"cyrus.live_background_task_count": 0,
+		});
+		// The identity of what is holding the session open, so the event gives an
+		// operator something to act on rather than just a count.
+		expect(deferred?.attributes?.["cyrus.pending_work"]).toEqual(
+			expect.stringContaining("check"),
+		);
+		// The pair is what makes "did this session ever finish?" answerable.
+		expect(logs.sink.find({ event: "session.terminal_signalled" })).toBe(
+			undefined,
+		);
+	});
+
+	// The prime suspect for a session that never terminates is a background task
+	// that never exits — and `formatPendingWorkThought`, which renders the
+	// user-facing "standing by" message, returns null for exactly that case: it
+	// lists only scheduled wakeups. Reporting `pending_work: null` there would
+	// leave the operator with a count and no identity in the one case that
+	// matters most.
+	it("names the live background task when that alone is what defers the session", async () => {
+		setup({
+			sessionCrons: [],
+			backgroundTasks: [],
+			liveBackgroundTasks: [
+				{ taskId: "bash-7", taskType: "shell", description: "pnpm dev" },
+			],
+		});
+
+		await manager.completeSession(sessionId, result());
+
+		const deferred = logs.sink.find({ event: "session.terminal_deferred" });
+		expect(deferred?.attributes).toMatchObject({
+			"cyrus.session_cron_count": 0,
+			"cyrus.background_task_count": 0,
+			"cyrus.live_background_task_count": 1,
+		});
+		expect(deferred?.attributes?.["cyrus.pending_work"]).toEqual(
+			expect.stringContaining("pnpm dev"),
+		);
+		expect(logs.sink.find({ event: "session.terminal_signalled" })).toBe(
+			undefined,
+		);
+	});
+
+	it("emits a queryable event when the terminal signal is actually sent", async () => {
+		setup();
+
+		await manager.completeSession(sessionId, result());
+
+		expect(
+			logs.sink.find({ event: "session.terminal_signalled" })?.attributes,
+		).toMatchObject({
+			"cyrus.agent_session_id": sessionId,
+			"cyrus.terminal_state": "complete",
+			"cyrus.forced": false,
+		});
 	});
 
 	it("emits terminal on the later result once the runner has closed", async () => {
