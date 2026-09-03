@@ -255,9 +255,9 @@ EdgeWorker → AgentSessionManager → Linear
 **Solution:** Only close stdin in `completeStream()`, not after initial write
 **Verify:** Run `test-stdin-direct.ts` to confirm streaming works
 
-## Gemini CLI Type Reference
+## Official Gemini CLI Type Reference
 
-The runner keeps local Zod schemas for Gemini CLI stream events and links to the upstream Gemini CLI sources for reference. We don't import official types at runtime, and we don't keep `@google/gemini-cli-core` installed only for reference because that adds a large unused dependency graph to the workspace.
+The `@google/gemini-cli-core` package (pinned to v0.17.0) is installed as a dev dependency for reference purposes. We don't import types from it at runtime, but it serves as the authoritative source for Gemini CLI's stream event structure.
 
 ### Why We Don't Use Official Types Directly
 
@@ -268,7 +268,7 @@ The official types use generic `Record<string, unknown>` for tool parameters. Ou
 3. **Type guards** - Functions like `isReadFileTool()`, `isWriteTodosTool()`
 4. **Parsing utilities** - `parseAsReadFileTool()`, `safeParseGeminiStreamEvent()`
 
-### Reference Links
+### Reference Links (pinned to v0.17.0)
 
 - **Official type definitions**: https://github.com/google-gemini/gemini-cli/blob/v0.17.0/packages/core/src/output/types.ts
 - **NPM package**: https://www.npmjs.com/package/@google/gemini-cli-core/v/0.17.0
@@ -278,7 +278,7 @@ The official types use generic `Record<string, unknown>` for tool parameters. Ou
 
 To verify our schemas match the official types, compare:
 - `src/schemas.ts` - Our Zod schemas
-- The upstream Gemini CLI type definitions linked above
+- `node_modules/@google/gemini-cli-core/dist/output/types.d.ts` - Official TypeScript types
 
 The event structure (`init`, `message`, `tool_use`, `tool_result`, `error`, `result`) should match exactly.
 
