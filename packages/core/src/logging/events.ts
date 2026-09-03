@@ -53,6 +53,17 @@ export const CYRUS_EVENTS = {
 	sessionPendingWorkRecorded: "session.pending_work_recorded",
 	/** The set of in-flight background tasks changed. */
 	sessionBackgroundTasksChanged: "session.background_tasks_changed",
+	/**
+	 * The subprocess env scrub posture this session resolved to. Carries
+	 * `cyrus.requested`, `cyrus.enabled`, `cyrus.platform` and, when the control
+	 * was asked for and could not be provided, `cyrus.failures`.
+	 *
+	 * The whole point of NOR-412 is that a security control which is off must be
+	 * something you can query rather than a prose log line nobody reads, so alert
+	 * on `requested == true and enabled == false` — that combination aborts every
+	 * session on the host.
+	 */
+	sessionEnvScrubResolved: "session.env_scrub_resolved",
 
 	/**
 	 * A `/<skill>` command leading a user's comment was echoed onto line 1 of

@@ -758,6 +758,16 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 						// a stray CLAUDE_CODE_SUBPROCESS_ENV_SCRUB in the worker's own
 						// environment enable the SDK sandbox behind resolveSubprocessEnvScrub's
 						// back — on a host it just declined to enable it for.
+						//
+						// INERT when `config.warmSession` is set: the branch below hands
+						// the prompt to `warmSession.query()` and discards `queryOptions`
+						// wholesale, so the operative env is the one
+						// `EdgeWorker.warmupRecentSessions()` passed to `startup()`. The
+						// two agree today only because both call
+						// `resolveSubprocessEnvScrub` against the same `process.env` in
+						// the same process — not because anything reconciles them. The
+						// first thing that makes this decision per-repository or
+						// hot-reloadable will diverge here silently.
 						CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: subprocessEnvScrub.enabled
 							? "1"
 							: undefined,

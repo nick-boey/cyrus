@@ -1,8 +1,8 @@
 {
 	"id": "cyrus-worker",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"name": "Cyrus worker",
-	"description": "Makes an arbitrary image able to host a Cyrus agent: a private Node runtime, the cyrus-ai worker, the non-root agent user, the workspace and repository-cache paths, and the git/gh/curl/jq tools the boot sequence shells out to.",
+	"description": "Makes an arbitrary image able to host a Cyrus agent: a private Node runtime, the cyrus-ai worker, the non-root agent user, the workspace and repository-cache paths, the git/gh/curl/jq tools the boot sequence shells out to, and the socat/bubblewrap prerequisites of subprocess env scrubbing.",
 	"documentationURL": "https://github.com/ceedaragents/cyrus/tree/main/features/src/cyrus-worker",
 	"options": {
 		"tarball": {

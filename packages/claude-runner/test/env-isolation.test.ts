@@ -263,6 +263,61 @@ describe("Environment variable isolation", () => {
 		expect(onError).not.toHaveBeenCalled();
 	});
 
+	it("does not apply its own scrub decision when running on a warm session", async () => {
+		// A warm session discards `queryOptions` entirely — the env that governs
+		// is the one EdgeWorker.warmupRecentSessions() handed to `startup()`
+		// before this runner existed. Pinning that here so the comment at the
+		// assignment site cannot quietly stop being true: anything that makes the
+		// scrub decision per-repository or hot-reloadable has to reconcile the two
+		// call sites rather than assume the runner-side value still applies.
+		vi.mocked(resolveSubprocessEnvScrub).mockReturnValueOnce({ enabled: true });
+
+		const warmQuery = vi.fn(async function* () {
+			yield {
+				type: "assistant",
+				message: { content: [{ type: "text", text: "Done" }] },
+				parent_tool_use_id: null,
+				session_id: "warm-session",
+			} as any;
+		});
+
+		mockSuccessfulQuery();
+		const runner = new ClaudeRunner(
+			Object.assign(makeConfig("/repo-a"), {
+				warmSession: { query: warmQuery },
+			}),
+		);
+		await runner.start("test");
+
+		expect(warmQuery).toHaveBeenCalledTimes(1);
+		// The SDK `query()` — and with it every env var built above — is bypassed.
+		expect(mockQuery).not.toHaveBeenCalled();
+	});
+
+	it("still aborts before reaching a warm session when a requested scrub is unavailable", async () => {
+		// The resolve sits above start()'s try, so it must gate the warm path too
+		// — otherwise opting in on an unsupported host would silently run
+		// unscrubbed for exactly the sessions that got pre-warmed.
+		vi.mocked(resolveSubprocessEnvScrub).mockImplementationOnce(() => {
+			throw new Error("CYRUS_SUBPROCESS_ENV_SCRUB is set, but this host…");
+		});
+
+		const warmQuery = vi.fn();
+		const onError = vi.fn();
+		const runner = new ClaudeRunner(
+			Object.assign(makeConfig("/repo-a"), {
+				warmSession: { query: warmQuery },
+				onError,
+			}),
+		);
+
+		await expect(runner.start("test")).rejects.toThrow(
+			"CYRUS_SUBPROCESS_ENV_SCRUB is set",
+		);
+		expect(warmQuery).not.toHaveBeenCalled();
+		expect(onError).not.toHaveBeenCalled();
+	});
+
 	it("should let repositoryEnv and additionalEnv override process.env", async () => {
 		envFileContents.set("/repo-a/.env", "PATH=/from-dotenv");
 

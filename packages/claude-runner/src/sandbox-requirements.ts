@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import type { ILogger } from "cyrus-core";
+import { CYRUS_EVENTS, cyrusAttributes, type ILogger } from "cyrus-core";
 
 /**
  * A single failed sandbox requirement, with user-facing guidance
@@ -48,6 +48,18 @@ export interface SandboxRequirementsResult {
 export const SUBPROCESS_ENV_SCRUB_ENV = "CYRUS_SUBPROCESS_ENV_SCRUB";
 
 /**
+ * The SDK-side flag {@link SUBPROCESS_ENV_SCRUB_ENV} governs.
+ *
+ * Named here only so we can notice it being set directly and say so: every
+ * caller overwrites it from {@link resolveSubprocessEnvScrub}'s verdict, so a
+ * value set by hand — in the worker's env, a repository `.env`, or a stored
+ * secret bundle — is silently discarded. Silently is the part worth fixing;
+ * someone who set this to re-enable the control after CYPACK-1108 would
+ * otherwise have no way to learn it stopped being the switch.
+ */
+export const SDK_SUBPROCESS_ENV_SCRUB_ENV = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
+
+/**
  * Thrown when a host asks for subprocess env scrubbing it cannot support.
  *
  * This is fatal on purpose. A security control that degrades to off with a
@@ -76,9 +88,19 @@ export class SubprocessEnvScrubUnavailableError extends Error {
 
 // Memoize the check at the module level so we only probe the system once per
 // process, and we only log guidance to the user on the first probe.
+//
+// ONLY a supported result is cached. A negative is a statement about packages
+// that are missing right now, and the error we raise off the back of it tells
+// the operator to go install them — so caching it means the very next session
+// after a successful `apt-get install` fails identically, and every session
+// after that, until the worker restarts. On a long-lived ACA sandbox that turns
+// a self-service fix into a `router containers destroy` and re-prompt, with
+// nothing saying so. Re-probing costs two or three `spawnSync` calls and only
+// happens on the opt-in-and-currently-broken path, which is already fatal.
 let cachedResult: SandboxRequirementsResult | undefined;
 let hasLoggedFailures = false;
 let hasLoggedScrubDisabled = false;
+let hasLoggedSdkFlagIgnored = false;
 
 /**
  * Verify that the host Linux system has the packages and kernel/AppArmor
@@ -154,7 +176,10 @@ export function checkLinuxSandboxRequirements(): SandboxRequirementsResult {
 		platform,
 		failures,
 	};
-	cachedResult = result;
+	// Deliberately not caching a failure — see the note on `cachedResult`.
+	if (result.supported) {
+		cachedResult = result;
+	}
 	return result;
 }
 
@@ -172,24 +197,50 @@ export function checkLinuxSandboxRequirements(): SandboxRequirementsResult {
  * - **Requested and unsupported**: throws
  *   {@link SubprocessEnvScrubUnavailableError}. Aborting the session is the
  *   alert that the warn-and-continue path never was.
+ *
+ * Every outcome also emits {@link CYRUS_EVENTS.sessionEnvScrubResolved}. The
+ * complaint NOR-412 was filed about is that a security control was off and the
+ * only trace was a prose log line, which nothing can alert on; a posture that is
+ * not queryable would reproduce it.
  */
 export function resolveSubprocessEnvScrub(options: {
 	logger: ILogger;
 	env?: NodeJS.ProcessEnv;
 }): { enabled: boolean } {
 	const env = options.env ?? process.env;
+	const requested = isTruthyEnvValue(env[SUBPROCESS_ENV_SCRUB_ENV]);
 
-	if (!isTruthyEnvValue(env[SUBPROCESS_ENV_SCRUB_ENV])) {
+	if (!requested) {
 		if (!hasLoggedScrubDisabled) {
 			hasLoggedScrubDisabled = true;
 			options.logger.info(
 				`Subprocess env scrubbing is off; set ${SUBPROCESS_ENV_SCRUB_ENV}=1 to require it.`,
 			);
 		}
+		// Setting the SDK flag by hand used to be how this was turned on. It is
+		// not any more — every call site overwrites it from this verdict — so say
+		// so rather than dropping it on the floor, which would look identical to
+		// the control working.
+		if (
+			!hasLoggedSdkFlagIgnored &&
+			isTruthyEnvValue(env[SDK_SUBPROCESS_ENV_SCRUB_ENV])
+		) {
+			hasLoggedSdkFlagIgnored = true;
+			options.logger.warn(
+				`${SDK_SUBPROCESS_ENV_SCRUB_ENV} is set but will be ignored — it is ` +
+					`overwritten per session from ${SUBPROCESS_ENV_SCRUB_ENV}. Set ` +
+					`${SUBPROCESS_ENV_SCRUB_ENV}=1 instead to require subprocess env scrubbing.`,
+			);
+		}
+		emitScrubPosture(options.logger, {
+			requested: false,
+			enabled: false,
+			platform: process.platform,
+		});
 		return { enabled: false };
 	}
 
-	const requirements = checkLinuxSandboxRequirements();
+	const requirements = checkSubprocessEnvScrubRequirements();
 	if (!requirements.supported) {
 		// Log the guidance as well as throwing. The log is once per process
 		// (`hasLoggedFailures`), so it is the FIRST failing session that gets a
@@ -197,10 +248,87 @@ export function resolveSubprocessEnvScrub(options: {
 		// message carries the same per-failure resolutions. The throw is the
 		// load-bearing half — never let this call become the only signal.
 		logSandboxRequirementFailures(requirements, options.logger);
+		emitScrubPosture(options.logger, {
+			requested: true,
+			enabled: false,
+			platform: requirements.platform,
+			failures: requirements.failures.map((failure) => failure.check).join(","),
+		});
 		throw new SubprocessEnvScrubUnavailableError(requirements.failures);
 	}
 
+	emitScrubPosture(options.logger, {
+		requested: true,
+		enabled: true,
+		platform: requirements.platform,
+	});
 	return { enabled: true };
+}
+
+/**
+ * The requirements of the scrub *as a control we are about to rely on*, which
+ * is a stricter question than {@link checkLinuxSandboxRequirements} answers.
+ *
+ * That function reports every non-Linux host as supported, and correctly so for
+ * what it was built for: it is a bubblewrap precheck, and there is no bubblewrap
+ * to check for on macOS or Windows. But "we found nothing to object to" is not
+ * "the control is in place", and using it as the sole predicate meant
+ * `CYRUS_SUBPROCESS_ENV_SCRUB=1` on a Mac returned enabled having probed
+ * precisely nothing. Nothing in this repository or in the SDK's typings
+ * establishes that the flag does anything off Linux — it is absent from
+ * `sdk.d.ts` entirely — so the one platform where the control is most likely to
+ * be a silent no-op was also the one where it could never fail loudly. That is
+ * the failure NOR-412 is about, reintroduced on the other half of the platform
+ * matrix.
+ *
+ * Refuse instead, and say why. When the scrub is observed working on another
+ * platform, add it here.
+ */
+function checkSubprocessEnvScrubRequirements(): SandboxRequirementsResult {
+	const platform = process.platform;
+	if (platform !== "linux") {
+		return {
+			supported: false,
+			platform,
+			failures: [
+				{
+					check: "platform",
+					message: `subprocess env scrubbing has only been verified on Linux; this host is ${platform}.`,
+					resolution: [
+						`The bubblewrap-backed scrub ${SDK_SUBPROCESS_ENV_SCRUB_ENV} selects is a`,
+						"Linux mechanism, and the flag is undocumented in the Claude Agent SDK's",
+						"typings, so we cannot assert it does anything here. Rather than report a",
+						"credential control as active without checking anything, this is refused.",
+						"",
+						`Unset ${SUBPROCESS_ENV_SCRUB_ENV} to run without it.`,
+					].join("\n"),
+				},
+			],
+		};
+	}
+	return checkLinuxSandboxRequirements();
+}
+
+function emitScrubPosture(
+	logger: ILogger,
+	attributes: {
+		requested: boolean;
+		enabled: boolean;
+		platform: NodeJS.Platform;
+		failures?: string;
+	},
+): void {
+	logger.event(
+		CYRUS_EVENTS.sessionEnvScrubResolved,
+		cyrusAttributes({
+			requested: attributes.requested,
+			enabled: attributes.enabled,
+			platform: attributes.platform,
+			...(attributes.failures !== undefined && {
+				failures: attributes.failures,
+			}),
+		}),
+	);
 }
 
 /**
@@ -239,6 +367,7 @@ export function resetSandboxRequirementsCacheForTesting(): void {
 	cachedResult = undefined;
 	hasLoggedFailures = false;
 	hasLoggedScrubDisabled = false;
+	hasLoggedSdkFlagIgnored = false;
 }
 
 function indent(text: string, spaces: number): string {

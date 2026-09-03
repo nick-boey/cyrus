@@ -5375,7 +5375,47 @@ ${taskSection}`;
 			// is received via handleClaudeMessage() callback
 		} catch (error) {
 			log.error(`Error in prompt building/starting:`, error);
+			// Nothing above us turns this into anything a user can see.
+			// `handleWebhook`'s catch logs and deliberately does not rethrow, so
+			// without this the session sits at "Working…" in Linear forever, with
+			// the router's issue lock and affinity still held. Post the reason and
+			// go terminal here, where we still know which session it was.
+			//
+			// This matters most for the failure it was added for — a host that
+			// opted into subprocess env scrubbing it cannot provide
+			// (SubprocessEnvScrubUnavailableError, NOR-412) — whose entire purpose
+			// is to be a loud abort rather than a silent degradation. But every
+			// start-time throw has the same shape, so the handling is general.
+			await this.failSessionOnStartupError(
+				agentSessionManager,
+				sessionId,
+				error,
+			);
 			throw error;
+		}
+	}
+
+	/**
+	 * Report a session that died before the agent ran, then let the error keep
+	 * propagating. Best-effort: if we cannot reach Linear, the original failure
+	 * is still the one worth surfacing, so it must not be masked by this.
+	 */
+	private async failSessionOnStartupError(
+		agentSessionManager: AgentSessionManager,
+		sessionId: string,
+		error: unknown,
+	): Promise<void> {
+		const reason = error instanceof Error ? error.message : String(error);
+		try {
+			await agentSessionManager.failSession(
+				sessionId,
+				`This session could not be started.\n\n\`\`\`\n${reason}\n\`\`\``,
+			);
+		} catch (err) {
+			this.logger.error(
+				`Failed to mark session ${sessionId} as failed after a startup error:`,
+				err,
+			);
 		}
 	}
 
@@ -8590,6 +8630,14 @@ ${input.userComment}
 			}
 		} catch (error) {
 			log.error(`Failed to start streaming session for ${sessionId}:`, error);
+			// Same reasoning as initializeAgentRunner's catch: this rethrow reaches
+			// handleWebhook, which logs and stops. Without a terminal state here the
+			// prompted session hangs in Linear exactly as a created one would.
+			await this.failSessionOnStartupError(
+				agentSessionManager,
+				sessionId,
+				error,
+			);
 			throw error;
 		}
 	}

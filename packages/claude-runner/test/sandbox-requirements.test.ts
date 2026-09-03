@@ -8,11 +8,13 @@ vi.mock("node:child_process", () => ({
 	spawnSync: vi.fn(),
 }));
 
+import { CYRUS_EVENTS } from "cyrus-core";
 import {
 	checkLinuxSandboxRequirements,
 	logSandboxRequirementFailures,
 	resetSandboxRequirementsCacheForTesting,
 	resolveSubprocessEnvScrub,
+	SDK_SUBPROCESS_ENV_SCRUB_ENV,
 	SUBPROCESS_ENV_SCRUB_ENV,
 	SubprocessEnvScrubUnavailableError,
 } from "../src/sandbox-requirements";
@@ -65,10 +67,26 @@ function createMockLogger() {
 		info: vi.fn(),
 		warn: vi.fn(),
 		error: vi.fn(),
+		event: vi.fn(),
 		withContext: vi.fn(),
 		getLevel: vi.fn(),
 		setLevel: vi.fn(),
 	};
+}
+
+/** The three `spawnSync` calls a fully-equipped Linux host answers. */
+function mockSupportedLinuxHost(): void {
+	spawnSyncMock
+		.mockReturnValueOnce(okResult("/usr/bin/socat\n"))
+		.mockReturnValueOnce(okResult("/usr/bin/bwrap\n"))
+		.mockReturnValueOnce(okResult(""));
+}
+
+/** The two `spawnSync` calls a host with neither package answers. */
+function mockUnequippedLinuxHost(): void {
+	spawnSyncMock
+		.mockReturnValueOnce(failResult("not found", 1)) // socat missing
+		.mockReturnValueOnce(failResult("not found", 1)); // bwrap missing
 }
 
 describe("sandbox-requirements", () => {
@@ -205,13 +223,10 @@ describe("sandbox-requirements", () => {
 		expect(probeFailure?.resolution).toContain("/etc/apparmor.d/usr.bin.bwrap");
 	});
 
-	it("caches the result so repeated calls do not re-probe the host", () => {
+	it("caches a supported result so repeated calls do not re-probe the host", () => {
 		setPlatform("linux");
 
-		spawnSyncMock
-			.mockReturnValueOnce(okResult("/usr/bin/socat\n"))
-			.mockReturnValueOnce(okResult("/usr/bin/bwrap\n"))
-			.mockReturnValueOnce(okResult(""));
+		mockSupportedLinuxHost();
 
 		const first = checkLinuxSandboxRequirements();
 		const second = checkLinuxSandboxRequirements();
@@ -219,6 +234,24 @@ describe("sandbox-requirements", () => {
 		expect(first).toBe(second);
 		// Three probes for the initial call, zero for the second
 		expect(spawnSyncMock).toHaveBeenCalledTimes(3);
+	});
+
+	it("re-probes after a failure, so installing the missing packages takes effect without a restart", () => {
+		setPlatform("linux");
+
+		// First call: nothing installed.
+		mockUnequippedLinuxHost();
+		expect(checkLinuxSandboxRequirements().supported).toBe(false);
+		expect(spawnSyncMock).toHaveBeenCalledTimes(2);
+
+		// The operator now does exactly what the failure's resolution text told
+		// them to do. Caching the negative would make this — and every session
+		// after it, until the worker restarts — keep failing identically, which
+		// on a long-lived sandbox means a destroy-and-re-prompt cycle to apply a
+		// fix we ourselves asked for.
+		mockSupportedLinuxHost();
+		expect(checkLinuxSandboxRequirements().supported).toBe(true);
+		expect(spawnSyncMock).toHaveBeenCalledTimes(5);
 	});
 
 	describe("logSandboxRequirementFailures", () => {
@@ -314,10 +347,7 @@ describe("sandbox-requirements", () => {
 			"treats %o as requested",
 			(value) => {
 				setPlatform("linux");
-				spawnSyncMock
-					.mockReturnValueOnce(okResult("/usr/bin/socat\n"))
-					.mockReturnValueOnce(okResult("/usr/bin/bwrap\n"))
-					.mockReturnValueOnce(okResult(""));
+				mockSupportedLinuxHost();
 
 				expect(resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: value }).enabled).toBe(
 					true,
@@ -339,27 +369,36 @@ describe("sandbox-requirements", () => {
 
 		it("enables the scrub when requested and the host supports it", () => {
 			setPlatform("linux");
-			spawnSyncMock
-				.mockReturnValueOnce(okResult("/usr/bin/socat\n"))
-				.mockReturnValueOnce(okResult("/usr/bin/bwrap\n"))
-				.mockReturnValueOnce(okResult(""));
+			mockSupportedLinuxHost();
 
 			expect(resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" }).enabled).toBe(true);
 			expect(mockLogger.warn).not.toHaveBeenCalled();
 		});
 
-		it("enables the scrub on non-Linux hosts, which need no bubblewrap", () => {
+		it("refuses, rather than reporting the scrub active, on an unverified non-Linux host", () => {
 			setPlatform("darwin");
 
-			expect(resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" }).enabled).toBe(true);
+			// `checkLinuxSandboxRequirements` reports every non-Linux host as
+			// supported, which is right for a bubblewrap precheck and wrong as the
+			// sole predicate for a credential control: it would return enabled
+			// having probed nothing at all, on the one platform where the flag is
+			// most likely to be a no-op and could never fail loudly.
+			let error: SubprocessEnvScrubUnavailableError | undefined;
+			try {
+				resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" });
+			} catch (caught) {
+				error = caught as SubprocessEnvScrubUnavailableError;
+			}
+
+			expect(error).toBeInstanceOf(SubprocessEnvScrubUnavailableError);
+			expect(error?.failures.map((f) => f.check)).toEqual(["platform"]);
+			expect(error?.message).toContain("darwin");
 			expect(spawnSyncMock).not.toHaveBeenCalled();
 		});
 
 		it("throws rather than silently degrading when requested but unsupported", () => {
 			setPlatform("linux");
-			spawnSyncMock
-				.mockReturnValueOnce(failResult("not found", 1)) // socat missing
-				.mockReturnValueOnce(failResult("not found", 1)); // bwrap missing
+			mockUnequippedLinuxHost();
 
 			expect(() => resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" })).toThrow(
 				SubprocessEnvScrubUnavailableError,
@@ -368,9 +407,7 @@ describe("sandbox-requirements", () => {
 
 		it("names every unmet requirement, and its resolution, in the thrown error", () => {
 			setPlatform("linux");
-			spawnSyncMock
-				.mockReturnValueOnce(failResult("not found", 1)) // socat missing
-				.mockReturnValueOnce(failResult("not found", 1)); // bwrap missing
+			mockUnequippedLinuxHost();
 
 			let error: SubprocessEnvScrubUnavailableError | undefined;
 			try {
@@ -396,15 +433,94 @@ describe("sandbox-requirements", () => {
 
 		it("keeps throwing on every session, not just the first", () => {
 			setPlatform("linux");
-			spawnSyncMock
-				.mockReturnValueOnce(failResult("not found", 1))
-				.mockReturnValueOnce(failResult("not found", 1));
+			mockUnequippedLinuxHost();
 
 			const env = { [SUBPROCESS_ENV_SCRUB_ENV]: "1" };
 			expect(() => resolve(env)).toThrow(SubprocessEnvScrubUnavailableError);
 			// The once-per-process log latch must not be allowed to turn the
-			// second session's hard failure into a silent one.
+			// second session's hard failure into a silent one. Note the fresh
+			// mocks: the negative is deliberately not cached, so this genuinely
+			// re-probes rather than replaying a memoised verdict.
+			mockUnequippedLinuxHost();
 			expect(() => resolve(env)).toThrow(SubprocessEnvScrubUnavailableError);
+		});
+
+		it("stops throwing once the packages the error asked for are installed", () => {
+			setPlatform("linux");
+			const env = { [SUBPROCESS_ENV_SCRUB_ENV]: "1" };
+
+			mockUnequippedLinuxHost();
+			expect(() => resolve(env)).toThrow(SubprocessEnvScrubUnavailableError);
+
+			// Same process, no restart — the operator ran the apt-get line the
+			// error printed.
+			mockSupportedLinuxHost();
+			expect(resolve(env).enabled).toBe(true);
+		});
+
+		it("warns once when the SDK flag is set directly, since it is now overwritten", () => {
+			setPlatform("linux");
+
+			const env = { [SDK_SUBPROCESS_ENV_SCRUB_ENV]: "1" };
+			expect(resolve(env).enabled).toBe(false);
+			expect(resolve(env).enabled).toBe(false);
+
+			// Silently dropping it looks exactly like the control working, which
+			// is the failure mode this whole issue is about.
+			expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+			const warning = mockLogger.warn.mock.calls[0]?.[0] as string;
+			expect(warning).toContain(SDK_SUBPROCESS_ENV_SCRUB_ENV);
+			expect(warning).toContain(SUBPROCESS_ENV_SCRUB_ENV);
+		});
+
+		it("does not warn about the SDK flag when it is not set", () => {
+			setPlatform("linux");
+
+			resolve({});
+
+			expect(mockLogger.warn).not.toHaveBeenCalled();
+		});
+
+		it("emits a queryable posture event for every outcome", () => {
+			setPlatform("linux");
+
+			// Off by default.
+			resolve({});
+			expect(mockLogger.event).toHaveBeenCalledWith(
+				CYRUS_EVENTS.sessionEnvScrubResolved,
+				expect.objectContaining({
+					"cyrus.requested": false,
+					"cyrus.enabled": false,
+				}),
+			);
+
+			// Requested and unavailable — the combination worth alerting on,
+			// because it aborts every session on the host. A prose log line is not
+			// something monitoring.bicep can key on, which was the original
+			// complaint.
+			mockLogger.event.mockClear();
+			mockUnequippedLinuxHost();
+			expect(() => resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" })).toThrow();
+			expect(mockLogger.event).toHaveBeenCalledWith(
+				CYRUS_EVENTS.sessionEnvScrubResolved,
+				expect.objectContaining({
+					"cyrus.requested": true,
+					"cyrus.enabled": false,
+					"cyrus.failures": "socat,bubblewrap",
+				}),
+			);
+
+			// Requested and honoured.
+			mockLogger.event.mockClear();
+			mockSupportedLinuxHost();
+			expect(resolve({ [SUBPROCESS_ENV_SCRUB_ENV]: "1" }).enabled).toBe(true);
+			expect(mockLogger.event).toHaveBeenCalledWith(
+				CYRUS_EVENTS.sessionEnvScrubResolved,
+				expect.objectContaining({
+					"cyrus.requested": true,
+					"cyrus.enabled": true,
+				}),
+			);
 		});
 	});
 });
