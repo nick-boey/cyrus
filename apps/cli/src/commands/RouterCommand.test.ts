@@ -863,6 +863,32 @@ describe("RouterCommand", () => {
 			expect(store.constructor.name).toBe("TableSecretStore");
 		});
 
+		it("keeps Codex credential-store config through the schema", () => {
+			const codex = {
+				clientId: "codex-client-id",
+				keyId: `https://vault.vault.azure.net/keys/codex/${"b".repeat(32)}`,
+				localKeyPath: join(cyrusHome, "codex-kek.key"),
+			};
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					containers: {
+						image: "worker:latest",
+						routerUrlForContainers: "wss://router.example.com",
+						repositories: [],
+						codex,
+					},
+				}),
+			);
+
+			const command = new RouterCommand(createMockApp(cyrusHome) as any);
+			const config = (command as any).readRouterConfig();
+			expect(config.containers.codex).toEqual(codex);
+		});
+
 		it("keeps setupUi through the config schema", async () => {
 			writeFileSync(
 				join(cyrusHome, "router-config.json"),

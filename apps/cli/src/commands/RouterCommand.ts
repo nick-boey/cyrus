@@ -265,6 +265,16 @@ const RouterConfigFileSchema = z.object({
 					keyId: z.string().min(1),
 				})
 				.optional(),
+			// ChatGPT-subscription credentials for Codex. Like tableStore, this
+			// must be modelled here or Zod strips it before RouterServer can build
+			// the token store and expose the "Codex account" section in /setup.
+			codex: z
+				.object({
+					clientId: z.string().optional(),
+					keyId: z.string().optional(),
+					localKeyPath: z.string().optional(),
+				})
+				.optional(),
 			/**
 			 * Executor inherited by users whose stored executor is the explicit
 			 * `{"type":"default"}` sentinel. A NULL/absent executor still means
