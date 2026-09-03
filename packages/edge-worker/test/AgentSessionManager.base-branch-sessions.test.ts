@@ -1,3 +1,4 @@
+import { createNoopLogger } from "cyrus-core";
 import { beforeEach, describe, expect, it } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
 
@@ -5,16 +6,11 @@ describe("AgentSessionManager.getSessionsByBaseBranch", () => {
 	let manager: AgentSessionManager;
 
 	beforeEach(() => {
-		const noopLogger = {
-			info: () => {},
-			warn: () => {},
-			error: () => {},
-			debug: () => {},
-			withContext: function () {
-				return this;
-			},
-		} as any;
-		manager = new AgentSessionManager(undefined, undefined, noopLogger);
+		// The real no-op, not a hand-rolled object literal cast to `any`. A partial
+		// stub silently satisfies the type and then throws the first time
+		// production code reaches a method it forgot — which is exactly what
+		// happened when `emitTerminalOnce` started calling `event()`.
+		manager = new AgentSessionManager(undefined, undefined, createNoopLogger());
 	});
 
 	it("returns sessions tracking the specified base branch and repository", () => {

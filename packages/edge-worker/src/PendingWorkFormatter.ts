@@ -86,6 +86,48 @@ export function formatPendingWorkThought(
 	].join("\n");
 }
 
+/**
+ * A compact, single-line rendering of everything holding a session open, for
+ * TELEMETRY rather than for Linear.
+ *
+ * Separate from {@link formatPendingWorkThought} because the two have different
+ * jobs and, critically, different coverage. The thought is the user-visible
+ * "standing by" message and deliberately lists only what will wake the session
+ * on a schedule — crons and backgrounded tasks the Stop hook reported. It
+ * returns null for a session held open ONLY by a live background task, because
+ * there is nothing scheduled to tell the user about.
+ *
+ * That null is exactly wrong for the diagnostic, though: a background task that
+ * never exits is the leading suspect for a session that never goes terminal
+ * (NOR-402), so the one case an operator most needs named is the one the thought
+ * cannot name. `liveBackgroundTasks` comes from the SDK's
+ * `background_tasks_changed` level signal and is populated independently of the
+ * Stop hook that fills the other two, so it has to be read separately.
+ *
+ * Never returns null: this is only called when something IS pending.
+ */
+export function formatPendingWorkSummary(
+	pendingWork: AgentPendingWork,
+): string {
+	const items = [
+		...pendingWork.sessionCrons.map(
+			(cron) =>
+				`cron(${cron.recurring ? "recurring " : ""}${cron.schedule})` +
+				(cron.prompt ? `: ${truncate(cron.prompt, 80)}` : ""),
+		),
+		...pendingWork.backgroundTasks.map(
+			(task) =>
+				`background(${task.type}/${task.status}: ` +
+				`${truncate(task.command ?? task.description, 80)})`,
+		),
+		...(pendingWork.liveBackgroundTasks ?? []).map(
+			(task) =>
+				`live-background(${task.taskType}: ${truncate(task.description, 80)})`,
+		),
+	];
+	return items.length > 0 ? items.join("; ") : "unspecified pending work";
+}
+
 function formatSessionCron(cron: SessionCronSummary): string {
 	const when = cron.recurring
 		? `on schedule \`${cron.schedule}\``
