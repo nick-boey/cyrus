@@ -1,5 +1,48 @@
 import type { EdgeWorkerConfig, RunnerType } from "cyrus-core";
 
+/**
+ * Codex's built-in default, when neither config nor an issue-level selector
+ * names a model.
+ *
+ * This is a LAST resort, not the product's answer to "which Codex model": since
+ * CYR-79 the router emits `CYRUS_CODEX_DEFAULT_MODEL` on every container from
+ * its own catalog (`defaultRunnerEnv`), so `config.codexDefaultModel` above is
+ * normally set and this constant is only reached on a deployment that predates
+ * that, or outside the container path entirely. It is deliberately the
+ * probe-verified `gpt-5.5` rather than the newer `gpt-5.6-sol`: this value is
+ * baked into the worker IMAGE, so changing it costs a rebuild and a paired
+ * `workerImage`/`acaDiskName` move, which is the opposite of the one-line
+ * rollback an unverified model needs. The catalog is where the current
+ * preference lives and where it should be changed.
+ */
+const CODEX_DEFAULT_MODEL = "gpt-5.5";
+
+/**
+ * What a failed Codex model resolves to.
+ *
+ * `gpt-5.5` rather than the older `gpt-5.2-codex` this used to be: under the
+ * ChatGPT-subscription auth Cyrus mandates (ADR 0005), OpenAI rejected
+ * `gpt-5.2-codex` outright on a live account, so the fallback was a name that
+ * could only ever fail for the credential most sessions run on. `gpt-5.5` is
+ * the name that probe actually answered on.
+ *
+ * Note the fallback only ever applies in `OPENAI_API_KEY` mode anyway —
+ * `CodexConfigBuilder`'s 404 probe returns early without a key — which is
+ * exactly why the wrong value here went unnoticed.
+ */
+const CODEX_FALLBACK_MODEL = "gpt-5.5";
+
+/**
+ * Compile-time proof that every `RunnerType` was handled. Never returns.
+ *
+ * Deliberately not a silent default: the branch this replaced returned a Codex
+ * model to any runner that fell through, which is how Cursor sessions ended up
+ * carrying one.
+ */
+function assertNoUnhandledRunner(runnerType: never): never {
+	throw new Error(`Unhandled runner type: ${String(runnerType)}`);
+}
+
 const isOpenCodeProviderModel = (model: string): boolean =>
 	/^[a-z0-9_.-]+\/[a-z0-9_.:/-]+$/i.test(model);
 
@@ -70,7 +113,11 @@ export class RunnerSelectionService {
 		if (runnerType === "opencode") {
 			return this.config.opencodeDefaultModel;
 		}
-		return this.config.codexDefaultModel || "gpt-5.5";
+		// Kept in step with the `/setup` picker's preferred Codex model
+		// (`RUNNER_CATALOG` in `packages/router/src/setup/runnerDefaults.ts`) and
+		// with `DEFAULT_CODEX_MODEL` in `cyrus-codex-runner`. When these disagree,
+		// a container whose picker said one thing silently runs another.
+		return this.config.codexDefaultModel || CODEX_DEFAULT_MODEL;
 	}
 
 	/**
@@ -91,7 +138,7 @@ export class RunnerSelectionService {
 			return "gemini-2.5-flash";
 		}
 		if (runnerType === "codex") {
-			return "gpt-5.2-codex";
+			return CODEX_FALLBACK_MODEL;
 		}
 		if (runnerType === "cursor") {
 			return this.config.cursorDefaultFallbackModel || "composer-2";
@@ -99,7 +146,11 @@ export class RunnerSelectionService {
 		if (runnerType === "opencode") {
 			return this.config.opencodeDefaultFallbackModel;
 		}
-		return "gpt-5";
+		// `RunnerType` is a closed union and every member is handled above, so
+		// this is unreachable for well-typed input. Kept as an exhaustiveness
+		// check rather than a value: a sixth runner added without a branch here
+		// should be a compile error, not a silent Codex model handed to it.
+		return assertNoUnhandledRunner(runnerType);
 	}
 
 	/**
@@ -266,13 +317,24 @@ export class RunnerSelectionService {
 				}
 				return "gemini-2.5-flash";
 			}
+			if (runnerType === "cursor") {
+				// Explicit, though it looks redundant next to the catch-all: the
+				// runner is fully resolved by this point, so Cursor reached the
+				// catch-all and took a *Codex* model — and because
+				// `fallbackModelOverride` is always truthy, that shadowed
+				// `defaultFallbackByRunner.cursor` downstream in
+				// `RunnerConfigBuilder`. The `isCodexModel(...)` test that used to
+				// sit below was the only hint the branch was shared, and removing
+				// it removed the hint too.
+				return defaultFallbackByRunner.cursor;
+			}
 			if (runnerType === "opencode") {
 				return defaultFallbackByRunner.opencode;
 			}
-			if (isCodexModel(normalizedModel)) {
-				return "gpt-5.2-codex";
-			}
-			return "gpt-5";
+			// Codex. The two arms here used to differ (`gpt-5.2-codex` vs `gpt-5`);
+			// both were names OpenAI rejects under subscription auth, so there was
+			// nothing to preserve in the distinction.
+			return CODEX_FALLBACK_MODEL;
 		};
 
 		const resolveRunnerFromName = (name?: string): RunnerType | undefined => {

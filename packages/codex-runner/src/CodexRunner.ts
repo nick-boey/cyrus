@@ -10,6 +10,7 @@ import type {
 import { CodexEventMapper, type MapperContext } from "./CodexEventMapper.js";
 import { CodexSkillStager } from "./CodexSkillStager.js";
 import { CodexConfigBuilder } from "./config/CodexConfigBuilder.js";
+import { assertCodexCredentialAvailable } from "./config/codexCredentials.js";
 import { CodexMessageFormatter } from "./formatter.js";
 import type {
 	CodexRunnerConfig,
@@ -57,6 +58,25 @@ export class CodexRunner extends EventEmitter implements IAgentRunner {
 	 * turn starts, so a fast follow-up is never lost or wrongly deferred.
 	 */
 	private pendingFollowups: string[] = [];
+	/**
+	 * Whether Codex has issued a thread id for this session.
+	 *
+	 * `sessionInfo.sessionId` is seeded with a locally generated UUID before the
+	 * backend is opened, purely so messages have something to carry, and is
+	 * overwritten by the real thread id on `thread-started`. If the session dies
+	 * before that — which the credential preflight is now a deliberate way of
+	 * doing — the mapper still synthesizes a `system/init` so the timeline is not
+	 * left blank, and it necessarily carries the fabricated id.
+	 *
+	 * That id must never be stored as a resumable Codex thread. It was, and the
+	 * consequence was worse than the failure it described: the edge worker
+	 * persisted it as `codexSessionId`, every later turn in that Linear agent
+	 * session resumed it, and codex-cli answered `no rollout found for thread id`
+	 * — so a user who read the actionable message, connected their subscription
+	 * and replied in the thread hit an opaque failure forever. See
+	 * {@link hasEstablishedRunnerSession}.
+	 */
+	private threadStarted = false;
 
 	constructor(config: CodexRunnerConfig) {
 		super();
@@ -134,6 +154,19 @@ export class CodexRunner extends EventEmitter implements IAgentRunner {
 		return this.formatter;
 	}
 
+	/**
+	 * Whether this session's id is one a later turn may resume.
+	 *
+	 * Read by `AgentSessionManager` before it stores a runner session id. True
+	 * once Codex has issued a thread id, and true for a resume (that id was
+	 * already Codex's and is already stored). False only in the window this
+	 * exists for: a session that failed before the backend was ever opened, whose
+	 * id is a local UUID Codex has never seen. See {@link threadStarted}.
+	 */
+	hasEstablishedRunnerSession(): boolean {
+		return this.threadStarted || Boolean(this.config.resumeSessionId);
+	}
+
 	// ---- internals ----------------------------------------------------------
 
 	private async startWithPrompt(
@@ -150,6 +183,7 @@ export class CodexRunner extends EventEmitter implements IAgentRunner {
 		};
 		this.wasStopped = false;
 		this.turnFinished = false;
+		this.threadStarted = false;
 		this.pendingFollowups = [];
 		this.mapper.reset();
 
@@ -160,15 +194,23 @@ export class CodexRunner extends EventEmitter implements IAgentRunner {
 		this.backend = backend;
 		backend.on("event", (event) => this.handleBackendEvent(event));
 
-		const resolved = await new CodexConfigBuilder(this.config).build();
-		this.skillStager.stage();
-
 		const input: CodexUserInput[] = prompt?.trim()
 			? [{ type: "text", text: prompt.trim() }]
 			: [];
 
 		let caughtError: unknown;
 		try {
+			// Inside the try, so a configuration or credential failure is finalized
+			// into an error result message the timeline renders — rather than
+			// escaping `start()` as a raw rejection that the caller only logs,
+			// which a user experiences as a session that silently never began.
+			const resolved = await new CodexConfigBuilder(this.config).build();
+			assertCodexCredentialAvailable({
+				codexHome: resolved.codexHome,
+				env: resolved.env,
+			});
+			this.skillStager.stage();
+
 			await backend.open(resolved);
 			await backend.runTurn(input);
 		} catch (error) {
@@ -229,6 +271,10 @@ export class CodexRunner extends EventEmitter implements IAgentRunner {
 			getStagedSkillNames: () => self.skillStager.getStagedSkillNames(),
 			emitMessage: (message) => self.emit("message", message),
 			onThreadStarted: (threadId) => {
+				// Set before the mapper emits `system/init` (it calls this first),
+				// so the very message that carries the id already reports it as
+				// resumable.
+				self.threadStarted = true;
 				if (self.sessionInfo) {
 					self.sessionInfo.sessionId = threadId;
 				}

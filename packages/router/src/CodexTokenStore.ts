@@ -165,8 +165,39 @@ export class CodexTokenStore {
 	 * The caller (`ContainerTargets.buildEnv`) turns the former into "fall back
 	 * to `OPENAI_API_KEY` if set, else fail the boot naming the remedy" and the
 	 * latter into a failure carrying {@link CodexRefreshError.remedy}.
+	 *
+	 * **Serialized per user.** OpenAI's refresh token is single-use and rotates
+	 * on every redemption, and `setUserCodexAuth` is a bare last-write-wins
+	 * `UPDATE` with no compare-and-swap — so two concurrent mints inside the
+	 * refresh window redeem the same token, one loses, and the loser can persist
+	 * a credential that is already dead. ADR 0005 calls that race "dissolved" by
+	 * refreshing only at boot, but boots are serialized per DEVICE
+	 * (`ContainerTargets.inFlightBoots`), not per user, so two of a user's issues
+	 * booting together were always able to reach it. CYR-79 made minting
+	 * unconditional, which widens the population that can — an ordinary Claude
+	 * boot now participates — so the race is closed here rather than left to get
+	 * more likely.
+	 *
+	 * A joiner gets the winner's freshly refreshed credential, which is what it
+	 * wanted anyway.
 	 */
 	async mint(userId: number): Promise<CodexCredential | undefined> {
+		const inFlight = this.mintsInFlight.get(userId);
+		if (inFlight) return inFlight;
+		const attempt = this.mintOnce(userId).finally(() => {
+			this.mintsInFlight.delete(userId);
+		});
+		this.mintsInFlight.set(userId, attempt);
+		return attempt;
+	}
+
+	/** One user's in-flight {@link mint}, so concurrent callers join it. */
+	private readonly mintsInFlight = new Map<
+		number,
+		Promise<CodexCredential | undefined>
+	>();
+
+	private async mintOnce(userId: number): Promise<CodexCredential | undefined> {
 		const stored = await this.get(userId);
 		if (!stored) return undefined;
 		if (!needsRefresh(stored, this.now())) return stored;

@@ -1707,18 +1707,42 @@ describe("writeCodexAuth", () => {
 	});
 
 	it("fails the boot rather than starting an unauthenticated Codex", () => {
-		// Unlike dotfiles, this is not best-effort: the session was routed to
-		// Codex because the user chose it, and continuing would fail at the
-		// first request with an error nothing connects back to this step.
+		// Unlike dotfiles, this is not best-effort when Codex is the runner this
+		// container will start: the user chose it, and continuing would fail at
+		// the first request with an error nothing connects back to this step.
 		const homeDir = join(tempHome(), "file-in-the-way");
 		writeFileSync(homeDir, "not a directory");
 
 		expect(() =>
 			new ContainerBootCommand({
-				env: baseEnv({ CODEX_AUTH_JSON: CREDENTIAL }),
+				env: baseEnv({
+					CODEX_AUTH_JSON: CREDENTIAL,
+					CYRUS_DEFAULT_RUNNER: "codex",
+				}),
 				homeDir,
 				logger: silentLogger(),
 			}).writeCodexAuth(),
 		).toThrow(/Could not write the Codex credential/);
+	});
+
+	it("does not fail a Claude container's boot", () => {
+		// CYR-79 made the router attach the credential to every container a
+		// subscribed user owns, so this method now runs on Claude containers too.
+		// A root-owned `~/.codex` on a warm volume must not kill a session that
+		// was never going to touch Codex — the same best-effort rule the router
+		// side applies, or the two disagree about what a bootable container is.
+		const homeDir = join(tempHome(), "file-in-the-way");
+		writeFileSync(homeDir, "not a directory");
+
+		expect(() =>
+			new ContainerBootCommand({
+				env: baseEnv({
+					CODEX_AUTH_JSON: CREDENTIAL,
+					CYRUS_DEFAULT_RUNNER: "claude",
+				}),
+				homeDir,
+				logger: silentLogger(),
+			}).writeCodexAuth(),
+		).not.toThrow();
 	});
 });

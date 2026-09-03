@@ -683,9 +683,12 @@ export class ContainerTargetService {
 			env[key] = value;
 		}
 
-		if (selection?.runner === "codex") {
-			await this.attachCodexCredential(userId, email, env);
-		}
+		// The credential is attached for EVERY runner, not only when Codex is the
+		// user's default. See {@link attachCodexCredential} for why, and for the
+		// boundary that makes it safe.
+		await this.attachCodexCredential(userId, email, env, {
+			required: selection?.runner === "codex",
+		});
 		return env;
 	}
 
@@ -703,16 +706,57 @@ export class ContainerTargetService {
 	 *   run on metered billing. That path stays supported precisely because the
 	 *   subscription path relies on an unofficial OAuth client that OpenAI could
 	 *   gate.
-	 * - **Neither, or a credential that no longer refreshes** — fail the boot.
+	 * - **Neither, or a credential that no longer refreshes** — fail the boot,
+	 *   but only when Codex is the runner the container is *going* to start
+	 *   (`required`). See below.
 	 *
 	 * It deliberately does **not** fall back to Claude. Silently running a
 	 * different runner than the user chose erodes trust in the whole picker, and
 	 * the user would have no way to tell it had happened.
+	 *
+	 * **The credential is attached regardless of the user's default runner, and
+	 * that is the fix for CYR-79.** The router decides a container's whole
+	 * environment at BOOT, from the user's workspace-wide default; the runner an
+	 * issue actually gets is decided later and repeatedly, inside the sandbox, by
+	 * `RunnerSelectionService` — from `[agent=]`/`[model=]` tags and labels that
+	 * can be edited mid-session, per turn, long after boot. Resolving the
+	 * effective runner here instead would therefore be resolving it once, from a
+	 * snapshot, for a decision that keeps changing: a `[agent=codex]` added to a
+	 * comment on an already-booted container would still land on an env with no
+	 * credential in it. So the delivery is made unconditional and the *selection*
+	 * is left entirely where it already lives.
+	 *
+	 * The security boundary this trades on: `CODEX_AUTH_JSON` is the requesting
+	 * user's own credential, going into a container dedicated to that same user's
+	 * issue, alongside the rest of their bundle — `CLAUDE_CODE_OAUTH_TOKEN`,
+	 * `GH_TOKEN`, `LINEAR_API_TOKEN` — with the same lifetime. It crosses no
+	 * boundary those do not already cross, and `ContainerBootCommand.writeCodexAuth`
+	 * scrubs the variable once the file exists. What widens is *exposure over
+	 * time*, not who can reach it: a Claude session now has a Codex credential on
+	 * disk it will never use, at 0600, for as long as that sandbox lives.
+	 *
+	 * Note what does NOT bound that, despite reading like it should: the router is
+	 * the sole refresher, but it only ever writes a container's `auth.json` at
+	 * COLD create — `AcaSandboxesProvider` discards the env this method builds on
+	 * the resume and snapshot-restore paths, which inherit the frozen state. So a
+	 * long-lived sandbox keeps the copy it booted with. The same asymmetry is why
+	 * a mint on a resume can rotate a refresh token whose old value is still on
+	 * that sandbox's disk; it predates CYR-79 for Codex-default users and is
+	 * widened by unconditional delivery, and re-delivering to a live sandbox needs
+	 * a router→worker channel that does not exist yet. Recorded rather than
+	 * claimed away.
+	 *
+	 * When Codex is NOT the default, every failure is best-effort: a user with no
+	 * ChatGPT subscription, or one whose refresh token has lapsed, must still be
+	 * able to boot the Claude container they actually asked for. The hard failure
+	 * is preserved verbatim for `required`, where a boot without a credential is a
+	 * session that cannot work.
 	 */
 	private async attachCodexCredential(
 		userId: number,
 		email: string,
 		env: Record<string, string>,
+		opts: { required: boolean },
 	): Promise<void> {
 		const hasApiKey = Boolean(env.OPENAI_API_KEY);
 		const tokens = this.deps.codexTokens;
@@ -731,15 +775,39 @@ export class ContainerTargetService {
 						);
 						return;
 					}
+					if (!opts.required) {
+						// Logged, not thrown: this container is booting for some other
+						// runner, and failing it would make a lapsed Codex subscription
+						// break Claude. The session that does select Codex fails with
+						// its own actionable message inside the sandbox (see
+						// `assertCodexCredentialAvailable` in cyrus-codex-runner).
+						this.deps.logger.warn(
+							`Codex credential refresh failed for ${email}; booting without it — a session that selects Codex will report the problem: ${error.message}`,
+						);
+						return;
+					}
 					throw new Error(
 						`Your Codex account could not be refreshed. ${error.message}\n\n${error.remedy}`,
 					);
+				}
+				// Same rule for an unexpected failure (an unreachable Key Vault, a
+				// transport error): it may not take down a boot that was never going
+				// to use this credential.
+				if (!opts.required) {
+					this.deps.logger.warn(
+						`Could not mint a Codex credential for ${email}; booting without it`,
+						error,
+					);
+					return;
 				}
 				throw error;
 			}
 		}
 
 		if (hasApiKey) return;
+		// Nothing to attach and nothing to complain about: this user has not
+		// connected a Codex account and is not booting for Codex either.
+		if (!opts.required) return;
 		// Two different messages, because the remedy is different and the wrong
 		// one is worse than none. Without a token store there IS no "Codex
 		// account" section on `/setup` — it is rendered only when the store

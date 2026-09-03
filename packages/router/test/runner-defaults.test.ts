@@ -11,6 +11,7 @@ import {
 	encodeDefaultRunnerJson,
 	encodeSelection,
 	MODEL_ENV_BY_RUNNER,
+	PREFERRED_CODEX_MODEL,
 	parseSelection,
 	RUNNER_CATALOG,
 	resolveDefaultRunner,
@@ -23,6 +24,40 @@ describe("the runner catalog", () => {
 		// never read; neither host is on the egress allowlist. Rendering either
 		// would be a choice guaranteed to fail.
 		expect([...SELECTABLE_RUNNERS].sort()).toEqual(["claude", "codex"]);
+	});
+
+	it("offers GPT-5.6 Sol without making it the fallback of last resort", () => {
+		// CYR-79 adds `gpt-5.6-sol`, which could not be run through the live
+		// subscription probe the rest of this list was built from. Order contains
+		// that: `models[0]` is what `resolveDefaultRunner` degrades a RETIRED
+		// stored selection onto, and what the built-in Codex default is kept in
+		// step with — two populations who never chose it. A rejected model under
+		// subscription auth does not degrade, it kills the session, so the
+		// unverified name is offered as an explicit choice and nothing lands on
+		// it by accident. Flip the order when the probe answers.
+		const codex = RUNNER_CATALOG.find((entry) => entry.runner === "codex");
+		expect(codex?.models[0]?.model).toBe("gpt-5.5");
+		expect(codex?.models.map((option) => option.model)).toContain(
+			"gpt-5.6-sol",
+		);
+	});
+
+	it("keeps a stored selection for a model still in the catalog", () => {
+		// The migration half of CYR-79: adding GPT-5.6 must not disturb anyone
+		// already on GPT-5.5 — no warning, no silent model change.
+		const warn = vi.fn();
+		expect(
+			resolveDefaultRunner('{"runner":"codex","model":"gpt-5.5"}', { warn }),
+		).toEqual({ runner: "codex", model: "gpt-5.5" });
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it("lets a user select GPT-5.6 Sol and round-trips it", () => {
+		const selection = { runner: "codex" as const, model: "gpt-5.6-sol" };
+		expect(parseSelection(encodeSelection(selection))).toEqual(selection);
+		expect(defaultRunnerEnv(selection).CYRUS_CODEX_DEFAULT_MODEL).toBe(
+			"gpt-5.6-sol",
+		);
 	});
 
 	it("has at least one model per runner and no duplicate values", () => {
@@ -139,8 +174,13 @@ describe("resolveDefaultRunner", () => {
 });
 
 describe("defaultRunnerEnv", () => {
-	it("emits nothing when the user has no preference", () => {
-		expect(defaultRunnerEnv(undefined)).toEqual({});
+	it("names no runner when the user has no preference", () => {
+		// The Codex model still ships (see below); what must not appear is a
+		// runner the user never chose.
+		expect(defaultRunnerEnv(undefined).CYRUS_DEFAULT_RUNNER).toBeUndefined();
+		expect(
+			defaultRunnerEnv(undefined).CYRUS_CLAUDE_DEFAULT_MODEL,
+		).toBeUndefined();
 	});
 
 	it("emits the runner and the runner's own model var", () => {
@@ -151,7 +191,28 @@ describe("defaultRunnerEnv", () => {
 		expect(defaultRunnerEnv({ runner: "claude", model: "sonnet" })).toEqual({
 			CYRUS_DEFAULT_RUNNER: "claude",
 			CYRUS_CLAUDE_DEFAULT_MODEL: "sonnet",
+			// CYR-79: present even though the default is Claude. Without it an
+			// `[agent=codex]` issue on this container falls through to the constant
+			// compiled into the worker image, so the catalog stops being the thing
+			// that decides — and a bad Codex model needs an image rebuild to undo.
+			CYRUS_CODEX_DEFAULT_MODEL: PREFERRED_CODEX_MODEL,
 		});
+	});
+
+	it("lets an explicit Codex selection win over the catalog preference", () => {
+		// The unconditional value is a floor for the deferred-selection path, not
+		// an override of what the user actually picked.
+		expect(
+			defaultRunnerEnv({ runner: "codex", model: "gpt-5.6-sol" })
+				.CYRUS_CODEX_DEFAULT_MODEL,
+		).toBe("gpt-5.6-sol");
+	});
+
+	it("emits a Codex model the catalog actually offers", () => {
+		const codex = RUNNER_CATALOG.find((entry) => entry.runner === "codex");
+		expect(codex?.models.map((option) => option.model)).toContain(
+			PREFERRED_CODEX_MODEL,
+		);
 	});
 
 	it("emits only keys the router owns", () => {

@@ -96,3 +96,50 @@ The terms prohibit sharing credentials *between humans*, not automation — one
 person's credential driving their own sessions across many machines is
 explicitly fine. A single team-wide subscription serving everyone's issues would
 not be, so the per-user secret model is load-bearing here, not incidental.
+
+**The credential is delivered to every container a subscribed user owns, not
+only to those whose default runner is Codex** (amended for CYR-79). The router
+builds a container's whole environment at boot, from the user's workspace-wide
+default; the runner an issue actually gets is chosen later and repeatedly,
+*inside* the sandbox, by `RunnerSelectionService` — from `[agent=]`/`[model=]`
+tags and labels that can be edited between turns. Gating delivery on the default
+therefore gated it on the wrong decision: a user whose default was Claude could
+select Codex on one issue and get a session that authenticated with nothing,
+failing on `401 Unauthorized: Missing bearer or basic authentication in header`
+from `/v1/responses`. Resolving the effective runner on the router instead would
+only move the mistake: it would resolve once, at boot, a decision that keeps
+changing afterwards.
+
+The boundary this trades on is that `CODEX_AUTH_JSON` is *the requesting user's
+own* credential entering a container dedicated to *that same user's* issue,
+alongside the rest of their bundle — `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`,
+`LINEAR_API_TOKEN` — with the same lifetime and the same reachability. Nobody
+gains access to a credential they could not already reach, and the per-user rule
+above is untouched. What widens is exposure *over time*: a Claude session now has
+a Codex credential on disk it will never use, at 0600, for as long as that
+sandbox lives. `writeCodexAuth` scrubs the variable from the environment once
+the file exists, so it is not also in every command the agent runs.
+
+Two limits on how far that is bounded are worth stating rather than glossing.
+First, the router writes a container's `auth.json` only at COLD create:
+`AcaSandboxesProvider` discards the env `buildEnv` produces on the resume and
+snapshot-restore paths, which inherit the frozen state — so "short-lived and
+router-refreshed" describes the router's stored credential, not the copy a
+long-lived sandbox is holding. Second, and from the same asymmetry, a mint that
+fires on a resume rotates a refresh token whose superseded value is still on
+that sandbox's disk. Neither is introduced here — both already applied to
+Codex-default users — but unconditional delivery widens who meets them, and
+closing them properly needs a router-to-worker channel for re-delivering a
+credential to a live sandbox, which does not exist yet. Concurrent mints for one
+user are serialized in `CodexTokenStore.mint`, which removes the rotation race
+between simultaneous boots but not this one.
+
+Delivery being unconditional means its failures must be, too. When Codex is the
+user's default, an absent or unrefreshable credential still fails the boot with
+its remedy; when it is not, the same failure is logged and the container boots,
+because a lapsed ChatGPT subscription may not break the Claude session the user
+actually asked for. The session that *does* select Codex then reports the problem
+itself, from inside the sandbox: `assertCodexCredentialAvailable` in
+`cyrus-codex-runner` checks `OPENAI_API_KEY` and `$CODEX_HOME/auth.json` before
+the first turn and finalises an error activity naming both remedies, rather than
+letting OpenAI's 401 be the user's only signal.

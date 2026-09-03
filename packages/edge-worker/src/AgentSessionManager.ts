@@ -96,6 +96,28 @@ export declare interface AgentSessionManager {
 }
 
 /**
+ * Whether a runner session id may be stored for a later turn to resume.
+ *
+ * A runner's terminal messages always carry SOME session id — a runner that
+ * died before its agent ever started still synthesizes one so the timeline is
+ * not left blank — and storing that id is how a single failed start becomes a
+ * permanently broken Linear session: every subsequent turn resumes an id the
+ * provider never issued and fails on it, including the turn where the user has
+ * just fixed the original problem.
+ *
+ * Runners that can tell the difference say so (`CodexRunner`, where the window
+ * is real: its credential preflight fails before the backend is opened).
+ * Runners that do not are trusted, which preserves existing behaviour exactly —
+ * this narrows a failure mode rather than adding a new gate.
+ */
+function isResumableRunnerSessionId(runner: IAgentRunner | undefined): boolean {
+	if (!runner) return true;
+	const probe = (runner as { hasEstablishedRunnerSession?: () => boolean })
+		.hasEstablishedRunnerSession;
+	return typeof probe === "function" ? probe.call(runner) : true;
+}
+
+/**
  * Manages Agent Sessions integration with Claude Code SDK
  * Transforms Claude streaming messages into Agent Session format
  * Handles session lifecycle: create → active → complete/error
@@ -322,8 +344,13 @@ export class AgentSessionManager extends EventEmitter {
 							? "opencode"
 							: "claude";
 
-		// Update the appropriate session ID based on runner type
-		if (runnerType === "gemini") {
+		// Update the appropriate session ID based on runner type — but only when
+		// the runner says the id is one a later turn can actually resume.
+		if (!isResumableRunnerSessionId(runner)) {
+			this.sessionLog(sessionId).warn(
+				`Not storing a ${runnerType} session id from a session that failed before the agent started; the next turn will start a fresh one`,
+			);
+		} else if (runnerType === "gemini") {
 			linearSession.geminiSessionId = claudeSystemMessage.session_id;
 		} else if (runnerType === "codex") {
 			linearSession.codexSessionId = claudeSystemMessage.session_id;
@@ -1104,16 +1131,21 @@ export class AgentSessionManager extends EventEmitter {
 		}
 
 		const resultEntry: CyrusAgentSessionEntry = {
-			// Set the appropriate session ID based on runner type
-			...(runnerType === "gemini"
-				? { geminiSessionId: resultMessage.session_id }
-				: runnerType === "codex"
-					? { codexSessionId: resultMessage.session_id }
-					: runnerType === "cursor"
-						? { cursorSessionId: resultMessage.session_id }
-						: runnerType === "opencode"
-							? { opencodeSessionId: resultMessage.session_id }
-							: { claudeSessionId: resultMessage.session_id }),
+			// Set the appropriate session ID based on runner type — omitted
+			// entirely when the runner reports that it never established one (see
+			// `isResumableRunnerSessionId`), so a failure that happened before the
+			// agent started cannot leave a resumable-looking id behind.
+			...(!isResumableRunnerSessionId(runner)
+				? {}
+				: runnerType === "gemini"
+					? { geminiSessionId: resultMessage.session_id }
+					: runnerType === "codex"
+						? { codexSessionId: resultMessage.session_id }
+						: runnerType === "cursor"
+							? { cursorSessionId: resultMessage.session_id }
+							: runnerType === "opencode"
+								? { opencodeSessionId: resultMessage.session_id }
+								: { claudeSessionId: resultMessage.session_id }),
 			type: "result",
 			content,
 			metadata: {

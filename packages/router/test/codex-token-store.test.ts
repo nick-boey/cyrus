@@ -162,6 +162,64 @@ describe("CodexTokenStore", () => {
 				status: "needs-attention",
 			});
 		});
+
+		it("redeems the refresh token once for concurrent mints on one user", async () => {
+			// OpenAI's refresh token is single-use and rotates on every redemption,
+			// and `setUserCodexAuth` is last-write-wins with no compare-and-swap —
+			// so a second redemption of the same token loses, and can persist a
+			// credential that is already dead. Boots are serialized per DEVICE, not
+			// per user, so two of a user's issues booting together reach this;
+			// CYR-79 made minting unconditional, which widens who can.
+			let calls = 0;
+			const fetchFn = vi.fn(async () => {
+				calls += 1;
+				return new Response(
+					JSON.stringify({
+						access_token: jwtExpiringAt(NOW + 3_600_000),
+						refresh_token: `refresh-${calls + 1}`,
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}) as unknown as typeof fetch;
+			const { tokens, userId } = harness({ fetchFn });
+			await tokens.put(userId, { ...LIVE, accessTokenExpiresMs: NOW + 1000 });
+
+			const [a, b, c] = await Promise.all([
+				tokens.mint(userId),
+				tokens.mint(userId),
+				tokens.mint(userId),
+			]);
+
+			expect(calls).toBe(1);
+			// Every joiner gets the winner's credential, which is what each wanted.
+			expect(a?.refreshToken).toBe("refresh-2");
+			expect(b?.refreshToken).toBe("refresh-2");
+			expect(c?.refreshToken).toBe("refresh-2");
+			expect((await tokens.get(userId))?.refreshToken).toBe("refresh-2");
+		});
+
+		it("does not wedge the user after a failed mint", async () => {
+			// The in-flight entry must be cleared on rejection too, or one transient
+			// failure would make every later mint for that user replay it.
+			let calls = 0;
+			const fetchFn = vi.fn(async () => {
+				calls += 1;
+				return calls === 1
+					? new Response("nope", { status: 500 })
+					: new Response(
+							JSON.stringify({
+								access_token: jwtExpiringAt(NOW + 3_600_000),
+								refresh_token: "refresh-2",
+							}),
+							{ status: 200, headers: { "content-type": "application/json" } },
+						);
+			}) as unknown as typeof fetch;
+			const { tokens, userId } = harness({ fetchFn });
+			await tokens.put(userId, { ...LIVE, accessTokenExpiresMs: NOW + 1000 });
+
+			await expect(tokens.mint(userId)).rejects.toBeTruthy();
+			expect((await tokens.mint(userId))?.refreshToken).toBe("refresh-2");
+		});
 	});
 });
 

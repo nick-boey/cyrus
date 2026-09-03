@@ -18,6 +18,7 @@ import type {
 } from "../src/RepositoryRegistry.js";
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
+import { CodexRefreshError } from "../src/setup/codexAuth.js";
 import { encodeDefaultRunnerJson } from "../src/setup/runnerDefaults.js";
 import {
 	eventsNamed as namedEvents,
@@ -1318,6 +1319,107 @@ describe("ContainerTargetService — the per-user runner default", () => {
 		expect(body).toMatch(/not configured for ChatGPT-subscription credentials/);
 		expect(body).toMatch(/OPENAI_API_KEY/);
 		expect(body).toMatch(/containers\.codex/);
+	});
+
+	// CYR-79. The router builds a container's whole environment from the user's
+	// WORKSPACE-WIDE default, but the runner an issue actually gets is decided
+	// later and repeatedly inside the sandbox, from `[agent=]`/`[model=]` tags and
+	// labels. Attaching the credential only when the default was Codex meant an
+	// issue-level Codex selection started with nothing to authenticate with and
+	// died on `401 Unauthorized: Missing bearer or basic authentication in
+	// header` from `/v1/responses`.
+	describe("the Codex credential is delivered independently of the default", () => {
+		const CREDENTIAL = {
+			refreshToken: "rt",
+			accessToken: "at",
+			updatedMs: 1,
+		};
+
+		/** A user whose default is Claude — i.e. NOT Codex. */
+		function claudeDefaultUser(): number {
+			const userId = claudeUser();
+			store.setUserDefaultRunner(
+				userId,
+				encodeDefaultRunnerJson({ runner: "claude", model: "opus" }),
+			);
+			return userId;
+		}
+
+		it("attaches it to a container whose default runner is Claude", async () => {
+			// The failing combination, reproduced: a connected ChatGPT subscription,
+			// a non-Codex default, and a container that must still be able to run
+			// Codex when the issue selects it.
+			const userId = claudeDefaultUser();
+			const codexTokens = {
+				mint: async () => CREDENTIAL,
+			} as unknown as ContainerRoutingDeps["codexTokens"];
+			const { service, docker } = serviceWith({ codexTokens });
+
+			const env = await bootEnv(service, docker, userId);
+			expect(env.CYRUS_DEFAULT_RUNNER).toBe("claude");
+			expect(env.CODEX_AUTH_JSON).toBeTruthy();
+			expect(JSON.parse(String(env.CODEX_AUTH_JSON)).tokens.access_token).toBe(
+				"at",
+			);
+		});
+
+		it("boots a non-Codex container when the user has connected no account", async () => {
+			// The other half: delivery became unconditional, so its ABSENCE must
+			// stay harmless. Failing here would let "no ChatGPT subscription" break
+			// every Claude session.
+			const userId = claudeDefaultUser();
+			const codexTokens = {
+				mint: async () => undefined,
+			} as unknown as ContainerRoutingDeps["codexTokens"];
+			const { service, docker } = serviceWith({ codexTokens });
+
+			const env = await bootEnv(service, docker, userId);
+			expect(env.CYRUS_DEFAULT_RUNNER).toBe("claude");
+			expect(env.CODEX_AUTH_JSON).toBeUndefined();
+		});
+
+		it("boots a non-Codex container when the credential no longer refreshes", async () => {
+			// A lapsed subscription is a hard boot failure for a Codex user and a
+			// logged non-event for everyone else. The session that does select Codex
+			// reports it itself, from inside the sandbox.
+			const userId = claudeDefaultUser();
+			const codexTokens = {
+				mint: async () => {
+					throw new CodexRefreshError("token expired", "Re-paste auth.json.");
+				},
+			} as unknown as ContainerRoutingDeps["codexTokens"];
+			const { service, docker } = serviceWith({ codexTokens });
+
+			const env = await bootEnv(service, docker, userId);
+			expect(env.CODEX_AUTH_JSON).toBeUndefined();
+		});
+
+		it("boots a non-Codex container when minting fails unexpectedly", async () => {
+			// An unreachable Key Vault must not take down a boot that was never
+			// going to use this credential.
+			const userId = claudeDefaultUser();
+			const codexTokens = {
+				mint: async () => {
+					throw new Error("Key Vault unreachable");
+				},
+			} as unknown as ContainerRoutingDeps["codexTokens"];
+			const { service, docker } = serviceWith({ codexTokens });
+
+			const env = await bootEnv(service, docker, userId);
+			expect(env.CODEX_AUTH_JSON).toBeUndefined();
+		});
+
+		it("still fails a Codex-default boot that cannot be authenticated", async () => {
+			// The relaxation is scoped to containers booting for another runner.
+			const codexTokens = {
+				mint: async () => {
+					throw new CodexRefreshError("token expired", "Re-paste auth.json.");
+				},
+			} as unknown as ContainerRoutingDeps["codexTokens"];
+			const body = await codexBootFailureBody({ codexTokens });
+			expect(body).toMatch(/could not be refreshed/);
+			expect(body).toMatch(/Re-paste auth\.json\./);
+		});
 	});
 });
 
