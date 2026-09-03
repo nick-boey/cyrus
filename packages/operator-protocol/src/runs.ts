@@ -130,25 +130,22 @@ export type RunRoutingSnapshotV1 = z.infer<typeof runRoutingSnapshotV1Schema>;
 
 /**
  * One routed input. Prompt text and comment previews are never retained — only
- * the identifier the input arrived under, which is what makes it observable at
- * all. An input carrying neither identifier could not be correlated with
- * anything, so it is refused.
+ * the Linear references the input arrived under, and the instant it was routed.
+ *
+ * BOTH identifiers are optional, and that is deliberate rather than lax: a
+ * delegation raises `agentSessionCreated` with no agent activity and no source
+ * comment, so the router's own `extractRunInput` yields `{routedMs}` alone and
+ * `parseRunInputs` keeps it. Since delegation is the primary way a first agent
+ * session begins, requiring an identifier here would make that run's ONLY input
+ * invalid — and a fleet operator would lose sight of exactly the runs they most
+ * need to see. `routedAt`, against the run's own identity, is still the fact
+ * that the router accepted input at that instant.
  */
-export const runInputV1Schema = z
-	.object({
-		activityId: identifierV1Schema.optional(),
-		commentId: identifierV1Schema.optional(),
-		routedAt: isoTimestampV1Schema,
-	})
-	.superRefine((input, ctx) => {
-		if (input.activityId === undefined && input.commentId === undefined) {
-			ctx.addIssue({
-				code: "custom",
-				message:
-					"An input must carry an activity or comment identifier to be observable",
-			});
-		}
-	});
+export const runInputV1Schema = z.object({
+	activityId: identifierV1Schema.optional(),
+	commentId: identifierV1Schema.optional(),
+	routedAt: isoTimestampV1Schema,
+});
 export type RunInputV1 = z.infer<typeof runInputV1Schema>;
 
 export const runWorkerV1Schema = z.object({
@@ -167,6 +164,18 @@ export type RunWorkerV1 = z.infer<typeof runWorkerV1Schema>;
  *
  * Tolerant of unknown keys — a newer router may add facts an older CLI ignores.
  * The cross-field rules below are what a client may actually rely on.
+ *
+ * EMITTING THIS REQUIRES A STORE MIGRATION, and the required fields say which:
+ * today's `agent_runs` table holds no `issue_id`, no `runner`, no `model`, and
+ * none of the routing snapshot, so `issueId`, `runner`, and `routing` cannot be
+ * populated from an existing row. They are required anyway because the spec
+ * makes them part of the observation and an optional identity is one every
+ * consumer must then handle forever. The consequence is deliberate and belongs
+ * to whichever issue adds the route: rows written before that migration cannot
+ * be rendered as v1, so it must backfill them or scope `/api/v1/runs` to runs
+ * routed after it. Note that terminal runs age out in 24 hours but non-terminal
+ * ones do not — a long-stuck run is both the hardest to backfill and the one an
+ * operator most needs to see.
  */
 export const runObservationV1Schema = z
 	.object({
@@ -182,9 +191,22 @@ export const runObservationV1Schema = z
 		provider: z.string().min(1).optional(),
 		lifecycle: runLifecycleStateV1Schema,
 		wait: runWaitV1Schema.optional(),
-		/** Background work an ACTIVE run is still carrying. Not a wait reason. */
+		/**
+		 * Background work the run is still carrying. Not a wait reason — that
+		 * distinction is carried by {@link waitReasonV1Schema} being a closed
+		 * enum that does not contain it, not by forbidding the two to coexist.
+		 * A run blocked on an elicitation WITH a live background build is a
+		 * state the worker explicitly models, and it is the evidence that
+		 * predicts a `worker_owns_active_work` refusal.
+		 */
 		pendingWorkCount: z.int().nonnegative().optional(),
-		inputs: z.array(runInputV1Schema).min(1),
+		/**
+		 * May be empty. A run always had input — that is what started it — but
+		 * an observation must never become unemittable because its input
+		 * provenance is thin, since that loses the whole run from the fleet
+		 * view rather than one correlation detail.
+		 */
+		inputs: z.array(runInputV1Schema),
 		/** The latest agent activity SUCCESSFULLY published to the timeline. */
 		lastPublishedActivityAt: isoTimestampV1Schema.optional(),
 		worker: runWorkerV1Schema,
@@ -230,15 +252,18 @@ export const runObservationV1Schema = z
 			});
 		}
 
-		// Pending work is an active-run fact. Allowing it on a waiting run would
-		// re-create the pending-work-as-wait-reason conflation the domain
-		// separates; allowing it on a terminal run would assert live background
-		// work under a run that has ended.
-		if (run.pendingWorkCount !== undefined && run.lifecycle !== "active") {
+		// Pending work belongs to a run that can still resume. Asserting live
+		// background work under a run that has ENDED is the contradiction worth
+		// refusing; a waiting run carrying it is not — the worker's own
+		// "safe to park?" gate exists precisely for a session blocked on a user
+		// answer with a background build still running, and dropping the count
+		// there would destroy the evidence that decides both parking and a
+		// `worker_owns_active_work` recovery refusal.
+		if (run.pendingWorkCount !== undefined && terminal) {
 			ctx.addIssue({
 				code: "custom",
 				path: ["pendingWorkCount"],
-				message: `Pending work is an active-run fact and does not apply to a \`${run.lifecycle}\` run`,
+				message: `Pending work cannot be carried by a \`${run.lifecycle}\` run, which has ended`,
 			});
 		}
 
@@ -336,15 +361,41 @@ export function encodeRunChangeCursor(cursor: RunChangeCursorV1): string {
 	].join(".");
 }
 
-/** @throws if the cursor is not a well-formed run-change cursor. */
-export function decodeRunChangeCursor(cursor: string): RunChangeCursorV1 {
-	const [, , streamEpoch, sequence] = runChangeCursorV1Schema
-		.parse(cursor)
-		.split(".") as [string, string, string, string];
+/**
+ * Non-throwing decode, for use inside schema refinements.
+ *
+ * A refinement that threw would escape `safeParse` entirely: Zod still runs an
+ * object-level refinement when a property failed only a string-format check,
+ * so a malformed cursor would raise where a caller validating untrusted input
+ * expects `{ success: false }`. Returns `undefined` instead, and the field-level
+ * check reports the malformed cursor on its own.
+ */
+function tryDecodeRunChangeCursor(
+	cursor: string,
+): RunChangeCursorV1 | undefined {
+	const parsed = runChangeCursorV1Schema.safeParse(cursor);
+	if (!parsed.success) return undefined;
+	const [, , streamEpoch, sequence] = parsed.data.split(".") as [
+		string,
+		string,
+		string,
+		string,
+	];
 	return {
 		streamEpoch: decodeSegment(streamEpoch),
 		sequence: decodeSegment(sequence),
 	};
+}
+
+/** @throws if the cursor is not a well-formed run-change cursor. */
+export function decodeRunChangeCursor(cursor: string): RunChangeCursorV1 {
+	const decoded = tryDecodeRunChangeCursor(cursor);
+	if (decoded === undefined) {
+		// Re-run through `parse` so the caller gets the schema's own ZodError
+		// rather than a second, differently-shaped error type.
+		runChangeCursorV1Schema.parse(cursor);
+	}
+	return decoded as RunChangeCursorV1;
 }
 
 export function encodeRunPageCursor(position: string): string {
@@ -443,8 +494,14 @@ export const runChangePageV1Schema = z
 		// Mixing epochs would hand a client a resume point that its next request
 		// answers `410 Gone` for, with no way to tell which entries it had
 		// already consumed.
-		const mismatched = (cursor: string): boolean =>
-			decodeRunChangeCursor(cursor).streamEpoch !== page.streamEpoch;
+		//
+		// A cursor that will not decode is already reported by the field-level
+		// check, so it is skipped rather than decoded — decoding it here would
+		// throw straight out of `safeParse`.
+		const mismatched = (cursor: string): boolean => {
+			const decoded = tryDecodeRunChangeCursor(cursor);
+			return decoded !== undefined && decoded.streamEpoch !== page.streamEpoch;
+		};
 		if (mismatched(page.nextCursor)) {
 			ctx.addIssue({
 				code: "custom",

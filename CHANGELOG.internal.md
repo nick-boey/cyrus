@@ -21,14 +21,25 @@ This changelog documents internal development changes, refactors, tooling update
   The schemas encode the approved distinctions as cross-field rules rather than
   leaving them to prose, so a violation is a test failure: run lifecycle is a
   separate closed enum from executor state and only a container carries a sampled
-  one; `waiting` and its worker-reported evidence travel together, while
-  `pendingWorkCount` is an active-run fact refused on a waiting or terminal run;
-  a captured routing name may not appear without its canonical ID; change cursors
-  are opaque and carry the router-start stream epoch, and a page may not mix
-  epochs; the log-source descriptor is strict so it cannot carry a credential; and
-  recovery is asynchronous, with a `RecoveryRequestV1` that is strict — silently
-  stripping a misspelled `expectedRevision` would turn a conditional recovery into
-  an unconditional one.
+  one; `waiting` and its worker-reported evidence travel together; a captured
+  routing name may not appear without its canonical ID; change cursors are opaque
+  and carry the router-start stream epoch, and a page may not mix epochs; the
+  log-source descriptor is strict so it cannot carry a credential; and recovery is
+  asynchronous, with a `RecoveryRequestV1` that is strict — silently stripping a
+  misspelled `expectedRevision` would turn a conditional recovery into an
+  unconditional one.
+
+  Where a rule would have been tighter than the router's real data, it is
+  deliberately not: pending work is refused only on a run that has ENDED, not on
+  a waiting one, because a session blocked on a user answer with a live
+  background build is the state the worker's own "safe to park?" gate exists for
+  (`pending_work` stays distinct from a wait reason by `waitReasonV1Schema` being
+  a closed enum, not by forbidding the two to coexist); and a run input may carry
+  neither an activity nor a comment ID, because a delegation produces exactly
+  that and requiring one would make the run it started unrepresentable. Emitting
+  `RunObservationV1` still requires a store migration — `agent_runs` today has no
+  `issue_id`, `runner`, or routing snapshot — which the schema documents rather
+  than papering over with optional identity.
 
 - **Adopted the observability domain language and decisions ([CYR-63](https://linear.app/northrop-digital/issue/CYR-63/migrate-cyr-62-domain-context-and-adrs-into-the-repository),
   planned on [CYR-62](https://linear.app/northrop-digital/issue/CYR-62/create-plan-for-project),

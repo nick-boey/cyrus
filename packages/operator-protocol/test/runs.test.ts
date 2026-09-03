@@ -19,6 +19,7 @@ import {
 	CHANGE_CURSOR,
 	compact,
 	elicitationWaitRun,
+	elicitationWaitWithPendingWork,
 	otherWaitRun,
 	RUN_PAGE_CURSOR,
 	runChangePage,
@@ -184,13 +185,17 @@ describe("RunObservationV1", () => {
 			).toBe(false);
 		});
 
-		// pending_work is an active-run fact, never a wait reason.
-		it("rejects pending work on a waiting run", () => {
-			expect(
-				runObservationV1Schema.safeParse(
-					compact({ ...elicitationWaitRun, pendingWorkCount: 2 }),
-				).success,
-			).toBe(false);
+		// pending_work is not a wait reason — the closed `waitReasonV1Schema`
+		// carries that distinction. It is NOT mutually exclusive with waiting:
+		// the worker's "safe to park?" gate exists precisely for a session
+		// blocked on a user answer with a background build still running, and
+		// that count is what predicts a `worker_owns_active_work` refusal.
+		it("accepts an elicitation wait that is still carrying background work", () => {
+			const fixture = compact(elicitationWaitWithPendingWork);
+			const parsed = runObservationV1Schema.parse(fixture);
+			expect(parsed.lifecycle).toBe("waiting");
+			expect(parsed.wait?.reason).toBe("elicitation");
+			expect(parsed.pendingWorkCount).toBe(1);
 		});
 
 		it("rejects pending work on a terminal run", () => {
@@ -283,11 +288,34 @@ describe("RunObservationV1", () => {
 		});
 	});
 
-	it("requires every input to carry an activity or comment identifier", () => {
+	// A delegation raises `agentSessionCreated` with no agent activity and no
+	// source comment, so the router's own `extractRunInput` yields just a routed
+	// time. Refusing that would make the run — whose only input it is —
+	// unemittable, hiding exactly the runs an operator needs from the fleet view.
+	it("accepts a delegation-shaped input carrying only a routed time", () => {
+		const delegated = {
+			...activeRunWithPendingWork,
+			inputs: [{ routedAt: "2026-09-03T09:58:00.000Z" }],
+		};
+		expect(runObservationV1Schema.parse(delegated).inputs).toEqual([
+			{ routedAt: "2026-09-03T09:58:00.000Z" },
+		]);
+	});
+
+	it("accepts an observation whose input provenance was lost", () => {
 		expect(
 			runObservationV1Schema.safeParse({
 				...activeRunWithPendingWork,
-				inputs: [{ routedAt: "2026-09-03T09:58:00.000Z" }],
+				inputs: [],
+			}).success,
+		).toBe(true);
+	});
+
+	it("still rejects an input with no routed time", () => {
+		expect(
+			runObservationV1Schema.safeParse({
+				...activeRunWithPendingWork,
+				inputs: [{ commentId: "comment-1" }],
 			}).success,
 		).toBe(false);
 	});
@@ -453,6 +481,22 @@ describe("RunChangePageV1", () => {
 			runChangePageV1Schema.safeParse({ ...withoutCursor, changes: [] })
 				.success,
 		).toBe(false);
+	});
+
+	// The epoch refinement decodes cursors, so it must not decode a cursor that
+	// will not parse: a throw there escapes `safeParse` entirely and a client
+	// validating an untrusted page crashes instead of reporting a bad response.
+	it("reports a malformed cursor through safeParse rather than throwing", () => {
+		for (const page of [
+			{ ...runChangePage, nextCursor: "42" },
+			{
+				...runChangePage,
+				changes: [{ ...runObservationChange, cursor: "not-a-cursor" }],
+			},
+		]) {
+			expect(() => runChangePageV1Schema.safeParse(page)).not.toThrow();
+			expect(runChangePageV1Schema.safeParse(page).success).toBe(false);
+		}
 	});
 
 	it("rejects a page mixing cursors from another stream epoch", () => {

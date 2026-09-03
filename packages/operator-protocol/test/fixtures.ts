@@ -148,6 +148,18 @@ export const elicitationWaitRun = {
 } as const;
 
 /**
+ * Blocked on a user answer WITH a background build still running — the exact
+ * state the worker's "safe to park?" gate exists for. Waiting and pending work
+ * are not mutually exclusive; pending work simply is not a wait reason.
+ */
+export const elicitationWaitWithPendingWork = {
+	...elicitationWaitRun,
+	runId: "run-01JBQK8DDDDDDDDDDDDDDDDDDD",
+	pendingWorkCount: 1,
+	revision: 11,
+} as const;
+
+/**
  * A worker-reported wait the schema does not model yet. `other` is only
  * meaningful with the condition the worker actually reported, so the contract
  * requires it.
