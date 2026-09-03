@@ -4,6 +4,42 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Changed
+- **Merged `cyrusagents/cyrus` main into the fork ([CYR-24](https://linear.app/northrop-digital/issue/CYR-24/bring-our-fork-up-to-date-with-the-upstream-cyrus-repo)).** The fork had diverged 33 ahead / 21 behind
+  since 2026-08-08. Merged rather than rebased: `cyrus-deploy` pins a 40-character
+  SHA of this branch and derives the router image tag from it, so rewriting these
+  SHAs would orphan every deployed image tag from the history it was built at, and
+  five open pull requests target `main`. Notable reconciliations, each preserving
+  both sides' intent:
+  - `WorkerService.startEdgeWorker` no longer lists `platform`, `router`,
+    `userAccessControl`, `sandbox`, `issueUpdateTrigger`, `prReviewTrigger`,
+    `promptDefaults` or `linearWorkspaces` explicitly. Upstream's `...edgeConfig`
+    spread (CYPACK-1478) forwards plain pass-throughs generically — the same
+    dropped-field bug those lines were added for — and its comment forbids
+    listing them. `platform` and `router` were added to `RELOAD_MERGED_KEYS` so
+    upstream's compile-time exhaustiveness check and hot-reload watch cover them.
+  - `RunnerSelectionService.inferRunnerFromModel` gained upstream's OpenCode
+    provider/model inference in the *public method*, not just the local closure,
+    so `RunnerConfigBuilder` — which calls it through the `RunnerSelector`
+    interface — cannot infer a different runner than the service does.
+  - `PersistenceManager` keeps the fork's pid+counter temp filename rather than
+    upstream's fixed `.tmp`: two overlapping in-process saves would otherwise
+    interleave writes to one path. Upstream's requirement that a crashed save
+    not leak its temp file is met by sweeping siblings on *load*, when no save
+    of this process's is in flight. The empty-file and corrupt-file paths are now
+    distinct — an intentionally cleared file is "no state", not a corruption.
+  - Dropped the `@anthropic-ai/sdk: '>=0.115.0'` floor from
+    `pnpm-workspace.yaml`. An override replaces the specifier outright, so it
+    silently pinned the package at 0.115.0 and defeated upstream's bump to
+    `^0.123.0`. Removing a floor a direct-dep bump has made redundant is what the
+    Dependency Security Policy in `CLAUDE.md` requires.
+  - Added the `opencode` arm to the router's `RUNNER_REQUIRED_SECRET_KEYS` and
+    `MODEL_ENV_BY_RUNNER` maps, which upstream's widened `RunnerType` made
+    non-exhaustive. Neither is reachable yet: OpenCode is not in `RUNNER_CATALOG`.
+  - Cleared nine pre-existing `noUnsafeOptionalChaining` errors in upstream's
+    `OpenCodeRunner.test.ts`. They fail `pnpm biome ci`, which this fork's CI
+    gates on; upstream's `main` is currently red on its own lint step.
+
 ### Fixed
 - **[NOR-402](https://linear.app/northrop-digital/issue/NOR-402/a-never-terminating-agent-session-makes-an-issue-permanently), [#49](https://github.com/nick-boey/cyrus/pull/49) — the stranded-session detector could not see the fault it was named for, and the fault itself was unfalsifiable.**
   - **`noteStranded` gained a second shape, `reason=no_progress`.** Its `notRunning && !online` gate excluded `running && online && sessions>0` **by definition**, which is exactly what CAN-133 reported once a minute for 5h17m — so `alert-cyrus-dev-sandbox-stranded-sessions` (enabled, severity 1, 15-minute evaluation) could never fire for it. "Looks healthy" cannot be the exclusion when a healthy-looking container is what the fault produces. `offline_pinned` keeps its own faster 10-minute grace because there the *state* itself proves no progress; `no_progress` is state-independent and defaults to an hour. Both stay DETECTION ONLY for the reasons in `noteStranded`'s doc comment. `offline_pinned` wins when both hold, and the once-per-entry error latch is now keyed by reason so a change of diagnosis is not swallowed.
@@ -310,6 +346,25 @@ This changelog documents internal development changes, refactors, tooling update
 
 ### Removed
 - Reverted multi-user env-var credential injection (UserCredentialResolver, credential-env scrub, cyrus users CLI); SessionCreator threading and F1 creator payloads retained for the router architecture.
+
+### Changed
+- Recorded, after the fact, why #1426 removed the `linear_agent_session_create` and `linear_agent_session_create_on_comment` cyrus-tools: they allowed concurrent child sessions to be started on the same issue. That removal also silently dropped the only runtime caller of `GlobalSessionRegistry.setParentSession`, breaking parent resumption. `EdgeWorker.linkChildSessionToParentIssueSession` now derives the child-to-parent session link from Linear's issue hierarchy on `AgentSessionEvent/created` (and after repository selection), so the removed tools stay removed. ([#1454](https://github.com/cyrusagents/cyrus/pull/1454))
+
+### Fixed
+- The release workflow's npm registry visibility check now waits up to 10 minutes per package instead of 60 seconds. The v0.2.70 release run aborted mid-graph because npm's publish processing exceeded the old 12×5s window even though the publish itself succeeded; the new deadline matches npm's own "may take a few minutes" guidance. ([CYPACK-1478](https://linear.app/ceedar/issue/CYPACK-1478/if-a-mcp-server-has-no-enabled-tools-will-it-not-be-allowed-as-an-mcp), [#1442](https://github.com/cyrusagents/cyrus/pull/1442))
+
+## [0.2.70] - 2026-08-27
+
+### Added
+- Guardrails against silently dropped `EdgeConfig` fields (the CYPACK-1478 / CYHOST-967 bug class): `WorkerService.startEdgeWorker` now spreads the entire file config so pass-through fields forward automatically, `ConfigManager`'s hot-reload merge and global-change watch are driven by a single `RELOAD_MERGED_KEYS` list with a compile-time exhaustiveness check that names any unclassified schema key, and a schema-complete CLI test asserts every `EdgeConfig` field survives into the `EdgeWorkerConfig`. ([CYPACK-1478](https://linear.app/ceedar/issue/CYPACK-1478/if-a-mcp-server-has-no-enabled-tools-will-it-not-be-allowed-as-an-mcp), [#1440](https://github.com/cyrusagents/cyrus/pull/1440))
+
+### Fixed
+- Release workflows now preflight npm package existence before running release work, with actionable first-publish and trusted-publisher guidance for newly added packages ([#1436](https://github.com/cyrusagents/cyrus/pull/1436)).
+
+## [0.2.69] - 2026-08-26
+
+### Fixed
+- Removed obsolete synthetic `fallback_credit` usage fields so all runner packages build against the current shared SDK types. ([#1428](https://github.com/cyrusagents/cyrus/pull/1428))
 
 ## [0.2.68] - 2026-08-05
 

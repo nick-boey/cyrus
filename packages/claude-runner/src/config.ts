@@ -23,6 +23,7 @@ export const availableTools = [
 	// Execution tools
 	"Bash",
 	"Task",
+	"ListAgents",
 
 	// Web tools
 	"WebFetch",
@@ -57,6 +58,7 @@ export const availableTools = [
 
 	// Monitoring and task lifecycle
 	"Monitor",
+	"LSP",
 	"RemoteTrigger",
 	"TaskOutput",
 	"TaskStop",
@@ -90,8 +92,10 @@ export const readOnlyTools: ToolName[] = [
 	"TaskGet",
 	"TaskList",
 	"Task",
+	"ListAgents",
 	"Skill",
 	"Monitor",
+	"LSP",
 	"TaskOutput",
 	"ToolSearch",
 ];

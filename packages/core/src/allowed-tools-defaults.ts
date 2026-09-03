@@ -38,6 +38,7 @@ export const LINEAR_DEFAULT_ALLOWED_TOOLS = [
 	// Execution
 	"Bash",
 	"Task",
+	"ListAgents",
 
 	// Web
 	"WebFetch",
@@ -67,6 +68,7 @@ export const LINEAR_DEFAULT_ALLOWED_TOOLS = [
 
 	// Monitoring + discovery
 	"Monitor",
+	"LSP",
 	"RemoteTrigger",
 	"ToolSearch",
 	"Skill",
@@ -156,6 +158,7 @@ export const GITHUB_DEFAULT_ALLOWED_TOOLS = [
 	// Execution
 	"Bash",
 	"Task",
+	"ListAgents",
 
 	// Web
 	"WebFetch",
@@ -185,6 +188,7 @@ export const GITHUB_DEFAULT_ALLOWED_TOOLS = [
 
 	// Monitoring + discovery
 	"Monitor",
+	"LSP",
 	"RemoteTrigger",
 	"ToolSearch",
 	"Skill",
