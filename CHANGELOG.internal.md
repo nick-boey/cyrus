@@ -5,7 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
-- **Authenticated scoped fleet operators and exposed discovery ([CYR-65](https://linear.app/northrop-digital/issue/CYR-65/authenticate-scoped-fleet-operators-and-expose-discovery)).**
+- **Authenticated scoped fleet operators and exposed discovery ([CYR-65](https://linear.app/northrop-digital/issue/CYR-65/authenticate-scoped-fleet-operators-and-expose-discovery), [#58](https://github.com/nick-boey/cyrus/pull/58)).**
   New `packages/router/src/fleet-operations/` module — `types.ts`,
   `OperatorAuthorizer.ts`, `FleetOperations.ts`, `routes.ts` — implementing the
   router-side authentication boundary for the CYR-64 v1 contracts, plus a new
