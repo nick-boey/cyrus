@@ -72,6 +72,21 @@ export const CYRUS_EVENTS = {
 	 * indefinitely was absent from the logs it had to be diagnosed from (NOR-402).
 	 */
 	sessionTerminalDeferred: "session.terminal_deferred",
+	/**
+	 * A session that had deferred its terminal signal lost its host before ever
+	 * sending it, and is not coming back.
+	 *
+	 * The THIRD outcome of a deferral, and it exists so the pairing with
+	 * {@link sessionTerminalDeferred} is closed on every lifecycle path rather
+	 * than only the in-process one. A deferred session that is destroyed,
+	 * recreated or floor-restored comes back with no runner and no terminal
+	 * state, so nothing ever reaches `emitTerminalOnce` for it — the router
+	 * reclaims its lock at hello, but no event records that, and a report keyed
+	 * on "deferred with no later signal" would count it as a permanently locked
+	 * issue forever. Sandbox destroy/recreate is routine, so this is the
+	 * difference between a usable report and one an operator learns to ignore.
+	 */
+	sessionTerminalAbandoned: "session.terminal_abandoned",
 
 	/**
 	 * A `/<skill>` command leading a user's comment was echoed onto line 1 of

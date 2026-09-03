@@ -43,7 +43,8 @@ import {
 } from "cyrus-router-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-	ISSUE_LOCKED_MESSAGE,
+	fillTemplate,
+	ISSUE_LOCKED_OTHER_USER_MESSAGE,
 	offlineWaitingMessage,
 	PROMPT_REJECTION_MESSAGE,
 } from "../src/messages.js";
@@ -406,7 +407,14 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 			}),
 		);
 
-		expect(activityBodies("sess-lock2")).toContain(ISSUE_LOCKED_MESSAGE);
+		// Alice's session holds the lock and Bob is the one rejected, so he gets
+		// the cross-user message — telling him to reply in her thread would be a
+		// dead end, since creator-only prompting rejects that too.
+		expect(activityBodies("sess-lock2")).toContain(
+			fillTemplate(ISSUE_LOCKED_OTHER_USER_MESSAGE, {
+				holderName: ALICE.name,
+			}),
+		);
 		// Empty queue delta: nothing enqueued, nothing delivered.
 		expect(pending()).toBe(0);
 		// Give any (erroneous) delivery a chance to arrive before asserting none.

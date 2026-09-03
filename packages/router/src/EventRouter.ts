@@ -33,6 +33,7 @@ import {
 	fillTemplate,
 	INVALID_ISSUE_KEY_MESSAGE,
 	ISSUE_LOCKED_MESSAGE,
+	ISSUE_LOCKED_OTHER_USER_MESSAGE,
 	NO_REPOSITORIES_MESSAGE,
 	ORPHANED_LOCK_RECLAIMED_MESSAGE,
 	offlineReleaseMessage,
@@ -1409,7 +1410,11 @@ export class EventRouter {
 				// is a live session (reply in its thread) or a strand that needs
 				// `cyrus router unlock`.
 				const holder = this.store.getIssueLock(issueId);
-				await this.postActivity(workspaceId, sessionId, ISSUE_LOCKED_MESSAGE);
+				await this.postActivity(
+					workspaceId,
+					sessionId,
+					this.issueLockedMessage(holder?.sessionId, creator?.id),
+				);
 				emitRoutingRejection(this.logger, {
 					reason: "issue_locked",
 					sessionId,
@@ -1428,7 +1433,9 @@ export class EventRouter {
 						`(device ${holder?.deviceId ?? "unknown"}); rejected session ${sessionId}. ` +
 						`The prompt did NOT reach an agent: the reply is posted only in the rejected ` +
 						`session's own thread. If the holding session is no longer working, it is ` +
-						`stranded — see sandbox.stranded_session — and needs \`cyrus router unlock\`.`,
+						`stranded — see sandbox.stranded_session with reason=no_progress, and confirm ` +
+						`against Cyrus-Sessions-Never-Terminal that it is not merely waiting before ` +
+						`running \`cyrus router unlock\`, which ends its claim outright.`,
 				);
 				return;
 			}
@@ -1548,7 +1555,11 @@ export class EventRouter {
 					sessionId,
 					PROMPT_REJECTION_MESSAGE,
 				);
-				this.logger.info(
+				emitRoutingRejection(this.logger, {
+					reason: "non_creator_prompt",
+					sessionId,
+				});
+				this.logger.warn(
 					`Rejected a non-creator's answer to the repository selection for session ${sessionId} (actor ${actorId ?? "unknown"} != creator ${creatorId}); the pending selection is untouched`,
 				);
 				return true;
@@ -1779,7 +1790,13 @@ export class EventRouter {
 				sessionId,
 				fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: invalidIssueKey }),
 			);
-			this.logger.info(
+			emitRoutingRejection(this.logger, {
+				reason: "invalid_issue_key",
+				sessionId,
+				...(issueId !== undefined ? { issueId } : {}),
+				issueKey: invalidIssueKey,
+			});
+			this.logger.warn(
 				`Refused to route prompted session ${sessionId}: issue key ${JSON.stringify(invalidIssueKey)} can't be used for a container workspace`,
 			);
 			return;
@@ -1790,6 +1807,11 @@ export class EventRouter {
 				sessionId,
 				PROMPT_UNROUTABLE_MESSAGE,
 			);
+			emitRoutingRejection(this.logger, {
+				reason: "unroutable_prompt",
+				sessionId,
+				...(issueId !== undefined ? { issueId } : {}),
+			});
 			this.logger.warn(
 				`Prompted event for session ${sessionId} resolved to no device; notified and dropping`,
 			);
@@ -1823,7 +1845,15 @@ export class EventRouter {
 						sessionId,
 						PROMPT_REJECTION_MESSAGE,
 					);
-					this.logger.info(
+					emitRoutingRejection(this.logger, {
+						reason: "non_creator_prompt",
+						sessionId,
+						...(issueId !== undefined ? { issueId } : {}),
+					});
+					// WARN for the same reason the lock rejection is: this is a
+					// prompt that did not reach an agent, and it is the END of the
+					// recovery path we tell a locked-out user to take.
+					this.logger.warn(
 						`Rejected non-creator prompt on session ${sessionId} (actor ${actorId ?? "unknown"} != creator ${creatorId})`,
 					);
 					return;
@@ -2175,16 +2205,53 @@ export class EventRouter {
 	}
 
 	private storedCreatorId(sessionId: string): string | undefined {
+		return this.storedCreator(sessionId)?.id;
+	}
+
+	private storedCreator(sessionId: string): StoredCreator | undefined {
 		const json = this.store.getSessionCreator(sessionId);
 		if (!json) return undefined;
 		try {
-			return (JSON.parse(json) as StoredCreator).id;
+			return JSON.parse(json) as StoredCreator;
 		} catch {
 			this.logger.warn(
 				`Corrupt stored creator for session ${sessionId}; skipping creator check`,
 			);
 			return undefined;
 		}
+	}
+
+	/**
+	 * The activity to post when an issue lock rejects a session.
+	 *
+	 * Two different messages because the recovery genuinely differs. For the
+	 * same person — the CAN-133 case — replying in the holder's thread works and
+	 * is what we tell them. For a DIFFERENT person it does not:
+	 * `creatorOnlyPrompting` (on by default) rejects that reply and tells them to
+	 * start their own session, which lands straight back on this lock. Sending
+	 * the same advice to both is a closed loop with no exit.
+	 *
+	 * Falls back to the same-person wording when the holder's creator is unknown
+	 * (an old affinity row, a corrupt blob) — that advice is harmless if wrong,
+	 * whereas naming a colleague who does not exist is the failure the message
+	 * was rewritten to avoid in the first place.
+	 */
+	private issueLockedMessage(
+		holderSessionId: string | undefined,
+		requesterCreatorId: string | undefined,
+	): string {
+		if (holderSessionId === undefined) return ISSUE_LOCKED_MESSAGE;
+		const holderCreator = this.storedCreator(holderSessionId);
+		if (
+			holderCreator?.id === undefined ||
+			requesterCreatorId === undefined ||
+			holderCreator.id === requesterCreatorId
+		) {
+			return ISSUE_LOCKED_MESSAGE;
+		}
+		return fillTemplate(ISSUE_LOCKED_OTHER_USER_MESSAGE, {
+			holderName: holderCreator.name ?? holderCreator.email ?? "another user",
+		});
 	}
 
 	/** Parses a queued payload and returns it only if it is an agent-session event. */

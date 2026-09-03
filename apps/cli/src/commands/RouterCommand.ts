@@ -279,6 +279,7 @@ const RouterConfigFileSchema = z.object({
 			affinityGraceMs: z.number().optional(),
 			offlineAgeOutMs: z.number().optional(),
 			strandedSessionGraceMs: z.number().optional(),
+			sessionNoProgressMs: z.number().optional(),
 			sessionsQueryTimeoutMs: z.number().optional(),
 			requiredSecretKeys: z
 				.array(
@@ -1207,13 +1208,24 @@ export class RouterCommand extends BaseCommand {
 	}
 
 	/**
-	 * Releases a stuck issue lock. Accepts either the Linear issue GUID (the raw
-	 * `issue_locks.issue_id`) or a human identifier like `PAR-169`.
+	 * Releases a stuck issue lock AND the holding session's affinity. Accepts
+	 * either the Linear issue GUID (the raw `issue_locks.issue_id`) or a human
+	 * identifier like `PAR-169`.
 	 *
 	 * Locks are keyed by GUID, so a human identifier is resolved to its GUID via
 	 * Linear (`resolveIssueGuid`) before the lookup. The direct GUID path runs
 	 * first and needs no network, so passing a GUID still works with no Linear
 	 * token configured — only the identifier path requires one.
+	 *
+	 * Clearing affinity as well is deliberate and is what makes this a complete
+	 * remedy rather than half of one: affinity pins the container out of
+	 * idle-stop, so unlocking alone leaves a stranded sandbox billing and its
+	 * severity-1 alert firing forever. See
+	 * {@link RouterStore.releaseIssueLockAndAffinityForSession}.
+	 *
+	 * Because it ends the session's claim, confirm the session is genuinely not
+	 * working first — a session deliberately waiting on a scheduled wakeup
+	 * presents identically to a strand from the router's side.
 	 */
 	private async unlock(issue: string | undefined): Promise<void> {
 		if (!issue) {
@@ -1248,12 +1260,22 @@ export class RouterCommand extends BaseCommand {
 				this.logger.info(`No lock found for issue ${where}.`);
 				return;
 			}
-			store.releaseIssueLockForSession(lock.sessionId);
+			// Lock AND affinity. Releasing only the lock reopens the issue but
+			// leaves the container pinned out of idle-stop and stale-destroy, so a
+			// `no_progress` strand would keep raising its severity-1 alert every
+			// tick with nothing left to try — see
+			// `releaseIssueLockAndAffinityForSession`.
+			const { affinityCleared } = store.releaseIssueLockAndAffinityForSession(
+				lock.sessionId,
+			);
 			const released = resolvedIdentifier
 				? `${resolvedIdentifier} → ${resolvedGuid}`
 				: resolvedGuid;
 			this.logSuccess(
-				`Released lock on ${released} (session ${lock.sessionId}).`,
+				`Released lock on ${released} (session ${lock.sessionId})` +
+					(affinityCleared
+						? " and cleared its session affinity, so the container is eligible for idle-stop again."
+						: "; it held no session affinity, so no container was pinned by it."),
 			);
 		} finally {
 			store.close();

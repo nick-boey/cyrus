@@ -547,6 +547,12 @@ export class AgentSessionManager extends EventEmitter {
 						background_task_count: pendingWork.backgroundTasks.length,
 						live_background_task_count:
 							pendingWork.liveBackgroundTasks?.length ?? 0,
+						// See the matching note on `session.terminal_signalled`: the
+						// never-terminal report joins these two and needs the issue key
+						// on both sides.
+						issue_key:
+							this.sessions.get(sessionId)?.issueContext?.issueIdentifier ??
+							null,
 						// The identity of what is holding the session open. Without it
 						// the event says a session is deferred and gives an operator
 						// nothing to act on.
@@ -699,6 +705,14 @@ export class AgentSessionManager extends EventEmitter {
 				agent_session_id: sessionId,
 				terminal_state: state,
 				forced: opts?.force ?? false,
+				// Explicit, even though the session-scoped logger already carries
+				// `issueIdentifier` as a structural field: every other issue-scoped
+				// query in the monitoring module keys on `cyrus.issue_key`, and the
+				// pair of terminal events is joined against those. Leaving it to the
+				// structural key alone made the issue column of
+				// `Cyrus-Sessions-Never-Terminal` silently empty — the one column
+				// that says WHICH issue is locked.
+				issue_key: session?.issueContext?.issueIdentifier ?? null,
 			}),
 		);
 		this.emit("sessionTerminal", sessionId, state);
@@ -1757,7 +1771,57 @@ export class AgentSessionManager extends EventEmitter {
 			log.info("Reconciled session interrupted by a host restart");
 		}
 
+		this.reportAbandonedDeferrals();
+
 		return interrupted;
+	}
+
+	/**
+	 * Close the `terminal_deferred` pairing for sessions whose host went away
+	 * mid-deferral.
+	 *
+	 * `completeSession` sets the session status to Complete BEFORE deciding to
+	 * defer, so a deferred session restores with a terminal status, no runner and
+	 * no `terminalState`. That combination is reconciled by nobody: the interrupt
+	 * loop above only considers Active/Pending, and `restoreState` only arms the
+	 * one-shot when `terminalState` is set. Nothing therefore reaches
+	 * `emitTerminalOnce`, and no counterpart event is ever produced.
+	 *
+	 * The LOCK is already fine — `getLiveSessionIds` omits a terminal session
+	 * with no runner precisely so the router reclaims it at hello. What is
+	 * missing is any record that it did, which matters because
+	 * `Cyrus-Sessions-Never-Terminal` is what an operator consults before running
+	 * `cyrus router unlock`. Without this, every deferred session that ever lost
+	 * its host — routine, given sandbox destroy/recreate and floor restore —
+	 * would sit in that report permanently, claiming an issue is locked when it
+	 * is not. A report that is wrong in the benign direction gets ignored, and
+	 * then it is also wrong in the dangerous one.
+	 *
+	 * Deliberately NOT a terminal signal: emitting one would fire
+	 * `sessionTerminal` for a session the router has already released, and
+	 * `addAgentRunner` re-arms the one-shot anyway if the session resumes. This
+	 * is a diagnostic only.
+	 */
+	private reportAbandonedDeferrals(): void {
+		for (const [sessionId, session] of this.sessions) {
+			if (session.agentRunner) continue;
+			if (session.terminalState) continue;
+			if (this.terminalEmittedSessions.has(sessionId)) continue;
+			if (
+				session.status === AgentSessionStatus.Active ||
+				session.status === AgentSessionStatus.Pending
+			) {
+				continue;
+			}
+			this.sessionLog(sessionId).event(
+				CYRUS_EVENTS.sessionTerminalAbandoned,
+				cyrusAttributes({
+					agent_session_id: sessionId,
+					status: session.status,
+					issue_key: session.issueContext?.issueIdentifier ?? null,
+				}),
+			);
+		}
 	}
 
 	/**

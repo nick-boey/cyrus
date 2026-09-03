@@ -315,13 +315,25 @@ resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches
         '    online         = any(tobool(p["cyrus.online"])),'
         '    no_progress_for = max(tolong(p["cyrus.no_progress_for_ms"])) * 1ms'
         '  by device_id, reason'
-        // The stop that produced this, if there was one: the newest idle-stop for
-        // the same device at or before we first reported it. `absent` sandboxes,
-        // `no_progress` rows, and stops older than the window simply have no
-        // match, hence the left join.
+        // The stop that produced this, if there was one. The join itself can only
+        // match on `device_id` — it has no way to express "at or before we first
+        // reported it" — so the ordering is applied AFTER, in the `iff` below.
+        // Without that, a device idle-stopped earlier in the window, resumed on a
+        // new prompt and later stranded with `no_progress` would carry a
+        // `killed_after` from a stop that has nothing to do with the strand. That
+        // is the normal lifecycle, not a corner case, and the reading guide above
+        // primes an operator to read a small `killed_after` as the NOR-366
+        // handoff race.
         '| join kind=leftouter ('
         '    stops | summarize arg_max(stopped_at, *) by device_id'
         '  ) on device_id'
+        // `killed_after` is meaningful ONLY for a stop that precedes the report.
+        // A `no_progress` row has no stop by construction (the sandbox is up), so
+        // this blanks it there too, which is what the guide above promises.
+        '| extend stop_explains_strand = isnotnull(stopped_at) and stopped_at <= first_reported'
+        '| extend'
+        '    stopped_at   = iff(stop_explains_strand, stopped_at, datetime(null)),'
+        '    killed_after = iff(stop_explains_strand, uptime, timespan(null))'
         '| project'
         '    issue_key,'
         '    device_id,'
@@ -332,7 +344,7 @@ resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches
         '    sessions,'
         '    no_progress_for,'
         '    stopped_at,'
-        '    killed_after = uptime,'
+        '    killed_after,'
         '    stranded_for = last_reported - first_reported,'
         '    ticks,'
         '    first_reported'
@@ -358,6 +370,12 @@ resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches
 // Sessions whose terminal signal was withheld and never sent. Each row is one
 // issue that is still locked to a session that has finished its work — the
 // CAN-133 shape. `deferred_for` is how long the issue has been unreachable.
+//
+// Read this alongside `sandbox.stranded_session` with `reason=no_progress`: the
+// detector cannot tell a strand from a session deliberately waiting on a
+// wakeup, and a defer with no LATER signal is what says which. It is NOT a
+// complete census of locked issues — a `parked` session releases affinity and
+// keeps its lock, and that class emits neither event (see `noteStranded`).
 resource sessionsNeverTerminal 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
   parent: logAnalytics
   name: 'Cyrus-Sessions-Never-Terminal'
@@ -366,31 +384,49 @@ resource sessionsNeverTerminal 'Microsoft.OperationalInsights/workspaces/savedSe
     displayName: 'Sessions deferred and never terminated'
     query: join(
       [
+        // `distinct` takes bare column names — an aliased expression is a syntax
+        // error, so the projection has to happen in its own `extend` first. And
+        // it must carry the TIME, because a bare set of session ids makes the
+        // anti-join order-blind: `agent_session_id` is stable across every turn
+        // of a Linear session and `addAgentRunner` re-arms the one-shot on each
+        // resumed prompt, so signal-then-defer is routine — and it is exactly
+        // what replying in-thread (the documented NOR-402 workaround) produces.
+        // `terminal_abandoned` counts as a resolution: it says the session's host
+        // went away mid-deferral and the router reclaimed the lock at hello.
+        // Without it every deferred session that was ever destroyed, recreated
+        // or floor-restored would sit here forever claiming a locked issue —
+        // routine enough to make the whole report ignorable.
         'let signalled ='
         '    ContainerAppConsoleLogs_CL'
         appFilter
         '    | extend p = parse_json(Log_s)'
-        '    | where tostring(p.event) == "session.terminal_signalled"'
-        '    | distinct session_id = tostring(p["cyrus.agent_session_id"]);'
+        '    | where tostring(p.event) in ("session.terminal_signalled", "session.terminal_abandoned")'
+        '    | extend session_id = tostring(p["cyrus.agent_session_id"])'
+        '    | summarize last_signalled = max(TimeGenerated) by session_id;'
         'ContainerAppConsoleLogs_CL'
         appFilter
         '| extend p = parse_json(Log_s)'
         '| where tostring(p.event) == "session.terminal_deferred"'
         '| extend session_id = tostring(p["cyrus.agent_session_id"])'
+        // `issueIdentifier` is the logger's structural field and is the fallback
+        // for records emitted before the events carried an explicit issue key.
+        '| extend issue = coalesce(tostring(p["cyrus.issue_key"]), tostring(p.issueIdentifier))'
         '| summarize'
         '    first_deferred = min(TimeGenerated),'
         '    last_deferred  = max(TimeGenerated),'
         '    defers         = count(),'
-        '    issue_key      = any(tostring(p["cyrus.issue_key"])),'
+        '    issue_key      = any(issue),'
         '    crons          = max(toint(p["cyrus.session_cron_count"])),'
         '    background     = max(toint(p["cyrus.background_task_count"])),'
         '    live_background = max(toint(p["cyrus.live_background_task_count"])),'
         '    pending_work   = any(tostring(p["cyrus.pending_work"]))'
         '  by session_id'
-        // Anti-join: what is left is every session that deferred and never came
-        // back. That set IS the population of permanently locked issues.
-        '| join kind=leftanti signalled on session_id'
+        // Left-OUTER, then filter on ordering. A session is only still deferred
+        // if it never signalled, or its last signal predates its last defer.
+        '| join kind=leftouter signalled on session_id'
+        '| where isnull(last_signalled) or last_signalled < last_deferred'
         '| extend deferred_for = now() - last_deferred'
+        '| project-away session_id1'
         '| order by first_deferred asc'
       ],
       '\n'
@@ -964,7 +1000,8 @@ resource sandboxBootFailures 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
 //    every `ScheduleWakeup` (clamped to 1h) but not a cron with a longer
 //    period. That is why the description sends the operator to
 //    `Cyrus-Sessions-Never-Terminal` to disambiguate before acting, and why it
-//    does NOT lead with `cyrus router unlock`.
+//    does NOT lead with `cyrus router unlock` — that command releases the
+//    affinity as well as the lock, so on a waiting session it kills live work.
 //
 // Nothing about either shape is visible anywhere else: Linear renders a normal
 // in-progress agent session for as long as it lasts, the gauge records it as
@@ -990,7 +1027,7 @@ resource sandboxStrandedSessions 'Microsoft.Insights/scheduledQueryRules@2023-03
   tags: tags
   properties: {
     displayName: 'alert-${namePrefix}-sandbox-stranded-sessions'
-    description: 'A Cyrus sandbox holds session affinity for an issue it is not working on. Check "cyrus.reason". "offline_pinned": the sandbox is stopped and disconnected — prompt the thread again to cold-boot it. "no_progress": it is running and connected, but nothing has been routed to it and its agent has posted nothing for over "cyrus.no_progress_ms". That is EITHER a session that never went terminal (the issue is now locked to a session that stopped working) OR one deliberately idle on a scheduled wakeup — the router cannot tell, because the deferral is recorded only on the device. Run the "Cyrus-Sessions-Never-Terminal" saved search for this issue: a "session.terminal_deferred" with no matching "session.terminal_signalled" says it is waiting and names what for. Either way a new top-level comment is rejected at the issue lock, so reply inside the running session\'s thread; use "cyrus router unlock" ONLY after confirming it is not waiting, since unlocking a session that is about to resume strands the lock instead of freeing it.'
+    description: 'A Cyrus sandbox holds session affinity for an issue it is not working on. Check "cyrus.reason". "offline_pinned": the sandbox is stopped and disconnected — prompt the thread again to cold-boot it. "no_progress": it is running and connected, but nothing has been routed to it and its agent has posted nothing for over "cyrus.no_progress_ms". That is EITHER a session that never went terminal (the issue is now locked to a session that stopped working) OR one deliberately idle on a scheduled wakeup — the router cannot tell, because the deferral is recorded only on the device. Run the "Cyrus-Sessions-Never-Terminal" saved search: a row for this session means its last "session.terminal_deferred" has no LATER "session.terminal_signalled", and its "pending_work" column names what is holding it open — a cron or wakeup there means it is waiting, not stranded. Either way a new top-level comment is rejected at the issue lock, so reply inside the running session\'s thread. Use "cyrus router unlock" ONLY after confirming it is not waiting: it releases the lock AND the affinity pinning the container, so on a run that is about to resume it kills live work.'
     severity: 1
     enabled: true
     evaluationFrequency: 'PT15M'

@@ -652,7 +652,7 @@ describe("DeviceGateway", () => {
 		httpServer.close();
 	});
 
-	it("stamps the device's progress clock on every rpc frame", async () => {
+	it("stamps the device's progress clock on an rpc frame", async () => {
 		// The stranded-session detector's only proof that an agent is still
 		// working (NOR-402). Every activity a sandbox posts arrives as an RPC, so
 		// this stamp is what separates a session running a long turn from one that
@@ -689,6 +689,96 @@ describe("DeviceGateway", () => {
 		const [stampedDeviceId, stampedMs] = markProgress.mock.calls[0] ?? [];
 		expect(stampedDeviceId).toBe(device.deviceId);
 		expect(stampedMs).toBeGreaterThanOrEqual(before);
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("coalesces the progress stamp instead of writing once per rpc", async () => {
+		// Every activity a sandbox posts is an RPC, so an unconditional write here
+		// would be a synchronous fsync-ing UPDATE on the hottest device→router
+		// path — to feed a detector that thresholds at four hours. Staleness of up
+		// to the coalescing window is invisible to that reader.
+		const { gateway, device, port, httpServer, store } = await setup();
+		const markProgress = vi.spyOn(store, "markDeviceProgress");
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+		await nextMessage(); // hello_ack
+
+		for (let i = 0; i < 5; i++) {
+			const rpcPromise = new Promise((r) => gateway.once("rpc", () => r(null)));
+			ws.send(
+				JSON.stringify({
+					type: "rpc_request",
+					id: `r${i}`,
+					method: "createAgentActivity",
+					params: [],
+				}),
+			);
+			await rpcPromise;
+		}
+
+		// Five activities in well under the window: one write.
+		expect(markProgress).toHaveBeenCalledTimes(1);
+		gateway.close();
+		httpServer.close();
+	});
+
+	it("logs a failing progress stamp once per outage rather than once per frame", async () => {
+		// The failures this guard exists for — SQLITE_FULL on the router's
+		// ephemeral disk, a readonly database after a bad restore — persist until
+		// an operator intervenes. An unlatched warn would therefore amplify a
+		// disk-full incident into device-rate log volume in a per-GB billed sink,
+		// and this is the only branch that can turn a device frame into router log
+		// lines at all. It must also never escape into the ws callback, which
+		// would drop every teammate's connection over a diagnostic write.
+		const logger = testLogger();
+		const { gateway, device, port, httpServer, store } = await setup({
+			logger,
+		});
+		vi.spyOn(store, "markDeviceProgress").mockImplementation(() => {
+			throw new Error("SQLITE_FULL: database or disk is full");
+		});
+		const ws = connect(port);
+		const nextMessage = messageReader(ws);
+		await new Promise((r) => ws.once("open", r));
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				deviceToken: device.deviceToken,
+				protocolVersion: PROTOCOL_VERSION,
+				lastAckedSeq: 0,
+			}),
+		);
+		await nextMessage(); // hello_ack
+
+		for (let i = 0; i < 4; i++) {
+			const rpcPromise = new Promise((r) => gateway.once("rpc", () => r(null)));
+			ws.send(
+				JSON.stringify({
+					type: "rpc_request",
+					id: `r${i}`,
+					method: "createAgentActivity",
+					params: [],
+				}),
+			);
+			// The RPC still dispatches: a diagnostic write must not swallow work.
+			await rpcPromise;
+		}
+
+		expect(
+			logger.warn.mock.calls.filter(([m]) =>
+				String(m).includes("Failed to stamp the progress clock"),
+			),
+		).toHaveLength(1);
 		gateway.close();
 		httpServer.close();
 	});
