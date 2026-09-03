@@ -216,6 +216,78 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		expect(routerExecute).toHaveBeenCalledWith(["sessions", "list"]);
 	});
 
+	it("registers `router operators create-token` and forwards its flags as string args", async () => {
+		await run([
+			"router",
+			"operators",
+			"create-token",
+			"--label",
+			"oncall-laptop",
+			"--role",
+			"fleet.read",
+			"--workspace",
+			"workspace-a",
+		]);
+
+		expect(routerExecute).toHaveBeenCalledWith([
+			"operators",
+			"create-token",
+			"--label",
+			"oncall-laptop",
+			"--role",
+			"fleet.read",
+			"--workspace",
+			"workspace-a",
+		]);
+	});
+
+	it("accumulates repeated `--role` and `--workspace` rather than keeping the last", async () => {
+		// Commander keeps only the LAST occurrence without an accumulator, which
+		// would silently halve a two-role grant and narrow a two-workspace one.
+		await run([
+			"router",
+			"operators",
+			"create-token",
+			"--label",
+			"sre",
+			"--role",
+			"fleet.read",
+			"--role",
+			"fleet.recover",
+			"--workspace",
+			"workspace-a",
+			"--workspace",
+			"workspace-b",
+		]);
+
+		expect(routerExecute).toHaveBeenCalledWith([
+			"operators",
+			"create-token",
+			"--label",
+			"sre",
+			"--role",
+			"fleet.read",
+			"--role",
+			"fleet.recover",
+			"--workspace",
+			"workspace-a",
+			"--workspace",
+			"workspace-b",
+		]);
+	});
+
+	it("registers `router operators list`", async () => {
+		await run(["router", "operators", "list"]);
+
+		expect(routerExecute).toHaveBeenCalledWith(["operators", "list"]);
+	});
+
+	it("registers `router operators revoke <tokenId>`", async () => {
+		await run(["router", "operators", "revoke", "3"]);
+
+		expect(routerExecute).toHaveBeenCalledWith(["operators", "revoke", "3"]);
+	});
+
 	it("registers `router containers list`", async () => {
 		await run(["router", "containers", "list"]);
 

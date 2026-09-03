@@ -8,6 +8,7 @@ import {
 import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import { resolvePath } from "cyrus-core";
+import type { OperatorRoleV1 } from "cyrus-operator-protocol";
 import { buildResourceAttributes } from "cyrus-otel-logs";
 import {
 	buildGitHubTokenScopeReport,
@@ -23,6 +24,7 @@ import {
 	KeyVaultSecretStore,
 	KeyVaultTokenStore,
 	type LinearTokenEnvelope,
+	OPERATOR_ROLES,
 	type PendingTeardownInfo,
 	probeGitHubTokenScopes,
 	RESERVED_ENV_KEYS,
@@ -225,6 +227,84 @@ const RouterConfigFileSchema = z.object({
 			certificateIssuerId: z.string().optional(),
 		})
 		.optional(),
+	/**
+	 * Fleet Operations. Optional: without it the router still serves
+	 * `/.well-known/cyrus` and `/api/v1/operator/context`, and still accepts
+	 * device tokens and locally minted operator tokens — there is simply no
+	 * Entra grant table, so a JWT is refused.
+	 *
+	 * `capabilities` is deliberately NOT modelled and is stripped by this
+	 * schema: what a router serves is decided by the routes it registers, never
+	 * by its config file. See `RouterServer.servedOperatorCapabilities`.
+	 */
+	fleetOperations: z
+		.object({
+			routerId: z.string().min(1).optional(),
+			routerName: z.string().min(1).optional(),
+			access: z
+				.object({
+					entra: z
+						.object({
+							tenantId: z.string().min(1),
+							// The `api://` Application ID URI operator ACCESS tokens
+							// carry — not the bare client-id GUID, which is an ID
+							// token's audience and would fail every request.
+							audience: z.string().min(1),
+							grants: z.array(
+								z.object({
+									// Immutable Entra object ids (a user's `oid` or a
+									// group's). Emails and UPNs are mutable in Entra, so a
+									// grant keyed on one follows a renamed or recycled
+									// account.
+									principalIds: z.array(z.string().min(1)).min(1),
+									roles: z.array(z.enum(OPERATOR_ROLES)).min(1),
+									workspaceIds: z.array(z.string().min(1)).min(1),
+								}),
+							),
+						})
+						.optional(),
+				})
+				.optional(),
+			// Disclosed only on the authenticated context route, and only to a
+			// principal whose capabilities include `logs.query`.
+			logSource: z
+				.object({
+					schemaVersion: z.literal(1),
+					kind: z.enum(["azure-log-analytics", "fake"]),
+					displayName: z.string().min(1).optional(),
+					azure: z
+						.object({
+							workspaceId: z.string().min(1),
+							table: z.literal("ContainerAppConsoleLogs_CL"),
+							cloud: z
+								.enum([
+									"AzurePublicCloud",
+									"AzureUSGovernment",
+									"AzureChinaCloud",
+								])
+								.optional(),
+							resourceId: z.string().min(1).optional(),
+						})
+						.optional(),
+					budgets: z.object({
+						defaultLookbackSeconds: z.number().int().positive(),
+						maxRangeSeconds: z.number().int().positive(),
+						maxRecords: z.number().int().positive(),
+						minFollowIntervalSeconds: z.number().int().positive(),
+					}),
+				})
+				.optional(),
+			skill: z
+				.object({
+					name: z.string().min(1),
+					version: z.string().min(1),
+					releaseUrl: z.url(),
+					checksum: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+					minCliVersion: z.string().min(1).optional(),
+				})
+				.optional(),
+		})
+		.optional(),
 	// Opt-in ephemeral container executor settings — see
 	// RouterContainersConfig in cyrus-router. Omitting this field entirely (the
 	// default) leaves the router routing every user to their enrolled physical
@@ -417,6 +497,10 @@ interface LinearTokenProbe {
  *   cyrus router devices list                   # list enrolled devices + who owns them
  *   cyrus router devices revoke <email>         # revoke a user's enrolled device
  *   cyrus router sessions list                  # list running + locked sessions (issue id + session GUID)
+ *   cyrus router operators create-token --label <label> --role <role> --workspace <id>
+ *                                                # mint a local operator credential; prints the token once
+ *   cyrus router operators list                 # list operator tokens (never the token itself)
+ *   cyrus router operators revoke <tokenId>     # revoke a local operator token
  *   cyrus router secrets set <email> <ENV_VAR_NAME> <value>
  *                                                # store a per-user container secret
  *   cyrus router secrets unset <email> <ENV_VAR_NAME>
@@ -466,6 +550,8 @@ export class RouterCommand extends BaseCommand {
 				return this.devices(rest);
 			case "sessions":
 				return this.sessions(rest);
+			case "operators":
+				return this.operators(rest);
 			case "secrets":
 				return this.secrets(rest);
 			case "containers":
@@ -476,7 +562,7 @@ export class RouterCommand extends BaseCommand {
 				return this.unlock(rest[0]);
 			default:
 				this.exitWithError(
-					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|aca>|devices list|devices revoke <email>|sessions list|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email> [--check-scopes]|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|linear status|unlock <issueId>>",
+					"Usage: cyrus router <start|users add <email>|users list|users remove <email>|users set-executor <email> <device|docker|aca>|devices list|devices revoke <email>|sessions list|operators create-token --label <label> --role <role> --workspace <id>|operators list|operators revoke <tokenId>|secrets set <email> <ENV_VAR_NAME> <value>|secrets unset <email> <ENV_VAR_NAME>|secrets list <email> [--check-scopes]|containers list|containers destroy <issueKey>|containers gc-snapshots [--yes]|linear status|unlock <issueId>>",
 				);
 		}
 	}
@@ -1228,6 +1314,149 @@ export class RouterCommand extends BaseCommand {
 				);
 			} else {
 				this.exitWithError(`Failed to revoke device for ${email}`);
+			}
+		} finally {
+			store.close();
+		}
+	}
+
+	/**
+	 * Local administration of Fleet Operations operator credentials.
+	 *
+	 * Local-only by design: every action opens the router database directly
+	 * rather than calling the operator API, because these commands MINT and
+	 * REVOKE the credentials that API authenticates. Exposing them over HTTP
+	 * would mean an operator token could mint another one, and revoking a
+	 * compromised token would depend on the compromised token still working.
+	 */
+	private async operators(rest: string[]): Promise<void> {
+		const [action, ...operatorRest] = rest;
+		switch (action) {
+			case "create-token":
+				return this.operatorsCreateToken(operatorRest);
+			case "list":
+				return this.operatorsList();
+			case "revoke":
+				return this.operatorsRevoke(operatorRest[0]);
+			default:
+				this.exitWithError(
+					"Usage: cyrus router operators <create-token --label <label> --role <fleet.read|fleet.recover> --workspace <workspaceId>|list|revoke <tokenId>>",
+				);
+		}
+	}
+
+	/**
+	 * Mints a local operator token and prints it ONCE.
+	 *
+	 * Only `sha256(token)` is stored, so there is no later command that could
+	 * reveal it — `operators list` shows the grant and never the credential. A
+	 * lost token is replaced by minting a new one and revoking the old.
+	 */
+	private operatorsCreateToken(args: string[]): void {
+		let label: string | undefined;
+		const roles: string[] = [];
+		const workspaceIds: string[] = [];
+		for (let i = 0; i < args.length; i++) {
+			const arg = args[i];
+			if (!arg) continue;
+			const value = args[i + 1];
+			if (arg === "--label" && value) {
+				label = value;
+				i++;
+			} else if (arg === "--role" && value) {
+				roles.push(value);
+				i++;
+			} else if (arg === "--workspace" && value) {
+				workspaceIds.push(value);
+				i++;
+			} else {
+				this.exitWithError(
+					`Unexpected argument "${arg}". Usage: cyrus router operators create-token --label <label> --role <${OPERATOR_ROLES.join("|")}> --workspace <workspaceId>`,
+				);
+			}
+		}
+		if (!label || roles.length === 0 || workspaceIds.length === 0) {
+			this.exitWithError(
+				`Usage: cyrus router operators create-token --label <label> --role <${OPERATOR_ROLES.join("|")}> --workspace <workspaceId>. --role and --workspace may be repeated.`,
+			);
+		}
+		// Validated here as well as in the store so a typo is reported against
+		// the flag the operator actually typed, listing what was expected —
+		// rather than as a store-layer error naming a column.
+		for (const role of roles) {
+			if (!(OPERATOR_ROLES as readonly string[]).includes(role)) {
+				this.exitWithError(
+					`Unknown role "${role}". Expected one of: ${OPERATOR_ROLES.join(", ")}. Note that fleet.read does not imply fleet.recover — pass --role twice to grant both.`,
+				);
+			}
+		}
+
+		const store = this.openExistingStore();
+		try {
+			const created = store.createOperatorToken({
+				label,
+				roles: roles as OperatorRoleV1[],
+				workspaceIds,
+			});
+			this.logSuccess(`Created operator token ${created.tokenId} (${label}).`);
+			this.logger.raw(`Roles:      ${roles.join(", ")}`);
+			this.logger.raw(`Workspaces: ${workspaceIds.join(", ")}`);
+			this.logger.raw("");
+			this.logger.raw(`Token: ${created.token}`);
+			this.logger.raw(
+				"This is the only time this token is shown. Only its hash is stored — store it somewhere safe now.",
+			);
+		} finally {
+			store.close();
+		}
+	}
+
+	/**
+	 * Lists every minted token, revoked ones included, and never the credential.
+	 * Revoked rows stay listed because "did my revocation take" is exactly the
+	 * question an operator opens this for.
+	 */
+	private operatorsList(): void {
+		const store = this.openExistingStore();
+		try {
+			const tokens = store.listOperatorTokens();
+			if (tokens.length === 0) {
+				this.logger.info("No operator tokens.");
+				return;
+			}
+			this.logger.raw(
+				`${"ID".padEnd(6)} ${"LABEL".padEnd(24)} ${"ROLES".padEnd(28)} ${"WORKSPACES".padEnd(30)} ${"CREATED".padEnd(25)} REVOKED`,
+			);
+			for (const token of tokens) {
+				this.logger.raw(
+					`${String(token.tokenId).padEnd(6)} ${token.label.padEnd(24)} ${token.roles.join(",").padEnd(28)} ${token.workspaceIds.join(",").padEnd(30)} ${new Date(token.createdMs).toISOString().padEnd(25)} ${
+						token.revokedMs ? new Date(token.revokedMs).toISOString() : "-"
+					}`,
+				);
+			}
+		} finally {
+			store.close();
+		}
+	}
+
+	private operatorsRevoke(rawTokenId: string | undefined): void {
+		const tokenId = Number(rawTokenId);
+		if (!rawTokenId || !Number.isInteger(tokenId) || tokenId <= 0) {
+			this.exitWithError(
+				"Usage: cyrus router operators revoke <tokenId> (the numeric ID from `cyrus router operators list`)",
+			);
+		}
+		const store = this.openExistingStore();
+		try {
+			if (store.revokeOperatorToken(tokenId)) {
+				this.logSuccess(`Revoked operator token ${tokenId}.`);
+				// Every operator request re-authorizes, so there is no session to
+				// expire and no cache to wait on.
+				this.logger.raw("It stops authenticating on the next request.");
+			} else {
+				this.exitWithError(
+					`No active operator token with ID ${tokenId} (it may already be revoked — check \`cyrus router operators list\`).`,
+				);
 			}
 		} finally {
 			store.close();

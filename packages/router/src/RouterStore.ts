@@ -1,7 +1,30 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
+import type { OperatorRoleV1 } from "cyrus-operator-protocol";
 
 const ENROLLMENT_CODE_TTL_MS = 15 * 60_000;
+
+/**
+ * Prefix every locally minted operator token carries.
+ *
+ * It is what lets one `Authorization: Bearer` header be resolved to exactly one
+ * credential kind without probing: a device token is bare hex, an Entra token
+ * is a JWT, and anything starting with this is an operator token. Without a
+ * marker, a revoked operator token would fall through to the device lookup and
+ * be reported as an unknown device rather than as the revoked credential it is.
+ * It also makes a leaked token greppable in a log or a paste.
+ */
+export const OPERATOR_TOKEN_PREFIX = "cyop_";
+
+/**
+ * The closed role set, mirrored from `operatorRoleV1Schema` so a stored row can
+ * be validated without pulling Zod into the storage layer. Read and recovery
+ * authority are separate roles, never a hierarchy.
+ */
+export const OPERATOR_ROLES: readonly OperatorRoleV1[] = [
+	"fleet.read",
+	"fleet.recover",
+];
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -119,6 +142,15 @@ CREATE TABLE IF NOT EXISTS pending_devcontainer_builds (
   created_event TEXT NOT NULL,
   created_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS operator_tokens (
+  token_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  label TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  roles_json TEXT NOT NULL,
+  workspaces_json TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  revoked_ms INTEGER
+);
 CREATE TABLE IF NOT EXISTS agent_runs (
   run_id TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL,
@@ -186,6 +218,48 @@ function parseCreator(creatorJson: string | null): {
 	} catch {
 		return {};
 	}
+}
+
+interface OperatorTokenRow {
+	token_id: number;
+	label: string;
+	roles_json: string;
+	workspaces_json: string;
+	created_ms: number;
+	revoked_ms: number | null;
+}
+
+/**
+ * A locally minted operator credential, WITHOUT its hash and without any way to
+ * recover the raw token. Everything an authorizer or an admin listing needs.
+ */
+export interface OperatorTokenInfo {
+	tokenId: number;
+	label: string;
+	roles: OperatorRoleV1[];
+	workspaceIds: string[];
+	createdMs: number;
+	revokedMs?: number;
+}
+
+/**
+ * Decodes a stored row. Roles are filtered against {@link OPERATOR_ROLES} on
+ * the way out as well as on the way in: a row written by a newer router (or
+ * hand-edited) must not be able to introduce a role this process does not
+ * understand and would then carry, unchecked, into an authorization decision.
+ */
+function toOperatorTokenInfo(row: OperatorTokenRow): OperatorTokenInfo {
+	return {
+		tokenId: row.token_id,
+		label: row.label,
+		roles: (JSON.parse(row.roles_json) as string[]).filter(
+			(role): role is OperatorRoleV1 =>
+				(OPERATOR_ROLES as readonly string[]).includes(role),
+		),
+		workspaceIds: JSON.parse(row.workspaces_json) as string[],
+		createdMs: row.created_ms,
+		...(row.revoked_ms !== null ? { revokedMs: row.revoked_ms } : {}),
+	};
 }
 
 interface UserRow {
@@ -1099,6 +1173,108 @@ export class RouterStore {
 		const result = this.db
 			.prepare("DELETE FROM devices WHERE user_id = ? AND kind = 'device'")
 			.run(user.user_id);
+		return result.changes > 0;
+	}
+
+	/**
+	 * Mints a local operator credential for a non-Entra deployment.
+	 *
+	 * The raw token is returned ONCE, to the caller that asked for it, and is
+	 * never persisted or logged — only `sha256(token)` reaches the database, the
+	 * same way `devices.token_hash` does. `operator_tokens` is a separate table
+	 * from `devices` on purpose: a device token's authority is its owner's own
+	 * work, and widening that row to also carry fleet roles is exactly the
+	 * broadening this feature must not do.
+	 *
+	 * Roles and workspaces are validated here rather than at the route, because
+	 * this is the only way a row gets written: an empty role set would mint a
+	 * credential that authenticates and can do nothing, and an empty workspace
+	 * set one that is authorized over nothing — both indistinguishable from a
+	 * revoked token at the point of use, hours after the mistake was made.
+	 */
+	createOperatorToken(input: {
+		label: string;
+		roles: OperatorRoleV1[];
+		workspaceIds: string[];
+		nowMs?: number;
+	}): { tokenId: number; token: string } {
+		const label = input.label.trim();
+		if (!label) throw new Error("An operator token needs a label");
+		const roles = [...new Set(input.roles)];
+		if (roles.length === 0) {
+			throw new Error("An operator token needs at least one role");
+		}
+		for (const role of roles) {
+			if (!OPERATOR_ROLES.includes(role)) {
+				throw new Error(
+					`Unknown operator role "${role}" (expected one of: ${OPERATOR_ROLES.join(", ")})`,
+				);
+			}
+		}
+		const workspaceIds = [
+			...new Set(input.workspaceIds.map((id) => id.trim()).filter(Boolean)),
+		];
+		if (workspaceIds.length === 0) {
+			throw new Error("An operator token needs at least one workspace id");
+		}
+		const token = `${OPERATOR_TOKEN_PREFIX}${generateTokenHex()}`;
+		const result = this.db
+			.prepare(
+				`INSERT INTO operator_tokens (label, token_hash, roles_json, workspaces_json, created_ms, revoked_ms)
+				 VALUES (?, ?, ?, ?, ?, NULL)`,
+			)
+			.run(
+				label,
+				sha256Hex(token),
+				JSON.stringify(roles),
+				JSON.stringify(workspaceIds),
+				input.nowMs ?? Date.now(),
+			);
+		return { tokenId: Number(result.lastInsertRowid), token };
+	}
+
+	/**
+	 * Resolves a raw operator token to its grant, or `undefined`.
+	 *
+	 * A revoked row resolves to `undefined` rather than to a row carrying
+	 * `revokedMs`. Fail-closed by construction: there is no shape in which a
+	 * caller can hold a revoked grant and forget to check it. Revoked rows stay
+	 * visible through {@link listOperatorTokens}, which is where an operator
+	 * looks to confirm a revocation took.
+	 */
+	getOperatorTokenByToken(token: string): OperatorTokenInfo | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT token_id, label, roles_json, workspaces_json, created_ms, revoked_ms
+				 FROM operator_tokens WHERE token_hash = ? AND revoked_ms IS NULL`,
+			)
+			.get(sha256Hex(token)) as OperatorTokenRow | undefined;
+		return row ? toOperatorTokenInfo(row) : undefined;
+	}
+
+	/** Every minted token, revoked ones included. Never exposes a hash. */
+	listOperatorTokens(): OperatorTokenInfo[] {
+		const rows = this.db
+			.prepare(
+				`SELECT token_id, label, roles_json, workspaces_json, created_ms, revoked_ms
+				 FROM operator_tokens ORDER BY token_id`,
+			)
+			.all() as OperatorTokenRow[];
+		return rows.map(toOperatorTokenInfo);
+	}
+
+	/**
+	 * Revokes a token. Returns `false` for an unknown id AND for one already
+	 * revoked — the `revoked_ms IS NULL` guard makes the write itself the
+	 * arbiter, so two concurrent revocations cannot both report success and the
+	 * recorded time is the first one's.
+	 */
+	revokeOperatorToken(tokenId: number, nowMs?: number): boolean {
+		const result = this.db
+			.prepare(
+				"UPDATE operator_tokens SET revoked_ms = ? WHERE token_id = ? AND revoked_ms IS NULL",
+			)
+			.run(nowMs ?? Date.now(), tokenId);
 		return result.changes > 0;
 	}
 

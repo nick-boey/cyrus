@@ -12,6 +12,7 @@ import {
 	LinearIssueTrackerService,
 	type LinearOAuthConfig,
 } from "cyrus-linear-event-transport";
+import type { OperatorCapabilityV1 } from "cyrus-operator-protocol";
 import type { SpanExporter } from "cyrus-otel-traces";
 import type {
 	ContainerExecutor,
@@ -47,6 +48,14 @@ import {
 	type EntraTokenVerifier,
 	registerEnrollmentRoute,
 } from "./enrollment.js";
+import { FleetOperations } from "./fleet-operations/FleetOperations.js";
+import {
+	createEntraOperatorTokenVerifier,
+	type EntraOperatorTokenVerifier,
+	OperatorAuthorizer,
+} from "./fleet-operations/OperatorAuthorizer.js";
+import { registerFleetOperationsRoutes } from "./fleet-operations/routes.js";
+import type { FleetOperationsConfig } from "./fleet-operations/types.js";
 import { KeyVaultSecretStore } from "./KeyVaultSecretStore.js";
 import { LinearExecutor } from "./LinearExecutor.js";
 import {
@@ -418,6 +427,28 @@ export interface RouterServerConfig {
 	/** Test seam for deterministic verification without a remote JWKS. */
 	entraTokenVerifier?: EntraTokenVerifier;
 	/**
+	 * Fleet Operations: the anonymous discovery document and the authenticated
+	 * operator context route.
+	 *
+	 * Omitting it still registers both routes — discovery is how a client learns
+	 * whether a router speaks the operator interface at all, and device tokens
+	 * and locally minted operator tokens authenticate with no configuration —
+	 * but no Entra grant exists, so a JWT is refused.
+	 *
+	 * `capabilities` on this object is IGNORED: what a router serves is decided
+	 * by the routes it registers, not by its config file. See
+	 * {@link RouterServer.servedOperatorCapabilities}.
+	 */
+	fleetOperations?: FleetOperationsConfig;
+	/**
+	 * Verifies operator Entra ACCESS tokens. Defaults to a JWKS-backed verifier
+	 * built from `fleetOperations.access.entra`. A third verifier alongside
+	 * `entraTokenVerifier` and `setupIdTokenVerifier` because each pins a
+	 * different audience and needs a different projection of the payload — this
+	 * one needs `oid` and `groups`.
+	 */
+	operatorTokenVerifier?: EntraOperatorTokenVerifier;
+	/**
 	 * Authenticated `/setup*` management UI. Opt-in and off by default.
 	 *
 	 * `setupUi.auth` is deliberately required when enabled: how identity is
@@ -654,6 +685,7 @@ export class RouterServer {
 			getSandboxObservation: (deviceId) =>
 				this.containerLifecycle?.getSandboxObservation(deviceId),
 		});
+		this.registerFleetOperations();
 
 		// Liveness probe for container orchestrators (Docker HEALTHCHECK,
 		// serverless platforms). Registered in the constructor because Fastify
@@ -982,6 +1014,70 @@ export class RouterServer {
 		await this.fastify.close();
 		await this.stateBackup?.stop();
 		this.store.close();
+	}
+
+	/**
+	 * Registers the Fleet Operations discovery and operator-context routes.
+	 *
+	 * Called from the constructor, before {@link start}: Fastify v5 forbids
+	 * adding routes once the server is listening. Registered unconditionally —
+	 * see {@link RouterServerConfig.fleetOperations} on why an unconfigured
+	 * router still serves discovery.
+	 */
+	private registerFleetOperations(): void {
+		const fleetConfig = this.config.fleetOperations ?? {};
+		const entra = fleetConfig.access?.entra;
+		const workspaceIds = Object.keys(this.config.workspaces);
+		const verifyEntraToken =
+			this.config.operatorTokenVerifier ??
+			(entra ? createEntraOperatorTokenVerifier(entra) : undefined);
+		if (entra && !verifyEntraToken) {
+			throw new Error(
+				"fleetOperations.access.entra is configured but no operator token verifier could be built",
+			);
+		}
+		const authorizer = new OperatorAuthorizer({
+			store: this.store,
+			workspaceIds,
+			...(fleetConfig.access ? { access: fleetConfig.access } : {}),
+			...(verifyEntraToken ? { verifyEntraToken } : {}),
+			logger: this.logger,
+		});
+		const fleet = new FleetOperations({
+			config: {
+				...fleetConfig,
+				capabilities: this.servedOperatorCapabilities(fleetConfig),
+			},
+			workspaceIds,
+		});
+		registerFleetOperationsRoutes(this.fastify, {
+			fleet,
+			authorizer,
+			logger: this.logger,
+		});
+		if (entra) {
+			this.logger.info(
+				`Fleet Operations Entra access enabled (tenant ${entra.tenantId}, audience ${entra.audience}, ${entra.grants.length} grant(s))`,
+			);
+		}
+	}
+
+	/**
+	 * What this router ACTUALLY serves over the operator interface — derived
+	 * from the routes registered above, never read from the config file.
+	 *
+	 * A client gates an optional command on a capability rather than on the
+	 * router's Cyrus version, so a capability advertised without a route behind
+	 * it presents to an orchestrating agent as a fleet problem rather than as a
+	 * router older than its CLI. `logs.query` is servable today because the
+	 * client queries the log backend DIRECTLY: the router only has to describe
+	 * where it is, which is exactly what a configured `logSource` does. The run
+	 * and recovery routes do not exist yet, so they are not advertised.
+	 */
+	private servedOperatorCapabilities(
+		fleetConfig: FleetOperationsConfig,
+	): OperatorCapabilityV1[] {
+		return fleetConfig.logSource ? ["logs.query"] : [];
 	}
 
 	/**

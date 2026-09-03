@@ -5,6 +5,63 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Authenticated scoped fleet operators and exposed discovery ([CYR-65](https://linear.app/northrop-digital/issue/CYR-65/authenticate-scoped-fleet-operators-and-expose-discovery)).**
+  New `packages/router/src/fleet-operations/` module — `types.ts`,
+  `OperatorAuthorizer.ts`, `FleetOperations.ts`, `routes.ts` — implementing the
+  router-side authentication boundary for the CYR-64 v1 contracts, plus a new
+  `operator_tokens` table and `cyrus router operators` admin commands.
+
+  `OperatorAuthorizer` is the ONLY code that turns a credential into an
+  `OperatorPrincipal`, which is what makes "a container token gains no recovery
+  authority" a property of the system rather than a rule each route remembers. It
+  tells the three credential kinds apart by SHAPE — an operator token carries the
+  `cyop_` prefix, an Entra token is a three-segment JWT, anything else is a device
+  token — rather than probing each store in turn, which would have made a revoked
+  operator token fall through to the device lookup and be reported as an unknown
+  device. Entra claims are re-checked here (`tid`, exact-string `aud`, `oid`)
+  rather than trusted from the verifier: `jose` accepts an ARRAY `aud` merely
+  CONTAINING the expected value, which would admit a token minted for a different
+  API in the same tenant. Grants are additive across `oid` and `groups`, keyed on
+  immutable object ids, and narrowed to the workspaces the router actually serves;
+  a verified identity with no role, or none over a served workspace, is 403.
+
+  A device principal carries `ownerUserId`, which is how the existing token keeps
+  its owner scope instead of being widened into fleet-wide read — every downstream
+  read must additionally filter by it. `OperatorPrincipal.authKind` includes
+  `"device"` beyond the `"entra" | "local"` pair in the brief, because
+  `OperatorContextV1.authMethod` is a required field over a closed three-member
+  enum and the authorizer is the only thing entitled to decide which one a caller
+  presented.
+
+  `FleetOperations` validates BOTH documents against their v1 schema before they
+  leave the class. That is a control, not a formality: `publicRouterMetadataV1Schema`
+  is strict precisely so an additive change slipping a workspace list or log-source
+  hint onto the anonymous document throws rather than discloses. Capabilities are
+  the intersection of the principal's roles with what `RouterServer` says it
+  SERVES — computed from registered routes, never read from the config file, and
+  the config schema does not model the field — so the context cannot advertise a
+  capability with no route behind it. Today that is `logs.query` when a log source
+  is configured, and nothing else; the run and recovery routes land in later
+  issues. The log-source descriptor is gated on the capability rather than on the
+  config, so it is never disclosed to a principal who may not query it.
+
+  Local credentials live in a new `operator_tokens` table (`label`, `token_hash`,
+  `roles_json`, `workspaces_json`, `created_ms`, `revoked_ms`), separate from
+  `devices.token_hash`. `getOperatorTokenByToken` filters revoked rows in SQL so
+  the grant is fail-closed by construction and no caller can forget the check;
+  `listOperatorTokens` still shows them, since "did my revocation take" is what an
+  operator opens that command for. `revokeOperatorToken`'s `revoked_ms IS NULL`
+  guard makes the write itself the arbiter of concurrent revocations. The
+  `cyrus router operators` commands are local-only — they mint and revoke the
+  credentials the operator API authenticates, so serving them over it would let a
+  token mint another, and revoking a compromised token would depend on that token
+  still working.
+
+  `/enroll`, `/workspaces`, `/runs`, and `/healthz` are untouched. Both new routes
+  register unconditionally, in the constructor before `start()` — Fastify v5
+  refuses routes on a listening server — and a router with no `fleetOperations`
+  block still serves discovery and still accepts device and local operator tokens.
+
 - **Defined versioned remote-operator contracts ([CYR-64](https://linear.app/northrop-digital/issue/CYR-64/define-versioned-remote-operator-contracts),
   [#57](https://github.com/nick-boey/cyrus/pull/57)).**
   New `cyrus-operator-protocol` package holding the v1 wire contracts the router's
