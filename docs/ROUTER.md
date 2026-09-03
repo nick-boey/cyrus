@@ -896,8 +896,8 @@ with no concept of one:
       "registry": "cyrusacr",
       "loginServer": "cyrusacr.azurecr.io",
       "imageRepository": "cyrus/devcontainers",
-      "workerFeatureRef": "ghcr.io/<owner>/cyrus-features/cyrus-worker:0.1.0",
-      "workerFeatureVersion": "0.1.0",
+      "workerFeatureRef": "ghcr.io/<owner>/cyrus-features/cyrus-worker:0.2.0",
+      "workerFeatureVersion": "0.2.0",
       "workerPayloadTarball": "https://…/worker-payload.tgz"
     }
   }

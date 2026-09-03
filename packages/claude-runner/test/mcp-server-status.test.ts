@@ -13,6 +13,7 @@ vi.mock("../src/sandbox-requirements", () => ({
 	})),
 	logSandboxRequirementFailures: vi.fn(),
 	resetSandboxRequirementsCacheForTesting: vi.fn(),
+	resolveSubprocessEnvScrub: vi.fn(() => ({ enabled: false })),
 }));
 
 vi.mock("fs", () => ({

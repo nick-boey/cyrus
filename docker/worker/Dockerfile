@@ -19,13 +19,30 @@ FROM node:22-slim
 # raw files via `curl`/`jq`). ca-certificates: node's fetch (used to reach the
 # router for bundle download/upload) needs a real root store, which node:22-slim
 # does not ship with by default.
+#
+# bubblewrap/socat: the two host prerequisites of the Claude Code SDK's
+# subprocess env scrub (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`), which keeps the
+# session's Anthropic credentials out of the env of every Bash subprocess the
+# agent spawns. Without them `checkLinuxSandboxRequirements()` reports the host
+# as unsupported and the scrub can never be turned on here (NOR-412).
+#
+# The third prerequisite — creating an unprivileged user namespace — is a
+# property of the runtime, not the image, and cannot be baked in. It was
+# verified to hold inside a live ACA sandbox: the exact probe
+# `sandbox-requirements.ts` runs (`bwrap --ro-bind / / --proc /proc --dev /dev
+# --unshare-user --unshare-pid --unshare-net -- true`) exits 0 there. It does
+# NOT hold under every local Docker daemon — NOR-364 phase 3 hit `bwrap: No
+# permissions to create a new namespace` on a Docker Desktop drive — which is
+# why the scrub is opt-in per host rather than assumed available.
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends \
+		bubblewrap \
 		ca-certificates \
 		curl \
 		gh \
 		git \
 		jq \
+		socat \
 	&& rm -rf /var/lib/apt/lists/*
 # .NET SDK: repos targeting .NET (e.g. net10.0/net8.0 solutions) need `dotnet`
 # for Claude sessions to build, test, restore, and run local tools. Installed

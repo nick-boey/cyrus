@@ -20,9 +20,12 @@ const AUTH_ENV_KEYS = [
  * Both `ClaudeRunner.start()` and `EdgeWorker.warmupRecentSessions()`
  * must use the same set — keep this as the single source of truth.
  *
- * Note: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is intentionally not included
- * while the Linux bubblewrap sandbox side effects it triggers are being
- * investigated. See CYPACK-1108.
+ * Note: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is deliberately NOT a constant here.
+ * It is a per-host decision (`resolveSubprocessEnvScrub`) rather than a fixed
+ * flag, and every caller must set or unset it explicitly on top of this —
+ * `buildBaseSessionEnv` spreads the whole parent process.env, so an absent
+ * key here means "inherit whatever the worker process happened to have", not
+ * "off". See NOR-412 and CYPACK-1108.
  *
  * - MCP_CONNECTION_NONBLOCKING lets MCP servers connect in the background so
  *   both cold-start and pre-warm sessions return faster.

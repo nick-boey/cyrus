@@ -777,6 +777,38 @@ export class AgentSessionManager extends EventEmitter {
 	}
 
 	/**
+	 * Marks a session terminal because it failed before the agent ever ran.
+	 *
+	 * A session that throws on the way up never reaches the message loop, so
+	 * neither `completeSession` (result branch only) nor `abortSession` (an
+	 * explicit stop) fires. The rejection propagates as far as
+	 * `EdgeWorker.handleWebhook`, whose catch deliberately does not rethrow so a
+	 * bad webhook cannot take the process down — and there it stops, as one log
+	 * line. Meanwhile `postInstantAcknowledgment` has already posted a thought,
+	 * so Linear renders the session as working, forever: no activity, no terminal
+	 * state, and the router's issue lock and session affinity still pinned
+	 * because only the terminal signal releases them. That is the NOR-402 shape.
+	 *
+	 * The error activity is best-effort for the same reason it is in
+	 * `completeSession`: a failed post must not cost us the terminal signal.
+	 * `emitTerminalOnce` is idempotent, so calling this on a session that somehow
+	 * did reach a terminal state is a no-op rather than a duplicate frame.
+	 */
+	async failSession(sessionId: string, body: string): Promise<void> {
+		const log = this.sessionLog(sessionId);
+		this.activeTasksBySession.delete(sessionId);
+		await this.updateSessionStatus(sessionId, AgentSessionStatus.Error);
+
+		try {
+			await this.createErrorActivity(sessionId, body);
+		} catch (err) {
+			log.error("Failed to post session-failure activity:", err);
+		}
+
+		await this.emitTerminalOnce(sessionId, "error");
+	}
+
+	/**
 	 * Handle child session completion and resume parent
 	 */
 	private async handleChildSessionCompletion(

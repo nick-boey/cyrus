@@ -33,8 +33,12 @@ export {
 	checkLinuxSandboxRequirements,
 	logSandboxRequirementFailures,
 	resetSandboxRequirementsCacheForTesting,
+	resolveSubprocessEnvScrub,
 	type SandboxRequirementFailure,
 	type SandboxRequirementsResult,
+	SDK_SUBPROCESS_ENV_SCRUB_ENV,
+	SUBPROCESS_ENV_SCRUB_ENV,
+	SubprocessEnvScrubUnavailableError,
 } from "./sandbox-requirements.js";
 export {
 	buildBaseSessionEnv,
