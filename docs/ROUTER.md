@@ -386,7 +386,7 @@ lookup and silently returns null — so read them with bracket syntax:
 | `sandbox.boot_started` | the router asked a provider to boot or resume a sandbox |
 | `sandbox.running` | the provider reported it running (`transitioned` is false for a re-route that found it already up) |
 | `sandbox.boot_failed` | `ensureRunning` rejected; `reason` carries the message |
-| `sandbox.parked` | a session blocked on a user answer and released affinity — the *container* is parked because its agent run is waiting; the two are distinct facts (see [Observe agent runs](#observe-agent-runs)) |
+| `sandbox.parked` | a session blocked on a user answer and released affinity. Despite the name this is the **run** waiting, not a container stop — nothing is stopped here, and the container keeps running (and billing) until the idle sweep stops it as `sandbox.idle_stopped`. See [Observe agent runs](#observe-agent-runs) |
 | `sandbox.unparked` | a park was reversed and the agent went back to work |
 | `sandbox.idle_stopped` | the lifecycle sweep parked an affinity-free sandbox past `idleStopMs` |
 | `sandbox.destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
@@ -646,6 +646,11 @@ NOR-279     aca       alice@example.com 2026-08-…    2026-08-…  3d4h  6h13m 
 `AGE 3d4h` with `UPTIME 6h13m` is a three-day-old issue whose sandbox has been
 up continuously for six hours — not a sandbox that has been running for
 three days.
+
+`PARKED` renders `devices.parked_at_ms`, which is stamped when a *run* blocks on
+a user answer — so it measures how long the run has been waiting, not how long
+the container has been stopped. A row can show a `PARKED` duration while the
+container is still running; `UPTIME` is what says whether it is up.
 
 On every start, if the required variables are set the entrypoint regenerates
 `/data/router-config.json` from them. With no config variables set, an existing
