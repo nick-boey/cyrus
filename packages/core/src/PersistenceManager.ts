@@ -1,14 +1,7 @@
 import { existsSync } from "node:fs";
-import {
-	mkdir,
-	readdir,
-	readFile,
-	rename,
-	unlink,
-	writeFile,
-} from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 import type {
 	CyrusAgentSession,
 	CyrusAgentSessionEntry,
@@ -62,9 +55,6 @@ interface V2CyrusAgentSession {
 	};
 	claudeSessionId?: string;
 	geminiSessionId?: string;
-	codexSessionId?: string;
-	cursorSessionId?: string;
-	opencodeSessionId?: string;
 	metadata?: Record<string, unknown>;
 }
 
@@ -150,10 +140,6 @@ export class PersistenceManager {
 				savedAt: new Date().toISOString(),
 				state,
 			};
-			// Write-then-rename so the state file is always a complete document.
-			// A plain writeFile interrupted mid-write (SIGKILL, OOM kill, power
-			// loss) leaves truncated JSON that the next boot cannot parse, which
-			// orphans every in-flight session.
 			await writeFile(tempFile, JSON.stringify(stateData, null, 2), "utf8");
 			await rename(tempFile, stateFile);
 		} catch (error) {
@@ -166,54 +152,17 @@ export class PersistenceManager {
 	}
 
 	/**
-	 * Remove temp files left beside `stateFile` by a save that died between its
-	 * write and its rename. Best-effort: this is hygiene, and a sweep failure
-	 * must never stop the state itself from loading.
-	 */
-	private async removeStaleTempFiles(stateFile: string): Promise<void> {
-		try {
-			const directory = dirname(stateFile);
-			const name = basename(stateFile);
-			const entries = await readdir(directory);
-			await Promise.all(
-				entries
-					.filter(
-						(entry) =>
-							entry !== name &&
-							entry.startsWith(name) &&
-							entry.endsWith(".tmp"),
-					)
-					.map((entry) => unlink(join(directory, entry)).catch(() => {})),
-			);
-		} catch {
-			// Directory missing or unreadable — nothing to sweep.
-		}
-	}
-
-	/**
 	 * Load EdgeWorker state from disk (single file for all repositories)
 	 * Automatically migrates from v2.0 to v3.0 format if needed.
 	 */
 	async loadEdgeWorkerState(): Promise<SerializableEdgeWorkerState | null> {
 		try {
 			const stateFile = this.getEdgeWorkerStateFilePath();
-			// A save killed between the write and the rename leaves its temp file
-			// behind, and the unique naming in `saveEdgeWorkerState` means no later
-			// save ever reuses — and so never overwrites — that path. Sweep here
-			// rather than on save: a load happens at boot, when this process has no
-			// save in flight to delete out from under itself.
-			await this.removeStaleTempFiles(stateFile);
 			if (!existsSync(stateFile)) {
 				return null;
 			}
 
 			const raw = await readFile(stateFile, "utf8");
-			if (!raw.trim()) {
-				// deleteStateFile clears the file rather than unlinking it; an
-				// empty file is "no state", not a parse error, and must not be
-				// preserved as corrupt.
-				return null;
-			}
 			// `state` is an opaque blob whose real shape depends on `version`; the
 			// migration branches below narrow it with explicit casts.
 			let stateData: { version?: string; state?: unknown };
@@ -429,9 +378,6 @@ export class PersistenceManager {
 			workspace: v2Session.workspace,
 			claudeSessionId: v2Session.claudeSessionId,
 			geminiSessionId: v2Session.geminiSessionId,
-			codexSessionId: v2Session.codexSessionId,
-			cursorSessionId: v2Session.cursorSessionId,
-			opencodeSessionId: v2Session.opencodeSessionId,
 			metadata: v2Session.metadata,
 			// New field: structured issue context
 			issueContext,

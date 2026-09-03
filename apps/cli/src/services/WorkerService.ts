@@ -15,21 +15,6 @@ import type { Workspace } from "../config/types.js";
 import type { ConfigService } from "./ConfigService.js";
 import type { Logger } from "./Logger.js";
 
-function parseToolEnv(value: string | undefined): string[] | undefined {
-	const tools = value
-		?.split(",")
-		.map((tool) => tool.trim())
-		.filter(Boolean);
-	return tools && tools.length > 0 ? tools : undefined;
-}
-
-function parseBooleanEnv(value: string | undefined): boolean | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	return value.toLowerCase().trim() === "true";
-}
-
 /**
  * Parses `CYRUS_DEFAULT_RUNNER` instead of casting it.
  *
@@ -245,27 +230,24 @@ export class WorkerService {
 		// Load config once for model defaults
 		const edgeConfig = this.configService.load();
 
-		// Create EdgeWorker configuration.
-		//
-		// EdgeWorkerConfig = EdgeConfig & EdgeWorkerRuntimeConfig, so the whole
-		// file config is spread first: every persisted field flows through to
-		// the EdgeWorker automatically, and a newly added EdgeConfig field can
-		// never be silently dropped at startup again (that bit us with
-		// `strictMcpConfig` — CYPACK-1478). Only fields that need env-var
-		// precedence, computed values, or call-parameter overrides may be
-		// assigned explicitly below the spread; plain pass-throughs must NOT be
-		// listed here.
+		// Create EdgeWorker configuration
 		const config: EdgeWorkerConfig = {
-			...edgeConfig,
 			version: this.version,
 			repositories,
 			cyrusHome: this.cyrusHome,
 			linearAllowedTools:
-				parseToolEnv(process.env.LINEAR_ALLOWED_TOOLS) ??
-				edgeConfig.linearAllowedTools,
+				process.env.LINEAR_ALLOWED_TOOLS?.split(",").map((t) => t.trim()) ||
+				edgeConfig.linearAllowedTools ||
+				[],
+			slackAllowedTools: edgeConfig.slackAllowedTools,
+			githubAllowedTools: edgeConfig.githubAllowedTools,
+			slackMcpConfigs: edgeConfig.slackMcpConfigs,
+			linearMcpConfigs: edgeConfig.linearMcpConfigs,
+			githubMcpConfigs: edgeConfig.githubMcpConfigs,
 			defaultDisallowedTools:
-				parseToolEnv(process.env.DISALLOWED_TOOLS) ??
-				edgeConfig.defaultDisallowedTools,
+				process.env.DISALLOWED_TOOLS?.split(",").map((t) => t.trim()) ||
+				edgeConfig.defaultDisallowedTools ||
+				undefined,
 			// Model configuration: environment variables take precedence over config file.
 			// Legacy env vars/keys are still accepted for backwards compatibility.
 			claudeDefaultModel:
@@ -282,23 +264,25 @@ export class WorkerService {
 				process.env.CYRUS_GEMINI_DEFAULT_MODEL || edgeConfig.geminiDefaultModel,
 			codexDefaultModel:
 				process.env.CYRUS_CODEX_DEFAULT_MODEL || edgeConfig.codexDefaultModel,
-			opencodeDefaultModel:
-				process.env.CYRUS_OPENCODE_DEFAULT_MODEL ||
-				edgeConfig.opencodeDefaultModel,
-			opencodeDefaultFallbackModel:
-				process.env.CYRUS_OPENCODE_DEFAULT_FALLBACK_MODEL ||
-				edgeConfig.opencodeDefaultFallbackModel,
-			inferOpenCodeRunnerFromProviderModel:
-				parseBooleanEnv(
-					process.env.CYRUS_INFER_OPENCODE_RUNNER_FROM_PROVIDER_MODEL,
-				) ?? edgeConfig.inferOpenCodeRunnerFromProviderModel,
 			defaultRunner:
 				parseDefaultRunner(process.env.CYRUS_DEFAULT_RUNNER) ||
 				edgeConfig.defaultRunner,
+			issueUpdateTrigger: edgeConfig.issueUpdateTrigger,
+			prReviewTrigger: edgeConfig.prReviewTrigger,
+			promptDefaults: edgeConfig.promptDefaults,
+			linearWorkspaces: edgeConfig.linearWorkspaces,
 			webhookBaseUrl: process.env.CYRUS_BASE_URL,
 			serverPort: parsePort(process.env.CYRUS_SERVER_PORT, DEFAULT_SERVER_PORT),
 			serverHost: isExternalHost ? "0.0.0.0" : "localhost",
 			ngrokAuthToken,
+			// User access control configuration
+			userAccessControl: edgeConfig.userAccessControl,
+			sandbox: edgeConfig.sandbox,
+			// Platform mode + router connection config. `cyrus connect` writes
+			// these to config.json; forward them so `cyrus start` doesn't drop
+			// them (Codex finding 5).
+			platform: edgeConfig.platform,
+			router: edgeConfig.router,
 			handlers: {
 				createWorkspace: async (
 					issue: Issue,

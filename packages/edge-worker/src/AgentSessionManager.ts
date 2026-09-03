@@ -23,7 +23,6 @@ import {
 	type ILogger,
 	type IssueMinimal,
 	type RepositoryContext,
-	type RunnerType,
 	type SerializedCyrusAgentSession,
 	type SerializedCyrusAgentSessionEntry,
 	type SessionCreator,
@@ -318,9 +317,7 @@ export class AgentSessionManager extends EventEmitter {
 					? "codex"
 					: runner?.constructor.name === "CursorRunner"
 						? "cursor"
-						: runner?.constructor.name === "OpenCodeRunner"
-							? "opencode"
-							: "claude";
+						: "claude";
 
 		// Update the appropriate session ID based on runner type
 		if (runnerType === "gemini") {
@@ -329,8 +326,6 @@ export class AgentSessionManager extends EventEmitter {
 			linearSession.codexSessionId = claudeSystemMessage.session_id;
 		} else if (runnerType === "cursor") {
 			linearSession.cursorSessionId = claudeSystemMessage.session_id;
-		} else if (runnerType === "opencode") {
-			linearSession.opencodeSessionId = claudeSystemMessage.session_id;
 		} else {
 			linearSession.claudeSessionId = claudeSystemMessage.session_id;
 		}
@@ -378,9 +373,7 @@ export class AgentSessionManager extends EventEmitter {
 					? "codex"
 					: runner?.constructor.name === "CursorRunner"
 						? "cursor"
-						: runner?.constructor.name === "OpenCodeRunner"
-							? "opencode"
-							: "claude";
+						: "claude";
 
 		const sessionEntry: CyrusAgentSessionEntry = {
 			// Set the appropriate session ID based on runner type
@@ -390,9 +383,7 @@ export class AgentSessionManager extends EventEmitter {
 					? { codexSessionId: sdkMessage.session_id }
 					: runnerType === "cursor"
 						? { cursorSessionId: sdkMessage.session_id }
-						: runnerType === "opencode"
-							? { opencodeSessionId: sdkMessage.session_id }
-							: { claudeSessionId: sdkMessage.session_id }),
+						: { claudeSessionId: sdkMessage.session_id }),
 			type: sdkMessage.type,
 			content: this.extractContent(sdkMessage),
 			metadata: {
@@ -509,21 +500,9 @@ export class AgentSessionManager extends EventEmitter {
 			// never to this one, so it does not strictly need to precede the
 			// terminal signal — but keeping it inside the `try` means a throw here
 			// still releases this session's lock.
-			//
-			// A session held open for pending work is not done yet: the wakeup or
-			// background task will stream more messages in, ending in another
-			// result. Resuming the parent now would hand it a non-final result and
-			// resume it again later, so defer to the result that actually ends the
-			// session — the same condition that defers the terminal signal below.
 			const parentSessionId = this.getParentSessionId?.(sessionId);
 			if (parentSessionId && this.resumeParentSession) {
-				if (pendingWork) {
-					log.info(
-						`Child session has pending work; deferring parent ${parentSessionId} resume until the session finishes`,
-					);
-				} else {
-					await this.handleChildSessionCompletion(sessionId, resultMessage);
-				}
+				await this.handleChildSessionCompletion(sessionId, resultMessage);
 			}
 		} finally {
 			// Notify terminal-state observers (router mode releases the issue lock +
@@ -1000,9 +979,7 @@ export class AgentSessionManager extends EventEmitter {
 					? "codex"
 					: runner?.constructor.name === "CursorRunner"
 						? "cursor"
-						: runner?.constructor.name === "OpenCodeRunner"
-							? "opencode"
-							: "claude";
+						: "claude";
 
 		// For error results, content may be in errors[] rather than result.
 		const resultText =
@@ -1079,9 +1056,7 @@ export class AgentSessionManager extends EventEmitter {
 					? { codexSessionId: resultMessage.session_id }
 					: runnerType === "cursor"
 						? { cursorSessionId: resultMessage.session_id }
-						: runnerType === "opencode"
-							? { opencodeSessionId: resultMessage.session_id }
-							: { claudeSessionId: resultMessage.session_id }),
+						: { claudeSessionId: resultMessage.session_id }),
 			type: "result",
 			content,
 			metadata: {
@@ -2215,33 +2190,11 @@ export class AgentSessionManager extends EventEmitter {
 		sessionId: string,
 		model: string,
 	): Promise<void> {
-		const displayModel = this.formatModelNotification(sessionId, model);
 		await this.postActivity(
 			sessionId,
-			{ content: { type: "thought", body: `Using model: ${displayModel}` } },
+			{ content: { type: "thought", body: `Using model: ${model}` } },
 			"model notification",
 		);
-	}
-
-	private formatModelNotification(sessionId: string, model: string): string {
-		const runnerType = this.getSessionRunnerType(sessionId);
-		if (model.startsWith(`${runnerType}/`)) {
-			return model;
-		}
-		return `${runnerType}/${model}`;
-	}
-
-	private getSessionRunnerType(sessionId: string): RunnerType {
-		const runner = this.sessions.get(sessionId)?.agentRunner;
-		return runner?.constructor.name === "GeminiRunner"
-			? "gemini"
-			: runner?.constructor.name === "CodexRunner"
-				? "codex"
-				: runner?.constructor.name === "CursorRunner"
-					? "cursor"
-					: runner?.constructor.name === "OpenCodeRunner"
-						? "opencode"
-						: "claude";
 	}
 
 	/**
