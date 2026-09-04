@@ -71,7 +71,12 @@ This changelog documents internal development changes, refactors, tooling update
   for the rendered value. `scripts/bootstrap-azure-role-assignments.test.sh`
   pins the array forwarding (including comment stripping and the empty case);
   `docker/router/entrypoint.test.mjs` pins the env-var mapping and its
-  `anyProvided` gate.
+  `anyProvided` gate — and CI now actually runs it. `docker/` is not a pnpm
+  workspace package (`pnpm-workspace.yaml` is `packages/*` + `apps/*`), so
+  `pnpm -r test:run` never reached that file and its assertions had been
+  inert since it was written. It joins the three shell suites the `infra`
+  job already lists by name, which is the only place an out-of-workspace
+  test is reachable from.
 
 - **Remote command profile and named router connections ([CYR-67](https://linear.app/northrop-digital/issue/CYR-67/add-the-remote-command-profile-and-named-router-connections), [#59](https://github.com/nick-boey/cyrus/pull/59)).**
   New `apps/cli/src/remote/` module — `errors.ts`, `credentials.ts`,
