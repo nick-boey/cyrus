@@ -5,7 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
-- **Remote command profile and named router connections ([CYR-67](https://linear.app/northrop-digital/issue/CYR-67/add-the-remote-command-profile-and-named-router-connections)).**
+- **Remote command profile and named router connections ([CYR-67](https://linear.app/northrop-digital/issue/CYR-67/add-the-remote-command-profile-and-named-router-connections), [#59](https://github.com/nick-boey/cyrus/pull/59)).**
   New `apps/cli/src/remote/` module — `errors.ts`, `credentials.ts`,
   `ConnectionStore.ts`, `OperatorHttpClient.ts` — plus
   `commands/ConnectionCommand.ts` and a command profile in `buildProgram.ts`.
