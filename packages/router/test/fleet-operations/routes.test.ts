@@ -63,17 +63,23 @@ const ACCESS: OperatorAccessConfig = {
 	},
 };
 
+const ISSUER = `https://login.microsoftonline.com/${TENANT}/v2.0`;
+
 const PAYLOADS: Record<string, Record<string, unknown>> = {
 	"hdr.reader.sig": {
 		tid: TENANT,
+		iss: ISSUER,
 		aud: AUDIENCE,
 		oid: READER_OID,
+		exp: NOW / 1000 + 3600,
 		name: "Reader",
 	},
 	"hdr.recoverer.sig": {
 		tid: TENANT,
+		iss: ISSUER,
 		aud: AUDIENCE,
 		oid: RECOVERER_OID,
+		exp: NOW / 1000 + 3600,
 		name: "Recoverer",
 	},
 };
@@ -331,7 +337,48 @@ describe("fleet-operations routes", () => {
 			const body = response.json();
 			expect(body.authMethod).toBe("device-token");
 			expect(body.roles).toEqual(["fleet.read"]);
+			// `runs.list` is router-mediated, so the router can narrow it to this
+			// device's owner. `logs.query` is NOT: the client would query the log
+			// backend directly, with no router-side filter, so granting it would
+			// convert "read your own runs" into "read every log line in every
+			// workspace" — and would hand over the Log Analytics workspace GUID
+			// and ARM resource id on the way. The descriptor goes with it.
+			expect(body.capabilities).toEqual(["runs.list"]);
 			expect(body.capabilities).not.toContain("recoveries.request");
+			expect(body.logSource).toBeUndefined();
+			expect(flatten(body)).not.toContain(LOG_SOURCE.azure.workspaceId);
+		});
+
+		it("re-authorizes every request, so a revocation takes effect mid-flight", async () => {
+			// Pins "checked on EVERY operator request": without it, memoising the
+			// authorizer would leave every other test in this file passing.
+			const created = store.createOperatorToken({
+				label: "oncall",
+				roles: ["fleet.read"],
+				workspaceIds: [WS_B],
+				nowMs: NOW,
+			});
+			const server = mount();
+			const headers = { authorization: `Bearer ${created.token}` };
+			const url = "/api/v1/operator/context";
+
+			expect(
+				(await server.inject({ method: "GET", url, headers })).statusCode,
+			).toBe(200);
+			store.revokeOperatorToken(created.tokenId, NOW + 1);
+			expect(
+				(await server.inject({ method: "GET", url, headers })).statusCode,
+			).toBe(401);
+		});
+
+		it("never caches a per-principal document in a shared cache", async () => {
+			const response = await mount().inject({
+				method: "GET",
+				url: "/api/v1/operator/context",
+				headers: { authorization: "Bearer hdr.reader.sig" },
+			});
+
+			expect(response.headers["cache-control"]).toBe("no-store");
 		});
 
 		it("denies a container device token, which gains no recovery authority", async () => {
@@ -343,6 +390,43 @@ describe("fleet-operations routes", () => {
 
 			expect(response.statusCode).toBe(403);
 			expect(flatten(response.json())).not.toContain(WS_A);
+		});
+	});
+
+	describe("configuration validation", () => {
+		// The config file's schema cannot express the wire schema's cross-field
+		// rules, so without a construction-time check a router with any of these
+		// starts cleanly, serves every other route, and 500s the one
+		// authenticated operator route for as long as it runs.
+		it.each([
+			[
+				"an Azure source that names no workspace",
+				{ ...LOG_SOURCE, azure: undefined },
+			],
+			[
+				"Azure details on a non-Azure source",
+				{ ...LOG_SOURCE, kind: "fake" as const },
+			],
+			[
+				"a default lookback beyond the maximum range",
+				{
+					...LOG_SOURCE,
+					budgets: { ...LOG_SOURCE.budgets, defaultLookbackSeconds: 999_999 },
+				},
+			],
+		])("refuses to construct with %s", (_label, logSource) => {
+			expect(
+				() =>
+					new FleetOperations({
+						config: {
+							routerId: "router-under-test",
+							logSource: logSource as never,
+							capabilities: ["logs.query"],
+						},
+						workspaceIds: [WS_A],
+						now: () => NOW,
+					}),
+			).toThrow(/Invalid fleetOperations configuration/);
 		});
 	});
 });

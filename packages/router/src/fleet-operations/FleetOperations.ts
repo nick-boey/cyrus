@@ -1,10 +1,12 @@
 import {
 	type AuthorizedWorkspaceV1,
+	logSourceDescriptorV1Schema,
 	type OperatorAuthMethodV1,
 	type OperatorCapabilityV1,
 	type OperatorContextV1,
 	type OperatorRoleV1,
 	operatorContextV1Schema,
+	operatorSkillCompatibilityV1Schema,
 	type PublicRouterMetadataV1,
 	publicRouterMetadataV1Schema,
 } from "cyrus-operator-protocol";
@@ -31,6 +33,25 @@ const ROLE_BY_CAPABILITY: Record<OperatorCapabilityV1, OperatorRoleV1> = {
 	"logs.query": "fleet.read",
 	"recoveries.request": "fleet.recover",
 };
+
+/**
+ * Which capabilities the ROUTER itself serves, and can therefore narrow to an
+ * owner-scoped principal's own work.
+ *
+ * `logs.query` is deliberately absent, and that absence is the whole mechanism
+ * behind {@link OperatorPrincipal.ownerUserId}. Under that capability the router
+ * hands over a log-source descriptor and the client queries the backend
+ * DIRECTLY — no router-side filter exists or can exist — so granting it to a
+ * device token would convert "read your own runs" into "read every log line in
+ * every workspace this router serves", and would disclose the Log Analytics
+ * workspace GUID and ARM resource id on the way. A `ownerUserId` recorded on the
+ * principal and consulted nowhere is not a scope; this is where it binds.
+ */
+const OWNER_SCOPE_ENFORCEABLE: readonly OperatorCapabilityV1[] = [
+	"runs.list",
+	"runs.changes",
+	"recoveries.request",
+];
 
 export interface FleetOperationsOptions {
 	config: FleetOperationsConfig;
@@ -61,6 +82,42 @@ export class FleetOperations {
 		this.workspaceIds = [...options.workspaceIds];
 		this.workspaceNames = options.workspaceNames ?? {};
 		this.now = options.now ?? (() => Date.now());
+		this.validateConfig();
+	}
+
+	/**
+	 * Rejects a configuration that would compile every request into a 500.
+	 *
+	 * The config file's schema is necessarily looser than the wire's: it cannot
+	 * express `logSourceDescriptorV1Schema`'s cross-field rules (an Azure source
+	 * must describe its workspace, a non-Azure one must not, a default lookback
+	 * cannot exceed the maximum range). Validating only at response time meant a
+	 * router with such a config started cleanly, served `/healthz`, `/enroll`,
+	 * `/workspaces`, `/runs`, and discovery normally, and then failed the ONE
+	 * authenticated operator route — for as long as it ran, with the only signal
+	 * a 500 per request.
+	 *
+	 * Called from the constructor, so `RouterServer` construction throws and the
+	 * router refuses to start — the same posture as `validateSetupAuthConfig`
+	 * and the `defaultExecutor` registration check.
+	 */
+	private validateConfig(): void {
+		try {
+			if (this.config.logSource) {
+				logSourceDescriptorV1Schema.parse(this.config.logSource);
+			}
+			if (this.config.skill) {
+				operatorSkillCompatibilityV1Schema.parse(this.config.skill);
+			}
+			// Derived entirely from config, so if it can ever be built it can be
+			// built now — and a strict-schema violation here is a disclosure bug,
+			// which must not wait for the first anonymous request to surface.
+			this.describe();
+		} catch (error) {
+			throw new Error(
+				`Invalid fleetOperations configuration: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 
 	/**
@@ -134,15 +191,22 @@ export class FleetOperations {
 	}
 
 	/**
-	 * The intersection of what this router serves and what this principal's
-	 * roles permit — in the router's declared order, so the document is stable
-	 * across requests.
+	 * The intersection of what this router serves, what this principal's roles
+	 * permit, and — for an owner-scoped principal — what the router is able to
+	 * narrow to that owner. In the router's declared order, so the document is
+	 * stable across requests.
+	 *
+	 * The third term is what keeps a device token at the authority it already
+	 * had. See {@link OWNER_SCOPE_ENFORCEABLE}.
 	 */
 	private capabilitiesFor(
 		principal: OperatorPrincipal,
 	): OperatorCapabilityV1[] {
-		return (this.config.capabilities ?? []).filter((capability) =>
-			principal.roles.has(ROLE_BY_CAPABILITY[capability]),
+		const ownerScoped = principal.ownerUserId !== undefined;
+		return (this.config.capabilities ?? []).filter(
+			(capability) =>
+				principal.roles.has(ROLE_BY_CAPABILITY[capability]) &&
+				(!ownerScoped || OWNER_SCOPE_ENFORCEABLE.includes(capability)),
 		);
 	}
 

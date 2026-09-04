@@ -18,13 +18,22 @@ export const OPERATOR_TOKEN_PREFIX = "cyop_";
 
 /**
  * The closed role set, mirrored from `operatorRoleV1Schema` so a stored row can
- * be validated without pulling Zod into the storage layer. Read and recovery
- * authority are separate roles, never a hierarchy.
+ * be validated without pulling Zod into the storage layer (the import above is
+ * `import type` and is erased). Read and recovery authority are separate roles,
+ * never a hierarchy.
+ *
+ * The `Record` keyed on `OperatorRoleV1` is what makes this EXHAUSTIVE: a
+ * `readonly OperatorRoleV1[]` annotation would happily accept a list missing a
+ * role, and a missing role here is silently unmintable, unlistable, and
+ * stripped back out of any row that already holds it.
  */
-export const OPERATOR_ROLES: readonly OperatorRoleV1[] = [
-	"fleet.read",
-	"fleet.recover",
-];
+const OPERATOR_ROLE_SET: Record<OperatorRoleV1, true> = {
+	"fleet.read": true,
+	"fleet.recover": true,
+};
+export const OPERATOR_ROLES = Object.keys(
+	OPERATOR_ROLE_SET,
+) as OperatorRoleV1[];
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (

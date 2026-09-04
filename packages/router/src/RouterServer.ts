@@ -1031,11 +1031,6 @@ export class RouterServer {
 		const verifyEntraToken =
 			this.config.operatorTokenVerifier ??
 			(entra ? createEntraOperatorTokenVerifier(entra) : undefined);
-		if (entra && !verifyEntraToken) {
-			throw new Error(
-				"fleetOperations.access.entra is configured but no operator token verifier could be built",
-			);
-		}
 		const authorizer = new OperatorAuthorizer({
 			store: this.store,
 			workspaceIds,

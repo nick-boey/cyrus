@@ -1391,6 +1391,31 @@ export class RouterCommand extends BaseCommand {
 			}
 		}
 
+		// A workspace id the router does not serve is narrowed away by
+		// `OperatorAuthorizer`, and a token left with none is 403 on every
+		// request — indistinguishable at the point of use from a revoked one,
+		// long after the typo. Warn rather than reject: this command legitimately
+		// runs somewhere `router-config.json` is absent or unreadable, and a
+		// workspace can be added to the router after the token is minted.
+		let servedWorkspaceIds: string[] | undefined;
+		try {
+			const config = this.readRouterConfig();
+			if (config) servedWorkspaceIds = Object.keys(config.workspaces);
+		} catch {
+			// An unreadable or invalid config is `router start`'s problem to
+			// report, not a reason to refuse to mint a credential.
+		}
+		if (servedWorkspaceIds) {
+			const unknown = workspaceIds.filter(
+				(id) => !servedWorkspaceIds.includes(id),
+			);
+			if (unknown.length > 0) {
+				this.logger.warn(
+					`This router does not serve ${unknown.join(", ")} (it serves ${servedWorkspaceIds.join(", ") || "no workspaces"}). A token authorized over none of the router's workspaces is refused on every request.`,
+				);
+			}
+		}
+
 		const store = this.openExistingStore();
 		try {
 			const created = store.createOperatorToken({
@@ -1451,8 +1476,15 @@ export class RouterCommand extends BaseCommand {
 			if (store.revokeOperatorToken(tokenId)) {
 				this.logSuccess(`Revoked operator token ${tokenId}.`);
 				// Every operator request re-authorizes, so there is no session to
-				// expire and no cache to wait on.
-				this.logger.raw("It stops authenticating on the next request.");
+				// expire and no cache to wait on. The caveat is durability, not
+				// latency: the router database lives on ephemeral local storage and
+				// is backed up periodically, so a restore from before this write
+				// would bring the token back — the same exposure every device token
+				// already has, and the reason a compromise wants the credential
+				// rotated rather than only revoked.
+				this.logger.raw(
+					"It stops authenticating on the next request. If this token was compromised, also confirm the revocation survives a router restart — the router database is backed up periodically, so a restore from before now would resurrect it.",
+				);
 			} else {
 				this.exitWithError(
 					`No active operator token with ID ${tokenId} (it may already be revoked — check \`cyrus router operators list\`).`,

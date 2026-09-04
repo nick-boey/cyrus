@@ -315,13 +315,19 @@ export function buildProgram(
 			"Mint a local operator token and print it once (only its hash is stored)",
 		)
 		.requiredOption("--label <label>", "Human label recorded with the grant")
-		.requiredOption(
+		// `option`, not `requiredOption`: Commander treats an option with a
+		// default value as satisfied, so `requiredOption(..., collect, [])` never
+		// enforces anything — the empty array IS the default. The repeatable
+		// flags need a default for `collect` to accumulate onto, so the "at least
+		// one" check belongs to RouterCommand, which reports it with the role and
+		// workspace context Commander has no idea about.
+		.option(
 			"--role <role>",
 			"fleet.read or fleet.recover; repeat for both (fleet.read does not imply fleet.recover)",
 			collect,
 			[],
 		)
-		.requiredOption(
+		.option(
 			"--workspace <workspaceId>",
 			"Linear workspace id this token is authorized over; repeatable",
 			collect,

@@ -151,6 +151,18 @@ export interface OperatorPrincipal {
 	 * operator principal is scoped by workspace and leaves this undefined —
 	 * which is why downstream code must treat "absent" as "not owner-scoped"
 	 * rather than as "no owner".
+	 *
+	 * PRESENCE alone already narrows authority, today, in
+	 * `FleetOperations.capabilitiesFor`: an owner-scoped principal is refused
+	 * every capability the router cannot filter for it, which is what stops a
+	 * device token from receiving `logs.query` and, with it, unfiltered read of
+	 * every workspace's logs. A field recorded and consulted nowhere would not
+	 * be a scope.
+	 *
+	 * A `number`, matching `RouterStore`'s own user ids (`getDeviceByToken`,
+	 * `listAgentRuns({ userId })`) — every call site it will be compared
+	 * against. It is deliberately NOT on the wire: no v1 document has a field
+	 * for it, so there is no string/number boundary for it to cross.
 	 */
 	ownerUserId?: number;
 }

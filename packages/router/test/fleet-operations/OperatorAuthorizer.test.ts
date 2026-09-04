@@ -5,6 +5,7 @@ import {
 } from "../../src/fleet-operations/OperatorAuthorizer.js";
 import type { OperatorAccessConfig } from "../../src/fleet-operations/types.js";
 import { RouterStore } from "../../src/RouterStore.js";
+import { testLogger } from "../helpers/logger.js";
 
 const NOW = 1_700_000_000_000;
 const TENANT = "11111111-1111-1111-1111-111111111111";
@@ -60,8 +61,10 @@ function entraPayload(
 ): Record<string, unknown> {
 	return {
 		tid: TENANT,
+		iss: `https://login.microsoftonline.com/${TENANT}/v2.0`,
 		aud: AUDIENCE,
 		oid: ALICE_OID,
+		exp: NOW / 1000 + 3600,
 		name: "Alice Example",
 		...overrides,
 	};
@@ -279,6 +282,114 @@ describe("OperatorAuthorizer", () => {
 
 			await expectDenied(authorizer.authenticate("Bearer hdr.no-oid.sig"), 401);
 		});
+
+		// Temporal and issuer validity are re-checked HERE, not left to the
+		// verifier. The fake below validates nothing, so a token it happily
+		// returns claims for is refused only because the authorizer refuses it —
+		// which is exactly the property the class claims: a verifier swapped in
+		// by a test or a future deployment cannot weaken the gate by omission.
+		it("rejects an expired token even though the verifier accepted it", async () => {
+			const authorizer = build({
+				access: accessConfig(),
+				payloads: {
+					"hdr.expired.sig": entraPayload({ exp: NOW / 1000 - 3600 }),
+				},
+			});
+
+			await expectDenied(
+				authorizer.authenticate("Bearer hdr.expired.sig"),
+				401,
+			);
+		});
+
+		it("rejects a token with no expiry at all", async () => {
+			const authorizer = build({
+				access: accessConfig(),
+				payloads: { "hdr.no-exp.sig": entraPayload({ exp: undefined }) },
+			});
+
+			await expectDenied(authorizer.authenticate("Bearer hdr.no-exp.sig"), 401);
+		});
+
+		it("rejects a token that is not yet valid", async () => {
+			const authorizer = build({
+				access: accessConfig(),
+				payloads: {
+					"hdr.future.sig": entraPayload({ nbf: NOW / 1000 + 3600 }),
+				},
+			});
+
+			await expectDenied(authorizer.authenticate("Bearer hdr.future.sig"), 401);
+		});
+
+		it("accepts both issuer forms and rejects any other", async () => {
+			const authorizer = build({
+				access: accessConfig(),
+				payloads: {
+					"hdr.v1-iss.sig": entraPayload({
+						iss: `https://sts.windows.net/${TENANT}/`,
+					}),
+					"hdr.bad-iss.sig": entraPayload({
+						iss: "https://login.microsoftonline.com/attacker/v2.0",
+					}),
+				},
+			});
+
+			await expect(
+				authorizer.authenticate("Bearer hdr.v1-iss.sig"),
+			).resolves.toMatchObject({ id: ALICE_OID });
+			await expectDenied(
+				authorizer.authenticate("Bearer hdr.bad-iss.sig"),
+				401,
+			);
+		});
+
+		it("denies an app-only token even when it matches a grant", async () => {
+			// Group membership is administered by a different role than fleet
+			// authority, so a service principal added to a granted group must not
+			// silently inherit `fleet.recover`.
+			const authorizer = build({
+				access: accessConfig(),
+				payloads: {
+					"hdr.app.sig": entraPayload({
+						idtyp: "app",
+						groups: [GROUP_SRE],
+					}),
+				},
+			});
+
+			await expectDenied(authorizer.authenticate("Bearer hdr.app.sig"), 403);
+		});
+
+		it("warns when Entra returns a groups overage instead of group ids", async () => {
+			// The overage fails CLOSED — nothing is granted — but it fails closed
+			// for exactly the senior operator a group grant exists for, and
+			// presents as an unexplained 403. It must be visible at warn level.
+			const logger = testLogger();
+			const authorizer = new OperatorAuthorizer({
+				store,
+				workspaceIds: [WS_A, WS_B],
+				access: accessConfig(),
+				verifyEntraToken: fakeVerifier({
+					"hdr.overage.sig": entraPayload({
+						oid: "eeeeeeee-0000-0000-0000-00000000000e",
+						groups: undefined,
+						_claim_names: { groups: "src1" },
+						_claim_sources: { src1: { endpoint: "https://graph…" } },
+					}),
+				}),
+				now: () => NOW,
+				logger,
+			});
+
+			await expectDenied(
+				authorizer.authenticate("Bearer hdr.overage.sig"),
+				403,
+			);
+			expect(logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("OVERAGE"),
+			);
+		});
 	});
 
 	describe("local operator tokens", () => {
@@ -371,8 +482,12 @@ describe("OperatorAuthorizer", () => {
 
 			expect(principal.authKind).toBe("device");
 			expect([...principal.roles]).toEqual(["fleet.read"]);
-			// The scope a device token already had — its owner's own work — is
-			// carried forward rather than widened into fleet-wide read.
+			// `ownerUserId` is the whole scope mechanism, not a note: its
+			// PRESENCE is what makes `FleetOperations` withhold every capability
+			// the router cannot filter for this owner. The workspace list is the
+			// set their own runs may appear in, never a licence to read anyone
+			// else's — see the routes suite, where a device token is refused
+			// `logs.query` and the log-source descriptor with it.
 			expect(principal.ownerUserId).toBe(aliceUserId);
 			expect([...principal.workspaceIds].sort()).toEqual([WS_A, WS_B]);
 			expect(principal.roles.has("fleet.recover")).toBe(false);

@@ -21,6 +21,12 @@ export type EntraOperatorTokenVerifier = (
 ) => Promise<Record<string, unknown>>;
 
 /**
+ * Tolerance applied to `exp` and `nbf`, so a router and an identity provider a
+ * few seconds apart do not reject valid tokens.
+ */
+const CLOCK_SKEW_MS = 60_000;
+
+/**
  * Lazily loads jose and caches the tenant's remote JWKS verifier, mirroring
  * `createEntraTokenVerifier` in `enrollment.ts`.
  *
@@ -111,6 +117,7 @@ export class OperatorAuthorizer {
 	private readonly servedWorkspaceIds: Set<string>;
 	private readonly orderedWorkspaceIds: string[];
 	private readonly verifyEntraToken: EntraOperatorTokenVerifier | undefined;
+	private readonly now: () => number;
 	private readonly logger: ILogger | undefined;
 
 	constructor(options: OperatorAuthorizerOptions) {
@@ -119,6 +126,7 @@ export class OperatorAuthorizer {
 		this.orderedWorkspaceIds = [...options.workspaceIds];
 		this.servedWorkspaceIds = new Set(options.workspaceIds);
 		this.verifyEntraToken = options.verifyEntraToken;
+		this.now = options.now ?? (() => Date.now());
 		this.logger = options.logger;
 	}
 
@@ -177,6 +185,15 @@ export class OperatorAuthorizer {
 				"token tenant does not match the router's configured tenant",
 			);
 		}
+		// Both issuer forms, matching `enrollment.ts` and `idTokenVerifier.ts`:
+		// which one Entra mints depends on the app registration's
+		// `accessTokenAcceptedVersion` and is not ours to assume.
+		if (!issuersFor(entra.tenantId).includes(String(claims.iss))) {
+			throw new OperatorAuthError(
+				401,
+				"token issuer is not this router's tenant",
+			);
+		}
 		// Exact string equality, deliberately refusing an array: `jose` treats an
 		// `aud` array containing the expected value as a match, which would admit
 		// a token the caller obtained for a different API in the same tenant.
@@ -186,9 +203,28 @@ export class OperatorAuthorizer {
 				"token audience does not exactly match the router audience",
 			);
 		}
+		// Temporal validity is re-checked for the same reason tenant and audience
+		// are: the stated threat model is that a verifier swapped in by a test or
+		// a future deployment must not be able to weaken the gate by OMISSION,
+		// and "the default verifier happens to call `jose.jwtVerify`" is exactly
+		// the trust this class declines to extend. `exp` is REQUIRED — a bearer
+		// credential with no expiry is not one this router will hold.
+		this.requireTemporalValidity(claims);
 		const objectId = typeof claims.oid === "string" ? claims.oid : undefined;
 		if (!objectId) {
 			throw new OperatorAuthError(401, "token carries no `oid` claim");
+		}
+		// An app-only token proves no human is behind the request. It matters
+		// because group membership is administered by a different role than fleet
+		// authority, so a service principal dropped into a group holding a
+		// `fleet.recover` grant would silently inherit it. This covers the claim
+		// Entra documents for the case; it is not a complete app-only detector,
+		// so a group granted `fleet.recover` should still contain only users.
+		if (claims.idtyp === "app") {
+			throw new OperatorAuthError(
+				403,
+				"app-only tokens hold no fleet-operations authority",
+			);
 		}
 
 		// The caller's own object id plus every group it is a member of. Emails
@@ -196,6 +232,7 @@ export class OperatorAuthorizer {
 		// a grant keyed on one would follow a renamed or recycled account.
 		const candidates = new Set<string>([objectId]);
 		for (const group of stringArray(claims.groups)) candidates.add(group);
+		this.warnOnGroupsOverage(claims, objectId);
 
 		const roles = new Set<OperatorRoleV1>();
 		const workspaceIds = new Set<string>();
@@ -250,10 +287,15 @@ export class OperatorAuthorizer {
 	 * An existing device token, at exactly the authority it already had.
 	 *
 	 * Read only, never recovery, and carrying `ownerUserId` so every downstream
-	 * read stays scoped to that user's own work. A CONTAINER device token is
-	 * refused outright: it is a credential held inside a sandbox running agent
-	 * code on one issue, and letting it read its owner's whole fleet would turn
-	 * a per-issue credential into a fleet-wide one.
+	 * read stays scoped to that user's own work — which is enforced by
+	 * `FleetOperations` withholding every capability whose scope the router
+	 * cannot narrow, not merely recorded here.
+	 *
+	 * An ALLOW-LIST on `kind`, not a deny-list on `"container"`. `devices.kind`
+	 * is a bare `TEXT` column with no `CHECK`, read back through an unchecked
+	 * `as "device" | "container"` cast, so a third value — a future device kind,
+	 * a hand-edited row — would slip past `kind === "container"` and be granted
+	 * a physical device's authority by default. The default has to be denial.
 	 */
 	private authenticateDevice(token: string): OperatorPrincipal {
 		const device = this.store.getDeviceByToken(token);
@@ -264,10 +306,10 @@ export class OperatorAuthorizer {
 		if (!info) {
 			throw new OperatorAuthError(401, "unknown device token");
 		}
-		if (info.kind === "container") {
+		if (info.kind !== "device") {
 			throw new OperatorAuthError(
 				403,
-				"container device tokens hold no fleet-operations authority",
+				`"${info.kind}" device tokens hold no fleet-operations authority`,
 			);
 		}
 		const workspaceIds = new Set(this.orderedWorkspaceIds);
@@ -283,6 +325,53 @@ export class OperatorAuthorizer {
 			ownerUserId: device.userId,
 			...(email ? { displayName: email } : {}),
 		};
+	}
+
+	/**
+	 * `exp` must be present and in the future; `nbf`, if present, must have
+	 * passed. {@link CLOCK_SKEW_MS} is allowed in both directions so a router and
+	 * an identity provider a few seconds apart do not reject valid tokens.
+	 */
+	private requireTemporalValidity(claims: Record<string, unknown>): void {
+		const nowSeconds = this.now() / 1000;
+		const skewSeconds = CLOCK_SKEW_MS / 1000;
+		const exp = typeof claims.exp === "number" ? claims.exp : undefined;
+		if (exp === undefined) {
+			throw new OperatorAuthError(401, "token carries no `exp` claim");
+		}
+		if (nowSeconds - skewSeconds >= exp) {
+			throw new OperatorAuthError(401, "token has expired");
+		}
+		const nbf = typeof claims.nbf === "number" ? claims.nbf : undefined;
+		if (nbf !== undefined && nowSeconds + skewSeconds < nbf) {
+			throw new OperatorAuthError(401, "token is not yet valid");
+		}
+	}
+
+	/**
+	 * Above roughly 200 groups Entra emits `_claim_names`/`_claim_sources`
+	 * pointing at the Graph API INSTEAD of a `groups` array, and the router does
+	 * not call Graph. That fails closed — the caller simply matches no
+	 * group-keyed grant — but it fails closed for precisely the senior operator a
+	 * `fleet.recover` group grant exists for, and presents as an unexplained 403.
+	 * Warn rather than debug: this is a misconfiguration an operator has to act
+	 * on, and a `debug` line in a sandbox worker never leaves the container.
+	 */
+	private warnOnGroupsOverage(
+		claims: Record<string, unknown>,
+		objectId: string,
+	): void {
+		const claimNames = claims._claim_names;
+		if (
+			claims.groups === undefined &&
+			claimNames !== null &&
+			typeof claimNames === "object" &&
+			"groups" in (claimNames as Record<string, unknown>)
+		) {
+			this.logger?.warn(
+				`Entra returned a groups OVERAGE for principal ${objectId}: the token names a Graph endpoint instead of listing group ids, so every group-keyed grant will fail to match and the caller will see a 403. Grant this principal directly by object id, or configure the app registration to emit app roles instead of group ids.`,
+			);
+		}
 	}
 
 	/**
@@ -331,4 +420,12 @@ function looksLikeJwt(token: string): boolean {
 function stringArray(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return value.filter((item): item is string => typeof item === "string");
+}
+
+/** The two issuer forms Entra mints, depending on `accessTokenAcceptedVersion`. */
+function issuersFor(tenantId: string): string[] {
+	return [
+		`https://sts.windows.net/${tenantId}/`,
+		`https://login.microsoftonline.com/${tenantId}/v2.0`,
+	];
 }

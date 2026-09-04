@@ -461,6 +461,62 @@ describe("RouterCommand", () => {
 			}
 		});
 
+		it.each([
+			["no --role", ["--label", "x", "--workspace", "workspace-a"]],
+			["no --workspace", ["--label", "x", "--role", "fleet.read"]],
+			["no --label", ["--role", "fleet.read", "--workspace", "workspace-a"]],
+		])("rejects create-token with %s", async (_label, args) => {
+			// Commander cannot enforce these: `--role`/`--workspace` need a default
+			// array for their accumulator, and an option with a default is treated
+			// as already satisfied. The check has to live here.
+			seedEmptyDb();
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await expect(
+				command.execute(["operators", "create-token", ...args]),
+			).rejects.toThrow(/process\.exit/);
+
+			const store = new RouterStore(dbPath());
+			try {
+				expect(store.listOperatorTokens()).toEqual([]);
+			} finally {
+				store.close();
+			}
+		});
+
+		it("warns when a token names a workspace this router does not serve", async () => {
+			// The authorizer narrows unknown workspaces away, so such a token is
+			// 403 on every request — indistinguishable at the point of use from a
+			// revoked one, long after the typo.
+			seedEmptyDb();
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: { "workspace-real": { linearToken: "token" } },
+					webhook: { verificationMode: "direct", secret: "secret" },
+				}),
+			);
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await command.execute([
+				"operators",
+				"create-token",
+				"--label",
+				"typo",
+				"--role",
+				"fleet.read",
+				"--workspace",
+				"workspace-typo",
+			]);
+
+			expect(app.logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("workspace-typo"),
+			);
+		});
+
 		it("lists grants without ever revealing a token, revoked rows included", async () => {
 			seedEmptyDb();
 			const app = createMockApp(cyrusHome);

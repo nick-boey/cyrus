@@ -25,9 +25,16 @@ This changelog documents internal development changes, refactors, tooling update
   immutable object ids, and narrowed to the workspaces the router actually serves;
   a verified identity with no role, or none over a served workspace, is 403.
 
-  A device principal carries `ownerUserId`, which is how the existing token keeps
-  its owner scope instead of being widened into fleet-wide read — every downstream
-  read must additionally filter by it. `OperatorPrincipal.authKind` includes
+  A device principal carries `ownerUserId`, and its PRESENCE is the scope
+  mechanism rather than a note for later: `FleetOperations.capabilitiesFor`
+  withholds from an owner-scoped principal every capability outside
+  `OWNER_SCOPE_ENFORCEABLE` — that is, every capability the router does not serve
+  itself and therefore cannot narrow to that owner. `logs.query` is the one that
+  matters today, because under it the client queries the log backend DIRECTLY
+  with no router-side filter, so granting it to a device token would have
+  converted "read your own runs" into unfiltered read of every workspace's logs
+  and disclosed the Log Analytics workspace GUID and ARM resource id with it.
+  `OperatorPrincipal.authKind` includes
   `"device"` beyond the `"entra" | "local"` pair in the brief, because
   `OperatorContextV1.authMethod` is a required field over a closed three-member
   enum and the authorizer is the only thing entitled to decide which one a caller
@@ -56,6 +63,31 @@ This changelog documents internal development changes, refactors, tooling update
   credentials the operator API authenticates, so serving them over it would let a
   token mint another, and revoking a compromised token would depend on that token
   still working.
+
+  Entra claims are re-checked here for tenant, issuer, audience, `exp`/`nbf`
+  (60s skew), `oid`, and `idtyp !== "app"`. Temporal and issuer validity are
+  re-checked for the same reason tenant and audience are: the stated threat model
+  is that a verifier swapped in by a test or a future deployment must not weaken
+  the gate by OMISSION, and "the default verifier happens to call
+  `jose.jwtVerify`" is exactly the trust the class declines to extend. An Entra
+  `groups` overage (`_claim_names` instead of `groups`, above ~200 groups) fails
+  closed and now warns, because it fails closed for precisely the senior operator
+  a `fleet.recover` group grant exists for and otherwise presents as an
+  unexplained 403. The container check is an ALLOW-LIST on `kind === "device"`:
+  `devices.kind` is a bare `TEXT` column with no `CHECK`, read through an
+  unchecked cast, so a third value must default to denial.
+
+  `FleetOperations` validates its `logSource`/`skill` config and builds the
+  discovery document in its CONSTRUCTOR, so a config the wire schema would reject
+  refuses to start the router rather than 500-ing the one authenticated route for
+  as long as the process lives — the config file's schema cannot express
+  `logSourceDescriptorV1Schema`'s cross-field rules. Both route handlers also
+  catch: Fastify has no error handler on this instance, so an uncaught throw is
+  rendered by its default handler, which puts the Zod issue list — naming the
+  offending key — in the response body, turning the control that prevents a
+  disclosure into the disclosure. The context route sends `Cache-Control:
+  no-store`, since the document is per-principal and carries the caller's email
+  on a device token.
 
   `/enroll`, `/workspaces`, `/runs`, and `/healthz` are untouched. Both new routes
   register unconditionally, in the constructor before `start()` — Fastify v5

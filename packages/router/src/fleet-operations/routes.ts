@@ -38,9 +38,21 @@ export function registerFleetOperationsRoutes(
 	// The router's ONLY unauthenticated surface. It answers "what is this and
 	// how do I authenticate to it", and nothing that would answer "what is
 	// running on it".
-	fastify.get(DISCOVERY_ROUTE, async (_request, reply) =>
-		reply.status(200).send(fleet.describe()),
-	);
+	//
+	// Wrapped even though `describe()` is validated at construction and cannot
+	// realistically throw here: Fastify has no error handler installed on this
+	// instance, so an uncaught throw is rendered by its DEFAULT handler, which
+	// puts the error's message in the response body. A strict-schema violation
+	// would then report the offending key to an anonymous caller — turning the
+	// control that exists to prevent a disclosure into the disclosure.
+	fastify.get(DISCOVERY_ROUTE, async (_request, reply) => {
+		try {
+			return reply.status(200).send(fleet.describe());
+		} catch (error) {
+			logger?.error("Could not build the router discovery document", error);
+			return reply.status(500).send({ error: "internal error" });
+		}
+	});
 
 	fastify.get(OPERATOR_CONTEXT_ROUTE, async (request, reply) => {
 		let principal: Awaited<ReturnType<OperatorAuthorizer["authenticate"]>>;
@@ -62,6 +74,22 @@ export function registerFleetOperationsRoutes(
 			logger?.error("Operator context authorization failed", error);
 			return reply.status(500).send({ error: "internal error" });
 		}
-		return reply.status(200).send(fleet.context(principal));
+		try {
+			// `no-store` because this document is per-principal and carries the
+			// caller's own display name — on a device token, their email. A shared
+			// cache keyed on the URL alone would serve one operator's authority to
+			// the next.
+			return reply
+				.status(200)
+				.header("cache-control", "no-store")
+				.send(fleet.context(principal));
+		} catch (error) {
+			// Same reasoning as the discovery route: without this, Fastify's
+			// default handler would return the Zod issue list — which names the
+			// log-source path it rejected — to a caller the document was being
+			// withheld from.
+			logger?.error("Could not build the operator context document", error);
+			return reply.status(500).send({ error: "internal error" });
+		}
 	});
 }
