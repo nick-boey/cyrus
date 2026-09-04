@@ -370,4 +370,53 @@ describe("Zod schema + migration round-trip", () => {
 			linearRefreshToken: "lin_refresh_new",
 		});
 	});
+
+	it("leaves the device-enrollment `router` connection out of operator access", () => {
+		// ADR 0009: a device bearer token keeps its least-privilege scope and is
+		// never silently broadened into an operator credential. So migration must
+		// NOT synthesise an `operatorConnections` entry from an enrolled device,
+		// however convenient that would be — an operator connection is created
+		// only by `cyrus connection add`, after the router has authorized it.
+		const enrolledDevice = {
+			repositories: [],
+			platform: "router",
+			router: { url: "wss://router.example.com", deviceToken: "dev_secret" },
+		};
+
+		const migrated = migrateEdgeConfig(enrolledDevice);
+
+		expect(migrated.operatorConnections).toBeUndefined();
+		expect(migrated.router).toEqual(enrolledDevice.router);
+	});
+
+	it("preserves operator connections through migration", () => {
+		const config = {
+			linearWorkspaceSlug: "acme-corp",
+			repositories: [
+				{
+					id: "repo-1",
+					name: "My Repo",
+					repositoryPath: "/path/to/repo",
+					baseBranch: "main",
+					linearWorkspaceId: "ws-abc",
+					linearToken: "lin_token_old",
+					workspaceBaseDir: "/ws",
+				},
+			],
+			operatorConnections: {
+				prod: {
+					url: "https://router.example.com",
+					auth: {
+						kind: "entra",
+						tenantId: "tenant-1",
+						audience: "api://cyrus-router",
+					},
+				},
+			},
+		};
+
+		const migrated = migrateEdgeConfig(config);
+
+		expect(migrated.operatorConnections).toEqual(config.operatorConnections);
+	});
 });

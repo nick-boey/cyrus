@@ -377,6 +377,53 @@ export const RepositoryConfigSchema = z.object({
  * It contains global settings that apply across all repositories,
  * plus the array of repository-specific configurations.
  */
+/**
+ * How the CLI authenticates to one named router's Fleet Operations API.
+ *
+ * Both variants are deliberately credential-free. `entra` records only the
+ * tenant and audience the router itself published at `/.well-known/cyrus`, and
+ * `local` records the NAME of an environment variable — never its value. That
+ * keeps `config.json` free of operator bearer tokens even though it already
+ * holds a device token, and it is what lets `cyrus connection show` print the
+ * whole stored connection without redacting anything.
+ */
+export const OperatorConnectionAuthSchema = z.discriminatedUnion("kind", [
+	// STRICT, and that is the control rather than tidiness: Zod's default is to
+	// STRIP an unknown key silently, so a hand-edited `token: "op_…"` would be
+	// dropped without a word and the operator would be left debugging why their
+	// connection does not authenticate. Refusing it says what happened, and says
+	// it before anything writes the file back.
+	z.strictObject({
+		kind: z.literal("entra"),
+		/** Entra tenant the router validates tokens against. */
+		tenantId: z.string().min(1),
+		/** The router's Application ID URI; a token is requested for its `/.default` scope. */
+		audience: z.string().min(1),
+	}),
+	z.strictObject({
+		kind: z.literal("local"),
+		/**
+		 * Name of the environment variable holding a local operator token minted
+		 * by `cyrus router operators create-token`. Read at request time, so
+		 * rotating the token never requires rewriting this file.
+		 */
+		tokenEnv: z.string().min(1),
+	}),
+]);
+export type OperatorConnectionAuth = z.infer<
+	typeof OperatorConnectionAuthSchema
+>;
+
+/** A stored, named connection to a remote router's operator interface. */
+export const OperatorConnectionConfigSchema = z.strictObject({
+	/** The router's HTTP(S) origin — the same value `/.well-known/cyrus` is served from. */
+	url: z.string().min(1),
+	auth: OperatorConnectionAuthSchema,
+});
+export type OperatorConnectionConfig = z.infer<
+	typeof OperatorConnectionConfigSchema
+>;
+
 export const EdgeConfigSchema = z.object({
 	/** Array of repository configurations */
 	repositories: z.array(RepositoryConfigSchema),
@@ -613,6 +660,23 @@ export const EdgeConfigSchema = z.object({
 			 */
 			floorSync: z.boolean().optional(),
 		})
+		.optional(),
+
+	/**
+	 * Named connections to remote routers' Fleet Operations APIs, keyed by the
+	 * name `cyrus connection add <name> …` was given and selected with the
+	 * global `--connection <name>` flag.
+	 *
+	 * Deliberately SEPARATE from the singular `router` above, which stays the
+	 * device-enrollment connection written by `cyrus connect` and is never
+	 * migrated into operator access. The two answer different questions: `router`
+	 * is "where does this device receive its own work from", and holds a device
+	 * token whose least-privilege scope ADR 0009 forbids broadening; this is
+	 * "which routers may this operator observe across users", and holds no
+	 * credential at all. A device that is also an operator workstation has both.
+	 */
+	operatorConnections: z
+		.record(z.string(), OperatorConnectionConfigSchema)
 		.optional(),
 });
 

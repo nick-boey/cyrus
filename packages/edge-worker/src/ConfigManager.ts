@@ -65,14 +65,25 @@ const RELOAD_MERGED_KEYS = [
 ] as const satisfies readonly (keyof EdgeConfig)[];
 
 /**
- * EdgeConfig keys deliberately NOT merged on hot reload — deprecated fields
- * whose replacements are merged instead (`defaultAllowedTools` is folded
- * into `linearAllowedTools` by `migrateEdgeConfig` at startup;
- * `linearWorkspaceSlug` migrated into `linearWorkspaces` entries).
+ * EdgeConfig keys deliberately NOT merged on hot reload.
+ *
+ * Two reasons, both requiring a conscious choice rather than an omission:
+ * deprecated fields whose replacements are merged instead
+ * (`defaultAllowedTools` is folded into `linearAllowedTools` by
+ * `migrateEdgeConfig` at startup; `linearWorkspaceSlug` migrated into
+ * `linearWorkspaces` entries); and fields no EdgeWorker code path reads at all.
+ *
+ * `operatorConnections` is the second kind: it is read straight off disk by the
+ * CLI's `ConnectionStore` on every `cyrus connection`/fleet command, and the
+ * running EdgeWorker never consults it. Merging it here would move bytes into
+ * an `EdgeWorkerConfig` field nothing reads, and — worse — would fire a
+ * `configChanged` event on every `cyrus connection add`, restarting nothing but
+ * looking to an operator like the worker reacted to their connection edit.
  */
 const RELOAD_EXEMPT_KEYS = [
 	"linearWorkspaceSlug",
 	"defaultAllowedTools",
+	"operatorConnections",
 ] as const satisfies readonly (keyof EdgeConfig)[];
 
 /**

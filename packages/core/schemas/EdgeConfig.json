@@ -1042,6 +1042,61 @@
 			},
 			"required": ["url", "deviceToken"],
 			"additionalProperties": false
+		},
+		"operatorConnections": {
+			"type": "object",
+			"propertyNames": {
+				"type": "string"
+			},
+			"additionalProperties": {
+				"type": "object",
+				"properties": {
+					"url": {
+						"type": "string",
+						"minLength": 1
+					},
+					"auth": {
+						"oneOf": [
+							{
+								"type": "object",
+								"properties": {
+									"kind": {
+										"type": "string",
+										"const": "entra"
+									},
+									"tenantId": {
+										"type": "string",
+										"minLength": 1
+									},
+									"audience": {
+										"type": "string",
+										"minLength": 1
+									}
+								},
+								"required": ["kind", "tenantId", "audience"],
+								"additionalProperties": false
+							},
+							{
+								"type": "object",
+								"properties": {
+									"kind": {
+										"type": "string",
+										"const": "local"
+									},
+									"tokenEnv": {
+										"type": "string",
+										"minLength": 1
+									}
+								},
+								"required": ["kind", "tokenEnv"],
+								"additionalProperties": false
+							}
+						]
+					}
+				},
+				"required": ["url", "auth"],
+				"additionalProperties": false
+			}
 		}
 	},
 	"required": ["repositories"],

@@ -6,6 +6,7 @@ import { Application } from "./Application.js";
 import { AuthCommand } from "./commands/AuthCommand.js";
 import { CheckTokensCommand } from "./commands/CheckTokensCommand.js";
 import { ConnectCommand } from "./commands/ConnectCommand.js";
+import { ConnectionCommand } from "./commands/ConnectionCommand.js";
 import { ContainerBootCommand } from "./commands/ContainerBootCommand.js";
 import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
 import { RouterCommand } from "./commands/RouterCommand.js";
@@ -13,6 +14,7 @@ import { RunsCommand } from "./commands/RunsCommand.js";
 import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
 import { SelfAuthCommand } from "./commands/SelfAuthCommand.js";
 import { StartCommand } from "./commands/StartCommand.js";
+import { UsageError } from "./remote/errors.js";
 
 /**
  * Builds the Commander program that the shipped `cyrus` binary parses.
@@ -37,10 +39,135 @@ function collect(value: string, previous: string[]): string[] {
 	return [...previous, value];
 }
 
+/**
+ * Which command surface the binary exposes (ADR 0011).
+ *
+ * `full` keeps the complete worker and router surface; `remote` registers only
+ * the commands an orchestrator uses to observe and recover work through a
+ * remote router.
+ */
+export type CommandProfile = "full" | "remote";
+
+export const COMMAND_PROFILES: readonly CommandProfile[] = ["full", "remote"];
+
+/** Environment variable an orchestrator installation sets as its default. */
+export const COMMAND_PROFILE_ENV = "CYRUS_COMMAND_PROFILE";
+
+/**
+ * The one top-level remote vocabulary, shared by both profiles.
+ *
+ * There is deliberately no `cyrus remote` namespace: the same words mean the
+ * same thing whichever profile is active, so a skill written against an
+ * orchestrator installation runs unchanged on a full one.
+ *
+ * This list is LOAD-BEARING, not documentation: `buildProgram` registers a
+ * command into the remote profile only if its name appears here, so membership
+ * cannot be granted by where a `register*` call happens to sit relative to a
+ * branch. Adding a command to the remote surface is an edit to this array.
+ *
+ * `logs`, `recover`, and `skills` are named but not yet implemented — they
+ * arrive with CYR-73, CYR-76, and CYR-77.
+ *
+ * `runs` is named but deliberately NOT yet registered in the remote profile.
+ * Today's `RunsCommand` reads `config.router.deviceToken`, the device-enrollment
+ * block written only by `cyrus connect` — which the remote profile does not
+ * register and `cyrus connection add` deliberately never writes. Registering it
+ * here would ship a command that always fails with advice to run a command the
+ * profile hides. CYR-70 moves `runs` onto `ConnectionStore`/`OperatorHttpClient`,
+ * at which point it joins {@link REMOTE_PROFILE_REGISTERED}.
+ */
+export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
+	"connection",
+	"runs",
+	"logs",
+	"recover",
+	"skills",
+];
+
+/**
+ * The subset of {@link REMOTE_PROFILE_COMMANDS} that exists and works today.
+ *
+ * Separate from the vocabulary above so that "approved for this profile" and
+ * "actually usable in this profile" are two decisions rather than one — a
+ * command may be approved long before it can function unattended.
+ */
+export const REMOTE_PROFILE_REGISTERED: readonly string[] = ["connection"];
+
+/**
+ * Adds the two selection flags every fleet command accepts: which stored
+ * connection to talk to, and which authorized workspace to act on.
+ *
+ * Attached to each fleet command rather than declared once on the program, and
+ * that is NOT a stylistic choice. Commander resolves an option a parent and a
+ * child both declare in favour of the PARENT: with `--workspace` on the
+ * program, `cyrus router operators create-token --workspace a --workspace b`
+ * parses both values into the program's single-valued option and hands the
+ * subcommand an empty array — silently minting a token authorized over no
+ * workspaces. `enablePositionalOptions()` fixes that collision but breaks
+ * `cyrus start --cyrus-home /x`, which works today. So the flags live on the
+ * commands that consume them, and every new fleet command must call this to
+ * keep the vocabulary uniform.
+ */
+export function addFleetSelectionOptions(command: Command): Command {
+	return command
+		.option(
+			"--connection <name>",
+			"Named router connection to use (see `cyrus connection list`). Optional when exactly one is stored.",
+		)
+		.option(
+			"--workspace <id>",
+			"Linear workspace to act on. Required when the connection authorizes more than one.",
+		);
+}
+
+/**
+ * Resolves the profile BEFORE the program is built, because the profile decides
+ * which commands exist and Commander cannot report an option it has not parsed
+ * yet. Explicit `--profile` beats the environment default, so one installation
+ * can still perform both roles deliberately.
+ */
+export function resolveCommandProfile(
+	argv: readonly string[] = process.argv,
+	env: NodeJS.ProcessEnv = process.env,
+): CommandProfile {
+	let raw: string | undefined = env[COMMAND_PROFILE_ENV]?.trim() || undefined;
+	let origin = `${COMMAND_PROFILE_ENV}`;
+
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--profile" && argv[i + 1]) {
+			// Last occurrence wins, matching Commander's own behaviour for a
+			// non-accumulating option.
+			raw = argv[++i];
+			origin = "--profile";
+		} else if (arg?.startsWith("--profile=")) {
+			raw = arg.slice("--profile=".length);
+			origin = "--profile";
+		}
+	}
+
+	if (raw === undefined) return "full";
+	if ((COMMAND_PROFILES as readonly string[]).includes(raw)) {
+		return raw as CommandProfile;
+	}
+	throw new UsageError(
+		`Unknown command profile "${raw}" from ${origin}. Valid profiles: ${COMMAND_PROFILES.join(", ")}.`,
+	);
+}
+
+export interface BuildProgramOptions {
+	/** Argv to resolve `--profile` from; defaults to `process.argv`. */
+	argv?: readonly string[];
+	/** Environment to resolve `CYRUS_COMMAND_PROFILE` from. */
+	env?: NodeJS.ProcessEnv;
+}
+
 export function buildProgram(
 	packageJson: { version: string },
 	errorReporter: ErrorReporter,
+	options: BuildProgramOptions = {},
 ): Command {
+	const profile = resolveCommandProfile(options.argv, options.env);
 	const program = new Command();
 
 	program
@@ -52,7 +179,47 @@ export function buildProgram(
 			"Specify custom Cyrus config directory",
 			resolve(homedir(), ".cyrus"),
 		)
-		.option("--env-file <path>", "Path to environment variables file");
+		.option("--env-file <path>", "Path to environment variables file")
+		// Registered so `--profile` parses and appears in help. The VALUE is
+		// resolved above, before any command exists; this declaration is not
+		// where the decision is made.
+		.option(
+			`--profile <${COMMAND_PROFILES.join("|")}>`,
+			"Command surface to expose: full (default) or remote for a fleet orchestrator",
+		);
+
+	// --- The shared remote vocabulary. The same words mean the same thing in
+	// both profiles: a command profile is a product and discoverability
+	// boundary, not an authorization boundary (ADR 0011) — the router
+	// authorizes every remote read and mutation regardless of which profile
+	// invoked it.
+	//
+	// Driven off REMOTE_PROFILE_REGISTERED so the allowlist is the mechanism
+	// rather than a description a future edit can silently diverge from.
+	const remoteVocabulary: Record<string, () => void> = {
+		connection: () =>
+			registerConnectionCommand(program, packageJson, errorReporter),
+		runs: () => registerRunsCommand(program, packageJson, errorReporter),
+	};
+
+	for (const [name, register] of Object.entries(remoteVocabulary)) {
+		if (profile === "remote" && !REMOTE_PROFILE_REGISTERED.includes(name)) {
+			continue;
+		}
+		register();
+	}
+
+	if (profile === "remote") {
+		// Returning here — with NO program-level action handler — is deliberate.
+		// This profile has no default command (`start` is not registered), and
+		// Commander's behaviour without an action is exactly what is wanted: a
+		// bare `cyrus` prints help, and `cyrus router unlock X` is rejected as
+		// `unknown command 'router'`. Adding an action to print help instead
+		// makes Commander treat `router unlock X` as excess PROGRAM arguments and
+		// report "too many arguments. Expected 0 arguments but got 3" — which
+		// tells an operator nothing about why the command is unavailable.
+		return program;
+	}
 
 	// Start command (default)
 	program
@@ -534,7 +701,113 @@ export function buildProgram(
 			}
 		});
 
-	// Runs command - inspect work through the connection created above
+	return program;
+}
+
+/**
+ * `cyrus connection …` — named connections to remote routers' operator APIs.
+ *
+ * Distinct from `cyrus connect`, which enrolls THIS DEVICE and is unchanged.
+ * The two are one letter apart, so keep their descriptions explicit about which
+ * is which.
+ */
+function registerConnectionCommand(
+	program: Command,
+	packageJson: { version: string },
+	errorReporter: ErrorReporter,
+): void {
+	const connectionCommand = program
+		.command("connection")
+		.description(
+			"Manage named connections to remote Cyrus routers' fleet-operations API (not device enrollment — see `cyrus connect`)",
+		);
+
+	/**
+	 * Builds the Application and disposes its watchers so a one-shot connection
+	 * command exits instead of idling on live `fs.watch` handles.
+	 */
+	const runConnection = async (
+		argv: string[],
+		selection: { connection?: string; workspace?: string } = {},
+	): Promise<void> => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		try {
+			await new ConnectionCommand(app).execute(argv, selection);
+		} finally {
+			app.disposeWatchers();
+		}
+	};
+
+	connectionCommand
+		.command("add <name> <url>")
+		.description(
+			"Verify a router's operator API and store it under <name>. The router's discovery document supplies the Entra tenant and audience.",
+		)
+		.requiredOption(
+			"--auth <entra|local>",
+			"How to authenticate: entra (non-interactive Azure chain) or local (operator token from an environment variable)",
+		)
+		.option(
+			"--token-env <ENV_NAME>",
+			"With --auth local: the environment variable holding the token from `cyrus router operators create-token`. The value is read at request time and never stored.",
+		)
+		.action(
+			async (
+				name: string,
+				url: string,
+				cmdOpts: { auth: string; tokenEnv?: string },
+			) => {
+				const argv = ["add", name, url, "--auth", cmdOpts.auth];
+				if (cmdOpts.tokenEnv) argv.push("--token-env", cmdOpts.tokenEnv);
+				await runConnection(argv);
+			},
+		);
+
+	connectionCommand
+		.command("list")
+		.description("List stored connections (no network access)")
+		.action(async () => {
+			await runConnection(["list"]);
+		});
+
+	addFleetSelectionOptions(
+		connectionCommand
+			.command("show [name]")
+			.description(
+				"Report a connection's router identity, roles, capabilities, authorized workspaces, log source, and operator skill, as the router reports them now",
+			),
+	).action(
+		async (
+			name: string | undefined,
+			cmdOpts: { connection?: string; workspace?: string },
+		) => {
+			await runConnection(name ? ["show", name] : ["show"], {
+				connection: cmdOpts.connection,
+				workspace: cmdOpts.workspace,
+			});
+		},
+	);
+
+	connectionCommand
+		.command("remove <name>")
+		.description("Forget a stored connection")
+		.action(async (name: string) => {
+			await runConnection(["remove", name]);
+		});
+}
+
+/** `cyrus runs …` — inspect work through the connected router. */
+function registerRunsCommand(
+	program: Command,
+	packageJson: { version: string },
+	errorReporter: ErrorReporter,
+): void {
 	program
 		.command("runs [issue]")
 		.description("List or watch agent runs on the connected Cyrus Router")
@@ -580,6 +853,4 @@ export function buildProgram(
 				}
 			},
 		);
-
-	return program;
 }

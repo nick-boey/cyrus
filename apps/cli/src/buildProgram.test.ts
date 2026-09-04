@@ -55,14 +55,46 @@ vi.mock("./commands/RunsCommand.js", () => ({
 	}),
 }));
 
-const { buildProgram } = await import("./buildProgram.js");
+const connectionExecute = vi.hoisted(() =>
+	vi.fn().mockResolvedValue(undefined),
+);
 
-function newProgram() {
-	return buildProgram({ version: "0.0.0-test" }, new NoopErrorReporter());
+vi.mock("./commands/ConnectionCommand.js", () => ({
+	ConnectionCommand: vi
+		.fn()
+		.mockImplementation(function FakeConnectionCommand() {
+			return { execute: connectionExecute };
+		}),
+}));
+
+const {
+	buildProgram,
+	REMOTE_PROFILE_COMMANDS,
+	REMOTE_PROFILE_REGISTERED,
+	resolveCommandProfile,
+} = await import("./buildProgram.js");
+const { UsageError } = await import("./remote/errors.js");
+
+function newProgram(options?: {
+	argv?: readonly string[];
+	env?: NodeJS.ProcessEnv;
+}) {
+	return buildProgram(
+		{ version: "0.0.0-test" },
+		new NoopErrorReporter(),
+		// Default to an empty environment so an ambient CYRUS_COMMAND_PROFILE on
+		// the machine running the suite cannot change which tree is under test.
+		{ env: {}, argv: [], ...options },
+	);
 }
 
 async function run(argv: string[]) {
 	await newProgram().parseAsync(["node", "cyrus", ...argv]);
+}
+
+/** Top-level command names Commander would actually dispatch. */
+function topLevelCommands(program: import("commander").Command): string[] {
+	return program.commands.map((command) => command.name()).sort();
 }
 
 describe("buildProgram — Commander wiring for the container subcommands", () => {
@@ -71,6 +103,7 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		runsExecute.mockClear();
 		applicationDisposeWatchers.mockClear();
 		containerBootExecute.mockClear();
+		connectionExecute.mockClear();
 	});
 
 	it("registers `router users set-executor <email> <type>`", async () => {
@@ -388,5 +421,338 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 			program.parseAsync(["node", "cyrus", "router", "does-not-exist"]),
 		).rejects.toThrow();
 		expect(routerExecute).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * The command profile is a PRODUCT and DISCOVERABILITY boundary, not an
+ * authorization boundary (ADR 0011). These tests pin what each profile
+ * registers; the security proof that a remote operator cannot reach router
+ * administration lives server-side, in `OperatorAuthorizer`.
+ */
+describe("buildProgram — command profiles", () => {
+	/**
+	 * Commands the remote profile must NOT register: router-server
+	 * administration, worker operation, device enrollment, secrets, containers,
+	 * and unlock. Naming them explicitly (rather than only asserting the
+	 * allowlist) is what makes the acceptance criterion legible in the failure
+	 * message when one of them leaks in.
+	 */
+	const FORBIDDEN_IN_REMOTE = [
+		"router",
+		"start",
+		"connect",
+		"container-boot",
+		"auth",
+		"check-tokens",
+		"refresh-token",
+		"self-auth-linear",
+		"self-add-repo",
+	];
+
+	beforeEach(() => {
+		connectionExecute.mockClear();
+	});
+
+	it("keeps every existing command in the full profile and adds the remote surface", () => {
+		const names = topLevelCommands(newProgram());
+
+		for (const existing of FORBIDDEN_IN_REMOTE) {
+			expect(names, `full profile dropped "${existing}"`).toContain(existing);
+		}
+		expect(names).toContain("connection");
+		expect(names).toContain("runs");
+	});
+
+	it("registers exactly the remote commands that exist and work today", () => {
+		const names = topLevelCommands(
+			newProgram({ argv: ["node", "cyrus", "--profile", "remote"] }),
+		);
+
+		// EXACT, not a subset. A subset assertion passes for a command that was
+		// accidentally registered under a name already sitting in the vocabulary
+		// (`logs`, `recover`, `skills`), which is precisely the accident the
+		// allowlist exists to prevent.
+		expect(names).toEqual([...REMOTE_PROFILE_REGISTERED].sort());
+	});
+
+	it("keeps every registered remote command inside the approved vocabulary", () => {
+		// The two lists answer different questions — "approved for this profile"
+		// and "usable today" — and this is what stops them diverging.
+		for (const name of REMOTE_PROFILE_REGISTERED) {
+			expect(REMOTE_PROFILE_COMMANDS).toContain(name);
+		}
+	});
+
+	it("does not expose `runs` in the remote profile while it needs device enrollment", () => {
+		// `RunsCommand` reads `config.router.deviceToken`, written only by
+		// `cyrus connect` — which this profile does not register, and which
+		// `cyrus connection add` deliberately never writes. Registering it here
+		// would ship a command that always fails, telling the operator to run a
+		// command the profile hides. CYR-70 moves it onto OperatorHttpClient.
+		const names = topLevelCommands(
+			newProgram({ argv: ["node", "cyrus", "--profile", "remote"] }),
+		);
+
+		expect(names).not.toContain("runs");
+		// Still approved vocabulary, so it needs no re-approval when CYR-70 lands.
+		expect(REMOTE_PROFILE_COMMANDS).toContain("runs");
+		// And it remains available in the full profile, where enrollment exists.
+		expect(topLevelCommands(newProgram())).toContain("runs");
+	});
+
+	it("cannot invoke router, worker, enrollment, secret, container, or unlock commands in the remote profile", () => {
+		const names = topLevelCommands(
+			newProgram({ argv: ["node", "cyrus", "--profile", "remote"] }),
+		);
+
+		for (const forbidden of FORBIDDEN_IN_REMOTE) {
+			expect(names).not.toContain(forbidden);
+		}
+	});
+
+	it("rejects a router subcommand at parse time in the remote profile", () => {
+		// The allowlist assertion above proves the command was not registered;
+		// this proves Commander actually refuses to dispatch it.
+		const program = newProgram({
+			argv: ["node", "cyrus", "--profile", "remote"],
+		});
+		const silence = (cmd: import("commander").Command): void => {
+			cmd.exitOverride();
+			cmd.configureOutput({ writeErr: () => {}, writeOut: () => {} });
+			cmd.commands.forEach(silence);
+		};
+		silence(program);
+
+		return Promise.all([
+			// The message must say the COMMAND is unknown. Registering a
+			// program-level action to print help instead makes Commander read
+			// `router unlock PAR-1` as excess program arguments and report "too
+			// many arguments. Expected 0 arguments but got 3", which tells an
+			// operator nothing about why the command is unavailable.
+			expect(
+				program.parseAsync(["node", "cyrus", "router", "unlock", "PAR-1"]),
+			).rejects.toThrow(/unknown command 'router'/),
+			expect(
+				program.parseAsync(["node", "cyrus", "container-boot"]),
+			).rejects.toThrow(/unknown command 'container-boot'/),
+		]).then(() => {
+			expect(routerExecute).not.toHaveBeenCalled();
+			expect(containerBootExecute).not.toHaveBeenCalled();
+		});
+	});
+
+	it("prints help for a bare `cyrus` in the remote profile", async () => {
+		// There is no default command in this profile (`start` is not
+		// registered), so without help here the binary would exit silently.
+		const program = newProgram({
+			argv: ["node", "cyrus", "--profile", "remote"],
+		});
+		const out: string[] = [];
+		program.exitOverride();
+		program.configureOutput({
+			writeErr: (s) => out.push(s),
+			writeOut: (s) => out.push(s),
+		});
+
+		await expect(program.parseAsync(["node", "cyrus"])).rejects.toMatchObject({
+			code: "commander.help",
+		});
+		expect(out.join("")).toContain("connection");
+	});
+
+	it("selects the remote profile from CYRUS_COMMAND_PROFILE", () => {
+		const names = topLevelCommands(
+			newProgram({ env: { CYRUS_COMMAND_PROFILE: "remote" } }),
+		);
+
+		expect(names).toContain("connection");
+		expect(names).not.toContain("router");
+	});
+
+	it("lets an explicit --profile override the environment default", () => {
+		// The same installation must still be able to perform both roles
+		// deliberately (ADR 0011).
+		const names = topLevelCommands(
+			newProgram({
+				argv: ["node", "cyrus", "--profile", "full"],
+				env: { CYRUS_COMMAND_PROFILE: "remote" },
+			}),
+		);
+
+		expect(names).toContain("router");
+		expect(names).toContain("connection");
+	});
+
+	it("defaults to the full profile", () => {
+		expect(topLevelCommands(newProgram())).toContain("router");
+	});
+
+	it("accepts --profile=remote as well as --profile remote", () => {
+		expect(
+			topLevelCommands(
+				newProgram({ argv: ["node", "cyrus", "--profile=remote"] }),
+			),
+		).not.toContain("router");
+	});
+
+	it("rejects an unknown profile as an invalid invocation", () => {
+		// Exit code 2, not the generic 1: an orchestrator branches on the code.
+		expect(() =>
+			newProgram({ argv: ["node", "cyrus", "--profile", "readonly"] }),
+		).toThrow(UsageError);
+		expect(() =>
+			newProgram({ env: { CYRUS_COMMAND_PROFILE: "readonly" } }),
+		).toThrow(UsageError);
+
+		try {
+			newProgram({ argv: ["node", "cyrus", "--profile", "readonly"] });
+		} catch (error) {
+			expect((error as { exitCode: number }).exitCode).toBe(2);
+		}
+	});
+
+	it("ignores an empty CYRUS_COMMAND_PROFILE rather than failing", () => {
+		// An exported-but-empty variable is a very common shell accident, and
+		// failing every command on it would be worse than defaulting.
+		expect(resolveCommandProfile([], { CYRUS_COMMAND_PROFILE: "" })).toBe(
+			"full",
+		);
+		expect(resolveCommandProfile([], { CYRUS_COMMAND_PROFILE: "  " })).toBe(
+			"full",
+		);
+	});
+});
+
+describe("buildProgram — Commander wiring for `connection`", () => {
+	beforeEach(() => {
+		connectionExecute.mockClear();
+		applicationDisposeWatchers.mockClear();
+	});
+
+	it("registers `connection add <name> <url> --auth entra`", async () => {
+		await run([
+			"connection",
+			"add",
+			"prod",
+			"https://router.example.com",
+			"--auth",
+			"entra",
+		]);
+
+		expect(connectionExecute).toHaveBeenCalledWith(
+			["add", "prod", "https://router.example.com", "--auth", "entra"],
+			{},
+		);
+		expect(applicationDisposeWatchers).toHaveBeenCalledTimes(1);
+	});
+
+	it("registers `connection add … --auth local --token-env <ENV>`", async () => {
+		await run([
+			"connection",
+			"add",
+			"dev",
+			"http://localhost:8787",
+			"--auth",
+			"local",
+			"--token-env",
+			"CYRUS_OPERATOR_TOKEN",
+		]);
+
+		expect(connectionExecute).toHaveBeenCalledWith(
+			[
+				"add",
+				"dev",
+				"http://localhost:8787",
+				"--auth",
+				"local",
+				"--token-env",
+				"CYRUS_OPERATOR_TOKEN",
+			],
+			{},
+		);
+	});
+
+	it("registers `connection list`", async () => {
+		await run(["connection", "list"]);
+
+		expect(connectionExecute).toHaveBeenCalledWith(["list"], {});
+	});
+
+	it("registers `connection show <name>`", async () => {
+		await run(["connection", "show", "prod"]);
+
+		expect(connectionExecute).toHaveBeenCalledWith(["show", "prod"], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("forwards --connection and --workspace to `connection show`", async () => {
+		await run([
+			"connection",
+			"show",
+			"--connection",
+			"prod",
+			"--workspace",
+			"ws-1",
+		]);
+
+		expect(connectionExecute).toHaveBeenCalledWith(["show"], {
+			connection: "prod",
+			workspace: "ws-1",
+		});
+	});
+
+	it("registers `connection remove <name>`", async () => {
+		await run(["connection", "remove", "prod"]);
+
+		expect(connectionExecute).toHaveBeenCalledWith(["remove", "prod"], {});
+	});
+
+	it("leaves `cyrus connect` device enrollment untouched", async () => {
+		// `connect` and `connection` are one letter apart and mean entirely
+		// different things: enrolling THIS DEVICE versus naming a remote router
+		// to observe. Registering the second must not shadow the first.
+		const program = newProgram();
+		const names = program.commands.map((command) => command.name());
+
+		expect(names).toContain("connect");
+		expect(names).toContain("connection");
+		const connect = program.commands.find((c) => c.name() === "connect");
+		expect(connect?.description()).toContain("Enroll this device");
+	});
+
+	it("does not let `--workspace` on a router command be captured by a fleet flag", async () => {
+		// Regression guard: declaring `--workspace` on the PROGRAM makes
+		// Commander resolve the collision in the parent's favour, handing
+		// `create-token` an empty workspace array — a token authorized over
+		// nothing, minted silently.
+		await run([
+			"router",
+			"operators",
+			"create-token",
+			"--label",
+			"sre",
+			"--workspace",
+			"workspace-a",
+			"--workspace",
+			"workspace-b",
+			"--role",
+			"fleet.read",
+		]);
+
+		expect(routerExecute).toHaveBeenCalledWith([
+			"operators",
+			"create-token",
+			"--label",
+			"sre",
+			"--role",
+			"fleet.read",
+			"--workspace",
+			"workspace-a",
+			"--workspace",
+			"workspace-b",
+		]);
 	});
 });

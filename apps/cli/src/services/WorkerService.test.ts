@@ -129,6 +129,16 @@ describe("WorkerService", () => {
 			sandbox: { enabled: false },
 			platform: "router",
 			router: { url: "wss://router.example", deviceToken: "dev_1" },
+			operatorConnections: {
+				prod: {
+					url: "https://router.example",
+					auth: {
+						kind: "entra",
+						tenantId: "tenant-1",
+						audience: "api://cyrus-router",
+					},
+				},
+			},
 		});
 
 		// Fixture-completeness tripwire: adding a field to EdgeConfigSchema

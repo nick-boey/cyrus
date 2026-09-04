@@ -85,4 +85,77 @@ describe("EdgeConfigSchema", () => {
 		expect(globalResult.success).toBe(false);
 		expect(repositoryResult.success).toBe(false);
 	});
+
+	it("accepts named operator connections for both auth kinds", () => {
+		const result = EdgeConfigSchema.safeParse({
+			repositories: [baseRepository],
+			operatorConnections: {
+				prod: {
+					url: "https://router.example.com",
+					auth: {
+						kind: "entra",
+						tenantId: "11111111-1111-1111-1111-111111111111",
+						audience: "api://cyrus-router",
+					},
+				},
+				dev: {
+					url: "http://localhost:8787",
+					auth: { kind: "local", tokenEnv: "CYRUS_DEV_OPERATOR_TOKEN" },
+				},
+			},
+		});
+
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.data.operatorConnections?.prod?.auth).toEqual({
+				kind: "entra",
+				tenantId: "11111111-1111-1111-1111-111111111111",
+				audience: "api://cyrus-router",
+			});
+			expect(result.data.operatorConnections?.dev?.auth).toEqual({
+				kind: "local",
+				tokenEnv: "CYRUS_DEV_OPERATOR_TOKEN",
+			});
+		}
+	});
+
+	it("refuses to persist an operator token alongside a connection", () => {
+		// A stored connection is credential-free by construction: `local` records
+		// the NAME of an env var, never its value. Someone reaching for the
+		// obvious `token` field must fail the schema rather than write an operator
+		// bearer into config.json, where nothing would ever redact it again.
+		const result = EdgeConfigSchema.safeParse({
+			repositories: [baseRepository],
+			operatorConnections: {
+				prod: {
+					url: "https://router.example.com",
+					auth: { kind: "local", tokenEnv: "TOKEN", token: "op_secret" },
+				},
+			},
+		});
+
+		expect(result.success).toBe(false);
+	});
+
+	it("rejects an unknown auth kind and an empty token env name", () => {
+		expect(
+			EdgeConfigSchema.safeParse({
+				repositories: [baseRepository],
+				operatorConnections: {
+					prod: { url: "https://r.example", auth: { kind: "oauth" } },
+				},
+			}).success,
+		).toBe(false);
+		expect(
+			EdgeConfigSchema.safeParse({
+				repositories: [baseRepository],
+				operatorConnections: {
+					prod: {
+						url: "https://r.example",
+						auth: { kind: "local", tokenEnv: "" },
+					},
+				},
+			}).success,
+		).toBe(false);
+	});
 });

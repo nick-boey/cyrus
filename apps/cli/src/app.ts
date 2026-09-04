@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createLogger, setGlobalErrorReporter } from "cyrus-core";
 import dotenv from "dotenv";
 import { buildProgram } from "./buildProgram.js";
+import { isRemoteOperatorError, redactSecrets } from "./remote/errors.js";
 import { createErrorReporter } from "./services/createErrorReporter.js";
 
 // Get the directory of the current module for reading package.json
@@ -31,14 +32,24 @@ preloadEnvForBootstrap();
 const errorReporter = createErrorReporter({ release: packageJson.version });
 setGlobalErrorReporter(errorReporter);
 
-// Build the Commander program (see buildProgram.ts for the full command tree)
-const program = buildProgram(packageJson, errorReporter);
-
-// Parse and execute
+// Parse and execute. The program is built INSIDE the try because resolving the
+// command profile can itself fail on an invalid `--profile`, and that failure
+// deserves the same exit-code mapping as any other invalid invocation.
 (async () => {
 	try {
+		// See buildProgram.ts for the full command tree.
+		const program = buildProgram(packageJson, errorReporter);
 		await program.parseAsync(process.argv);
 	} catch (error) {
+		// A deliberate remote-operator failure carries the exit category an
+		// orchestrating agent branches on (ADR 0011). Reporting it as the
+		// generic `1` would tell a skill that an unsupported capability and a
+		// crashed CLI were the same event — and would send it to Sentry as a
+		// defect when it is a user-facing refusal.
+		if (isRemoteOperatorError(error)) {
+			createLogger({ component: "cli" }).error(redactSecrets(error.message));
+			process.exit(error.exitCode);
+		}
 		errorReporter.captureException(error, { tags: { phase: "bootstrap" } });
 		await errorReporter.flush(2000).catch(() => false);
 		// Through ILogger rather than console.error so the failure that killed the
