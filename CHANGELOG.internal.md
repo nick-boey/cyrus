@@ -5,7 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
-- **Provisioned fleet-operator roles and Log Analytics access ([CYR-66](https://linear.app/northrop-digital/issue/CYR-66/provision-fleet-operator-roles-and-log-analytics-access)).**
+- **Provisioned fleet-operator roles and Log Analytics access ([CYR-66](https://linear.app/northrop-digital/issue/CYR-66/provision-fleet-operator-roles-and-log-analytics-access), [#60](https://github.com/nick-boey/cyrus/pull/60)).**
   New `fleetOperatorGrants`, `enableFleetRecovery`, and
   `fleetOperatorLogReaderPrincipalIds` parameters on `infra/azure/bicep/main.bicep`,
   a `logAnalyticsReaderPrincipalIds` loop in `modules/role-assignments.bicep`, and
