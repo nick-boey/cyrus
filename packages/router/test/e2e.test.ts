@@ -729,7 +729,10 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 
 		// A cursor from a previous router process is `410 Gone`, not an empty 200 —
 		// so a reconnecting client knows to re-list rather than assuming quiet.
-		const stale = new RunCursorCodec("an-epoch-from-before-this-process");
+		const stale = new RunCursorCodec(
+			"an-epoch-from-before-this-process",
+			server.store.getOrCreateSecret("fleet-run-cursor"),
+		);
 		const staleCursor = stale.encodeChangeCursor(0, stale.fingerprint({}));
 		const gone = await fleetGet(
 			`/api/v1/run-changes?cursor=${encodeURIComponent(staleCursor)}`,

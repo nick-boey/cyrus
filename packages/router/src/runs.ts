@@ -9,10 +9,11 @@ import type {
 	RunWaitV1,
 } from "cyrus-operator-protocol";
 import type { FastifyInstance } from "fastify";
-import type {
-	AgentRunInfo,
-	AgentRunRouting,
-	RouterStore,
+import {
+	type AgentRunInfo,
+	type AgentRunRouting,
+	type RouterStore,
+	UNREPORTED_RUNNER,
 } from "./RouterStore.js";
 import type { SandboxGaugeState } from "./SandboxTelemetry.js";
 
@@ -268,8 +269,13 @@ export function observeRun(
  * rather than concealed. It reads the same way `executorState: "unknown"`
  * already does elsewhere in this file: a fact the router does not have, said
  * out loud.
+ *
+ * Defined in `RouterStore` and re-exported here, because the FILTER has to
+ * agree with the placeholder — `?runner=unknown` compiles to `runner IS NULL`,
+ * so an operator who reads this value off a page and filters for it gets back
+ * the runs they just saw.
  */
-export const UNREPORTED_RUNNER = "unknown";
+export { UNREPORTED_RUNNER };
 
 /**
  * Renders the internal observation as the published v1 document, or

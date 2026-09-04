@@ -72,6 +72,9 @@ describe("FleetOperations run observations (CYR-69)", () => {
 			now: () => NOW,
 		});
 
+	/** The durable key FleetOperations itself signs cursors with. */
+	const cursorSecret = () => store.getOrCreateSecret("fleet-run-cursor");
+
 	beforeEach(() => {
 		store = new RouterStore(":memory:");
 		alice = store.addUser({ email: "alice@example.com", name: "Alice" }).userId;
@@ -365,13 +368,15 @@ describe("FleetOperations run observations (CYR-69)", () => {
 			const { principal } = operator([WS_A]);
 			const before = build(
 				["runs.list", "runs.changes"],
-				new RunCursorCodec("epoch-before"),
+				// Same durable signing key the store hands the real codec, different
+				// epoch — which is exactly what a restart produces.
+				new RunCursorCodec("epoch-before", cursorSecret()),
 			);
 			const stale = before.listChanges(principal).nextCursor;
 
 			const after = build(
 				["runs.list", "runs.changes"],
-				new RunCursorCodec("epoch-after"),
+				new RunCursorCodec("epoch-after", cursorSecret()),
 			);
 			expect(() =>
 				after.listChanges(principal, { cursor: stale }),

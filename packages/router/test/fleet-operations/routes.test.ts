@@ -137,9 +137,8 @@ describe("fleet-operations routes", () => {
 	/**
 	 * The server for this test, built once and reused.
 	 *
-	 * Cursor validation is per-INSTANCE — the signing key and the stream epoch
-	 * are minted when `FleetOperations` is constructed — so a helper that mounted
-	 * a fresh server per request would make every cursor look forged, and the
+	 * The stream epoch is minted per `FleetOperations` instance, so a helper that
+	 * mounted a fresh server per request would answer every cursor `410` and the
 	 * pagination tests would pass for entirely the wrong reason.
 	 */
 	function server(overrides?: Partial<FleetOperationsConfig>): FastifyInstance {
@@ -726,7 +725,12 @@ describe("fleet-operations routes", () => {
 
 		it("answers 410 to a cursor from a previous router process", async () => {
 			seedRun();
-			const stale = new RunCursorCodec("epoch-from-a-previous-process");
+			// Signed with the router's durable key under a previous epoch: the
+			// shape a genuine restart leaves behind.
+			const stale = new RunCursorCodec(
+				"epoch-from-a-previous-process",
+				store.getOrCreateSecret("fleet-run-cursor"),
+			);
 			const cursor = stale.encodeChangeCursor(
 				0,
 				stale.fingerprint({ nothing: true }),
@@ -745,6 +749,63 @@ describe("fleet-operations routes", () => {
 			const fresh = await get("/api/v1/run-changes", "hdr.reader.sig");
 			expect(fresh.statusCode).toBe(200);
 			expect(fresh.json().nextCursor).toBeDefined();
+		});
+
+		it("accepts `state` as the spelling for `lifecycle`", async () => {
+			seedRun();
+			// The fleet vocabulary says `state`; the wire document calls the same
+			// field `lifecycle`. Ignoring the alias answered 200 with a SUPERSET of
+			// what was asked for.
+			const filtered = await get(
+				"/api/v1/runs?state=complete",
+				"hdr.reader.sig",
+			);
+			expect(filtered.statusCode).toBe(200);
+			expect(filtered.json().runs).toEqual([]);
+		});
+
+		it("refuses an unknown or empty query parameter rather than ignoring it", async () => {
+			seedRun();
+			const unknown = await get(
+				"/api/v1/runs?workspaceId=workspace-a",
+				"hdr.reader.sig",
+			);
+			expect(unknown.statusCode).toBe(400);
+			expect(unknown.json().error).toBe("invalid_query");
+			expect(unknown.json().message).toContain("workspaceId");
+
+			const empty = await get("/api/v1/runs?cursor=", "hdr.reader.sig");
+			expect(empty.statusCode).toBe(400);
+			expect(empty.json().error).toBe("invalid_query");
+		});
+
+		it("starts a watch at the present with `from=latest`", async () => {
+			seedRun();
+			// The snapshot-then-watch handoff: take a position now, then list, then
+			// resume — without dragging the whole retained window through first.
+			const now = await get(
+				"/api/v1/run-changes?from=latest",
+				"hdr.reader.sig",
+			);
+			expect(now.statusCode).toBe(200);
+			expect(now.json().changes).toEqual([]);
+
+			store.recordAgentRunActivity("session-a", NOW + 5);
+			const followed = await get(
+				`/api/v1/run-changes?cursor=${encodeURIComponent(now.json().nextCursor)}`,
+				"hdr.reader.sig",
+			);
+			expect(
+				followed.json().changes.map((change: { kind: string }) => change.kind),
+			).toEqual(["lifecycle"]);
+		});
+
+		it("refuses an unknown `from` value", async () => {
+			const response = await get(
+				"/api/v1/run-changes?from=yesterday",
+				"hdr.reader.sig",
+			);
+			expect(response.statusCode).toBe(400);
 		});
 
 		it("refuses a cursor minted for a different principal's authority", async () => {

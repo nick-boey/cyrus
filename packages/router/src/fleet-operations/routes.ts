@@ -110,47 +110,129 @@ export function registerFleetOperationsRoutes(
 		);
 		if (!principal) return reply;
 		const query = request.query;
+		const rejection =
+			rejectUnknownParameters(query, RUNS_PARAMETERS) ??
+			rejectEmptyParameters(query, RUNS_PARAMETERS);
+		if (rejection) return reply.status(400).send(rejection);
 		const rawLimit = single(query.limit);
 		if (rawLimit !== undefined && !/^\d+$/.test(rawLimit)) {
-			return reply.status(400).send({ error: "invalid limit" });
+			return reply
+				.status(400)
+				.send({ error: "invalid_query", message: "`limit` must be a number" });
 		}
+		// `state` is the vocabulary the fleet spec and the CLI use; the wire
+		// document calls the same field `lifecycle`. Accepted as an alias rather
+		// than ignored, because an unapplied filter answers `200` with a SUPERSET
+		// of what was asked for — the worst possible outcome on a surface whose
+		// whole job is deciding whether to intervene in a live fleet.
+		const { state, ...filters } = pickSingle(query, RUNS_FILTERS);
 		return runFleetRead(reply, logger, "run listing", () =>
 			fleet.listRuns(principal, {
-				...pickSingle(query, [
-					"runId",
-					"agentSessionId",
-					"issueId",
-					"issueKey",
-					"workspace",
-					"owner",
-					"team",
-					"project",
-					"lifecycle",
-					"runner",
-					"model",
-					"cursor",
-				]),
+				...filters,
+				...(state !== undefined && filters.lifecycle === undefined
+					? { lifecycle: state }
+					: {}),
 				...(rawLimit !== undefined ? { limit: Number(rawLimit) } : {}),
 			}),
 		);
 	});
 
-	fastify.get<{ Querystring: { cursor?: string | string[] } }>(
-		RUN_CHANGES_ROUTE,
-		async (request, reply) => {
-			const principal = await authenticate(
-				authorizer,
-				request.headers,
-				reply,
-				logger,
-			);
-			if (!principal) return reply;
-			const cursor = single(request.query.cursor);
-			return runFleetRead(reply, logger, "run change feed", () =>
-				fleet.listChanges(principal, cursor ? { cursor } : {}),
-			);
-		},
+	fastify.get<{
+		Querystring: Record<string, string | string[] | undefined>;
+	}>(RUN_CHANGES_ROUTE, async (request, reply) => {
+		const principal = await authenticate(
+			authorizer,
+			request.headers,
+			reply,
+			logger,
+		);
+		if (!principal) return reply;
+		const query = request.query;
+		const rejection =
+			rejectUnknownParameters(query, CHANGES_PARAMETERS) ??
+			rejectEmptyParameters(query, CHANGES_PARAMETERS);
+		if (rejection) return reply.status(400).send(rejection);
+		const cursor = single(query.cursor);
+		const from = single(query.from);
+		if (from !== undefined && from !== "start" && from !== "latest") {
+			return reply.status(400).send({
+				error: "invalid_query",
+				message: "`from` must be `start` or `latest`",
+			});
+		}
+		return runFleetRead(reply, logger, "run change feed", () =>
+			fleet.listChanges(principal, {
+				...(cursor ? { cursor } : {}),
+				...(from ? { from } : {}),
+			}),
+		);
+	});
+}
+
+/**
+ * Every parameter `GET /api/v1/runs` understands.
+ *
+ * `state` is the alias handled above. The rest map onto
+ * {@link FleetRunsQueryInput} by name.
+ */
+const RUNS_FILTERS = [
+	"runId",
+	"agentSessionId",
+	"issueId",
+	"issueKey",
+	"workspace",
+	"owner",
+	"team",
+	"project",
+	"lifecycle",
+	"state",
+	"runner",
+	"model",
+	"cursor",
+] as const;
+const RUNS_PARAMETERS: readonly string[] = [...RUNS_FILTERS, "limit"];
+const CHANGES_PARAMETERS: readonly string[] = ["cursor", "from"];
+
+/**
+ * Refuses a parameter this route does not implement.
+ *
+ * Silently dropping one is the failure worth spending a `400` to avoid: an
+ * unapplied filter returns `200` with every run the caller may see, and a
+ * client — or an agent — reads that superset as the answer to the narrow
+ * question it asked. A typo, a `workspaceId` for a `workspace`, or a parameter
+ * from a newer CLI all land here.
+ */
+function rejectUnknownParameters(
+	query: Record<string, unknown>,
+	allowed: readonly string[],
+): { error: string; message: string } | undefined {
+	const unknown = Object.keys(query).filter((key) => !allowed.includes(key));
+	if (unknown.length === 0) return undefined;
+	return {
+		error: "invalid_query",
+		message: `Unknown query parameter(s): ${unknown.sort().join(", ")}. Supported: ${[...allowed].sort().join(", ")}`,
+	};
+}
+
+/**
+ * Refuses a parameter present but empty.
+ *
+ * Without this, `?cursor=` silently restarts pagination at page one — which a
+ * client looping on a cursor it failed to store reads as a feed that never
+ * advances, rather than as the bug it is.
+ */
+function rejectEmptyParameters(
+	query: Record<string, string | string[] | undefined>,
+	allowed: readonly string[],
+): { error: string; message: string } | undefined {
+	const empty = allowed.filter(
+		(key) => key in query && single(query[key]) === undefined,
 	);
+	if (empty.length === 0) return undefined;
+	return {
+		error: "invalid_query",
+		message: `Empty query parameter(s): ${empty.sort().join(", ")}`,
+	};
 }
 
 /**

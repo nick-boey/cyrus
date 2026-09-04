@@ -51,10 +51,10 @@ describe("RunCursorCodec", () => {
 		});
 
 		it("refuses a cursor from a previous router process with 410, not 400", () => {
-			// The signing key rotates per process too, so a naive implementation
-			// reports this as a forged cursor and tells the client to fix a request
-			// that was never wrong. The epoch has to be checked first.
-			const before = new RunCursorCodec(OTHER_EPOCH, Buffer.alloc(32, 9));
+			// A restart rotates the EPOCH and keeps the durable signing key, which
+			// is what lets the router tell this apart from a forgery. Same secret,
+			// different epoch.
+			const before = new RunCursorCodec(OTHER_EPOCH, SECRET);
 			const after = codec();
 			const fingerprint = after.fingerprint({ workspaceIds: ["ws-a"] });
 			const stale = before.encodeChangeCursor(
@@ -64,6 +64,23 @@ describe("RunCursorCodec", () => {
 
 			expect(() => after.decodeChangeCursor(stale, fingerprint)).toThrowError(
 				expect.objectContaining({ status: 410, code: "stream_gone" }),
+			);
+		});
+
+		it("refuses a cursor signed by another router with 400, not 410", () => {
+			// The distinction the durable key buys: 410 must mean "re-list", so a
+			// cursor this router never issued may not be reported as a restart —
+			// even though it names an epoch this process does not recognise.
+			const foreign = new RunCursorCodec(OTHER_EPOCH, Buffer.alloc(32, 9));
+			const after = codec();
+			const fingerprint = after.fingerprint({ workspaceIds: ["ws-a"] });
+			const alien = foreign.encodeChangeCursor(
+				11,
+				foreign.fingerprint({ workspaceIds: ["ws-a"] }),
+			);
+
+			expect(() => after.decodeChangeCursor(alien, fingerprint)).toThrowError(
+				expect.objectContaining({ status: 400, code: "invalid_cursor" }),
 			);
 		});
 

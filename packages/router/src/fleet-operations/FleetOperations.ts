@@ -37,15 +37,23 @@ import {
 const DEFAULT_RUN_PAGE_SIZE = 50;
 const MAX_RUN_PAGE_SIZE = 200;
 /**
- * How many stored entries one change request scans.
+ * How many entries one change request returns.
  *
- * A SCAN limit rather than a result limit: entries outside the caller's
- * authorization are filtered after they are read, so a page can legitimately
- * come back shorter than this. The cursor still advances past everything
- * scanned, so a caller polling through a stretch of other people's activity
- * makes progress rather than looping.
+ * A RESULT limit, because the store applies the caller's authorization inside
+ * the query. As a scan limit it would starve a principal whose runs are a small
+ * fraction of a busy router: each request would advance the cursor by 200
+ * entries and return almost none of the caller's own, and since entries age out
+ * at 24 hours a slow reader could fall behind and silently lose changes with no
+ * `410` to tell it so.
+ *
+ * A page can still come back short of this, when a stored snapshot fails to
+ * parse or cannot be rendered as a v1 observation. Both are bugs rather than
+ * routine, and both are logged.
  */
-const CHANGE_SCAN_LIMIT = 200;
+const CHANGE_PAGE_SIZE = 200;
+
+/** Where the durable cursor-signing key is kept. */
+const CURSOR_SECRET_NAME = "fleet-run-cursor";
 
 /**
  * The dimensions a query may name by canonical id OR by the name captured
@@ -187,7 +195,12 @@ export class FleetOperations {
 		this.cursors =
 			options.cursors ??
 			(options.store
-				? new RunCursorCodec(options.store.changeStreamEpoch)
+				? new RunCursorCodec(
+						options.store.changeStreamEpoch,
+						// Durable, so a forged cursor fails the signature (`400`) while a
+						// pre-restart one passes it and fails only the epoch (`410`).
+						options.store.getOrCreateSecret(CURSOR_SECRET_NAME),
+					)
 				: undefined);
 		this.logger = options.logger;
 		this.now = options.now ?? (() => Date.now());
@@ -265,15 +278,20 @@ export class FleetOperations {
 	 * The material changes recorded after a cursor, for a principal that holds
 	 * `runs.changes`.
 	 *
-	 * `nextCursor` is returned even when the page is empty, and even when every
-	 * entry scanned belonged to somebody else — a watch that polled and saw
-	 * nothing still has to be able to make progress, and a cursor that stood
-	 * still would make an unauthorized caller's traffic look, to an authorized
-	 * one, like a stalled feed.
+	 * `nextCursor` is returned even when the page is empty — a watch that polled
+	 * and saw nothing still has to be able to make progress, and a cursor that
+	 * stood still would be indistinguishable from a stalled feed.
+	 *
+	 * `from: "latest"` starts at the present instead of replaying the retained
+	 * history, and it is what makes the snapshot→watch handoff expressible: take
+	 * a cursor from HERE first, then list runs, then resume from that cursor —
+	 * in that order, so nothing can happen in the gap without landing in the
+	 * feed. It is also how a client recovers from the `410` a restart produces,
+	 * without dragging the whole 24-hour window through first.
 	 */
 	listChanges(
 		principal: OperatorPrincipal,
-		input: { cursor?: string } = {},
+		input: { cursor?: string; from?: "start" | "latest" } = {},
 	): RunChangePageV1 {
 		this.requireCapability(principal, "runs.changes");
 		const store = this.requireStore();
@@ -290,24 +308,32 @@ export class FleetOperations {
 		});
 		const afterChangeId = input.cursor
 			? cursors.decodeChangeCursor(input.cursor, fingerprint)
-			: 0;
+			: input.from === "latest"
+				? store.latestAgentRunChangeId()
+				: 0;
 
+		// Authorization is pushed INTO the query (see `listAgentRunChanges`), so
+		// this limit counts entries the caller may read rather than entries the
+		// router happens to have written.
 		const scanned = store.listAgentRunChanges({
 			afterChangeId,
-			limit: CHANGE_SCAN_LIMIT,
+			limit: CHANGE_PAGE_SIZE,
+			...scope,
 		});
 		const observedAt = new Date(this.now()).toISOString();
-		const changes = scanned.flatMap((change) =>
+		const changes = scanned.changes.flatMap((change) =>
 			this.renderChange(change, scope, cursors, fingerprint),
 		);
-		const lastScannedId = scanned.at(-1)?.changeId ?? afterChangeId;
 
 		return runChangePageV1Schema.parse({
 			schemaVersion: 1,
 			observedAt,
 			streamEpoch: cursors.streamEpoch,
 			changes,
-			nextCursor: cursors.encodeChangeCursor(lastScannedId, fingerprint),
+			// From how far the SCAN reached, never from the entries returned: a
+			// window whose snapshots all failed to parse would otherwise re-encode
+			// the position it started from, and the client would poll it forever.
+			nextCursor: cursors.encodeChangeCursor(scanned.lastChangeId, fingerprint),
 		} satisfies RunChangePageV1);
 	}
 

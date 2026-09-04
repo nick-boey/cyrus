@@ -197,13 +197,20 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   executor_state TEXT,
   executor_state_observed_ms INTEGER
 );
+CREATE TABLE IF NOT EXISTS router_secrets (
+  name TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  created_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS agent_run_changes (
   change_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL,
   revision INTEGER NOT NULL,
   kind TEXT NOT NULL,
   changed_ms INTEGER NOT NULL,
-  observation_json TEXT NOT NULL
+  observation_json TEXT NOT NULL,
+  workspace_id TEXT,
+  user_id INTEGER
 );
 `;
 
@@ -867,13 +874,24 @@ function buildFleetRunFilter(query: FleetRunQuery): {
 		[query.linearTeamId, "ar.linear_team_id = ?"],
 		[query.linearProjectId, "ar.linear_project_id = ?"],
 		[query.lifecycle, `${LIFECYCLE_SQL} = ?`],
-		[query.runner, "ar.runner = ?"],
 		[query.model, "ar.model = ?"],
 	];
 	for (const [value, clause] of equals) {
 		if (value !== undefined) {
 			clauses.push(clause);
 			params.push(value);
+		}
+	}
+	// `runner` is the one filter with a rendered placeholder behind it. A run the
+	// worker has not reported a runner for is shown as `UNREPORTED_RUNNER`, and
+	// `runner = 'unknown'` would match none of them — so the filter that reads
+	// back the value a page displayed has to mean "no runner reported".
+	if (query.runner !== undefined) {
+		if (query.runner === UNREPORTED_RUNNER) {
+			clauses.push("ar.runner IS NULL");
+		} else {
+			clauses.push("ar.runner = ?");
+			params.push(query.runner);
 		}
 	}
 	return { clauses, params };
@@ -895,14 +913,50 @@ function parseRunInputs(value: string): AgentRunInput[] {
 }
 
 /**
+ * The longest worker-reported wait condition this store will retain.
+ *
+ * It is the ONLY unbounded worker-controlled string on a run — everything else
+ * in the observation is a timestamp, an identifier, or a closed enum — and it is
+ * now copied into every subsequent change entry for that run and kept for 24
+ * hours past terminal. A worker that reports a stack trace, or a shell
+ * transcript, as its condition would multiply it across the whole feed. The cap
+ * is generous enough to carry a sentence naming a condition v1 does not model,
+ * which is all this field is for.
+ */
+const MAX_REPORTED_CONDITION_CHARS = 512;
+
+/** See {@link RouterStore.trimAgentRunChanges}. */
+const MAX_CHANGES_PER_RUN = 500;
+
+function truncateReportedCondition(value: string | undefined): string | null {
+	if (value === undefined) return null;
+	return value.length <= MAX_REPORTED_CONDITION_CHARS
+		? value
+		: `${value.slice(0, MAX_REPORTED_CONDITION_CHARS - 1)}…`;
+}
+
+/**
+ * What a run whose `runner` the worker has not reported yet is rendered as.
+ *
+ * Lives here rather than beside the projection that emits it because the FILTER
+ * has to agree with it: `?runner=unknown` compiles to `runner IS NULL` (see
+ * {@link buildFleetRunFilter}), so an operator who reads the placeholder off a
+ * page and filters for it gets the runs they just saw. Two answers disagreeing
+ * about the same row is the one thing a fleet view must not do.
+ */
+export const UNREPORTED_RUNNER = "unknown";
+
+/**
  * Reads back an observation snapshot stored on a feed entry.
  *
- * Validates only the two fields the feed itself indexes on. The snapshot was
- * written by this same module from a typed projection, so a deep re-validation
- * would be re-checking our own serializer; what this guards against is a row
- * from a future or truncated schema, where the honest answer is to skip the
- * entry rather than to hand a caller something shaped like a run but missing
- * its identity.
+ * Validates the fields a CONSUMER dereferences without checking, not merely the
+ * ones this module writes. The snapshot came from a typed projection, so a deep
+ * re-validation would be re-checking our own serializer; what this guards
+ * against is a row from a truncated write or a future schema. `routing` is in
+ * the set because the change route reaches two levels into it to decide who may
+ * read the entry — a row that parsed but lacked it would throw there, and one
+ * unreadable row would become a 500 for every watching principal, on a cursor
+ * that never advances past it.
  */
 function parseStoredObservation(value: string): AgentRunInfo | undefined {
 	try {
@@ -911,7 +965,10 @@ function parseStoredObservation(value: string): AgentRunInfo | undefined {
 			typeof parsed !== "object" ||
 			parsed === null ||
 			typeof parsed.runId !== "string" ||
-			typeof parsed.revision !== "number"
+			typeof parsed.revision !== "number" ||
+			typeof parsed.userId !== "number" ||
+			typeof parsed.routing !== "object" ||
+			parsed.routing === null
 		) {
 			return undefined;
 		}
@@ -1460,19 +1517,25 @@ export class RouterStore {
 			}
 		}
 
-		// Connectivity is a fact about a LIVE socket, and this process has none
-		// yet: every device is offline until it dials back in. A `worker_online = 1`
-		// surviving from the previous process would otherwise be reported as current
-		// for as long as that device stayed away.
-		//
-		// Cleared WITHOUT appending change entries, deliberately. The stream epoch
-		// rotates on every construction (see `streamEpoch`), so every cursor a
-		// client holds is already `410 Gone` and it must re-snapshot regardless —
-		// entries describing a restart no client can read are pure noise, and they
-		// would be attributed to a revision nobody ever observed.
-		this.db.exec(
-			"UPDATE agent_runs SET worker_online = NULL WHERE ended_ms IS NULL AND worker_online IS NOT NULL",
-		);
+		// The change feed's own authorization columns. Denormalised onto the entry
+		// rather than joined back to the run, so a caller's page can be filtered in
+		// SQL — and because an entry is a HISTORICAL fact whose readership must be
+		// decided by what it captured, not by a run row that has since moved.
+		const changeCols = this.db
+			.prepare("PRAGMA table_info(agent_run_changes)")
+			.all() as Array<{ name: string }>;
+		const haveChangeCols = new Set(changeCols.map((c) => c.name));
+		for (const [name, ddl] of [
+			["workspace_id", "TEXT"],
+			["user_id", "INTEGER"],
+		] as const) {
+			if (changeCols.length > 0 && !haveChangeCols.has(name)) {
+				this.db.exec(`ALTER TABLE agent_run_changes ADD COLUMN ${name} ${ddl}`);
+			}
+		}
+
+		// NOTE: worker connectivity is deliberately NOT reset here. See
+		// {@link resetRunWorkerConnectivity}, which only the serving router calls.
 
 		// `parked` conflated the run being blocked with its container being
 		// suspendable. The run half is now `waiting`, and every retained `parked`
@@ -1613,15 +1676,39 @@ export class RouterStore {
 	 * those rows don't strand pointing at a device_id that no longer exists.
 	 */
 	private purgeDeviceScopedRows(deviceId: number, nowMs = Date.now()): void {
-		this.db
+		// Routed through {@link updateAgentRun} row by row rather than done as one
+		// bulk `UPDATE … revision = revision + 1`, which is what this used to be.
+		//
+		// A bulk write bumps the revision and appends NOTHING, which breaks the
+		// one invariant the change feed rests on: a revision a client can observe
+		// is never without the entry that explains it. And this is not a rare
+		// path — `releaseLocksAndAffinityForDevice` reaches it from the 60s sweep
+		// for every device dark past its TTL, so a laptop that goes to sleep
+		// mid-session takes its run terminal with the feed saying nothing at all.
+		// A watcher would render that run `active` forever, and 24 hours later
+		// the row and its history would age out beneath it.
+		const live = this.db
 			.prepare(
-				`UPDATE agent_runs
-				 SET state = 'unknown', ended_ms = ?, revision = revision + 1,
-				     wait_reason = NULL, wait_since_ms = NULL, wait_condition = NULL,
-				     pending_work_count = NULL
+				`SELECT run_id FROM agent_runs
 				 WHERE device_id = ? AND state IN (${NON_TERMINAL_RUN_STATES.map(() => "?").join(", ")})`,
 			)
-			.run(nowMs, deviceId, ...NON_TERMINAL_RUN_STATES);
+			.all(deviceId, ...NON_TERMINAL_RUN_STATES) as Array<
+			Pick<AgentRunRow, "run_id">
+		>;
+		for (const row of live) {
+			this.updateAgentRun(
+				row.run_id,
+				{
+					state: "unknown",
+					ended_ms: nowMs,
+					wait_reason: null,
+					wait_since_ms: null,
+					wait_condition: null,
+					pending_work_count: null,
+				},
+				nowMs,
+			);
+		}
 		this.db
 			.prepare("DELETE FROM issue_locks WHERE device_id = ?")
 			.run(deviceId);
@@ -1990,6 +2077,15 @@ export class RouterStore {
 
 	deleteContainerDevice(deviceId: number): void {
 		const txn = this.db.transaction(() => {
+			// The container is gone, so its executor state is `absent` — recorded
+			// BEFORE the purge, while the runs are still non-terminal and can carry
+			// it. Only `ContainerLifecycle`'s stale-destroy path used to sample this
+			// on the way out, so a run that outlived its container down any other
+			// route (a terminal teardown, `containers destroy`, a user removal) kept
+			// reporting `executorState: "running"` for a sandbox destroyed hours
+			// earlier — the exact NOR-402 shape, described by the fleet view as
+			// healthy.
+			this.setRunExecutorState(deviceId, "absent", Date.now());
 			this.purgeDeviceScopedRows(deviceId);
 			// The teardown row is keyed by issue, not device, so it has no FK to
 			// cascade from — drop it explicitly. Once the container row is gone
@@ -2655,7 +2751,7 @@ export class RouterStore {
 				state,
 				wait_reason: wait?.reason ?? null,
 				wait_since_ms: wait?.sinceMs ?? null,
-				wait_condition: wait?.reportedCondition ?? null,
+				wait_condition: truncateReportedCondition(wait?.reportedCondition),
 				...(facts?.runner !== undefined ? { runner: facts.runner } : {}),
 				...(facts?.model !== undefined ? { model: facts.model } : {}),
 				...(facts?.pendingWorkCount !== undefined
@@ -2766,8 +2862,8 @@ export class RouterStore {
 		this.db
 			.prepare(
 				`INSERT INTO agent_run_changes
-				 (run_id, revision, kind, changed_ms, observation_json)
-				 VALUES (?, ?, ?, ?, ?)`,
+				 (run_id, revision, kind, changed_ms, observation_json, workspace_id, user_id)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				runId,
@@ -2775,7 +2871,101 @@ export class RouterStore {
 				kind,
 				changedMs,
 				JSON.stringify(observation),
+				// Copied from the observation, not re-read from the run: these decide
+				// who may READ this entry, and an entry describes an instant. A later
+				// re-derivation from a row that has since moved workspace would change
+				// the readership of history that was already written.
+				observation.routing.workspaceId ?? null,
+				observation.userId,
 			);
+		this.trimAgentRunChanges(runId);
+	}
+
+	/**
+	 * Keeps one run's history bounded.
+	 *
+	 * Age-based retention alone does not bound this, because it only fires once a
+	 * run is TERMINAL: a run that never ends keeps every entry it ever produced,
+	 * and the runs that never end are exactly the ones that generate entries
+	 * fastest. A worker stuck in a reconnect loop writes two connectivity entries
+	 * per iteration, and a provider flapping writes one per sweep tick.
+	 *
+	 * The cap is deliberately far above any legitimate run's output — a busy
+	 * eight-hour session produces a few hundred entries — so it never truncates
+	 * history an operator would have read, and only ever bites the pathological
+	 * case it exists for. A client lagging past it loses entries the same way it
+	 * loses them to the 24-hour window; the snapshot route remains authoritative
+	 * for current state.
+	 */
+	private trimAgentRunChanges(runId: string): void {
+		this.db
+			.prepare(
+				`DELETE FROM agent_run_changes
+				 WHERE run_id = ? AND change_id <= (
+				   SELECT change_id FROM agent_run_changes WHERE run_id = ?
+				   ORDER BY change_id DESC LIMIT 1 OFFSET ?
+				 )`,
+			)
+			.run(runId, runId, MAX_CHANGES_PER_RUN);
+	}
+
+	/**
+	 * Forgets every run's recorded worker connectivity, because THIS process
+	 * holds no sockets yet.
+	 *
+	 * Called from `RouterServer.start()` and from nowhere else, and that
+	 * restriction is the whole point rather than tidiness. Connectivity is a fact
+	 * about a live socket in the SERVING process, but the router's SQLite file is
+	 * documented as shared: `cyrus router containers list` — which the
+	 * stranded-session runbook tells an operator to run mid-incident — opens the
+	 * same database. Doing this in the constructor meant that command silently
+	 * blanked the connectivity of every live run in the fleet, and since the
+	 * serving router only writes the column on connect and disconnect, and those
+	 * devices were already connected, it stayed blank until each one happened to
+	 * reconnect. `/api/v1/runs` reported the whole fleet offline while `/runs`,
+	 * reading the live socket registry, reported it online — two routes on one
+	 * running router disagreeing about the same run.
+	 *
+	 * Appends no change entries: the stream epoch rotates on every construction,
+	 * so every cursor a client holds is already `410 Gone` and it must re-snapshot
+	 * regardless. Entries no client can reach are noise attributed to a revision
+	 * nobody observed.
+	 */
+	/**
+	 * A long-lived random secret, minted on first use and stable thereafter.
+	 *
+	 * Deliberately NOT per-process, which is what the cursor codec used before.
+	 * A per-process key makes a forged cursor and a pre-restart cursor fail the
+	 * SAME check, so the router cannot answer them differently — and it has to,
+	 * because one means "fix your request" (`400`) and the other means "the
+	 * stream is gone, re-list" (`410`). With a durable key the signature proves
+	 * the router issued the cursor, and the epoch — which rotates every process —
+	 * is then free to mean only what it says.
+	 *
+	 * Nothing here is a credential a client ever sees, so a restored backup
+	 * carrying the same value is correct rather than a leak: it keeps cursors
+	 * verifiable across the restore, and the epoch still rejects them.
+	 */
+	getOrCreateSecret(name: string, nowMs = Date.now()): Buffer {
+		return this.db.transaction(() => {
+			const row = this.db
+				.prepare("SELECT value FROM router_secrets WHERE name = ?")
+				.get(name) as { value: string } | undefined;
+			if (row) return Buffer.from(row.value, "base64");
+			const value = randomBytes(32);
+			this.db
+				.prepare(
+					"INSERT INTO router_secrets (name, value, created_ms) VALUES (?, ?, ?)",
+				)
+				.run(name, value.toString("base64"), nowMs);
+			return value;
+		})();
+	}
+
+	resetRunWorkerConnectivity(): void {
+		this.db.exec(
+			"UPDATE agent_runs SET worker_online = NULL WHERE ended_ms IS NULL AND worker_online IS NOT NULL",
+		);
 	}
 
 	/**
@@ -2796,14 +2986,11 @@ export class RouterStore {
 		online: boolean,
 		nowMs: number,
 	): void {
-		const rows = this.db
-			.prepare(
-				"SELECT run_id FROM agent_runs WHERE device_id = ? AND ended_ms IS NULL",
-			)
-			.all(deviceId) as Array<Pick<AgentRunRow, "run_id">>;
-		for (const row of rows) {
-			this.updateAgentRun(row.run_id, { worker_online: online ? 1 : 0 }, nowMs);
-		}
+		this.patchLiveRunsOnDevice(
+			deviceId,
+			{ worker_online: online ? 1 : 0 },
+			nowMs,
+		);
 	}
 
 	/**
@@ -2820,18 +3007,41 @@ export class RouterStore {
 		state: SandboxGaugeState,
 		observedMs: number,
 	): void {
-		const rows = this.db
-			.prepare(
-				"SELECT run_id FROM agent_runs WHERE device_id = ? AND ended_ms IS NULL",
-			)
-			.all(deviceId) as Array<Pick<AgentRunRow, "run_id">>;
-		for (const row of rows) {
-			this.updateAgentRun(
-				row.run_id,
-				{ executor_state: state, executor_state_observed_ms: observedMs },
-				observedMs,
-			);
-		}
+		this.patchLiveRunsOnDevice(
+			deviceId,
+			{ executor_state: state, executor_state_observed_ms: observedMs },
+			observedMs,
+		);
+	}
+
+	/**
+	 * Applies one patch to every NON-TERMINAL run on a device, atomically.
+	 *
+	 * The read and the writes share a transaction because they are separated by
+	 * an arbitrary number of nested write transactions: without it, a run that
+	 * goes terminal between the SELECT and its own UPDATE still receives the
+	 * patch — and a change entry — after it has ended, which is exactly the
+	 * "leaves terminal runs alone" invariant this is scoped to uphold.
+	 *
+	 * It also collapses a device's whole sample into one commit rather than one
+	 * per run, which matters on the 60-second sweep: this database is on the same
+	 * event loop as the WebSocket gateway and carries a 5s busy timeout.
+	 */
+	private patchLiveRunsOnDevice(
+		deviceId: number,
+		patch: Record<string, string | number | null>,
+		nowMs: number,
+	): void {
+		this.db.transaction(() => {
+			const rows = this.db
+				.prepare(
+					"SELECT run_id FROM agent_runs WHERE device_id = ? AND ended_ms IS NULL",
+				)
+				.all(deviceId) as Array<Pick<AgentRunRow, "run_id">>;
+			for (const row of rows) {
+				this.updateAgentRun(row.run_id, patch, nowMs);
+			}
+		})();
 	}
 
 	/**
@@ -3097,52 +3307,87 @@ export class RouterStore {
 	 * its row and its history for as long as it is stuck — that run is precisely
 	 * the one an operator most needs to see.
 	 *
-	 * The orphan clause is not defensive padding: `agent_run_changes` has no
-	 * foreign key (the rest of this schema declares none, and adding one to a
-	 * single table would make deletion order load-bearing everywhere else), so a
-	 * run row removed by any other path would strand its entries forever.
+	 * The entries are deleted FIRST, by `run_id`, so the delete is served by
+	 * `idx_agent_run_changes_run` and touches only the runs actually expiring.
+	 * The obvious spelling — deleting the runs and then sweeping entries whose
+	 * `run_id` no longer exists — is an unindexable full scan of the whole feed
+	 * inside a write transaction, on a 60-second timer, in the process that also
+	 * serves the WebSocket gateway.
 	 */
 	sweepTerminalAgentRuns(cutoffMs: number): number {
 		return this.db.transaction(() => {
-			const deleted = this.db
+			const expiring =
+				"SELECT run_id FROM agent_runs WHERE ended_ms IS NOT NULL AND ended_ms < ?";
+			this.db
+				.prepare(`DELETE FROM agent_run_changes WHERE run_id IN (${expiring})`)
+				.run(cutoffMs);
+			return this.db
 				.prepare(
 					`DELETE FROM agent_runs WHERE ended_ms IS NOT NULL AND ended_ms < ?`,
 				)
 				.run(cutoffMs).changes;
-			this.db
-				.prepare(
-					`DELETE FROM agent_run_changes
-					 WHERE run_id NOT IN (SELECT run_id FROM agent_runs)`,
-				)
-				.run();
-			return deleted;
 		})();
 	}
 
 	/**
-	 * The material changes recorded after `afterChangeId`, oldest first.
+	 * The material changes a principal may read, recorded after `afterChangeId`,
+	 * oldest first.
 	 *
 	 * Ordered by `change_id` — the AUTOINCREMENT sequence, not a timestamp.
 	 * Wall-clock stamps come from several call sites with several clocks and can
 	 * tie or move backwards; the sequence is the only total order the feed has,
 	 * and it is what the cursor names.
 	 *
-	 * `limit + 1` is the caller's business: this returns exactly what it is asked
-	 * for, and page-boundary decisions belong to the route.
+	 * Authorization is a WHERE clause, not a filter applied to the result. That
+	 * distinction is the whole difference between a bounded page and a starving
+	 * one: with `LIMIT` applied before scoping, a principal whose runs are 1% of a
+	 * busy feed advanced its cursor by `limit` entries per request and received
+	 * almost none of its own — and, since entries age out at 24 hours, could fall
+	 * behind and lose changes with no `410` to tell it so. Applied here, `limit`
+	 * counts rows the caller may actually read.
+	 *
+	 * `lastChangeId` is the furthest the scan reached, INCLUDING rows that were
+	 * filtered out or failed to parse, and is what the caller must build its next
+	 * cursor from. Deriving that from the returned entries instead would let a
+	 * window of unreadable rows pin a client on a position it can never get past.
 	 */
 	listAgentRunChanges(input: {
 		afterChangeId?: number;
 		limit: number;
-	}): AgentRunChange[] {
+		/** Workspaces this principal may read. Empty authorizes nothing. */
+		workspaceIds: string[];
+		/** Set for an owner-scoped principal; compared against the run's user. */
+		ownerScopeUserId?: number;
+	}): { changes: AgentRunChange[]; lastChangeId: number } {
+		const afterChangeId = input.afterChangeId ?? 0;
+		// Read BEFORE the scan, so it can be used as the resume point on a short
+		// page. Read after, it would include a row inserted mid-query, and
+		// resuming past that row would skip it silently — the one thing a change
+		// feed may never do.
+		const maxBeforeScan = this.latestAgentRunChangeId();
+		const clauses = ["change_id > ?"];
+		const params: Array<string | number> = [afterChangeId];
+		if (input.workspaceIds.length === 0) {
+			clauses.push("1 = 0");
+		} else {
+			clauses.push(
+				`workspace_id IN (${input.workspaceIds.map(() => "?").join(", ")})`,
+			);
+			params.push(...input.workspaceIds);
+		}
+		if (input.ownerScopeUserId !== undefined) {
+			clauses.push("user_id = ?");
+			params.push(input.ownerScopeUserId);
+		}
 		const rows = this.db
 			.prepare(
 				`SELECT change_id, run_id, revision, kind, changed_ms, observation_json
 				 FROM agent_run_changes
-				 WHERE change_id > ?
+				 WHERE ${clauses.join(" AND ")}
 				 ORDER BY change_id ASC
 				 LIMIT ?`,
 			)
-			.all(input.afterChangeId ?? 0, input.limit) as Array<{
+			.all(...params, input.limit) as Array<{
 			change_id: number;
 			run_id: string;
 			revision: number;
@@ -3150,12 +3395,12 @@ export class RouterStore {
 			changed_ms: number;
 			observation_json: string;
 		}>;
-		return rows.flatMap((row) => {
+		const changes = rows.flatMap((row) => {
 			const observation = parseStoredObservation(row.observation_json);
 			// A row whose snapshot will not parse is skipped rather than thrown on.
 			// The feed is a monitoring surface: one unreadable entry must not make
-			// the whole page a 500, which would strand every watching client on a
-			// cursor it can never get past.
+			// the whole page a 500, which would strand every watching client. The
+			// cursor still advances past it — see `lastChangeId`.
 			if (!observation) return [];
 			return [
 				{
@@ -3168,6 +3413,15 @@ export class RouterStore {
 				},
 			];
 		});
+		// A short page means the scan reached the end of the feed, so the resume
+		// point is the whole sequence rather than the last row that matched.
+		// Without this, a principal with little traffic on a busy router re-scans
+		// every other principal's entries on every poll, forever.
+		const lastChangeId =
+			rows.length < input.limit
+				? Math.max(maxBeforeScan, afterChangeId)
+				: (rows.at(-1)?.change_id ?? afterChangeId);
+		return { changes, lastChangeId };
 	}
 
 	/**

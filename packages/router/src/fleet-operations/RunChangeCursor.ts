@@ -66,11 +66,12 @@ const TAG_SEPARATOR = "~";
 /**
  * Mints and validates the two cursor families.
  *
- * One codec per router process. The signing key is generated here rather than
- * taken from config on purpose: it protects nothing that survives a restart —
- * the epoch already invalidates every cursor at that boundary — so a
- * configured, file-backed key would add a rotation and leak surface for no
- * additional guarantee.
+ * One codec per router process, but its signing key is DURABLE — supplied by
+ * `RouterStore.getOrCreateSecret` — while the stream epoch rotates on every
+ * construction. That split is what lets the two failures be told apart: the
+ * signature answers "did this router issue the cursor", the epoch answers "was
+ * it this process". A per-process key collapses both into one check, and the
+ * router can then only answer a forgery and a genuine restart identically.
  */
 export class RunCursorCodec {
 	private readonly secret: Buffer;
@@ -82,6 +83,12 @@ export class RunCursorCodec {
 		 * minting its own would be asserting a continuity it cannot observe.
 		 */
 		readonly streamEpoch: string,
+		/**
+		 * Durable HMAC key. Falls back to a per-process one so a test — or a
+		 * router assembled without a store — still works; production always passes
+		 * the stored value, because without it a hand-crafted cursor is reported as
+		 * a restart.
+		 */
 		secret?: Buffer,
 	) {
 		this.secret = secret ?? randomBytes(32);
@@ -133,12 +140,14 @@ export class RunCursorCodec {
 				"Malformed change cursor",
 			);
 		}
-		// Checked BEFORE the signature, and the order is load-bearing: the signing
-		// key is per-process too, so a pre-restart cursor fails verification as
-		// well — and reporting that as `400 invalid` would tell a client to fix a
-		// request that was never wrong, instead of to re-list.
-		this.assertEpoch(decoded.streamEpoch);
+		// Signature FIRST, epoch second, and the order is load-bearing. The key is
+		// durable, so passing verification proves this router issued the cursor —
+		// which leaves the epoch check meaning exactly one thing, a restart, and
+		// makes `410` a reliable "re-list and resume". Checking the epoch first
+		// (which a per-process key forced) answered a hand-crafted cursor as
+		// though the router had restarted.
 		const payload = this.verify(decoded.sequence);
+		this.assertEpoch(decoded.streamEpoch);
 		const [rawChangeId, cursorFingerprint] = splitOnce(payload, ":");
 		const lastChangeId = Number(rawChangeId);
 		if (!Number.isSafeInteger(lastChangeId) || lastChangeId < 0) {
@@ -176,11 +185,9 @@ export class RunCursorCodec {
 		} catch {
 			throw new RunCursorError(400, "invalid_cursor", "Malformed page cursor");
 		}
-		// Read off the UNVERIFIED payload, before the signature check, for exactly
-		// the reason spelled out in `decodeChangeCursor`.
-		const [epoch] = splitOnce(stripTag(position), ":");
+		// Verified before anything is read out of it — see `decodeChangeCursor`.
+		const [epoch, afterEpoch] = splitOnce(this.verify(position), ":");
 		this.assertEpoch(epoch);
-		const [, afterEpoch] = splitOnce(this.verify(position), ":");
 		const [rawStartedMs, remainder] = splitOnce(afterEpoch, ":");
 		// The run id is taken LAST and left un-split, so an id containing the
 		// separator cannot shift the fields ahead of it.
@@ -248,9 +255,4 @@ function splitOnce(value: string, separator: string): [string, string] {
 	return index < 0
 		? [value, ""]
 		: [value.slice(0, index), value.slice(index + separator.length)];
-}
-
-function stripTag(signed: string): string {
-	const separator = signed.lastIndexOf(TAG_SEPARATOR);
-	return separator < 0 ? signed : signed.slice(0, separator);
 }

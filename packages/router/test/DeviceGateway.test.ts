@@ -63,6 +63,66 @@ function messageReader(ws: WebSocket): () => Promise<string> {
 }
 
 describe("DeviceGateway", () => {
+	it("records worker connectivity on a run, without a spurious flap on reconnect", async () => {
+		const { store, device, port, gateway, httpServer } = await setup();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "CYR-69",
+			issueId: "issue-69",
+			sessionId: "session-69",
+			routedMs: NOW,
+			routing: { workspaceId: "ws-a" },
+		});
+		const kinds = () =>
+			store
+				.listAgentRunChanges({ limit: 100, workspaceIds: ["ws-a"] })
+				.changes.map((change) => change.kind);
+
+		const hello = async () => {
+			const ws = connect(port);
+			const nextMessage = messageReader(ws);
+			await new Promise((r) => ws.once("open", r));
+			ws.send(
+				JSON.stringify({
+					type: "hello",
+					deviceToken: device.deviceToken,
+					protocolVersion: PROTOCOL_VERSION,
+					lastAckedSeq: 0,
+				}),
+			);
+			expect(JSON.parse(await nextMessage()).type).toBe("hello_ack");
+			return ws;
+		};
+
+		const first = await hello();
+		expect(kinds()).toEqual(["routing", "worker_connectivity"]);
+		expect(store.listAgentRuns({ userId: 1 })[0]?.workerOnline).toBe(true);
+
+		// Second-connection-wins. The old socket is terminated, and its close
+		// handler must NOT report the device offline — with the registry updated
+		// after the terminate, a reconnect wrote an offline/online pair into every
+		// live run's feed.
+		const second = await hello();
+		await new Promise((r) => setTimeout(r, 50));
+		expect(kinds()).toEqual(["routing", "worker_connectivity"]);
+		expect(store.listAgentRuns({ userId: 1 })[0]?.workerOnline).toBe(true);
+
+		// A real disconnect still lands.
+		second.close();
+		await vi.waitFor(() =>
+			expect(store.listAgentRuns({ userId: 1 })[0]?.workerOnline).toBe(false),
+		);
+		expect(kinds()).toEqual([
+			"routing",
+			"worker_connectivity",
+			"worker_connectivity",
+		]);
+
+		first.close();
+		gateway.close();
+		httpServer.close();
+	});
+
 	it("rejects a bad token with hello_error", async () => {
 		const { port, gateway, httpServer } = await setup();
 		const ws = connect(port);

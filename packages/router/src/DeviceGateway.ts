@@ -433,15 +433,19 @@ export class DeviceGateway extends EventEmitter {
 		// Single device, newest wins: terminate any existing connection for
 		// this device before registering the new one.
 		const existing = this.sockets.get(deviceId);
+		state.deviceId = deviceId;
+		// Registered BEFORE the old socket is terminated, so the old socket's
+		// "close" handler cannot match `this.sockets.get(deviceId) === ws` and
+		// report the device offline. `terminate()` can emit "close" synchronously,
+		// and with the order reversed a reconnect wrote a spurious
+		// offline-then-online pair into every live run's change feed.
+		this.sockets.set(deviceId, ws);
 		if (existing && existing !== ws) {
 			this.logger.warn(
 				`Device ${deviceId} reconnected while an older socket was still open; terminating the older one`,
 			);
 			existing.terminate();
 		}
-
-		state.deviceId = deviceId;
-		this.sockets.set(deviceId, ws);
 		state.capabilities = new Set(frame.capabilities ?? []);
 		this.capabilities.set(deviceId, state.capabilities);
 

@@ -87,6 +87,56 @@ describe("ContainerLifecycle", () => {
 		return { deviceId, createdMs };
 	}
 
+	it("does not persist an unreadable provider listing as an executor transition", async () => {
+		// One throttled ARM call must not become a durable `running -> unknown`
+		// on every live run in the fleet, and its recovery a second transition:
+		// an operator watching the change feed would see a fleet-wide executor
+		// collapse that never happened. `unknown` describes the control plane,
+		// not the container.
+		const { deviceId } = makeContainerDevice("CYR-69-GAUGE", "docker");
+		store.recordAgentRunRouted({
+			deviceId,
+			issueKey: "CYR-69-GAUGE",
+			issueId: "issue-gauge",
+			sessionId: "session-gauge",
+			routedMs: 1_000,
+			routing: { workspaceId: "ws-a" },
+		});
+		const healthy = fakeExecutor("docker", {
+			listManaged: ["CYR-69-GAUGE"],
+			listStates: [{ issueKey: "CYR-69-GAUGE", status: "running" }],
+		});
+		const options = {
+			store,
+			executors: new Map<string, ContainerExecutor>([["docker", healthy]]),
+			idleStopMs: 900_000,
+			staleDestroyMs: 14 * 24 * 60 * 60_000,
+			offlineAgeOutMs: 3_600_000,
+			logger,
+			now: () => 2_000,
+		};
+		await new ContainerLifecycle(options).sweep();
+		const afterHealthy = store.latestAgentRunChangeId();
+		expect(store.listAgentRuns({ userId })[0]?.executorState).toBe("running");
+
+		// The provider cannot be listed at all this tick.
+		const throttled = fakeExecutor("docker", {
+			listManagedImpl: vi.fn(async () => {
+				throw new Error("Too many requests");
+			}),
+		});
+		await new ContainerLifecycle({
+			...options,
+			executors: new Map<string, ContainerExecutor>([["docker", throttled]]),
+			now: () => 3_000,
+		}).sweep();
+
+		expect(store.latestAgentRunChangeId()).toBe(afterHealthy);
+		// The last real sample survives, with its own (older) observation time, so
+		// a client can age it rather than being told nothing is known.
+		expect(store.listAgentRuns({ userId })[0]?.executorState).toBe("running");
+	});
+
 	it("idle-stops a container with no active affinity once past idleStopMs", async () => {
 		const { createdMs, deviceId } = makeContainerDevice("CYPACK-1", "docker");
 		const docker = fakeExecutor("docker", { status: "running" });

@@ -332,6 +332,19 @@ export class ContainerLifecycle {
 	 *
 	 * Repeats are free: the store appends nothing for an unchanged state, so the
 	 * once-per-tick cadence does not grow the feed.
+	 *
+	 * `unknown` is the exception, and it is NOT persisted. That value does not
+	 * mean "the sandbox is in an unknown state" — it means the provider could not
+	 * be listed this tick, which is a fact about the control plane and not about
+	 * the container. Writing it through would turn one throttled ARM call into a
+	 * durable `running → unknown` transition on every live run in the fleet, and
+	 * the recovery into a second one, so an operator watching the feed would see
+	 * a fleet-wide executor collapse that never happened. The in-memory gauge
+	 * still records it — that is what the per-tick telemetry is for — and the
+	 * durable sample keeps its previous state alongside the older
+	 * `executorStateObservedAt`, which is precisely what lets a client age it and
+	 * decide for itself. The same reasoning already guards `running_since_ms` a
+	 * few lines below.
 	 */
 	private recordObservation(
 		deviceId: number,
@@ -339,6 +352,7 @@ export class ContainerLifecycle {
 		observedMs: number,
 	): void {
 		this.observations.set(deviceId, { state, observedMs });
+		if (state === "unknown") return;
 		try {
 			this.store.setRunExecutorState(deviceId, state, observedMs);
 		} catch (err) {
