@@ -253,6 +253,7 @@ export class DeviceGateway extends EventEmitter {
 			if (this.sockets.get(deviceId) === ws) {
 				this.sockets.delete(deviceId);
 				this.capabilities.delete(deviceId);
+				this.recordRunConnectivity(deviceId, false);
 				this.logger.info(
 					`Device ${deviceId} disconnected (code ${code}${
 						reason.length > 0 ? `, ${reason.toString()}` : ""
@@ -522,6 +523,14 @@ export class DeviceGateway extends EventEmitter {
 			})`,
 		);
 
+		// Connectivity is recorded onto the device's live runs HERE rather than
+		// from a "deviceConnected" listener, so it cannot be lost to listener
+		// ordering or to a listener that throws before reaching the store. It is
+		// what makes a drop-and-reconnect between two operator polls observable at
+		// all: the socket registry is in-memory, so without this the transition
+		// leaves no trace anywhere.
+		this.recordRunConnectivity(deviceId, true);
+
 		// Carry the device's declared active sessions so a listener can
 		// reconcile stale issue locks. Emitted after the lastAckedSeq purge
 		// above and before deliverPending, so a reconcile handler sees the true
@@ -529,6 +538,28 @@ export class DeviceGateway extends EventEmitter {
 		this.emit("deviceConnected", deviceId, frame.activeSessions);
 
 		this.deliverPending(deviceId);
+	}
+
+	/**
+	 * Mirrors the socket registry onto the device's non-terminal runs.
+	 *
+	 * Best-effort: a store failure must never take down a connect or a close.
+	 * Losing one connectivity entry costs an operator a transition in the change
+	 * feed; throwing here would leave a socket half-registered, or abort the
+	 * cleanup that removes it — a far worse trade for a monitoring fact.
+	 *
+	 * Idempotent in the store, so a reconnect from a device that was already
+	 * recorded online appends nothing.
+	 */
+	private recordRunConnectivity(deviceId: number, online: boolean): void {
+		try {
+			this.store.setRunWorkerConnectivity(deviceId, online, Date.now());
+		} catch (err) {
+			this.logger.warn(
+				`Could not record worker connectivity for device ${deviceId}`,
+				err,
+			);
+		}
 	}
 
 	private runHeartbeat(): void {

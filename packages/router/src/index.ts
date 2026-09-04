@@ -24,6 +24,8 @@ export {
 export {
 	FleetOperations,
 	type FleetOperationsOptions,
+	FleetQueryError,
+	type FleetRunsQueryInput,
 } from "./fleet-operations/FleetOperations.js";
 export {
 	createEntraOperatorTokenVerifier,
@@ -33,9 +35,16 @@ export {
 	type OperatorAuthorizerOptions,
 } from "./fleet-operations/OperatorAuthorizer.js";
 export {
+	RunCursorCodec,
+	RunCursorError,
+	type RunPagePosition,
+} from "./fleet-operations/RunChangeCursor.js";
+export {
 	DISCOVERY_ROUTE,
 	type FleetOperationsRoutesOptions,
 	OPERATOR_CONTEXT_ROUTE,
+	RUN_CHANGES_ROUTE,
+	RUNS_ROUTE,
 	registerFleetOperationsRoutes,
 } from "./fleet-operations/routes.js";
 export {
@@ -87,11 +96,15 @@ export {
 	type RouterWorkspaceConfig,
 } from "./RouterServer.js";
 export {
+	type AgentRunChange,
+	type AgentRunChangeKind,
 	type AgentRunInfo,
 	type AgentRunInput,
 	type AgentRunState,
 	type ContainerDeviceInfo,
 	type DeviceInfo,
+	type FleetRunDimension,
+	type FleetRunQuery,
 	OPERATOR_ROLES,
 	OPERATOR_TOKEN_PREFIX,
 	type OperatorTokenInfo,
@@ -109,8 +122,13 @@ export {
 export {
 	type AgentRunObservation,
 	type AgentRunsResponse,
+	observeRun,
 	type RegisterRunsRouteOptions,
+	type RunObservation,
+	type RunObservationSources,
 	registerRunsRoute,
+	toRunObservationV1,
+	UNREPORTED_RUNNER,
 } from "./runs.js";
 export {
 	SANDBOX_LOG_SOURCE,

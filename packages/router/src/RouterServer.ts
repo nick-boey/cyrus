@@ -1049,6 +1049,8 @@ export class RouterServer {
 				capabilities: this.servedOperatorCapabilities(fleetConfig),
 			},
 			workspaceIds,
+			store: this.store,
+			logger: this.logger,
 		});
 		registerFleetOperationsRoutes(this.fastify, {
 			fleet,
@@ -1071,13 +1073,21 @@ export class RouterServer {
 	 * it presents to an orchestrating agent as a fleet problem rather than as a
 	 * router older than its CLI. `logs.query` is servable today because the
 	 * client queries the log backend DIRECTLY: the router only has to describe
-	 * where it is, which is exactly what a configured `logSource` does. The run
-	 * and recovery routes do not exist yet, so they are not advertised.
+	 * where it is, which is exactly what a configured `logSource` does.
+	 *
+	 * `runs.list` and `runs.changes` are unconditional because their routes are
+	 * registered unconditionally and read the store this server always has —
+	 * there is no configuration under which they are present but unserved.
+	 * `recoveries.request` still has no route, so it is still not advertised.
 	 */
 	private servedOperatorCapabilities(
 		fleetConfig: FleetOperationsConfig,
 	): OperatorCapabilityV1[] {
-		return fleetConfig.logSource ? ["logs.query"] : [];
+		return [
+			"runs.list",
+			"runs.changes",
+			...(fleetConfig.logSource ? (["logs.query"] as const) : []),
+		];
 	}
 
 	/**

@@ -5,6 +5,7 @@ import type {
 	ExecutorStateV1,
 	RunInputV1,
 	RunLifecycleStateV1,
+	RunObservationV1,
 	RunWaitV1,
 } from "cyrus-operator-protocol";
 import type { FastifyInstance } from "fastify";
@@ -71,11 +72,25 @@ export interface RunObservation {
 	revision: number;
 }
 
-export interface RegisterRunsRouteOptions {
-	isDeviceOnline(deviceId: number): boolean;
+/**
+ * Live views of facts the run row also records durably.
+ *
+ * Both are OPTIONAL, and the fallback is the point. The legacy `/runs` route
+ * supplies them and keeps reading the router's in-memory socket registry and
+ * gauge map, exactly as it always has. The v1 routes supply NEITHER, because
+ * they must be able to render a run as it was at some past instant — a change
+ * entry embeds the observation captured when the change happened, and asking a
+ * live registry about it would report the present under a past timestamp.
+ */
+export interface RunObservationSources {
+	isDeviceOnline?(deviceId: number): boolean;
 	getSandboxObservation?(
 		deviceId: number,
 	): { state: SandboxGaugeState; observedMs: number } | undefined;
+}
+
+export interface RegisterRunsRouteOptions extends RunObservationSources {
+	isDeviceOnline(deviceId: number): boolean;
 	now?: () => number;
 }
 
@@ -161,9 +176,18 @@ export function registerRunsRoute(
  */
 export function observeRun(
 	run: AgentRunInfo,
-	options: RegisterRunsRouteOptions,
+	options: RunObservationSources = {},
 ): RunObservation {
-	const sandbox = options.getSandboxObservation?.(run.deviceId);
+	// Live sample first, the run's own durable record second. They agree while
+	// the router is up — the gauge writes through to the row — and the fallback
+	// is what makes a stored observation renderable long after the sample that
+	// produced it left memory.
+	const sandbox =
+		options.getSandboxObservation?.(run.deviceId) ??
+		(run.executorState !== undefined &&
+		run.executorStateObservedMs !== undefined
+			? { state: run.executorState, observedMs: run.executorStateObservedMs }
+			: undefined);
 	return {
 		runId: run.runId,
 		agentSessionId: run.sessionId,
@@ -205,7 +229,12 @@ export function observeRun(
 		lastRoutedAt: iso(run.lastRoutedMs),
 		...(run.endedMs !== undefined ? { endedAt: iso(run.endedMs) } : {}),
 		worker: {
-			online: options.isDeviceOnline(run.deviceId),
+			// `false` for a run whose worker has never been observed. The wire type
+			// is a boolean and always has been, so there is no third value to
+			// report; `lastHeartbeatAt` being absent alongside it is what
+			// distinguishes "never seen" from "seen, and gone".
+			online:
+				options.isDeviceOnline?.(run.deviceId) ?? run.workerOnline ?? false,
 			...(run.lastHeartbeatMs !== undefined
 				? { lastHeartbeatAt: iso(run.lastHeartbeatMs) }
 				: {}),
@@ -225,6 +254,104 @@ export function observeRun(
 					executorStateObservedAt: iso(sandbox.observedMs),
 				}
 			: {}),
+		revision: run.revision,
+	};
+}
+
+/**
+ * What a run whose `runner` the worker has not reported yet is rendered as.
+ *
+ * `runObservationV1Schema` makes `runner` required, and a run that has only
+ * just been routed genuinely has none — the value arrives on the worker's first
+ * state frame. Dropping such runs would hide every run during precisely the
+ * window an operator is most likely to be watching one, so the gap is reported
+ * rather than concealed. It reads the same way `executorState: "unknown"`
+ * already does elsewhere in this file: a fact the router does not have, said
+ * out loud.
+ */
+export const UNREPORTED_RUNNER = "unknown";
+
+/**
+ * Renders the internal observation as the published v1 document, or
+ * `undefined` when the run lacks the identity v1 requires.
+ *
+ * The three fields that can be missing — the issue id, the workspace, and the
+ * instant the run was routed — are exactly what a run routed before the CYR-68
+ * migration has none of, which is the scoping `runObservationV1Schema`'s own
+ * doc comment hands to this route. `RouterStore.listFleetAgentRuns` already
+ * excludes them in SQL so a page cannot come back short; this is the second
+ * check, and the one that covers the change feed, whose entries are read back
+ * from rows written at arbitrary points in the past.
+ *
+ * `observedAt` is a PARAMETER rather than a clock read: for a listing it is the
+ * instant the page was read, and for a change entry it is the instant the
+ * change happened. Reading `Date.now()` here would stamp a stored observation
+ * with the time it was replayed.
+ */
+export function toRunObservationV1(
+	run: RunObservation,
+	observedAt: string,
+): RunObservationV1 | undefined {
+	const { workspaceId, ownerUserId, routedAtMs } = run.routing;
+	if (
+		run.issueId === undefined ||
+		workspaceId === undefined ||
+		ownerUserId === undefined ||
+		routedAtMs === undefined
+	) {
+		return undefined;
+	}
+	return {
+		schemaVersion: 1,
+		runId: run.runId,
+		agentSessionId: run.agentSessionId,
+		issueId: run.issueId,
+		issueKey: run.issueKey,
+		routing: {
+			workspaceId,
+			...(run.routing.workspaceName
+				? { workspaceName: run.routing.workspaceName }
+				: {}),
+			ownerUserId,
+			...(run.routing.ownerName ? { ownerName: run.routing.ownerName } : {}),
+			...(run.routing.linearTeamId
+				? { linearTeamId: run.routing.linearTeamId }
+				: {}),
+			...(run.routing.linearTeamName
+				? { linearTeamName: run.routing.linearTeamName }
+				: {}),
+			...(run.routing.linearProjectId
+				? { linearProjectId: run.routing.linearProjectId }
+				: {}),
+			...(run.routing.linearProjectName
+				? { linearProjectName: run.routing.linearProjectName }
+				: {}),
+			routedAt: iso(routedAtMs),
+		},
+		runner: run.runner ?? UNREPORTED_RUNNER,
+		...(run.model !== undefined ? { model: run.model } : {}),
+		executorKind: run.executorKind,
+		...(run.provider ? { provider: run.provider } : {}),
+		lifecycle: run.lifecycle,
+		...(run.wait ? { wait: run.wait } : {}),
+		...(run.pendingWorkCount !== undefined
+			? { pendingWorkCount: run.pendingWorkCount }
+			: {}),
+		inputs: run.inputs,
+		...(run.lastPublishedActivityAt !== undefined
+			? { lastPublishedActivityAt: run.lastPublishedActivityAt }
+			: {}),
+		worker: run.worker,
+		...(run.executorState !== undefined &&
+		run.executorStateObservedAt !== undefined
+			? {
+					executorState: run.executorState,
+					executorStateObservedAt: run.executorStateObservedAt,
+				}
+			: {}),
+		startedAt: run.startedAt,
+		...(run.endedAt !== undefined ? { endedAt: run.endedAt } : {}),
+		observedAt,
 		revision: run.revision,
 	};
 }

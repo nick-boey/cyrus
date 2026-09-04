@@ -1,7 +1,13 @@
+import { runObservationV1Schema } from "cyrus-operator-protocol";
 import Fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { RouterStore } from "../src/RouterStore.js";
-import { observeRun, registerRunsRoute } from "../src/runs.js";
+import {
+	observeRun,
+	registerRunsRoute,
+	toRunObservationV1,
+	UNREPORTED_RUNNER,
+} from "../src/runs.js";
 
 const NOW = 1_000_000;
 
@@ -251,5 +257,104 @@ describe("GET /runs", () => {
 		expect(observed.routing.ownerUserId).toBe("1");
 		expect(observed.routing.ownerName).toBe("alice@example.com");
 		expect(observed.routing.routedAtMs).toBe(NOW);
+	});
+});
+
+describe("v1 observation projection (CYR-69)", () => {
+	let store: RouterStore;
+	let deviceId: number;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+		const { userId } = store.addUser({
+			email: "alice@example.com",
+			name: "Alice",
+		});
+		deviceId = store.createContainerDevice(userId, "CYR-69", "aca").deviceId;
+	});
+
+	afterEach(() => {
+		store.close();
+	});
+
+	const routeRun = (routing?: Record<string, string>) => {
+		store.recordAgentRunRouted({
+			deviceId,
+			issueKey: "CYR-69",
+			...(routing === undefined ? {} : { issueId: "issue-1" }),
+			sessionId: "session-1",
+			routedMs: NOW,
+			...(routing ? { routing } : {}),
+		});
+		const [run] = store.listAgentRuns({ userId: 1 });
+		if (!run) throw new Error("expected the run");
+		return run;
+	};
+
+	const observedAt = new Date(NOW + 1_000).toISOString();
+
+	it("renders a complete run against the published schema", () => {
+		const run = routeRun({ workspaceId: "ws-a", workspaceName: "Acme" });
+		store.setAgentRunState("session-1", "active", { runner: "claude" });
+		const [latest] = store.listAgentRuns({ userId: 1 });
+
+		const v1 = toRunObservationV1(observeRun(latest ?? run), observedAt);
+
+		expect(v1).toBeDefined();
+		expect(runObservationV1Schema.parse(v1)).toEqual(v1);
+		expect(v1).toMatchObject({
+			schemaVersion: 1,
+			issueId: "issue-1",
+			runner: "claude",
+			observedAt,
+			routing: { workspaceId: "ws-a", ownerUserId: "1", ownerName: "Alice" },
+		});
+	});
+
+	it("reports an unreported runner rather than dropping a freshly routed run", () => {
+		// The runner arrives on the worker's first state frame, so requiring it
+		// would hide every run during the window an operator is most likely to be
+		// watching one.
+		const run = routeRun({ workspaceId: "ws-a" });
+
+		const v1 = toRunObservationV1(observeRun(run), observedAt);
+
+		expect(v1?.runner).toBe(UNREPORTED_RUNNER);
+		expect(runObservationV1Schema.safeParse(v1).success).toBe(true);
+	});
+
+	it("declines a run that predates the routing-snapshot migration", () => {
+		const run = routeRun();
+		expect(toRunObservationV1(observeRun(run), observedAt)).toBeUndefined();
+	});
+
+	it("reads connectivity and the gauge off the run when no live source is given", () => {
+		// This is what makes a stored observation renderable long after the sample
+		// that produced it left memory — the change feed's whole premise.
+		routeRun({ workspaceId: "ws-a" });
+		store.setRunWorkerConnectivity(deviceId, true, NOW + 10);
+		store.setRunExecutorState(deviceId, "running", NOW + 20);
+		const [run] = store.listAgentRuns({ userId: 1 });
+		if (!run) throw new Error("expected the run");
+
+		const observed = observeRun(run);
+
+		expect(observed.worker.online).toBe(true);
+		expect(observed.executorState).toBe("running");
+		expect(observed.executorStateObservedAt).toBe(
+			new Date(NOW + 20).toISOString(),
+		);
+	});
+
+	it("still prefers a live source when one is supplied", () => {
+		// The legacy route keeps its in-memory reads exactly as they were.
+		routeRun({ workspaceId: "ws-a" });
+		store.setRunWorkerConnectivity(deviceId, true, NOW + 10);
+		const [run] = store.listAgentRuns({ userId: 1 });
+		if (!run) throw new Error("expected the run");
+
+		expect(observeRun(run, { isDeviceOnline: () => false }).worker.online).toBe(
+			false,
+		);
 	});
 });

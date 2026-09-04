@@ -2559,6 +2559,11 @@ export class EventRouter {
 			// whatever the issue has MOVED to, which is precisely what makes a
 			// historical team or project filter unstable.
 			routing: extractRoutingSnapshot(event),
+			// Seeds the run's durable connectivity from the socket registry. Without
+			// it, a run created on a device that was ALREADY connected has its
+			// worker's state unobserved until that device next connects or drops —
+			// for a long-lived physical device, potentially never.
+			workerOnline: this.gateway.isOnline(target.deviceId),
 			...input,
 		});
 		// The project is not on the webhook at any nesting, so it takes a Linear
