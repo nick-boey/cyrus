@@ -5,7 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
-- **Captured routing and worker-reported run facts ([CYR-68](https://linear.app/northrop-digital/issue/CYR-68/capture-routing-and-worker-reported-run-facts)).**
+- **Captured routing and worker-reported run facts ([CYR-68](https://linear.app/northrop-digital/issue/CYR-68/capture-routing-and-worker-reported-run-facts), [#61](https://github.com/nick-boey/cyrus/pull/61)).**
   The `session_state` frame gains an explicit `waiting` state carrying
   `wait { reason, since, reportedCondition }`, a separate `executorMayPark`
   declaration, and `runner` / `model` / `pendingWorkCount`. `agent_runs` gains
