@@ -5,6 +5,63 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Provisioned fleet-operator roles and Log Analytics access ([CYR-66](https://linear.app/northrop-digital/issue/CYR-66/provision-fleet-operator-roles-and-log-analytics-access)).**
+  New `fleetOperatorGrants`, `enableFleetRecovery`, and
+  `fleetOperatorLogReaderPrincipalIds` parameters on `infra/azure/bicep/main.bicep`,
+  a `logAnalyticsReaderPrincipalIds` loop in `modules/role-assignments.bicep`, and
+  a new `CYRUS_ROUTER_FLEET_OPERATIONS_JSON` env var that
+  `docker/router/entrypoint.mjs` maps to `fleetOperations` in `router-config.json`.
+
+  The two authorizations are kept structurally independent and neither is derived
+  from the other. `fleetOperatorGrants` decides what the ROUTER answers; the Azure
+  `Log Analytics Reader` role decides what the operator's OWN client reads. Log
+  records never pass back through the router, so deriving the reader list from the
+  grant table would have quietly made `fleet.read` an Azure data-plane grant — the
+  exact widening `FleetOperations.capabilitiesFor` refuses for device tokens.
+
+  `enableFleetRecovery` STRIPS `fleet.recover` from each rendered grant rather than
+  refusing the deployment, and then drops any grant left with no roles, because the
+  router's Zod schema requires `roles.min(1)`. A read+recover principal therefore
+  degrades to read-only instead of vanishing, and the Entra assignment is untouched
+  either way — the kill switch lives in the deployment, not the directory.
+
+  Rendered as ONE JSON env var, mirroring `CYRUS_ROUTER_CONTAINERS_JSON`: the
+  router re-validates it against its own schema, so remapping fields in the
+  entrypoint would only give the deployed shape and the router's shape a way to
+  drift. `logSource` uses the descriptor `fleetOperations.logSource` already
+  accepts (CYR-71 adds the friendlier `observability.logSource` alias), and its two
+  identifiers come from new `foundation.bicep` outputs — `logAnalyticsCustomerId`
+  and `logAnalyticsWorkspaceResourceId` — rather than from parameters, so a
+  deployment cannot name a workspace it did not create. `cloud` is omitted rather
+  than hardcoded: the protocol enum values do not match `az.environment().name`.
+
+  The whole block renders only when grants are configured. With no grants there is
+  nobody the router could disclose the log source to, so an unconfigured deployment
+  publishes no workspace metadata at all.
+
+  `scripts/bootstrap-azure-role-assignments.sh` forwards the reader list through a
+  new `param_array` helper. That path is not optional plumbing: northrop-dev (and
+  every stack past bootstrap) runs `manageRoleAssignments = false`, so the
+  privileged script is the ONLY way that grant reaches Azure — wiring it into
+  `main.bicep` alone would have left it dead on exactly the deployments that use
+  it. Deployment itself goes through CD in the private `cyrus-deploy` repository,
+  which pins a Cyrus commit and calls this repository's `scripts/deploy-azure.sh`;
+  the new parameters must be added to `env/*.bicepparam` there before they take
+  effect.
+
+  Coverage: `scripts/check-bicep.sh` type-checks the new parameters via
+  `main.bicepparam.example` and two `infra/azure/bicep/testdata/` fixtures — every
+  parameter omitted, and every parameter populated with a read-only principal, a
+  read+recover principal, two workspace grants and the reader list — then asserts
+  the recovery strip, the conditional env var and the workspace-scoped role
+  assignment survive in the COMPILED ARM. Those assertions read the compiled
+  template because ARM lambdas are evaluated at deployment time, so nothing local
+  can see what a grant table renders to; `az deployment sub what-if` stays the gate
+  for the rendered value. `scripts/bootstrap-azure-role-assignments.test.sh`
+  pins the array forwarding (including comment stripping and the empty case);
+  `docker/router/entrypoint.test.mjs` pins the env-var mapping and its
+  `anyProvided` gate.
+
 - **Remote command profile and named router connections ([CYR-67](https://linear.app/northrop-digital/issue/CYR-67/add-the-remote-command-profile-and-named-router-connections), [#59](https://github.com/nick-boey/cyrus/pull/59)).**
   New `apps/cli/src/remote/` module — `errors.ts`, `credentials.ts`,
   `ConnectionStore.ts`, `OperatorHttpClient.ts` — plus

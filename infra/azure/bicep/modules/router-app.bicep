@@ -26,6 +26,9 @@ param linearWorkspaceId string
 @description('The complete, rendered CYRUS_ROUTER_CONTAINERS_JSON value.')
 param routerContainersJson string
 
+@description('The complete, rendered CYRUS_ROUTER_FLEET_OPERATIONS_JSON value, or empty to omit the variable entirely. Credential-free: Entra object ids, Linear workspace ids, and Log Analytics workspace identifiers. Absent, the router still serves discovery and still accepts device and locally minted operator tokens; there is simply no Entra grant table, so an operator JWT is refused.')
+param fleetOperationsJson string = ''
+
 param backupBlobUrl string
 
 @description('ACR login server for a private router image, or empty for an anonymously pullable one.')
@@ -59,6 +62,17 @@ param deploymentEnvironment string
 param applicationInsightsConnectionString string
 
 var entraEnabled = !empty(entraTenantId) && !empty(entraAudience)
+
+// Omitted rather than set empty: `cyrus router start` re-parses this through a
+// Zod schema, and an empty string is not valid JSON.
+var fleetOperationsEnv = empty(fleetOperationsJson)
+  ? []
+  : [
+      {
+        name: 'CYRUS_ROUTER_FLEET_OPERATIONS_JSON'
+        value: fleetOperationsJson
+      }
+    ]
 
 // Linear secrets sourced from Key Vault via the router identity (Key Vault
 // Secrets User + Secrets Officer granted in foundation.bicep).
@@ -321,7 +335,7 @@ resource routerApp 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.5')
             memory: '1Gi'
           }
-          env: concat(baseEnv, otelEnv, entraEnv, setupUiEnv)
+          env: concat(baseEnv, otelEnv, entraEnv, setupUiEnv, fleetOperationsEnv)
           volumeMounts: [
             {
               volumeName: 'artifacts'

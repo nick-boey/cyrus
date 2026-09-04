@@ -30,8 +30,9 @@ stack. Preview is the default.
 
 The script deliberately reads and forwards only these non-secret parameters:
 project, environment, resourceGroupName, enableAcr, enableSetupSecretStore,
-operatorPrincipalId, and sandboxGroupDataOwnerRoleId. Linear and setup secret
-values are never passed to this deployment.
+operatorPrincipalId, fleetOperatorLogReaderPrincipalIds, and
+sandboxGroupDataOwnerRoleId. Linear and setup secret values are never passed to
+this deployment.
 USAGE
 }
 
@@ -39,6 +40,35 @@ value_or_default() {
   local name="$1" default_value="$2" value
   value="$(param_value "$name")"
   printf '%s\n' "${value:-$default_value}"
+}
+
+# param_array <name> — read a `param <name> = [ ... ]` assignment out of the
+# .bicepparam file and emit it as a compact JSON array, which is the form
+# `az deployment ... --parameters name=<json>` accepts for an array parameter.
+#
+# Deliberately as simple as param_value: it only has to reach lists of quoted
+# identifiers (Entra object ids), so it takes every single-quoted string between
+# the opening bracket and the closing one. An absent or empty parameter yields
+# `[]`.
+#
+# Comments are stripped INSIDE awk, before the closing bracket is looked for.
+# Stripping them in a later pipe stage instead means a `]` in a trailing comment
+# (`'<oid>' // on-call [primary]`) ends the scan early and silently drops every
+# principal after it — a shorter grant list, no error, and a green what-if.
+param_array() {
+  local name="$1" item json=""
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    json+="${json:+,}\"${item}\""
+  done < <(
+    awk -v name="$name" '
+      { line = $0; sub(/\/\/.*/, "", line) }
+      line ~ "^[[:space:]]*param[[:space:]]+" name "[[:space:]]*=[[:space:]]*\\[" { inside = 1 }
+      inside { print line }
+      inside && line ~ /\]/ { exit }
+    ' "$PARAMS" | grep -oE "'[^']*'" | tr -d "'"
+  )
+  printf '[%s]\n' "$json"
 }
 
 require_bool() {
@@ -71,7 +101,7 @@ bootstrap_rbac_main() {
   [[ -f "$RBAC_TEMPLATE" ]] || die "RBAC template not found: ${RBAC_TEMPLATE}"
 
   local project environment resource_group enable_acr enable_setup_secret_store
-  local operator_principal_id sandbox_data_owner_role_id
+  local operator_principal_id sandbox_data_owner_role_id log_reader_principal_ids
   project="$(param_value project)"
   [[ -n "$project" ]] || die "could not read project from ${PARAMS}"
   environment="$(value_or_default environment dev)"
@@ -80,6 +110,9 @@ bootstrap_rbac_main() {
   enable_acr="$(value_or_default enableAcr false)"
   enable_setup_secret_store="$(value_or_default enableSetupSecretStore false)"
   operator_principal_id="$(param_value operatorPrincipalId)"
+  # main.bicep's parameter name; the RBAC module names it for the Azure role it
+  # assigns rather than for the operator persona it serves.
+  log_reader_principal_ids="$(param_array fleetOperatorLogReaderPrincipalIds)"
   sandbox_data_owner_role_id="$(value_or_default sandboxGroupDataOwnerRoleId c24cf47c-5077-412d-a19c-45202126392c)"
 
   require_bool enableAcr "$enable_acr"
@@ -94,6 +127,7 @@ bootstrap_rbac_main() {
     "enableAcr=${enable_acr}"
     "enableSetupSecretStore=${enable_setup_secret_store}"
     "operatorPrincipalId=${operator_principal_id}"
+    "logAnalyticsReaderPrincipalIds=${log_reader_principal_ids}"
     "sandboxGroupDataOwnerRoleId=${sandbox_data_owner_role_id}"
   )
 
