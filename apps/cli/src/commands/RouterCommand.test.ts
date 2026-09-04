@@ -393,6 +393,193 @@ describe("RouterCommand", () => {
 		});
 	});
 
+	describe("operators", () => {
+		it("mints a token, prints it exactly once, and stores only its hash", async () => {
+			seedEmptyDb();
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await command.execute([
+				"operators",
+				"create-token",
+				"--label",
+				"oncall-laptop",
+				"--role",
+				"fleet.read",
+				"--role",
+				"fleet.recover",
+				"--workspace",
+				"workspace-a",
+			]);
+
+			const printed = printedStdout();
+			const match = printed.match(/Token: (cyop_[0-9a-f]+)/);
+			expect(match).not.toBeNull();
+			const token = match?.[1] as string;
+			expect(printed.split(token).length - 1).toBe(1);
+
+			// The raw token authenticates, and the database holds only its hash.
+			const store = new RouterStore(dbPath());
+			try {
+				const grant = store.getOperatorTokenByToken(token);
+				expect(grant?.label).toBe("oncall-laptop");
+				expect(grant?.roles.sort()).toEqual(["fleet.read", "fleet.recover"]);
+				expect(grant?.workspaceIds).toEqual(["workspace-a"]);
+				expect(JSON.stringify(store.listOperatorTokens())).not.toContain(token);
+			} finally {
+				store.close();
+			}
+			expect(readFileSync(dbPath()).toString("latin1")).not.toContain(token);
+		});
+
+		it("rejects an unknown role rather than storing an unusable grant", async () => {
+			seedEmptyDb();
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await expect(
+				command.execute([
+					"operators",
+					"create-token",
+					"--label",
+					"typo",
+					"--role",
+					"fleet.admin",
+					"--workspace",
+					"workspace-a",
+				]),
+			).rejects.toThrow(/process\.exit/);
+
+			expect(app.logger.error).toHaveBeenCalledWith(
+				expect.stringContaining("fleet.admin"),
+			);
+			const store = new RouterStore(dbPath());
+			try {
+				expect(store.listOperatorTokens()).toEqual([]);
+			} finally {
+				store.close();
+			}
+		});
+
+		it.each([
+			["no --role", ["--label", "x", "--workspace", "workspace-a"]],
+			["no --workspace", ["--label", "x", "--role", "fleet.read"]],
+			["no --label", ["--role", "fleet.read", "--workspace", "workspace-a"]],
+		])("rejects create-token with %s", async (_label, args) => {
+			// Commander cannot enforce these: `--role`/`--workspace` need a default
+			// array for their accumulator, and an option with a default is treated
+			// as already satisfied. The check has to live here.
+			seedEmptyDb();
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await expect(
+				command.execute(["operators", "create-token", ...args]),
+			).rejects.toThrow(/process\.exit/);
+
+			const store = new RouterStore(dbPath());
+			try {
+				expect(store.listOperatorTokens()).toEqual([]);
+			} finally {
+				store.close();
+			}
+		});
+
+		it("warns when a token names a workspace this router does not serve", async () => {
+			// The authorizer narrows unknown workspaces away, so such a token is
+			// 403 on every request — indistinguishable at the point of use from a
+			// revoked one, long after the typo.
+			seedEmptyDb();
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: { "workspace-real": { linearToken: "token" } },
+					webhook: { verificationMode: "direct", secret: "secret" },
+				}),
+			);
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+
+			await command.execute([
+				"operators",
+				"create-token",
+				"--label",
+				"typo",
+				"--role",
+				"fleet.read",
+				"--workspace",
+				"workspace-typo",
+			]);
+
+			expect(app.logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("workspace-typo"),
+			);
+		});
+
+		it("lists grants without ever revealing a token, revoked rows included", async () => {
+			seedEmptyDb();
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute([
+				"operators",
+				"create-token",
+				"--label",
+				"reader",
+				"--role",
+				"fleet.read",
+				"--workspace",
+				"workspace-a",
+			]);
+			const token = printedStdout().match(/Token: (cyop_[0-9a-f]+)/)?.[1];
+			expect(token).toBeDefined();
+
+			consoleLogSpy.mockClear();
+			await command.execute(["operators", "list"]);
+
+			const listed = printedStdout();
+			expect(listed).toContain("reader");
+			expect(listed).toContain("fleet.read");
+			expect(listed).toContain("workspace-a");
+			expect(listed).not.toContain(token as string);
+
+			await command.execute(["operators", "revoke", "1"]);
+			consoleLogSpy.mockClear();
+			await command.execute(["operators", "list"]);
+			// Revoked rows stay listed: "did my revocation take" is the question
+			// this command is opened for.
+			expect(printedStdout()).toContain("reader");
+
+			const store = new RouterStore(dbPath());
+			try {
+				expect(store.getOperatorTokenByToken(token as string)).toBeUndefined();
+			} finally {
+				store.close();
+			}
+		});
+
+		it("refuses to revoke a token that is already revoked", async () => {
+			seedEmptyDb();
+			const app = createMockApp(cyrusHome);
+			const command = new RouterCommand(app as any);
+			await command.execute([
+				"operators",
+				"create-token",
+				"--label",
+				"reader",
+				"--role",
+				"fleet.read",
+				"--workspace",
+				"workspace-a",
+			]);
+			await command.execute(["operators", "revoke", "1"]);
+
+			await expect(
+				command.execute(["operators", "revoke", "1"]),
+			).rejects.toThrow(/process\.exit/);
+		});
+	});
+
 	describe("unlock", () => {
 		it("releases a stuck issue lock by session id", async () => {
 			const app = createMockApp(cyrusHome);
@@ -1303,6 +1490,19 @@ describe("RouterCommand", () => {
 			[["users", "list"]],
 			[["devices", "list"]],
 			[["sessions", "list"]],
+			[["operators", "list"]],
+			[
+				[
+					"operators",
+					"create-token",
+					"--label",
+					"x",
+					"--role",
+					"fleet.read",
+					"--workspace",
+					"workspace-a",
+				],
+			],
 		])("errors without creating a db for %j", async (args) => {
 			const app = createMockApp(cyrusHome);
 			const command = new RouterCommand(app as any);

@@ -246,6 +246,121 @@ describe("RouterServer /healthz", () => {
 	});
 });
 
+describe("RouterServer fleet-operations routes", () => {
+	let server: RouterServer | undefined;
+
+	afterEach(async () => {
+		if (server) {
+			await server.stop();
+			server = undefined;
+		}
+	});
+
+	// Driven over real HTTP rather than a Fastify inject seam, because the claim
+	// under test is that these routes are registered BEFORE listen() — Fastify
+	// v5 refuses new routes on a listening server, so a registration moved into
+	// start() would 404 here while every unit test still passed.
+	it("serves discovery anonymously on a router with no operator config", async () => {
+		server = makeServer();
+		await server.start();
+
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/.well-known/cyrus`,
+		);
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			schemaVersion: 1,
+			routerId: "cyrus-router",
+			operatorApiVersions: ["v1"],
+			authentication: {
+				methods: ["device-token", "local-operator-token"],
+			},
+		});
+	});
+
+	it("publishes the configured Entra tenant and audience, and nothing else", async () => {
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			fleetOperations: {
+				routerId: "prod-router",
+				access: {
+					entra: {
+						tenantId: "tenant-1",
+						audience: "api://cyrus-router",
+						grants: [
+							{
+								principalIds: ["oid-1"],
+								roles: ["fleet.read"],
+								workspaceIds: ["ws-1"],
+							},
+						],
+					},
+				},
+			},
+			// A verifier is supplied so construction does not reach for a remote
+			// JWKS; discovery itself verifies nothing.
+			operatorTokenVerifier: async () => ({}),
+		});
+		await server.start();
+
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/.well-known/cyrus`,
+		);
+		const body = await res.json();
+
+		expect(body.authentication.entra).toEqual({
+			tenantId: "tenant-1",
+			audience: "api://cyrus-router",
+		});
+		const serialized = JSON.stringify(body);
+		for (const secret of ["ws-1", "oid-1", "grants", "test-token"]) {
+			expect(serialized).not.toContain(secret);
+		}
+	});
+
+	it("requires authentication for the operator context route", async () => {
+		server = makeServer();
+		await server.start();
+
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/api/v1/operator/context`,
+		);
+
+		expect(res.status).toBe(401);
+		expect(await res.json()).toEqual({ error: "unauthorized" });
+	});
+
+	it("authenticates a locally minted operator token end to end", async () => {
+		server = makeServer();
+		await server.start();
+		const created = server.store.createOperatorToken({
+			label: "oncall",
+			roles: ["fleet.read"],
+			workspaceIds: ["ws-1"],
+		});
+
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/api/v1/operator/context`,
+			{ headers: { authorization: `Bearer ${created.token}` } },
+		);
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.authMethod).toBe("local-operator-token");
+		expect(body.roles).toEqual(["fleet.read"]);
+		expect(body.authorizedWorkspaces).toEqual([{ workspaceId: "ws-1" }]);
+		// No route serves runs, changes, or recoveries yet, and no log source is
+		// configured — so this router advertises nothing it cannot do.
+		expect(body.capabilities).toEqual([]);
+		expect(body.logSource).toBeUndefined();
+	});
+});
+
 describe("RouterServer /workspaces", () => {
 	let server: RouterServer | undefined;
 

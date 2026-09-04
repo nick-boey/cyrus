@@ -22,6 +22,32 @@ export {
 	registerEnrollmentRoute,
 } from "./enrollment.js";
 export {
+	FleetOperations,
+	type FleetOperationsOptions,
+} from "./fleet-operations/FleetOperations.js";
+export {
+	createEntraOperatorTokenVerifier,
+	type EntraOperatorTokenVerifier,
+	OperatorAuthError,
+	OperatorAuthorizer,
+	type OperatorAuthorizerOptions,
+} from "./fleet-operations/OperatorAuthorizer.js";
+export {
+	DISCOVERY_ROUTE,
+	type FleetOperationsRoutesOptions,
+	OPERATOR_CONTEXT_ROUTE,
+	registerFleetOperationsRoutes,
+} from "./fleet-operations/routes.js";
+export {
+	AUTH_METHOD_BY_KIND,
+	DEFAULT_ROUTER_ID,
+	type FleetOperationsConfig,
+	type OperatorAccessConfig,
+	type OperatorAuthKind,
+	type OperatorGrant,
+	type OperatorPrincipal,
+} from "./fleet-operations/types.js";
+export {
 	buildGitHubTokenScopeReport,
 	diagnoseGitHubTokenScopes,
 	GITHUB_ORG_SCOPE,
@@ -66,6 +92,9 @@ export {
 	type AgentRunState,
 	type ContainerDeviceInfo,
 	type DeviceInfo,
+	OPERATOR_ROLES,
+	OPERATOR_TOKEN_PREFIX,
+	type OperatorTokenInfo,
 	type PendingTeardownInfo,
 	RouterStore,
 	type SessionInfo,

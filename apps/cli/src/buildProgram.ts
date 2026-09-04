@@ -27,6 +27,16 @@ import { StartCommand } from "./commands/StartCommand.js";
  * containers list/destroy`) would still pass such tests while being
  * completely unreachable from the shipped binary. See CYPACK task 9 finding 1.
  */
+/**
+ * Commander option accumulator for repeatable flags (`--role a --role b`).
+ * Without one, Commander keeps only the LAST occurrence — which for `--role`
+ * would silently drop half of a two-role grant, and for `--workspace` would
+ * narrow a grant the operator believed they had widened.
+ */
+function collect(value: string, previous: string[]): string[] {
+	return [...previous, value];
+}
+
 export function buildProgram(
 	packageJson: { version: string },
 	errorReporter: ErrorReporter,
@@ -290,6 +300,67 @@ export function buildProgram(
 			"List running and locked sessions with their Linear issue id and session GUID",
 		)
 		.action(makeRouterAction("sessions", "list"));
+
+	// Local operator credentials for the Fleet Operations API. Local-only on
+	// purpose: these mint and revoke the credentials that API authenticates, so
+	// serving them over it would let a token mint another, and revoking a
+	// compromised token would depend on that token still working.
+	const routerOperatorsCommand = routerCommand
+		.command("operators")
+		.description("Manage local Fleet Operations operator credentials");
+
+	routerOperatorsCommand
+		.command("create-token")
+		.description(
+			"Mint a local operator token and print it once (only its hash is stored)",
+		)
+		.requiredOption("--label <label>", "Human label recorded with the grant")
+		// `option`, not `requiredOption`: Commander treats an option with a
+		// default value as satisfied, so `requiredOption(..., collect, [])` never
+		// enforces anything — the empty array IS the default. The repeatable
+		// flags need a default for `collect` to accumulate onto, so the "at least
+		// one" check belongs to RouterCommand, which reports it with the role and
+		// workspace context Commander has no idea about.
+		.option(
+			"--role <role>",
+			"fleet.read or fleet.recover; repeat for both (fleet.read does not imply fleet.recover)",
+			collect,
+			[],
+		)
+		.option(
+			"--workspace <workspaceId>",
+			"Linear workspace id this token is authorized over; repeatable",
+			collect,
+			[],
+		)
+		.action(
+			async (cmdOpts: {
+				label: string;
+				role: string[];
+				workspace: string[];
+			}) => {
+				// makeRouterAction forwards only positional strings, so translate
+				// the parsed options back into the flag form the command parses.
+				const argv = ["--label", cmdOpts.label];
+				for (const role of cmdOpts.role) argv.push("--role", role);
+				for (const workspace of cmdOpts.workspace) {
+					argv.push("--workspace", workspace);
+				}
+				await makeRouterAction("operators", "create-token")(...argv);
+			},
+		);
+
+	routerOperatorsCommand
+		.command("list")
+		.description(
+			"List operator tokens and their grants (never the token itself)",
+		)
+		.action(makeRouterAction("operators", "list"));
+
+	routerOperatorsCommand
+		.command("revoke <tokenId>")
+		.description("Revoke a local operator token by its numeric ID")
+		.action(makeRouterAction("operators", "revoke"));
 
 	const routerSecretsCommand = routerCommand
 		.command("secrets")
