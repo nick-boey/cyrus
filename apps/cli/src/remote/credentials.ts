@@ -12,6 +12,26 @@ import { AuthorizationError, redactSecrets } from "./errors.js";
  */
 export interface OperatorCredentialProvider {
 	getAuthorization(): Promise<{ header: string; source: string }>;
+
+	/**
+	 * Discards the credential just returned and reports whether another one
+	 * exists, so a caller that was REFUSED (401/403) can try the next link
+	 * rather than treating the chain as exhausted.
+	 *
+	 * Minting a token successfully and being authorized to use it are different
+	 * questions, and only the router can answer the second. Without this, the
+	 * first credential the environment happens to produce is final: an
+	 * unattended host holding an ungranted managed identity alongside a granted
+	 * service principal dead-ends on a 403 that no grant can fix — three of the
+	 * four Entra links produce APP-ONLY tokens, which the router refuses outright
+	 * (`OperatorAuthorizer.authenticateEntra` rejects `idtyp === "app"`), so on
+	 * a router that emits that claim only `azure-cli` can ever succeed. Falling
+	 * through makes that self-healing instead of a support ticket.
+	 *
+	 * Optional: a provider with exactly one credential returns `false` (or omits
+	 * the method), and the caller reports the refusal as final.
+	 */
+	rejectAndAdvance?(source: string): boolean;
 }
 
 /**
@@ -36,6 +56,12 @@ export const ENTRA_CREDENTIAL_SOURCES = [
 	"azure-cli",
 ] as const;
 export type EntraCredentialSource = (typeof ENTRA_CREDENTIAL_SOURCES)[number];
+
+/**
+ * Ceiling on ONE credential acquisition. Node's `fetch` has no default timeout
+ * and neither does an IMDS probe on a host that silently drops the packets.
+ */
+const DEFAULT_ACQUIRE_TIMEOUT_MS = 15_000;
 
 /** The slice of `@azure/identity`'s `TokenCredential` this module needs. */
 export interface AccessTokenSource {
@@ -162,30 +188,44 @@ export class LocalTokenCredentialProvider
  * The credential that succeeded IS remembered, so a chain whose first two links
  * fail does not re-probe them on every request; the full chain is retried if
  * the remembered one later stops working.
+ *
+ * A link the ROUTER refused is remembered too, via {@link rejectAndAdvance} —
+ * minting a token and being allowed to use it are different questions, and only
+ * the router can answer the second.
  */
 export class EntraCredentialProvider implements OperatorCredentialProvider {
 	private readonly chain: EntraCredentialCandidate[];
 	private readonly scope: string;
+	private readonly acquireTimeoutMs: number;
 	private preferred?: EntraCredentialCandidate;
+	/** Sources the router refused this run; skipped rather than re-presented. */
+	private readonly rejected = new Set<string>();
 
 	constructor(options: {
 		tenantId: string;
 		audience: string;
 		chain?: EntraCredentialCandidate[];
+		acquireTimeoutMs?: number;
 	}) {
 		this.chain = options.chain ?? createDefaultEntraChain(options.tenantId);
 		this.scope = entraScopeFor(options.audience);
+		this.acquireTimeoutMs =
+			options.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
 	}
 
 	async getAuthorization(): Promise<{ header: string; source: string }> {
-		const order = this.preferred
-			? [this.preferred, ...this.chain.filter((c) => c !== this.preferred)]
-			: this.chain;
+		const available = this.chain.filter(
+			(candidate) => !this.rejected.has(candidate.source),
+		);
+		const order =
+			this.preferred && available.includes(this.preferred)
+				? [this.preferred, ...available.filter((c) => c !== this.preferred)]
+				: available;
 
 		const failures: string[] = [];
 		for (const candidate of order) {
 			try {
-				const result = await candidate.create().getToken(this.scope);
+				const result = await this.acquire(candidate);
 				const token = result?.token;
 				if (!token) {
 					failures.push(`${candidate.source}: no token returned`);
@@ -199,10 +239,63 @@ export class EntraCredentialProvider implements OperatorCredentialProvider {
 		}
 
 		this.preferred = undefined;
+		const refused = [...this.rejected];
 		throw new AuthorizationError(
 			`Could not acquire an Entra token for ${this.scope}. Tried, in order: ` +
-				`${failures.join("; ")}.`,
+				`${failures.join("; ") || "no credential sources remained"}.` +
+				(refused.length > 0
+					? ` Already refused by the router: ${refused.join(", ")}.`
+					: ""),
 		);
+	}
+
+	/**
+	 * Marks a source as refused and reports whether an untried one remains.
+	 *
+	 * Rejection is per-source rather than per-token: re-presenting a credential
+	 * the router has already refused cannot start working within one command, and
+	 * retrying it is how a bounded fallback becomes a loop.
+	 */
+	rejectAndAdvance(source: string): boolean {
+		this.rejected.add(source);
+		if (this.preferred?.source === source) this.preferred = undefined;
+		return this.chain.some((candidate) => !this.rejected.has(candidate.source));
+	}
+
+	/**
+	 * Bounds one credential acquisition.
+	 *
+	 * `ManagedIdentityCredential` on a host that blackholes 169.254.169.254 can
+	 * stall far past the HTTP deadline `OperatorHttpClient` applies, which would
+	 * defeat the whole reason this chain excludes interactive credentials: an
+	 * orchestrating agent must get a refusal, not a hang with no output. The
+	 * timeout is per LINK, so a stalled probe costs one link rather than the run.
+	 */
+	private async acquire(
+		candidate: EntraCredentialCandidate,
+	): Promise<{ token: string } | null | undefined> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				candidate.create().getToken(this.scope),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								new Error(
+									`timed out after ${this.acquireTimeoutMs}ms (no response from the credential endpoint)`,
+								),
+							),
+						this.acquireTimeoutMs,
+					);
+				}),
+			]);
+		} finally {
+			// Without this the timer keeps the event loop alive after a fast
+			// success, and a one-shot CLI command hangs for the full timeout
+			// before exiting.
+			if (timer) clearTimeout(timer);
+		}
 	}
 }
 

@@ -55,12 +55,36 @@ This changelog documents internal development changes, refactors, tooling update
   program arguments and report "too many arguments. Expected 0 arguments but got
   3", which explains nothing.
 
-  `REMOTE_PROFILE_COMMANDS` is an ALLOWLIST containing `logs`, `recover`, and
-  `skills` before they exist (CYR-73/76/77), so a future command reaches the
-  remote profile only by being added there deliberately; the test asserts the
-  registered set is a SUBSET of it and names the forbidden commands explicitly.
-  Per ADR 0011 this is a product boundary, not an authorization one — the
-  server-side tests in `OperatorAuthorizer.test.ts` remain the security proof.
+  **The Entra chain falls through on a router REFUSAL, not only on an
+  acquisition failure**, via the optional `rejectAndAdvance` on
+  `OperatorCredentialProvider`. Minting a token and being allowed to use it are
+  different questions and only the router answers the second: three of the four
+  links produce APP-ONLY tokens, which `OperatorAuthorizer.authenticateEntra`
+  refuses outright (`idtyp === "app"` → 403) regardless of grant, so on a router
+  emitting that claim only `azure-cli` can ever succeed. Without the fallback the
+  first credential the environment happens to produce is final, and the operator
+  gets a 403 telling them to request a grant that cannot help. Rejection is
+  recorded per SOURCE so the loop is bounded by the chain length and can never
+  re-present a refused credential. Each acquisition is also bounded
+  (`acquireTimeoutMs`, 15s): `ManagedIdentityCredential` against a blackholed
+  169.254.169.254 stalls past the HTTP deadline, which would defeat the reason
+  the chain excludes interactive credentials.
+
+  `REMOTE_PROFILE_COMMANDS` is a LOAD-BEARING allowlist — `buildProgram`
+  registers from a name-keyed table filtered by `REMOTE_PROFILE_REGISTERED`, so
+  profile membership cannot be granted by where a `register*` call sits relative
+  to a branch, and the test asserts an EXACT set rather than a subset (a subset
+  passes for a command accidentally registered under a name already in the
+  vocabulary). The two constants answer different questions: `…COMMANDS` is the
+  approved vocabulary including `logs`/`recover`/`skills` (CYR-73/76/77) and
+  `runs`; `…REGISTERED` is what exists and works today. `runs` is approved but
+  NOT registered in the remote profile — `RunsCommand` reads
+  `config.router.deviceToken`, written only by `cyrus connect`, which this
+  profile does not register and `connection add` deliberately never writes, so
+  registering it would ship a command that always fails while advising a command
+  the profile hides. CYR-70 moves it onto `OperatorHttpClient`. Per ADR 0011 this
+  is a product boundary, not an authorization one — the server-side tests in
+  `OperatorAuthorizer.test.ts` remain the security proof.
 
   `operatorConnections` is a new `EdgeConfigSchema` field, classified into
   `RELOAD_EXEMPT_KEYS`: no EdgeWorker code path reads it, and merging it would

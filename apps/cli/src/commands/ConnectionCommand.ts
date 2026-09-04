@@ -5,6 +5,7 @@ import type {
 } from "cyrus-operator-protocol";
 import type { Application } from "../Application.js";
 import {
+	assertValidConnectionName,
 	ConnectionStore,
 	normalizeConnectionUrl,
 	type OperatorConnectionRecord,
@@ -131,8 +132,12 @@ export class ConnectionCommand extends BaseCommand {
 	private async add(args: string[]): Promise<void> {
 		const { name, url, auth, tokenEnv } = parseAddArgs(args);
 
-		// Both cheap checks run before any network call: a typo'd name or URL
-		// should not depend on a router being reachable to be reported.
+		// Every purely local check runs before any network call: a typo'd name or
+		// URL should not depend on a router being reachable to be reported, and
+		// should not cost a credential acquisition. `ConnectionStore.add` checks
+		// the name again — this is the early report, that is the store's own
+		// guard.
+		assertValidConnectionName(name);
 		const normalizedUrl = normalizeConnectionUrl(url);
 		if (this.store.has(name)) {
 			throw new UsageError(

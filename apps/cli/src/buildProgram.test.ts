@@ -67,8 +67,12 @@ vi.mock("./commands/ConnectionCommand.js", () => ({
 		}),
 }));
 
-const { buildProgram, REMOTE_PROFILE_COMMANDS, resolveCommandProfile } =
-	await import("./buildProgram.js");
+const {
+	buildProgram,
+	REMOTE_PROFILE_COMMANDS,
+	REMOTE_PROFILE_REGISTERED,
+	resolveCommandProfile,
+} = await import("./buildProgram.js");
 const { UsageError } = await import("./remote/errors.js");
 
 function newProgram(options?: {
@@ -460,22 +464,41 @@ describe("buildProgram — command profiles", () => {
 		expect(names).toContain("runs");
 	});
 
-	it("registers only the approved remote vocabulary under --profile remote", () => {
+	it("registers exactly the remote commands that exist and work today", () => {
 		const names = topLevelCommands(
 			newProgram({ argv: ["node", "cyrus", "--profile", "remote"] }),
 		);
 
-		// Subset of the allowlist, not equal to it: `logs`, `recover`, and
-		// `skills` are named in the vocabulary but land with CYR-73/76/77. What
-		// must hold today is that NOTHING outside the list reaches this profile.
-		for (const name of names) {
-			expect(
-				REMOTE_PROFILE_COMMANDS,
-				`"${name}" is registered in the remote profile but is not part of the approved vocabulary`,
-			).toContain(name);
+		// EXACT, not a subset. A subset assertion passes for a command that was
+		// accidentally registered under a name already sitting in the vocabulary
+		// (`logs`, `recover`, `skills`), which is precisely the accident the
+		// allowlist exists to prevent.
+		expect(names).toEqual([...REMOTE_PROFILE_REGISTERED].sort());
+	});
+
+	it("keeps every registered remote command inside the approved vocabulary", () => {
+		// The two lists answer different questions — "approved for this profile"
+		// and "usable today" — and this is what stops them diverging.
+		for (const name of REMOTE_PROFILE_REGISTERED) {
+			expect(REMOTE_PROFILE_COMMANDS).toContain(name);
 		}
-		expect(names).toContain("connection");
-		expect(names).toContain("runs");
+	});
+
+	it("does not expose `runs` in the remote profile while it needs device enrollment", () => {
+		// `RunsCommand` reads `config.router.deviceToken`, written only by
+		// `cyrus connect` — which this profile does not register, and which
+		// `cyrus connection add` deliberately never writes. Registering it here
+		// would ship a command that always fails, telling the operator to run a
+		// command the profile hides. CYR-70 moves it onto OperatorHttpClient.
+		const names = topLevelCommands(
+			newProgram({ argv: ["node", "cyrus", "--profile", "remote"] }),
+		);
+
+		expect(names).not.toContain("runs");
+		// Still approved vocabulary, so it needs no re-approval when CYR-70 lands.
+		expect(REMOTE_PROFILE_COMMANDS).toContain("runs");
+		// And it remains available in the full profile, where enrollment exists.
+		expect(topLevelCommands(newProgram())).toContain("runs");
 	});
 
 	it("cannot invoke router, worker, enrollment, secret, container, or unlock commands in the remote profile", () => {

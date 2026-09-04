@@ -236,6 +236,108 @@ describe("EntraCredentialProvider", () => {
 	});
 });
 
+describe("EntraCredentialProvider.rejectAndAdvance", () => {
+	it("offers the next link after the router refuses one", async () => {
+		// Minting a token and being allowed to use it are different questions.
+		// Three of the four links produce app-only tokens the router refuses
+		// outright, so without this the first credential the environment happens
+		// to produce is final.
+		const managed = candidate("managed-identity", { token: "app-only-token" });
+		const cli = candidate("azure-cli", { token: "user-token" });
+		const provider = new EntraCredentialProvider({
+			tenantId: "tenant-1",
+			audience: "api://cyrus-router",
+			chain: [managed, cli],
+		});
+
+		const first = await provider.getAuthorization();
+		expect(first.source).toBe("managed-identity");
+
+		expect(provider.rejectAndAdvance("managed-identity")).toBe(true);
+		const second = await provider.getAuthorization();
+
+		expect(second).toEqual({
+			header: "Bearer user-token",
+			source: "azure-cli",
+		});
+	});
+
+	it("reports that nothing remains once every link has been refused", async () => {
+		const cli = candidate("azure-cli", { token: "t" });
+		const provider = new EntraCredentialProvider({
+			tenantId: "tenant-1",
+			audience: "api://cyrus-router",
+			chain: [cli],
+		});
+
+		await provider.getAuthorization();
+
+		expect(provider.rejectAndAdvance("azure-cli")).toBe(false);
+	});
+
+	it("never re-presents a refused source, so the fallback cannot loop", async () => {
+		const managed = candidate("managed-identity", { token: "a" });
+		const cli = candidate("azure-cli", { token: "b" });
+		const provider = new EntraCredentialProvider({
+			tenantId: "tenant-1",
+			audience: "api://cyrus-router",
+			chain: [managed, cli],
+		});
+
+		await provider.getAuthorization();
+		provider.rejectAndAdvance("managed-identity");
+		await provider.getAuthorization();
+		provider.rejectAndAdvance("azure-cli");
+
+		const error = await provider.getAuthorization().catch((e) => e);
+		expect(error).toBeInstanceOf(AuthorizationError);
+		expect(error.message).toContain("Already refused by the router");
+		// Each was acquired exactly once; neither was offered a second time.
+		expect(managed.calls).toHaveLength(1);
+		expect(cli.calls).toHaveLength(1);
+	});
+});
+
+describe("EntraCredentialProvider acquisition timeout", () => {
+	it("gives up on a stalled credential and moves to the next link", async () => {
+		// ManagedIdentityCredential on a host that blackholes 169.254.169.254
+		// stalls indefinitely. An orchestrating agent must get a refusal, not a
+		// hang with no output — the same reason the chain excludes interactive
+		// credentials.
+		const stalled: EntraCredentialCandidate = {
+			source: "managed-identity",
+			create: () => ({ getToken: () => new Promise(() => {}) }),
+		};
+		const cli = candidate("azure-cli", { token: "t" });
+
+		const result = await new EntraCredentialProvider({
+			tenantId: "tenant-1",
+			audience: "api://cyrus-router",
+			chain: [stalled, cli],
+			acquireTimeoutMs: 20,
+		}).getAuthorization();
+
+		expect(result.source).toBe("azure-cli");
+	});
+
+	it("does not hold the event loop open after a fast success", async () => {
+		// A timer left armed after the race resolves keeps a one-shot CLI command
+		// alive for the full timeout before it can exit.
+		const cli = candidate("azure-cli", { token: "t" });
+		const before = process.getActiveResourcesInfo?.().length ?? 0;
+
+		await new EntraCredentialProvider({
+			tenantId: "tenant-1",
+			audience: "api://cyrus-router",
+			chain: [cli],
+			acquireTimeoutMs: 60_000,
+		}).getAuthorization();
+
+		const after = process.getActiveResourcesInfo?.().length ?? 0;
+		expect(after).toBeLessThanOrEqual(before);
+	});
+});
+
 describe("createDefaultEntraChain", () => {
 	it("is exactly the four non-interactive sources, in order", () => {
 		const chain = createDefaultEntraChain("tenant-1");

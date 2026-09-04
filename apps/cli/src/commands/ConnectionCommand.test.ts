@@ -299,6 +299,26 @@ describe("ConnectionCommand add", () => {
 		expect(fetchFn).not.toHaveBeenCalled();
 	});
 
+	it("refuses an invalid connection name without touching the network", async () => {
+		// A purely local, statically-checkable condition must not cost two HTTP
+		// round trips and a real token acquisition before it is reported.
+		const { app } = fakeApp();
+		const fetchFn = healthyRouter();
+
+		const error = await catchAsync(
+			new ConnectionCommand(app, { fetchFn: fetchFn as never }).run([
+				"add",
+				"my prod",
+				BASE_URL,
+				"--auth",
+				"entra",
+			]),
+		);
+
+		expect(error).toBeInstanceOf(UsageError);
+		expect(fetchFn).not.toHaveBeenCalled();
+	});
+
 	it("stores a local connection as an environment variable NAME, never a token", async () => {
 		const { app, current } = fakeApp();
 		const fetchFn = healthyRouter();

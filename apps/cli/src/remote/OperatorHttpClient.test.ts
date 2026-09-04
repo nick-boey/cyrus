@@ -234,6 +234,141 @@ describe("OperatorHttpClient.context", () => {
 		}
 	});
 
+	it("falls through to the next credential when the router refuses one", async () => {
+		// A credential that MINTS successfully can still be refused: three of the
+		// four Entra links produce app-only tokens the router rejects outright.
+		// Without this the first credential the environment produces is final.
+		const offered: string[] = [];
+		let remaining = ["managed-identity", "azure-cli"];
+		const chaining = {
+			getAuthorization: async () => {
+				const source = remaining[0] as string;
+				offered.push(source);
+				return { header: `Bearer token-${source}`, source };
+			},
+			rejectAndAdvance: (source: string) => {
+				remaining = remaining.filter((s) => s !== source);
+				return remaining.length > 0;
+			},
+		};
+		const fetchFn = vi.fn(async (_url, init) =>
+			(init as RequestInit).headers &&
+			(init as { headers: Record<string, string> }).headers.authorization ===
+				"Bearer token-azure-cli"
+				? jsonResponse(contextDocument)
+				: new Response("", { status: 403 }),
+		);
+
+		const result = await clientWith(fetchFn as never, {
+			credentials: chaining,
+		}).context();
+
+		expect(offered).toEqual(["managed-identity", "azure-cli"]);
+		expect(result.authSource).toBe("azure-cli");
+	});
+
+	it("stops once the chain is exhausted and names every credential tried", async () => {
+		const exhausting = {
+			getAuthorization: async () => ({
+				header: "Bearer t",
+				source: "managed-identity",
+			}),
+			rejectAndAdvance: () => false,
+		};
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValue(new Response("", { status: 403 }));
+
+		const error = await catchAsync(
+			clientWith(fetchFn as never, { credentials: exhausting }).context(),
+		);
+
+		expect(error).toBeInstanceOf(AuthorizationError);
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+		// The remedy names the app-only case, because for a workload/managed/
+		// service-principal token no grant can help.
+		expect(error.message).toContain("app-only");
+		expect(error.message).toContain("az login");
+	});
+
+	it("does not offer the app-only remedy to a credential it cannot apply to", async () => {
+		// A local operator token is not an Entra principal, so `az login` has no
+		// bearing on its refusal. Saying less beats sending the operator
+		// somewhere irrelevant.
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValue(new Response("", { status: 403 }));
+
+		const error = await catchAsync(
+			clientWith(fetchFn as never, {
+				credentials: {
+					getAuthorization: async () => ({
+						header: "Bearer cyop_x",
+						source: "env:CYRUS_OPERATOR_TOKEN",
+					}),
+				},
+			}).context(),
+		);
+
+		expect(error).toBeInstanceOf(AuthorizationError);
+		expect(error.message).toContain("fleet.read grant");
+		expect(error.message).not.toContain("az login");
+		expect(error.message).not.toContain("app-only");
+	});
+
+	it("offers the app-only remedy for the three Entra sources that produce one", async () => {
+		for (const source of [
+			"workload-identity",
+			"managed-identity",
+			"service-principal-env",
+		]) {
+			const fetchFn = vi
+				.fn()
+				.mockResolvedValue(new Response("", { status: 403 }));
+
+			const error = await catchAsync(
+				clientWith(fetchFn as never, {
+					credentials: {
+						getAuthorization: async () => ({ header: "Bearer t", source }),
+					},
+				}).context(),
+			);
+
+			expect(error.message, source).toContain("app-only");
+		}
+
+		// `azure-cli` yields a USER token, so the hint would be wrong there.
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValue(new Response("", { status: 403 }));
+		const error = await catchAsync(
+			clientWith(fetchFn as never, {
+				credentials: {
+					getAuthorization: async () => ({
+						header: "Bearer t",
+						source: "azure-cli",
+					}),
+				},
+			}).context(),
+		);
+		expect(error.message).not.toContain("app-only");
+	});
+
+	it("treats a provider without a chain as final on the first refusal", async () => {
+		// A local operator token has exactly one credential; retrying it would be
+		// a loop, so `rejectAndAdvance` is absent and the refusal stands.
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValue(new Response("", { status: 401 }));
+
+		const error = await catchAsync(
+			clientWith(fetchFn as never, { credentials }).context(),
+		);
+
+		expect(error).toBeInstanceOf(AuthorizationError);
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+	});
+
 	it("never echoes the bearer token into a diagnostic, even when the router does", async () => {
 		const fetchFn = vi.fn().mockResolvedValue(
 			new Response(

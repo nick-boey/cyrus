@@ -60,11 +60,21 @@ export const COMMAND_PROFILE_ENV = "CYRUS_COMMAND_PROFILE";
  * same thing whichever profile is active, so a skill written against an
  * orchestrator installation runs unchanged on a full one.
  *
- * `logs`, `recover`, and `skills` are named here but not yet registered — they
- * arrive with CYR-73, CYR-76, and CYR-77. Listing them now is what makes this
- * an ALLOWLIST rather than a description of today's tree: a new command lands
- * in the remote profile only by being added here deliberately, and
- * `buildProgram.test.ts` fails if anything outside the list reaches it.
+ * This list is LOAD-BEARING, not documentation: `buildProgram` registers a
+ * command into the remote profile only if its name appears here, so membership
+ * cannot be granted by where a `register*` call happens to sit relative to a
+ * branch. Adding a command to the remote surface is an edit to this array.
+ *
+ * `logs`, `recover`, and `skills` are named but not yet implemented — they
+ * arrive with CYR-73, CYR-76, and CYR-77.
+ *
+ * `runs` is named but deliberately NOT yet registered in the remote profile.
+ * Today's `RunsCommand` reads `config.router.deviceToken`, the device-enrollment
+ * block written only by `cyrus connect` — which the remote profile does not
+ * register and `cyrus connection add` deliberately never writes. Registering it
+ * here would ship a command that always fails with advice to run a command the
+ * profile hides. CYR-70 moves `runs` onto `ConnectionStore`/`OperatorHttpClient`,
+ * at which point it joins {@link REMOTE_PROFILE_REGISTERED}.
  */
 export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
 	"connection",
@@ -73,6 +83,15 @@ export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
 	"recover",
 	"skills",
 ];
+
+/**
+ * The subset of {@link REMOTE_PROFILE_COMMANDS} that exists and works today.
+ *
+ * Separate from the vocabulary above so that "approved for this profile" and
+ * "actually usable in this profile" are two decisions rather than one — a
+ * command may be approved long before it can function unattended.
+ */
+export const REMOTE_PROFILE_REGISTERED: readonly string[] = ["connection"];
 
 /**
  * Adds the two selection flags every fleet command accepts: which stored
@@ -169,13 +188,26 @@ export function buildProgram(
 			"Command surface to expose: full (default) or remote for a fleet orchestrator",
 		);
 
-	// --- The shared remote vocabulary. Registered in BOTH profiles: a command
-	// profile is a product and discoverability boundary, not an authorization
-	// boundary (ADR 0011) — the router authorizes every remote read and
-	// mutation regardless of which profile invoked it.
+	// --- The shared remote vocabulary. The same words mean the same thing in
+	// both profiles: a command profile is a product and discoverability
+	// boundary, not an authorization boundary (ADR 0011) — the router
+	// authorizes every remote read and mutation regardless of which profile
+	// invoked it.
+	//
+	// Driven off REMOTE_PROFILE_REGISTERED so the allowlist is the mechanism
+	// rather than a description a future edit can silently diverge from.
+	const remoteVocabulary: Record<string, () => void> = {
+		connection: () =>
+			registerConnectionCommand(program, packageJson, errorReporter),
+		runs: () => registerRunsCommand(program, packageJson, errorReporter),
+	};
 
-	registerConnectionCommand(program, packageJson, errorReporter);
-	registerRunsCommand(program, packageJson, errorReporter);
+	for (const [name, register] of Object.entries(remoteVocabulary)) {
+		if (profile === "remote" && !REMOTE_PROFILE_REGISTERED.includes(name)) {
+			continue;
+		}
+		register();
+	}
 
 	if (profile === "remote") {
 		// Returning here — with NO program-level action handler — is deliberate.

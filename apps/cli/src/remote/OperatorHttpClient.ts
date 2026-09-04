@@ -117,20 +117,50 @@ export class OperatorHttpClient {
 				"This client was created without credentials, so it cannot read the operator context.",
 			);
 		}
-		const { header, source } = await this.credentials.getAuthorization();
-		const response = await this.request(OPERATOR_CONTEXT_PATH, {
-			authorization: header,
-		});
-		if (response.status === 401 || response.status === 403) {
+		// Walk the credential chain against the ROUTER, not only against the token
+		// endpoint. Minting a token and being allowed to use it are different
+		// questions, and only the router answers the second: an unattended host
+		// can hold an ungranted managed identity alongside a granted service
+		// principal, and three of the four Entra links produce APP-ONLY tokens
+		// which `OperatorAuthorizer` refuses regardless of grant. Without this
+		// the first credential the environment happens to produce is final.
+		//
+		// Bounded by the chain length — `rejectAndAdvance` records each refused
+		// source and never offers it again, so the loop cannot re-present one.
+		const refusals: string[] = [];
+		let response: Response;
+		let source: string;
+		while (true) {
+			const authorization = await this.credentials.getAuthorization();
+			source = authorization.source;
+			response = await this.request(OPERATOR_CONTEXT_PATH, {
+				authorization: authorization.header,
+			});
+			if (response.status !== 401 && response.status !== 403) break;
+
+			refusals.push(`${source} (${response.status})`);
+			if (this.credentials.rejectAndAdvance?.(source)) continue;
+
 			// The router deliberately withholds the reason (it would enumerate
 			// workspaces and grants to an unauthorized caller), so the remedy has
-			// to come from our side: name the credential that was presented.
+			// to come from our side: name every credential that was presented.
+			const tried =
+				refusals.length > 1 ? ` Tried, in order: ${refusals.join(", ")}.` : "";
+			// The app-only remedy is offered only for the Entra sources it can
+			// apply to. A local operator token is not an Entra principal at all,
+			// so telling its holder to run `az login` sends them somewhere with no
+			// bearing on their problem — which is worse than saying less.
+			const appOnlyHint = isAppOnlyEntraSource(source)
+				? " This is an app-only credential, and a router refuses app-only tokens whatever grant they hold — sign in as a user with `az login` instead."
+				: "";
 			throw new AuthorizationError(
 				response.status === 401
-					? `The router rejected the credential from ${source} (401). It may be expired, or minted for a different audience.`
-					: `The credential from ${source} is authenticated but not authorized for fleet operations (403). Ask a router administrator for a fleet.read grant.`,
+					? `The router rejected the credential from ${source} (401). It may be expired, or minted for a different audience.${tried}`
+					: `The credential from ${source} is authenticated but not authorized for fleet operations (403). ` +
+							`Ask a router administrator for a fleet.read grant.${appOnlyHint}${tried}`,
 			);
 		}
+
 		if (response.status === 404) {
 			throw new UsageError(
 				`${this.baseUrl} does not serve ${OPERATOR_CONTEXT_PATH}. The router is too old for fleet operations.`,
@@ -198,6 +228,24 @@ export class OperatorHttpClient {
 			});
 		}
 	}
+}
+
+/**
+ * The Entra chain links that yield an APP-ONLY token.
+ *
+ * `OperatorAuthorizer.authenticateEntra` refuses `idtyp === "app"` with a 403
+ * before any grant is consulted, so for these three no grant is the remedy —
+ * which is exactly the wrong thing to tell someone unless it applies.
+ * `azure-cli` is excluded because it yields a user token.
+ */
+const APP_ONLY_ENTRA_SOURCES: ReadonlySet<string> = new Set([
+	"workload-identity",
+	"managed-identity",
+	"service-principal-env",
+]);
+
+function isAppOnlyEntraSource(source: string): boolean {
+	return APP_ONLY_ENTRA_SOURCES.has(source);
 }
 
 /**
