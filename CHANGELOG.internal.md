@@ -28,10 +28,38 @@ This changelog documents internal development changes, refactors, tooling update
   not, because `state` is a closed enum and `DeviceGateway.handleMessage` closes
   the socket on any frame it cannot parse. Without the gate a worker would be
   disconnected on its first elicitation and reconnect into the same loop.
-  `RouterConnection.sendSessionWaiting` degrades to the legacy `parked` frame when
-  the router has not advertised, and to sending NOTHING when the executor must not
-  park — lossy in one direction on purpose, since an old router has no way to
-  record a wait without also releasing affinity.
+
+  **The gate is at the SEND, in `trySendSessionState`, not at the call site.** A
+  `waiting` entry is durable, so it can be replayed minutes later — most likely
+  onto a router that was rolled back, which is exactly when it matters. An
+  ungated replay is rejected, the socket closes with 1002, we reconnect, we
+  replay: a permanent loop that `loadSessionStateEntries` cannot clear (it does
+  not reload non-terminal entries) and that takes down event delivery, RPC, and
+  every OTHER session's terminal frame queued behind it. `handleDisconnect` also
+  clears `serverCapabilities` — a capability is one router's answer on one
+  connection, and carrying it across a disconnect turns an answer into an
+  assumption about whatever build the next dial lands on.
+
+  Degradation: a parkable wait becomes the legacy `parked` frame; a non-parkable
+  one sends NOTHING and logs. Lossy in one direction on purpose — an old router
+  has no way to record a wait without also releasing affinity, and releasing it
+  for a run whose executor must not park freezes a live build.
+
+  **Terminal frames carry `runner`/`model` too, and that is not cosmetic.** The
+  ORDINARY run — no elicitation, no deferred pending work — never passes through
+  `setAgentRunState`, so its terminal frame is the only point at which execution
+  identity is ever offered. Dropping it there left the common case with
+  `runner = NULL` permanently, which no later backfill could close (the worker is
+  gone) and which would have made `runObservationV1Schema` — where `runner` is
+  required — unemittable for exactly that case.
+
+  **An unmodelled wait reason is narrowed, not rejected.** `sessionWait.reason` is
+  an open string on the wire and `EventRouter.narrowWaitReason` maps anything but
+  `elicitation` to `other`, preserving the raw reason as the condition. A closed
+  enum would have implemented criterion (b) as a parse failure, and a parse
+  failure closes the device's whole socket over one unrecognised string — the
+  precise failure `RUN_FACTS_CAPABILITY` exists to prevent, reintroduced by the
+  field meant to be the most forward-compatible thing on the frame.
 
   **Legacy `parked` is read, not inferred.** `EventRouter` treats an explicit
   `parked` frame as waiting-on-elicitation plus executor parking, which is what
@@ -67,12 +95,48 @@ This changelog documents internal development changes, refactors, tooling update
   an ended `parked` row is `unknown`, not `waiting`, so it cannot produce a
   terminal run carrying live wait evidence.
 
-  Routing snapshots are captured from the webhook (owner and workspace from the
-  device row, in `recordAgentRunRouted`'s own transaction) rather than fetched, so
-  no Linear call enters the routing hot path. Today's
-  `AgentSessionEventWebhookPayload` carries the issue's team but no project and no
-  workspace name; those fields stay absent rather than being invented, and every
-  captured name requires its canonical id.
+  **Routing snapshots are captured in two passes, because the webhook cannot
+  answer the whole question.** Linear's `AgentSessionEventWebhookPayload.issue` is
+  an `IssueWithDescriptionChildWebhookPayload` —
+  `{description?, id, identifier, team, teamId, title, url}` — so the team is free
+  and the PROJECT is not on the payload at any nesting. Owner, workspace id and
+  team are written from the webhook and the device row inside
+  `recordAgentRunRouted`'s own transaction, keeping the routing path free of a
+  Linear call; the project comes from `LinearExecutor.fetchRoutingContext`, fired
+  off the delivery path and gated by `runRoutingNeedsEnrichment` so it is one
+  round-trip per RUN, not per webhook.
+
+  `enrichRunRouting` fills only blanks and never overwrites, which is what keeps
+  the snapshot immutable despite arriving late: an issue moved between the route
+  and the read would otherwise rewrite its own history seconds after it was
+  recorded. The gate is a dedicated `routing_enriched_ms` stamp rather than any
+  snapshot column, and neither column could have served — gating on the team means
+  the read essentially never fires (it is on the webhook), and gating on the
+  project re-fetches forever for an issue that is in no project. Only "did we ask?"
+  separates not-yet-asked from asked-and-there-was-nothing.
+
+  **What `revision` does not cover.** It moves for durable run facts only. Two of
+  the change kinds `runChangeKindV1Schema` names — `worker_connectivity` and
+  `executor_state` — are joined at query time from `devices.last_seen_ms` and the
+  sandbox gauge and are deliberately not persisted, so a worker going offline and
+  returning leaves the number where it was. A `stale_revision` guard on
+  `POST /api/v1/recoveries` therefore proves the RUN's facts have not moved and
+  proves nothing about connectivity; a recovery that cares must re-read it.
+
+  **`observeRun` omits BOTH executor-state fields for an unsampled container**
+  rather than emitting `"unknown"` with no observation time — the v1 schema
+  refuses that pair, because a sample that cannot be aged has to be treated as
+  current, which is how a stale gauge comes to look like a live fact. The frozen
+  `/runs` shape reconstitutes its `"unknown"` placeholder in `toLegacyObservation`,
+  so the wire is unchanged.
+
+  **The `parked` → `waiting` conversion is one-way and a downgrade strands rows.**
+  An older router's non-terminal set has no `waiting`, so such a row is never
+  ended, never reclaimed, never swept, and each new input starts a duplicate run
+  beside it. Not fixable forward, and not migration-only (a row written by this
+  build is `waiting` too); the forward direction IS handled — `parked` stays in
+  `NON_TERMINAL_RUN_STATES` for a rolling deploy. The rollback SQL is recorded at
+  the migration site.
 
 - **Provisioned fleet-operator roles and Log Analytics access ([CYR-66](https://linear.app/northrop-digital/issue/CYR-66/provision-fleet-operator-roles-and-log-analytics-access), [#60](https://github.com/nick-boey/cyrus/pull/60)).**
   New `fleetOperatorGrants`, `enableFleetRecovery`, and

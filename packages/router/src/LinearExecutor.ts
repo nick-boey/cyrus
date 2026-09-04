@@ -331,6 +331,83 @@ export class LinearExecutor {
 	}
 
 	/**
+	 * The Linear context a run's routing snapshot records: the team and project
+	 * an issue belonged to at the instant work was routed to it.
+	 *
+	 * Exists because the webhook cannot answer it. Linear's
+	 * `AgentSessionWebhookPayload.issue` is an
+	 * `IssueWithDescriptionChildWebhookPayload` — `{description?, id, identifier,
+	 * team, teamId, title, url}` — so the team rides the webhook but the PROJECT
+	 * is simply not on it, at any nesting. Without this read, `linear_project_id`
+	 * and `linear_project_name` would be columns nothing could ever fill, and the
+	 * project filter they exist for would silently match zero runs forever.
+	 *
+	 * Called at most ONCE per run (the caller checks whether the snapshot still
+	 * needs it first) and off the delivery path, so it costs a Linear round-trip
+	 * per new run rather than per webhook. Returns `undefined` rather than
+	 * throwing on any failure: a snapshot dimension is worth a best-effort read
+	 * and never worth failing a route over.
+	 *
+	 * Both halves of each pair travel together — a name is never returned without
+	 * its canonical id, which is the invariant `runRoutingSnapshotV1Schema`
+	 * enforces on the other side.
+	 */
+	async fetchRoutingContext(
+		workspaceId: string,
+		issueId: string,
+	): Promise<
+		| {
+				linearTeamId?: string;
+				linearTeamName?: string;
+				linearProjectId?: string;
+				linearProjectName?: string;
+		  }
+		| undefined
+	> {
+		const tracker = this.trackers.get(workspaceId);
+		if (!tracker) return undefined;
+
+		let issue: Awaited<ReturnType<IIssueTrackerService["fetchIssue"]>>;
+		try {
+			issue = await tracker.fetchIssue(issueId);
+		} catch (error) {
+			this.logger.warn(
+				`Could not fetch issue ${issueId} for its routing snapshot`,
+				error,
+			);
+			return undefined;
+		}
+		if (!issue) return undefined;
+
+		// `team` and `project` are each their own Linear round-trip, so they
+		// overlap rather than stack — the same ruling as `fetchIssueFacts` above.
+		// Isolated from each other: an issue in no project is the common case and
+		// must not cost us the team.
+		const [teamResult, projectResult] = await Promise.allSettled([
+			(async () => issue.team)(),
+			(async () => issue.project)(),
+		]);
+
+		const context: {
+			linearTeamId?: string;
+			linearTeamName?: string;
+			linearProjectId?: string;
+			linearProjectName?: string;
+		} = {};
+		if (teamResult.status === "fulfilled" && teamResult.value?.id) {
+			context.linearTeamId = teamResult.value.id;
+			if (teamResult.value.name) context.linearTeamName = teamResult.value.name;
+		}
+		if (projectResult.status === "fulfilled" && projectResult.value?.id) {
+			context.linearProjectId = projectResult.value.id;
+			if (projectResult.value.name) {
+				context.linearProjectName = projectResult.value.name;
+			}
+		}
+		return context;
+	}
+
+	/**
 	 * Reads everything the repository matcher needs, in ONE `fetchIssue`.
 	 *
 	 * `team`, `project`, and `labels()` are each a separate Linear round-trip

@@ -633,6 +633,11 @@ export class RouterServer {
 				this.executor.postActivity(workspaceId, agentSessionId, body),
 			moveIssueToStartedState: (workspaceId, issueId) =>
 				this.executor.moveIssueToStartedState(workspaceId, issueId),
+			// Only the router holds a Linear token, and the agent-session webhook
+			// carries an issue's team but not its project — so this is the only way
+			// the project dimension of a run's routing snapshot can be filled.
+			fetchRoutingContext: (workspaceId, issueId) =>
+				this.executor.fetchRoutingContext(workspaceId, issueId),
 			containerTargets,
 			terminalTeardown: this.terminalTeardown,
 			...(built?.devcontainers

@@ -125,15 +125,32 @@ describe("frames", () => {
 			expect(frame.executorMayPark).toBeUndefined();
 		});
 
-		it("refuses an `other` wait with no condition", () => {
-			// It exists only to carry a condition v1 does not model. Without the text
-			// it records nothing an operator could act on.
-			expect(() =>
-				parse({
-					state: "waiting",
-					wait: { reason: "other", since: "2026-09-04T00:00:00.000Z" },
-				}),
-			).toThrow();
+		it("accepts a wait reason this version does not model", () => {
+			// `reason` is deliberately an open string, not the closed enum the v1
+			// observation uses. The router narrows anything it does not recognise to
+			// `other`; rejecting it HERE would make the narrowing a parse failure,
+			// and `DeviceGateway` answers an unparsable frame by closing the socket —
+			// dropping every session on that worker over one unmodelled string, and
+			// reconnecting into the same loop.
+			const frame = parse({
+				state: "waiting",
+				wait: { reason: "quota_backoff", since: "2026-09-04T00:00:00.000Z" },
+			});
+
+			expect(frame.wait?.reason).toBe("quota_backoff");
+		});
+
+		it("accepts an `other` wait with no condition, leaving the router to supply one", () => {
+			// The v1 observation refuses this, and the router synthesises a condition
+			// for it. The wire must still parse it, for the same reason as above: a
+			// worker that declined to describe its wait is a worker bug worth
+			// reporting, not one worth disconnecting the whole device over.
+			const frame = parse({
+				state: "waiting",
+				wait: { reason: "other", since: "2026-09-04T00:00:00.000Z" },
+			});
+
+			expect(frame.wait?.reportedCondition).toBeUndefined();
 		});
 
 		it("refuses a `waiting` frame with no wait", () => {

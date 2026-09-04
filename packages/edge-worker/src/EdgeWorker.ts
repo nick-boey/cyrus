@@ -156,6 +156,7 @@ import {
 	RouterIssueTrackerService,
 	RouterLogForwarder,
 	RouterSpanForwarder,
+	WAIT_REASON_ELICITATION,
 } from "cyrus-router-client";
 import {
 	SlackEventTransport,
@@ -638,7 +639,10 @@ export class EdgeWorker extends EventEmitter {
 					this.agentSessionManager.pendingWorkCount(sessionId);
 				this.routerConnection?.sendSessionWaiting(
 					sessionId,
-					{ reason: "elicitation", since: new Date().toISOString() },
+					{
+						reason: WAIT_REASON_ELICITATION,
+						since: new Date().toISOString(),
+					},
 					{
 						executorMayPark: pendingWorkCount === 0,
 						...this.agentSessionManager.getRunFacts(sessionId),
@@ -692,10 +696,16 @@ export class EdgeWorker extends EventEmitter {
 		this.agentSessionManager.on("sessionUnparked", (sessionId: string) => {
 			if (this.config.platform !== "router") return;
 			try {
-				this.routerConnection?.sendSessionUnparked(
-					sessionId,
-					this.agentSessionManager.getRunFacts(sessionId),
-				);
+				// Carries the CURRENT pending-work count, not just the identity. A
+				// session that reported 3 while it waited and finished that work
+				// while blocked would otherwise keep reporting 3 until it went
+				// terminal, and a stale count is worse evidence than none — it is
+				// what a `worker_owns_active_work` recovery refusal keys off.
+				this.routerConnection?.sendSessionUnparked(sessionId, {
+					...this.agentSessionManager.getRunFacts(sessionId),
+					pendingWorkCount:
+						this.agentSessionManager.pendingWorkCount(sessionId),
+				});
 			} catch (error) {
 				this.logger.error(
 					`Failed to unpark session ${sessionId}; it will keep its parked state on the router until the next terminal frame`,

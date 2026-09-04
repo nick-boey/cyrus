@@ -165,9 +165,14 @@ describe("wait on elicitation", () => {
 		settle({ answered: true, answers: { q: "CSV only" } });
 		await inFlight;
 
+		// The count is re-read, not carried over from the wait. A session that
+		// reported 3 while blocked and finished that work while blocked would
+		// otherwise keep reporting 3 until it went terminal, and a stale count is
+		// worse evidence than none — it is what a `worker_owns_active_work`
+		// recovery refusal keys off.
 		expect(routerConnection.sendSessionUnparked).toHaveBeenCalledWith(
 			SESSION_ID,
-			{ runner: "claude", model: "claude-opus-5" },
+			{ runner: "claude", model: "claude-opus-5", pendingWorkCount: 0 },
 		);
 	});
 
@@ -220,7 +225,7 @@ describe("wait on elicitation", () => {
 		// record, so retracting is safe.
 		expect(routerConnection.sendSessionUnparked).toHaveBeenCalledWith(
 			SESSION_ID,
-			expect.anything(),
+			expect.objectContaining({ pendingWorkCount: 2 }),
 		);
 	});
 

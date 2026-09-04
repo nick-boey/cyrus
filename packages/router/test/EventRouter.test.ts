@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { ContainerTargetService } from "../src/ContainerTargets.js";
 import {
 	EventRouter,
+	type EventRouterOptions,
 	TERMINAL_OWNERSHIP_GRACE_MS,
 } from "../src/EventRouter.js";
 import {
@@ -245,6 +246,7 @@ function makeRouter(
 		containerTargets?: ContainerTargetService;
 		terminalTeardown?: TerminalTeardown;
 		logger?: ILogger;
+		fetchRoutingContext?: EventRouterOptions["fetchRoutingContext"];
 		config?: Partial<{
 			eventTtlMs: number;
 			issueLock: boolean;
@@ -269,6 +271,9 @@ function makeRouter(
 		gateway,
 		postActivity,
 		moveIssueToStartedState,
+		...(overrides?.fetchRoutingContext
+			? { fetchRoutingContext: overrides.fetchRoutingContext }
+			: {}),
 		containerTargets: overrides?.containerTargets,
 		terminalTeardown: overrides?.terminalTeardown,
 		config: {
@@ -2200,12 +2205,17 @@ describe("EventRouter explicit run facts", () => {
 	async function routedSession(overrides?: {
 		identifier?: string;
 		team?: { id: string; name: string };
+		fetchRoutingContext?: EventRouterOptions["fetchRoutingContext"];
 	}) {
 		const deviceId = enroll(store, ALICE.email, {
 			name: ALICE.name,
 			linearId: ALICE.id,
 		});
-		const { router, clock } = makeRouter(store);
+		const { router, clock } = makeRouter(store, {
+			...(overrides?.fetchRoutingContext
+				? { fetchRoutingContext: overrides.fetchRoutingContext }
+				: {}),
+		});
 		const event = createdEvent({
 			sessionId: "sess-1",
 			issueId: "ISS-1",
@@ -2387,6 +2397,159 @@ describe("EventRouter explicit run facts", () => {
 		});
 
 		expect(run().pendingWorkCount).toBeUndefined();
+	});
+
+	it("narrows a wait reason it does not model to `other`, keeping the raw text", async () => {
+		const { router, deviceId } = await routedSession();
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "waiting",
+			wait: {
+				reason: "quota_backoff",
+				since: new Date(ROUTE_NOW).toISOString(),
+			},
+		});
+
+		// Criterion (b): unknown worker reasons are `other`. The narrowing happens
+		// here rather than in the frame schema, whose only way to reject a reason
+		// is a parse failure — which `DeviceGateway` answers by closing the whole
+		// device socket. The raw reason survives as the condition, so narrowing
+		// loses the classification and never the fact.
+		expect(run().wait).toEqual({
+			reason: "other",
+			sinceMs: ROUTE_NOW,
+			reportedCondition: "unmodelled worker wait reason: quota_backoff",
+		});
+	});
+
+	it("supplies a condition for an `other` wait that arrived without one", async () => {
+		const { router, deviceId } = await routedSession();
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "waiting",
+			wait: { reason: "other", since: new Date(ROUTE_NOW).toISOString() },
+		});
+
+		// An `other` wait with no text records nothing an operator could act on,
+		// and the v1 observation refuses it — but "the worker declined to say" is
+		// itself the actionable fact, and it beats closing the socket over it.
+		expect(run().wait?.reason).toBe("other");
+		expect(run().wait?.reportedCondition).toBe(
+			"the worker reported `other` without describing the condition",
+		);
+	});
+
+	it("records the runner and model a terminal frame reports", async () => {
+		const { router, deviceId } = await routedSession();
+
+		// The ordinary run: no elicitation, no deferred pending work. Its terminal
+		// frame is the ONLY point at which execution identity is ever offered, so
+		// dropping it here left the common case with `runner = NULL` forever — a
+		// gap no later backfill could close, since the worker is gone.
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "complete",
+			runner: "codex",
+			model: "gpt-5.5-codex",
+		});
+
+		expect(run()).toMatchObject({
+			state: "complete",
+			runner: "codex",
+			model: "gpt-5.5-codex",
+		});
+	});
+
+	it("fills the project dimension the webhook cannot carry", async () => {
+		// Linear's `AgentSessionEventWebhookPayload.issue` has no project field at
+		// any nesting, so without this read the project columns could never be
+		// filled and the filter they exist for would match zero runs.
+		const fetchRoutingContext = vi.fn(async () => ({
+			linearTeamId: "team-1",
+			linearTeamName: "Platform",
+			linearProjectId: "proj-1",
+			linearProjectName: "Observability",
+		}));
+		await routedSession({ fetchRoutingContext });
+		await vi.waitFor(() =>
+			expect(run().routing.linearProjectId).toBe("proj-1"),
+		);
+
+		expect(run().routing).toMatchObject({
+			linearTeamId: "team-1",
+			linearTeamName: "Platform",
+			linearProjectId: "proj-1",
+			linearProjectName: "Observability",
+		});
+		expect(fetchRoutingContext).toHaveBeenCalledWith("ws-1", "ISS-1");
+	});
+
+	it("never lets a later read rewrite a dimension captured at route time", async () => {
+		// The issue has already moved by the time the enriching read lands. The
+		// snapshot's whole value is that it does not move, so a late read may fill
+		// a blank and never overwrite.
+		const fetchRoutingContext = vi.fn(async () => ({
+			linearTeamId: "team-2",
+			linearTeamName: "Infra",
+			linearProjectId: "proj-1",
+		}));
+		await routedSession({
+			team: { id: "team-1", name: "Platform" },
+			fetchRoutingContext,
+		});
+		await vi.waitFor(() =>
+			expect(run().routing.linearProjectId).toBe("proj-1"),
+		);
+
+		expect(run().routing.linearTeamId).toBe("team-1");
+		expect(run().routing.linearTeamName).toBe("Platform");
+	});
+
+	it("asks Linear for the routing context once per run, not once per webhook", async () => {
+		// An issue in NO project answers with nothing to fill. Without a "have we
+		// asked?" stamp that reads as "still needs enrichment", and every later
+		// prompt into the same run pays another Linear round-trip forever — the
+		// commonest case being the most expensive one.
+		const fetchRoutingContext = vi.fn(async () => ({
+			linearTeamId: "team-1",
+		}));
+		const { router } = await routedSession({ fetchRoutingContext });
+		await vi.waitFor(() =>
+			expect(fetchRoutingContext).toHaveBeenCalledTimes(1),
+		);
+
+		await router.route(
+			promptedEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				actorUserId: ALICE.id,
+				creator: ALICE,
+			}),
+		);
+		await vi.waitFor(() => expect(run().inputs).toHaveLength(2));
+
+		expect(fetchRoutingContext).toHaveBeenCalledTimes(1);
+	});
+
+	it("routes normally when the routing-context read fails", async () => {
+		const fetchRoutingContext = vi.fn(async () => {
+			throw new Error("Linear is down");
+		});
+		const { deviceId } = await routedSession({ fetchRoutingContext });
+
+		// A snapshot dimension is worth a best-effort read and never worth failing
+		// a route over: the event that starts the work is already queued.
+		await vi.waitFor(() => expect(fetchRoutingContext).toHaveBeenCalled());
+		expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(1);
+		expect(run().state).toBe("routed");
 	});
 
 	it("keeps a rate limit terminal rather than turning it into a wait", async () => {

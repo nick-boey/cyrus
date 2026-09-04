@@ -183,6 +183,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   pending_work_count INTEGER,
   revision INTEGER NOT NULL DEFAULT 1,
   routed_at_ms INTEGER,
+  routing_enriched_ms INTEGER,
   workspace_id TEXT,
   workspace_name TEXT,
   owner_user_id TEXT,
@@ -589,6 +590,7 @@ interface AgentRunRow {
 	model: string | null;
 	revision: number;
 	routed_at_ms: number | null;
+	routing_enriched_ms: number | null;
 	workspace_id: string | null;
 	workspace_name: string | null;
 	owner_user_id: string | null;
@@ -1156,6 +1158,7 @@ export class RouterStore {
 			// would have every consumer handle "no revision yet" forever.
 			["revision", "INTEGER NOT NULL DEFAULT 1"],
 			["routed_at_ms", "INTEGER"],
+			["routing_enriched_ms", "INTEGER"],
 			["workspace_id", "TEXT"],
 			["workspace_name", "TEXT"],
 			["owner_user_id", "TEXT"],
@@ -1188,6 +1191,25 @@ export class RouterStore {
 		// something happened to this run, which is the closest honest upper bound
 		// on when the wait began — it can only under-state how long the run has
 		// been waiting, never over-state it.
+		//
+		// ── ONE-WAY, AND WHAT THAT COSTS ON A DOWNGRADE ──
+		// A router that predates this build has `["routed","active","parked"]` as
+		// its non-terminal set, so a `waiting` row is invisible to its
+		// `latestNonTerminalRunId`: it is never given an `ended_ms` by
+		// `finishAgentRun`, never reclaimed by `purgeDeviceScopedRows`, never swept
+		// by the 24h retention pass, and each new input starts a duplicate run
+		// beside it. Rolling back therefore strands every waiting run.
+		//
+		// Not fixable from this side — the old build's SQL is what it is, and no
+		// forward migration can teach it a state it does not know. Nor is it a
+		// migration-only exposure: a row WRITTEN by this build is `waiting` too, so
+		// undoing the conversion here would not avoid it. Two things bound it: the
+		// forward direction is handled (this build keeps `parked` in
+		// `NON_TERMINAL_RUN_STATES`, so an old router writing during a rolling
+		// deploy is understood), and the stranding is bounded to non-terminal runs,
+		// which `cyrus router sessions list` still surfaces. A rollback past this
+		// build should be followed by
+		// `UPDATE agent_runs SET state = 'parked' WHERE state = 'waiting' AND ended_ms IS NULL`.
 		this.db.exec(
 			`UPDATE agent_runs
 			 SET state = 'waiting',
@@ -2174,6 +2196,95 @@ export class RouterStore {
 		return txn();
 	}
 
+	/**
+	 * Whether this run's routing snapshot has yet had its one enriching Linear
+	 * read.
+	 *
+	 * Asked BEFORE that read so it happens at most once per RUN rather than once
+	 * per webhook: a run receives many inputs, and re-fetching an issue's project
+	 * on every prompt would put a round-trip in the routing path for a value that,
+	 * by definition, must never change once captured.
+	 *
+	 * Keyed on a dedicated "have we asked?" stamp rather than on any snapshot
+	 * column, because neither column can answer it. The TEAM is on the webhook, so
+	 * gating on it means the read essentially never fires — the exact defect this
+	 * gate would otherwise reintroduce. The PROJECT is legitimately absent for an
+	 * issue in no project, so gating on it re-fetches forever for the commonest
+	 * case. Only "did we ask?" distinguishes not-yet-asked from asked-and-there-
+	 * was-nothing.
+	 */
+	runRoutingNeedsEnrichment(runId: string): boolean {
+		const row = this.db
+			.prepare("SELECT routing_enriched_ms FROM agent_runs WHERE run_id = ?")
+			.get(runId) as { routing_enriched_ms: number | null } | undefined;
+		return row !== undefined && row.routing_enriched_ms === null;
+	}
+
+	/**
+	 * Fills routing-snapshot dimensions that are still absent, and NEVER
+	 * overwrites one already captured.
+	 *
+	 * The snapshot's whole value is that it does not move: a historical filter
+	 * reads it precisely so an issue that later changes team or project does not
+	 * rewrite the history of runs that already happened. So this is strictly
+	 * additive — the first value captured for a dimension is the one that
+	 * survives, and a late-arriving Linear read can only fill a blank. That is not
+	 * a theoretical ordering: the read is fired off the delivery path, so an issue
+	 * moved between the route and the read would otherwise rewrite its own history
+	 * seconds after it was recorded.
+	 *
+	 * A name is written only alongside its canonical id, upholding the invariant
+	 * `runRoutingSnapshotV1Schema` enforces on the other side.
+	 *
+	 * Stamps `routing_enriched_ms` unconditionally, INCLUDING when it fills
+	 * nothing — an issue in no project is a complete answer, and without the stamp
+	 * it would be re-asked on every subsequent input into the run.
+	 */
+	enrichRunRouting(
+		runId: string,
+		routing: Pick<
+			AgentRunRouting,
+			| "workspaceName"
+			| "linearTeamId"
+			| "linearTeamName"
+			| "linearProjectId"
+			| "linearProjectName"
+		>,
+		nowMs: number,
+	): void {
+		this.db.transaction(() => {
+			const current = this.db
+				.prepare(
+					`SELECT workspace_name, linear_team_id, linear_team_name,
+					        linear_project_id, linear_project_name
+					 FROM agent_runs WHERE run_id = ?`,
+				)
+				.get(runId) as Record<string, string | null> | undefined;
+			if (!current) return;
+
+			const patch: Record<string, string | number> = {
+				routing_enriched_ms: nowMs,
+			};
+			const fillIfBlank = (column: string, value: string | undefined) => {
+				if (value !== undefined && current[column] === null) {
+					patch[column] = value;
+				}
+			};
+			fillIfBlank("workspace_name", routing.workspaceName);
+			fillIfBlank("linear_team_id", routing.linearTeamId);
+			fillIfBlank("linear_project_id", routing.linearProjectId);
+			// Names only alongside a captured id — either one already on the row, or
+			// one this same patch is about to write.
+			if (patch.linear_team_id ?? current.linear_team_id) {
+				fillIfBlank("linear_team_name", routing.linearTeamName);
+			}
+			if (patch.linear_project_id ?? current.linear_project_id) {
+				fillIfBlank("linear_project_name", routing.linearProjectName);
+			}
+			this.updateAgentRun(runId, patch);
+		})();
+	}
+
 	/** The first successfully posted worker activity proves the routed run is active. */
 	recordAgentRunActivity(sessionId: string, nowMs: number): void {
 		const runId = this.latestNonTerminalRunId(sessionId);
@@ -2232,37 +2343,73 @@ export class RouterStore {
 	 * worker re-reporting the same wait on every reconnect, or an idempotent
 	 * frame replay, must therefore leave it alone — otherwise the feed becomes a
 	 * stream of "still the same" and the number stops meaning anything.
+	 *
+	 * ── WHAT THIS REVISION DOES NOT COVER ──
+	 * It moves for DURABLE run facts only, because those are the only ones stored
+	 * on the row. Two of the change kinds `runChangeKindV1Schema` names —
+	 * `worker_connectivity` and `executor_state` — are joined at QUERY time from
+	 * `devices.last_seen_ms` and the sandbox gauge, and are deliberately not
+	 * persisted here (the spec keeps them as evidence, not durable facts). So a
+	 * worker going offline and coming back, or a container's gauge changing,
+	 * leaves the revision where it was.
+	 *
+	 * That is a real limitation for whoever builds the change feed and the
+	 * `stale_revision` guard on `POST /api/v1/recoveries`: quoting a revision
+	 * proves the RUN's facts have not moved, and proves nothing about the worker's
+	 * connectivity at the instant of the request. A recovery that cares must
+	 * re-read connectivity itself rather than infer it from an unchanged number.
+	 *
+	 * Read-compare-write, so it runs in a transaction: the compare and the write
+	 * must not be separated by another connection's update, and the store's file
+	 * is documented as shared by two processes. `revision = revision + 1` is
+	 * computed in SQL regardless, so no increment can be lost even if the
+	 * comparison races.
 	 */
 	private updateAgentRun(
 		runId: string,
 		patch: Record<string, string | number | null>,
 	): void {
-		const current = this.db
-			.prepare("SELECT * FROM agent_runs WHERE run_id = ?")
-			.get(runId) as (AgentRunRow & Record<string, unknown>) | undefined;
-		if (!current) return;
+		this.db.transaction(() => {
+			const current = this.db
+				.prepare("SELECT * FROM agent_runs WHERE run_id = ?")
+				.get(runId) as (AgentRunRow & Record<string, unknown>) | undefined;
+			if (!current) return;
 
-		const changed = Object.entries(patch).filter(
-			([column, value]) => (current[column] ?? null) !== value,
-		);
-		if (changed.length === 0) return;
-		const material = changed.some(([column]) =>
-			MATERIAL_RUN_COLUMNS.has(column),
-		);
+			const changed = Object.entries(patch).filter(
+				([column, value]) => (current[column] ?? null) !== value,
+			);
+			if (changed.length === 0) return;
+			const material = changed.some(([column]) =>
+				MATERIAL_RUN_COLUMNS.has(column),
+			);
 
-		const assignments = changed.map(([column]) => `${column} = ?`);
-		if (material) assignments.push("revision = revision + 1");
-		this.db
-			.prepare(
-				`UPDATE agent_runs SET ${assignments.join(", ")} WHERE run_id = ?`,
-			)
-			.run(...changed.map(([, value]) => value), runId);
+			const assignments = changed.map(([column]) => `${column} = ?`);
+			if (material) assignments.push("revision = revision + 1");
+			this.db
+				.prepare(
+					`UPDATE agent_runs SET ${assignments.join(", ")} WHERE run_id = ?`,
+				)
+				.run(...changed.map(([, value]) => value), runId);
+		})();
 	}
 
+	/**
+	 * Moves a run to its terminal state, recording the execution identity the
+	 * worker reported on the way out.
+	 *
+	 * `facts` is not decorative here, and omitting it was a real hole: the
+	 * ORDINARY run — no elicitation, no deferred pending work — never passes
+	 * through {@link setAgentRunState} at all, so its terminal frame is the ONLY
+	 * point at which `runner` and `model` are ever offered. Dropping them there
+	 * left every such run with `runner = NULL` permanently, which is not a
+	 * gap a later backfill can close and would have made `runObservationV1Schema`
+	 * (where `runner` is required) unemittable for exactly the common case.
+	 */
 	finishAgentRun(
 		sessionId: string,
 		state: "complete" | "error" | "stopped",
 		nowMs: number,
+		facts?: { runner?: string; model?: string },
 	): void {
 		const latest = this.db
 			.prepare(
@@ -2288,6 +2435,8 @@ export class RouterStore {
 			wait_since_ms: null,
 			wait_condition: null,
 			pending_work_count: null,
+			...(facts?.runner !== undefined ? { runner: facts.runner } : {}),
+			...(facts?.model !== undefined ? { model: facts.model } : {}),
 		});
 	}
 

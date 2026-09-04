@@ -249,32 +249,61 @@ const rpcRequestFrame = z.object({
 	...traceContextFields,
 });
 /**
- * Why a worker reports that a run cannot currently progress.
+ * The reason a worker gives for a run being unable to progress, as it appears
+ * ON THE WIRE.
  *
- * Mirrors `waitReasonV1Schema` in `cyrus-operator-protocol` — declared
- * separately so this package (imported by the CLI and every runner) stays free
- * of an operator-contract dependency, exactly as {@link spanRecord} is declared
- * separately from `cyrus-otel-traces`'s `SerializedSpan`.
+ * Related to, but deliberately LOOSER than, `waitReasonV1Schema` in
+ * `cyrus-operator-protocol`. That one is a closed enum because the observation
+ * it appears in is a contract a client parses; this one is what an arbitrary
+ * worker build may send, and the router narrows it — see {@link WAIT_REASON_ELICITATION}.
  *
- * `elicitation` is the only condition v1 models. `other` carries a condition
- * the schema does not model yet, which is why it is useless — and therefore
- * refused — without the condition text.
+ * Declared here rather than imported so this package (which the CLI and every
+ * runner depend on) stays free of an operator-contract dependency, exactly as
+ * {@link spanRecord} is declared separately from `cyrus-otel-traces`'s
+ * `SerializedSpan`.
  */
-const sessionWait = z
-	.object({
-		reason: z.enum(["elicitation", "other"]),
-		/** ISO-8601, from the DEVICE's clock: when the wait began. */
-		since: z.string().min(1),
-		/** The worker's own description of the condition. */
-		reportedCondition: z.string().min(1).optional(),
-	})
-	.refine(
-		(wait) => wait.reason !== "other" || wait.reportedCondition !== undefined,
-		{
-			path: ["reportedCondition"],
-			message: "An `other` wait must carry the condition the worker reported",
-		},
-	);
+const sessionWait = z.object({
+	/**
+	 * OPEN, not the closed enum the v1 observation uses. A newer worker will
+	 * report conditions this version does not model, and the receiving router
+	 * narrows anything it does not recognise to `other` — that is criterion (b),
+	 * "unknown worker reasons are `other`", and it has to be implemented
+	 * somewhere rather than left to the sender's good behaviour.
+	 *
+	 * A closed enum here would implement it as a PARSE FAILURE instead, and
+	 * `DeviceGateway.handleMessage` answers an unparsable frame with
+	 * `ws.close(1002, "invalid frame")` — so one unmodelled reason would drop the
+	 * device's whole socket, taking every session on that worker with it, and it
+	 * would reconnect into the same loop. That is the precise failure
+	 * {@link RUN_FACTS_CAPABILITY} exists to prevent, and it would be
+	 * reintroduced here by the field meant to be the most forward-compatible
+	 * thing on the frame.
+	 */
+	reason: z.string().min(1),
+	/** ISO-8601, from the DEVICE's clock: when the wait began. */
+	since: z.string().min(1),
+	/**
+	 * The worker's own description of the condition.
+	 *
+	 * Optional on the WIRE even though the v1 observation refuses an `other` wait
+	 * without one. The receiving router synthesises a condition for a wait that
+	 * arrives without it, for the same reason `reason` is open: rejecting the
+	 * frame would close the socket, and a worker that declined to describe its
+	 * wait is a worker bug worth reporting, not one worth disconnecting the whole
+	 * device over.
+	 */
+	reportedCondition: z.string().min(1).optional(),
+});
+
+/**
+ * The one wait condition v1 models by name. Every other reason a worker reports
+ * is narrowed to `other` by the router, carrying the raw string as the
+ * condition so nothing an operator could act on is lost in the narrowing.
+ *
+ * Exported so the sender and the narrowing side spell it identically — a typo
+ * here would silently reclassify every elicitation as `other`.
+ */
+export const WAIT_REASON_ELICITATION = "elicitation";
 
 const sessionStateFrame = z
 	.object({

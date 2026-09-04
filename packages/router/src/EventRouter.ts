@@ -17,7 +17,10 @@ import {
 	withSpan,
 	withSpanSync,
 } from "cyrus-otel-traces";
-import type { SessionStateFrame } from "cyrus-router-protocol";
+import {
+	type SessionStateFrame,
+	WAIT_REASON_ELICITATION,
+} from "cyrus-router-protocol";
 import {
 	type ContainerTargetService,
 	InvalidIssueKeyError,
@@ -119,6 +122,30 @@ export interface EventRouterOptions {
 		workspaceId: string,
 		issueId: string,
 	) => Promise<string | undefined>;
+	/**
+	 * Reads the Linear team and project an issue belongs to, for a run's routing
+	 * snapshot — see {@link LinearExecutor.fetchRoutingContext}.
+	 *
+	 * Needed because the agent-session webhook carries the issue's team but NOT
+	 * its project, so without this the project dimension of the snapshot could
+	 * never be filled and the filter it exists for would match nothing.
+	 *
+	 * Called at most once per run and never on the delivery path. Optional:
+	 * omitting it leaves the snapshot with whatever the webhook carried, which is
+	 * a missing filter dimension rather than a broken route.
+	 */
+	fetchRoutingContext?: (
+		workspaceId: string,
+		issueId: string,
+	) => Promise<
+		| {
+				linearTeamId?: string;
+				linearTeamName?: string;
+				linearProjectId?: string;
+				linearProjectName?: string;
+		  }
+		| undefined
+	>;
 	/**
 	 * Routes container-executor users to per-issue ephemeral container
 	 * devices instead of a physical enrolled device. Optional: omitting it
@@ -232,6 +259,9 @@ export class EventRouter {
 	private readonly moveIssueToStartedState:
 		| ((workspaceId: string, issueId: string) => Promise<string | undefined>)
 		| undefined;
+	private readonly fetchRoutingContext:
+		| EventRouterOptions["fetchRoutingContext"]
+		| undefined;
 	private readonly containerTargets: ContainerTargetService | undefined;
 	private readonly devcontainers: DevcontainerImageService | undefined;
 	private readonly repositoryRegistry: RepositoryRegistry | undefined;
@@ -295,6 +325,7 @@ export class EventRouter {
 		this.gateway = opts.gateway;
 		this.postActivity = opts.postActivity;
 		this.moveIssueToStartedState = opts.moveIssueToStartedState;
+		this.fetchRoutingContext = opts.fetchRoutingContext;
 		this.containerTargets = opts.containerTargets;
 		this.repositoryResolver = opts.repositoryResolver;
 		this.devcontainers = opts.devcontainers;
@@ -638,13 +669,7 @@ export class EventRouter {
 			const legacy = frame.state === "parked";
 			const wait: AgentRunWait = legacy
 				? { reason: "elicitation", sinceMs: now }
-				: {
-						reason: frame.wait?.reason ?? "elicitation",
-						sinceMs: parseFrameTimestamp(frame.wait?.since) ?? now,
-						...(frame.wait?.reportedCondition
-							? { reportedCondition: frame.wait.reportedCondition }
-							: {}),
-					};
+				: narrowWaitReason(frame.wait, now);
 			// The run being blocked and its container being suspendable are
 			// independent, and only the second one releases affinity. A worker with
 			// a live background build reports `waiting` with no park permission:
@@ -817,7 +842,15 @@ export class EventRouter {
 		// Read before `finishAgentRun` moves the row to a terminal state, so a
 		// replay can still be told apart from a stray frame afterwards.
 		const priorRun = this.store.getLatestAgentRunForSession(frame.sessionId);
-		this.store.finishAgentRun(frame.sessionId, frame.state, now);
+		// The terminal frame is the ONLY point at which an ordinary run — one that
+		// never waited and never deferred for pending work — offers its runner and
+		// model. Dropping them here left that run with `runner = NULL` for good.
+		this.store.finishAgentRun(
+			frame.sessionId,
+			frame.state,
+			now,
+			readFrameRunFacts(frame),
+		);
 		// Granted BEFORE the two releases below, so there is no instant in which
 		// the terminating device owns the session by none of the routes
 		// `getSessionOwner` checks. Unlike the park path, which keeps the issue
@@ -1787,6 +1820,41 @@ export class EventRouter {
 	}
 
 	/**
+	 * Fills the routing-snapshot dimensions the webhook could not supply.
+	 *
+	 * Entirely best-effort, on every axis. It returns early when the snapshot is
+	 * already complete (so it is one Linear read per run, not per webhook), the
+	 * read itself is allowed to fail, and the store fills only blanks — so a
+	 * dimension captured at route time can never be rewritten by a later read of
+	 * an issue that has since moved.
+	 *
+	 * A failure here costs a filter dimension on one run. It must never be
+	 * allowed to fail a route, which is why the caller does not await it and why
+	 * everything below is swallowed.
+	 */
+	private async enrichRunRouting(
+		runId: string,
+		workspaceId: string,
+		issueId: string,
+	): Promise<void> {
+		if (!this.fetchRoutingContext) return;
+		try {
+			if (!this.store.runRoutingNeedsEnrichment(runId)) return;
+			const context = await this.fetchRoutingContext(workspaceId, issueId);
+			// Stamped even for an empty answer — an issue in no project is a
+			// complete answer, and leaving the run un-stamped would re-ask on every
+			// subsequent input. A read that THREW is deliberately not stamped: the
+			// next input retries it.
+			if (context) this.store.enrichRunRouting(runId, context, this.now());
+		} catch (error) {
+			this.logger.warn(
+				`Could not complete the routing snapshot for run ${runId} (issue ${issueId}); its team/project filters will be incomplete`,
+				error,
+			);
+		}
+	}
+
+	/**
 	 * Marks a delegated issue as started in Linear. Reached only once the event
 	 * has been accepted — an unenrolled creator or a lock rejection returns from
 	 * {@link routeCreated} before this, so a rejected issue is never promoted.
@@ -2481,7 +2549,7 @@ export class EventRouter {
 		const input = extractRunInput(event, routedMs);
 		const issueId =
 			event.agentSession.issueId ?? event.agentSession.issue?.id ?? undefined;
-		this.store.recordAgentRunRouted({
+		const runId = this.store.recordAgentRunRouted({
 			deviceId: target.deviceId,
 			issueKey: extractIssueKey(event) ?? target.issueKey ?? "unknown",
 			...(issueId !== undefined ? { issueId } : {}),
@@ -2493,6 +2561,13 @@ export class EventRouter {
 			routing: extractRoutingSnapshot(event),
 			...input,
 		});
+		// The project is not on the webhook at any nesting, so it takes a Linear
+		// read. Fire-and-forget and gated on the snapshot still being blank, so it
+		// costs one round-trip per RUN and never delays delivery — the queued event
+		// below is what actually starts the work.
+		if (issueId !== undefined) {
+			void this.enrichRunRouting(runId, workspaceId, issueId);
+		}
 
 		if (this.gateway.isOnline(target.deviceId)) {
 			this.gateway.deliverPending(target.deviceId);
@@ -2649,6 +2724,40 @@ function parseFrameTimestamp(value: string | undefined): number | undefined {
 	return Number.isFinite(ms) ? ms : undefined;
 }
 
+/**
+ * Narrows an arbitrary worker-reported wait to the closed v1 vocabulary.
+ *
+ * `elicitation` is the only condition v1 models by name; everything else — a
+ * reason from a newer worker, a typo, or a literal `other` — becomes `other`,
+ * carrying text that says what the worker actually reported. The raw reason is
+ * preserved as the condition rather than discarded, so narrowing loses the
+ * classification but never the fact.
+ *
+ * The narrowing happens HERE, not in the frame schema, because the schema's only
+ * way to reject a reason is a parse failure, and `DeviceGateway` answers that by
+ * closing the device's socket — dropping every session on that worker over one
+ * unmodelled string. See `sessionWait` in `cyrus-router-protocol`.
+ *
+ * A wait with no condition at all still gets one, because an `other` wait
+ * without text records nothing an operator could act on — and "the worker
+ * declined to say" is itself the actionable fact.
+ */
+function narrowWaitReason(
+	wait: SessionStateFrame["wait"],
+	nowMs: number,
+): AgentRunWait {
+	const sinceMs = parseFrameTimestamp(wait?.since) ?? nowMs;
+	if (wait?.reason === WAIT_REASON_ELICITATION) {
+		return { reason: "elicitation", sinceMs };
+	}
+	const reportedCondition =
+		wait?.reportedCondition ??
+		(wait?.reason !== undefined && wait.reason !== "other"
+			? `unmodelled worker wait reason: ${wait.reason}`
+			: "the worker reported `other` without describing the condition");
+	return { reason: "other", sinceMs, reportedCondition };
+}
+
 /** The execution identity and pending-work count a worker reported, if any. */
 function readFrameRunFacts(frame: SessionStateFrame): {
 	runner?: string;
@@ -2665,47 +2774,43 @@ function readFrameRunFacts(frame: SessionStateFrame): {
 }
 
 /**
- * The Linear context an input arrived under, for the run's routing snapshot.
+ * What the WEBHOOK alone can say about the Linear context an input arrived
+ * under, for the run's routing snapshot.
  *
- * Read defensively from the webhook rather than fetched: a Linear call here
- * would sit in the routing hot path, and every field is optional in the
- * snapshot precisely so a thin payload costs a filter dimension rather than the
- * whole run. Today's `AgentSessionEventWebhookPayload` carries the issue's team
- * (id, key, name) but no project and no workspace name, so those stay absent
- * until a payload that has them arrives — which is why they are read through
- * `unknown` rather than off the SDK type.
+ * Read from the webhook rather than fetched, because this runs on the routing
+ * path and a Linear round-trip here would delay every delivery. What the
+ * webhook cannot answer is filled afterwards, off the path, by
+ * `EventRouter.enrichRunRouting`.
+ *
+ * The split is not arbitrary — it is exactly what Linear puts on an
+ * `AgentSessionEventWebhookPayload`. Its `agentSession.issue` is an
+ * `IssueWithDescriptionChildWebhookPayload`, whose complete field set is
+ * `{description?, id, identifier, team, teamId, title, url}`. So the TEAM is
+ * here and free; the PROJECT is not on the payload at any nesting and costs a
+ * fetch; and the workspace NAME appears nowhere on the webhook at all, only its
+ * id. Reading through `unknown` rather than off the SDK type keeps this
+ * tolerant of a payload that gains fields later.
  */
 function extractRoutingSnapshot(webhook: SessionEvent): {
 	workspaceId?: string;
-	workspaceName?: string;
 	linearTeamId?: string;
 	linearTeamName?: string;
-	linearProjectId?: string;
-	linearProjectName?: string;
 } {
 	const session = webhook.agentSession as unknown as Record<string, unknown>;
 	const issue = session.issue as Record<string, unknown> | null | undefined;
 	const team = issue?.team as Record<string, unknown> | null | undefined;
-	const project = issue?.project as Record<string, unknown> | null | undefined;
 
 	const workspaceId = readNonEmptyString(webhook.organizationId);
 	const teamId =
 		readNonEmptyString(team?.id) ?? readNonEmptyString(issue?.teamId);
-	const projectId =
-		readNonEmptyString(project?.id) ?? readNonEmptyString(issue?.projectId);
+	const teamName = readNonEmptyString(team?.name);
 	// A captured name never travels without its canonical id — that invariant is
 	// enforced by `runRoutingSnapshotV1Schema`, and honouring it here keeps a
 	// name-only payload from producing an unemittable observation later.
 	return {
 		...(workspaceId ? { workspaceId } : {}),
 		...(teamId ? { linearTeamId: teamId } : {}),
-		...(teamId && readNonEmptyString(team?.name)
-			? { linearTeamName: readNonEmptyString(team?.name) }
-			: {}),
-		...(projectId ? { linearProjectId: projectId } : {}),
-		...(projectId && readNonEmptyString(project?.name)
-			? { linearProjectName: readNonEmptyString(project?.name) }
-			: {}),
+		...(teamId && teamName ? { linearTeamName: teamName } : {}),
 	};
 }
 

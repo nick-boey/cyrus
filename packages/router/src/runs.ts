@@ -212,15 +212,17 @@ export function observeRun(
 		},
 		// Only a container has a sampled executor state: park applies to a
 		// container, and a physical device is not something the router samples.
-		...(run.executorKind === "container"
+		//
+		// A sample and its observation time travel TOGETHER or not at all — the v1
+		// observation refuses the pair split, because a sample that cannot be aged
+		// has to be treated as current, which is exactly how a stale gauge comes to
+		// look like a live fact. So a container that has never been sampled reports
+		// NEITHER: absence is the honest reading of "no sample", whereas an
+		// `unknown` state with no time is a sample claiming to be one.
+		...(run.executorKind === "container" && sandbox
 			? {
-					executorState: sandbox?.state ?? "unknown",
-					// A sample with no observation time cannot be aged, so the two
-					// travel together. `unknown` with no time is the honest reading of
-					// "never sampled", not a stale gauge presented as current.
-					...(sandbox
-						? { executorStateObservedAt: iso(sandbox.observedMs) }
-						: {}),
+					executorState: sandbox.state,
+					executorStateObservedAt: iso(sandbox.observedMs),
 				}
 			: {}),
 		revision: run.revision,
@@ -257,11 +259,19 @@ function toLegacyObservation(run: RunObservation): AgentRunObservation {
 		...(run.worker.lastHeartbeatAt !== undefined
 			? { lastHeartbeatAt: run.worker.lastHeartbeatAt }
 			: {}),
-		...(run.executorState !== undefined
-			? { sandboxState: run.executorState }
-			: {}),
-		...(run.executorStateObservedAt !== undefined
-			? { sandboxStateObservedAt: run.executorStateObservedAt }
+		// The legacy shape has always reported `sandboxState: "unknown"` for a
+		// container it has never sampled, and existing clients read the field's
+		// presence as "this is a container". The internal observation now omits
+		// both fields in that case (a sample with no time is refused by v1), so
+		// the `"unknown"` placeholder is reconstituted HERE rather than being
+		// carried in a shape that must not hold it.
+		...(run.executorKind === "container"
+			? {
+					sandboxState: run.executorState ?? "unknown",
+					...(run.executorStateObservedAt !== undefined
+						? { sandboxStateObservedAt: run.executorStateObservedAt }
+						: {}),
+				}
 			: {}),
 	};
 }
