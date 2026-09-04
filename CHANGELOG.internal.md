@@ -5,6 +5,70 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Remote command profile and named router connections ([CYR-67](https://linear.app/northrop-digital/issue/CYR-67/add-the-remote-command-profile-and-named-router-connections)).**
+  New `apps/cli/src/remote/` module — `errors.ts`, `credentials.ts`,
+  `ConnectionStore.ts`, `OperatorHttpClient.ts` — plus
+  `commands/ConnectionCommand.ts` and a command profile in `buildProgram.ts`.
+  The CLI side of the CYR-64 contracts and the CYR-65 router routes; it depends
+  on `cyrus-operator-protocol` and never on `cyrus-router`.
+
+  `ConnectionStore` is the only code that reads or writes stored connections and
+  `OperatorHttpClient` the only code that reaches a router, so "where do
+  connections live" and "how is a router request authenticated, validated, and
+  version-negotiated" each stay one decision. Every other module takes a
+  resolved record or a parsed document.
+
+  **Version negotiation runs BEFORE schema validation**, and the order is the
+  whole point. `operatorApiVersionV1Schema` is a closed enum, so a router
+  serving only `v2` fails the strict parse and would be reported as a MALFORMED
+  document — the one case where "this router is newer than your CLI" is exactly
+  what the operator needs to hear. `discover()` therefore reads
+  `operatorApiVersions` permissively first and refuses a disjoint set with the
+  upgrade message.
+
+  **The Entra chain is ours, not `DefaultAzureCredential`.** Order is pinned —
+  workload identity, managed identity, service-principal env, Azure CLI — and
+  asserted by a test, because a CI runner has both a federated token and a
+  managed identity and a workstation often has stale `AZURE_CLIENT_*` exports
+  beside an `az login`: whichever comes first decides who the router sees. There
+  is deliberately no browser or device-code link, since a credential that can
+  block on a human turns a failed authentication inside an orchestrating agent
+  into a hung session with no output. Walking the chain ourselves is also what
+  produces `source`, which is the single most useful fact when a command is
+  authorized in one shell and refused in another; the winning credential is
+  remembered, and a token is acquired on every request so each credential's own
+  expiry-aware cache stays authoritative.
+
+  **`--connection`/`--workspace` are attached to each fleet command, not to the
+  program.** Commander resolves an option a parent and child both declare in
+  favour of the PARENT: a program-level `--workspace` swallows
+  `router operators create-token --workspace a --workspace b` into a
+  single-valued parent option and hands the subcommand an empty array — silently
+  minting a token authorized over no workspaces. `enablePositionalOptions()`
+  fixes that collision but breaks `cyrus start --cyrus-home /x`, which works
+  today. Both behaviours are pinned by tests in `buildProgram.test.ts`.
+
+  The remote profile returns from `buildProgram` with **no program-level action
+  handler**, also deliberately: Commander then rejects `cyrus router unlock X`
+  as `unknown command 'router'` and prints help for a bare `cyrus`. Registering
+  an action to print help instead makes Commander read the subcommand as excess
+  program arguments and report "too many arguments. Expected 0 arguments but got
+  3", which explains nothing.
+
+  `REMOTE_PROFILE_COMMANDS` is an ALLOWLIST containing `logs`, `recover`, and
+  `skills` before they exist (CYR-73/76/77), so a future command reaches the
+  remote profile only by being added there deliberately; the test asserts the
+  registered set is a SUBSET of it and names the forbidden commands explicitly.
+  Per ADR 0011 this is a product boundary, not an authorization one — the
+  server-side tests in `OperatorAuthorizer.test.ts` remain the security proof.
+
+  `operatorConnections` is a new `EdgeConfigSchema` field, classified into
+  `RELOAD_EXEMPT_KEYS`: no EdgeWorker code path reads it, and merging it would
+  fire a `configChanged` event on every `cyrus connection add`. Its auth union is
+  `z.strictObject` so a hand-added `token:` is REFUSED rather than silently
+  stripped, which keeps the "a stored connection carries no credential"
+  invariant enforceable rather than aspirational.
+
 - **Authenticated scoped fleet operators and exposed discovery ([CYR-65](https://linear.app/northrop-digital/issue/CYR-65/authenticate-scoped-fleet-operators-and-expose-discovery), [#58](https://github.com/nick-boey/cyrus/pull/58)).**
   New `packages/router/src/fleet-operations/` module — `types.ts`,
   `OperatorAuthorizer.ts`, `FleetOperations.ts`, `routes.ts` — implementing the

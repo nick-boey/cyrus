@@ -67,6 +67,7 @@ describe("JSON Schema export", () => {
 				"ngrokAuthToken",
 				"stripeCustomerId",
 				"linearWorkspaceSlug",
+				"operatorConnections",
 			];
 			for (const field of expectedFields) {
 				expect(schema.properties).toHaveProperty(field);
@@ -100,6 +101,24 @@ describe("JSON Schema export", () => {
 			expect(pd.properties).toHaveProperty("scoper");
 			expect(pd.properties).toHaveProperty("orchestrator");
 			expect(pd.properties).toHaveProperty("graphite-orchestrator");
+		});
+
+		it("represents operatorConnections as a record whose auth is a closed union", () => {
+			// The two auth variants are the whole point of the field: an editor
+			// validating config.json against this schema must reject a stored
+			// connection that carries, say, a literal `token`, which is exactly the
+			// shape a user would reach for and exactly the one that must never be
+			// persisted.
+			const connections = schema.properties.operatorConnections;
+			expect(connections.type).toBe("object");
+			const entry = connections.additionalProperties;
+			expect(entry.required).toEqual(["url", "auth"]);
+			const variants = entry.properties.auth.oneOf;
+			expect(variants).toHaveLength(2);
+			expect(variants[0].required).toEqual(["kind", "tenantId", "audience"]);
+			expect(variants[0].additionalProperties).toBe(false);
+			expect(variants[1].required).toEqual(["kind", "tokenEnv"]);
+			expect(variants[1].additionalProperties).toBe(false);
 		});
 
 		it("represents linearWorkspaces as record with string keys", () => {
