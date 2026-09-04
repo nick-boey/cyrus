@@ -5,6 +5,75 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Captured routing and worker-reported run facts ([CYR-68](https://linear.app/northrop-digital/issue/CYR-68/capture-routing-and-worker-reported-run-facts)).**
+  The `session_state` frame gains an explicit `waiting` state carrying
+  `wait { reason, since, reportedCondition }`, a separate `executorMayPark`
+  declaration, and `runner` / `model` / `pendingWorkCount`. `agent_runs` gains
+  matching columns plus a routing snapshot and a `revision`, and `runs.ts` grows
+  an internal `RunObservation` that the frozen `GET /runs` shape is rendered
+  from.
+
+  **The park/wait split is the whole point.** `parked` conflated two independent
+  facts — the RUN is blocked on a user, and its CONTAINER may be suspended — so
+  `createAskUserQuestionCallback` had to suppress the report entirely when
+  `hasPendingWork` was true, because reporting it would also have released
+  affinity and let the sweep freeze a live build. The result was that the one
+  case most worth seeing produced no signal. The frame now separates them:
+  the wait is always reported, and `executorMayPark` alone gates
+  `clearSessionAffinity` / `setDeviceParkedAt` in `EventRouter`.
+
+  **`waiting` is capability-gated, not version-bumped** — `RUN_FACTS_CAPABILITY`,
+  following `LOG_INGEST_CAPABILITY` exactly. The additive FIELDS are already safe
+  against an old router (`z.object` strips unknown keys); the new `state` VALUE is
+  not, because `state` is a closed enum and `DeviceGateway.handleMessage` closes
+  the socket on any frame it cannot parse. Without the gate a worker would be
+  disconnected on its first elicitation and reconnect into the same loop.
+  `RouterConnection.sendSessionWaiting` degrades to the legacy `parked` frame when
+  the router has not advertised, and to sending NOTHING when the executor must not
+  park — lossy in one direction on purpose, since an old router has no way to
+  record a wait without also releasing affinity.
+
+  **Legacy `parked` is read, not inferred.** `EventRouter` treats an explicit
+  `parked` frame as waiting-on-elicitation plus executor parking, which is what
+  that frame has always meant. The router still never derives a wait from silence,
+  elapsed time, or executor state.
+
+  **The `active` branch had to stop requiring a park on record.** A non-parking
+  wait leaves no `parkedSessionCreators` entry, so the old early-return would have
+  left such a run labelled `waiting` forever. It now falls through to a
+  gated-on-ownership, grants-nothing path that records facts only — no affinity,
+  no grace, no park entry. The pre-existing behaviour for a stray `active` from a
+  non-owner (log and ignore) is unchanged.
+
+  **`sendRunFacts` is deliberately fire-and-forget**, unlike every other
+  `session_state`. Making it durable would make it replayable, and a replayed
+  `active` against a router that has since recorded a park mints affinity back — a
+  real hazard bought for a count.
+
+  **Revision increments on material change only.** `updateAgentRun` diffs the
+  patch against the row and bumps only when a `MATERIAL_RUN_COLUMNS` member
+  actually moved; `last_routed_ms` is excluded, since a real route also changes
+  `inputs_json`. An idempotent frame replay must not look like a change to a
+  watching client.
+
+  **Migration converts non-terminal `state = 'parked'` to `waiting` +
+  `wait_reason = 'elicitation'` and leaves terminal rows alone.** Nothing else is
+  backfilled: a run routed before this migration was routed by a router that
+  captured no snapshot and knew no runner, and writing one now would fabricate
+  history into exactly the columns whose purpose is to be faithful. That is the
+  constraint `runObservationV1Schema`'s doc comment hands to whoever adds
+  `/api/v1/runs` — scope it to post-migration runs, or backfill. `toAgentRunInfo`
+  reads a legacy row's state through `readAgentRunState`, where `ended_ms` wins:
+  an ended `parked` row is `unknown`, not `waiting`, so it cannot produce a
+  terminal run carrying live wait evidence.
+
+  Routing snapshots are captured from the webhook (owner and workspace from the
+  device row, in `recordAgentRunRouted`'s own transaction) rather than fetched, so
+  no Linear call enters the routing hot path. Today's
+  `AgentSessionEventWebhookPayload` carries the issue's team but no project and no
+  workspace name; those fields stay absent rather than being invented, and every
+  captured name requires its canonical id.
+
 - **Provisioned fleet-operator roles and Log Analytics access ([CYR-66](https://linear.app/northrop-digital/issue/CYR-66/provision-fleet-operator-roles-and-log-analytics-access), [#60](https://github.com/nick-boey/cyrus/pull/60)).**
   New `fleetOperatorGrants`, `enableFleetRecovery`, and
   `fleetOperatorLogReaderPrincipalIds` parameters on `infra/azure/bicep/main.bicep`,

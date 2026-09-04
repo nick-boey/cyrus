@@ -143,6 +143,39 @@ describe("LinearExecutor.dispatch", () => {
 		expect(activityObserved).toHaveBeenCalledWith("s1", expect.any(Number));
 	});
 
+	it("clears a wait when the run publishes an activity", async () => {
+		store.addUser({ email: "alice@example.com" });
+		const code = store.mintEnrollmentCode("alice@example.com", 1);
+		const device = store.redeemEnrollmentCode(code, 1);
+		if (!device) throw new Error("enroll failed");
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-1",
+			sessionId: "s1",
+			routedMs: 1_000,
+		});
+		store.setAgentRunState("s1", "waiting", {
+			wait: { reason: "elicitation", sinceMs: 1_100 },
+		});
+		store.setSessionAffinity("s1", device.deviceId);
+
+		await executor.dispatch(
+			device.deviceId,
+			frame("createAgentActivity", [
+				{ agentSessionId: "s1", content: { type: "thought", body: "hi" } },
+			]),
+		);
+
+		// A run that just published to the timeline is demonstrably progressing.
+		// Leaving the wait behind would go on reporting a block the run itself has
+		// disproved — and `lastPublishedActivityAt` is the freshness a caller
+		// applies its own staleness policy to.
+		const run = store.listAgentRuns({ userId: 1 })[0];
+		expect(run?.state).toBe("active");
+		expect(run?.wait).toBeUndefined();
+		expect(run?.lastAgentActivityMs).toEqual(expect.any(Number));
+	});
+
 	it("does not count an activity payload that Linear reports unsuccessful", async () => {
 		store.setSessionAffinity("s1", DEVICE_A);
 		tracker.createAgentActivity.mockResolvedValueOnce({ success: false });

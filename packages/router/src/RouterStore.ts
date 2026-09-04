@@ -173,7 +173,24 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   ended_ms INTEGER,
   inputs_json TEXT NOT NULL,
   executor_kind TEXT NOT NULL,
-  provider TEXT
+  provider TEXT,
+  issue_id TEXT,
+  runner TEXT,
+  model TEXT,
+  wait_reason TEXT,
+  wait_since_ms INTEGER,
+  wait_condition TEXT,
+  pending_work_count INTEGER,
+  revision INTEGER NOT NULL DEFAULT 1,
+  routed_at_ms INTEGER,
+  workspace_id TEXT,
+  workspace_name TEXT,
+  owner_user_id TEXT,
+  owner_name TEXT,
+  linear_team_id TEXT,
+  linear_team_name TEXT,
+  linear_project_id TEXT,
+  linear_project_name TEXT
 );
 `;
 
@@ -464,14 +481,59 @@ export interface SessionInfo {
 	creatorName?: string;
 }
 
+/**
+ * The lifecycle of an agent run — a continuous episode of work within a Linear
+ * agent session.
+ *
+ * This is NOT the state of the machine the run executes on. There is no
+ * `parked` here: park is what happens to an idle CONTAINER, and the run-level
+ * concept it used to stand for is the explicitly worker-reported `waiting`.
+ * `parked` survives only on the wire, as the legacy spelling a pre-run-facts
+ * worker still sends.
+ */
 export type AgentRunState =
 	| "routed"
 	| "active"
-	| "parked"
+	| "waiting"
 	| "complete"
 	| "error"
 	| "stopped"
 	| "unknown";
+
+/**
+ * Why a worker reported that a run cannot progress. Never inferred by the
+ * router from silence, elapsed time, or executor state.
+ */
+export type AgentRunWaitReason = "elicitation" | "other";
+
+export interface AgentRunWait {
+	reason: AgentRunWaitReason;
+	sinceMs: number;
+	/** The worker's own description. Required when the reason is `other`. */
+	reportedCondition?: string;
+}
+
+/**
+ * The workspace, owner, and Linear context captured WHEN THE RUN'S FIRST INPUT
+ * WAS ROUTED, and never rewritten afterwards.
+ *
+ * Historical filters read this rather than calling Linear at query time, so an
+ * issue that later moves team or project does not rewrite the history of runs
+ * that already happened. IDs are canonical; names are captured alongside them
+ * for display, which is why a name never appears without its id.
+ */
+export interface AgentRunRouting {
+	workspaceId?: string;
+	workspaceName?: string;
+	/** The Cyrus user who owns the run — the router's own `users.user_id`. */
+	ownerUserId?: string;
+	ownerName?: string;
+	linearTeamId?: string;
+	linearTeamName?: string;
+	linearProjectId?: string;
+	linearProjectName?: string;
+	routedAtMs?: number;
+}
 
 export interface AgentRunInput {
 	activityId?: string;
@@ -485,8 +547,20 @@ export interface AgentRunInfo {
 	userId: number;
 	deviceId: number;
 	issueKey: string;
+	issueId?: string;
 	sessionId: string;
 	state: AgentRunState;
+	/** Present exactly when `state` is `waiting`. */
+	wait?: AgentRunWait;
+	/**
+	 * Background work the run is still carrying. An active-run fact, not a wait
+	 * reason — the two coexist, since a run blocked on an elicitation with a live
+	 * background build is precisely what decides whether its container may park.
+	 */
+	pendingWorkCount?: number;
+	runner?: string;
+	model?: string;
+	routing: AgentRunRouting;
 	startedMs: number;
 	lastRoutedMs: number;
 	lastAgentActivityMs?: number;
@@ -495,6 +569,8 @@ export interface AgentRunInfo {
 	executorKind: "device" | "container";
 	provider?: string;
 	lastHeartbeatMs?: number;
+	/** Incremented on each material change; quoted by a recovery request. */
+	revision: number;
 }
 
 interface AgentRunRow {
@@ -502,8 +578,25 @@ interface AgentRunRow {
 	user_id: number;
 	device_id: number;
 	issue_key: string;
+	issue_id: string | null;
 	session_id: string;
 	state: string;
+	wait_reason: string | null;
+	wait_since_ms: number | null;
+	wait_condition: string | null;
+	pending_work_count: number | null;
+	runner: string | null;
+	model: string | null;
+	revision: number;
+	routed_at_ms: number | null;
+	workspace_id: string | null;
+	workspace_name: string | null;
+	owner_user_id: string | null;
+	owner_name: string | null;
+	linear_team_id: string | null;
+	linear_team_name: string | null;
+	linear_project_id: string | null;
+	linear_project_name: string | null;
 	started_ms: number;
 	last_routed_ms: number;
 	last_agent_activity_ms: number | null;
@@ -514,7 +607,56 @@ interface AgentRunRow {
 	last_seen_ms?: number | null;
 }
 
-const NON_TERMINAL_RUN_STATES = ["routed", "active", "parked"] as const;
+/**
+ * Includes the legacy `parked` so a row written by a router that predates the
+ * migration — or by one running concurrently mid-deploy — is still recognised
+ * as a run that can resume. Dropping it here would make such a row invisible to
+ * `latestNonTerminalRunId`, which would silently start a second run for the
+ * same session.
+ */
+const NON_TERMINAL_RUN_STATES = [
+	"routed",
+	"active",
+	"waiting",
+	"parked",
+] as const;
+
+/**
+ * Columns whose change is worth a new observation revision.
+ *
+ * Deliberately excludes `last_routed_ms`: on its own it is a freshness stamp,
+ * and bumping the revision for it would make a watch a firehose of "still the
+ * same". A route that actually delivers input changes `inputs_json` too, which
+ * IS material — so a real routing event still increments and a repeated
+ * no-change write does not.
+ */
+const MATERIAL_RUN_COLUMNS = new Set([
+	"user_id",
+	"device_id",
+	"issue_key",
+	"issue_id",
+	"state",
+	"wait_reason",
+	"wait_since_ms",
+	"wait_condition",
+	"pending_work_count",
+	"runner",
+	"model",
+	"routed_at_ms",
+	"workspace_id",
+	"workspace_name",
+	"owner_user_id",
+	"owner_name",
+	"linear_team_id",
+	"linear_team_name",
+	"linear_project_id",
+	"linear_project_name",
+	"last_agent_activity_ms",
+	"ended_ms",
+	"inputs_json",
+	"executor_kind",
+	"provider",
+]);
 
 function parseRunInputs(value: string): AgentRunInput[] {
 	try {
@@ -531,14 +673,69 @@ function parseRunInputs(value: string): AgentRunInput[] {
 	}
 }
 
+/**
+ * The wait a row records, or `undefined` when it is not waiting.
+ *
+ * A `parked` row is read as waiting-on-elicitation: that is what the legacy
+ * state always meant, and a router mid-deploy (or a database whose migration
+ * has not run yet) can still hold one. The `since` falls back the same way the
+ * migration does — to the last instant the router knows something happened —
+ * because the legacy frame never carried one.
+ */
+function readAgentRunWait(row: AgentRunRow): AgentRunWait | undefined {
+	if (row.ended_ms !== null) return undefined;
+	if (row.state !== "waiting" && row.state !== "parked") return undefined;
+	const reason: AgentRunWaitReason =
+		row.wait_reason === "other" ? "other" : "elicitation";
+	return {
+		reason,
+		sinceMs: row.wait_since_ms ?? row.last_routed_ms,
+		...(row.wait_condition ? { reportedCondition: row.wait_condition } : {}),
+	};
+}
+
+/**
+ * The lifecycle a row reports, with the legacy `parked` corrected on the way
+ * out so the vocabulary fix cannot leak past the store.
+ *
+ * `ended_ms` wins over the state column. A row that ended is terminal whatever
+ * its state says, and a legacy `parked` row that also ended is exactly what
+ * `unknown` describes: ownership finished without a terminal outcome reaching
+ * the router. Reading it as `waiting` instead would produce an ended run
+ * carrying live wait evidence — the contradiction the v1 observation refuses.
+ */
+function readAgentRunState(row: AgentRunRow): AgentRunState {
+	if (row.state !== "parked") return row.state as AgentRunState;
+	return row.ended_ms === null ? "waiting" : "unknown";
+}
+
 function toAgentRunInfo(row: AgentRunRow): AgentRunInfo {
+	const wait = readAgentRunWait(row);
 	return {
 		runId: row.run_id,
 		userId: row.user_id,
 		deviceId: row.device_id,
 		issueKey: row.issue_key,
+		issueId: row.issue_id ?? undefined,
 		sessionId: row.session_id,
-		state: row.state as AgentRunState,
+		state: readAgentRunState(row),
+		...(wait ? { wait } : {}),
+		...(row.pending_work_count !== null
+			? { pendingWorkCount: row.pending_work_count }
+			: {}),
+		runner: row.runner ?? undefined,
+		model: row.model ?? undefined,
+		routing: {
+			workspaceId: row.workspace_id ?? undefined,
+			workspaceName: row.workspace_name ?? undefined,
+			ownerUserId: row.owner_user_id ?? undefined,
+			ownerName: row.owner_name ?? undefined,
+			linearTeamId: row.linear_team_id ?? undefined,
+			linearTeamName: row.linear_team_name ?? undefined,
+			linearProjectId: row.linear_project_id ?? undefined,
+			linearProjectName: row.linear_project_name ?? undefined,
+			routedAtMs: row.routed_at_ms ?? undefined,
+		},
 		startedMs: row.started_ms,
 		lastRoutedMs: row.last_routed_ms,
 		lastAgentActivityMs: row.last_agent_activity_ms ?? undefined,
@@ -547,6 +744,7 @@ function toAgentRunInfo(row: AgentRunRow): AgentRunInfo {
 		executorKind: row.executor_kind as "device" | "container",
 		provider: row.provider ?? undefined,
 		lastHeartbeatMs: row.last_seen_ms ?? undefined,
+		revision: row.revision ?? 1,
 	};
 }
 
@@ -914,6 +1112,89 @@ export class RouterStore {
 				)
 				.run(Date.now());
 		}
+
+		this.migrateAgentRunFacts();
+	}
+
+	/**
+	 * The explicit run facts (CYR-68): routing snapshots, execution identity, the
+	 * worker-reported wait, and the observation revision.
+	 *
+	 * Every column is added independently, the same way the `events` trace
+	 * columns above are. These `ALTER`s run outside a transaction, so a crash
+	 * partway through must leave a database that the next start repairs rather
+	 * than one a paired check skips forever.
+	 *
+	 * NONE of the new columns is backfilled with an invented value. A run routed
+	 * before this migration was routed by a router that captured no snapshot and
+	 * knew no runner; writing one now would be fabricating history into exactly
+	 * the columns whose whole purpose is to be a faithful record of routing time.
+	 * The consequence is documented on `runObservationV1Schema`: rows written
+	 * before this migration cannot be rendered as a v1 observation, so whichever
+	 * issue adds `/api/v1/runs` must scope that route to runs routed after it.
+	 * Terminal runs age out within 24 hours, so the gap closes on its own for all
+	 * but the long-stuck runs — which are, unhelpfully, the ones an operator most
+	 * needs to see.
+	 */
+	private migrateAgentRunFacts(): void {
+		const runCols = this.db
+			.prepare("PRAGMA table_info(agent_runs)")
+			.all() as Array<{ name: string }>;
+		if (runCols.length === 0) return;
+		const have = new Set(runCols.map((c) => c.name));
+
+		for (const [name, ddl] of [
+			["issue_id", "TEXT"],
+			["runner", "TEXT"],
+			["model", "TEXT"],
+			["wait_reason", "TEXT"],
+			["wait_since_ms", "INTEGER"],
+			["wait_condition", "TEXT"],
+			["pending_work_count", "INTEGER"],
+			// Defaulted rather than left NULL: `revision` is the value a recovery
+			// request quotes to say which observation it acted on, so an absent one
+			// would have every consumer handle "no revision yet" forever.
+			["revision", "INTEGER NOT NULL DEFAULT 1"],
+			["routed_at_ms", "INTEGER"],
+			["workspace_id", "TEXT"],
+			["workspace_name", "TEXT"],
+			["owner_user_id", "TEXT"],
+			["owner_name", "TEXT"],
+			["linear_team_id", "TEXT"],
+			["linear_team_name", "TEXT"],
+			["linear_project_id", "TEXT"],
+			["linear_project_name", "TEXT"],
+		] as const) {
+			if (!have.has(name)) {
+				this.db.exec(`ALTER TABLE agent_runs ADD COLUMN ${name} ${ddl}`);
+			}
+		}
+
+		// `parked` conflated the run being blocked with its container being
+		// suspendable. The run half is now `waiting`, and every retained `parked`
+		// row got there exactly one way — a worker reporting an elicitation — so
+		// the reason is known rather than guessed.
+		//
+		// Scoped to NON-TERMINAL rows. Terminal history is left exactly as
+		// recorded: a run that ended is a fact about what happened, and rewriting
+		// its state would be editing the past to match a vocabulary it never used.
+		// (No terminal row should carry `parked` today, since `finishAgentRun`
+		// overwrites the state — the guard is here so that stays true if it ever
+		// stops being.)
+		//
+		// `wait_since_ms` is the one value with nothing exact to draw on: the
+		// worker's `since` was never persisted, because the frame did not carry
+		// one. `last_routed_ms` is the most recent instant the router knows
+		// something happened to this run, which is the closest honest upper bound
+		// on when the wait began — it can only under-state how long the run has
+		// been waiting, never over-state it.
+		this.db.exec(
+			`UPDATE agent_runs
+			 SET state = 'waiting',
+			     wait_reason = 'elicitation',
+			     wait_since_ms = COALESCE(wait_since_ms, last_routed_ms)
+			 WHERE state = 'parked' AND ended_ms IS NULL`,
+		);
 	}
 
 	addUser(input: { email: string; name?: string; linearId?: string }): {
@@ -1011,10 +1292,13 @@ export class RouterStore {
 	private purgeDeviceScopedRows(deviceId: number, nowMs = Date.now()): void {
 		this.db
 			.prepare(
-				`UPDATE agent_runs SET state = 'unknown', ended_ms = ?
-				 WHERE device_id = ? AND state IN ('routed', 'active', 'parked')`,
+				`UPDATE agent_runs
+				 SET state = 'unknown', ended_ms = ?, revision = revision + 1,
+				     wait_reason = NULL, wait_since_ms = NULL, wait_condition = NULL,
+				     pending_work_count = NULL
+				 WHERE device_id = ? AND state IN (${NON_TERMINAL_RUN_STATES.map(() => "?").join(", ")})`,
 			)
-			.run(nowMs, deviceId);
+			.run(nowMs, deviceId, ...NON_TERMINAL_RUN_STATES);
 		this.db
 			.prepare("DELETE FROM issue_locks WHERE device_id = ?")
 			.run(deviceId);
@@ -1769,18 +2053,40 @@ export class RouterStore {
 	recordAgentRunRouted(input: {
 		deviceId: number;
 		issueKey: string;
+		issueId?: string;
 		sessionId: string;
 		activityId?: string;
 		commentId?: string;
 		routedMs: number;
+		/**
+		 * The Linear context this input arrived under. Captured into the run's
+		 * routing snapshot when the run is CREATED and never rewritten, so a later
+		 * team or project move does not rewrite the history of runs that already
+		 * happened. Owner and workspace are filled in from the device's own row
+		 * inside the same transaction — see below.
+		 */
+		routing?: Pick<
+			AgentRunRouting,
+			| "workspaceId"
+			| "workspaceName"
+			| "linearTeamId"
+			| "linearTeamName"
+			| "linearProjectId"
+			| "linearProjectName"
+		>;
 	}): string {
 		const txn = this.db.transaction(() => {
 			const device = this.db
 				.prepare(
-					"SELECT user_id, kind, provider FROM devices WHERE device_id = ?",
+					`SELECT d.user_id, d.kind, d.provider, u.email AS owner_email, u.name AS owner_name
+					 FROM devices d LEFT JOIN users u ON u.user_id = d.user_id
+					 WHERE d.device_id = ?`,
 				)
 				.get(input.deviceId) as
-				| Pick<DeviceRow, "user_id" | "kind" | "provider">
+				| (Pick<DeviceRow, "user_id" | "kind" | "provider"> & {
+						owner_email: string | null;
+						owner_name: string | null;
+				  })
 				| undefined;
 			if (!device) throw new Error(`Unknown device: ${input.deviceId}`);
 
@@ -1804,44 +2110,64 @@ export class RouterStore {
 			) {
 				const inputs = parseRunInputs(latest.inputs_json);
 				inputs.push(runInput);
-				this.db
-					.prepare(
-						`UPDATE agent_runs SET user_id = ?, device_id = ?, issue_key = ?,
-						 last_routed_ms = ?, inputs_json = ?, executor_kind = ?, provider = ?
-						 WHERE run_id = ?`,
-					)
-					.run(
-						device.user_id,
-						input.deviceId,
-						input.issueKey,
-						input.routedMs,
-						JSON.stringify(inputs),
-						device.kind,
-						device.provider,
-						latest.run_id,
-					);
+				// Deliberately does NOT touch the routing snapshot columns. They
+				// belong to the instant this run began, and a run spans every input
+				// delivered into it — so an issue moved between two inputs of the
+				// SAME run keeps the team it was routed under. A fresh run (the
+				// branch below, reached once the previous one is terminal) captures
+				// the new context.
+				this.updateAgentRun(latest.run_id, {
+					user_id: device.user_id,
+					device_id: input.deviceId,
+					issue_key: input.issueKey,
+					...(input.issueId !== undefined ? { issue_id: input.issueId } : {}),
+					last_routed_ms: input.routedMs,
+					inputs_json: JSON.stringify(inputs),
+					executor_kind: device.kind,
+					provider: device.provider,
+				});
 				return latest.run_id;
 			}
 
 			const runId = randomUUID();
+			// Written in the same statement that creates the run, inside the same
+			// transaction that read the device — so a run row can never exist
+			// without the snapshot of what it was routed under.
+			const routing = input.routing ?? {};
 			this.db
 				.prepare(
 					`INSERT INTO agent_runs
-					 (run_id, user_id, device_id, issue_key, session_id, state,
-					  started_ms, last_routed_ms, inputs_json, executor_kind, provider)
-					 VALUES (?, ?, ?, ?, ?, 'routed', ?, ?, ?, ?, ?)`,
+					 (run_id, user_id, device_id, issue_key, issue_id, session_id, state,
+					  started_ms, last_routed_ms, inputs_json, executor_kind, provider,
+					  revision, routed_at_ms, workspace_id, workspace_name,
+					  owner_user_id, owner_name, linear_team_id, linear_team_name,
+					  linear_project_id, linear_project_name)
+					 VALUES (?, ?, ?, ?, ?, ?, 'routed', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				)
 				.run(
 					runId,
 					device.user_id,
 					input.deviceId,
 					input.issueKey,
+					input.issueId ?? null,
 					input.sessionId,
 					input.routedMs,
 					input.routedMs,
 					JSON.stringify([runInput]),
 					device.kind,
 					device.provider,
+					input.routedMs,
+					routing.workspaceId ?? null,
+					routing.workspaceName ?? null,
+					// The router's own user id, not Linear's: this is the Cyrus owner
+					// whose device ran the work, which is the identity a fleet operator
+					// filters and scopes by.
+					String(device.user_id),
+					device.owner_name ?? device.owner_email ?? null,
+					routing.linearTeamId ?? null,
+					routing.linearTeamName ?? null,
+					routing.linearProjectId ?? null,
+					routing.linearProjectName ?? null,
 				);
 			return runId;
 		});
@@ -1852,19 +2178,85 @@ export class RouterStore {
 	recordAgentRunActivity(sessionId: string, nowMs: number): void {
 		const runId = this.latestNonTerminalRunId(sessionId);
 		if (!runId) return;
-		this.db
-			.prepare(
-				"UPDATE agent_runs SET state = 'active', last_agent_activity_ms = ? WHERE run_id = ?",
-			)
-			.run(nowMs, runId);
+		// Clears the wait as well as advancing the state. A run that just published
+		// an activity is demonstrably progressing, so leaving the wait behind would
+		// keep reporting evidence the run itself has disproved.
+		this.updateAgentRun(runId, {
+			state: "active",
+			wait_reason: null,
+			wait_since_ms: null,
+			wait_condition: null,
+			last_agent_activity_ms: nowMs,
+		});
 	}
 
-	setAgentRunState(sessionId: string, state: "active" | "parked"): void {
+	/**
+	 * Applies a worker's explicitly reported run state.
+	 *
+	 * `waiting` requires the wait, for the same reason the frame does: the router
+	 * never infers a wait, so the state and its evidence move together or not at
+	 * all. Any other state clears the wait.
+	 */
+	setAgentRunState(
+		sessionId: string,
+		state: "active" | "waiting",
+		facts?: {
+			wait?: AgentRunWait;
+			runner?: string;
+			model?: string;
+			pendingWorkCount?: number;
+		},
+	): void {
 		const runId = this.latestNonTerminalRunId(sessionId);
 		if (!runId) return;
+		const wait = state === "waiting" ? facts?.wait : undefined;
+		this.updateAgentRun(runId, {
+			state,
+			wait_reason: wait?.reason ?? null,
+			wait_since_ms: wait?.sinceMs ?? null,
+			wait_condition: wait?.reportedCondition ?? null,
+			...(facts?.runner !== undefined ? { runner: facts.runner } : {}),
+			...(facts?.model !== undefined ? { model: facts.model } : {}),
+			...(facts?.pendingWorkCount !== undefined
+				? { pending_work_count: facts.pendingWorkCount }
+				: {}),
+		});
+	}
+
+	/**
+	 * Writes only the columns that actually changed, and increments `revision`
+	 * only when one of the MATERIAL ones did.
+	 *
+	 * The revision is what a recovery request quotes to say which observation it
+	 * acted on, and what a watch uses to tell a real change from a repeat. A
+	 * worker re-reporting the same wait on every reconnect, or an idempotent
+	 * frame replay, must therefore leave it alone — otherwise the feed becomes a
+	 * stream of "still the same" and the number stops meaning anything.
+	 */
+	private updateAgentRun(
+		runId: string,
+		patch: Record<string, string | number | null>,
+	): void {
+		const current = this.db
+			.prepare("SELECT * FROM agent_runs WHERE run_id = ?")
+			.get(runId) as (AgentRunRow & Record<string, unknown>) | undefined;
+		if (!current) return;
+
+		const changed = Object.entries(patch).filter(
+			([column, value]) => (current[column] ?? null) !== value,
+		);
+		if (changed.length === 0) return;
+		const material = changed.some(([column]) =>
+			MATERIAL_RUN_COLUMNS.has(column),
+		);
+
+		const assignments = changed.map(([column]) => `${column} = ?`);
+		if (material) assignments.push("revision = revision + 1");
 		this.db
-			.prepare("UPDATE agent_runs SET state = ? WHERE run_id = ?")
-			.run(state, runId);
+			.prepare(
+				`UPDATE agent_runs SET ${assignments.join(", ")} WHERE run_id = ?`,
+			)
+			.run(...changed.map(([, value]) => value), runId);
 	}
 
 	finishAgentRun(
@@ -1886,9 +2278,17 @@ export class RouterStore {
 		) {
 			return;
 		}
-		this.db
-			.prepare("UPDATE agent_runs SET state = ?, ended_ms = ? WHERE run_id = ?")
-			.run(state, nowMs, latest.run_id);
+		// Clears the wait and the pending-work count along with going terminal. A
+		// run that has ENDED cannot be carrying live background work, and asserting
+		// otherwise is the one contradiction the v1 observation refuses outright.
+		this.updateAgentRun(latest.run_id, {
+			state,
+			ended_ms: nowMs,
+			wait_reason: null,
+			wait_since_ms: null,
+			wait_condition: null,
+			pending_work_count: null,
+		});
 	}
 
 	/**
@@ -1960,11 +2360,14 @@ export class RouterStore {
 	markAgentRunUnknown(sessionId: string, nowMs: number): void {
 		const runId = this.latestNonTerminalRunId(sessionId);
 		if (!runId) return;
-		this.db
-			.prepare(
-				"UPDATE agent_runs SET state = 'unknown', ended_ms = ? WHERE run_id = ?",
-			)
-			.run(nowMs, runId);
+		this.updateAgentRun(runId, {
+			state: "unknown",
+			ended_ms: nowMs,
+			wait_reason: null,
+			wait_since_ms: null,
+			wait_condition: null,
+			pending_work_count: null,
+		});
 	}
 
 	listAgentRuns(input: {
@@ -2011,10 +2414,12 @@ export class RouterStore {
 		const row = this.db
 			.prepare(
 				`SELECT run_id FROM agent_runs WHERE session_id = ?
-				 AND state IN ('routed', 'active', 'parked')
+				 AND state IN (${NON_TERMINAL_RUN_STATES.map(() => "?").join(", ")})
 				 ORDER BY started_ms DESC, rowid DESC LIMIT 1`,
 			)
-			.get(sessionId) as Pick<AgentRunRow, "run_id"> | undefined;
+			.get(sessionId, ...NON_TERMINAL_RUN_STATES) as
+			| Pick<AgentRunRow, "run_id">
+			| undefined;
 		return row?.run_id;
 	}
 

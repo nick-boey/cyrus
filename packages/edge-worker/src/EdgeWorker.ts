@@ -617,21 +617,67 @@ export class EdgeWorker extends EventEmitter {
 			}
 		});
 
-		// Router mode: a session blocked on a user answer with no work in flight
-		// releases its device, so ContainerLifecycle can idle-suspend the
-		// container while it waits. Non-fatal: a failed park costs a suspend, not
+		// Router mode: a session blocked on a user answer reports that its RUN is
+		// waiting — always, so a session blocked with a background build in flight
+		// is observable rather than silent.
+		//
+		// Whether its EXECUTOR may park is a separate declaration on the same
+		// frame, and it is the one with consequences: parking releases session
+		// affinity, which is what lets ContainerLifecycle idle-suspend the
+		// container. A container suspended with a build in flight has that build
+		// frozen, and the completion that would normally wake the session can then
+		// never arrive — so pending work withholds park permission while still
+		// reporting the wait.
+		//
+		// Non-fatal: a failed report costs a suspend and an observation, not
 		// correctness — the container simply stays up until the next transition.
 		this.agentSessionManager.on("sessionParked", (sessionId: string) => {
 			if (this.config.platform !== "router") return;
 			try {
-				this.routerConnection?.sendSessionState(sessionId, "parked");
+				const pendingWorkCount =
+					this.agentSessionManager.pendingWorkCount(sessionId);
+				this.routerConnection?.sendSessionWaiting(
+					sessionId,
+					{ reason: "elicitation", since: new Date().toISOString() },
+					{
+						executorMayPark: pendingWorkCount === 0,
+						...this.agentSessionManager.getRunFacts(sessionId),
+						pendingWorkCount,
+					},
+				);
 			} catch (error) {
 				this.logger.error(
-					`Failed to signal parked state for session ${sessionId}; its container will stay up until the next transition`,
+					`Failed to signal waiting state for session ${sessionId}; its container will stay up until the next transition`,
 					error,
 				);
 			}
 		});
+
+		// Router mode: a turn that ended holding a cron or a background task keeps
+		// the session open, so no terminal frame is sent. Report the run as active
+		// with what is holding it — a seven-hour pending-work run must stay
+		// observable, not be mistaken for silence.
+		//
+		// Fire-and-forget on the connection side: losing this costs one
+		// observation, and making it durable would make it replayable, which is a
+		// real hazard for a frame the router reads as an unpark.
+		this.agentSessionManager.on(
+			"sessionPendingWork",
+			(sessionId: string, pendingWorkCount: number) => {
+				if (this.config.platform !== "router") return;
+				try {
+					this.routerConnection?.sendRunFacts(sessionId, {
+						...this.agentSessionManager.getRunFacts(sessionId),
+						pendingWorkCount,
+					});
+				} catch (error) {
+					this.logger.error(
+						`Failed to report pending work for session ${sessionId}`,
+						error,
+					);
+				}
+			},
+		);
 
 		// The counterpart. Durability cuts both ways: replaying a stale `parked`
 		// on a later reconnect would clear the affinity a live turn is posting
@@ -646,7 +692,10 @@ export class EdgeWorker extends EventEmitter {
 		this.agentSessionManager.on("sessionUnparked", (sessionId: string) => {
 			if (this.config.platform !== "router") return;
 			try {
-				this.routerConnection?.sendSessionUnparked(sessionId);
+				this.routerConnection?.sendSessionUnparked(
+					sessionId,
+					this.agentSessionManager.getRunFacts(sessionId),
+				);
 			} catch (error) {
 				this.logger.error(
 					`Failed to unpark session ${sessionId}; it will keep its parked state on the router until the next terminal frame`,
@@ -663,7 +712,15 @@ export class EdgeWorker extends EventEmitter {
 			(sessionId: string, state: "complete" | "error" | "stopped") => {
 				if (this.config.platform !== "router") return;
 				try {
-					this.routerConnection?.sendSessionState(sessionId, state);
+					// Execution identity rides the terminal frame too: it describes the
+					// run that just ended, which is exactly what a fleet operator
+					// filters a completed run by. No pending-work count — a run that
+					// has ended carries none, by definition.
+					this.routerConnection?.sendSessionState(
+						sessionId,
+						state,
+						this.agentSessionManager.getRunFacts(sessionId),
+					);
 				} catch (error) {
 					// sendSessionState persists the frame to disk before transmitting.
 					// A failure there must not abort session teardown (this listener
@@ -7856,20 +7913,26 @@ ${input.userComment}
 		organizationId: string,
 	): AgentRunnerConfig["onAskUserQuestion"] {
 		return async (input, _sessionId, signal) => {
-			// Park for the duration of the elicitation: this await can outlive the
-			// container by hours, and it holds the SDK query open, so no terminal
-			// frame is ever sent and the router would otherwise pin the device
-			// forever (PAR-146).
+			// Report the run as waiting for the duration of the elicitation: this
+			// await can outlive the container by hours, and it holds the SDK query
+			// open, so no terminal frame is ever sent and the router would otherwise
+			// pin the device forever (PAR-146).
 			//
-			// But ONLY once the question is actually in front of the user. Parking
-			// releases the router's session affinity, and posting the elicitation
-			// is a session-scoped RPC — so parking first makes the post fail with
-			// "session not owned by this device". That failure is silent and
-			// unrecoverable: no question ever reaches the user, so nothing wakes
-			// the session, and every activity the agent posts for the rest of the
-			// turn is rejected the same way. `RepositoryRouter` parks after its own
-			// successful post for exactly this reason; this is the same ordering.
-			let parked = false;
+			// But ONLY once the question is actually in front of the user. The
+			// waiting report can release the router's session affinity, and posting
+			// the elicitation is a session-scoped RPC — so reporting first makes the
+			// post fail with "session not owned by this device". That failure is
+			// silent and unrecoverable: no question ever reaches the user, so nothing
+			// wakes the session, and every activity the agent posts for the rest of
+			// the turn is rejected the same way. `RepositoryRouter` reports after its
+			// own successful post for exactly this reason; this is the same ordering.
+			//
+			// Pending work no longer suppresses the report — it withholds only the
+			// EXECUTOR's park permission, which the `sessionParked` listener decides
+			// from `pendingWorkCount`. The two used to be one decision, which is why
+			// a run blocked on a user with a live background build was reported as
+			// nothing at all.
+			let waiting = false;
 			try {
 				// Note: We use linearAgentSessionId (from closure) instead of the passed sessionId
 				// because the passed sessionId is the Claude session ID, not the Linear agent session ID
@@ -7879,13 +7942,7 @@ ${input.userComment}
 					organizationId,
 					signal,
 					() => {
-						// Evaluated here, not on entry: the post is an await, and a
-						// background task started during it must still block the park.
-						// Suspending a container with a build in flight freezes it, and
-						// its completion could then never arrive to wake us.
-						if (this.agentSessionManager.hasPendingWork(linearAgentSessionId))
-							return;
-						parked = true;
+						waiting = true;
 						this.agentSessionManager.emit(
 							"sessionParked",
 							linearAgentSessionId,
@@ -7894,9 +7951,9 @@ ${input.userComment}
 				);
 			} finally {
 				// `finally`, not the success path: an abort or a throw leaves the
-				// session just as unparked, and a still-buffered `parked` frame
-				// would then replay over the next live turn.
-				if (parked) {
+				// session just as un-waiting, and a still-buffered wait frame would
+				// then replay over the next live turn.
+				if (waiting) {
 					this.agentSessionManager.emit(
 						"sessionUnparked",
 						linearAgentSessionId,

@@ -11,6 +11,7 @@ import {
 	PROTOCOL_VERSION,
 	parseDeviceFrame,
 	type RpcResponseFrame,
+	RUN_FACTS_CAPABILITY,
 	SESSIONS_QUERY_CAPABILITY,
 	SPAN_INGEST_CAPABILITY,
 } from "cyrus-router-protocol";
@@ -452,11 +453,17 @@ export class DeviceGateway extends EventEmitter {
 				// watchdog terminates its socket at the same point we terminate
 				// ours, even when this router runs a non-default heartbeatMs.
 				heartbeatMs: this.heartbeatMs,
-				// Tell the device which newer frame types we can parse. Without
-				// this a worker that forwarded logs to an older router would have
-				// its socket closed as "invalid frame" on every log line — see
-				// LOG_INGEST_CAPABILITY.
-				capabilities: [LOG_INGEST_CAPABILITY, SPAN_INGEST_CAPABILITY],
+				// Tell the device which newer frame types and frame VALUES we can
+				// parse. Without this a worker that forwarded logs to an older
+				// router would have its socket closed as "invalid frame" on every
+				// log line — see LOG_INGEST_CAPABILITY. RUN_FACTS_CAPABILITY is the
+				// same gate for the `waiting` session_state value, which an older
+				// router's closed `state` enum rejects the same way.
+				capabilities: [
+					LOG_INGEST_CAPABILITY,
+					SPAN_INGEST_CAPABILITY,
+					RUN_FACTS_CAPABILITY,
+				],
 			}),
 		);
 

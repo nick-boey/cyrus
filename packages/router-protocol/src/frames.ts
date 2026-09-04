@@ -91,6 +91,30 @@ export const LOG_INGEST_CAPABILITY = "log_ingest";
 export const SPAN_INGEST_CAPABILITY = "span_ingest";
 
 /**
+ * Advertised by the ROUTER in `hello_ack.capabilities` when it understands the
+ * explicit run facts on a `session_state` frame — the `waiting` state in
+ * particular. A device reports `waiting` ONLY after seeing this, and otherwise
+ * falls back to the legacy `parked` frame.
+ *
+ * Exactly the {@link LOG_INGEST_CAPABILITY} pattern, for the same reason, with
+ * one wrinkle worth spelling out. The additive *fields* (`wait`, `runner`,
+ * `model`, `pendingWorkCount`, `executorMayPark`) are already safe against an
+ * older router on their own: `z.object` strips unknown keys rather than
+ * rejecting them, so an old router silently ignores facts it cannot use. The
+ * new `state` VALUE is not safe — `state` is a closed enum, so `waiting` fails
+ * to parse and `DeviceGateway.handleMessage` closes the socket on any frame it
+ * cannot parse (`ws.close(1002, "invalid frame")`). A worker that reported
+ * `waiting` at an old router would be disconnected on its first elicitation and
+ * reconnect into the same loop.
+ *
+ * So this gate is what lets `waiting` ship without the deploy-ordering
+ * requirement that `parked`/`active` carry (router before worker image, or the
+ * fleet drops connections). Bumping {@link PROTOCOL_VERSION} instead would
+ * reject every not-yet-updated worker outright, which is strictly worse.
+ */
+export const RUN_FACTS_CAPABILITY = "run_facts";
+
+/**
  * W3C Trace Context fields, carried on the frames that hand a unit of work from
  * one process to the other.
  *
@@ -224,37 +248,124 @@ const rpcRequestFrame = z.object({
 	// trace rather than dangling as a root of its own.
 	...traceContextFields,
 });
-const sessionStateFrame = z.object({
-	type: z.literal("session_state"),
-	// Correlates the router's `session_state_ack`. Stable across replays so a
-	// frame delivered twice (ack lost, device reconnects and resends) is deduped
-	// by the router's idempotent lock release rather than double-applied.
-	id: z.string().min(1),
-	sessionId: z.string().min(1),
-	// `complete`/`error`/`stopped` are terminal: the router releases both the
-	// issue lock and session affinity.
-	//
-	// `parked` is NOT terminal. It says the session is blocked on a user answer
-	// with no work in flight, so the router releases session affinity ONLY —
-	// which is what lets ContainerLifecycle idle-stop the container — while
-	// keeping the issue lock so no other session claims the issue mid-
-	// conversation.
-	//
-	// `active` is `parked`'s counterpart and is likewise NOT terminal: the
-	// session resumed without the user ever answering (the elicitation was
-	// abandoned, replaced, or failed). It restores session affinity and clears
-	// the idle stamp. Without it a park is one-way — the device keeps running
-	// with no affinity, so every session-scoped RPC it makes is rejected with
-	// "session not owned by this device" and the whole turn is dropped in
-	// silence (PAR-146).
-	//
-	// Additive: PROTOCOL_VERSION is deliberately NOT bumped, since an older
-	// worker simply never sends these values and bumping would reject it
-	// outright. The corollary is a deploy-ordering requirement — the router must
-	// ship BEFORE the worker image, because an older router cannot parse
-	// `parked`/`active` and would drop the device connection on receiving one.
-	state: z.enum(["complete", "error", "stopped", "parked", "active"]),
-});
+/**
+ * Why a worker reports that a run cannot currently progress.
+ *
+ * Mirrors `waitReasonV1Schema` in `cyrus-operator-protocol` — declared
+ * separately so this package (imported by the CLI and every runner) stays free
+ * of an operator-contract dependency, exactly as {@link spanRecord} is declared
+ * separately from `cyrus-otel-traces`'s `SerializedSpan`.
+ *
+ * `elicitation` is the only condition v1 models. `other` carries a condition
+ * the schema does not model yet, which is why it is useless — and therefore
+ * refused — without the condition text.
+ */
+const sessionWait = z
+	.object({
+		reason: z.enum(["elicitation", "other"]),
+		/** ISO-8601, from the DEVICE's clock: when the wait began. */
+		since: z.string().min(1),
+		/** The worker's own description of the condition. */
+		reportedCondition: z.string().min(1).optional(),
+	})
+	.refine(
+		(wait) => wait.reason !== "other" || wait.reportedCondition !== undefined,
+		{
+			path: ["reportedCondition"],
+			message: "An `other` wait must carry the condition the worker reported",
+		},
+	);
+
+const sessionStateFrame = z
+	.object({
+		type: z.literal("session_state"),
+		// Correlates the router's `session_state_ack`. Stable across replays so a
+		// frame delivered twice (ack lost, device reconnects and resends) is deduped
+		// by the router's idempotent lock release rather than double-applied.
+		id: z.string().min(1),
+		sessionId: z.string().min(1),
+		// `complete`/`error`/`stopped` are terminal: the router releases both the
+		// issue lock and session affinity.
+		//
+		// `waiting` is NOT terminal. It is the worker saying, explicitly, that the
+		// run cannot progress — carrying `wait` as the evidence for why. The router
+		// NEVER infers this from silence, elapsed time, or executor state.
+		//
+		// `parked` is the LEGACY spelling of `waiting`, kept on the wire so a
+		// pre-run-facts worker keeps working. It conflated two independent facts:
+		// that the run is blocked on a user answer, and that its container may be
+		// suspended. The router reads it as waiting-on-elicitation with
+		// `executorMayPark`, which is exactly what it always meant. New workers
+		// send `waiting` once the router advertises {@link RUN_FACTS_CAPABILITY}.
+		//
+		// `active` is the counterpart to both and is likewise NOT terminal: the run
+		// is progressing. After a park it restores session affinity and clears the
+		// idle stamp — without it a park is one-way, the device keeps running with
+		// no affinity, and every session-scoped RPC it makes is rejected with
+		// "session not owned by this device", dropping the whole turn in silence
+		// (PAR-146). It also carries run facts for a run that is simply still
+		// working, which is how a long `pendingWorkCount` run stays observable
+		// without being mislabelled as waiting.
+		//
+		// Additive: PROTOCOL_VERSION is deliberately NOT bumped, since an older
+		// worker simply never sends these values and bumping would reject it
+		// outright. `parked`/`active` shipped with a deploy-ordering requirement
+		// instead (router before worker image); `waiting` does not need one, since
+		// it is gated on {@link RUN_FACTS_CAPABILITY}.
+		state: z.enum([
+			"complete",
+			"error",
+			"stopped",
+			"parked",
+			"active",
+			"waiting",
+		]),
+		/** Required on `waiting`, and meaningless anywhere else. */
+		wait: sessionWait.optional(),
+		/**
+		 * Set on a `waiting` frame whose executor may be suspended while the wait
+		 * lasts. Separate from the wait itself because the two facts are
+		 * independent: a run blocked on an elicitation with a background build
+		 * still in flight is waiting, but suspending its container would freeze
+		 * that build — and the completion that would wake the session could then
+		 * never arrive. Absent reads as "do not park", which is the safe direction.
+		 */
+		executorMayPark: z.boolean().optional(),
+		/** The agent CLI executing this run, e.g. "claude", "codex". */
+		runner: z.string().min(1).optional(),
+		model: z.string().min(1).optional(),
+		/**
+		 * Scheduled wakeups, crons, and in-flight background tasks the run is
+		 * still carrying. An ACTIVE-run fact, never a wait reason — which is why
+		 * the `wait` enum above does not contain it, rather than the two being
+		 * forbidden to coexist.
+		 */
+		pendingWorkCount: z.int().nonnegative().optional(),
+	})
+	.superRefine((frame, ctx) => {
+		// Waiting is worker-reported, so the state and the evidence for it travel
+		// together or not at all. A `waiting` frame with no wait would be asking
+		// the router to guess, which is the thing this whole frame exists to stop.
+		if (frame.state === "waiting" && frame.wait === undefined) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["wait"],
+				message: "A `waiting` frame must carry the wait the worker reported",
+			});
+		}
+		// Deliberately NOT extended to `runner`/`model`/`pendingWorkCount`, which
+		// are true of a run in any state. Every cross-field rule here is a way for
+		// a worker bug to get its socket closed, so the bar for adding one is that
+		// the field would otherwise be unreadable — as a wait on a non-waiting
+		// frame is.
+		if (frame.state !== "waiting" && frame.wait !== undefined) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["wait"],
+				message: `Wait evidence does not apply to a \`${frame.state}\` frame`,
+			});
+		}
+	});
 /**
  * One worker log line, shipped device → router.
  *
@@ -467,6 +578,9 @@ export type HelloFrame = z.infer<typeof helloFrame>;
 export type EventAckFrame = z.infer<typeof eventAckFrame>;
 export type RpcRequestFrame = z.infer<typeof rpcRequestFrame>;
 export type SessionStateFrame = z.infer<typeof sessionStateFrame>;
+export type SessionWait = z.infer<typeof sessionWait>;
+/** Every state a worker may report for a run, legacy `parked` included. */
+export type SessionStateValue = SessionStateFrame["state"];
 export type SessionStateAckFrame = z.infer<typeof sessionStateAckFrame>;
 export type SessionsQueryFrame = z.infer<typeof sessionsQueryFrame>;
 export type SessionsReportFrame = z.infer<typeof sessionsReportFrame>;

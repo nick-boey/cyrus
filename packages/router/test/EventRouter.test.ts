@@ -2178,3 +2178,298 @@ describe("EventRouter dangling issue/parent affinity healing", () => {
 		);
 	});
 });
+
+/**
+ * CYR-68 — the worker reports what a run is doing, explicitly, and the router
+ * records it without inferring anything from silence.
+ *
+ * The failure being designed out: `parked` conflated two independent facts —
+ * that a run is blocked on a user answer, and that its container may be
+ * suspended — so a run held open by a live background build was reported as
+ * nothing at all, and a run waiting on a user was indistinguishable from a
+ * container that had been idle-stopped.
+ */
+describe("EventRouter explicit run facts", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	/** Routes a created event so the device owns the session and a run exists. */
+	async function routedSession(overrides?: {
+		identifier?: string;
+		team?: { id: string; name: string };
+	}) {
+		const deviceId = enroll(store, ALICE.email, {
+			name: ALICE.name,
+			linearId: ALICE.id,
+		});
+		const { router, clock } = makeRouter(store);
+		const event = createdEvent({
+			sessionId: "sess-1",
+			issueId: "ISS-1",
+			identifier: overrides?.identifier ?? "NOR-1",
+			creator: ALICE,
+		}) as unknown as {
+			agentSession: { issue: Record<string, unknown> };
+		};
+		if (overrides?.team) {
+			event.agentSession.issue.team = overrides.team;
+			event.agentSession.issue.teamId = overrides.team.id;
+		}
+		await router.route(event as unknown as AgentEvent);
+		return { router, deviceId, clock };
+	}
+
+	function run() {
+		const found = store.listAgentRuns({ userId: 1 })[0];
+		if (!found) throw new Error("expected a run");
+		return found;
+	}
+
+	it("records an explicit elicitation wait and parks the executor when told it may", async () => {
+		const { router, deviceId } = await routedSession();
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "waiting",
+			wait: { reason: "elicitation", since: new Date(ROUTE_NOW).toISOString() },
+			executorMayPark: true,
+			runner: "claude",
+			model: "claude-opus-5",
+		});
+
+		expect(run()).toMatchObject({
+			state: "waiting",
+			wait: { reason: "elicitation", sinceMs: ROUTE_NOW },
+			runner: "claude",
+			model: "claude-opus-5",
+		});
+		// Park permission is what releases affinity, so `ContainerLifecycle` can
+		// idle-stop the container while the user thinks.
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(0);
+	});
+
+	it("records a wait that must NOT park its executor without releasing affinity", async () => {
+		const { router, deviceId } = await routedSession();
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "waiting",
+			wait: { reason: "elicitation", since: new Date(ROUTE_NOW).toISOString() },
+			pendingWorkCount: 1,
+		});
+
+		// The run is blocked either way — that is the worker's report, and it is
+		// recorded. What changes is the executor: suspending a container with a
+		// build in flight freezes it, and the completion that would wake the
+		// session could then never arrive.
+		expect(run()).toMatchObject({
+			state: "waiting",
+			wait: { reason: "elicitation" },
+			pendingWorkCount: 1,
+		});
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(1);
+	});
+
+	it("records an explicit `other` wait with the condition the worker reported", async () => {
+		const { router, deviceId } = await routedSession();
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "waiting",
+			wait: {
+				reason: "other",
+				since: new Date(ROUTE_NOW).toISOString(),
+				reportedCondition: "waiting on a deploy lock",
+			},
+		});
+
+		expect(run().wait).toEqual({
+			reason: "other",
+			sinceMs: ROUTE_NOW,
+			reportedCondition: "waiting on a deploy lock",
+		});
+		// A wait the schema does not model says nothing about the executor.
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(1);
+	});
+
+	it("reads a legacy parked frame as waiting-on-elicitation plus executor parking", async () => {
+		const { router, deviceId } = await routedSession();
+
+		// Exactly what a pre-run-facts worker sends: no wait, no facts, nothing.
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "parked",
+		});
+
+		expect(run()).toMatchObject({
+			state: "waiting",
+			wait: { reason: "elicitation", sinceMs: ROUTE_NOW },
+		});
+		// The executor half of what `parked` always meant, unchanged.
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(0);
+
+		// And the legacy unpark still restores affinity through the park record.
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f2",
+			sessionId: "sess-1",
+			state: "active",
+		});
+		expect(run().state).toBe("active");
+		expect(run().wait).toBeUndefined();
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(1);
+	});
+
+	it("keeps a pending-work run active without minting any claim", async () => {
+		const { router, deviceId } = await routedSession();
+
+		// The seven-hour cron case: no park was ever recorded, so there is nothing
+		// to redeem — but the run is demonstrably working and its count is what
+		// makes that legible.
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "active",
+			pendingWorkCount: 4,
+			runner: "claude",
+		});
+
+		expect(run()).toMatchObject({
+			state: "active",
+			pendingWorkCount: 4,
+			runner: "claude",
+		});
+		expect(run().wait).toBeUndefined();
+		// Unchanged from the route: the frame granted nothing.
+		expect(store.countSessionAffinityForDevice(deviceId)).toBe(1);
+	});
+
+	it("refuses to label a run waiting for a device that does not own it", async () => {
+		const { router } = await routedSession();
+		const mallory = enroll(store, "mallory@example.com");
+
+		router.handleSessionState(mallory, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "waiting",
+			wait: { reason: "elicitation", since: new Date(ROUTE_NOW).toISOString() },
+		});
+
+		// `setAgentRunState` writes to whatever session the frame names, so an
+		// ungated path would let any enrolled device label someone else's run.
+		expect(run().state).toBe("routed");
+		expect(run().wait).toBeUndefined();
+	});
+
+	it("ignores an active frame from a device that owns nothing", async () => {
+		const { router } = await routedSession();
+		const mallory = enroll(store, "mallory@example.com");
+
+		router.handleSessionState(mallory, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "active",
+			pendingWorkCount: 9,
+		});
+
+		expect(run().pendingWorkCount).toBeUndefined();
+	});
+
+	it("keeps a rate limit terminal rather than turning it into a wait", async () => {
+		const { router, deviceId, clock } = await routedSession();
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "waiting",
+			wait: { reason: "elicitation", since: new Date(ROUTE_NOW).toISOString() },
+			pendingWorkCount: 2,
+		});
+
+		// The wait enum has no rate-limit member, deliberately: a rate limit ENDS
+		// the run today, and there is no resumable-backoff design behind it that
+		// would make "waiting on a rate limit" a state anything could act on. So a
+		// rate-limited run arrives here as a terminal `error`.
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f2",
+			sessionId: "sess-1",
+			state: "error",
+			runner: "claude",
+		});
+
+		expect(run()).toMatchObject({ state: "error", endedMs: clock.value });
+		expect(run().wait).toBeUndefined();
+		// Live background work under a run that has ENDED is a contradiction.
+		expect(run().pendingWorkCount).toBeUndefined();
+	});
+
+	it("captures the routing snapshot at route time and holds it steady", async () => {
+		const { router } = await routedSession({
+			team: { id: "team-1", name: "Platform" },
+		});
+
+		expect(run().routing).toMatchObject({
+			workspaceId: "ws-1",
+			ownerUserId: "1",
+			ownerName: "Alice",
+			linearTeamId: "team-1",
+			linearTeamName: "Platform",
+			routedAtMs: ROUTE_NOW,
+		});
+		expect(run().issueId).toBe("ISS-1");
+
+		// The issue moves team mid-run. A historical filter must keep finding the
+		// run under the team it was ROUTED under.
+		const moved = createdEvent({
+			sessionId: "sess-1",
+			issueId: "ISS-1",
+			identifier: "NOR-1",
+			creator: ALICE,
+		}) as unknown as { agentSession: { issue: Record<string, unknown> } };
+		moved.agentSession.issue.team = { id: "team-2", name: "Infra" };
+		moved.agentSession.issue.teamId = "team-2";
+		await router.route(moved as unknown as AgentEvent);
+
+		expect(run().routing.linearTeamId).toBe("team-1");
+		expect(run().routing.linearTeamName).toBe("Platform");
+	});
+
+	it("increments the revision only when a material fact changes", async () => {
+		const { router, deviceId } = await routedSession();
+		const revision = () => run().revision;
+		const before = revision();
+
+		const waiting = {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "waiting",
+			wait: { reason: "elicitation", since: new Date(ROUTE_NOW).toISOString() },
+			pendingWorkCount: 1,
+		} as const;
+		router.handleSessionState(deviceId, waiting);
+		expect(revision()).toBe(before + 1);
+
+		// A replayed frame — the router applies `session_state` before acking it,
+		// so a device that dies in between resends one it already applied. An
+		// idempotent replay must not look like a change to a watching client.
+		router.handleSessionState(deviceId, { ...waiting, id: "f2" });
+		expect(revision()).toBe(before + 1);
+	});
+});

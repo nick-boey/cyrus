@@ -48,7 +48,7 @@ describe("frames", () => {
 		expect(frame.seq).toBe(7);
 	});
 
-	it.each(["complete", "error", "stopped", "parked"])(
+	it.each(["complete", "error", "stopped", "parked", "active"])(
 		"parses a %s session_state frame",
 		(state) => {
 			const frame = parseDeviceFrame(
@@ -75,6 +75,115 @@ describe("frames", () => {
 				}),
 			),
 		).toThrow();
+	});
+
+	describe("explicit run facts on session_state", () => {
+		const base = { type: "session_state", id: "f1", sessionId: "sess-1" };
+
+		function parse(extra: Record<string, unknown>) {
+			const frame = parseDeviceFrame(JSON.stringify({ ...base, ...extra }));
+			if (frame.type !== "session_state") throw new Error("wrong type");
+			return frame;
+		}
+
+		it("parses an explicit elicitation wait that may park its executor", () => {
+			const frame = parse({
+				state: "waiting",
+				wait: { reason: "elicitation", since: "2026-09-04T00:00:00.000Z" },
+				executorMayPark: true,
+				runner: "claude",
+				model: "claude-opus-5",
+			});
+
+			expect(frame.state).toBe("waiting");
+			expect(frame.wait).toEqual({
+				reason: "elicitation",
+				since: "2026-09-04T00:00:00.000Z",
+			});
+			// Parking is a separate declaration from the wait itself: the run is
+			// blocked either way, but only some waits leave the container safe to
+			// suspend.
+			expect(frame.executorMayPark).toBe(true);
+			expect(frame.runner).toBe("claude");
+			expect(frame.model).toBe("claude-opus-5");
+		});
+
+		it("parses an explicit `other` wait carrying its reported condition", () => {
+			const frame = parse({
+				state: "waiting",
+				wait: {
+					reason: "other",
+					since: "2026-09-04T00:00:00.000Z",
+					reportedCondition: "waiting on a deploy lock",
+				},
+			});
+
+			expect(frame.wait?.reason).toBe("other");
+			expect(frame.wait?.reportedCondition).toBe("waiting on a deploy lock");
+			// A wait the schema does not model says nothing about the executor, so
+			// nothing is parked on its account.
+			expect(frame.executorMayPark).toBeUndefined();
+		});
+
+		it("refuses an `other` wait with no condition", () => {
+			// It exists only to carry a condition v1 does not model. Without the text
+			// it records nothing an operator could act on.
+			expect(() =>
+				parse({
+					state: "waiting",
+					wait: { reason: "other", since: "2026-09-04T00:00:00.000Z" },
+				}),
+			).toThrow();
+		});
+
+		it("refuses a `waiting` frame with no wait", () => {
+			// Waiting is worker-reported. Without the evidence the router would have
+			// to guess why, which is the thing this frame exists to stop.
+			expect(() => parse({ state: "waiting" })).toThrow();
+		});
+
+		it("refuses wait evidence on a frame that is not waiting", () => {
+			expect(() =>
+				parse({
+					state: "active",
+					wait: { reason: "elicitation", since: "2026-09-04T00:00:00.000Z" },
+				}),
+			).toThrow();
+		});
+
+		it("carries pending work on an active run", () => {
+			// Pending background work is an ACTIVE-run fact, not a wait reason — a
+			// seven-hour cron run must stay active and observable with its count.
+			const frame = parse({
+				state: "active",
+				pendingWorkCount: 3,
+				runner: "claude",
+			});
+
+			expect(frame.state).toBe("active");
+			expect(frame.pendingWorkCount).toBe(3);
+			expect(frame.wait).toBeUndefined();
+		});
+
+		it("keeps parsing a legacy parked frame that carries no facts at all", () => {
+			// A pre-run-facts worker sends exactly this. The router reads it as
+			// waiting-on-elicitation plus executor parking; nothing here is required.
+			const frame = parse({ state: "parked" });
+
+			expect(frame.state).toBe("parked");
+			expect(frame.wait).toBeUndefined();
+			expect(frame.executorMayPark).toBeUndefined();
+		});
+
+		it("ignores facts an older router would not understand", () => {
+			// The additive FIELDS are safe against an old router because `z.object`
+			// strips unknown keys. Only the new `state` value needs the capability
+			// gate, which is why that asymmetry is worth pinning.
+			const frame = parse({ state: "complete", somethingNewer: 1 });
+
+			expect(frame.state).toBe("complete");
+			expect(frame).not.toHaveProperty("somethingNewer");
+		});
 	});
 
 	it("session-scoped methods are a subset of the allowlist", () => {

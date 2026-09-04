@@ -388,4 +388,82 @@ describe("AgentSessionManager pending-work activities", () => {
 			expect(manager.hasPendingWork("no-such-session")).toBe(false);
 		});
 	});
+
+	// ── pendingWorkCount: the same evidence, reported rather than gated on ──
+	// `hasPendingWork` answers "may the executor park?". The COUNT is what the
+	// router records so a run held open for hours is legible as active work
+	// rather than as silence (CYR-68).
+
+	describe("pendingWorkCount", () => {
+		it("sums crons, backgrounded tasks, and live tasks", () => {
+			setup({
+				sessionCrons: [
+					{ id: "c1", schedule: "* * * * *", recurring: true, prompt: "p" },
+				],
+				backgroundTasks: [
+					{
+						id: "t1",
+						type: "shell",
+						status: "running",
+						description: "d",
+						command: "pnpm dev",
+					},
+				],
+				liveBackgroundTasks: [
+					{ taskId: "t2", taskType: "bash", description: "pnpm build" },
+				],
+			});
+
+			expect(manager.pendingWorkCount(sessionId)).toBe(3);
+		});
+
+		it("is 0 for a runner that reports nothing and for an unknown session", () => {
+			setup(null);
+
+			// The same reading `hasPendingWork` takes: a runner without
+			// `getPendingWork` is "nothing pending", not "unknown".
+			expect(manager.pendingWorkCount(sessionId)).toBe(0);
+			expect(manager.pendingWorkCount("no-such-session")).toBe(0);
+		});
+	});
+
+	describe("sessionPendingWork", () => {
+		it("reports the run as still active when the terminal signal is deferred", async () => {
+			setup(PENDING_WORK);
+			const terminal = vi.fn();
+			const pending = vi.fn();
+			manager.on("sessionTerminal", terminal);
+			manager.on("sessionPendingWork", pending);
+
+			await manager.handleClaudeMessage(
+				sessionId,
+				buildSuccessResult("Scheduled."),
+			);
+
+			// The turn ended but the session did not: the runner will stream more
+			// messages in on the wakeup, so going terminal here would strand the
+			// rest of the run unowned.
+			expect(terminal).not.toHaveBeenCalled();
+			// Without this the router's last word on a session held open for hours
+			// is whatever it was doing before the turn ended — indistinguishable
+			// from a worker that stopped reporting.
+			expect(pending).toHaveBeenCalledWith(sessionId, 1);
+		});
+
+		it("is not emitted when the session genuinely finishes", async () => {
+			setup(null);
+			const terminal = vi.fn();
+			const pending = vi.fn();
+			manager.on("sessionTerminal", terminal);
+			manager.on("sessionPendingWork", pending);
+
+			await manager.handleClaudeMessage(
+				sessionId,
+				buildSuccessResult("All done."),
+			);
+
+			expect(terminal).toHaveBeenCalledWith(sessionId, "complete");
+			expect(pending).not.toHaveBeenCalled();
+		});
+	});
 });

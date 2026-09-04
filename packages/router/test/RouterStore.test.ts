@@ -1696,7 +1696,9 @@ describe("RouterStore agent runs", () => {
 		).toBe(firstRunId);
 
 		store.recordAgentRunActivity("session-1", NOW + 200);
-		store.setAgentRunState("session-1", "parked");
+		store.setAgentRunState("session-1", "waiting", {
+			wait: { reason: "elicitation", sinceMs: NOW + 250 },
+		});
 		store.finishAgentRun("session-1", "complete", NOW + 300);
 		const first = store.listAgentRuns({
 			userId: 1,
@@ -1769,6 +1771,267 @@ describe("RouterStore agent runs", () => {
 			}),
 		).toBe(second);
 		expect(store.listAgentRuns({ userId: 1 })).toHaveLength(2);
+	});
+
+	it("captures the routing snapshot when the run starts and never rewrites it", () => {
+		const { store, device } = storeWithDevice();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			issueId: "issue-uuid",
+			sessionId: "session-1",
+			routedMs: NOW,
+			routing: {
+				workspaceId: "ws-1",
+				linearTeamId: "team-1",
+				linearTeamName: "Platform",
+				linearProjectId: "proj-1",
+				linearProjectName: "Observability",
+			},
+		});
+
+		// The issue moves team and project mid-run. A historical filter must still
+		// find this run under the team it was ROUTED under — that is the whole
+		// point of a snapshot over a query-time join.
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			issueId: "issue-uuid",
+			sessionId: "session-1",
+			routedMs: NOW + 100,
+			routing: {
+				workspaceId: "ws-1",
+				linearTeamId: "team-2",
+				linearTeamName: "Infra",
+				linearProjectId: "proj-2",
+				linearProjectName: "Migrations",
+			},
+		});
+
+		const run = store.listAgentRuns({ userId: 1 })[0];
+		expect(run?.issueId).toBe("issue-uuid");
+		expect(run?.routing).toEqual({
+			workspaceId: "ws-1",
+			workspaceName: undefined,
+			// From the device's own row, resolved in the same transaction that
+			// created the run — so the owner is captured even for a route that
+			// carried no Linear context at all.
+			ownerUserId: "1",
+			ownerName: "Alice",
+			linearTeamId: "team-1",
+			linearTeamName: "Platform",
+			linearProjectId: "proj-1",
+			linearProjectName: "Observability",
+			routedAtMs: NOW,
+		});
+
+		// A NEW run, once the previous one is terminal, captures the current
+		// context. The snapshot is immutable per run, not per session.
+		store.finishAgentRun("session-1", "complete", NOW + 200);
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			routedMs: NOW + 300,
+			routing: { workspaceId: "ws-1", linearTeamId: "team-2" },
+		});
+		expect(store.listAgentRuns({ userId: 1 })[0]?.routing.linearTeamId).toBe(
+			"team-2",
+		);
+	});
+
+	it("records an explicit elicitation wait and clears it when the run resumes", () => {
+		const { store, device } = storeWithDevice();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			routedMs: NOW,
+		});
+
+		store.setAgentRunState("session-1", "waiting", {
+			wait: { reason: "elicitation", sinceMs: NOW + 50 },
+			runner: "claude",
+			model: "claude-opus-5",
+		});
+		const waiting = store.listAgentRuns({ userId: 1 })[0];
+		expect(waiting?.state).toBe("waiting");
+		expect(waiting?.wait).toEqual({ reason: "elicitation", sinceMs: NOW + 50 });
+		expect(waiting?.runner).toBe("claude");
+		expect(waiting?.model).toBe("claude-opus-5");
+
+		store.setAgentRunState("session-1", "active");
+		const active = store.listAgentRuns({ userId: 1 })[0];
+		expect(active?.state).toBe("active");
+		// The wait was evidence for a state the run has left. Keeping it would go
+		// on reporting a block the run itself has disproved.
+		expect(active?.wait).toBeUndefined();
+		// Execution identity is NOT part of the wait, so it survives.
+		expect(active?.runner).toBe("claude");
+	});
+
+	it("records an `other` wait with the condition the worker reported", () => {
+		const { store, device } = storeWithDevice();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			routedMs: NOW,
+		});
+
+		store.setAgentRunState("session-1", "waiting", {
+			wait: {
+				reason: "other",
+				sinceMs: NOW + 50,
+				reportedCondition: "waiting on a deploy lock",
+			},
+		});
+
+		expect(store.listAgentRuns({ userId: 1 })[0]?.wait).toEqual({
+			reason: "other",
+			sinceMs: NOW + 50,
+			reportedCondition: "waiting on a deploy lock",
+		});
+	});
+
+	it("keeps a pending-work run active and drops the count once it ends", () => {
+		const { store, device } = storeWithDevice();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			routedMs: NOW,
+		});
+
+		store.setAgentRunState("session-1", "active", { pendingWorkCount: 3 });
+		const active = store.listAgentRuns({ userId: 1 })[0];
+		// Pending background work is an active-run fact. A seven-hour cron run is
+		// neither waiting nor failed.
+		expect(active?.state).toBe("active");
+		expect(active?.pendingWorkCount).toBe(3);
+		expect(active?.wait).toBeUndefined();
+
+		store.finishAgentRun("session-1", "complete", NOW + 100);
+		expect(
+			store.listAgentRuns({ userId: 1 })[0]?.pendingWorkCount,
+		).toBeUndefined();
+	});
+
+	it("increments the revision only when a material fact changes", () => {
+		const { store, device } = storeWithDevice();
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-402",
+			sessionId: "session-1",
+			routedMs: NOW,
+		});
+		const revision = () => store.listAgentRuns({ userId: 1 })[0]?.revision;
+		expect(revision()).toBe(1);
+
+		store.setAgentRunState("session-1", "waiting", {
+			wait: { reason: "elicitation", sinceMs: NOW + 50 },
+		});
+		expect(revision()).toBe(2);
+
+		// The worker re-reporting the same wait — a frame replay, a reconnect — is
+		// not a change. Bumping here would turn a watch into a firehose of "still
+		// the same" and make the number a client quotes meaningless.
+		store.setAgentRunState("session-1", "waiting", {
+			wait: { reason: "elicitation", sinceMs: NOW + 50 },
+		});
+		expect(revision()).toBe(2);
+
+		store.setAgentRunState("session-1", "waiting", {
+			wait: { reason: "elicitation", sinceMs: NOW + 999 },
+		});
+		expect(revision()).toBe(3);
+
+		store.recordAgentRunActivity("session-1", NOW + 200);
+		expect(revision()).toBe(4);
+		store.finishAgentRun("session-1", "complete", NOW + 300);
+		expect(revision()).toBe(5);
+	});
+
+	it("migrates a retained parked run to an explicit elicitation wait", () => {
+		const dir = mkdtempSync(join(tmpdir(), "cyrus-run-facts-"));
+		const file = join(dir, "router.db");
+
+		// A database written by a router that predates the run-facts columns.
+		const legacy = new Database(file);
+		legacy.exec(`
+CREATE TABLE agent_runs (
+  run_id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  device_id INTEGER NOT NULL,
+  issue_key TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  started_ms INTEGER NOT NULL,
+  last_routed_ms INTEGER NOT NULL,
+  last_agent_activity_ms INTEGER,
+  ended_ms INTEGER,
+  inputs_json TEXT NOT NULL,
+  executor_kind TEXT NOT NULL,
+  provider TEXT
+);`);
+		const insert = legacy.prepare(
+			`INSERT INTO agent_runs
+			 (run_id, user_id, device_id, issue_key, session_id, state, started_ms,
+			  last_routed_ms, ended_ms, inputs_json, executor_kind)
+			 VALUES (?, 1, 1, 'NOR-402', ?, ?, ?, ?, ?, '[]', 'container')`,
+		);
+		insert.run("run-parked", "session-parked", "parked", NOW, NOW + 10, null);
+		// A run that ended is history: the migration leaves its stored state
+		// exactly as recorded rather than editing the past into a vocabulary it
+		// never used. (`finishAgentRun` overwrites the state today, so this shape
+		// should not exist — the guard is here so it stays that way if it stops
+		// being true.)
+		insert.run("run-old", "session-old", "parked", NOW, NOW + 10, NOW + 20);
+		insert.run("run-active", "session-active", "active", NOW, NOW + 10, null);
+		legacy.close();
+
+		const store = new RouterStore(file);
+		const byId = new Map(
+			store.listAgentRuns({ userId: 1 }).map((run) => [run.runId, run]),
+		);
+
+		expect(byId.get("run-parked")?.state).toBe("waiting");
+		expect(byId.get("run-parked")?.wait).toEqual({
+			reason: "elicitation",
+			// The legacy frame carried no `since`, so the last instant the router
+			// knows something happened is the closest honest bound.
+			sinceMs: NOW + 10,
+		});
+		// Left `parked` in the table, but an ENDED run is terminal whatever its
+		// state column says — so it reads as `unknown` (ownership finished without
+		// a terminal outcome reaching the router) and carries no wait. Reading it
+		// as `waiting` would assert a live block on a run that is over.
+		expect(byId.get("run-old")?.state).toBe("unknown");
+		expect(byId.get("run-old")?.wait).toBeUndefined();
+		expect(
+			(
+				new Database(file)
+					.prepare("SELECT state FROM agent_runs WHERE run_id = 'run-old'")
+					.get() as { state: string }
+			).state,
+		).toBe("parked");
+		expect(byId.get("run-active")?.state).toBe("active");
+		// Every pre-migration row starts at revision 1 rather than NULL, so no
+		// consumer has to handle "no revision yet".
+		expect(byId.get("run-active")?.revision).toBe(1);
+		// Nothing is invented for the columns that record routing time: a run
+		// routed before the migration was routed by a router that captured none.
+		expect(byId.get("run-active")?.routing.ownerUserId).toBeUndefined();
+
+		// Idempotent: a second open must not re-run anything or throw.
+		store.close();
+		const reopened = new RouterStore(file);
+		expect(
+			reopened
+				.listAgentRuns({ userId: 1 })
+				.find((r) => r.runId === "run-parked")?.state,
+		).toBe("waiting");
+		reopened.close();
 	});
 
 	it("retains active runs while sweeping terminal runs older than the cutoff", () => {

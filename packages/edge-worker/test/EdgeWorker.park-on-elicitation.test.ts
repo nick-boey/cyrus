@@ -10,10 +10,15 @@ import { EdgeWorker } from "../src/EdgeWorker.js";
  * container. PAR-146 sat `Running` for 41 minutes at 4 vCPU / 8 GiB on exactly
  * this path.
  *
- * The fix parks the session for the duration of the elicitation, but ONLY when
- * nothing will wake it on its own: suspending a container with a background
- * build in flight would freeze that build, and its completion — the thing that
- * would normally wake the session — could then never arrive.
+ * The RUN is reported as waiting for the duration of the elicitation, always.
+ * Whether its EXECUTOR may be parked is a second, separate declaration on the
+ * same frame — and only that one has consequences: suspending a container with
+ * a background build in flight would freeze that build, and its completion —
+ * the thing that would normally wake the session — could then never arrive.
+ *
+ * These used to be one decision, which meant a run blocked on a user with a
+ * live background build was reported as nothing at all: the seven-hour run that
+ * looks like silence (CYR-68).
  */
 
 const SESSION_ID = "session-1";
@@ -21,6 +26,8 @@ const ORG_ID = "ws-1";
 
 interface RouterConnectionStub {
 	sendSessionState: ReturnType<typeof vi.fn>;
+	sendSessionWaiting: ReturnType<typeof vi.fn>;
+	sendRunFacts: ReturnType<typeof vi.fn>;
 	discardBufferedSessionState: ReturnType<typeof vi.fn>;
 	sendSessionUnparked: ReturnType<typeof vi.fn>;
 }
@@ -32,7 +39,8 @@ type AskUserQuestionCallback = (
 ) => Promise<AskUserQuestionResult>;
 
 function makeWorker(opts: {
-	pendingWork: boolean;
+	/** How many things will wake this session on their own. */
+	pendingWorkCount?: number;
 	platform?: "router" | "linear";
 }) {
 	const worker = new EdgeWorker({
@@ -46,6 +54,8 @@ function makeWorker(opts: {
 
 	const routerConnection: RouterConnectionStub = {
 		sendSessionState: vi.fn(),
+		sendSessionWaiting: vi.fn(),
+		sendRunFacts: vi.fn(),
 		discardBufferedSessionState: vi.fn(),
 		sendSessionUnparked: vi.fn(),
 	};
@@ -60,9 +70,14 @@ function makeWorker(opts: {
 		) => AskUserQuestionCallback;
 	};
 	internals.routerConnection = routerConnection;
-	vi.spyOn(internals.agentSessionManager, "hasPendingWork").mockReturnValue(
-		opts.pendingWork,
+	const pendingWorkCount = opts.pendingWorkCount ?? 0;
+	vi.spyOn(internals.agentSessionManager, "pendingWorkCount").mockReturnValue(
+		pendingWorkCount,
 	);
+	vi.spyOn(internals.agentSessionManager, "getRunFacts").mockReturnValue({
+		runner: "claude",
+		model: "claude-opus-5",
+	});
 
 	// Hand the test control of when the elicitation settles.
 	let settle!: (result: AskUserQuestionResult) => void;
@@ -100,30 +115,33 @@ function makeWorker(opts: {
 	return { routerConnection, settle, fail, inFlight, postElicitation };
 }
 
-describe("park on elicitation", () => {
-	it("does not park until the elicitation has been posted", () => {
-		const { routerConnection, postElicitation } = makeWorker({
-			pendingWork: false,
-		});
+describe("wait on elicitation", () => {
+	it("does not report waiting until the elicitation has been posted", () => {
+		const { routerConnection, postElicitation } = makeWorker({});
 
-		// Parking releases the router's session affinity, and posting the
-		// elicitation is a session-scoped RPC. Park first and the post is rejected
-		// with "session not owned by this device" — the question never reaches the
-		// user and every later activity is rejected too (PAR-146).
-		expect(routerConnection.sendSessionState).not.toHaveBeenCalled();
+		// The waiting report can release the router's session affinity, and
+		// posting the elicitation is a session-scoped RPC. Report first and the
+		// post is rejected with "session not owned by this device" — the question
+		// never reaches the user and every later activity is rejected too
+		// (PAR-146).
+		expect(routerConnection.sendSessionWaiting).not.toHaveBeenCalled();
 
 		postElicitation();
 
-		expect(routerConnection.sendSessionState).toHaveBeenCalledWith(
+		expect(routerConnection.sendSessionWaiting).toHaveBeenCalledWith(
 			SESSION_ID,
-			"parked",
+			{ reason: "elicitation", since: expect.any(String) },
+			{
+				executorMayPark: true,
+				runner: "claude",
+				model: "claude-opus-5",
+				pendingWorkCount: 0,
+			},
 		);
 	});
 
-	it("never parks when the elicitation post fails", async () => {
-		const { routerConnection, settle, inFlight } = makeWorker({
-			pendingWork: false,
-		});
+	it("never reports a wait when the elicitation post fails", async () => {
+		const { routerConnection, settle, inFlight } = makeWorker({});
 
 		// The handler returns the failure without ever calling `onPosted`.
 		settle({
@@ -134,14 +152,14 @@ describe("park on elicitation", () => {
 
 		// Nothing is in front of the user, so nothing would ever wake a parked
 		// session — and the agent still needs its affinity to keep posting.
-		expect(routerConnection.sendSessionState).not.toHaveBeenCalled();
+		expect(routerConnection.sendSessionWaiting).not.toHaveBeenCalled();
 		expect(routerConnection.sendSessionUnparked).not.toHaveBeenCalled();
 	});
 
-	it("unparks once the user answers", async () => {
-		const { routerConnection, settle, inFlight, postElicitation } = makeWorker({
-			pendingWork: false,
-		});
+	it("stops waiting once the user answers", async () => {
+		const { routerConnection, settle, inFlight, postElicitation } = makeWorker(
+			{},
+		);
 		postElicitation();
 
 		settle({ answered: true, answers: { q: "CSV only" } });
@@ -149,51 +167,65 @@ describe("park on elicitation", () => {
 
 		expect(routerConnection.sendSessionUnparked).toHaveBeenCalledWith(
 			SESSION_ID,
+			{ runner: "claude", model: "claude-opus-5" },
 		);
 	});
 
-	it("does not park while background work is in flight", () => {
-		// Suspending here would freeze the build, and nothing would ever wake it.
+	it("still reports the wait while background work is in flight, but withholds park permission", () => {
 		const { routerConnection, postElicitation } = makeWorker({
-			pendingWork: true,
+			pendingWorkCount: 2,
 		});
 		postElicitation();
 
-		expect(routerConnection.sendSessionState).not.toHaveBeenCalled();
+		// The run IS waiting and says so — reporting nothing here is what made a
+		// blocked session with a live build indistinguishable from silence. What
+		// pending work withholds is park permission: suspending the container
+		// would freeze the build, and nothing would ever wake the session.
+		expect(routerConnection.sendSessionWaiting).toHaveBeenCalledWith(
+			SESSION_ID,
+			{ reason: "elicitation", since: expect.any(String) },
+			expect.objectContaining({ executorMayPark: false, pendingWorkCount: 2 }),
+		);
 	});
 
-	it("unparks even when the question handler throws", async () => {
-		const { routerConnection, fail, inFlight, postElicitation } = makeWorker({
-			pendingWork: false,
-		});
+	it("stops waiting even when the question handler throws", async () => {
+		const { routerConnection, fail, inFlight, postElicitation } = makeWorker(
+			{},
+		);
 		postElicitation();
 
 		fail(new Error("boom"));
 		await expect(inFlight).rejects.toThrow("boom");
 
-		// The `finally` must run, or the session stays parked with no live frame
+		// The `finally` must run, or the session stays waiting with no live frame
 		// to correct it.
 		expect(routerConnection.sendSessionUnparked).toHaveBeenCalledWith(
 			SESSION_ID,
+			expect.anything(),
 		);
 	});
 
-	it("does not unpark a session it never parked", async () => {
+	it("clears a wait it reported even when the executor never parked", async () => {
 		const { routerConnection, settle, inFlight, postElicitation } = makeWorker({
-			pendingWork: true,
+			pendingWorkCount: 2,
 		});
 		postElicitation();
 
 		settle({ answered: true, answers: { q: "CSV only" } });
 		await inFlight;
 
-		// Discarding here would drop an unrelated buffered frame for this session.
-		expect(routerConnection.sendSessionUnparked).not.toHaveBeenCalled();
+		// A wait was reported, so it has to be retracted — otherwise the run reads
+		// as blocked forever. Nothing was parked, and `sendSessionUnparked`'s
+		// `active` frame grants nothing on the router when there is no park on
+		// record, so retracting is safe.
+		expect(routerConnection.sendSessionUnparked).toHaveBeenCalledWith(
+			SESSION_ID,
+			expect.anything(),
+		);
 	});
 
 	it("is inert outside router platform mode", async () => {
 		const { routerConnection, settle, inFlight, postElicitation } = makeWorker({
-			pendingWork: false,
 			platform: "linear",
 		});
 		postElicitation();
@@ -201,6 +233,7 @@ describe("park on elicitation", () => {
 		settle({ answered: true, answers: { q: "CSV only" } });
 		await inFlight;
 
+		expect(routerConnection.sendSessionWaiting).not.toHaveBeenCalled();
 		expect(routerConnection.sendSessionState).not.toHaveBeenCalled();
 		expect(routerConnection.sendSessionUnparked).not.toHaveBeenCalled();
 	});

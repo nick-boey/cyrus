@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { RouterStore } from "../src/RouterStore.js";
-import { registerRunsRoute } from "../src/runs.js";
+import { observeRun, registerRunsRoute } from "../src/runs.js";
 
 const NOW = 1_000_000;
 
@@ -148,5 +148,108 @@ describe("GET /runs", () => {
 				})
 			).statusCode,
 		).toBe(400);
+	});
+
+	it("reports a waiting run to a legacy client as `parked`", async () => {
+		store.setAgentRunState("session-a", "waiting", {
+			wait: { reason: "elicitation", sinceMs: NOW + 400 },
+		});
+
+		const body = (
+			await fastify.inject({
+				method: "GET",
+				url: "/runs",
+				headers: { authorization: `Bearer ${physicalToken}` },
+			})
+		).json();
+
+		// The frozen shape has no `waiting`, and its `parked` has always meant
+		// exactly this — "blocked on a user answer". Every existing client reads it
+		// that way, so the mapping is the old name read backwards, not a downgrade.
+		expect(body.runs[0].state).toBe("parked");
+		// New facts are deliberately absent here. They belong on the v1
+		// observation and its own route; this shape does not grow.
+		expect(body.runs[0]).not.toHaveProperty("wait");
+		expect(body.runs[0]).not.toHaveProperty("revision");
+		expect(body.runs[0]).not.toHaveProperty("routing");
+	});
+
+	it("separates the run's wait from its executor's sampled state", () => {
+		store.setAgentRunState("session-a", "waiting", {
+			wait: {
+				reason: "other",
+				sinceMs: NOW + 400,
+				reportedCondition: "waiting on a deploy lock",
+			},
+			runner: "claude",
+			model: "claude-opus-5",
+		});
+		const [run] = store.listAgentRuns({ userId: 1, issueKey: "NOR-402" });
+		if (!run) throw new Error("expected the run");
+
+		const observed = observeRun(run, {
+			isDeviceOnline: () => true,
+			getSandboxObservation: () => ({
+				state: "running",
+				observedMs: NOW + 300,
+			}),
+		});
+
+		// The RUN is waiting; the CONTAINER is running. Collapsing the two is what
+		// made a waiting run indistinguishable from a parked container.
+		expect(observed.lifecycle).toBe("waiting");
+		expect(observed.wait).toEqual({
+			reason: "other",
+			since: new Date(NOW + 400).toISOString(),
+			reportedCondition: "waiting on a deploy lock",
+		});
+		expect(observed.executorState).toBe("running");
+		expect(observed.executorStateObservedAt).toBe(
+			new Date(NOW + 300).toISOString(),
+		);
+		expect(observed.runner).toBe("claude");
+		expect(observed.model).toBe("claude-opus-5");
+	});
+
+	it("keeps a long pending-work run active and observable with its count", () => {
+		// The seven-hour cron case. It is not waiting and it has not failed; the
+		// only honest report is an active run carrying what is holding it open.
+		store.setAgentRunState("session-a", "active", { pendingWorkCount: 2 });
+		const [run] = store.listAgentRuns({ userId: 1, issueKey: "NOR-402" });
+		if (!run) throw new Error("expected the run");
+
+		const observed = observeRun(run, { isDeviceOnline: () => true });
+
+		expect(observed.lifecycle).toBe("active");
+		expect(observed.pendingWorkCount).toBe(2);
+		expect(observed.wait).toBeUndefined();
+		expect(observed.endedAt).toBeUndefined();
+	});
+
+	it("never reports pending work on a run that has ended", () => {
+		store.setAgentRunState("session-a", "active", { pendingWorkCount: 2 });
+		store.finishAgentRun("session-a", "complete", NOW + 900);
+		const [run] = store.listAgentRuns({ userId: 1, issueKey: "NOR-402" });
+		if (!run) throw new Error("expected the run");
+
+		const observed = observeRun(run, { isDeviceOnline: () => false });
+
+		// Live background work under a run that has ENDED is the one contradiction
+		// the v1 observation refuses outright.
+		expect(observed.lifecycle).toBe("complete");
+		expect(observed.pendingWorkCount).toBeUndefined();
+	});
+
+	it("carries the routing snapshot the run was routed under", () => {
+		const [run] = store.listAgentRuns({ userId: 1, issueKey: "NOR-402" });
+		if (!run) throw new Error("expected the run");
+
+		const observed = observeRun(run, { isDeviceOnline: () => true });
+
+		// Owner and workspace come from the device's own row, so they are present
+		// even for a route that carried no Linear team or project.
+		expect(observed.routing.ownerUserId).toBe("1");
+		expect(observed.routing.ownerName).toBe("alice@example.com");
+		expect(observed.routing.routedAtMs).toBe(NOW);
 	});
 });
