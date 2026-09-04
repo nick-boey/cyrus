@@ -187,3 +187,84 @@ test("SETUP_UI_ENABLED alone regenerates config rather than being ignored", () =
 	assert.equal(result.status, 1);
 	assert.match(result.stderr, /CYRUS_ROUTER_SETUP_UI_AUTH_MODE/);
 });
+
+test("fleetOperations is absent unless the env var is set", () => {
+	const result = run();
+	assert.equal(result.status, 0, result.stderr);
+	assert.equal(result.config.fleetOperations, undefined);
+});
+
+test("passes CYRUS_ROUTER_FLEET_OPERATIONS_JSON through verbatim", () => {
+	// Rendered whole by main.bicep, exactly like the containers block: the
+	// router re-validates it with its own Zod schema, so remapping fields here
+	// would only give the two shapes a way to drift.
+	const fleetOperations = {
+		access: {
+			entra: {
+				tenantId: "tenant-id",
+				audience: "api://router",
+				grants: [
+					{
+						principalIds: ["oid-1"],
+						roles: ["fleet.read"],
+						workspaceIds: ["ws-1"],
+					},
+				],
+			},
+		},
+		logSource: {
+			schemaVersion: 1,
+			kind: "azure-log-analytics",
+			azure: {
+				workspaceId: "customer-id",
+				table: "ContainerAppConsoleLogs_CL",
+			},
+			budgets: {
+				defaultLookbackSeconds: 900,
+				maxRangeSeconds: 86400,
+				maxRecords: 5000,
+				minFollowIntervalSeconds: 15,
+			},
+		},
+	};
+	const result = run({
+		CYRUS_ROUTER_FLEET_OPERATIONS_JSON: JSON.stringify(fleetOperations),
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(result.config.fleetOperations, fleetOperations);
+});
+
+test("rejects malformed and array fleetOperations JSON", () => {
+	for (const value of ["{bad", "[]"]) {
+		const result = run({ CYRUS_ROUTER_FLEET_OPERATIONS_JSON: value });
+		assert.equal(result.status, 1);
+		assert.match(result.stderr, /CYRUS_ROUTER_FLEET_OPERATIONS_JSON/);
+	}
+});
+
+test("FLEET_OPERATIONS_JSON alone regenerates config rather than being ignored", () => {
+	// The anyProvided gate: an env var missing from that list is silently
+	// dropped whenever a config file already exists. Reaching it needs the three
+	// Linear vars ABSENT and a config file already on disk — with them present
+	// the gate is already true, and this test would pass with
+	// CYRUS_ROUTER_FLEET_OPERATIONS_JSON removed from the list entirely.
+	const dir = mkdtempSync(join(tmpdir(), "router-entrypoint-"));
+	const app = join(dir, "app.mjs");
+	writeFileSync(app, "");
+	writeFileSync(join(dir, "router-config.json"), "{}\n");
+	const result = spawnSync(process.execPath, [ENTRYPOINT], {
+		encoding: "utf8",
+		env: {
+			PATH: process.env.PATH,
+			CYRUS_DATA_DIR: dir,
+			CYRUS_APP_PATH: app,
+			CYRUS_ROUTER_FLEET_OPERATIONS_JSON: "{bad",
+		},
+	});
+	// Without the gate the existing file is used as-is and the entrypoint exits
+	// 0 with "using existing"; with it, generation runs and dies on the absent
+	// Linear vars. Exit 1 is therefore the whole proof — the malformed JSON is
+	// never reached, because required-env validation runs before any parse.
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /missing required environment variables/);
+});

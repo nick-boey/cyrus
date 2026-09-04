@@ -31,6 +31,9 @@ param routerPrincipalId string
 @description('Optional Entra principal id granted break-glass Storage Blob Data Contributor on router-backups.')
 param operatorPrincipalId string
 
+@description('Optional Entra principal/group object ids granted Log Analytics Reader at the workspace scope, so an authorized fleet operator can query the advertised log source with their own credential. Deliberately SEPARATE from the router-side fleet roles: fleetOperatorGrants decides what the router will answer, this Azure data-plane role decides what the operator can read directly, and neither implies the other. It is also NOT narrowed by Linear workspace the way a grant is — one Log Analytics workspace holds the logs of every Linear workspace, so this is all-or-nothing over the stack. Empty grants nothing.')
+param logAnalyticsReaderPrincipalIds array = []
+
 @description('Role-definition GUID for Container Apps SandboxGroup Data Owner.')
 param sandboxGroupDataOwnerRoleId string
 
@@ -41,6 +44,7 @@ var roleIds = {
   storageBlobDataContributor: 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
   storageTableDataContributor: '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
   acrPull: '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+  logAnalyticsReader: '73c42c96-874c-492b-b04d-ab87d138a893'
 }
 
 var routerBackupsContainerName = 'router-backups'
@@ -52,6 +56,10 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
 
 resource routerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
   name: 'id-${namePrefix}-router'
+}
+
+resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
+  name: 'log-${namePrefix}'
 }
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
@@ -185,3 +193,24 @@ resource sandboxGroupAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01
     principalType: 'ServicePrincipal'
   }
 }
+
+// Workspace-scoped, not subscription-scoped, and principalType is omitted for
+// the same reason as the break-glass grant above: an operator may be a user, a
+// group, or a service principal.
+// `union(..., [])` deduplicates: the assignment name is a guid() of the
+// principal id, so listing the same principal twice — easy to do when a person
+// is added again years later — would declare one resource twice and fail the
+// whole deployment on a name collision rather than on anything meaningful.
+resource operatorLogAnalyticsReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for principalId in union(logAnalyticsReaderPrincipalIds, []): {
+    name: guid(logAnalytics.id, principalId, roleIds.logAnalyticsReader)
+    scope: logAnalytics
+    properties: {
+      roleDefinitionId: subscriptionResourceId(
+        'Microsoft.Authorization/roleDefinitions',
+        roleIds.logAnalyticsReader
+      )
+      principalId: principalId
+    }
+  }
+]

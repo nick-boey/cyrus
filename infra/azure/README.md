@@ -996,6 +996,240 @@ and sign in to `setupUiUrl` as a real teammate.
 Never do these in one deployment, and never step 2 before step 1 — that is the
 unauthenticated-`/setup` window again, in reverse.
 
+### 12. Optional: fleet operator access
+
+Lets a named person or group query this router's fleet through
+`/api/v1/operator/*` with their own Entra identity, and query the router's
+historical logs with their own Azure credential. Off entirely unless you
+configure it: with `fleetOperatorGrants` and
+`fleetOperatorLogReaderPrincipalIds` both empty, the deployment creates no
+operator role assignments and renders no `fleetOperations` block into the
+router config.
+
+**Two authorizations, deliberately independent.** `fleetOperatorGrants` decides
+what the *router* will answer. The Azure `Log Analytics Reader` role decides
+what the operator's *own client* can read from the workspace. Log records never
+pass back through the router, so neither implies the other: a `fleet.read`
+principal gains no Azure access, and a principal you grant `Log Analytics
+Reader` gains no recovery authority. Grant them separately, and revoke them
+separately.
+
+#### Step 1 — optional: define the two app roles (Microsoft Graph, not ARM)
+
+**The router does not read the `roles` claim.** Authority comes from
+`fleetOperatorGrants` in step 2, matched on the caller's `oid` and `groups`, and
+that table is fail-closed on its own: a verified identity matching no grant is
+authenticated over nothing and gets a `403`. So this step grants nobody
+anything, and skipping it costs no security.
+
+What it buys is control over who can obtain a token for the audience at all.
+By default any account in the tenant can, and being refused by the grant table
+is the only thing that stops them. Defining the roles and setting
+`appRoleAssignmentRequired` moves that refusal to Entra, where it is visible to
+whoever audits directory access. Keep the role names identical to the grant
+strings so an operator reading an Entra assignment and a parameter file does not
+have to reconcile two vocabularies.
+
+Bicep cannot do this. App registrations are Graph objects, not ARM resources,
+so app roles are created with `az ad app` against the **existing** router app
+registration — one app registration/audience per router deployment is a
+standing invariant, so do not mint a second one.
+
+`--app-roles` REPLACES the whole collection. Read the current one back first,
+or you will silently delete the "default access" role `/setup` sign-in assigns.
+
+```bash
+APP_ID='<router-app-registration-client-id>'   # same GUID as setupUiClientId
+
+# Read the existing roles BEFORE writing. Keep this file: it is the rollback.
+az ad app show --id "$APP_ID" --query appRoles -o json > /tmp/app-roles.before.json
+cat /tmp/app-roles.before.json
+
+# Each `id` is a GUID generated once and never changed — an assignment
+# references the role by id, so regenerating one orphans every assignment.
+cat >/tmp/app-roles.new.json <<JSON
+[
+  {
+    "allowedMemberTypes": ["User", "Application"],
+    "description": "Read fleet state: sessions, runs, and the advertised log source.",
+    "displayName": "Cyrus fleet read",
+    "id": "$(uuidgen)",
+    "isEnabled": true,
+    "value": "fleet.read"
+  },
+  {
+    "allowedMemberTypes": ["User", "Application"],
+    "description": "Request recovery of a stuck or stranded Cyrus session.",
+    "displayName": "Cyrus fleet recover",
+    "id": "$(uuidgen)",
+    "isEnabled": true,
+    "value": "fleet.recover"
+  }
+]
+JSON
+
+# Merge, then write the WHOLE collection back.
+jq -s 'add' /tmp/app-roles.before.json /tmp/app-roles.new.json \
+  > /tmp/app-roles.merged.json
+az ad app update --id "$APP_ID" --app-roles @/tmp/app-roles.merged.json
+
+# Verify both new roles survived ALONGSIDE the pre-existing ones.
+az ad app show --id "$APP_ID" --query "appRoles[].value" -o tsv
+```
+
+Assign them in the Entra portal (Enterprise applications → the router app →
+Users and groups), or with `az ad app role assignment` / a Graph
+`appRoleAssignments` call. Prefer assigning a **group**: the router keys grants
+on immutable object ids, and a group id survives staff changes that a user's
+`oid` does not.
+
+`value` must be exactly `fleet.read` / `fleet.recover` — those strings are the
+protocol's role names, not labels.
+
+To make the assignment actually gate token issuance:
+
+```bash
+az ad sp update --id "$(az ad sp show --id "$APP_ID" --query id -o tsv)"   --set appRoleAssignmentRequired=true
+```
+
+That flag applies to the **whole service principal**, which also serves
+`/enroll` and `/setup`. Turning it on means every enrolling device owner and
+every `/setup` user needs an assignment too — do it when the directory is the
+place you want that gate, not as a reflex.
+
+#### Step 2 — render the grants into the router
+
+Entra app roles are tenant-wide; the per-workspace narrowing lives in router
+configuration, which is what makes "this team reads workspace A only" possible
+at all.
+
+```bicep
+// Requires entraTenantId + entraAudience (section 8) — operator access tokens
+// are verified against the same app registration as /enroll.
+param fleetOperatorGrants = [
+  {
+    principalIds: ['<oncall-group-object-id>']
+    roles: ['fleet.read']
+    workspaceIds: ['75294f85-72ad-42ef-b9d7-c6ded611fc42']
+  }
+  {
+    principalIds: ['<responder-object-id>']
+    roles: ['fleet.read', 'fleet.recover']
+    workspaceIds: ['75294f85-72ad-42ef-b9d7-c6ded611fc42']
+  }
+]
+
+// Recovery stays OFF until the final validation gate. While false,
+// `fleet.recover` is STRIPPED from every rendered grant: the read+recover
+// principal above keeps working read-only, and a recovery-ONLY grant
+// disappears entirely. The Entra assignment can stay in place meanwhile.
+param enableFleetRecovery = false
+```
+
+`principalIds` are **immutable object ids** — a user's `oid` or a group's
+object id. Never an email or a UPN: both are mutable and reassignable in Entra,
+so a grant keyed on one follows a renamed or recycled account.
+
+Grants are **additive**: a caller matching several entries — typically their own
+`oid` plus one or more groups — holds the union of the roles and the union of
+the workspaces, narrowed to the workspaces this router actually serves.
+
+One caveat on group grants. Above roughly 200 group memberships Entra stops
+emitting a `groups` array and emits a Graph pointer instead, which the router
+does not follow. Such a caller matches no group-keyed grant and sees an
+unexplained `403` — and it is precisely the long-tenured operator a
+`fleet.recover` group grant exists for. The router logs a warning naming the
+principal when it sees this; grant those few people directly by object id.
+
+Deploy, then read back what the router received. It is credential-free by
+construction, so it is safe to print:
+
+```bash
+az deployment sub show --name cyrus-cyrus-dev \
+  --query 'properties.outputs.cyrusRouterFleetOperationsJson.value' -o tsv | jq .
+```
+
+Expect object ids, role names, workspace ids, and the log-source descriptor —
+and no tokens, keys, or connection strings of any kind.
+
+#### Step 3 — grant Log Analytics Reader
+
+```bicep
+param fleetOperatorLogReaderPrincipalIds = [
+  '<oncall-group-object-id>'
+]
+```
+
+Assigned at the **workspace** scope, not the subscription. `principalType` is
+omitted so the list accepts users, groups, and service principals alike.
+
+**This grant is NOT narrowed by workspace id, and that asymmetry is the one
+thing to understand before handing it out.** `fleetOperatorGrants[].workspaceIds`
+bounds what the *router* will answer; nothing bounds what Log Analytics will
+answer. There is one workspace per stack and it is the sink for
+`ContainerAppConsoleLogs_CL` and `AppTraces` across every Linear workspace and
+every user, so a contractor granted `fleet.read` on workspace A alone — plus this
+role, so their `logs.query` works at all — can query workspace B's router and
+sandbox logs directly with their own credential. The router is not in that path
+and cannot refuse it.
+
+Azure has no per-Linear-workspace lever here: the finest available bound is
+table-level RBAC on the workspace, which cuts by table rather than by tenant.
+So treat this role as "may read this stack's logs, all of them" and grant it to
+principals you would trust with the whole stack. Where that is not acceptable,
+leave the list empty — a `fleet.read` operator without it keeps every other
+operator command and simply cannot run log queries.
+
+**On a `manageRoleAssignments = false` stack — which is what routine CD runs —
+this parameter does nothing during a deployment.** The grant is applied by the
+privileged bootstrap path, which reads the same parameter file:
+
+```bash
+./scripts/bootstrap-azure-role-assignments.sh --params <your>.bicepparam
+./scripts/bootstrap-azure-role-assignments.sh --params <your>.bicepparam --apply
+```
+
+**Manual fallback**, for a deployment whose identity cannot assign roles at all
+(and for verifying what the bootstrap did):
+
+```bash
+WS_ID="$(az deployment sub show --name cyrus-cyrus-dev \
+  --query 'properties.outputs.logAnalyticsWorkspaceName.value' -o tsv)"
+
+az role assignment create \
+  --assignee-object-id '<principal-object-id>' \
+  --assignee-principal-type Group \
+  --role 'Log Analytics Reader' \
+  --scope "$(az monitor log-analytics workspace show \
+    --resource-group rg-cyrus-dev --workspace-name "$WS_ID" --query id -o tsv)"
+```
+
+#### Verifying, and rolling back
+
+An authorized operator's context should list the roles you granted, and the
+log-source descriptor only when their capabilities include `logs.query`:
+
+```bash
+curl -s -H "Authorization: Bearer $OPERATOR_ACCESS_TOKEN" \
+  "https://$FQDN/api/v1/operator/context" | jq '{roles, capabilities, logSource}'
+```
+
+Anonymous discovery must disclose neither workspaces nor the log source:
+
+```bash
+curl -s "https://$FQDN/.well-known/cyrus" | jq .
+```
+
+Rollback is per-authorization and neither step needs the other:
+
+1. `enableFleetRecovery = false` retracts recovery from every grant on the next
+   revision without touching Entra.
+2. Emptying `fleetOperatorGrants` removes the router-side grant table and, with
+   it, the log-source metadata. Emptying
+   `fleetOperatorLogReaderPrincipalIds` stops *new* Log Analytics Reader
+   assignments — but incremental mode never deletes an existing one, so remove
+   it with `az role assignment delete`.
+
 ### Key Vault → Table migration for per-user secrets
 
 The Azure Table (`cyrussetup`), the envelope-encryption KEK, and the router's

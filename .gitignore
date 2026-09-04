@@ -55,6 +55,11 @@ docker/router/.env
 # write flag is enabled. Only the committed `.example` checklist is tracked.
 *.bicepparam
 !*.bicepparam.example
+# Test fixtures, not deployment intent. scripts/check-bicep.sh type-checks every
+# file in here against main.bicep, so an ignored fixture is a check that passes
+# locally and does not exist for anyone else. They hold placeholder GUIDs only —
+# never point a real deployment at this directory.
+!infra/azure/bicep/testdata/*.bicepparam
 # scripts/deploy-router-image.sh stages its rewrite in a mode-600 temp file
 # beside main.bicepparam. `*.bicepparam` above does not match a name with a
 # suffix after `.bicepparam`, and BSD mktemp only substitutes a TRAILING run of

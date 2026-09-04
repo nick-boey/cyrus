@@ -225,6 +225,61 @@ param entraAudience string = ''
 param entraAllowedDomain string = ''
 
 ////////////////////////////////////////////////////////////////////////////////
+// Fleet operator access
+//
+// Two independent authorizations, and keeping them independent is the point:
+//
+//   * fleetOperatorGrants decides what the ROUTER will answer. Entra app roles
+//     are tenant-wide, so the per-workspace narrowing that makes them useful
+//     lives here, in router configuration, not in the directory.
+//   * fleetOperatorLogReaderPrincipalIds decides what the operator CLIENT can
+//     read from Log Analytics directly. Log records never pass back through the
+//     router, so a fleet.read grant confers no Azure data-plane access on its
+//     own, and a fleet.recover principal listed here gains no recovery
+//     authority from being able to read logs.
+//
+// Omit both and the deployment is what it is today: no operator role
+// assignments, and no fleetOperations block in the rendered router config.
+////////////////////////////////////////////////////////////////////////////////
+
+// Typed rather than a bare `array` so a malformed grant fails at COMPILE time,
+// where `scripts/check-bicep.sh` sees it, instead of at deployment — a missing
+// `roles` key would otherwise reach `filter(grant.roles, ...)` inside the
+// recovery strip, and a misspelled role would render into the router config and
+// be rejected by its Zod schema after the revision was already published.
+// Every list is @minLength(1) because the router's Zod schema requires it
+// (`RouterConfigFileSchema` in apps/cli/src/commands/RouterCommand.ts). Without
+// these, emptying a grant's `workspaceIds` while leaving the entry in place
+// type-checks, survives build-params AND what-if, renders into
+// CYRUS_ROUTER_FLEET_OPERATIONS_JSON, and then fails the router's parse at
+// startup — a crash-looping revision, which is the exact failure this typed
+// parameter exists to move forward to deploy time. `roles` is separately
+// protected by the empty-grant filter below, but only AFTER the recovery strip;
+// an empty `roles` in the input is a typo either way, so reject it here.
+type fleetOperatorGrant = {
+  @description('IMMUTABLE Entra object ids: a user oid or a group object id, never an email or UPN because both are reassignable.')
+  @minLength(1)
+  principalIds: string[]
+
+  @description('Roles these principals hold. Additive across a caller oid and their group memberships.')
+  @minLength(1)
+  roles: ('fleet.read' | 'fleet.recover')[]
+
+  @description('Linear workspace ids those roles apply to. The router narrows them to the workspaces it actually serves.')
+  @minLength(1)
+  workspaceIds: string[]
+}
+
+@description('Router-side authorization rules for Entra fleet operators, passed VERBATIM into CYRUS_ROUTER_FLEET_OPERATIONS_JSON as access.entra.grants. Each entry is { principalIds, roles, workspaceIds }: IMMUTABLE Entra object ids (a user oid or a group object id, never an email or UPN because both are reassignable), the roles they hold (fleet.read and/or fleet.recover), and the Linear workspace ids those roles apply to. Grants are additive across a caller oid and their group memberships. Requires entraTenantId and entraAudience: operator access tokens are verified against the same app registration as /enroll.')
+param fleetOperatorGrants fleetOperatorGrant[] = []
+
+@description('Allow fleet.recover to reach the router. FALSE by default, and kept false in production parameters until the final validation gate: while it is false, fleet.recover is STRIPPED from every rendered grant, so a recovery principal authenticates as a reader and a grant naming only fleet.recover disappears entirely. A deployment-side kill switch, not a directory change: the Entra app-role assignment can stay in place while it is off.')
+param enableFleetRecovery bool = false
+
+@description('Entra principal/group object ids granted the Azure Log Analytics Reader data-plane role at the workspace scope, so an authorized operator can query the advertised log source with their own credential. SEPARATE from fleetOperatorGrants on purpose: neither role implies the other. Empty assigns nothing. When manageRoleAssignments=false, these are applied by scripts/bootstrap-azure-role-assignments.sh instead.')
+param fleetOperatorLogReaderPrincipalIds array = []
+
+////////////////////////////////////////////////////////////////////////////////
 // Setup management UI (/setup) — STAGED ROLLOUT (D7)
 //
 // Reaching a live `/setup` takes TWO separate deployments, and that is the
@@ -474,6 +529,7 @@ var parameterViolations = concat(
   !enableSetupUi || setupAuthStage1Verified ? [] : ['enableSetupUi requires setupAuthStage1Verified=true. Stage 1 must be deployed on its own and verified live (README section 11 step 5) BEFORE the routes exist.'],
   !enableSetupUi || setupUiAuthMode != 'entra-token' || !empty(setupUiIdTokenAudience) || !empty(setupUiClientId) ? [] : ['setupUiAuthMode=entra-token needs an ID token audience: set setupUiClientId (the audience defaults to it) or override setupUiIdTokenAudience explicitly.'],
   !enableSetupTableBackend || enableSetupSecretStore ? [] : ['enableSetupTableBackend requires enableSetupSecretStore=true. The selector points the router at a Table and a KEK that the creation flag provisions; without it the rendered config would name resources that do not exist.'],
+  empty(fleetOperatorGrants) || (!empty(entraTenantId) && !empty(entraAudience)) ? [] : ['fleetOperatorGrants requires entraTenantId and entraAudience. Operator access tokens are verified against the same app registration as /enroll, so a grant table with no tenant and no audience to check claims against would authorize nobody.'],
   !setupUiAutoProvisionUsers || setupUiAllowedPrincipalsConfigured || setupUiAssignmentRequiredVerified ? [] : ['setupUiAutoProvisionUsers=true requires a membership gate: populate setupUiAllowedGroupObjectIds / setupUiAllowedPrincipalObjectIds, or perform the Entra assignment steps in README section 11 step 3 and set setupUiAssignmentRequiredVerified=true. By default ANY account in the tenant can obtain a token for the app, and setupUiAllowedDomain cannot tell an assigned teammate from any other account in the same tenant.']
 )
 
@@ -557,6 +613,7 @@ module roleAssignments 'modules/role-assignments.bicep' = if (manageRoleAssignme
     enableSetupSecretStore: enableSetupSecretStore
     routerPrincipalId: foundation.outputs.routerPrincipalId
     operatorPrincipalId: operatorPrincipalId
+    logAnalyticsReaderPrincipalIds: union(fleetOperatorLogReaderPrincipalIds, [])
     sandboxGroupDataOwnerRoleId: sandboxGroupDataOwnerRoleId
   }
   dependsOn: [
@@ -672,6 +729,86 @@ var routerContainersConfig = union(
 )
 
 ////////////////////////////////////////////////////////////////////////////////
+// Fleet Operations router config (CYRUS_ROUTER_FLEET_OPERATIONS_JSON)
+//
+// Credential-free by construction. Grants name Entra object ids; the log source
+// names a workspace GUID and an ARM resource id. Neither is a secret, which is
+// why the whole block is safe to render into a plain container env var and to
+// export as a deployment output.
+////////////////////////////////////////////////////////////////////////////////
+
+// The recovery kill switch. Stripping the role rather than refusing the
+// deployment is deliberate: a fleet.read+fleet.recover grant keeps working as
+// read-only, and only a grant that was recovery-ONLY vanishes — which it must,
+// because the router schema requires at least one role per grant.
+//
+// `enableFleetRecovery` is tested INSIDE the map rather than short-circuiting
+// the whole expression, so `grant.roles` is dereferenced either way. Short-
+// circuiting made the safer-looking setting validate LESS: with recovery on,
+// nothing touched the grants, so a misspelled key rendered verbatim into
+// CYRUS_ROUTER_FLEET_OPERATIONS_JSON, failed the router's Zod parse at startup,
+// and surfaced as a crash-looping revision instead of a parameter error.
+// Dereferencing unconditionally moves that to `az deployment sub what-if`,
+// which routine CD always runs first. The `fleetOperatorGrant` type above
+// catches the rest — a missing key, a misspelled role, an emptied list — so the
+// router's schema is now a backstop rather than the first line of defence.
+var fleetGrants = filter(
+  map(fleetOperatorGrants, grant => union(grant, {
+    roles: enableFleetRecovery
+      ? grant.roles
+      : filter(grant.roles, role => role != 'fleet.recover')
+  })),
+  grant => !empty(grant.roles)
+)
+
+// Disclosed only on the authenticated operator context route, and only to a
+// principal whose capabilities include logs.query. `table` is pinned by the
+// protocol; `cloud` is omitted rather than hardcoded, because the enum values
+// do not match az.environment().name and a wrong one is worse than an absent
+// one the client defaults.
+var fleetLogSource = {
+  schemaVersion: 1
+  kind: 'azure-log-analytics'
+  displayName: 'Cyrus ${namePrefix}'
+  azure: {
+    workspaceId: foundation.outputs.logAnalyticsCustomerId
+    table: 'ContainerAppConsoleLogs_CL'
+    resourceId: foundation.outputs.logAnalyticsWorkspaceResourceId
+  }
+  budgets: {
+    defaultLookbackSeconds: 900
+    maxRangeSeconds: 86400
+    maxRecords: 5000
+    minFollowIntervalSeconds: 15
+  }
+}
+
+// Rendered ONLY when operators are configured, so an unconfigured deployment
+// publishes no workspace metadata at all.
+//
+// Gated on the PARAMETER, not on the post-strip `fleetGrants`. Those differ
+// exactly when every configured grant was recovery-only and `enableFleetRecovery`
+// stripped them to nothing — and there, turning recovery off would also have
+// silently retracted the log source from a stack that plainly does have
+// operators. Withholding the descriptor from a caller who may not read it is
+// `FleetOperations.context()`'s job (it gates on the `logs.query` capability),
+// not this template's.
+var fleetOperationsConfig = empty(fleetOperatorGrants)
+  ? {}
+  : {
+      logSource: fleetLogSource
+      access: {
+        entra: {
+          tenantId: entraTenantId
+          audience: entraAudience
+          grants: fleetGrants
+        }
+      }
+    }
+
+var fleetOperationsJson = empty(fleetOperationsConfig) ? '' : string(fleetOperationsConfig)
+
+////////////////////////////////////////////////////////////////////////////////
 // Router Container App
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -690,6 +827,7 @@ module routerApp 'modules/router-app.bicep' = {
     keyVaultUri: foundation.outputs.keyVaultUri
     linearWorkspaceId: linearWorkspaceId
     routerContainersJson: string(routerContainersConfig)
+    fleetOperationsJson: fleetOperationsJson
     backupBlobUrl: backupBlobUrl
     acrLoginServer: enableAcr ? foundation.outputs.acrLoginServer : ''
     customDomains: routerCustomDomains
@@ -840,6 +978,12 @@ output setupKekVersionedKeyId string = enableSetupSecretStore ? foundation.outpu
 
 @description('Name of the workspace-based Application Insights component used as the router\'s OTLP endpoint. Empty when enableOtelLogs is false.')
 output otelLogsApplicationInsightsName string = monitoring.outputs.applicationInsightsName
+
+@description('The complete, rendered CYRUS_ROUTER_FLEET_OPERATIONS_JSON value, or empty when no fleet operators are configured. Credential-free: Entra object ids, Linear workspace ids, and Log Analytics workspace identifiers only.')
+output cyrusRouterFleetOperationsJson string = fleetOperationsJson
+
+@description('Log Analytics workspace customer id — the GUID an operator query is addressed to, as advertised in the log-source descriptor. An identifier, not a credential.')
+output logAnalyticsCustomerId string = foundation.outputs.logAnalyticsCustomerId
 
 @description('The single Log Analytics workspace receiving both router stdout in ContainerAppConsoleLogs_CL and OTLP records in AppTraces.')
 output logAnalyticsWorkspaceName string = foundation.outputs.logAnalyticsWorkspaceName

@@ -179,6 +179,54 @@ param entraTenantId = ''
 param entraAudience = ''
 param entraAllowedDomain = ''
 
+// ---- Fleet operator access --------------------------------------------------
+// Two INDEPENDENT authorizations. Leave both empty and the deployment is what
+// it is today: no operator role assignments, and no fleetOperations block in the
+// rendered router config.
+//
+// The grant table below is the authority, and it is fail-closed on its own: a
+// verified identity matching no grant is authorized over nothing. Matching Entra
+// app roles are OPTIONAL — they gate who can obtain a token for the audience at
+// all, not what that token can do, and Bicep cannot create them because app
+// registrations are Microsoft Graph objects rather than ARM resources. See
+// infra/azure/README.md §12.
+//
+// 1. What the ROUTER will answer. Entra app roles are tenant-wide, so the
+//    per-workspace narrowing lives here. principalIds are IMMUTABLE object ids
+//    (a user's `oid` or a group's) — never an email or UPN, both of which are
+//    reassignable. Requires entraTenantId + entraAudience above.
+param fleetOperatorGrants = []
+// param fleetOperatorGrants = [
+//   {
+//     principalIds: ['<group-object-id>']
+//     roles: ['fleet.read']
+//     workspaceIds: ['00000000-0000-0000-0000-000000000000']
+//   }
+//   {
+//     principalIds: ['<responder-object-id>']
+//     roles: ['fleet.read', 'fleet.recover']
+//     workspaceIds: ['00000000-0000-0000-0000-000000000000']
+//   }
+// ]
+
+// Deployment-side kill switch for recovery, FALSE until the final validation
+// gate. While false, `fleet.recover` is STRIPPED from every rendered grant — a
+// read+recover principal keeps working read-only and a recovery-only grant
+// disappears — without touching the Entra assignment.
+param enableFleetRecovery = false
+
+// 2. What the operator's OWN client may read from Log Analytics. Log records
+//    never pass back through the router, so this grants no router authority and
+//    a router grant grants no log access. On a manageRoleAssignments=false
+//    stack this list is applied by
+//    scripts/bootstrap-azure-role-assignments.sh, not by routine CD.
+//
+//    NOT narrowed by workspace id, unlike the grants above: one Log Analytics
+//    workspace holds every Linear workspace's logs, so this is all-or-nothing
+//    over the stack. Grant it only to principals you would trust with all of
+//    it — README §12 step 3.
+param fleetOperatorLogReaderPrincipalIds = []
+
 // ---- Setup management UI (/setup) — STAGED, see README §11 ------------------
 // TWO SEPARATE DEPLOYMENTS with a live verification gate between them.
 // `authConfigs` is a child of the Container App, so a single flag would

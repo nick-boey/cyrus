@@ -32,6 +32,10 @@ param resourceGroupName = 'rg-cyrus'
 param enableAcr = true
 param enableSetupSecretStore = true
 param operatorPrincipalId = '11111111-1111-1111-1111-111111111111'
+param fleetOperatorLogReaderPrincipalIds = [
+  '22222222-2222-2222-2222-222222222222' // on-call [primary]
+  '33333333-3333-3333-3333-333333333333'
+]
 param sandboxGroupDataOwnerRoleId = 'c24cf47c-5077-412d-a19c-45202126392c'
 param linearClientSecret = 'SECRET_MUST_NOT_REACH_AZURE'
 param setupUiClientSecret = 'ALSO_MUST_NOT_REACH_AZURE'
@@ -103,6 +107,33 @@ elif grep -q '^deployment group ' "$calls"; then
   fail "attempted a deployment with no project"
 else
   ok "requires an explicit project before resolving the resource group"
+fi
+
+# 6. The Log Analytics Reader list reaches the RBAC template as a JSON array,
+#    with the trailing `//` comments stripped. This is the ONLY path that grant
+#    has on a manageRoleAssignments=false deployment, which is what routine CD
+#    runs.
+#
+#    The first entry's comment contains a `]` on purpose: a scan that looked for
+#    the closing bracket before stripping comments ended there and dropped the
+#    second principal silently — a shorter grant list with no error anywhere.
+: >"$calls"
+if AZ_CALLS="$calls" PATH="$WORK/bin:$PATH" "$SCRIPT" --params "$params" >/dev/null \
+  && grep -q 'fleetOperatorLogReaderPrincipalIds' "$calls"; then
+  fail "forwarded the main.bicep parameter name instead of the RBAC template one"
+elif grep -q 'logAnalyticsReaderPrincipalIds=\["22222222-2222-2222-2222-222222222222","33333333-3333-3333-3333-333333333333"\]' "$calls"; then
+  ok "forwards the Log Analytics Reader principals as a JSON array"
+else
+  fail "did not forward logAnalyticsReaderPrincipalIds"
+fi
+
+# 7. An omitted list forwards an empty array rather than an unquoted blank.
+: >"$calls"
+if AZ_CALLS="$calls" PATH="$WORK/bin:$PATH" "$SCRIPT" --params "$minimal" >/dev/null \
+  && grep -q 'logAnalyticsReaderPrincipalIds=\[\]' "$calls"; then
+  ok "forwards an empty array when no operators are configured"
+else
+  fail "did not forward an empty logAnalyticsReaderPrincipalIds"
 fi
 
 exit "$FAILURES"

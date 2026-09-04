@@ -81,8 +81,16 @@ Compile everything locally before pushing:
 ./scripts/check-bicep.sh
 ```
 
-It builds every template, type-checks `main.bicepparam.example` against
-`main.bicep`, and **treats warnings as failures**. CI runs the same script.
+It builds every template, type-checks `main.bicepparam.example` and every
+fixture in `testdata/` against `main.bicep`, asserts a handful of ARM
+expressions survive in the compiled output, and **treats warnings as failures**.
+CI runs the same script.
+
+Those ARM assertions exist because `build` and `build-params` cannot evaluate:
+an ARM lambda runs at deployment time, so nothing local can see what a grant
+table renders to. They pin the wiring around it — the recovery strip, the
+conditional env var, the workspace-scoped role — and `az deployment sub what-if`
+remains the gate for the rendered value itself.
 
 ## Why Bicep, in one paragraph
 
@@ -190,6 +198,35 @@ The bootstrap template and `main.bicep` both call the same
 important: their `guid(...)` expressions are Azure resource identities, so a
 second implementation could replace working assignments even if its display
 names looked identical.
+
+### Fleet operator access is two independent grants
+
+`fleetOperatorGrants` renders into `CYRUS_ROUTER_FLEET_OPERATIONS_JSON` and
+decides what the **router** answers. `fleetOperatorLogReaderPrincipalIds`
+assigns Azure `Log Analytics Reader` at the workspace scope and decides what the
+operator's **own client** can read. Neither implies the other, and the template
+never derives one list from the other — log records do not pass through the
+router, so a router role confers no data-plane access and vice versa.
+
+The two are also bounded differently, which is easy to miss: grants carry
+`workspaceIds`, the Azure role carries nothing equivalent. One Log Analytics
+workspace per stack holds every Linear workspace's logs, so `Log Analytics
+Reader` is all-or-nothing over the stack regardless of how narrow the matching
+grant is. See infra/azure/README.md § "Optional: fleet operator access", step 3.
+
+`enableFleetRecovery` is a deployment-side kill switch, not a directory change:
+while it is false the template STRIPS `fleet.recover` from every rendered grant,
+and drops any grant that had no other role (the router schema requires at least
+one). The Entra app-role assignment is untouched, so re-enabling is a parameter
+flip rather than a directory round trip.
+
+Entra app roles themselves are **not** created here. App registrations are
+Microsoft Graph objects, not ARM resources; `az ad app update --app-roles` is
+the documented path (infra/azure/README.md § "Optional: fleet operator access"),
+and it REPLACES the whole role collection, so read the existing one back first.
+They are also not what authorizes a caller: the router matches `oid` and
+`groups` against `fleetOperatorGrants` and never reads the `roles` claim, so an
+app role gates who can obtain a token, not what that token can do.
 
 ### Cross-parameter invariants
 

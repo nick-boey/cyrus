@@ -101,7 +101,8 @@ function generateConfig(env) {
 			env.CYRUS_ROUTER_ENTRA_JWKS_URL ||
 			env.CYRUS_ROUTER_ENTRA_CERT_ISSUER_ID ||
 			env.CYRUS_ROUTER_LINEAR_TOKEN_STORE_KEY_VAULT_URL ||
-			env.CYRUS_ROUTER_SETUP_UI_ENABLED,
+			env.CYRUS_ROUTER_SETUP_UI_ENABLED ||
+			env.CYRUS_ROUTER_FLEET_OPERATIONS_JSON,
 	);
 
 	if (!anyProvided) {
@@ -170,6 +171,16 @@ function generateConfig(env) {
 		config.containers = parseObject(
 			"CYRUS_ROUTER_CONTAINERS_JSON",
 			env.CYRUS_ROUTER_CONTAINERS_JSON,
+		);
+	}
+	if (env.CYRUS_ROUTER_FLEET_OPERATIONS_JSON) {
+		// Rendered whole by main.bicep and handed over verbatim, exactly like the
+		// containers block. `cyrus router start` re-validates it against its own
+		// Zod schema, so remapping fields here would only give the deployed shape
+		// and the router's shape a way to drift apart.
+		config.fleetOperations = parseObject(
+			"CYRUS_ROUTER_FLEET_OPERATIONS_JSON",
+			env.CYRUS_ROUTER_FLEET_OPERATIONS_JSON,
 		);
 	}
 	if (env.CYRUS_ROUTER_BACKUP_BLOB_URL) {

@@ -34,15 +34,18 @@ jobs:
     - name: Check Bicep templates
       run: ./scripts/check-bicep.sh
     # `pnpm test` is workspace-only (pnpm-workspace.yaml is packages/* + apps/*),
-    # so nothing else in CI runs scripts/*.test.sh. Without this the rewrite
-    # suite — the only guard on a mode-600 .bicepparam holding the Linear client
-    # secret and both OAuth tokens — would rot unnoticed, along with the
-    # image-pin allowlist it also covers.
+    # so nothing else in CI runs scripts/*.test.sh — nor docker/, which is not a
+    # workspace package either. Without this the rewrite suite — the only guard
+    # on a mode-600 .bicepparam holding the Linear client secret and both OAuth
+    # tokens — would rot unnoticed, along with the image-pin allowlist it also
+    # covers and the router entrypoint's env-var-to-router-config mapping.
+    # Every test here must be listed by name; a new one is invisible until it is.
     - name: Test deploy scripts
       run: |
         bash scripts/deploy-router-image.test.sh
         bash scripts/deploy-worker-image.test.sh
         bash scripts/bootstrap-azure-role-assignments.test.sh
+        node --test docker/router/entrypoint.test.mjs
 
   test:
     runs-on: ubuntu-latest

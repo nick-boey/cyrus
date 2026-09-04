@@ -386,6 +386,14 @@ resource setupKek 'Microsoft.KeyVault/vaults/keys@2023-07-01' = if (enableSetupS
 ////////////////////////////////////////////////////////////////////////////////
 
 output logAnalyticsWorkspaceName string = logAnalytics.name
+
+// The two identifiers LogSourceDescriptorV1 is built from. Neither is a
+// credential: `customerId` is the workspace GUID a query is addressed to, and
+// the ARM resource id is what an operator's client resolves for a
+// resource-scoped query. Both are derived here rather than taken as parameters
+// so a deployment cannot name a workspace it did not create.
+output logAnalyticsCustomerId string = logAnalytics.properties.customerId
+output logAnalyticsWorkspaceResourceId string = logAnalytics.id
 output keyVaultName string = keyVault.name
 output keyVaultUri string = keyVault.properties.vaultUri
 output routerIdentityId string = routerIdentity.id

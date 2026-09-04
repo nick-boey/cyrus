@@ -25,6 +25,9 @@ param enableSetupSecretStore bool = false
 @description('Optional Entra principal id granted break-glass Storage Blob Data Contributor on router-backups.')
 param operatorPrincipalId string = ''
 
+@description('Optional Entra principal/group object ids granted Log Analytics Reader at the workspace scope. Mirrors fleetOperatorLogReaderPrincipalIds in main.bicep; scripts/bootstrap-azure-role-assignments.sh forwards it from the same parameter file.')
+param logAnalyticsReaderPrincipalIds array = []
+
 @description('Role-definition GUID for Container Apps SandboxGroup Data Owner.')
 param sandboxGroupDataOwnerRoleId string = 'c24cf47c-5077-412d-a19c-45202126392c'
 
@@ -44,6 +47,7 @@ module roleAssignments 'modules/role-assignments.bicep' = {
     enableSetupSecretStore: enableSetupSecretStore
     routerPrincipalId: routerIdentity.properties.principalId
     operatorPrincipalId: operatorPrincipalId
+    logAnalyticsReaderPrincipalIds: union(logAnalyticsReaderPrincipalIds, [])
     sandboxGroupDataOwnerRoleId: sandboxGroupDataOwnerRoleId
   }
 }
