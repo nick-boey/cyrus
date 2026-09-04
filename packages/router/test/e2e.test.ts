@@ -568,7 +568,68 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 		);
 		expect(active.runs[0]?.lastAgentActivityAt).toBeDefined();
 
-		stack.connection.sendSessionState("sess-prompt", "complete");
+		// ── explicit worker-reported run facts, over the real wire (CYR-68) ──
+		// A unit test of either half would pass throughout: the router's narrowing,
+		// the client's capability gate, and the frame schema only meet here.
+		expect(stack.connection.acceptsRunFacts).toBe(true);
+
+		const runFacts = () =>
+			server.store.listAgentRuns({ userId: 1, issueKey: "DEF-12" })[0];
+
+		// A run blocked on the user with a background build still in flight. The
+		// wait IS reported; park permission is withheld, so affinity survives and
+		// the container this would be running in stays up.
+		const affinityBefore = server.store.countSessionAffinityForDevice(deviceId);
+		stack.connection.sendSessionWaiting(
+			"sess-prompt",
+			{ reason: "elicitation", since: new Date().toISOString() },
+			{
+				executorMayPark: false,
+				runner: "claude",
+				model: "claude-opus-5",
+				pendingWorkCount: 2,
+			},
+		);
+		await waitUntil(
+			() => runFacts()?.state === "waiting",
+			"waiting run observation",
+		);
+		expect(runFacts()).toMatchObject({
+			state: "waiting",
+			wait: { reason: "elicitation" },
+			pendingWorkCount: 2,
+			runner: "claude",
+			model: "claude-opus-5",
+		});
+		// Unchanged: a wait whose executor must not park releases nothing. Had it
+		// released, `ContainerLifecycle` would be free to suspend a container with
+		// a live build in it, and the completion that would wake this session
+		// could then never arrive.
+		expect(server.store.countSessionAffinityForDevice(deviceId)).toBe(
+			affinityBefore,
+		);
+		// The frozen `/runs` shape still answers `parked`, which is what that name
+		// has always meant to an existing client.
+		expect((await query()).runs[0]?.state).toBe("parked");
+
+		// A reason this version does not model must NOT close the socket — it is
+		// narrowed to `other`, carrying the raw text.
+		stack.connection.sendSessionWaiting(
+			"sess-prompt",
+			{ reason: "quota_backoff", since: new Date().toISOString() },
+			{ executorMayPark: false },
+		);
+		await waitUntil(
+			() => runFacts()?.wait?.reason === "other",
+			"narrowed wait reason",
+		);
+		expect(runFacts()?.wait?.reportedCondition).toContain("quota_backoff");
+		expect(server.isDeviceOnline(deviceId)).toBe(true);
+
+		stack.connection.sendSessionState("sess-prompt", "complete", {
+			runner: "claude",
+			model: "claude-opus-5",
+		});
 		await waitUntil(
 			() =>
 				server.store.listAgentRuns({ userId: 1, issueKey: "DEF-12" })[0]
@@ -576,5 +637,14 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 			"terminal run observation",
 		);
 		expect((await query()).runs[0]?.state).toBe("complete");
+		// The ordinary run's ONLY chance to record its execution identity, and the
+		// wait/pending-work evidence must not survive a run that has ended.
+		expect(runFacts()).toMatchObject({
+			state: "complete",
+			runner: "claude",
+			model: "claude-opus-5",
+		});
+		expect(runFacts()?.wait).toBeUndefined();
+		expect(runFacts()?.pendingWorkCount).toBeUndefined();
 	});
 });

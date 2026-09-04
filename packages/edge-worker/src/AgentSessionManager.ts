@@ -64,21 +64,37 @@ export type AgentSessionManagerEvents = {
 	 */
 	sessionResumed: (sessionId: string) => void;
 	/**
-	 * Emitted when a session blocks on a user answer with no work in flight.
-	 * Router platform mode listens for this to send a non-terminal `parked`
-	 * frame, which releases session affinity so the container can be
-	 * idle-suspended while it waits — without releasing the issue lock, since
-	 * the session is paused rather than finished.
+	 * Emitted when a session blocks on a user answer. Router platform mode
+	 * listens for this to report a non-terminal `waiting` state.
+	 *
+	 * The RUN is waiting whether or not anything is still in flight — that is
+	 * the fact this event carries, and it is reported unconditionally so a
+	 * session blocked with a live background build is observable rather than
+	 * silent. Whether its EXECUTOR may be suspended is a separate question the
+	 * listener answers from {@link AgentSessionManager.hasPendingWork}: releasing
+	 * affinity is what lets the container be idle-suspended, and suspending one
+	 * with a build in flight freezes it. The issue lock is retained either way,
+	 * since the session is paused rather than finished.
 	 */
 	sessionParked: (sessionId: string) => void;
 	/**
-	 * Emitted when a parked session stops waiting — answered, cancelled, or
+	 * Emitted when a waiting session stops waiting — answered, cancelled, or
 	 * aborted. Router platform mode listens for this to drop any still-unacked
-	 * `parked` frame, so a later reconnect cannot replay it over a live turn.
+	 * wait frame, so a later reconnect cannot replay it over a live turn.
 	 * The counterpart to `sessionParked`, exactly as `sessionResumed` is to
 	 * `sessionTerminal`.
 	 */
 	sessionUnparked: (sessionId: string) => void;
+	/**
+	 * Emitted when a turn ends but the session is held open by pending work — a
+	 * scheduled wakeup, a cron, or a live background task.
+	 *
+	 * The run is ACTIVE, not waiting and not failed, and this is what makes that
+	 * legible: without it a session held open for seven hours by a cron produces
+	 * no frame at all, and the router's last word on it is whatever it was doing
+	 * before the turn ended.
+	 */
+	sessionPendingWork: (sessionId: string, pendingWorkCount: number) => void;
 };
 
 /**
@@ -115,6 +131,31 @@ function isResumableRunnerSessionId(runner: IAgentRunner | undefined): boolean {
 	const probe = (runner as { hasEstablishedRunnerSession?: () => boolean })
 		.hasEstablishedRunnerSession;
 	return typeof probe === "function" ? probe.call(runner) : true;
+}
+
+/**
+ * Which agent CLI a runner is, by constructor name.
+ *
+ * Constructor names rather than a declared field because that is what every
+ * existing call site here already keys on — this consolidates three identical
+ * ternary chains rather than introducing a fourth. Claude is the fallback for
+ * the same reason it always was: it is the default runner, and an unrecognised
+ * constructor is far more likely to be a Claude subclass than a new provider
+ * that forgot to announce itself.
+ */
+function runnerTypeOf(runner: IAgentRunner): RunnerType {
+	switch (runner.constructor.name) {
+		case "GeminiRunner":
+			return "gemini";
+		case "CodexRunner":
+			return "codex";
+		case "CursorRunner":
+			return "cursor";
+		case "OpenCodeRunner":
+			return "opencode";
+		default:
+			return "claude";
+	}
 }
 
 /**
@@ -610,6 +651,18 @@ export class AgentSessionManager extends EventEmitter {
 				log.info(
 					`Deferring terminal signal: runner has pending work (${pendingWork.sessionCrons.length} crons, ${pendingWork.backgroundTasks.length} background tasks)`,
 				);
+				// The run is still ACTIVE and this says so explicitly. Without it the
+				// router's last word on a session held open for hours by a cron is
+				// whatever it happened to be doing before the turn ended — which is
+				// indistinguishable from a worker that stopped reporting, and is how
+				// a healthy long-running session comes to look stranded.
+				this.emit(
+					"sessionPendingWork",
+					sessionId,
+					pendingWork.sessionCrons.length +
+						pendingWork.backgroundTasks.length +
+						(pendingWork.liveBackgroundTasks?.length ?? 0),
+				);
 			}
 		}
 
@@ -646,6 +699,48 @@ export class AgentSessionManager extends EventEmitter {
 	 */
 	hasPendingWork(sessionId: string): boolean {
 		return this.getRunnerPendingWork(sessionId) !== null;
+	}
+
+	/**
+	 * How many things will wake this session later — scheduled wakeups and
+	 * crons, backgrounded tasks, and tasks still live.
+	 *
+	 * Reported to the router as an ACTIVE-run fact, never as a wait reason: a
+	 * run carrying pending work is working, and a seven-hour cron run must stay
+	 * active and observable rather than being labelled waiting or failed.
+	 *
+	 * A runner without `getPendingWork` reads as 0, the same way
+	 * {@link hasPendingWork} reads it as "nothing pending" — see there for why
+	 * the conservative alternative is worse.
+	 */
+	pendingWorkCount(sessionId: string): number {
+		const pending = this.getRunnerPendingWork(sessionId);
+		if (!pending) return 0;
+		return (
+			pending.sessionCrons.length +
+			pending.backgroundTasks.length +
+			(pending.liveBackgroundTasks?.length ?? 0)
+		);
+	}
+
+	/**
+	 * The execution identity of a session's current turn, as far as it is known.
+	 *
+	 * Both fields are optional and neither is guessed. The model is only known
+	 * once the runner's init message has arrived, and a session parked before
+	 * that reports no model rather than a placeholder — an invented value in a
+	 * column an operator filters on is worse than an absent one.
+	 */
+	getRunFacts(sessionId: string): { runner?: string; model?: string } {
+		const session = this.sessions.get(sessionId);
+		if (!session) return {};
+		const runner = session.agentRunner
+			? runnerTypeOf(session.agentRunner)
+			: undefined;
+		return {
+			...(runner ? { runner } : {}),
+			...(session.metadata?.model ? { model: session.metadata.model } : {}),
+		};
 	}
 
 	private consumeStopRequest(linearAgentActivitySessionId: string): boolean {
@@ -2297,15 +2392,10 @@ export class AgentSessionManager extends EventEmitter {
 
 	private getSessionRunnerType(sessionId: string): RunnerType {
 		const runner = this.sessions.get(sessionId)?.agentRunner;
-		return runner?.constructor.name === "GeminiRunner"
-			? "gemini"
-			: runner?.constructor.name === "CodexRunner"
-				? "codex"
-				: runner?.constructor.name === "CursorRunner"
-					? "cursor"
-					: runner?.constructor.name === "OpenCodeRunner"
-						? "opencode"
-						: "claude";
+		// A session with no runner attached reads as "claude", the default runner,
+		// because this feeds a model-name prefix that must always produce one.
+		// `getRunFacts` deliberately does NOT share that fallback — see there.
+		return runner ? runnerTypeOf(runner) : "claude";
 	}
 
 	/**

@@ -17,7 +17,10 @@ import {
 	withSpan,
 	withSpanSync,
 } from "cyrus-otel-traces";
-import type { SessionStateFrame } from "cyrus-router-protocol";
+import {
+	type SessionStateFrame,
+	WAIT_REASON_ELICITATION,
+} from "cyrus-router-protocol";
 import {
 	type ContainerTargetService,
 	InvalidIssueKeyError,
@@ -54,7 +57,7 @@ import type {
 	RepositoryDecision,
 	RepositoryResolver,
 } from "./RepositoryResolver.js";
-import type { RouterStore } from "./RouterStore.js";
+import type { AgentRunWait, RouterStore } from "./RouterStore.js";
 import {
 	emitRoutingRejection,
 	emitSessionOwnershipRefusal,
@@ -119,6 +122,30 @@ export interface EventRouterOptions {
 		workspaceId: string,
 		issueId: string,
 	) => Promise<string | undefined>;
+	/**
+	 * Reads the Linear team and project an issue belongs to, for a run's routing
+	 * snapshot — see {@link LinearExecutor.fetchRoutingContext}.
+	 *
+	 * Needed because the agent-session webhook carries the issue's team but NOT
+	 * its project, so without this the project dimension of the snapshot could
+	 * never be filled and the filter it exists for would match nothing.
+	 *
+	 * Called at most once per run and never on the delivery path. Optional:
+	 * omitting it leaves the snapshot with whatever the webhook carried, which is
+	 * a missing filter dimension rather than a broken route.
+	 */
+	fetchRoutingContext?: (
+		workspaceId: string,
+		issueId: string,
+	) => Promise<
+		| {
+				linearTeamId?: string;
+				linearTeamName?: string;
+				linearProjectId?: string;
+				linearProjectName?: string;
+		  }
+		| undefined
+	>;
 	/**
 	 * Routes container-executor users to per-issue ephemeral container
 	 * devices instead of a physical enrolled device. Optional: omitting it
@@ -232,6 +259,9 @@ export class EventRouter {
 	private readonly moveIssueToStartedState:
 		| ((workspaceId: string, issueId: string) => Promise<string | undefined>)
 		| undefined;
+	private readonly fetchRoutingContext:
+		| EventRouterOptions["fetchRoutingContext"]
+		| undefined;
 	private readonly containerTargets: ContainerTargetService | undefined;
 	private readonly devcontainers: DevcontainerImageService | undefined;
 	private readonly repositoryRegistry: RepositoryRegistry | undefined;
@@ -295,6 +325,7 @@ export class EventRouter {
 		this.gateway = opts.gateway;
 		this.postActivity = opts.postActivity;
 		this.moveIssueToStartedState = opts.moveIssueToStartedState;
+		this.fetchRoutingContext = opts.fetchRoutingContext;
 		this.containerTargets = opts.containerTargets;
 		this.repositoryResolver = opts.repositoryResolver;
 		this.devcontainers = opts.devcontainers;
@@ -623,16 +654,33 @@ export class EventRouter {
 		// a way to MINT authorization over someone else's session.
 		//
 		// "Grant" means every claim a branch can create, not just the grace rows:
-		// the `parked` branch's in-memory entry authorizes a later `active`, and
+		// the waiting branch's in-memory entry authorizes a later `active`, and
 		// `active` writes affinity outright. All three are gated. What is NOT
 		// gated is the terminal branch's RELEASES — see there for why.
 		const owner = this.store.getSessionOwner(frame.sessionId, this.now());
-		if (frame.state === "parked") {
+		if (frame.state === "parked" || frame.state === "waiting") {
 			const now = this.now();
+			// The legacy `parked` frame conflated two facts. Reading it as
+			// waiting-on-elicitation with executor parking is not an inference about
+			// a silent worker — it is what a worker sending that frame has always
+			// explicitly meant, and it is the only thing that frame was ever sent
+			// for. The `since` it never carried falls back to now, which is the
+			// instant the router learned of the wait.
+			const legacy = frame.state === "parked";
+			const wait: AgentRunWait = legacy
+				? { reason: "elicitation", sinceMs: now }
+				: narrowWaitReason(frame.wait, now);
+			// The run being blocked and its container being suspendable are
+			// independent, and only the second one releases affinity. A worker with
+			// a live background build reports `waiting` with no park permission:
+			// suspending it would freeze the build, and the completion that would
+			// wake the session could then never arrive. Absent reads as "do not
+			// park" — the direction that costs a suspend rather than a stall.
+			const mayPark = legacy ? true : frame.executorMayPark === true;
 			// Gated as a WHOLE, not just the grace grant below. `parkedSessionCreators`
 			// is the only thing the `active` branch consults before writing full
 			// session affinity, so an ungated `set` here is itself an escalation
-			// primitive: a forged `parked` that merely seeds the map lets a following
+			// primitive: a forged park that merely seeds the map lets a following
 			// forged `active` mint affinity over someone else's session — a strictly
 			// stronger claim than the grace this gate refuses. Two frames, not one.
 			//
@@ -641,6 +689,11 @@ export class EventRouter {
 			// nothing: the rightful owner keeps every claim it already had, and the
 			// issue stays delegatable. The terminal branch must still run its
 			// releases for exactly the opposite reason.
+			//
+			// Applies to a non-parking wait too, even though that one grants nothing
+			// durable: `setAgentRunState` writes to the run row of whatever session
+			// the frame names, so an ungated path would let any enrolled device
+			// label someone else's run as waiting.
 			if (owner !== deviceId) {
 				this.refuseSessionOwnership(
 					{
@@ -650,10 +703,30 @@ export class EventRouter {
 						ownerDeviceId: owner,
 						sessionState: frame.state,
 					},
-					`Device ${deviceId} reported 'parked' for session ${frame.sessionId}, which it does not own (owner: ${owner ?? "none"}); ignored`,
+					`Device ${deviceId} reported '${frame.state}' for session ${frame.sessionId}, which it does not own (owner: ${owner ?? "none"}); ignored`,
 				);
 				return;
 			}
+
+			// The RUN is waiting either way — that is the worker's report, and it is
+			// recorded before any executor decision, so a run blocked with a live
+			// background build is observable as waiting rather than as silence.
+			this.store.setAgentRunState(frame.sessionId, "waiting", {
+				wait,
+				...readFrameRunFacts(frame),
+			});
+
+			if (!mayPark) {
+				// Nothing durable is released: affinity stays, the idle stamp is not
+				// set, and no in-memory park is recorded — so no later `active` can
+				// redeem one. The session simply keeps running, blocked, on a
+				// container that must stay up.
+				this.logger.info(
+					`Session ${frame.sessionId} is waiting on device ${deviceId} (${wait.reason}) but its executor must not park; kept affinity`,
+				);
+				return;
+			}
+
 			// Stashed, not dropped: `clearSessionAffinity` deletes the row that
 			// carries `creator_json`, and that field is the gate on who may prompt
 			// this session. Holding it here lets `active` put it back intact.
@@ -677,9 +750,8 @@ export class EventRouter {
 			);
 			this.store.clearSessionAffinity(frame.sessionId);
 			this.store.setDeviceParkedAt(deviceId, now);
-			this.store.setAgentRunState(frame.sessionId, "parked");
 			this.logger.info(
-				`Session ${frame.sessionId} parked on device ${deviceId}; released affinity, retained the issue lock`,
+				`Session ${frame.sessionId} is waiting on device ${deviceId} (${wait.reason}); parked its executor, released affinity, retained the issue lock`,
 			);
 			this.emitSandboxLifecycle(deviceId, SANDBOX_EVENTS.parked, {
 				session_id: frame.sessionId,
@@ -691,6 +763,24 @@ export class EventRouter {
 			// `active` must not mint ownership out of nothing.
 			const parked = this.parkedSessionCreators.get(frame.sessionId);
 			if (parked === undefined) {
+				// No park to redeem — but the frame is still the worker explicitly
+				// saying this run is progressing, and it carries the facts (runner,
+				// model, pending work) that keep a long-running session observable.
+				// Recording them is what stops a run held open by a seven-hour cron
+				// from looking like silence.
+				//
+				// Gated on ownership, and grants NOTHING: no affinity, no grace, no
+				// park entry. The pre-run-facts behaviour for a stray `active` — log
+				// and ignore — is preserved exactly for a device that does not own
+				// the session.
+				if (owner === deviceId) {
+					this.store.setAgentRunState(
+						frame.sessionId,
+						"active",
+						readFrameRunFacts(frame),
+					);
+					return;
+				}
 				this.logger.info(
 					`Ignoring 'active' for session ${frame.sessionId} on device ${deviceId}: no park on record`,
 				);
@@ -726,7 +816,11 @@ export class EventRouter {
 			// claim that supports it, and a terminal frame later re-grants the much
 			// shorter terminal window from scratch.
 			this.store.clearSessionOwnershipGrace(frame.sessionId);
-			this.store.setAgentRunState(frame.sessionId, "active");
+			this.store.setAgentRunState(
+				frame.sessionId,
+				"active",
+				readFrameRunFacts(frame),
+			);
 			this.logger.info(
 				`Session ${frame.sessionId} unparked on device ${deviceId}; restored affinity and cleared the idle stamp`,
 			);
@@ -748,7 +842,15 @@ export class EventRouter {
 		// Read before `finishAgentRun` moves the row to a terminal state, so a
 		// replay can still be told apart from a stray frame afterwards.
 		const priorRun = this.store.getLatestAgentRunForSession(frame.sessionId);
-		this.store.finishAgentRun(frame.sessionId, frame.state, now);
+		// The terminal frame is the ONLY point at which an ordinary run — one that
+		// never waited and never deferred for pending work — offers its runner and
+		// model. Dropping them here left that run with `runner = NULL` for good.
+		this.store.finishAgentRun(
+			frame.sessionId,
+			frame.state,
+			now,
+			readFrameRunFacts(frame),
+		);
 		// Granted BEFORE the two releases below, so there is no instant in which
 		// the terminating device owns the session by none of the routes
 		// `getSessionOwner` checks. Unlike the park path, which keeps the issue
@@ -1718,6 +1820,41 @@ export class EventRouter {
 	}
 
 	/**
+	 * Fills the routing-snapshot dimensions the webhook could not supply.
+	 *
+	 * Entirely best-effort, on every axis. It returns early when the snapshot is
+	 * already complete (so it is one Linear read per run, not per webhook), the
+	 * read itself is allowed to fail, and the store fills only blanks — so a
+	 * dimension captured at route time can never be rewritten by a later read of
+	 * an issue that has since moved.
+	 *
+	 * A failure here costs a filter dimension on one run. It must never be
+	 * allowed to fail a route, which is why the caller does not await it and why
+	 * everything below is swallowed.
+	 */
+	private async enrichRunRouting(
+		runId: string,
+		workspaceId: string,
+		issueId: string,
+	): Promise<void> {
+		if (!this.fetchRoutingContext) return;
+		try {
+			if (!this.store.runRoutingNeedsEnrichment(runId)) return;
+			const context = await this.fetchRoutingContext(workspaceId, issueId);
+			// Stamped even for an empty answer — an issue in no project is a
+			// complete answer, and leaving the run un-stamped would re-ask on every
+			// subsequent input. A read that THREW is deliberately not stamped: the
+			// next input retries it.
+			if (context) this.store.enrichRunRouting(runId, context, this.now());
+		} catch (error) {
+			this.logger.warn(
+				`Could not complete the routing snapshot for run ${runId} (issue ${issueId}); its team/project filters will be incomplete`,
+				error,
+			);
+		}
+	}
+
+	/**
 	 * Marks a delegated issue as started in Linear. Reached only once the event
 	 * has been accepted — an unenrolled creator or a lock rejection returns from
 	 * {@link routeCreated} before this, so a rejected issue is never promoted.
@@ -2410,12 +2547,27 @@ export class EventRouter {
 			injectTraceContext(),
 		);
 		const input = extractRunInput(event, routedMs);
-		this.store.recordAgentRunRouted({
+		const issueId =
+			event.agentSession.issueId ?? event.agentSession.issue?.id ?? undefined;
+		const runId = this.store.recordAgentRunRouted({
 			deviceId: target.deviceId,
 			issueKey: extractIssueKey(event) ?? target.issueKey ?? "unknown",
+			...(issueId !== undefined ? { issueId } : {}),
 			sessionId,
+			// Captured HERE, from the webhook that caused the route, and written in
+			// the same transaction that creates the run. A later query would read
+			// whatever the issue has MOVED to, which is precisely what makes a
+			// historical team or project filter unstable.
+			routing: extractRoutingSnapshot(event),
 			...input,
 		});
+		// The project is not on the webhook at any nesting, so it takes a Linear
+		// read. Fire-and-forget and gated on the snapshot still being blank, so it
+		// costs one round-trip per RUN and never delays delivery — the queued event
+		// below is what actually starts the work.
+		if (issueId !== undefined) {
+			void this.enrichRunRouting(runId, workspaceId, issueId);
+		}
 
 		if (this.gateway.isOnline(target.deviceId)) {
 			this.gateway.deliverPending(target.deviceId);
@@ -2556,6 +2708,110 @@ function extractIssueKey(webhook: SessionEvent): string | undefined {
 	return typeof identifier === "string" && identifier.length > 0
 		? identifier
 		: undefined;
+}
+
+/**
+ * The device's own ISO timestamp, or `undefined` when it is absent or garbage.
+ *
+ * Never throws and never substitutes a router clock here — the caller decides
+ * what to do with "the worker did not tell us", and silently swapping in the
+ * router's `now()` inside a parser would make a worker-reported fact
+ * indistinguishable from a router-invented one.
+ */
+function parseFrameTimestamp(value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const ms = Date.parse(value);
+	return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * Narrows an arbitrary worker-reported wait to the closed v1 vocabulary.
+ *
+ * `elicitation` is the only condition v1 models by name; everything else — a
+ * reason from a newer worker, a typo, or a literal `other` — becomes `other`,
+ * carrying text that says what the worker actually reported. The raw reason is
+ * preserved as the condition rather than discarded, so narrowing loses the
+ * classification but never the fact.
+ *
+ * The narrowing happens HERE, not in the frame schema, because the schema's only
+ * way to reject a reason is a parse failure, and `DeviceGateway` answers that by
+ * closing the device's socket — dropping every session on that worker over one
+ * unmodelled string. See `sessionWait` in `cyrus-router-protocol`.
+ *
+ * A wait with no condition at all still gets one, because an `other` wait
+ * without text records nothing an operator could act on — and "the worker
+ * declined to say" is itself the actionable fact.
+ */
+function narrowWaitReason(
+	wait: SessionStateFrame["wait"],
+	nowMs: number,
+): AgentRunWait {
+	const sinceMs = parseFrameTimestamp(wait?.since) ?? nowMs;
+	if (wait?.reason === WAIT_REASON_ELICITATION) {
+		return { reason: "elicitation", sinceMs };
+	}
+	const reportedCondition =
+		wait?.reportedCondition ??
+		(wait?.reason !== undefined && wait.reason !== "other"
+			? `unmodelled worker wait reason: ${wait.reason}`
+			: "the worker reported `other` without describing the condition");
+	return { reason: "other", sinceMs, reportedCondition };
+}
+
+/** The execution identity and pending-work count a worker reported, if any. */
+function readFrameRunFacts(frame: SessionStateFrame): {
+	runner?: string;
+	model?: string;
+	pendingWorkCount?: number;
+} {
+	return {
+		...(frame.runner !== undefined ? { runner: frame.runner } : {}),
+		...(frame.model !== undefined ? { model: frame.model } : {}),
+		...(frame.pendingWorkCount !== undefined
+			? { pendingWorkCount: frame.pendingWorkCount }
+			: {}),
+	};
+}
+
+/**
+ * What the WEBHOOK alone can say about the Linear context an input arrived
+ * under, for the run's routing snapshot.
+ *
+ * Read from the webhook rather than fetched, because this runs on the routing
+ * path and a Linear round-trip here would delay every delivery. What the
+ * webhook cannot answer is filled afterwards, off the path, by
+ * `EventRouter.enrichRunRouting`.
+ *
+ * The split is not arbitrary — it is exactly what Linear puts on an
+ * `AgentSessionEventWebhookPayload`. Its `agentSession.issue` is an
+ * `IssueWithDescriptionChildWebhookPayload`, whose complete field set is
+ * `{description?, id, identifier, team, teamId, title, url}`. So the TEAM is
+ * here and free; the PROJECT is not on the payload at any nesting and costs a
+ * fetch; and the workspace NAME appears nowhere on the webhook at all, only its
+ * id. Reading through `unknown` rather than off the SDK type keeps this
+ * tolerant of a payload that gains fields later.
+ */
+function extractRoutingSnapshot(webhook: SessionEvent): {
+	workspaceId?: string;
+	linearTeamId?: string;
+	linearTeamName?: string;
+} {
+	const session = webhook.agentSession as unknown as Record<string, unknown>;
+	const issue = session.issue as Record<string, unknown> | null | undefined;
+	const team = issue?.team as Record<string, unknown> | null | undefined;
+
+	const workspaceId = readNonEmptyString(webhook.organizationId);
+	const teamId =
+		readNonEmptyString(team?.id) ?? readNonEmptyString(issue?.teamId);
+	const teamName = readNonEmptyString(team?.name);
+	// A captured name never travels without its canonical id — that invariant is
+	// enforced by `runRoutingSnapshotV1Schema`, and honouring it here keeps a
+	// name-only payload from producing an unemittable observation later.
+	return {
+		...(workspaceId ? { workspaceId } : {}),
+		...(teamId ? { linearTeamId: teamId } : {}),
+		...(teamId && teamName ? { linearTeamName: teamName } : {}),
+	};
 }
 
 /** Stable Linear references for the input that caused this routing decision. */

@@ -31,10 +31,12 @@ import {
 	parseServerFrame,
 	type RpcRequestFrame,
 	type RpcResponseFrame,
+	RUN_FACTS_CAPABILITY,
 	SESSIONS_QUERY_CAPABILITY,
 	type ServerFrame,
 	type SessionStateAckFrame,
 	type SessionsQueryFrame,
+	type SessionWait,
 	SPAN_INGEST_CAPABILITY,
 	type SpanFrame,
 } from "cyrus-router-protocol";
@@ -157,7 +159,25 @@ interface InboxEntry {
 interface SessionStateEntry {
 	id: string;
 	sessionId: string;
-	state: "complete" | "error" | "stopped" | "parked" | "active";
+	state: "complete" | "error" | "stopped" | "parked" | "active" | "waiting";
+	/** Present exactly when `state` is `waiting`. */
+	wait?: SessionWait;
+	executorMayPark?: boolean;
+	runner?: string;
+	model?: string;
+	pendingWorkCount?: number;
+}
+
+/**
+ * The execution identity and pending-work count a worker reports alongside a
+ * state. All optional: a runner that cannot report one of these must send
+ * nothing rather than a placeholder, since an invented value is worse than an
+ * absent one for a fact an operator filters on.
+ */
+export interface RunFacts {
+	runner?: string;
+	model?: string;
+	pendingWorkCount?: number;
 }
 
 interface PersistedState {
@@ -370,21 +390,112 @@ export class RouterConnection extends EventEmitter {
 	 * Delivery is at-least-once: a lost ack replays the frame, and the router's
 	 * release is idempotent.
 	 *
-	 * The non-terminal `parked` state rides the same buffer. Its stakes are
+	 * The non-terminal park/wait states ride the same buffer. Their stakes are
 	 * lower — losing one costs a suspend rather than stranding an issue, since
-	 * it releases affinity but not the issue lock — but it needs the same
+	 * they release affinity but not the issue lock — but they need the same
 	 * per-session supersede rule, so a later terminal frame replaces a
-	 * still-unacked `parked` rather than both replaying. To unpark, call
+	 * still-unacked wait rather than both replaying. To unpark, call
 	 * {@link sendSessionUnparked} rather than this method — it pairs the wire
 	 * frame with the buffer drop that must accompany it.
 	 */
 	sendSessionState(
 		sessionId: string,
 		state: "complete" | "error" | "stopped" | "parked" | "active",
+		facts?: RunFacts,
 	): void {
-		const entry: SessionStateEntry = { id: randomUUID(), sessionId, state };
+		const entry: SessionStateEntry = {
+			id: randomUUID(),
+			sessionId,
+			state,
+			...facts,
+		};
 		this.appendSessionStateEntry(entry);
 		this.trySendSessionState(entry);
+	}
+
+	/** True once the router has advertised that it understands explicit run facts. */
+	get acceptsRunFacts(): boolean {
+		return this.serverCapabilities.has(RUN_FACTS_CAPABILITY);
+	}
+
+	/**
+	 * Reports that a run cannot currently progress, and whether its executor may
+	 * be suspended while it waits.
+	 *
+	 * Against a router that has NOT advertised {@link RUN_FACTS_CAPABILITY} this
+	 * degrades to exactly what a pre-run-facts worker did, and the degradation
+	 * has to be spelled out because it is lossy in one direction:
+	 *
+	 *  - `executorMayPark` → the legacy `parked` frame, which is what that frame
+	 *    has always meant.
+	 *  - otherwise → NOTHING is sent. An old router has no way to record a wait
+	 *    without also releasing affinity, and releasing it here is the one
+	 *    outcome that must not happen — suspending a container with a background
+	 *    build in flight freezes it, and the completion that would wake the
+	 *    session could then never arrive. Losing the observation is the cheaper
+	 *    failure, and it is the status quo for that router either way.
+	 *
+	 * Sending `waiting` blind would be worse than either: `state` is a closed
+	 * enum on the router's side, and `DeviceGateway` closes the socket on any
+	 * frame it cannot parse — so the worker would be disconnected on its first
+	 * elicitation and reconnect into the same loop.
+	 */
+	sendSessionWaiting(
+		sessionId: string,
+		wait: SessionWait,
+		opts: RunFacts & { executorMayPark: boolean },
+	): void {
+		const { executorMayPark, ...facts } = opts;
+		const entry: SessionStateEntry = {
+			id: randomUUID(),
+			sessionId,
+			state: "waiting",
+			wait,
+			executorMayPark,
+			...facts,
+		};
+		// Buffered as `waiting` REGARDLESS of the current capability, and degraded
+		// at send time by `trySendSessionState`. Degrading here instead would bake
+		// this instant's answer into a durable entry that may not be sent for
+		// minutes — and a reconnect can land on a different router than the one
+		// that was asked.
+		this.appendSessionStateEntry(entry);
+		this.trySendSessionState(entry);
+	}
+
+	/**
+	 * Reports run facts for a run that is simply still working — a turn that
+	 * ended with a cron or a background task still holding the session open.
+	 *
+	 * Fire-and-forget, unlike every other `session_state`: it carries no
+	 * ownership transition the router must not miss, so a lost frame costs one
+	 * observation rather than a stranded issue or a frozen build. Making it
+	 * durable would also make it REPLAYABLE, and a replayed `active` against a
+	 * router that has since recorded a park would mint affinity back — a real
+	 * hazard bought for a count.
+	 *
+	 * A no-op without {@link RUN_FACTS_CAPABILITY}: an older router reads a bare
+	 * `active` as an unpark attempt, so sending one here would put a stray
+	 * "no park on record" line in its log for every deferred turn and buy
+	 * nothing, since it could not record the facts anyway.
+	 */
+	sendRunFacts(sessionId: string, facts: RunFacts): void {
+		if (!this.acceptsRunFacts) return;
+		if (!this.isOnline() || !this.ws) return;
+		try {
+			this.ws.send(
+				JSON.stringify({
+					type: "session_state",
+					id: randomUUID(),
+					sessionId,
+					state: "active",
+					...facts,
+				}),
+			);
+		} catch {
+			// A send on a socket closing underneath us. The next transition reports
+			// the current facts anyway, so there is nothing to recover here.
+		}
 	}
 
 	/** True once the router has advertised that it accepts `log` frames. */
@@ -444,17 +555,72 @@ export class RouterConnection extends EventEmitter {
 		}
 	}
 
-	/** Best-effort transmit; the durable entry survives until acked. */
+	/**
+	 * Best-effort transmit; the durable entry survives until acked.
+	 *
+	 * THE CAPABILITY GATE LIVES HERE, not at the call site, because this is the
+	 * only place every send passes through — including `replaySessionStateBuffer`.
+	 * A `waiting` entry minted while the router advertised `run_facts` can be
+	 * replayed minutes later against a router that was rolled back, and the
+	 * `state` enum there is closed: `DeviceGateway` answers an unparsable frame
+	 * with `ws.close(1002)`, we reconnect, we replay, it closes again. That loop
+	 * is permanent — `loadSessionStateEntries` deliberately does not reload
+	 * non-terminal entries, so only a worker restart clears it — and it takes the
+	 * whole socket down, stranding the issue locks of every OTHER session whose
+	 * terminal frame is queued behind the poison entry.
+	 */
 	private trySendSessionState(entry: SessionStateEntry): void {
 		if (!this.isOnline() || !this.ws) return;
-		this.ws.send(
-			JSON.stringify({
-				type: "session_state",
-				id: entry.id,
-				sessionId: entry.sessionId,
-				state: entry.state,
-			}),
-		);
+		const frame = this.degradeSessionState(entry);
+		if (!frame) return;
+		this.ws.send(JSON.stringify(frame));
+	}
+
+	/**
+	 * The wire form of an entry for the router we are talking to RIGHT NOW, or
+	 * `undefined` when there is nothing this router could usefully be told.
+	 *
+	 * The degradation mirrors {@link sendSessionWaiting}'s contract exactly, and
+	 * is lossy in one direction on purpose: a router with no `run_facts` has no
+	 * way to record a wait WITHOUT also releasing session affinity, and releasing
+	 * it for a run whose executor must not park is the one outcome that must not
+	 * happen — suspending a container with a background build in flight freezes
+	 * it, and the completion that would wake the session then never arrives.
+	 * Losing the observation is the cheaper failure.
+	 *
+	 * The extra optional FIELDS need no gate: `z.object` strips unknown keys, so
+	 * an older router silently ignores facts it cannot use.
+	 */
+	private degradeSessionState(
+		entry: SessionStateEntry,
+	): Record<string, unknown> | undefined {
+		let state = entry.state;
+		let wait = entry.wait;
+		if (state === "waiting" && !this.acceptsRunFacts) {
+			if (!entry.executorMayPark) {
+				this.logger.warn(
+					`Dropping the waiting report for session ${entry.sessionId}: this router does not accept run facts, and the legacy 'parked' frame it does accept would release affinity for a run whose executor must not park`,
+				);
+				return undefined;
+			}
+			state = "parked";
+			wait = undefined;
+		}
+		return {
+			type: "session_state",
+			id: entry.id,
+			sessionId: entry.sessionId,
+			state,
+			...(wait ? { wait } : {}),
+			...(entry.executorMayPark !== undefined && state === "waiting"
+				? { executorMayPark: entry.executorMayPark }
+				: {}),
+			...(entry.runner !== undefined ? { runner: entry.runner } : {}),
+			...(entry.model !== undefined ? { model: entry.model } : {}),
+			...(entry.pendingWorkCount !== undefined
+				? { pendingWorkCount: entry.pendingWorkCount }
+				: {}),
+		};
 	}
 
 	private replaySessionStateBuffer(): void {
@@ -538,6 +704,14 @@ export class RouterConnection extends EventEmitter {
 	private handleDisconnect(): void {
 		const wasConnected = this._connected;
 		this._connected = false;
+		// A capability is an answer from ONE router on ONE connection. Carrying it
+		// across a disconnect makes it a claim about the next router we dial, and
+		// nothing guarantees that is the same process — a rollback, a blue/green
+		// swap, or a load-balanced pair mid-deploy all put a different build on the
+		// other end. Every send path re-reads this, so the honest state while
+		// disconnected is "supports nothing new"; `hello_ack` re-establishes it
+		// before anything is replayed.
+		this.serverCapabilities = new Set<string>();
 		this.stopLivenessWatchdog();
 		this.rejectAllPending(new RouterRpcError("connection lost", true));
 		if (wasConnected) this.emit("disconnected");
@@ -972,7 +1146,22 @@ export class RouterConnection extends EventEmitter {
 						v.state === "error" ||
 						v.state === "stopped")
 				) {
-					return { id: v.id, sessionId: v.sessionId, state: v.state };
+					// Deliberately narrower than the states this buffer can HOLD: a
+					// reloaded `waiting`/`active`/`parked` would replay a stale
+					// non-terminal transition over whatever the session is doing now.
+					// Only a terminal frame is worth replaying after a restart, because
+					// only it releases the issue lock.
+					//
+					// Execution identity rides along — it describes the run that
+					// produced the frame and is still true when the frame replays. The
+					// pending-work count does not: a terminal run carries none.
+					return {
+						id: v.id,
+						sessionId: v.sessionId,
+						state: v.state,
+						...(typeof v.runner === "string" ? { runner: v.runner } : {}),
+						...(typeof v.model === "string" ? { model: v.model } : {}),
+					};
 				}
 				return undefined;
 			},
@@ -1034,9 +1223,9 @@ export class RouterConnection extends EventEmitter {
 	 * one for a session the router never parked is harmless: it ignores an
 	 * `active` with no park on record rather than inventing affinity.
 	 */
-	sendSessionUnparked(sessionId: string): void {
+	sendSessionUnparked(sessionId: string, facts?: RunFacts): void {
 		this.discardBufferedSessionState(sessionId);
-		this.sendSessionState(sessionId, "active");
+		this.sendSessionState(sessionId, "active", facts);
 	}
 
 	discardBufferedSessionState(sessionId: string): void {

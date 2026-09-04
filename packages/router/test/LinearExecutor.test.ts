@@ -143,6 +143,39 @@ describe("LinearExecutor.dispatch", () => {
 		expect(activityObserved).toHaveBeenCalledWith("s1", expect.any(Number));
 	});
 
+	it("clears a wait when the run publishes an activity", async () => {
+		store.addUser({ email: "alice@example.com" });
+		const code = store.mintEnrollmentCode("alice@example.com", 1);
+		const device = store.redeemEnrollmentCode(code, 1);
+		if (!device) throw new Error("enroll failed");
+		store.recordAgentRunRouted({
+			deviceId: device.deviceId,
+			issueKey: "NOR-1",
+			sessionId: "s1",
+			routedMs: 1_000,
+		});
+		store.setAgentRunState("s1", "waiting", {
+			wait: { reason: "elicitation", sinceMs: 1_100 },
+		});
+		store.setSessionAffinity("s1", device.deviceId);
+
+		await executor.dispatch(
+			device.deviceId,
+			frame("createAgentActivity", [
+				{ agentSessionId: "s1", content: { type: "thought", body: "hi" } },
+			]),
+		);
+
+		// A run that just published to the timeline is demonstrably progressing.
+		// Leaving the wait behind would go on reporting a block the run itself has
+		// disproved — and `lastPublishedActivityAt` is the freshness a caller
+		// applies its own staleness policy to.
+		const run = store.listAgentRuns({ userId: 1 })[0];
+		expect(run?.state).toBe("active");
+		expect(run?.wait).toBeUndefined();
+		expect(run?.lastAgentActivityMs).toEqual(expect.any(Number));
+	});
+
 	it("does not count an activity payload that Linear reports unsuccessful", async () => {
 		store.setSessionAffinity("s1", DEVICE_A);
 		tracker.createAgentActivity.mockResolvedValueOnce({ success: false });
@@ -530,6 +563,97 @@ describe("LinearExecutor.postActivity (options)", () => {
 			agentSessionId: "sess-1",
 			content: { type: "thought", body: "hello" },
 		});
+	});
+});
+
+/**
+ * The routing snapshot's Linear half. It exists because the agent-session
+ * webhook carries an issue's team but NOT its project — so without this read
+ * the project columns could never be filled and the filter they exist for
+ * would silently match zero runs.
+ */
+describe("LinearExecutor.fetchRoutingContext", () => {
+	it("reads the team and project ids, with their names", async () => {
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => ({
+				id: "issue-1",
+				team: Promise.resolve({ id: "team-1", key: "NOR", name: "Platform" }),
+				project: Promise.resolve({ id: "proj-1", name: "Observability" }),
+			})),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(await executor.fetchRoutingContext("ws-1", "issue-1")).toEqual({
+			linearTeamId: "team-1",
+			linearTeamName: "Platform",
+			linearProjectId: "proj-1",
+			linearProjectName: "Observability",
+		});
+	});
+
+	it("returns the team alone for an issue in no project", async () => {
+		// The commonest case, and not an error: an issue simply need not be in a
+		// project. The caller stamps the run as enriched anyway so this is asked
+		// once, not on every prompt.
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => ({
+				id: "issue-1",
+				team: Promise.resolve({ id: "team-1", name: "Platform" }),
+				project: Promise.resolve(undefined),
+			})),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(await executor.fetchRoutingContext("ws-1", "issue-1")).toEqual({
+			linearTeamId: "team-1",
+			linearTeamName: "Platform",
+		});
+	});
+
+	it("never returns a name without its canonical id", async () => {
+		// `runRoutingSnapshotV1Schema` refuses a captured name whose id is absent,
+		// so producing that pair here would make the observation unemittable later.
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => ({
+				id: "issue-1",
+				team: Promise.resolve({ name: "Platform" }),
+				project: Promise.resolve({ name: "Observability" }),
+			})),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(await executor.fetchRoutingContext("ws-1", "issue-1")).toEqual({});
+	});
+
+	it("keeps the team when the project read throws", async () => {
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => ({
+				id: "issue-1",
+				team: Promise.resolve({ id: "team-1", name: "Platform" }),
+				get project(): Promise<never> {
+					throw new Error("project unavailable");
+				},
+			})),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(await executor.fetchRoutingContext("ws-1", "issue-1")).toEqual({
+			linearTeamId: "team-1",
+			linearTeamName: "Platform",
+		});
+	});
+
+	it("returns undefined rather than throwing when the issue cannot be read", async () => {
+		// A snapshot dimension is worth a best-effort read and never worth failing
+		// a route over.
+		const executor = executorWithTracker("ws-1", {
+			fetchIssue: vi.fn(async () => {
+				throw new Error("Linear is down");
+			}),
+		} as unknown as Partial<IIssueTrackerService>);
+
+		expect(
+			await executor.fetchRoutingContext("ws-1", "issue-1"),
+		).toBeUndefined();
+		expect(
+			await executor.fetchRoutingContext("ws-missing", "issue-1"),
+		).toBeUndefined();
 	});
 });
 
