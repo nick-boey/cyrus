@@ -36,12 +36,19 @@ import {
 	isUserPromptMessage,
 } from "cyrus-core";
 import {
+	type RunChangePageV1,
+	type RunObservationPageV1,
+	runChangePageV1Schema,
+	runObservationPageV1Schema,
+} from "cyrus-operator-protocol";
+import {
 	RouterConnection,
 	RouterEventTransport,
 	RouterIssueTrackerService,
 	RouterRpcError,
 } from "cyrus-router-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { RunCursorCodec } from "../src/fleet-operations/RunChangeCursor.js";
 import {
 	fillTemplate,
 	ISSUE_LOCKED_BY_OTHER_MESSAGE,
@@ -646,5 +653,91 @@ describe("router e2e (in-process server + real client over localhost)", () => {
 		});
 		expect(runFacts()?.wait).toBeUndefined();
 		expect(runFacts()?.pendingWorkCount).toBeUndefined();
+	});
+
+	it("8. serves paginated v1 run snapshots and a resumable change feed (CYR-69)", async () => {
+		const fleetGet = async (path: string) => {
+			const response = await fetch(`http://127.0.0.1:${server.port}${path}`, {
+				headers: { authorization: `Bearer ${deviceToken}` },
+			});
+			return { status: response.status, body: await response.json() };
+		};
+
+		// ── the snapshot ──
+		const snapshot = await fleetGet("/api/v1/runs");
+		expect(snapshot.status).toBe(200);
+		expect(runObservationPageV1Schema.parse(snapshot.body)).toEqual(
+			snapshot.body,
+		);
+		const runs = (snapshot.body as RunObservationPageV1).runs;
+		expect(runs.length).toBeGreaterThan(0);
+		// The route is device-token authenticated, so it is owner-scoped: every run
+		// it returns belongs to the enrolled user.
+		expect(runs.every((run) => run.routing.ownerUserId === String(1))).toBe(
+			true,
+		);
+
+		// One run per page, walked to the end without repeating a run.
+		const seen: string[] = [];
+		let cursor: string | undefined;
+		for (let page = 0; page < runs.length + 2; page += 1) {
+			const next = await fleetGet(
+				`/api/v1/runs?limit=1${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+			);
+			expect(next.status).toBe(200);
+			const body = next.body as RunObservationPageV1;
+			seen.push(...body.runs.map((run) => run.runId));
+			cursor = body.nextCursor;
+			if (!cursor) break;
+		}
+		expect(seen).toEqual(runs.map((run) => run.runId));
+		expect(new Set(seen).size).toBe(seen.length);
+
+		// ── the change feed ──
+		const start = await fleetGet("/api/v1/run-changes");
+		expect(start.status).toBe(200);
+		expect(runChangePageV1Schema.parse(start.body)).toEqual(start.body);
+		const startCursor = (start.body as RunChangePageV1).nextCursor;
+
+		// A transition that begins and ends between two snapshots: the run is
+		// routed and finished before anything polls `/api/v1/runs` again, and the
+		// feed still reports both.
+		seedSession(tracker, "sess-feed", "issue-prompt");
+		server.store.recordAgentRunRouted({
+			deviceId,
+			issueKey: "DEF-12",
+			issueId: "issue-prompt",
+			sessionId: "sess-feed",
+			routedMs: Date.now(),
+			routing: { workspaceId: WORKSPACE },
+		});
+		server.store.finishAgentRun("sess-feed", "complete", Date.now() + 1);
+
+		const followed = await fleetGet(
+			`/api/v1/run-changes?cursor=${encodeURIComponent(startCursor)}`,
+		);
+		expect(followed.status).toBe(200);
+		const page = followed.body as RunChangePageV1;
+		expect(
+			page.changes
+				.filter((change) => change.observation.agentSessionId === "sess-feed")
+				.map((change) => [change.kind, change.observation.lifecycle]),
+		).toEqual([
+			["routing", "routed"],
+			["lifecycle", "complete"],
+		]);
+
+		// A cursor from a previous router process is `410 Gone`, not an empty 200 —
+		// so a reconnecting client knows to re-list rather than assuming quiet.
+		const stale = new RunCursorCodec(
+			"an-epoch-from-before-this-process",
+			server.store.getOrCreateSecret("fleet-run-cursor"),
+		);
+		const staleCursor = stale.encodeChangeCursor(0, stale.fingerprint({}));
+		const gone = await fleetGet(
+			`/api/v1/run-changes?cursor=${encodeURIComponent(staleCursor)}`,
+		);
+		expect(gone.status).toBe(410);
+		expect((await fleetGet("/api/v1/run-changes")).status).toBe(200);
 	});
 });

@@ -354,9 +354,11 @@ describe("RouterServer fleet-operations routes", () => {
 		expect(body.authMethod).toBe("local-operator-token");
 		expect(body.roles).toEqual(["fleet.read"]);
 		expect(body.authorizedWorkspaces).toEqual([{ workspaceId: "ws-1" }]);
-		// No route serves runs, changes, or recoveries yet, and no log source is
-		// configured — so this router advertises nothing it cannot do.
-		expect(body.capabilities).toEqual([]);
+		// The run routes are registered unconditionally and read the store this
+		// server always has, so they are always served. No log source is
+		// configured and no recovery route exists, so neither is advertised —
+		// this router still advertises nothing it cannot do.
+		expect(body.capabilities).toEqual(["runs.list", "runs.changes"]);
 		expect(body.logSource).toBeUndefined();
 	});
 });

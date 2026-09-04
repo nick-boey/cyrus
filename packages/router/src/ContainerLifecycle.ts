@@ -318,6 +318,52 @@ export class ContainerLifecycle {
 	}
 
 	/**
+	 * Records a sample both in memory and on the device's live runs.
+	 *
+	 * The in-memory map is what the legacy `/runs` route reads and is gone on
+	 * restart; the durable copy is what lets the change feed report a container
+	 * that stopped and restarted between two operator polls. Writing both here —
+	 * rather than leaving the store write to callers — is what keeps them from
+	 * drifting: there is exactly one place a sample is recorded.
+	 *
+	 * The store call is best-effort. A sample is a monitoring fact, and letting a
+	 * store failure escape would abort the sweep tick mid-loop, which costs idle
+	 * parking and stale-destroy for every container after this one.
+	 *
+	 * Repeats are free: the store appends nothing for an unchanged state, so the
+	 * once-per-tick cadence does not grow the feed.
+	 *
+	 * `unknown` is the exception, and it is NOT persisted. That value does not
+	 * mean "the sandbox is in an unknown state" — it means the provider could not
+	 * be listed this tick, which is a fact about the control plane and not about
+	 * the container. Writing it through would turn one throttled ARM call into a
+	 * durable `running → unknown` transition on every live run in the fleet, and
+	 * the recovery into a second one, so an operator watching the feed would see
+	 * a fleet-wide executor collapse that never happened. The in-memory gauge
+	 * still records it — that is what the per-tick telemetry is for — and the
+	 * durable sample keeps its previous state alongside the older
+	 * `executorStateObservedAt`, which is precisely what lets a client age it and
+	 * decide for itself. The same reasoning already guards `running_since_ms` a
+	 * few lines below.
+	 */
+	private recordObservation(
+		deviceId: number,
+		state: SandboxGaugeState,
+		observedMs: number,
+	): void {
+		this.observations.set(deviceId, { state, observedMs });
+		if (state === "unknown") return;
+		try {
+			this.store.setRunExecutorState(deviceId, state, observedMs);
+		} catch (err) {
+			this.logger.warn(
+				`Could not record the executor state for device ${deviceId}`,
+				err,
+			);
+		}
+	}
+
+	/**
 	 * The affinity count the sweep should actually gate on.
 	 *
 	 * A raw row count is not trustworthy: `routePrompted` can leave affinity for a
@@ -728,10 +774,7 @@ export class ContainerLifecycle {
 		const gaugeState: SandboxGaugeState = !listing?.states
 			? "unknown"
 			: (state?.status ?? "absent");
-		this.observations.set(row.deviceId, {
-			state: gaugeState,
-			observedMs: now,
-		});
+		this.recordObservation(row.deviceId, gaugeState, now);
 
 		let runningSinceMs = row.runningSinceMs;
 		if (gaugeState === "running" && runningSinceMs === undefined) {
@@ -944,10 +987,7 @@ export class ContainerLifecycle {
 				);
 				if (rowNow - lastTouch > this.staleDestroyMs) {
 					await executor.destroy(row.issueKey);
-					this.observations.set(row.deviceId, {
-						state: "absent",
-						observedMs: this.now(),
-					});
+					this.recordObservation(row.deviceId, "absent", this.now());
 					this.store.deleteContainerDevice(row.deviceId);
 					emitSandboxEvent(
 						this.logger,
@@ -1038,10 +1078,7 @@ export class ContainerLifecycle {
 					}
 					if (status === "running") {
 						await executor.stop(row.issueKey);
-						this.observations.set(row.deviceId, {
-							state: "stopped",
-							observedMs: this.now(),
-						});
+						this.recordObservation(row.deviceId, "stopped", this.now());
 						// The container is no longer running, so its continuous-uptime
 						// clock stops here. Read before clearing so the event can report
 						// how long the run it ends actually lasted — the single most

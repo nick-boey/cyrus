@@ -1,15 +1,21 @@
 import type { ILogger } from "cyrus-core";
-import type { FastifyInstance } from "fastify";
-import type { FleetOperations } from "./FleetOperations.js";
+import type { FastifyInstance, FastifyReply } from "fastify";
+import { type FleetOperations, FleetQueryError } from "./FleetOperations.js";
 import {
 	OperatorAuthError,
 	type OperatorAuthorizer,
 } from "./OperatorAuthorizer.js";
+import { RunCursorError } from "./RunChangeCursor.js";
+import type { OperatorPrincipal } from "./types.js";
 
 /** Where a client discovers a Cyrus router's operator interface. */
 export const DISCOVERY_ROUTE = "/.well-known/cyrus";
 /** The authenticated operator's own view of its authority. */
 export const OPERATOR_CONTEXT_ROUTE = "/api/v1/operator/context";
+/** Workspace-authorized, paginated run snapshots. */
+export const RUNS_ROUTE = "/api/v1/runs";
+/** The durable, ordered feed of material run changes. */
+export const RUN_CHANGES_ROUTE = "/api/v1/run-changes";
 
 export interface FleetOperationsRoutesOptions {
 	fleet: FleetOperations;
@@ -92,4 +98,240 @@ export function registerFleetOperationsRoutes(
 			return reply.status(500).send({ error: "internal error" });
 		}
 	});
+
+	fastify.get<{
+		Querystring: Record<string, string | string[] | undefined>;
+	}>(RUNS_ROUTE, async (request, reply) => {
+		const principal = await authenticate(
+			authorizer,
+			request.headers,
+			reply,
+			logger,
+		);
+		if (!principal) return reply;
+		const query = request.query;
+		const rejection =
+			rejectUnknownParameters(query, RUNS_PARAMETERS) ??
+			rejectEmptyParameters(query, RUNS_PARAMETERS);
+		if (rejection) return reply.status(400).send(rejection);
+		const rawLimit = single(query.limit);
+		if (rawLimit !== undefined && !/^\d+$/.test(rawLimit)) {
+			return reply
+				.status(400)
+				.send({ error: "invalid_query", message: "`limit` must be a number" });
+		}
+		// `state` is the vocabulary the fleet spec and the CLI use; the wire
+		// document calls the same field `lifecycle`. Accepted as an alias rather
+		// than ignored, because an unapplied filter answers `200` with a SUPERSET
+		// of what was asked for — the worst possible outcome on a surface whose
+		// whole job is deciding whether to intervene in a live fleet.
+		const { state, ...filters } = pickSingle(query, RUNS_FILTERS);
+		return runFleetRead(reply, logger, "run listing", () =>
+			fleet.listRuns(principal, {
+				...filters,
+				...(state !== undefined && filters.lifecycle === undefined
+					? { lifecycle: state }
+					: {}),
+				...(rawLimit !== undefined ? { limit: Number(rawLimit) } : {}),
+			}),
+		);
+	});
+
+	fastify.get<{
+		Querystring: Record<string, string | string[] | undefined>;
+	}>(RUN_CHANGES_ROUTE, async (request, reply) => {
+		const principal = await authenticate(
+			authorizer,
+			request.headers,
+			reply,
+			logger,
+		);
+		if (!principal) return reply;
+		const query = request.query;
+		const rejection =
+			rejectUnknownParameters(query, CHANGES_PARAMETERS) ??
+			rejectEmptyParameters(query, CHANGES_PARAMETERS);
+		if (rejection) return reply.status(400).send(rejection);
+		const cursor = single(query.cursor);
+		const from = single(query.from);
+		if (from !== undefined && from !== "start" && from !== "latest") {
+			return reply.status(400).send({
+				error: "invalid_query",
+				message: "`from` must be `start` or `latest`",
+			});
+		}
+		return runFleetRead(reply, logger, "run change feed", () =>
+			fleet.listChanges(principal, {
+				...(cursor ? { cursor } : {}),
+				...(from ? { from } : {}),
+			}),
+		);
+	});
+}
+
+/**
+ * Every parameter `GET /api/v1/runs` understands.
+ *
+ * `state` is the alias handled above. The rest map onto
+ * {@link FleetRunsQueryInput} by name.
+ */
+const RUNS_FILTERS = [
+	"runId",
+	"agentSessionId",
+	"issueId",
+	"issueKey",
+	"workspace",
+	"owner",
+	"team",
+	"project",
+	"lifecycle",
+	"state",
+	"runner",
+	"model",
+	"cursor",
+] as const;
+const RUNS_PARAMETERS: readonly string[] = [...RUNS_FILTERS, "limit"];
+const CHANGES_PARAMETERS: readonly string[] = ["cursor", "from"];
+
+/**
+ * Refuses a parameter this route does not implement.
+ *
+ * Silently dropping one is the failure worth spending a `400` to avoid: an
+ * unapplied filter returns `200` with every run the caller may see, and a
+ * client — or an agent — reads that superset as the answer to the narrow
+ * question it asked. A typo, a `workspaceId` for a `workspace`, or a parameter
+ * from a newer CLI all land here.
+ */
+function rejectUnknownParameters(
+	query: Record<string, unknown>,
+	allowed: readonly string[],
+): { error: string; message: string } | undefined {
+	const unknown = Object.keys(query).filter((key) => !allowed.includes(key));
+	if (unknown.length === 0) return undefined;
+	return {
+		error: "invalid_query",
+		message: `Unknown query parameter(s): ${unknown.sort().join(", ")}. Supported: ${[...allowed].sort().join(", ")}`,
+	};
+}
+
+/**
+ * Refuses a parameter present but empty.
+ *
+ * Without this, `?cursor=` silently restarts pagination at page one — which a
+ * client looping on a cursor it failed to store reads as a feed that never
+ * advances, rather than as the bug it is.
+ */
+function rejectEmptyParameters(
+	query: Record<string, string | string[] | undefined>,
+	allowed: readonly string[],
+): { error: string; message: string } | undefined {
+	const empty = allowed.filter(
+		(key) => key in query && single(query[key]) === undefined,
+	);
+	if (empty.length === 0) return undefined;
+	return {
+		error: "invalid_query",
+		message: `Empty query parameter(s): ${empty.sort().join(", ")}`,
+	};
+}
+
+/**
+ * Authenticates a fleet request, or writes the refusal and returns
+ * `undefined`.
+ *
+ * Shared by both run routes so neither can accidentally answer a differently
+ * shaped 401/403 than the context route already does — the body stays
+ * "unauthorized"/"forbidden", with the reason kept to the router's own logs.
+ */
+async function authenticate(
+	authorizer: OperatorAuthorizer,
+	headers: { authorization?: string },
+	reply: FastifyReply,
+	logger?: ILogger,
+): Promise<OperatorPrincipal | undefined> {
+	try {
+		return await authorizer.authenticate(headers.authorization);
+	} catch (error) {
+		if (error instanceof OperatorAuthError) {
+			logger?.debug(`Fleet read denied (${error.status}): ${error.message}`);
+			void reply
+				.status(error.status)
+				.send({ error: error.status === 401 ? "unauthorized" : "forbidden" });
+			return undefined;
+		}
+		logger?.error("Fleet read authorization failed", error);
+		void reply.status(500).send({ error: "internal error" });
+		return undefined;
+	}
+}
+
+/**
+ * Runs an authorized fleet read and renders its refusals.
+ *
+ * Every refusal a client can act on is modelled — an ambiguous captured name,
+ * a cursor from another query, a cursor from a previous router process — and
+ * each says which. That is the whole reason the routes cannot just return an
+ * empty page: an empty success is what a client mistakes for "nothing has
+ * happened", and both cursor faults are exactly the cases where nothing could
+ * be further from true.
+ *
+ * `no-store` for the same reason the context route sets it: a page is scoped to
+ * one principal's authority, and a cache keyed on the URL alone would serve one
+ * operator's fleet to the next.
+ */
+function runFleetRead(
+	reply: FastifyReply,
+	logger: ILogger | undefined,
+	what: string,
+	read: () => unknown,
+): FastifyReply {
+	try {
+		return reply.status(200).header("cache-control", "no-store").send(read());
+	} catch (error) {
+		if (error instanceof FleetQueryError) {
+			logger?.debug(
+				`Fleet ${what} refused (${error.status}): ${error.message}`,
+			);
+			return reply.status(error.status).send({
+				error: error.code,
+				...(error.status === 400 ? { message: error.message } : {}),
+				...(error.candidates ? { candidates: error.candidates } : {}),
+			});
+		}
+		if (error instanceof RunCursorError) {
+			logger?.debug(`Fleet ${what} cursor refused: ${error.message}`);
+			return reply
+				.status(error.status)
+				.send({ error: error.code, message: error.message });
+		}
+		// Same reasoning as the two documents above: Fastify has no error handler
+		// on this instance, so an uncaught throw would put the message — here, a
+		// Zod issue list naming rejected paths — into the response body.
+		logger?.error(`Could not serve the fleet ${what}`, error);
+		return reply.status(500).send({ error: "internal error" });
+	}
+}
+
+function single(value: string | string[] | undefined): string | undefined {
+	const first = Array.isArray(value) ? value[0] : value;
+	return typeof first === "string" && first.length > 0 ? first : undefined;
+}
+
+/**
+ * Reads the named query parameters, taking the FIRST value of a repeated one.
+ *
+ * Fastify hands a repeated parameter back as an array, and letting one reach a
+ * filter would turn `?workspace=a&workspace=b` into a filter compared against
+ * an array — which SQLite would silently bind as a string and match nothing.
+ */
+function pickSingle<K extends string>(
+	query: Record<string, string | string[] | undefined>,
+	keys: readonly K[],
+): Partial<Record<K, string>> {
+	const out: Partial<Record<K, string>> = {};
+	for (const key of keys) {
+		const value = single(query[key]);
+		if (value !== undefined) out[key] = value;
+	}
+	return out;
 }

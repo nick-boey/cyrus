@@ -2056,3 +2056,647 @@ CREATE TABLE agent_runs (
 		).toEqual(["active"]);
 	});
 });
+
+describe("agent run change feed (CYR-69)", () => {
+	const seed = (store: RouterStore) => {
+		const { userId } = store.addUser({
+			email: "owner@example.com",
+			name: "Owner",
+		});
+		const { deviceId } = store.createContainerDevice(userId, "CYR-69", "aca");
+		return { userId, deviceId };
+	};
+
+	const route = (
+		store: RouterStore,
+		deviceId: number,
+		overrides: Partial<Parameters<RouterStore["recordAgentRunRouted"]>[0]> = {},
+	) =>
+		store.recordAgentRunRouted({
+			deviceId,
+			issueKey: "CYR-69",
+			issueId: "issue-69",
+			sessionId: "session-1",
+			routedMs: 1_000,
+			routing: { workspaceId: "ws-a", workspaceName: "Acme" },
+			...overrides,
+		});
+
+	/** Every entry an authorized reader can see, in feed order. */
+	const listChanges = (store: RouterStore) =>
+		store.listAgentRunChanges({ limit: 100, workspaceIds: ["ws-a"] }).changes;
+
+	const kinds = (store: RouterStore) =>
+		listChanges(store).map((change) => change.kind);
+
+	it("records the run's creation as the first entry, with the whole observation", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+
+		const runId = route(store, deviceId);
+
+		const changes = listChanges(store);
+		expect(changes).toHaveLength(1);
+		expect(changes[0]).toMatchObject({
+			runId,
+			kind: "routing",
+			revision: 1,
+			changedMs: 1_000,
+		});
+		// The embedded snapshot is the run itself, so a watching client needs no
+		// second request to render it.
+		expect(changes[0]?.observation).toMatchObject({
+			runId,
+			issueKey: "CYR-69",
+			issueId: "issue-69",
+			sessionId: "session-1",
+			state: "routed",
+			routing: { workspaceId: "ws-a", workspaceName: "Acme" },
+		});
+		store.close();
+	});
+
+	it("names the kind of each material transition", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+		route(store, deviceId);
+
+		store.setAgentRunState(
+			"session-1",
+			"waiting",
+			{ wait: { reason: "elicitation", sinceMs: 2_000 }, runner: "claude" },
+			2_000,
+		);
+		// Same state, new wait evidence: a wait change, not a lifecycle one.
+		store.setAgentRunState(
+			"session-1",
+			"waiting",
+			{
+				wait: {
+					reason: "other",
+					sinceMs: 3_000,
+					reportedCondition: "waiting on CI",
+				},
+			},
+			3_000,
+		);
+		store.recordAgentRunActivity("session-1", 4_000);
+		// Already active, so only the activity stamp moves.
+		store.recordAgentRunActivity("session-1", 5_000);
+		store.finishAgentRun("session-1", "complete", 6_000);
+
+		expect(kinds(store)).toEqual([
+			"routing",
+			"lifecycle",
+			"wait",
+			"lifecycle",
+			"published_activity",
+			"lifecycle",
+		]);
+		store.close();
+	});
+
+	it("appends the entry in the same transaction as the mutation", () => {
+		// The durability claim: a revision a client can observe is never without
+		// the entry that explains it.
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+		const runId = route(store, deviceId);
+		store.finishAgentRun("session-1", "error", 7_000);
+
+		const run = store.listAgentRuns({ userId: 1 })[0];
+		const changes = listChanges(store);
+		expect(changes.at(-1)?.revision).toBe(run?.revision);
+		expect(changes.at(-1)?.observation.state).toBe("error");
+		expect(changes.every((change) => change.runId === runId)).toBe(true);
+		store.close();
+	});
+
+	it("orders by the change sequence and resumes after a cursor without duplicates", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+		route(store, deviceId);
+		store.recordAgentRunActivity("session-1", 2_000);
+		store.finishAgentRun("session-1", "complete", 3_000);
+
+		const all = listChanges(store);
+		expect(all.map((change) => change.changeId)).toEqual([1, 2, 3]);
+
+		const first = store.listAgentRunChanges({
+			limit: 2,
+			workspaceIds: ["ws-a"],
+		});
+		const rest = store.listAgentRunChanges({
+			afterChangeId: first.lastChangeId,
+			limit: 100,
+			workspaceIds: ["ws-a"],
+		});
+		expect(
+			[...first.changes, ...rest.changes].map((change) => change.changeId),
+		).toEqual([1, 2, 3]);
+		expect(store.latestAgentRunChangeId()).toBe(3);
+		store.close();
+	});
+
+	it("does not grow on a repeated heartbeat", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+		route(store, deviceId);
+
+		store.setRunWorkerConnectivity(deviceId, true, 2_000);
+		store.setRunWorkerConnectivity(deviceId, true, 3_000);
+		store.setRunWorkerConnectivity(deviceId, true, 4_000);
+
+		expect(kinds(store)).toEqual(["routing", "worker_connectivity"]);
+
+		// A real transition still lands — including one that begins and ends
+		// between two snapshots.
+		store.setRunWorkerConnectivity(deviceId, false, 5_000);
+		store.setRunWorkerConnectivity(deviceId, true, 6_000);
+		expect(
+			listChanges(store)
+				.filter((change) => change.kind === "worker_connectivity")
+				.map((change) => change.observation.workerOnline),
+		).toEqual([true, false, true]);
+		store.close();
+	});
+
+	it("does not grow on an unchanged sandbox gauge, but keeps the sample fresh", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+		route(store, deviceId);
+
+		store.setRunExecutorState(deviceId, "running", 2_000);
+		store.setRunExecutorState(deviceId, "running", 3_000);
+		store.setRunExecutorState(deviceId, "running", 4_000);
+
+		expect(kinds(store)).toEqual(["routing", "executor_state"]);
+		// Freshness still advances, so a client can age the sample it is given.
+		const run = store.listAgentRuns({ userId: 1 })[0];
+		expect(run?.executorState).toBe("running");
+		expect(run?.executorStateObservedMs).toBe(4_000);
+
+		store.setRunExecutorState(deviceId, "stopped", 5_000);
+		expect(
+			kinds(store).filter((kind) => kind === "executor_state"),
+		).toHaveLength(2);
+		store.close();
+	});
+
+	it("leaves terminal runs alone when connectivity or the gauge moves", () => {
+		// A run that ended is a record of what happened; its worker reconnecting
+		// says nothing about it, and writing to it would produce an entry for a run
+		// nobody is watching every time any device reconnects.
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+		route(store, deviceId);
+		store.finishAgentRun("session-1", "complete", 2_000);
+		const before = store.latestAgentRunChangeId();
+
+		store.setRunWorkerConnectivity(deviceId, false, 3_000);
+		store.setRunExecutorState(deviceId, "absent", 4_000);
+
+		expect(store.latestAgentRunChangeId()).toBe(before);
+		store.close();
+	});
+
+	it("expires terminal runs and their entries under one cutoff", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+		route(store, deviceId);
+		store.finishAgentRun("session-1", "complete", 2_000);
+		const survivingRun = route(store, deviceId, {
+			sessionId: "session-2",
+			routedMs: 3_000,
+		});
+
+		expect(store.sweepTerminalAgentRuns(2_500)).toBe(1);
+
+		const remaining = listChanges(store);
+		expect(remaining.map((change) => change.runId)).toEqual([survivingRun]);
+		store.close();
+	});
+
+	it("retains a non-terminal run and its entries at any age", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seed(store);
+		route(store, deviceId);
+		store.setAgentRunState(
+			"session-1",
+			"waiting",
+			{ wait: { reason: "elicitation", sinceMs: 2_000 } },
+			2_000,
+		);
+
+		expect(store.sweepTerminalAgentRuns(Number.MAX_SAFE_INTEGER)).toBe(0);
+		expect(listChanges(store)).toHaveLength(2);
+		store.close();
+	});
+
+	it("mints a fresh stream epoch per construction", () => {
+		// A restored database can roll `change_id` backwards; without a rotating
+		// epoch a stale cursor would silently replay entries as though new.
+		const a = new RouterStore(":memory:");
+		const b = new RouterStore(":memory:");
+		expect(a.changeStreamEpoch).not.toBe(b.changeStreamEpoch);
+		expect(a.changeStreamEpoch.length).toBeGreaterThan(0);
+		a.close();
+		b.close();
+	});
+});
+
+describe("listFleetAgentRuns (CYR-69)", () => {
+	const build = () => {
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({
+			email: "alice@example.com",
+			name: "Alice",
+		});
+		const { userId: otherUserId } = store.addUser({
+			email: "bob@example.com",
+			name: "Bob",
+		});
+		const alice = store.createContainerDevice(userId, "AAA-1", "aca").deviceId;
+		const bob = store.createContainerDevice(
+			otherUserId,
+			"BBB-1",
+			"aca",
+		).deviceId;
+		store.recordAgentRunRouted({
+			deviceId: alice,
+			issueKey: "AAA-1",
+			issueId: "issue-a",
+			sessionId: "s-a",
+			routedMs: 1_000,
+			routing: {
+				workspaceId: "ws-a",
+				workspaceName: "Acme",
+				linearTeamId: "team-1",
+				linearTeamName: "Platform",
+			},
+		});
+		store.recordAgentRunRouted({
+			deviceId: bob,
+			issueKey: "BBB-1",
+			issueId: "issue-b",
+			sessionId: "s-b",
+			routedMs: 2_000,
+			routing: {
+				workspaceId: "ws-b",
+				workspaceName: "Beta",
+				linearTeamId: "team-2",
+				linearTeamName: "Platform",
+			},
+		});
+		return { store, userId, otherUserId, alice, bob };
+	};
+
+	it("applies workspace authorization before any filter", () => {
+		const { store } = build();
+		expect(
+			store
+				.listFleetAgentRuns({ workspaceIds: ["ws-a"], limit: 10 })
+				.map((run) => run.sessionId),
+		).toEqual(["s-a"]);
+		// An unauthorized workspace named explicitly cannot widen the result.
+		expect(
+			store.listFleetAgentRuns({
+				workspaceIds: ["ws-a"],
+				workspaceId: "ws-b",
+				limit: 10,
+			}),
+		).toEqual([]);
+		expect(store.listFleetAgentRuns({ workspaceIds: [], limit: 10 })).toEqual(
+			[],
+		);
+		store.close();
+	});
+
+	it("narrows an owner-scoped principal to its own runs", () => {
+		const { store, userId } = build();
+		expect(
+			store
+				.listFleetAgentRuns({
+					workspaceIds: ["ws-a", "ws-b"],
+					ownerScopeUserId: userId,
+					limit: 10,
+				})
+				.map((run) => run.sessionId),
+		).toEqual(["s-a"]);
+		store.close();
+	});
+
+	it("paginates on a stable key without duplicates", () => {
+		const { store } = build();
+		const query = { workspaceIds: ["ws-a", "ws-b"] } as const;
+		const first = store.listFleetAgentRuns({ ...query, limit: 1 });
+		expect(first.map((run) => run.sessionId)).toEqual(["s-b"]);
+		const second = store.listFleetAgentRuns({
+			...query,
+			limit: 10,
+			after: {
+				startedMs: first[0]?.startedMs ?? 0,
+				runId: first[0]?.runId ?? "",
+			},
+		});
+		expect(second.map((run) => run.sessionId)).toEqual(["s-a"]);
+		store.close();
+	});
+
+	it("excludes a run that cannot be rendered as a v1 observation", () => {
+		// A run routed before the CYR-68 migration captured no workspace, issue id,
+		// or routing instant. Excluded in SQL so a page is exactly as long as it
+		// claims and `nextCursor` cannot skip silently discarded rows.
+		const { store, alice } = build();
+		store.recordAgentRunRouted({
+			deviceId: alice,
+			issueKey: "AAA-2",
+			sessionId: "s-legacy",
+			routedMs: 3_000,
+		});
+		expect(
+			store
+				.listFleetAgentRuns({ workspaceIds: ["ws-a", "ws-b"], limit: 10 })
+				.map((run) => run.sessionId),
+		).toEqual(["s-b", "s-a"]);
+		store.close();
+	});
+
+	it("reports dimension candidates only from the authorized set", () => {
+		const { store } = build();
+		expect(
+			store.listFleetRunDimensionValues({
+				workspaceIds: ["ws-a"],
+				dimension: "team",
+			}),
+		).toEqual([{ id: "team-1", name: "Platform" }]);
+		// Both teams share a captured name, so an authorized-for-both caller sees
+		// the ambiguity the route reports as a 400.
+		expect(
+			store.listFleetRunDimensionValues({
+				workspaceIds: ["ws-a", "ws-b"],
+				dimension: "team",
+			}),
+		).toEqual([
+			{ id: "team-1", name: "Platform" },
+			{ id: "team-2", name: "Platform" },
+		]);
+		store.close();
+	});
+
+	it("filters on the corrected lifecycle, not the stored state", () => {
+		const { store } = build();
+		store.setAgentRunState(
+			"s-a",
+			"waiting",
+			{ wait: { reason: "elicitation", sinceMs: 2_000 } },
+			2_000,
+		);
+		expect(
+			store
+				.listFleetAgentRuns({
+					workspaceIds: ["ws-a", "ws-b"],
+					lifecycle: "waiting",
+					limit: 10,
+				})
+				.map((run) => run.sessionId),
+		).toEqual(["s-a"]);
+		expect(
+			store
+				.listFleetAgentRuns({
+					workspaceIds: ["ws-a", "ws-b"],
+					lifecycle: "routed",
+					limit: 10,
+				})
+				.map((run) => run.sessionId),
+		).toEqual(["s-b"]);
+		store.close();
+	});
+});
+
+describe("change feed regressions (CYR-69 review)", () => {
+	const seedRun = (
+		store: RouterStore,
+		opts: { workspaceId?: string; email?: string; issueKey?: string } = {},
+	) => {
+		const email = opts.email ?? "owner@example.com";
+		const { userId } = store.addUser({ email, name: "Owner" });
+		const issueKey = opts.issueKey ?? "CYR-69";
+		const { deviceId } = store.createContainerDevice(userId, issueKey, "aca");
+		store.recordAgentRunRouted({
+			deviceId,
+			issueKey,
+			issueId: `issue-${issueKey}`,
+			sessionId: `session-${issueKey}`,
+			routedMs: 1_000,
+			routing: { workspaceId: opts.workspaceId ?? "ws-a" },
+		});
+		return { userId, deviceId, sessionId: `session-${issueKey}` };
+	};
+
+	const feed = (store: RouterStore, workspaceIds = ["ws-a"]) =>
+		store.listAgentRunChanges({ limit: 100, workspaceIds });
+
+	it("does not blank worker connectivity merely because a second process opened the file", () => {
+		// A `cyrus router …` subcommand opens the same database as the running
+		// router. Clearing connectivity on construction had an operator running
+		// `containers list` mid-incident report the whole fleet offline.
+		const dir = mkdtempSync(join(tmpdir(), "cyrus-router-feed-"));
+		const dbPath = join(dir, "router.db");
+		const serving = new RouterStore(dbPath);
+		const { deviceId } = seedRun(serving);
+		serving.setRunWorkerConnectivity(deviceId, true, 2_000);
+
+		const admin = new RouterStore(dbPath);
+		admin.close();
+
+		expect(serving.listAgentRuns({ userId: 1 })[0]?.workerOnline).toBe(true);
+		// The serving router, and only it, forgets on start.
+		serving.resetRunWorkerConnectivity();
+		expect(
+			serving.listAgentRuns({ userId: 1 })[0]?.workerOnline,
+		).toBeUndefined();
+		serving.close();
+	});
+
+	it("reports the terminal transition when a dark device's rows are reclaimed", () => {
+		// The 60s sweep reclaims a device past its TTL. This used to be a bulk
+		// UPDATE that bumped `revision` and appended nothing, so a laptop going to
+		// sleep took its run terminal with the feed saying nothing at all.
+		const store = new RouterStore(":memory:");
+		const { deviceId, sessionId } = seedRun(store);
+		const before = store.latestAgentRunChangeId();
+
+		store.releaseLocksAndAffinityForDevice(deviceId, 9_000);
+
+		const appended = feed(store).changes.filter(
+			(change) => change.changeId > before,
+		);
+		expect(appended.map((change) => change.kind)).toEqual(["lifecycle"]);
+		expect(appended[0]?.observation.state).toBe("unknown");
+		expect(appended[0]?.revision).toBe(
+			store.listAgentRuns({ userId: 1 })[0]?.revision,
+		);
+		expect(sessionId).toBe("session-CYR-69");
+		store.close();
+	});
+
+	it("does not record an unreadable provider listing as an executor transition", () => {
+		// `unknown` means the control plane could not be listed — a fact about ARM,
+		// not about the container. Persisting it turns one throttled call into a
+		// fleet-wide `running → unknown → running` pair that never happened.
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seedRun(store);
+		store.setRunExecutorState(deviceId, "running", 2_000);
+		const before = store.latestAgentRunChangeId();
+
+		store.setRunExecutorState(deviceId, "unknown", 3_000);
+
+		// The store still writes what it is told; the suppression lives in
+		// `ContainerLifecycle.recordObservation`, which is where the meaning of
+		// `unknown` is known. What matters here is that a repeat is still free.
+		store.setRunExecutorState(deviceId, "unknown", 4_000);
+		expect(store.latestAgentRunChangeId()).toBe(before + 1);
+		store.close();
+	});
+
+	it("records the container's absence when its device row is deleted", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seedRun(store);
+		store.setRunExecutorState(deviceId, "running", 2_000);
+
+		store.deleteContainerDevice(deviceId);
+
+		const run = store.listAgentRuns({ userId: 1 })[0];
+		expect(run?.executorState).toBe("absent");
+		// And the run is terminal, so the fleet view cannot describe a destroyed
+		// sandbox as a healthy running one.
+		expect(run?.state).toBe("unknown");
+		store.close();
+	});
+
+	it("authorizes the change feed inside the query, so a quiet principal is not starved", () => {
+		const store = new RouterStore(":memory:");
+		seedRun(store, { workspaceId: "ws-a", email: "a@example.com" });
+		// A great deal of traffic the ws-a reader may not see.
+		const noisy = seedRun(store, {
+			workspaceId: "ws-b",
+			email: "b@example.com",
+			issueKey: "CYR-70",
+		});
+		for (let i = 0; i < 50; i += 1) {
+			store.setRunWorkerConnectivity(noisy.deviceId, i % 2 === 0, 3_000 + i);
+		}
+
+		// A limit smaller than the noise: applied as a SCAN limit this returned
+		// nothing at all and advanced the cursor past the caller's own entry.
+		const page = store.listAgentRunChanges({
+			limit: 5,
+			workspaceIds: ["ws-a"],
+		});
+		expect(page.changes).toHaveLength(1);
+		expect(page.changes[0]?.observation.routing.workspaceId).toBe("ws-a");
+		store.close();
+	});
+
+	it("narrows the change feed to an owner-scoped principal", () => {
+		const store = new RouterStore(":memory:");
+		const mine = seedRun(store, { email: "a@example.com" });
+		seedRun(store, { email: "b@example.com", issueKey: "CYR-70" });
+
+		const page = store.listAgentRunChanges({
+			limit: 100,
+			workspaceIds: ["ws-a"],
+			ownerScopeUserId: mine.userId,
+		});
+
+		expect(page.changes.map((change) => change.observation.userId)).toEqual([
+			mine.userId,
+		]);
+		store.close();
+	});
+
+	it("advances the resume point past entries it could not read", () => {
+		// A window of unparseable snapshots must not pin a client on a position it
+		// can never get past.
+		const store = new RouterStore(":memory:");
+		seedRun(store);
+		const db = new Database(":memory:");
+		db.close();
+		// Corrupt the stored snapshot in place.
+		const raw = (store as unknown as { db: Database.Database }).db;
+		raw.prepare("UPDATE agent_run_changes SET observation_json = ?").run("{");
+
+		const page = store.listAgentRunChanges({
+			limit: 100,
+			workspaceIds: ["ws-a"],
+		});
+
+		expect(page.changes).toEqual([]);
+		expect(page.lastChangeId).toBe(store.latestAgentRunChangeId());
+		store.close();
+	});
+
+	it("matches the rendered runner placeholder with an `IS NULL` filter", () => {
+		const store = new RouterStore(":memory:");
+		seedRun(store);
+
+		expect(
+			store
+				.listFleetAgentRuns({
+					workspaceIds: ["ws-a"],
+					runner: "unknown",
+					limit: 10,
+				})
+				.map((run) => run.runner),
+		).toEqual([undefined]);
+		store.close();
+	});
+
+	it("caps a worker-reported wait condition", () => {
+		const store = new RouterStore(":memory:");
+		seedRun(store);
+
+		store.setAgentRunState(
+			"session-CYR-69",
+			"waiting",
+			{
+				wait: {
+					reason: "other",
+					sinceMs: 2_000,
+					reportedCondition: "x".repeat(10_000),
+				},
+			},
+			2_000,
+		);
+
+		const condition =
+			store.listAgentRuns({ userId: 1 })[0]?.wait?.reportedCondition ?? "";
+		expect(condition.length).toBe(512);
+		expect(condition.endsWith("…")).toBe(true);
+		store.close();
+	});
+
+	it("bounds one run's history however long it stays non-terminal", () => {
+		const store = new RouterStore(":memory:");
+		const { deviceId } = seedRun(store);
+		// A worker stuck in a reconnect loop: two entries per iteration, on a run
+		// age-based retention will never reach because it never ends.
+		for (let i = 0; i < 600; i += 1) {
+			store.setRunWorkerConnectivity(deviceId, i % 2 === 0, 2_000 + i);
+		}
+
+		const raw = (store as unknown as { db: Database.Database }).db;
+		const { n, oldest, newest } = raw
+			.prepare(
+				"SELECT COUNT(*) AS n, MIN(change_id) AS oldest, MAX(change_id) AS newest FROM agent_run_changes",
+			)
+			.get() as { n: number; oldest: number; newest: number };
+
+		expect(n).toBeLessThanOrEqual(501);
+		// It is the NEWEST history that survives; the oldest entries are dropped.
+		expect(newest).toBe(store.latestAgentRunChangeId());
+		expect(oldest).toBeGreaterThan(1);
+		store.close();
+	});
+});
