@@ -247,14 +247,26 @@ param entraAllowedDomain string = ''
 // `roles` key would otherwise reach `filter(grant.roles, ...)` inside the
 // recovery strip, and a misspelled role would render into the router config and
 // be rejected by its Zod schema after the revision was already published.
+// Every list is @minLength(1) because the router's Zod schema requires it
+// (`RouterConfigFileSchema` in apps/cli/src/commands/RouterCommand.ts). Without
+// these, emptying a grant's `workspaceIds` while leaving the entry in place
+// type-checks, survives build-params AND what-if, renders into
+// CYRUS_ROUTER_FLEET_OPERATIONS_JSON, and then fails the router's parse at
+// startup — a crash-looping revision, which is the exact failure this typed
+// parameter exists to move forward to deploy time. `roles` is separately
+// protected by the empty-grant filter below, but only AFTER the recovery strip;
+// an empty `roles` in the input is a typo either way, so reject it here.
 type fleetOperatorGrant = {
   @description('IMMUTABLE Entra object ids: a user oid or a group object id, never an email or UPN because both are reassignable.')
+  @minLength(1)
   principalIds: string[]
 
   @description('Roles these principals hold. Additive across a caller oid and their group memberships.')
+  @minLength(1)
   roles: ('fleet.read' | 'fleet.recover')[]
 
   @description('Linear workspace ids those roles apply to. The router narrows them to the workspaces it actually serves.')
+  @minLength(1)
   workspaceIds: string[]
 }
 
@@ -737,9 +749,9 @@ var routerContainersConfig = union(
 // CYRUS_ROUTER_FLEET_OPERATIONS_JSON, failed the router's Zod parse at startup,
 // and surfaced as a crash-looping revision instead of a parameter error.
 // Dereferencing unconditionally moves that to `az deployment sub what-if`,
-// which routine CD always runs first. It does not catch every shape error —
-// `roles` given as a bare string still survives — so the router's own schema
-// stays the backstop.
+// which routine CD always runs first. The `fleetOperatorGrant` type above
+// catches the rest — a missing key, a misspelled role, an emptied list — so the
+// router's schema is now a backstop rather than the first line of defence.
 var fleetGrants = filter(
   map(fleetOperatorGrants, grant => union(grant, {
     roles: enableFleetRecovery

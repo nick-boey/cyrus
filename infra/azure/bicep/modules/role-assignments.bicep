@@ -31,7 +31,7 @@ param routerPrincipalId string
 @description('Optional Entra principal id granted break-glass Storage Blob Data Contributor on router-backups.')
 param operatorPrincipalId string
 
-@description('Optional Entra principal/group object ids granted Log Analytics Reader at the workspace scope, so an authorized fleet operator can query the advertised log source with their own credential. Deliberately SEPARATE from the router-side fleet roles: the Entra app role decides what the router will answer, this Azure data-plane role decides what the operator can read directly, and neither implies the other. Empty grants nothing.')
+@description('Optional Entra principal/group object ids granted Log Analytics Reader at the workspace scope, so an authorized fleet operator can query the advertised log source with their own credential. Deliberately SEPARATE from the router-side fleet roles: fleetOperatorGrants decides what the router will answer, this Azure data-plane role decides what the operator can read directly, and neither implies the other. It is also NOT narrowed by Linear workspace the way a grant is — one Log Analytics workspace holds the logs of every Linear workspace, so this is all-or-nothing over the stack. Empty grants nothing.')
 param logAnalyticsReaderPrincipalIds array = []
 
 @description('Role-definition GUID for Container Apps SandboxGroup Data Owner.')

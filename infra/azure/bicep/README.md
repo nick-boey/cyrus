@@ -208,6 +208,12 @@ operator's **own client** can read. Neither implies the other, and the template
 never derives one list from the other — log records do not pass through the
 router, so a router role confers no data-plane access and vice versa.
 
+The two are also bounded differently, which is easy to miss: grants carry
+`workspaceIds`, the Azure role carries nothing equivalent. One Log Analytics
+workspace per stack holds every Linear workspace's logs, so `Log Analytics
+Reader` is all-or-nothing over the stack regardless of how narrow the matching
+grant is. See infra/azure/README.md § "Optional: fleet operator access", step 3.
+
 `enableFleetRecovery` is a deployment-side kill switch, not a directory change:
 while it is false the template STRIPS `fleet.recover` from every rendered grant,
 and drops any grant that had no other role (the router schema requires at least

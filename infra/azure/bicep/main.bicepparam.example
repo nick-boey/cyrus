@@ -220,6 +220,11 @@ param enableFleetRecovery = false
 //    a router grant grants no log access. On a manageRoleAssignments=false
 //    stack this list is applied by
 //    scripts/bootstrap-azure-role-assignments.sh, not by routine CD.
+//
+//    NOT narrowed by workspace id, unlike the grants above: one Log Analytics
+//    workspace holds every Linear workspace's logs, so this is all-or-nothing
+//    over the stack. Grant it only to principals you would trust with all of
+//    it — README §12 step 3.
 param fleetOperatorLogReaderPrincipalIds = []
 
 // ---- Setup management UI (/setup) — STAGED, see README §11 ------------------

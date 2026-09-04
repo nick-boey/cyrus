@@ -1163,6 +1163,23 @@ param fleetOperatorLogReaderPrincipalIds = [
 Assigned at the **workspace** scope, not the subscription. `principalType` is
 omitted so the list accepts users, groups, and service principals alike.
 
+**This grant is NOT narrowed by workspace id, and that asymmetry is the one
+thing to understand before handing it out.** `fleetOperatorGrants[].workspaceIds`
+bounds what the *router* will answer; nothing bounds what Log Analytics will
+answer. There is one workspace per stack and it is the sink for
+`ContainerAppConsoleLogs_CL` and `AppTraces` across every Linear workspace and
+every user, so a contractor granted `fleet.read` on workspace A alone — plus this
+role, so their `logs.query` works at all — can query workspace B's router and
+sandbox logs directly with their own credential. The router is not in that path
+and cannot refuse it.
+
+Azure has no per-Linear-workspace lever here: the finest available bound is
+table-level RBAC on the workspace, which cuts by table rather than by tenant.
+So treat this role as "may read this stack's logs, all of them" and grant it to
+principals you would trust with the whole stack. Where that is not acceptable,
+leave the list empty — a `fleet.read` operator without it keeps every other
+operator command and simply cannot run log queries.
+
 **On a `manageRoleAssignments = false` stack — which is what routine CD runs —
 this parameter does nothing during a deployment.** The grant is applied by the
 privileged bootstrap path, which reads the same parameter file:

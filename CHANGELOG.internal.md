@@ -49,6 +49,17 @@ This changelog documents internal development changes, refactors, tooling update
   the new parameters must be added to `env/*.bicepparam` there before they take
   effect.
 
+  `fleetOperatorGrants` is a user-defined `fleetOperatorGrant[]` rather than a bare
+  `array`, with `@minLength(1)` on all three lists to match the router's Zod
+  schema. A missing key, a misspelled role, or an emptied `workspaceIds` would
+  otherwise type-check, survive `build-params` AND `what-if`, render into the env
+  var, and fail the router's parse at startup — a crash-looping revision from a
+  parameter typo. `Log Analytics Reader`, by contrast, has no per-workspace bound
+  available to it: one Log Analytics workspace holds the logs of every Linear
+  workspace, so that role is all-or-nothing over the stack no matter how narrow
+  the matching grant is. That asymmetry is documented at each of the three places
+  the list is configured rather than left to be discovered.
+
   Coverage: `scripts/check-bicep.sh` type-checks the new parameters via
   `main.bicepparam.example` and two `infra/azure/bicep/testdata/` fixtures — every
   parameter omitted, and every parameter populated with a read-only principal, a

@@ -3,10 +3,9 @@
 // Log Analytics Reader list.
 //
 // `build-params` type-checks this against main.bicep, so it pins the parameter
-// NAMES — and only those. `fleetOperatorGrants` is an untyped `array`, so the
-// grant OBJECT shape is not checked here: main.bicep dereferences `grant.roles`
-// unconditionally so a malformed grant fails at `az deployment sub what-if`,
-// and the router's own Zod schema is the backstop behind that.
+// names AND the grant object shape: `fleetOperatorGrants` is a
+// `fleetOperatorGrant[]`, so a missing key, a misspelled role, or an emptied
+// list fails right here rather than at deploy time or in the router's Zod parse.
 //
 // build-params also does not evaluate the template, so it cannot see what the
 // grants render to. The compiled-ARM assertions in scripts/check-bicep.sh cover

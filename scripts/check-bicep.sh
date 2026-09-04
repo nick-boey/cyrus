@@ -108,12 +108,15 @@ fi
 # the rendered value; these are the gate for the wiring around it.
 assert_arm() {
   local template="$1" needle="$2" label="$3" out
-  if ! out="$(bicep build "$BICEP_DIR/$template" --stdout 2>/dev/null)"; then
+  # One build per template, reused across assertions. Without the cache each
+  # assertion recompiles a template the loop above already built.
+  out="${tmp}/arm-${template//\//_}.json"
+  if [[ ! -s "$out" ]] && ! bicep build "$BICEP_DIR/$template" --stdout >"$out" 2>/dev/null; then
     echo "FAIL — ${label} (${template} did not compile)"
     status=1
     return
   fi
-  if [[ "$out" == *"$needle"* ]]; then
+  if grep -qF -- "$needle" "$out"; then
     echo "ok   — ${label}"
   else
     echo "FAIL — ${label}"
