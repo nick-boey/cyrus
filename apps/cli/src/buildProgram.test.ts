@@ -372,34 +372,6 @@ describe("buildProgram — Commander wiring for the container subcommands", () =
 		expect(containerBootExecute).toHaveBeenCalledWith(["--restore-only"]);
 	});
 
-	it("registers `runs` beside `connect` and forwards its filters", async () => {
-		await run([
-			"runs",
-			"NOR-402",
-			"--comment",
-			"comment-1",
-			"--after",
-			"2026-09-02T00:00:00.000Z",
-			"--watch",
-			"--timeout",
-			"600",
-			"--json",
-		]);
-
-		expect(runsExecute).toHaveBeenCalledWith([
-			"NOR-402",
-			"--comment",
-			"comment-1",
-			"--after",
-			"2026-09-02T00:00:00.000Z",
-			"--watch",
-			"--timeout",
-			"600",
-			"--json",
-		]);
-		expect(applicationDisposeWatchers).toHaveBeenCalledTimes(1);
-	});
-
 	it("still rejects a genuinely unregistered router subcommand", async () => {
 		// Sanity check for every test above: confirms Commander actually
 		// errors on a command that was never registered, so the passing tests
@@ -484,20 +456,18 @@ describe("buildProgram — command profiles", () => {
 		}
 	});
 
-	it("does not expose `runs` in the remote profile while it needs device enrollment", () => {
-		// `RunsCommand` reads `config.router.deviceToken`, written only by
-		// `cyrus connect` — which this profile does not register, and which
-		// `cyrus connection add` deliberately never writes. Registering it here
-		// would ship a command that always fails, telling the operator to run a
-		// command the profile hides. CYR-70 moves it onto OperatorHttpClient.
+	it("exposes `runs` in the remote profile now that it reads a stored connection", () => {
+		// It used to need `config.router.deviceToken`, written only by `cyrus
+		// connect` — a command this profile hides. CYR-70 moved it onto
+		// `ConnectionStore`/`OperatorHttpClient`, which `cyrus connection add`
+		// does write, so the command can now function unattended here.
 		const names = topLevelCommands(
 			newProgram({ argv: ["node", "cyrus", "--profile", "remote"] }),
 		);
 
-		expect(names).not.toContain("runs");
-		// Still approved vocabulary, so it needs no re-approval when CYR-70 lands.
+		expect(names).toContain("runs");
 		expect(REMOTE_PROFILE_COMMANDS).toContain("runs");
-		// And it remains available in the full profile, where enrollment exists.
+		expect(REMOTE_PROFILE_REGISTERED).toContain("runs");
 		expect(topLevelCommands(newProgram())).toContain("runs");
 	});
 
@@ -621,6 +591,168 @@ describe("buildProgram — command profiles", () => {
 		expect(resolveCommandProfile([], { CYRUS_COMMAND_PROFILE: "  " })).toBe(
 			"full",
 		);
+	});
+});
+
+/**
+ * `runs` is the first command with BOTH real subcommands and a default one that
+ * preserves the previous syntax. Commander dispatches a default subcommand only
+ * when no named one matches, and getting that wrong either breaks every existing
+ * script (`cyrus runs NOR-402`) or shadows the new vocabulary — so all four
+ * forms are pinned here, against the real command tree.
+ */
+describe("buildProgram — Commander wiring for `runs`", () => {
+	beforeEach(() => {
+		runsExecute.mockClear();
+		applicationDisposeWatchers.mockClear();
+	});
+
+	it("registers `runs list` with the fleet filters", async () => {
+		await run([
+			"runs",
+			"list",
+			"--issue",
+			"NOR-402",
+			"--owner",
+			"Ada",
+			"--team",
+			"Platform",
+			"--project",
+			"Fleet",
+			"--run",
+			"run-1",
+			"--session",
+			"session-1",
+			"--state",
+			"active",
+			"--runner",
+			"claude",
+			"--model",
+			"claude-opus-5",
+			"--comment",
+			"comment-1",
+			"--routed-after",
+			"2026-09-02T00:00:00.000Z",
+			"--json",
+		]);
+
+		expect(runsExecute).toHaveBeenCalledWith(
+			[
+				"list",
+				"--run",
+				"run-1",
+				"--session",
+				"session-1",
+				"--issue",
+				"NOR-402",
+				"--owner",
+				"Ada",
+				"--team",
+				"Platform",
+				"--project",
+				"Fleet",
+				"--state",
+				"active",
+				"--runner",
+				"claude",
+				"--model",
+				"claude-opus-5",
+				"--comment",
+				"comment-1",
+				"--routed-after",
+				"2026-09-02T00:00:00.000Z",
+				"--json",
+			],
+			{ connection: undefined, workspace: undefined },
+		);
+		expect(applicationDisposeWatchers).toHaveBeenCalledTimes(1);
+	});
+
+	it("forwards --connection and --workspace as the fleet selection", async () => {
+		await run(["runs", "list", "--connection", "prod", "--workspace", "ws-1"]);
+
+		expect(runsExecute).toHaveBeenCalledWith(["list"], {
+			connection: "prod",
+			workspace: "ws-1",
+		});
+	});
+
+	it("registers `runs watch` with filters and a timeout", async () => {
+		await run([
+			"runs",
+			"watch",
+			"--state",
+			"active",
+			"--timeout",
+			"600",
+			"--json",
+		]);
+
+		expect(runsExecute).toHaveBeenCalledWith(
+			["watch", "--state", "active", "--timeout", "600", "--json"],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("registers `runs wait <runId>`", async () => {
+		await run(["runs", "wait", "run-1", "--timeout", "600", "--json"]);
+
+		expect(runsExecute).toHaveBeenCalledWith(
+			["wait", "run-1", "--timeout", "600", "--json"],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("still parses the deprecated `runs [issue] [--watch]` syntax", async () => {
+		// Existing scripts get an actionable deprecation path rather than an
+		// immediate parse failure.
+		await run([
+			"runs",
+			"NOR-402",
+			"--comment",
+			"comment-1",
+			"--after",
+			"2026-09-02T00:00:00.000Z",
+			"--watch",
+			"--timeout",
+			"600",
+			"--json",
+		]);
+
+		expect(runsExecute).toHaveBeenCalledWith(
+			[
+				"NOR-402",
+				"--comment",
+				"comment-1",
+				"--after",
+				"2026-09-02T00:00:00.000Z",
+				"--watch",
+				"--timeout",
+				"600",
+				"--json",
+			],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("routes a bare `cyrus runs` through the deprecated form", async () => {
+		await run(["runs"]);
+
+		expect(runsExecute).toHaveBeenCalledWith([], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("does not let the deprecated form shadow the new subcommands", async () => {
+		// `list`, `watch`, and `wait` must dispatch as subcommands, never as a
+		// positional issue key handed to the shim.
+		await run(["runs", "list"]);
+
+		expect(runsExecute).toHaveBeenCalledWith(["list"], {
+			connection: undefined,
+			workspace: undefined,
+		});
 	});
 });
 

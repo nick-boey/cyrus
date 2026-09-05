@@ -7,10 +7,15 @@ import {
 	operatorContextV1Schema,
 	type PublicRouterMetadataV1,
 	publicRouterMetadataV1Schema,
+	type RunChangePageV1,
+	type RunObservationPageV1,
+	runChangePageV1Schema,
+	runObservationPageV1Schema,
 } from "cyrus-operator-protocol";
 import type { OperatorCredentialProvider } from "./credentials.js";
 import {
 	AuthorizationError,
+	StreamEpochChangedError,
 	summarizeBody,
 	TransientError,
 	UsageError,
@@ -20,6 +25,10 @@ import {
 export const DISCOVERY_PATH = "/.well-known/cyrus";
 /** The authenticated operator's own view of its authority. */
 export const OPERATOR_CONTEXT_PATH = "/api/v1/operator/context";
+/** Workspace-authorized, paginated run snapshots. */
+export const RUNS_PATH = "/api/v1/runs";
+/** The durable, ordered feed of material run changes. */
+export const RUN_CHANGES_PATH = "/api/v1/run-changes";
 
 /**
  * Operator interface versions this CLI can speak.
@@ -112,31 +121,123 @@ export class OperatorHttpClient {
 	 * provider and possibly getting a different one.
 	 */
 	async context(): Promise<OperatorContextResult> {
-		if (!this.credentials) {
+		const { response, source } = await this.authorizedRequest(
+			OPERATOR_CONTEXT_PATH,
+		);
+
+		if (response.status === 404) {
 			throw new UsageError(
-				"This client was created without credentials, so it cannot read the operator context.",
+				`${this.baseUrl} does not serve ${OPERATOR_CONTEXT_PATH}. The router is too old for fleet operations.`,
 			);
 		}
-		// Walk the credential chain against the ROUTER, not only against the token
-		// endpoint. Minting a token and being allowed to use it are different
-		// questions, and only the router answers the second: an unattended host
-		// can hold an ungranted managed identity alongside a granted service
-		// principal, and three of the four Entra links produce APP-ONLY tokens
-		// which `OperatorAuthorizer` refuses regardless of grant. Without this
-		// the first credential the environment happens to produce is final.
-		//
-		// Bounded by the chain length — `rejectAndAdvance` records each refused
-		// source and never offers it again, so the loop cannot re-present one.
+		const body = await this.readJson(response, OPERATOR_CONTEXT_PATH);
+		const parsed = operatorContextV1Schema.safeParse(body);
+		if (!parsed.success) {
+			throw new UsageError(
+				`${this.baseUrl}${OPERATOR_CONTEXT_PATH} returned an invalid operator context: ${describeIssues(parsed.error)}`,
+			);
+		}
+		return { context: parsed.data, authSource: source };
+	}
+
+	/**
+	 * One page of run observations for the given query.
+	 *
+	 * The query is passed through verbatim rather than assembled here: which
+	 * parameters exist is a FILTER-vocabulary decision (`runFilters.ts`), and the
+	 * route refuses an unknown one with a 400 rather than silently dropping it —
+	 * so a parameter this client invented would fail loudly at the router instead
+	 * of quietly returning a superset.
+	 */
+	async listRuns(
+		query: Record<string, string> = {},
+	): Promise<RunObservationPageV1> {
+		const body = await this.readAuthorizedJson(RUNS_PATH, query);
+		const parsed = runObservationPageV1Schema.safeParse(body);
+		if (!parsed.success) {
+			throw new UsageError(
+				`${this.baseUrl}${RUNS_PATH} returned an invalid run page: ${describeIssues(parsed.error)}`,
+			);
+		}
+		return parsed.data;
+	}
+
+	/**
+	 * The material changes recorded after a cursor.
+	 *
+	 * `from: "latest"` starts at the present instead of replaying the retained
+	 * history, which is what makes the snapshot→watch handoff expressible: take a
+	 * cursor from HERE, then list runs, then resume from that cursor — in that
+	 * order, so nothing can happen in the gap without landing in the feed.
+	 *
+	 * @throws {StreamEpochChangedError} when the cursor predates a router
+	 * restart. The caller must re-snapshot rather than pretend it observed the
+	 * restart interval (ADR 0016).
+	 */
+	async listChanges(
+		input: { cursor?: string; from?: "start" | "latest" } = {},
+	): Promise<RunChangePageV1> {
+		const body = await this.readAuthorizedJson(RUN_CHANGES_PATH, {
+			...(input.cursor ? { cursor: input.cursor } : {}),
+			...(input.from ? { from: input.from } : {}),
+		});
+		const parsed = runChangePageV1Schema.safeParse(body);
+		if (!parsed.success) {
+			throw new UsageError(
+				`${this.baseUrl}${RUN_CHANGES_PATH} returned an invalid change page: ${describeIssues(parsed.error)}`,
+			);
+		}
+		return parsed.data;
+	}
+
+	private async readAuthorizedJson(
+		path: string,
+		query: Record<string, string>,
+	): Promise<unknown> {
+		const { response } = await this.authorizedRequest(path, query);
+		if (response.status === 404) {
+			throw new UsageError(
+				`${this.baseUrl} does not serve ${path}. The router is too old for fleet run operations.`,
+			);
+		}
+		return this.readJson(response, path);
+	}
+
+	/**
+	 * Presents credentials until one is not refused, or the chain is exhausted.
+	 *
+	 * Walks the chain against the ROUTER, not only against the token endpoint.
+	 * Minting a token and being allowed to use it are different questions, and
+	 * only the router answers the second: an unattended host can hold an
+	 * ungranted managed identity alongside a granted service principal, and three
+	 * of the four Entra links produce APP-ONLY tokens which `OperatorAuthorizer`
+	 * refuses regardless of grant. Without this the first credential the
+	 * environment happens to produce is final.
+	 *
+	 * Bounded by the chain length — `rejectAndAdvance` records each refused
+	 * source and never offers it again, so the loop cannot re-present one.
+	 */
+	private async authorizedRequest(
+		path: string,
+		query: Record<string, string> = {},
+	): Promise<{ response: Response; source: string }> {
+		if (!this.credentials) {
+			throw new UsageError(
+				"This client was created without credentials, so it cannot read authenticated operator routes.",
+			);
+		}
 		const refusals: string[] = [];
-		let response: Response;
-		let source: string;
 		while (true) {
 			const authorization = await this.credentials.getAuthorization();
-			source = authorization.source;
-			response = await this.request(OPERATOR_CONTEXT_PATH, {
-				authorization: authorization.header,
-			});
-			if (response.status !== 401 && response.status !== 403) break;
+			const source = authorization.source;
+			const response = await this.request(
+				path,
+				{ authorization: authorization.header },
+				query,
+			);
+			if (response.status !== 401 && response.status !== 403) {
+				return { response, source };
+			}
 
 			refusals.push(`${source} (${response.status})`);
 			if (this.credentials.rejectAndAdvance?.(source)) continue;
@@ -160,27 +261,15 @@ export class OperatorHttpClient {
 							`Ask a router administrator for a fleet.read grant.${appOnlyHint}${tried}`,
 			);
 		}
-
-		if (response.status === 404) {
-			throw new UsageError(
-				`${this.baseUrl} does not serve ${OPERATOR_CONTEXT_PATH}. The router is too old for fleet operations.`,
-			);
-		}
-		const body = await this.readJson(response, OPERATOR_CONTEXT_PATH);
-		const parsed = operatorContextV1Schema.safeParse(body);
-		if (!parsed.success) {
-			throw new UsageError(
-				`${this.baseUrl}${OPERATOR_CONTEXT_PATH} returned an invalid operator context: ${describeIssues(parsed.error)}`,
-			);
-		}
-		return { context: parsed.data, authSource: source };
 	}
 
 	private async request(
 		path: string,
 		headers: Record<string, string>,
+		query: Record<string, string> = {},
 	): Promise<Response> {
-		const url = `${this.baseUrl}${path}`;
+		const search = new URLSearchParams(query).toString();
+		const url = `${this.baseUrl}${path}${search ? `?${search}` : ""}`;
 		try {
 			return await this.fetchFn(url, {
 				headers: { accept: "application/json", ...headers },
@@ -204,7 +293,8 @@ export class OperatorHttpClient {
 	 */
 	private async readJson(response: Response, path: string): Promise<unknown> {
 		if (!response.ok) {
-			const body = summarizeBody(await response.text().catch(() => ""));
+			const text = await response.text().catch(() => "");
+			const body = summarizeBody(text);
 			const detail = body ? `: ${body}` : "";
 			if (response.status === 401 || response.status === 403) {
 				throw new AuthorizationError(
@@ -216,8 +306,17 @@ export class OperatorHttpClient {
 					`${this.baseUrl}${path} failed (${response.status})${detail}`,
 				);
 			}
+			// A cursor from a previous router process. Its own category, because a
+			// watch RECOVERS from it — re-snapshot and resume — while every other
+			// 4xx here is the operator's to fix.
+			if (response.status === 410) {
+				throw new StreamEpochChangedError(
+					`${this.baseUrl}${path} no longer serves that cursor (410); the router restarted${detail}`,
+				);
+			}
 			throw new UsageError(
-				`${this.baseUrl}${path} rejected the request (${response.status})${detail}`,
+				describeAmbiguousName(text) ??
+					`${this.baseUrl}${path} rejected the request (${response.status})${detail}`,
 			);
 		}
 		try {
@@ -246,6 +345,48 @@ const APP_ONLY_ENTRA_SOURCES: ReadonlySet<string> = new Set([
 
 function isAppOnlyEntraSource(source: string): boolean {
 	return APP_ONLY_ENTRA_SOURCES.has(source);
+}
+
+/**
+ * Renders the router's `ambiguous_name` refusal as the answer it actually is.
+ *
+ * The router refuses a captured name matching more than one canonical id rather
+ * than picking, and returns the candidates — computed from the caller's OWN
+ * authorized set, so naming them discloses nothing new. Surfacing them beats the
+ * generic "rejected the request (400)" by the whole distance between a dead end
+ * and a next command to run.
+ *
+ * Returns `undefined` for anything else, including a body that is not JSON, so
+ * the generic message stays the fallback.
+ */
+function describeAmbiguousName(body: string): string | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(body);
+	} catch {
+		return undefined;
+	}
+	const refusal = parsed as {
+		error?: unknown;
+		message?: unknown;
+		candidates?: unknown;
+	} | null;
+	if (refusal?.error !== "ambiguous_name") return undefined;
+	const candidates = Array.isArray(refusal.candidates)
+		? (refusal.candidates as Array<{ id?: string; name?: string }>)
+		: [];
+	const listed = candidates
+		.map((candidate) =>
+			candidate.name
+				? `${candidate.name} (${candidate.id})`
+				: String(candidate.id),
+		)
+		.join(", ");
+	const message =
+		typeof refusal.message === "string"
+			? refusal.message
+			: "That name matches more than one id.";
+	return listed ? `${message}. Candidates: ${listed}.` : `${message}.`;
 }
 
 /**
