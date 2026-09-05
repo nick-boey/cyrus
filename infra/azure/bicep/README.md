@@ -214,6 +214,22 @@ workspace per stack holds every Linear workspace's logs, so `Log Analytics
 Reader` is all-or-nothing over the stack regardless of how narrow the matching
 grant is. See infra/azure/README.md § "Optional: fleet operator access", step 3.
 
+The same `CYRUS_ROUTER_FLEET_OPERATIONS_JSON` carries `logSource`, the
+credential-free descriptor that tells an authorized operator's client **where**
+to run its own query. Its two identifiers come from `foundation.bicep`'s
+`logAnalyticsCustomerId` and `logAnalyticsWorkspaceResourceId` outputs rather
+than from parameters, so a deployment cannot name a workspace it did not create,
+and the whole block renders only when grants are configured — with nobody to
+disclose it to, an unconfigured stack publishes no workspace metadata at all.
+
+The rendered value is the already-normalized v1 descriptor, which `cyrus router
+start` accepts verbatim as `fleetOperations.logSource`. A **self-hosted** router
+with no Bicep writes the friendlier `observability.logSource` block instead and
+the CLI normalizes it into the same descriptor — see docs/ROUTER.md §
+"Advertise the historical log source". Declaring both is refused, so a
+deployment that renders one and a config that hand-writes the other fails at
+startup rather than picking a winner silently.
+
 `enableFleetRecovery` is a deployment-side kill switch, not a directory change:
 while it is false the template STRIPS `fleet.recover` from every rendered grant,
 and drops any grant that had no other role (the router schema requires at least

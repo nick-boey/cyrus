@@ -5,6 +5,51 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Advertised the configured historical log source ([CYR-71](https://linear.app/northrop-digital/issue/CYR-71/advertise-the-configured-historical-log-source)).**
+  `router-config.json` gains an `observability.logSource` block that
+  `RouterConfigFileSchema` normalizes into a `LogSourceDescriptorV1` on
+  `fleetOperations.logSource`. The router side needed no change: `FleetOperations`
+  already gates the descriptor on the `logs.query` capability and
+  `RouterServer.servedOperatorCapabilities` already derives that capability from a
+  configured source. What was missing was a form an operator could write by hand.
+
+  **The normalization is a schema `.transform()`, not a helper each reader calls.**
+  The config is `safeParse`d at six sites in `RouterCommand`, and a
+  hand-maintained copy site is precisely how a field gets honoured on one path and
+  silently dropped on another — the `strictMcpConfig` / `slackAllowedTools` shape
+  in CLAUDE.md §9. A transform leaves exactly one place to miss, and it is
+  unmissable: `observability` is destructured out, so nothing downstream ever sees
+  the friendly form and `RouterServerConfig` has one shape to handle.
+
+  **The friendly form has no `table` field and never will.**
+  `ContainerAppConsoleLogs_CL`, the KQL compiled against it, and the response
+  columns are the Azure adapter's knowledge. The block is `strictObject` at both
+  levels for the same reason the wire descriptor is: the property that makes it
+  safe to disclose is that it CANNOT carry a way to reach a backend, so
+  `endpoint`, `authorityHost`, `sharedKey` and friends are refused rather than
+  stripped. `resourceId` is the one free-form Azure field, hence the one place a
+  URL could hide, so it is pinned to a `Microsoft.OperationalInsights/workspaces`
+  ARM path — a client that treated a URL there as an endpoint would authenticate
+  to whatever it named.
+
+  `fleetOperations.logSource` now uses `logSourceDescriptorV1Schema` itself rather
+  than a hand-rolled copy of its shape. The copy could not express the wire
+  schema's cross-field rules, so a config violating one parsed cleanly in the CLI
+  and threw later inside `FleetOperations` — a router that starts, serves
+  everything else, and 500s one route. Declaring the source under both keys is a
+  config error: two spellings of one setting is a silent-precedence bug, where
+  whichever lost gets edited for hours with no effect.
+
+  The budget ceilings (525600 minutes, 8760 hours, 1e6 records, 86400 seconds) are
+  not policy — they exist so a slipped digit cannot multiply out into a wire
+  descriptor. Real deployments are orders of magnitude below them.
+
+  No log-query route was added, and `RouterServer.test.ts` now pins that: four
+  plausible log paths 404 on both GET and POST, and a KQL-shaped `?query=` on
+  `/api/v1/runs` is refused with `invalid_query` rather than ignored. The
+  "no Azure token can be serialized" claim is checked from the other side too —
+  `routes.test.ts` asserts the disclosed descriptor's key set is exactly
+  `{schemaVersion, kind, displayName, azure, budgets}`.
 - **Captured routing and worker-reported run facts ([CYR-68](https://linear.app/northrop-digital/issue/CYR-68/capture-routing-and-worker-reported-run-facts), [#61](https://github.com/nick-boey/cyrus/pull/61)).**
   The `session_state` frame gains an explicit `waiting` state carrying
   `wait { reason, since, reportedCondition }`, a separate `executorMayPark`

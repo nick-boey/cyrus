@@ -8,7 +8,11 @@ import {
 import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import { resolvePath } from "cyrus-core";
-import type { OperatorRoleV1 } from "cyrus-operator-protocol";
+import {
+	type LogSourceDescriptorV1,
+	logSourceDescriptorV1Schema,
+	type OperatorRoleV1,
+} from "cyrus-operator-protocol";
 import { buildResourceAttributes } from "cyrus-otel-logs";
 import {
 	buildGitHubTokenScopeReport,
@@ -174,12 +178,188 @@ interface SnapshotGcProvider {
 }
 
 /**
+ * A Log Analytics workspace customer ID: the GUID a query is addressed to.
+ *
+ * Validated here rather than left to the operator's own client, which fails
+ * against Azure with a `404` that reads as a permissions problem — the single
+ * most expensive way to discover a typo in a workspace ID.
+ */
+const LOG_ANALYTICS_WORKSPACE_ID_RE =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The ARM resource id of a Log Analytics workspace.
+ *
+ * `resourceId` is the one free-form Azure field in the descriptor, so it is the
+ * one place a URL could hide — and a client that treated it as an endpoint would
+ * then authenticate to whatever it named. Pinned to an Operational Insights
+ * workspace path so it can only ever denote the workspace beside it.
+ */
+const LOG_ANALYTICS_RESOURCE_ID_RE =
+	/^\/subscriptions\/[^/]+\/resourceGroups\/[^/]+\/providers\/Microsoft\.OperationalInsights\/workspaces\/[^/]+$/i;
+
+/** The `cloud` names an operator writes in `observability.logSource`. */
+const LOG_SOURCE_CLOUDS = [
+	"AzurePublic",
+	"AzureGovernment",
+	"AzureChina",
+] as const;
+
+/**
+ * Friendly `cloud` name → the protocol's enum.
+ *
+ * The two spellings differ deliberately: the config uses the short names an
+ * operator recognises, and the wire uses the values the Azure adapter switches
+ * on. Neither is derivable from the other, so the mapping is explicit — and
+ * `satisfies` makes a name added to one and not the other a `tsc` error, rather
+ * than an enum member that maps to `undefined` at runtime.
+ */
+const LOG_SOURCE_CLOUD_BY_ALIAS = {
+	AzurePublic: "AzurePublicCloud",
+	AzureGovernment: "AzureUSGovernment",
+	AzureChina: "AzureChinaCloud",
+} as const satisfies Record<
+	(typeof LOG_SOURCE_CLOUDS)[number],
+	NonNullable<NonNullable<LogSourceDescriptorV1["azure"]>["cloud"]>
+>;
+
+/**
+ * The budgets a descriptor advertises when the config declares none.
+ *
+ * A 15-minute lookback over a 24-hour window is the shape of an incident
+ * question ("what just happened"), and 5000 records is what a terminal can
+ * usefully render. They match `main.bicep`'s rendered defaults, so a self-host
+ * config and an Azure deployment advertise the same budgets.
+ */
+const LOG_SOURCE_BUDGET_DEFAULTS = {
+	lookbackMinutes: 15,
+	maximumRangeHours: 24,
+	maximumRecords: 5000,
+	followPollSeconds: 15,
+} as const;
+
+/**
+ * One optional budget: a positive whole number, bounded generously.
+ *
+ * The ceilings exist only so a slipped digit cannot become a wire descriptor —
+ * every budget is multiplied out into seconds, and the client enforces the
+ * result against a billed backend. They sit orders of magnitude above any real
+ * deployment, so they refuse a typo without ever refusing an intent.
+ */
+function budgetField(max: number) {
+	return z.number().int().positive().max(max).optional();
+}
+
+/**
+ * The operator-facing spelling of a log source: where the data lives, in the
+ * units an operator thinks in, with no way to name a table, a query, or a
+ * credential.
+ *
+ * STRICT for the same reason the wire descriptor is: the property that makes
+ * this safe to hand to an authorized operator is that it CANNOT carry a way to
+ * reach a backend. An unknown key — `endpoint`, `sharedKey`, `authorityHost` —
+ * is refused rather than stripped, so a config that believed it was setting one
+ * fails at startup instead of running with it silently dropped.
+ *
+ * `table` is absent by design. `ContainerAppConsoleLogs_CL`, the KQL compiled
+ * against it, and the columns that come back are the Azure ADAPTER's knowledge,
+ * not the router's configuration.
+ */
+const ObservabilityLogSourceSchema = z
+	.strictObject({
+		// A single-member enum rather than a bare literal so a second adapter kind
+		// is one entry here plus its own branch, with no other API moving.
+		kind: z.enum(["azure-log-analytics"]),
+		displayName: z.string().min(1).optional(),
+		workspaceId: z.string().regex(LOG_ANALYTICS_WORKSPACE_ID_RE),
+		resourceId: z.string().regex(LOG_ANALYTICS_RESOURCE_ID_RE).optional(),
+		cloud: z.enum(LOG_SOURCE_CLOUDS).optional(),
+		defaults: z
+			.strictObject({
+				lookbackMinutes: budgetField(525_600),
+				maximumRangeHours: budgetField(8_760),
+				maximumRecords: budgetField(1_000_000),
+				followPollSeconds: budgetField(86_400),
+			})
+			.optional(),
+	})
+	.superRefine((source, ctx) => {
+		const lookback =
+			source.defaults?.lookbackMinutes ??
+			LOG_SOURCE_BUDGET_DEFAULTS.lookbackMinutes;
+		const range =
+			source.defaults?.maximumRangeHours ??
+			LOG_SOURCE_BUDGET_DEFAULTS.maximumRangeHours;
+		// The wire schema refuses this too, but there it surfaces as a router that
+		// starts cleanly and then 500s the one authenticated operator route for as
+		// long as it runs. Caught here it is a startup error naming the field.
+		if (lookback > range * 60) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["defaults", "lookbackMinutes"],
+				message: `lookbackMinutes (${lookback}) cannot exceed maximumRangeHours (${range} = ${range * 60} minutes)`,
+			});
+		}
+	});
+
+/**
+ * Expands the friendly form into the credential-free v1 descriptor the router
+ * and every operator client speak.
+ *
+ * Normalizing at config-parse time rather than at response time is what keeps
+ * ONE shape downstream: `RouterServerConfig` only ever sees a
+ * `LogSourceDescriptorV1`, so `FleetOperations` has no second form to handle and
+ * a future adapter kind is added in one place.
+ */
+function toLogSourceDescriptor(
+	source: z.infer<typeof ObservabilityLogSourceSchema>,
+): LogSourceDescriptorV1 {
+	// Field by field rather than by spread: a key present with an explicit
+	// `undefined` would spread OVER its default and multiply out to `NaN`, which
+	// the wire schema then reports as a type error against a field the operator
+	// did set.
+	const declared = source.defaults ?? {};
+	const defaults = {
+		lookbackMinutes:
+			declared.lookbackMinutes ?? LOG_SOURCE_BUDGET_DEFAULTS.lookbackMinutes,
+		maximumRangeHours:
+			declared.maximumRangeHours ??
+			LOG_SOURCE_BUDGET_DEFAULTS.maximumRangeHours,
+		maximumRecords:
+			declared.maximumRecords ?? LOG_SOURCE_BUDGET_DEFAULTS.maximumRecords,
+		followPollSeconds:
+			declared.followPollSeconds ??
+			LOG_SOURCE_BUDGET_DEFAULTS.followPollSeconds,
+	};
+	return {
+		schemaVersion: 1,
+		kind: source.kind,
+		...(source.displayName ? { displayName: source.displayName } : {}),
+		azure: {
+			workspaceId: source.workspaceId,
+			// Owned by the adapter. The config has no field to override it with.
+			table: "ContainerAppConsoleLogs_CL",
+			...(source.cloud
+				? { cloud: LOG_SOURCE_CLOUD_BY_ALIAS[source.cloud] }
+				: {}),
+			...(source.resourceId ? { resourceId: source.resourceId } : {}),
+		},
+		budgets: {
+			defaultLookbackSeconds: defaults.lookbackMinutes * 60,
+			maxRangeSeconds: defaults.maximumRangeHours * 3600,
+			maxRecords: defaults.maximumRecords,
+			minFollowIntervalSeconds: defaults.followPollSeconds,
+		},
+	};
+}
+
+/**
  * JSON shape of `<cyrusHome>/router-config.json`: a {@link RouterServerConfig}
  * minus `dbPath` (always defaulted to `<cyrusHome>/router/router.db` — see
  * {@link RouterCommand.resolveDbPath}) and minus the runtime-only
  * `trackerFactory`/`logger` fields, which aren't JSON-serializable.
  */
-const RouterConfigFileSchema = z.object({
+const RouterConfigFileFieldsSchema = z.object({
 	port: z.number(),
 	workspaces: z.record(
 		z.string(),
@@ -267,33 +447,18 @@ const RouterConfigFileSchema = z.object({
 				.optional(),
 			// Disclosed only on the authenticated context route, and only to a
 			// principal whose capabilities include `logs.query`.
-			logSource: z
-				.object({
-					schemaVersion: z.literal(1),
-					kind: z.enum(["azure-log-analytics", "fake"]),
-					displayName: z.string().min(1).optional(),
-					azure: z
-						.object({
-							workspaceId: z.string().min(1),
-							table: z.literal("ContainerAppConsoleLogs_CL"),
-							cloud: z
-								.enum([
-									"AzurePublicCloud",
-									"AzureUSGovernment",
-									"AzureChinaCloud",
-								])
-								.optional(),
-							resourceId: z.string().min(1).optional(),
-						})
-						.optional(),
-					budgets: z.object({
-						defaultLookbackSeconds: z.number().int().positive(),
-						maxRangeSeconds: z.number().int().positive(),
-						maxRecords: z.number().int().positive(),
-						minFollowIntervalSeconds: z.number().int().positive(),
-					}),
-				})
-				.optional(),
+			//
+			// The already-normalized v1 descriptor, which is what `main.bicep`
+			// renders into CYRUS_ROUTER_FLEET_OPERATIONS_JSON. A hand-written config
+			// should use `observability.logSource` instead — the same thing in the
+			// units an operator thinks in.
+			//
+			// The WIRE schema itself, rather than a copy of its shape: a hand-rolled
+			// copy cannot express the cross-field rules (an Azure source must name a
+			// workspace, a default lookback cannot exceed the maximum range), so a
+			// config violating one used to parse cleanly here and fail later inside
+			// `FleetOperations`.
+			logSource: logSourceDescriptorV1Schema.optional(),
 			skill: z
 				.object({
 					name: z.string().min(1),
@@ -304,6 +469,17 @@ const RouterConfigFileSchema = z.object({
 				})
 				.optional(),
 		})
+		.optional(),
+	/**
+	 * Where this router's historical logs live, in the operator-facing spelling.
+	 *
+	 * Normalized into `fleetOperations.logSource` before the config leaves this
+	 * schema, so nothing downstream sees this shape. Omitting it leaves the router
+	 * exactly as it is today: no `logs.query` capability is advertised and the
+	 * authenticated context document carries no descriptor.
+	 */
+	observability: z
+		.strictObject({ logSource: ObservabilityLogSourceSchema.optional() })
 		.optional(),
 	// Opt-in ephemeral container executor settings — see
 	// RouterContainersConfig in cyrus-router. Omitting this field entirely (the
@@ -471,6 +647,40 @@ const RouterConfigFileSchema = z.object({
 			autoProvisionUsers: z.boolean().optional(),
 		})
 		.optional(),
+});
+
+/**
+ * The config file, with `observability.logSource` folded into
+ * `fleetOperations.logSource`.
+ *
+ * A transform on the SCHEMA rather than a normalizer each reader calls: the
+ * config is `safeParse`d at half a dozen call sites, and a hand-maintained copy
+ * site is how a field ends up silently dropped on one path and honoured on
+ * another (the `strictMcpConfig` and `slackAllowedTools` shape, per CLAUDE.md
+ * §9). There is exactly one place to miss, and it is unmissable.
+ */
+const RouterConfigFileSchema = RouterConfigFileFieldsSchema.superRefine(
+	(config, ctx) => {
+		// Two spellings of one setting is a silent-precedence bug waiting to
+		// happen: whichever one lost would be edited for hours with no effect.
+		if (config.observability?.logSource && config.fleetOperations?.logSource) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["observability", "logSource"],
+				message:
+					"Declare the log source once: either `observability.logSource` (the operator-facing form) or `fleetOperations.logSource` (the rendered v1 descriptor), not both",
+			});
+		}
+	},
+).transform(({ observability, ...config }) => {
+	if (!observability?.logSource) return config;
+	return {
+		...config,
+		fleetOperations: {
+			...config.fleetOperations,
+			logSource: toLogSourceDescriptor(observability.logSource),
+		},
+	};
 });
 
 /**
