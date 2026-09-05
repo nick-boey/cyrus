@@ -5,7 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
-- **Advertised the configured historical log source ([CYR-71](https://linear.app/northrop-digital/issue/CYR-71/advertise-the-configured-historical-log-source)).**
+- **Advertised the configured historical log source ([CYR-71](https://linear.app/northrop-digital/issue/CYR-71/advertise-the-configured-historical-log-source), [#64](https://github.com/nick-boey/cyrus/pull/64)).**
   `router-config.json` gains an `observability.logSource` block that
   `RouterConfigFileSchema` normalizes into a `LogSourceDescriptorV1` on
   `fleetOperations.logSource`. The router side needed no change: `FleetOperations`
@@ -27,18 +27,38 @@ This changelog documents internal development changes, refactors, tooling update
   levels for the same reason the wire descriptor is: the property that makes it
   safe to disclose is that it CANNOT carry a way to reach a backend, so
   `endpoint`, `authorityHost`, `sharedKey` and friends are refused rather than
-  stripped. `resourceId` is the one free-form Azure field, hence the one place a
-  URL could hide, so it is pinned to a `Microsoft.OperationalInsights/workspaces`
-  ARM path — a client that treated a URL there as an endpoint would authenticate
-  to whatever it named.
+  stripped.
+
+  **The two Azure identifiers are format-checked in the CONTRACT, not in the
+  config schema that happens to produce a descriptor.** `workspaceId` becomes a
+  GUID and `resourceId` a `Microsoft.OperationalInsights/workspaces` ARM path in
+  `azureLogAnalyticsDescriptorV1Schema` itself, because a router accepts this
+  shape from more than one place: a hand-written `router-config.json` AND the
+  whole-block `CYRUS_ROUTER_FLEET_OPERATIONS_JSON` that `main.bicep` and
+  `docker/router/entrypoint.mjs` render straight through. Validating only the
+  friendly alias would have left the rule true of the path nobody uses and merely
+  documented on the path every Azure and Docker deployment takes — with the
+  CHANGELOG stating it unconditionally. `resourceId` is the one free-form field,
+  hence the one place a URL could hide, so it is pinned over ARM's own name
+  charset and terminated with `(?![\s\S])` rather than `$`: `$` also matches
+  before a trailing newline, which would admit a CRLF into whatever URL or header
+  a future client builds from it.
 
   `fleetOperations.logSource` now uses `logSourceDescriptorV1Schema` itself rather
-  than a hand-rolled copy of its shape. The copy could not express the wire
-  schema's cross-field rules, so a config violating one parsed cleanly in the CLI
-  and threw later inside `FleetOperations` — a router that starts, serves
-  everything else, and 500s one route. Declaring the source under both keys is a
-  config error: two spellings of one setting is a silent-precedence bug, where
-  whichever lost gets edited for hours with no effect.
+  than a hand-rolled copy of its shape. Both forms already refused to start the
+  router — `FleetOperations.validateConfig` runs in its constructor — so what the
+  earlier check buys is the MESSAGE: a cross-field violation now names
+  `lookbackMinutes`, not a `defaultLookbackSeconds` in units the operator never
+  wrote. Declaring the source under both keys is a config error: two spellings of
+  one setting is a silent-precedence bug, where whichever lost gets edited for
+  hours with no effect.
+
+  **A configured log source is logged at startup**, kind and all. Omitting the
+  block and misspelling the key are observationally identical from outside — the
+  router starts clean, advertises no `logs.query`, discloses nothing — and
+  `RouterConfigFileFieldsSchema` is `z.object`, so a typo'd top-level key is
+  stripped in silence. One line makes the two distinguishable without making
+  every other top-level typo fatal.
 
   The budget ceilings (525600 minutes, 8760 hours, 1e6 records, 86400 seconds) are
   not policy — they exist so a slipped digit cannot multiply out into a wire

@@ -1708,9 +1708,10 @@ describe("RouterCommand", () => {
 		});
 
 		it("rejects a default lookback longer than the maximum range", () => {
-			// The wire schema refuses this too, but there it surfaces as a router that
-			// starts cleanly and 500s the one authenticated operator route. Caught at
-			// config-parse time it is a startup error naming the field.
+			// The wire schema refuses this too, and `FleetOperations.validateConfig`
+			// runs in its constructor, so either way the router refuses to start.
+			// Caught here the error names `lookbackMinutes` rather than a
+			// `defaultLookbackSeconds` this operator never wrote.
 			expectRejected({
 				logSource: {
 					kind: "azure-log-analytics",
@@ -1801,6 +1802,51 @@ describe("RouterCommand", () => {
 			);
 
 			expect(readConfig().fleetOperations?.logSource).toEqual(logSource);
+		});
+
+		it.each([
+			["a workspace ID that is not a GUID", { workspaceId: "cyrus-prod-logs" }],
+			[
+				"a resource ID that is a URL",
+				{ resourceId: "https://attacker.example" },
+			],
+			[
+				"a resource ID carrying a CRLF",
+				{ resourceId: `${RESOURCE_ID}\r\nX-Evil: 1` },
+			],
+		])("refuses %s in the rendered descriptor too", (_label, override) => {
+			// The identifier rules live in the wire contract, not in the friendly
+			// alias, precisely so they hold on THIS path — the one `main.bicep` and
+			// `docker/router/entrypoint.mjs` render straight through, and therefore
+			// the one every Azure and Docker deployment takes. A rule true only of
+			// the hand-written form would be documented rather than enforced.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					fleetOperations: {
+						logSource: {
+							schemaVersion: 1,
+							kind: "azure-log-analytics",
+							azure: {
+								workspaceId: WORKSPACE_GUID,
+								table: "ContainerAppConsoleLogs_CL",
+								...override,
+							},
+							budgets: {
+								defaultLookbackSeconds: 900,
+								maxRangeSeconds: 86_400,
+								maxRecords: 5000,
+								minFollowIntervalSeconds: 15,
+							},
+						},
+					},
+				}),
+			);
+
+			expect(() => readConfig()).toThrow("Invalid router config");
 		});
 
 		it("refuses a rendered descriptor whose default lookback exceeds its range", () => {

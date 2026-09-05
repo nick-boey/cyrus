@@ -9,6 +9,8 @@ import { dirname, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import { resolvePath } from "cyrus-core";
 import {
+	azureWorkspaceIdV1Schema,
+	azureWorkspaceResourceIdV1Schema,
 	type LogSourceDescriptorV1,
 	logSourceDescriptorV1Schema,
 	type OperatorRoleV1,
@@ -177,27 +179,6 @@ interface SnapshotGcProvider {
 	): Promise<SnapshotGcItem[]>;
 }
 
-/**
- * A Log Analytics workspace customer ID: the GUID a query is addressed to.
- *
- * Validated here rather than left to the operator's own client, which fails
- * against Azure with a `404` that reads as a permissions problem — the single
- * most expensive way to discover a typo in a workspace ID.
- */
-const LOG_ANALYTICS_WORKSPACE_ID_RE =
-	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/**
- * The ARM resource id of a Log Analytics workspace.
- *
- * `resourceId` is the one free-form Azure field in the descriptor, so it is the
- * one place a URL could hide — and a client that treated it as an endpoint would
- * then authenticate to whatever it named. Pinned to an Operational Insights
- * workspace path so it can only ever denote the workspace beside it.
- */
-const LOG_ANALYTICS_RESOURCE_ID_RE =
-	/^\/subscriptions\/[^/]+\/resourceGroups\/[^/]+\/providers\/Microsoft\.OperationalInsights\/workspaces\/[^/]+$/i;
-
 /** The `cloud` names an operator writes in `observability.logSource`. */
 const LOG_SOURCE_CLOUDS = [
 	"AzurePublic",
@@ -271,8 +252,12 @@ const ObservabilityLogSourceSchema = z
 		// is one entry here plus its own branch, with no other API moving.
 		kind: z.enum(["azure-log-analytics"]),
 		displayName: z.string().min(1).optional(),
-		workspaceId: z.string().regex(LOG_ANALYTICS_WORKSPACE_ID_RE),
-		resourceId: z.string().regex(LOG_ANALYTICS_RESOURCE_ID_RE).optional(),
+		// The CONTRACT's own field schemas, not a copy of their rules: the
+		// descriptor this normalizes into is checked against them anyway, so a
+		// second definition here could only ever disagree with the one that
+		// decides.
+		workspaceId: azureWorkspaceIdV1Schema,
+		resourceId: azureWorkspaceResourceIdV1Schema.optional(),
 		cloud: z.enum(LOG_SOURCE_CLOUDS).optional(),
 		defaults: z
 			.strictObject({
@@ -290,9 +275,11 @@ const ObservabilityLogSourceSchema = z
 		const range =
 			source.defaults?.maximumRangeHours ??
 			LOG_SOURCE_BUDGET_DEFAULTS.maximumRangeHours;
-		// The wire schema refuses this too, but there it surfaces as a router that
-		// starts cleanly and then 500s the one authenticated operator route for as
-		// long as it runs. Caught here it is a startup error naming the field.
+		// The wire schema refuses this too — `FleetOperations.validateConfig` runs
+		// in its constructor, so either way the router refuses to start rather than
+		// serving a route that 500s. What is gained by checking here is the
+		// MESSAGE: the wire schema can only name `budgets.defaultLookbackSeconds`,
+		// a field this operator did not write, in units they did not use.
 		if (lookback > range * 60) {
 			ctx.addIssue({
 				code: "custom",

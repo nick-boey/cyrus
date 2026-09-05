@@ -467,7 +467,11 @@ describe("RouterServer fleet-operations routes", () => {
 		}
 	});
 
-	it("keeps every KQL-shaped parameter off the routes it does serve", async () => {
+	it("has no `query` parameter on the routes it does serve, KQL-shaped or not", async () => {
+		// This is the allowlist in `rejectUnknownParameters` doing its ordinary
+		// job, not a KQL-specific defence — there is no KQL detection anywhere and
+		// there should not be. What it pins is that `query` is not a parameter any
+		// route understands, so a later route cannot quietly acquire one.
 		server = makeLogSourceServer();
 		await server.start();
 		const created = server.store.createOperatorToken({
@@ -487,6 +491,40 @@ describe("RouterServer fleet-operations routes", () => {
 		// with a superset of what was asked for.
 		expect(res.status).toBe(400);
 		expect((await res.json()).error).toBe("invalid_query");
+	});
+
+	it.each([
+		[
+			"reports a configured log source at startup",
+			{ logSource: LOG_SOURCE },
+			`kind ${LOG_SOURCE.kind}, workspace ${LOG_SOURCE.azure.workspaceId}`,
+		],
+		["reports an absent one just as plainly", {}, "not configured"],
+	])("%s", async (_label, fleetOperations, expected) => {
+		// Omitting `observability.logSource` and MISSPELLING its key are otherwise
+		// indistinguishable from outside — both start clean, advertise no
+		// `logs.query`, and disclose nothing — and the config schema strips an
+		// unknown top-level key in silence. Without a line either way, an operator
+		// debugging "my descriptor never arrives" has no evidence to go on.
+		const logger = testLogger();
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			fleetOperations,
+			logger,
+		});
+
+		expect(
+			logger.info.mock.calls.some(
+				(call: unknown[]) =>
+					typeof call[0] === "string" &&
+					call[0].includes("log source") &&
+					call[0].includes(expected),
+			),
+		).toBe(true);
 	});
 });
 

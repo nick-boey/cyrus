@@ -93,6 +93,65 @@ describe("LogSourceDescriptorV1", () => {
 		});
 	});
 
+	// Format-checked in the CONTRACT rather than in whichever config schema
+	// produced the descriptor. A router accepts this shape from a hand-written
+	// `router-config.json` and from the whole-block
+	// `CYRUS_ROUTER_FLEET_OPERATIONS_JSON` that `main.bicep` and the Docker
+	// entrypoint render, so a rule enforced on one of those is a rule the others
+	// document but do not have.
+	it.each([
+		["not a GUID", "cyrus-prod-logs"],
+		[
+			"a GUID with surrounding whitespace",
+			" 3c9f2a10-5b6c-4d7e-8f90-a1b2c3d4e5f6 ",
+		],
+		["braced", "{3c9f2a10-5b6c-4d7e-8f90-a1b2c3d4e5f6}"],
+		["empty", ""],
+	])("rejects a workspace ID that is %s", (_label, workspaceId) => {
+		expect(
+			logSourceDescriptorV1Schema.safeParse({
+				...azureLogSourceDescriptor,
+				azure: { ...azureLogSourceDescriptor.azure, workspaceId },
+			}).success,
+		).toBe(false);
+	});
+
+	it.each([
+		["a URL", "https://attacker.example/logs"],
+		["a bare hostname", "attacker.example"],
+		[
+			"another resource provider",
+			"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-cyrus-dev/providers/Microsoft.Storage/storageAccounts/exfil",
+		],
+		["a relative path", "../../attacker"],
+		[
+			"carrying a query string",
+			"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-cyrus-dev/providers/Microsoft.OperationalInsights/workspaces/log-cyrus-dev?x=1",
+		],
+		[
+			"carrying a fragment",
+			"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-cyrus-dev/providers/Microsoft.OperationalInsights/workspaces/log-cyrus-dev#f",
+		],
+		[
+			// `$` matches before a trailing newline, so this is what the
+			// `(?![\s\S])` terminator exists for: a value that would carry a header
+			// break into whatever URL or header a client builds from it.
+			"carrying a CRLF",
+			"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-cyrus-dev/providers/Microsoft.OperationalInsights/workspaces/log-cyrus-dev\r\nX-Evil: 1",
+		],
+		[
+			"traversing out of its subscription",
+			"/subscriptions/../resourceGroups/../providers/Microsoft.OperationalInsights/workspaces/w",
+		],
+	])("rejects a resource ID that is %s", (_label, resourceId) => {
+		expect(
+			logSourceDescriptorV1Schema.safeParse({
+				...azureLogSourceDescriptor,
+				azure: { ...azureLogSourceDescriptor.azure, resourceId },
+			}).success,
+		).toBe(false);
+	});
+
 	it("rejects a default lookback wider than the maximum range", () => {
 		expect(
 			logSourceDescriptorV1Schema.safeParse({

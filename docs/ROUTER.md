@@ -1658,20 +1658,25 @@ An Azure deployment does not need this block. `main.bicep` renders the already
 normalized v1 descriptor into `CYRUS_ROUTER_FLEET_OPERATIONS_JSON`, from the
 workspace it created — see
 [`infra/azure/bicep/README.md`](../infra/azure/bicep/README.md). That rendered
-form is still accepted verbatim as `fleetOperations.logSource`; declaring the log
-source under both keys is refused, so there is no silent precedence between them.
+form is still accepted verbatim as `fleetOperations.logSource`, and gets the same
+identifier checks — the GUID and ARM-path rules live in the wire contract, so
+they hold whichever key the source arrives under. Declaring the log source under
+both keys is refused, so there is no silent precedence between them.
 
 **A different backend later.** `kind` selects the adapter, and the run and
 recovery APIs do not mention log sources at all — so a second backend is a new
-`kind` plus its own locator, with nothing else on the wire moving. The
-descriptor's non-Azure shape carries budgets and no `azure` block:
+`kind` plus its own locator, with nothing else on the wire moving. A non-Azure
+descriptor carries budgets, its own locator block, and no `azure`:
 
-```json
+```jsonc
+// Illustrative — Azure Log Analytics is the only backend with an adapter today.
+// The one other kind the schema accepts, "fake", exists for tests: configuring
+// it makes the router advertise a log capability that no client can query.
 {
   "fleetOperations": {
     "logSource": {
       "schemaVersion": 1,
-      "kind": "fake",
+      "kind": "<a-future-backend>",
       "budgets": {
         "defaultLookbackSeconds": 900,
         "maxRangeSeconds": 86400,

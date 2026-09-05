@@ -20,6 +20,38 @@ export const logLevelV1Schema = z.enum(["debug", "info", "warn", "error"]);
 export type LogLevelV1 = z.infer<typeof logLevelV1Schema>;
 
 /**
+ * A Log Analytics workspace customer ID: the GUID a query is addressed to.
+ *
+ * Pinned to a GUID rather than left an opaque identifier because anything else
+ * is a typo that only fails later, against Azure, as a `404` the operator reads
+ * as a permissions problem.
+ */
+export const azureWorkspaceIdV1Schema = z
+	.string()
+	.regex(
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+		"Must be a Log Analytics workspace customer ID (a GUID)",
+	);
+
+/**
+ * The ARM resource id of a Log Analytics workspace.
+ *
+ * `resourceId` is the only free-form field on the descriptor, so it is the only
+ * place a URL could hide — and a client that took one for an endpoint would then
+ * authenticate to whatever it named. Pinned to an Operational Insights workspace
+ * path, over ARM's own name charset, so it can only ever denote the workspace
+ * beside it. The terminating `(?![\s\S])` rather than `$` is load-bearing: `$`
+ * also matches before a trailing newline, which would admit a value carrying a
+ * CRLF into whatever header or URL a future client builds from it.
+ */
+export const azureWorkspaceResourceIdV1Schema = z
+	.string()
+	.regex(
+		/^\/subscriptions\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/resourceGroups\/[A-Za-z0-9._()-]{1,90}\/providers\/Microsoft\.OperationalInsights\/workspaces\/[A-Za-z0-9-]{4,63}(?![\s\S])/i,
+		"Must be the ARM resource id of a Microsoft.OperationalInsights workspace",
+	);
+
+/**
  * Where the Azure Log Analytics data lives. `workspaceId` is the workspace
  * customer ID a query is addressed to — an identifier, not a credential.
  *
@@ -27,14 +59,21 @@ export type LogLevelV1 = z.infer<typeof logLevelV1Schema>;
  * dataset holding structured router logs and relayed worker logs even when
  * OTLP export is off. Pinning it also keeps the descriptor from becoming a
  * place to name an arbitrary table.
+ *
+ * The two identifiers are format-checked HERE, in the wire contract, rather than
+ * in whichever config schema happens to produce a descriptor. A router accepts
+ * this shape from several places — a hand-written `router-config.json`, the
+ * whole-block `CYRUS_ROUTER_FLEET_OPERATIONS_JSON` that `main.bicep` and the
+ * Docker entrypoint render — and a rule enforced on one of them is a rule the
+ * others document but do not have.
  */
 export const azureLogAnalyticsDescriptorV1Schema = z.strictObject({
-	workspaceId: identifierV1Schema,
+	workspaceId: azureWorkspaceIdV1Schema,
 	table: z.literal("ContainerAppConsoleLogs_CL"),
 	cloud: z
 		.enum(["AzurePublicCloud", "AzureUSGovernment", "AzureChinaCloud"])
 		.optional(),
-	resourceId: z.string().min(1).optional(),
+	resourceId: azureWorkspaceResourceIdV1Schema.optional(),
 });
 export type AzureLogAnalyticsDescriptorV1 = z.infer<
 	typeof azureLogAnalyticsDescriptorV1Schema
