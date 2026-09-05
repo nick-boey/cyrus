@@ -58,8 +58,12 @@ The three subcommands have deliberately different success semantics:
 | `cyrus runs wait <runId>` | Has this one run finished, or does it need input? | The run reaches a terminal or waiting state, or `--timeout` elapses |
 
 ```bash
-# Every run in the one authorized workspace. Succeeds whatever states it reports.
+# Every agent session in the one authorized workspace, as one row each.
+# Succeeds whatever states it reports.
 cyrus runs list
+
+# Every TURN instead, including the runs already finished under a session.
+cyrus runs list --all-runs
 
 # Narrow it. Names must match exactly; an ambiguous one is refused with candidates.
 cyrus runs list --team Platform --state waiting
@@ -74,6 +78,20 @@ cyrus runs wait 019bd6f2-1d1e-7a8e-9f4c-0b7c2a5e91d3 --timeout 900 --json
 # Pick the connection and workspace explicitly when more than one is available.
 cyrus runs list --connection prod --workspace ws-1
 ```
+
+### One row per session, not per turn
+
+A Linear agent session spans turns, and the router opens a new run each time one
+is routed into a session whose previous run has finished — so Stop followed by
+Continue leaves a `stopped` run and an `active` one under the same session.
+`list` shows the CURRENT run of each session, because "what is the fleet doing"
+has one answer per session and a spent turn rendered beside a live one reads as
+two agents on one issue. `--all-runs` turns the collapsing off.
+
+The runs themselves stay per-turn on the router. A run's team and project are
+the ones it was routed under, and carrying them across a stop would rewrite the
+history of work that already happened. `watch` is unaffected: its change events
+are per run, and a new run beginning under an existing session is a real event.
 
 ### Filters
 

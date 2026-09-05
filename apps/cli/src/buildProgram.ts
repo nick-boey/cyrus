@@ -936,12 +936,18 @@ function registerRunsCommand(
 			runsCommand
 				.command("list")
 				.description(
-					"Print every current run observation for one authorized workspace. Succeeds whatever states it reports.",
+					"Print the current run of every agent session in one authorized workspace. Succeeds whatever states it reports.",
 				),
-		).option("--json", "Emit one JSON document instead of a table"),
+		)
+			.option(
+				"--all-runs",
+				"Show every turn's run instead of each session's current one",
+			)
+			.option("--json", "Emit one JSON document instead of a table"),
 	).action(
 		async (
 			cmdOpts: RunFilterOptionValues & {
+				allRuns?: boolean;
 				json?: boolean;
 				connection?: string;
 				workspace?: string;
@@ -951,6 +957,7 @@ function registerRunsCommand(
 				[
 					"list",
 					...runFilterArgs(cmdOpts),
+					...(cmdOpts.allRuns ? ["--all-runs"] : []),
 					...(cmdOpts.json ? ["--json"] : []),
 				],
 				{ connection: cmdOpts.connection, workspace: cmdOpts.workspace },

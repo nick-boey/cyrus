@@ -191,8 +191,9 @@ export class RunsCommand extends BaseCommand {
 	): Promise<void> {
 		const { filters, rest } = parseRunFilters(argv);
 		const options = parseCommandOptions(rest, {
-			usage: "cyrus runs list [filters] [--json]",
+			usage: "cyrus runs list [filters] [--all-runs] [--json]",
 			allowTimeout: false,
+			allowAllRuns: true,
 			positionals: 0,
 		});
 		const { client, workspace } = await this.connect(
@@ -206,6 +207,7 @@ export class RunsCommand extends BaseCommand {
 			client,
 			filters,
 			workspace,
+			options.allRuns,
 		);
 		if (options.json) {
 			this.out.data(
@@ -597,10 +599,25 @@ export class RunsCommand extends BaseCommand {
 	 * parameter, so stopping early would return a page that had been narrowed
 	 * after the router already decided what fits on it.
 	 */
+	/**
+	 * Every run matching the filters, collapsed to the CURRENT run of each agent
+	 * session unless `allRuns` is set.
+	 *
+	 * A Linear agent session spans turns, and the router opens a new run row per
+	 * turn: `recordAgentRunRouted` folds an input into the latest run only while
+	 * that run is non-terminal, so Stop followed by Continue leaves a `stopped`
+	 * run and an `active` one for the SAME `agentSessionId`. That is the right
+	 * shape to STORE — a run's routing snapshot is the context it was routed
+	 * under, and rewriting it across a stop would falsify history — but it is the
+	 * wrong shape to READ. "What is the fleet doing right now?" has one answer per
+	 * session, and rendering the spent turn beside the live one reads as two
+	 * concurrent sessions on one issue, which is the state an operator escalates.
+	 */
 	private async fetchAllRuns(
 		client: OperatorHttpClient,
 		filters: RunFilters,
 		workspace: AuthorizedWorkspaceV1,
+		allRuns = false,
 	): Promise<{ runs: RunObservationV1[]; observedAt: string }> {
 		const query = toRunsQuery(filters, workspace.workspaceId);
 		const runs: RunObservationV1[] = [];
@@ -626,7 +643,7 @@ export class RunsCommand extends BaseCommand {
 			cursor = page.nextCursor;
 		}
 		return {
-			runs,
+			runs: allRuns ? runs : currentRunPerSession(runs),
 			observedAt: observedAt ?? new Date(this.now()).toISOString(),
 		};
 	}
@@ -712,6 +729,8 @@ function observedWaitOutcome(run: RunObservationV1): WaitOutcome | undefined {
 
 interface CommandOptions {
 	json: boolean;
+	/** `--all-runs`: every turn's run, not just each session's current one. */
+	allRuns: boolean;
 	timeoutMs?: number;
 	connection?: string;
 	positional: string[];
@@ -731,13 +750,32 @@ interface CommandOptions {
  */
 function parseCommandOptions(
 	argv: readonly string[],
-	spec: { usage: string; allowTimeout?: boolean; positionals: number },
+	spec: {
+		usage: string;
+		allowTimeout?: boolean;
+		allowAllRuns?: boolean;
+		positionals: number;
+	},
 ): CommandOptions {
-	const options: CommandOptions = { json: false, positional: [] };
+	const options: CommandOptions = {
+		json: false,
+		allRuns: false,
+		positional: [],
+	};
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i] as string;
 		if (arg === "--json") {
 			options.json = true;
+		} else if (arg === "--all-runs") {
+			// Refused rather than ignored where it cannot apply, for the same
+			// reason an unknown option is: a flag that parses and does nothing
+			// reads as an answered question.
+			if (spec.allowAllRuns !== true) {
+				throw new UsageError(
+					`--all-runs does not apply here. Usage: ${spec.usage}`,
+				);
+			}
+			options.allRuns = true;
 		} else if (arg === "--timeout") {
 			if (spec.allowTimeout === false) {
 				throw new UsageError(
@@ -761,6 +799,32 @@ function parseCommandOptions(
 		);
 	}
 	return options;
+}
+
+/**
+ * One observation per `agentSessionId` — the run with the latest `startedAt`.
+ *
+ * Keyed on the session rather than the run because that is the entity a person
+ * recognises: one Linear agent session, one row, whatever number of turns the
+ * router opened underneath it.
+ *
+ * The router already orders runs `started_ms DESC`, so first-seen would almost
+ * always be right; comparing `startedAt` explicitly costs one line and keeps
+ * this correct if that ordering ever changes, rather than silently rendering a
+ * spent turn as the session's current state. Insertion order is preserved, so
+ * the collapsed table keeps the router's ordering.
+ */
+function currentRunPerSession(
+	runs: readonly RunObservationV1[],
+): RunObservationV1[] {
+	const current = new Map<string, RunObservationV1>();
+	for (const run of runs) {
+		const held = current.get(run.agentSessionId);
+		if (!held || run.startedAt > held.startedAt) {
+			current.set(run.agentSessionId, run);
+		}
+	}
+	return [...current.values()];
 }
 
 function parseTimeoutSeconds(raw: string | undefined): number {

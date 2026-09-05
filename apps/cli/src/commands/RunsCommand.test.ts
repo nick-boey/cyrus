@@ -210,10 +210,21 @@ describe("cyrus runs list", () => {
 
 	it("fetches every page and exits 0 whatever the runs report", async () => {
 		const pages = [
-			page([observation({ runId: "run-1" })], "v1.runs.cGFnZS0y"),
+			page(
+				[observation({ runId: "run-1", agentSessionId: "session-1" })],
+				"v1.runs.cGFnZS0y",
+			),
 			page([
-				observation({ runId: "run-2", lifecycle: "error" }),
-				observation({ runId: "run-3", lifecycle: "unknown" }),
+				observation({
+					runId: "run-2",
+					agentSessionId: "session-2",
+					lifecycle: "error",
+				}),
+				observation({
+					runId: "run-3",
+					agentSessionId: "session-3",
+					lifecycle: "unknown",
+				}),
 			]),
 		];
 		const { fetchFn, calls } = router({
@@ -450,6 +461,118 @@ describe("cyrus runs list", () => {
 		expect(await exitCodeOf(cmd, ["list"])).toBe(ExitCode.usage);
 		expect(out.diagnostics.join("\n")).toContain("runs.list");
 		expect(calls.some((url) => url.pathname === RUNS_PATH)).toBe(false);
+	});
+
+	it("shows one row per agent session, not one per turn", async () => {
+		// Stop then Continue in Linear: the router terminates the run and opens a
+		// new one under the SAME agent session, because a run's routing snapshot
+		// is the context it was routed under and must not be rewritten across a
+		// stop. Rendered raw, that reads as two concurrent sessions on one issue.
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[RUNS_PATH]: () =>
+				json(
+					page([
+						observation({
+							runId: "turn-2",
+							agentSessionId: "session-1",
+							lifecycle: "active",
+							startedAt: "2026-09-02T00:05:00.000Z",
+						}),
+						observation({
+							runId: "turn-1",
+							agentSessionId: "session-1",
+							lifecycle: "stopped",
+							startedAt: "2026-09-02T00:00:00.000Z",
+							endedAt: "2026-09-02T00:04:00.000Z",
+						}),
+					]),
+				),
+		});
+		const { cmd, out } = command(fetchFn);
+
+		expect(await exitCodeOf(cmd, ["list", "--json"])).toBe(ExitCode.success);
+		const document = JSON.parse(out.data_.join("\n"));
+		expect(document.runs.map((run: RunObservationV1) => run.runId)).toEqual([
+			"turn-2",
+		]);
+	});
+
+	it("keeps the session's CURRENT turn whatever order the router returns", async () => {
+		// The router orders `started_ms DESC`, so the live turn normally arrives
+		// first and first-seen would be enough. Reversed here on purpose: picking
+		// by position would render the spent turn as the session's state.
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[RUNS_PATH]: () =>
+				json(
+					page([
+						observation({
+							runId: "turn-1",
+							agentSessionId: "session-1",
+							lifecycle: "stopped",
+							startedAt: "2026-09-02T00:00:00.000Z",
+							endedAt: "2026-09-02T00:04:00.000Z",
+						}),
+						observation({
+							runId: "turn-2",
+							agentSessionId: "session-1",
+							lifecycle: "active",
+							startedAt: "2026-09-02T00:05:00.000Z",
+						}),
+					]),
+				),
+		});
+		const { cmd, out } = command(fetchFn);
+
+		expect(await exitCodeOf(cmd, ["list", "--json"])).toBe(ExitCode.success);
+		const document = JSON.parse(out.data_.join("\n"));
+		expect(document.runs.map((run: RunObservationV1) => run.runId)).toEqual([
+			"turn-2",
+		]);
+	});
+
+	it("collapses per session, and --all-runs opts back out", async () => {
+		const pages = () =>
+			page([
+				observation({
+					runId: "turn-2",
+					agentSessionId: "session-1",
+					lifecycle: "active",
+					startedAt: "2026-09-02T00:05:00.000Z",
+				}),
+				observation({
+					runId: "turn-1",
+					agentSessionId: "session-1",
+					lifecycle: "stopped",
+					startedAt: "2026-09-02T00:00:00.000Z",
+					endedAt: "2026-09-02T00:04:00.000Z",
+				}),
+			]);
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[RUNS_PATH]: () => json(pages()),
+		});
+		const { cmd, out } = command(fetchFn);
+
+		expect(await exitCodeOf(cmd, ["list", "--all-runs", "--json"])).toBe(
+			ExitCode.success,
+		);
+		const document = JSON.parse(out.data_.join("\n"));
+		expect(document.runs.map((run: RunObservationV1) => run.runId)).toEqual([
+			"turn-2",
+			"turn-1",
+		]);
+	});
+
+	it("refuses --all-runs where it cannot apply rather than ignoring it", async () => {
+		const { fetchFn } = router({ [CONTEXT_PATH]: () => json(context()) });
+		const { cmd, out } = command(fetchFn);
+
+		expect(await exitCodeOf(cmd, ["wait", "run-1", "--all-runs"])).toBe(
+			ExitCode.usage,
+		);
+		expect(out.diagnostics.join("\n")).toContain("--all-runs");
 	});
 
 	it("rejects an unknown option rather than ignoring it", async () => {
@@ -1182,9 +1305,14 @@ describe("cyrus runs — the deprecated pre-CYR-70 syntax", () => {
 						observation({
 							runId: "done",
 							lifecycle: "complete",
+							startedAt: "2026-09-02T00:00:00.000Z",
 							endedAt: "2026-09-02T00:00:05.000Z",
 						}),
-						observation({ runId: "live", lifecycle: "active" }),
+						observation({
+							runId: "live",
+							lifecycle: "active",
+							startedAt: "2026-09-02T00:00:06.000Z",
+						}),
 					]),
 				),
 			[CHANGES_PATH]: (url) =>
@@ -1228,8 +1356,16 @@ describe("cyrus runs — the deprecated pre-CYR-70 syntax", () => {
 			[RUNS_PATH]: () =>
 				json(
 					page([
-						observation({ runId: "run-a", lifecycle: "active" }),
-						observation({ runId: "run-b", lifecycle: "routed" }),
+						observation({
+							runId: "run-a",
+							agentSessionId: "session-a",
+							lifecycle: "active",
+						}),
+						observation({
+							runId: "run-b",
+							agentSessionId: "session-b",
+							lifecycle: "routed",
+						}),
 					]),
 				),
 		});

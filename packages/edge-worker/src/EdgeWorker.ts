@@ -616,6 +616,36 @@ export class EdgeWorker extends EventEmitter {
 					error,
 				);
 			}
+			// A runner has just been attached, which is the FIRST instant the
+			// session can say which runner it is — and, before this, the only
+			// instants that ever said so were a wait, a deferred turn, and the
+			// terminal frame. An ordinary run reached none of them until it was
+			// over, so `runner` stayed NULL for its whole life and the fleet view
+			// rendered every in-flight run as `unknown`: the one column an operator
+			// reads to answer "what is running on this?" was blank exactly while
+			// the answer mattered.
+			//
+			// Fire-and-forget, like the pending-work report and for the same
+			// reason: it carries no ownership transition, so a lost frame costs one
+			// observation, and making it durable would make it REPLAYABLE — a
+			// replayed `active` against a router that has since recorded a park
+			// mints affinity back.
+			//
+			// The model is deliberately absent here when the runner's init message
+			// has not landed yet. `getRunFacts` omits rather than guesses, and the
+			// router merges only the keys a frame actually carries, so the model
+			// fills in on the next frame instead of being written as a placeholder.
+			try {
+				this.routerConnection?.sendRunFacts(
+					sessionId,
+					this.agentSessionManager.getRunFacts(sessionId),
+				);
+			} catch (error) {
+				this.logger.error(
+					`Failed to report run facts for session ${sessionId}`,
+					error,
+				);
+			}
 		});
 
 		// Router mode: a session blocked on a user answer reports that its RUN is
