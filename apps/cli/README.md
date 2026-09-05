@@ -77,8 +77,15 @@ cyrus runs list --connection prod --workspace ws-1
 
 ### Filters
 
-`--run`, `--session`, `--issue`, `--state`, `--runner`, `--model`, `--comment`,
-`--routed-after`, plus `--owner`, `--team`, and `--project`.
+`list` and `watch` share one filter vocabulary: `--run`, `--session`, `--issue`,
+`--state`, `--runner`, `--model`, `--comment`, `--routed-after`, plus `--owner`,
+`--team`, and `--project`.
+
+`wait` takes a run id and nothing else (beyond `--connection`/`--workspace`). A
+run id is already the narrowest selector, and a filter over a fact that moves
+would be actively harmful: `--state active` would make the run invisible the
+moment it completed, turning the outcome the command exists to report into "no
+such run".
 
 `--workspace`, `--owner`, `--team`, and `--project` accept a canonical id **or**
 the display name captured when the run was routed. A name matching more than one
@@ -124,8 +131,13 @@ looking.
 `cyrus runs [issue] [--watch]` still parses for one more release and prints a
 deprecation notice on **stderr**. Without `--watch` it runs `list`; with
 `--watch` it resolves the single non-terminal matching run and waits on it,
-exiting `2` with the candidate run ids if more than one matches. Migrate to
-`cyrus runs list` and `cyrus runs wait <runId>`.
+exiting `2` with the candidate run ids if more than one matches. `--after` maps
+to `--routed-after`. Migrate to `cyrus runs list` and `cyrus runs wait <runId>`.
+
+**Its exit codes changed.** The old `--watch` exited `1` for any non-`complete`
+outcome and for a timeout. It now uses the table above — `3` for a non-success
+outcome, `4` for a timeout, `2` for an ambiguous match — so a script testing
+`[ $? -eq 1 ]` will no longer fire.
 
 ## Configuration
 

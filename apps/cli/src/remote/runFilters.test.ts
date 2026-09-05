@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { UsageError } from "./errors.js";
 import {
 	describeRunFilters,
+	matchesChangeRunFilters,
 	matchesLocalRunFilters,
 	parseRunFilters,
 	RUN_FILTER_FLAGS,
@@ -268,6 +269,88 @@ describe("matchesLocalRunFilters", () => {
 		// `state` went to the router; re-applying it here would double-filter a
 		// value the router may have resolved differently (e.g. a captured name).
 		expect(matchesLocalRunFilters(observation(), filters)).toBe(true);
+	});
+});
+
+describe("matchesChangeRunFilters", () => {
+	// `GET /api/v1/run-changes` takes only `cursor` and `from`, so on the change
+	// feed there is no router to have applied anything. Reusing the listing's
+	// predicate there emits a SUPERSET: a watch scoped to one state delivers
+	// every change for every run, contradicting its own opening snapshot.
+	it.each([
+		["--run", "run-9"],
+		["--session", "session-9"],
+		["--issue", "NOR-999"],
+		["--state", "complete"],
+		["--runner", "codex"],
+		["--model", "gpt-5.5"],
+		["--owner", "Grace"],
+		["--team", "Infra"],
+		["--project", "Router"],
+	])("rejects a change that does not match %s", (flag, value) => {
+		const { filters } = parseRunFilters([flag, value]);
+
+		expect(matchesChangeRunFilters(observation(), filters)).toBe(false);
+		// The listing predicate deliberately ignores it — which is right there,
+		// and is exactly why the two must not be the same function.
+		expect(matchesLocalRunFilters(observation(), filters)).toBe(true);
+	});
+
+	it.each([
+		["--run", "run-1"],
+		["--session", "session-1"],
+		["--issue", "NOR-402"],
+		["--issue", "issue-uuid-1"],
+		["--state", "active"],
+		["--runner", "claude"],
+		["--model", "claude-opus-5"],
+	])("keeps a change that matches %s", (flag, value) => {
+		const { filters } = parseRunFilters([flag, value]);
+
+		expect(matchesChangeRunFilters(observation(), filters)).toBe(true);
+	});
+
+	it.each([
+		["--owner", "user-1", "Ada"],
+		["--team", "team-1", "Platform"],
+		["--project", "project-1", "Fleet"],
+	])(
+		"accepts either the canonical id or the captured name for %s",
+		(flag, id, name) => {
+			// On the listing route the ROUTER resolves one to the other; here
+			// nothing does, so the operator's raw text may legitimately be either.
+			expect(
+				matchesChangeRunFilters(
+					observation(),
+					parseRunFilters([flag, id]).filters,
+				),
+			).toBe(true);
+			expect(
+				matchesChangeRunFilters(
+					observation(),
+					parseRunFilters([flag, name]).filters,
+				),
+			).toBe(true);
+		},
+	);
+
+	it("still applies the two filters the listing route also lacks", () => {
+		expect(
+			matchesChangeRunFilters(
+				observation(),
+				parseRunFilters(["--comment", "comment-9"]).filters,
+			),
+		).toBe(false);
+		expect(
+			matchesChangeRunFilters(
+				observation(),
+				parseRunFilters(["--routed-after", "2026-09-03T00:00:00.000Z"]).filters,
+			),
+		).toBe(false);
+	});
+
+	it("keeps every change when nothing was filtered", () => {
+		expect(matchesChangeRunFilters(observation(), {})).toBe(true);
 	});
 });
 

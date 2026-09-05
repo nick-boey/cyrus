@@ -1493,12 +1493,17 @@ cyrus runs watch --timeout 600 --json             # follow the fleet as NDJSON
 cyrus runs wait <runId> --timeout 900             # block on one run
 ```
 
-Filters are `--run`, `--session`, `--issue`, `--state`, `--runner`, `--model`,
-`--comment`, `--routed-after`, `--owner`, `--team`, and `--project`; the last
-three plus `--workspace` accept a canonical id or the name captured when the run
-was routed, and an ambiguous name is refused with its candidate ids rather than
-resolved. `--connection <name>` and `--workspace <id>` are optional when there is
-exactly one and required when there is more than one.
+`list` and `watch` share one filter vocabulary: `--run`, `--session`, `--issue`,
+`--state`, `--runner`, `--model`, `--comment`, `--routed-after`, `--owner`,
+`--team`, and `--project`. The last three plus `--workspace` accept a canonical
+id or the name captured when the run was routed; on `list` the router resolves
+these and refuses an ambiguous name with its candidate ids, while on the change
+feed — which takes no filters at all — the CLI matches either side itself.
+`wait` deliberately accepts no filters beyond `--connection`/`--workspace`: a
+run id is already the narrowest selector, and `--state active` would make the
+run invisible the instant it completed. `--connection <name>` and
+`--workspace <id>` are optional when there is exactly one and required when
+there is more than one.
 
 The three commands have three different success semantics, and their exit codes
 say which:
@@ -1523,7 +1528,10 @@ The pre-CYR-70 syntax — `cyrus runs [issue] [--comment <id>] [--after <time>]
 [--watch] [--timeout <seconds>] [--json]` — still parses for one release and
 prints a deprecation notice on stderr. Without `--watch` it runs `list`; with
 `--watch` it resolves the single non-terminal matching run and waits on it,
-exiting `2` with the candidate run ids when more than one matches.
+exiting `2` with the candidate run ids when more than one matches. Its exit
+codes changed with it: the old `--watch` returned `1` for any non-`complete`
+outcome and for a timeout, and now returns `3`, `4`, or `2` per the table above,
+so a script testing for `1` will no longer fire.
 
 The router records a stable run ID, issue and agent-session IDs, routed input
 references, lifecycle timestamps, the latest successfully published Linear

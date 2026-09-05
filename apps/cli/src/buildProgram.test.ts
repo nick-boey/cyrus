@@ -754,6 +754,38 @@ describe("buildProgram — Commander wiring for `runs`", () => {
 			workspace: undefined,
 		});
 	});
+
+	it("reserves no name an operator could otherwise have typed", async () => {
+		// The shim is a hidden default subcommand, so its NAME is reachable. That
+		// is the accepted cost of not hanging it off the parent, which would let
+		// Commander's parent-wins option resolution swallow `--comment`/`--json`
+		// from `list` and `watch`. The name is therefore one no Linear issue
+		// identifier can look like.
+		const names = newProgram()
+			.commands.find((command) => command.name() === "runs")
+			?.commands.map((command) => command.name())
+			.sort();
+
+		expect(names).toEqual(["__deprecated__", "list", "wait", "watch"]);
+		// An issue-shaped word still reaches the shim as an issue.
+		await run(["runs", "legacy"]);
+		expect(runsExecute).toHaveBeenCalledWith(["legacy"], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("keeps subcommand options out of the parent's hands", async () => {
+		// Regression guard for the alternative shim wiring: with the deprecated
+		// form on the PARENT command, Commander resolves the `--comment`/`--json`
+		// collision in the parent's favour and `list` receives neither.
+		await run(["runs", "list", "--comment", "comment-1", "--json"]);
+
+		expect(runsExecute).toHaveBeenCalledWith(
+			["list", "--comment", "comment-1", "--json"],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
 });
 
 describe("buildProgram — Commander wiring for `connection`", () => {

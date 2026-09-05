@@ -29,19 +29,35 @@ export interface OutputStreams {
 	data(line: string): void;
 	/** stderr. Everything a human reads and a parser must not. */
 	diagnostic(line: string): void;
+	/**
+	 * Resolves once every line written so far has reached the OS.
+	 *
+	 * Must be awaited before `process.exit`, which does NOT drain pending
+	 * writes. `process.stdout` is asynchronous when it is a pipe on macOS, so
+	 * without this a command that prints its document and then exits non-zero —
+	 * exactly what `runs wait` does for every outcome but `complete` — truncates
+	 * or loses the document on the one path a caller most needs it.
+	 */
+	flush(): Promise<void>;
 }
 
 export function createOutputStreams(
 	stdout: NodeJS.WritableStream = process.stdout,
 	stderr: NodeJS.WritableStream = process.stderr,
 ): OutputStreams {
+	// Chained rather than counted so `flush` awaits the LAST write on each
+	// stream, and so an error on one write cannot leave the chain unresolved.
+	let pending: Promise<void> = Promise.resolve();
+	const write = (stream: NodeJS.WritableStream, line: string): void => {
+		const written = new Promise<void>((resolve) => {
+			stream.write(`${line}\n`, () => resolve());
+		});
+		pending = pending.then(() => written).catch(() => undefined);
+	};
 	return {
-		data: (line) => {
-			stdout.write(`${line}\n`);
-		},
-		diagnostic: (line) => {
-			stderr.write(`${line}\n`);
-		},
+		data: (line) => write(stdout, line),
+		diagnostic: (line) => write(stderr, line),
+		flush: () => pending,
 	};
 }
 
@@ -64,6 +80,7 @@ export function createRecordingOutput(): RecordingOutput {
 		diagnostic: (line) => {
 			diagnostics.push(line);
 		},
+		flush: async () => {},
 	};
 }
 

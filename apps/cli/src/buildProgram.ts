@@ -1025,13 +1025,25 @@ function registerRunsCommand(
 		},
 	);
 
-	// The deprecated pre-CYR-70 form. Registered as the DEFAULT subcommand so an
-	// existing `cyrus runs NOR-402 --watch` still parses and receives an
-	// actionable deprecation notice on stderr, rather than failing outright on
-	// upgrade. Hidden from help, which advertises only the new vocabulary.
+	// The deprecated pre-CYR-70 form, as a hidden DEFAULT subcommand: Commander
+	// dispatches one only when no named subcommand matches, so `cyrus runs list`
+	// reaches `list` while `cyrus runs NOR-402 --watch` and a bare `cyrus runs`
+	// reach the shim — parsing, with an actionable notice on stderr, instead of
+	// failing outright on upgrade.
+	//
+	// Hanging it off the PARENT command instead (`runsCommand.argument("[issue]")`
+	// plus an action) reads better and would reserve no name, but it is the exact
+	// collision `addFleetSelectionOptions` documents: the shim needs `--comment`
+	// and `--json`, `list` and `watch` declare the same two, and Commander
+	// resolves a parent/child option collision in the PARENT's favour — so
+	// `cyrus runs list --comment c1 --json` silently hands `list` an empty option
+	// set. `enablePositionalOptions()` does not change that. The cost of the
+	// default-subcommand form is one hidden, reachable `cyrus runs __deprecated__`
+	// — a name chosen because no Linear issue identifier can look like it, so it
+	// reserves nothing an operator could otherwise have typed.
 	addFleetSelectionOptions(
 		runsCommand
-			.command("legacy [issue]", { isDefault: true, hidden: true })
+			.command("__deprecated__ [issue]", { isDefault: true, hidden: true })
 			.description("Deprecated: use `cyrus runs list|watch|wait`")
 			.option("--comment <id>", "Deprecated: use `--comment` on `runs list`")
 			.option("--after <timestamp>", "Deprecated: use `--routed-after`")

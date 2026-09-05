@@ -62,12 +62,57 @@ describe("createOutputStreams", () => {
 			out.data("payload");
 			out.diagnostic("careful");
 
-			expect(stdout).toHaveBeenCalledWith("payload\n");
-			expect(stderr).toHaveBeenCalledWith("careful\n");
+			// The callback is how `flush` learns the write landed.
+			expect(stdout).toHaveBeenCalledWith("payload\n", expect.any(Function));
+			expect(stderr).toHaveBeenCalledWith("careful\n", expect.any(Function));
 		} finally {
 			stdout.mockRestore();
 			stderr.mockRestore();
 		}
+	});
+});
+
+describe("createOutputStreams — flush", () => {
+	it("resolves only once every pending write has been acknowledged", async () => {
+		// `process.exit` does not drain pending writes, and stdout is async when
+		// it is a pipe on macOS. A command that prints its document and then
+		// exits non-zero — which is every `runs wait` outcome but `complete` —
+		// truncates it without this.
+		const callbacks: Array<() => void> = [];
+		const slow = {
+			write: (_chunk: string, cb: () => void) => {
+				callbacks.push(cb);
+				return true;
+			},
+		} as unknown as NodeJS.WritableStream;
+
+		const out = createOutputStreams(slow, slow);
+		out.data("document");
+		let settled = false;
+		const flushed = out.flush().then(() => {
+			settled = true;
+		});
+
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		for (const cb of callbacks) cb();
+		await flushed;
+		expect(settled).toBe(true);
+	});
+
+	it("does not hang when a write reports an error", async () => {
+		const failing = {
+			write: (_chunk: string, cb: (error?: Error) => void) => {
+				cb(new Error("EPIPE"));
+				return true;
+			},
+		} as unknown as NodeJS.WritableStream;
+
+		const out = createOutputStreams(failing, failing);
+		out.data("document");
+
+		await expect(out.flush()).resolves.toBeUndefined();
 	});
 });
 

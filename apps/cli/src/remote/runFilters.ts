@@ -6,23 +6,30 @@ import {
 import { UsageError } from "./errors.js";
 
 /**
- * The one filter vocabulary `runs list`, `runs watch`, and `runs wait` share.
+ * The one filter vocabulary `runs list` and `runs watch` share.
  *
- * Parsing, validation, translation to router query parameters, and the few
- * filters the router cannot apply all live here together because they fail as
- * one thing: a filter that parses but is never sent returns a SUPERSET of what
- * was asked for, and a caller reads that superset as the answer to its narrow
- * question. Keeping the three steps in one module is what makes "every filter is
- * applied somewhere" a property you can read off a single file.
+ * (`runs wait` takes a run id and refuses filters: a run id is already the
+ * narrowest selector, and a filter over a moving fact would make the run vanish
+ * the instant it changed.)
+ *
+ * Parsing, validation, translation to router query parameters, and the filters
+ * each route cannot apply all live here together because they fail as one thing:
+ * a filter that parses but is never applied returns a SUPERSET of what was asked
+ * for, and a caller reads that superset as the answer to its narrow question.
+ * Keeping the steps in one module is what makes "every filter is applied
+ * somewhere" a property you can read off a single file — and the two routes have
+ * DIFFERENT divisions of labour, which is the thing most likely to go wrong
+ * here. See {@link matchesLocalRunFilters} and {@link matchesChangeRunFilters}.
  */
 
 /**
  * The filters as the operator typed them.
  *
  * `workspace`, `owner`, `team`, and `project` accept a canonical id OR the name
- * captured beside it when the run was routed; the router resolves those, and
- * refuses a name matching more than one id rather than picking. The rest are
- * matched literally.
+ * captured beside it when the run was routed. On the listing route the ROUTER
+ * resolves those and refuses a name matching more than one id rather than
+ * picking; on the change feed, which takes no filters, the CLI matches either
+ * side itself. The rest are matched literally.
  */
 export interface RunFilters {
 	workspace?: string;
@@ -166,15 +173,19 @@ function looksLikeIssueIdentifier(value: string): boolean {
 }
 
 /**
- * The filters the router does not implement, applied to one observation.
+ * The filters `GET /api/v1/runs` has no parameter for, applied to one
+ * observation.
  *
  * Only `comment` and `routedAfter` land here, and each because the fleet
- * vocabulary carries a fact `GET /api/v1/runs` has no parameter for: a run's
- * comment provenance lives inside its `inputs` array, and the route offers no
- * time bound at all. Every other filter is applied by the router, and is NOT
+ * vocabulary carries a fact that route cannot express: a run's comment
+ * provenance lives inside its `inputs` array, and the route offers no time bound
+ * at all. Every other filter IS applied by that route, and is deliberately not
  * re-checked here — the router may have resolved a captured name to a canonical
  * id, and re-comparing the operator's raw text against the resolved value would
  * throw away exactly the runs the resolution found.
+ *
+ * This is the RUN LISTING's division of labour and nothing else. The change
+ * feed's is different; see {@link matchesChangeRunFilters}.
  *
  * The cost of applying these two client-side is that they narrow a page AFTER
  * pagination, so `runs list` fetches every page before filtering. That is why
@@ -202,6 +213,83 @@ export function matchesLocalRunFilters(
 		if (!(latest >= threshold)) return false;
 	}
 	return true;
+}
+
+/**
+ * EVERY filter, applied to one observation off the change feed.
+ *
+ * `GET /api/v1/run-changes` takes only `cursor` and `from` — it scopes entries
+ * to the principal's authorized workspaces and owner and applies nothing else.
+ * So on that route there is no router to have applied the rest, and reusing
+ * {@link matchesLocalRunFilters} there emits a SUPERSET: a watch scoped to
+ * `--state waiting` would deliver every lifecycle, connectivity, and
+ * executor-state change for every run in the workspace, while its own opening
+ * snapshot showed only the waiting ones. Two halves of one stream contradicting
+ * each other is worse than either answer alone.
+ *
+ * The nameable dimensions are matched against the canonical id OR the captured
+ * name, because on the listing route the ROUTER resolves one to the other and
+ * here nothing does — so the operator's raw text may legitimately be either.
+ * That is looser than the router's resolution, which refuses an ambiguous name
+ * outright; it cannot be reproduced client-side from a single observation, and
+ * erring toward showing a change is the right way to be wrong on a stream whose
+ * purpose is not missing one.
+ */
+export function matchesChangeRunFilters(
+	observation: RunObservationV1,
+	filters: RunFilters,
+): boolean {
+	if (!matchesLocalRunFilters(observation, filters)) return false;
+	if (filters.run !== undefined && observation.runId !== filters.run) {
+		return false;
+	}
+	if (
+		filters.session !== undefined &&
+		observation.agentSessionId !== filters.session
+	) {
+		return false;
+	}
+	// Either column: `toRunsQuery` decides between them by shape for the router,
+	// and matching both here keeps the two routes answering the same question.
+	if (
+		filters.issue !== undefined &&
+		observation.issueKey !== filters.issue &&
+		observation.issueId !== filters.issue
+	) {
+		return false;
+	}
+	if (filters.state !== undefined && observation.lifecycle !== filters.state) {
+		return false;
+	}
+	if (filters.runner !== undefined && observation.runner !== filters.runner) {
+		return false;
+	}
+	if (filters.model !== undefined && observation.model !== filters.model) {
+		return false;
+	}
+	const routing = observation.routing;
+	return (
+		matchesIdOrName(filters.owner, routing.ownerUserId, routing.ownerName) &&
+		matchesIdOrName(
+			filters.team,
+			routing.linearTeamId,
+			routing.linearTeamName,
+		) &&
+		matchesIdOrName(
+			filters.project,
+			routing.linearProjectId,
+			routing.linearProjectName,
+		)
+	);
+}
+
+function matchesIdOrName(
+	requested: string | undefined,
+	id: string | undefined,
+	name: string | undefined,
+): boolean {
+	if (requested === undefined) return true;
+	return requested === id || requested === name;
 }
 
 /** A one-line rendering of the applied filters, for a diagnostic. */

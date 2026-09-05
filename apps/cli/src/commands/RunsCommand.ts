@@ -38,6 +38,7 @@ import {
 } from "../remote/output.js";
 import {
 	describeRunFilters,
+	matchesChangeRunFilters,
 	matchesLocalRunFilters,
 	parseRunFilters,
 	type RunFilters,
@@ -54,6 +55,15 @@ const DEFAULT_POLL_INTERVAL_MS = 2_000;
  * one, which is why it reports as transient rather than as usage.
  */
 const MAX_LIST_PAGES = 1_000;
+
+/**
+ * How many backlog pages a watch may consume without pausing.
+ *
+ * Bounds the request rate at (this + 1) per poll interval when the feed is
+ * continuously busy, while still letting a watch that fell behind catch up
+ * instead of trickling one page per interval.
+ */
+const MAX_DRAIN_PAGES_PER_TICK = 5;
 
 /** Options threaded down from the program's global fleet-selection flags. */
 export interface RunsCommandContext {
@@ -132,6 +142,9 @@ export class RunsCommand extends BaseCommand {
 			// succeed, so it propagates as the crash it is.
 			if (code === undefined) throw error;
 			this.out.diagnostic(redactSecrets((error as Error).message));
+			// `runs wait` prints its document and THEN throws, so by here stdout
+			// may hold an unflushed payload that `process.exit` would discard.
+			await this.out.flush();
 			process.exit(code);
 			// `process.exit` does not return in production. The explicit return
 			// matters anyway: a test that stubs it would otherwise fall through and
@@ -180,6 +193,7 @@ export class RunsCommand extends BaseCommand {
 		const options = parseCommandOptions(rest, {
 			usage: "cyrus runs list [filters] [--json]",
 			allowTimeout: false,
+			positionals: 0,
 		});
 		const { client, workspace } = await this.connect(
 			filters,
@@ -222,6 +236,7 @@ export class RunsCommand extends BaseCommand {
 		const { filters, rest } = parseRunFilters(argv);
 		const options = parseCommandOptions(rest, {
 			usage: "cyrus runs watch [filters] [--timeout <seconds>] [--json]",
+			positionals: 0,
 		});
 		const { client, workspace } = await this.connect(
 			filters,
@@ -250,6 +265,8 @@ export class RunsCommand extends BaseCommand {
 			let cursor = (await client.listChanges({ from: "latest" })).nextCursor;
 			await this.emitSnapshot(client, filters, workspace, emit);
 
+			/** Consecutive backlog pages consumed without pausing. */
+			let drained = 0;
 			while (true) {
 				if (interrupt.requested) {
 					emit(this.stopEvent("interrupted"));
@@ -277,6 +294,12 @@ export class RunsCommand extends BaseCommand {
 					});
 					await this.emitSnapshot(client, filters, workspace, emit);
 					cursor = fresh.nextCursor;
+					// Sleep like any other iteration. A `410` means the router process
+					// started, so a crash-looping router mints a new epoch each time —
+					// and without this the branch would re-snapshot the entire fleet
+					// back-to-back with no delay, against a router already failing.
+					drained = 0;
+					await this.sleep(this.pollIntervalMs);
 					continue;
 				}
 
@@ -289,7 +312,9 @@ export class RunsCommand extends BaseCommand {
 					) {
 						continue;
 					}
-					if (!matchesLocalRunFilters(change.observation, filters)) continue;
+					// EVERY filter, not just the two the listing route lacks: this route
+					// takes no filters at all, so nothing upstream applied the rest.
+					if (!matchesChangeRunFilters(change.observation, filters)) continue;
 					emit({
 						schemaVersion: 1,
 						event: "change",
@@ -301,6 +326,19 @@ export class RunsCommand extends BaseCommand {
 						observation: change.observation,
 					});
 				}
+
+				// A non-empty page may not have been the whole backlog, so poll again
+				// at once rather than capping throughput at one page per interval — a
+				// watch that falls behind gets no signal, because the router skips
+				// aged-out entries silently rather than answering `410`. The client
+				// cannot see the router's page size, so "non-empty" is the only signal
+				// available; the bound is what stops a steadily busy fleet turning that
+				// into a request loop, at the cost of one extra request per interval.
+				if (page.changes.length > 0 && drained < MAX_DRAIN_PAGES_PER_TICK) {
+					drained++;
+					continue;
+				}
+				drained = 0;
 				await this.sleep(this.pollIntervalMs);
 			}
 		} finally {
@@ -327,11 +365,25 @@ export class RunsCommand extends BaseCommand {
 		const { filters, rest } = parseRunFilters(argv);
 		const options = parseCommandOptions(rest, {
 			usage: "cyrus runs wait <runId> [--timeout <seconds>] [--json]",
+			positionals: 1,
 		});
 		const runId = options.positional[0];
-		if (!runId || options.positional.length > 1) {
+		if (!runId) {
 			throw new UsageError(
 				"Usage: cyrus runs wait <runId> [--timeout <seconds>] [--json]",
+			);
+		}
+		// A run id is already the narrowest possible selector, so every other
+		// filter can only narrow it to nothing — and a filter over a MOVING fact
+		// is worse than useless here: `--state active` would make the run
+		// invisible the instant it completes, turning the outcome this command
+		// exists to report into "no such run". `--workspace` is not a filter in
+		// that sense; it selects which authority to read under.
+		const narrowing = describeRunFilters({ ...filters, workspace: undefined });
+		if (narrowing !== "none") {
+			throw new UsageError(
+				`\`cyrus runs wait\` takes a run id, not filters (got ${narrowing}). ` +
+					"Use `cyrus runs list` with the filters to find the run id first.",
 			);
 		}
 		const { client, workspace } = await this.connect(
@@ -672,10 +724,14 @@ interface CommandOptions {
  * how `--stalled` — a flag this CLI deliberately does not have, because nothing
  * here infers a verdict from elapsed time — would return the whole fleet and
  * read as the answer to a much narrower question.
+ *
+ * A surplus positional is refused for the same reason, and refused HERE rather
+ * than left to Commander: `run()` is a public entry point that the deprecation
+ * shim re-enters by argv, so the CLI boundary is not the only way in.
  */
 function parseCommandOptions(
 	argv: readonly string[],
-	spec: { usage: string; allowTimeout?: boolean },
+	spec: { usage: string; allowTimeout?: boolean; positionals: number },
 ): CommandOptions {
 	const options: CommandOptions = { json: false, positional: [] };
 	for (let i = 0; i < argv.length; i++) {
@@ -698,6 +754,11 @@ function parseCommandOptions(
 		} else {
 			options.positional.push(arg);
 		}
+	}
+	if (options.positional.length > spec.positionals) {
+		throw new UsageError(
+			`Unexpected argument: ${options.positional[spec.positionals]}. Usage: ${spec.usage}`,
+		);
 	}
 	return options;
 }

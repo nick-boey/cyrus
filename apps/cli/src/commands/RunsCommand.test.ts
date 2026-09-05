@@ -673,6 +673,176 @@ describe("cyrus runs watch", () => {
 		}
 	});
 
+	it("applies EVERY filter to a change, not only the two `list` applies locally", async () => {
+		// `GET /api/v1/run-changes` takes only `cursor` and `from`, so nothing
+		// upstream applied `--state`/`--issue`/`--run`. Without a client-side
+		// check the stream contradicts its own snapshot: a correctly-filtered
+		// empty snapshot, then change events for runs matching none of them.
+		let clock = Date.parse("2026-09-02T00:00:10.000Z");
+		let delivered = false;
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			// The router honours `?state=waiting` here and returns nothing.
+			[RUNS_PATH]: () => json(page([])),
+			[CHANGES_PATH]: (url) => {
+				if (url.searchParams.get("from") === "latest" || delivered) {
+					return json(changePage([], cursor("0")));
+				}
+				delivered = true;
+				return json(
+					changePage(
+						[
+							{
+								changeId: "1",
+								observation: observation({
+									runId: "unrelated",
+									issueKey: "NOR-999",
+									lifecycle: "complete",
+									endedAt: "2026-09-02T00:00:11.000Z",
+								}),
+							},
+							{
+								changeId: "2",
+								observation: observation({
+									runId: "wanted",
+									lifecycle: "waiting",
+									wait: {
+										reason: "elicitation",
+										since: "2026-09-02T00:00:11.000Z",
+									},
+								}),
+							},
+						],
+						cursor("2"),
+					),
+				);
+			},
+		});
+		const { cmd, out } = command(fetchFn, createRecordingOutput(), {
+			now: () => clock,
+			sleep: async () => {
+				clock += 2_000;
+			},
+		});
+
+		expect(
+			await exitCodeOf(cmd, [
+				"watch",
+				"--json",
+				"--state",
+				"waiting",
+				"--timeout",
+				"3",
+			]),
+		).toBe(ExitCode.success);
+
+		const changes = out.data_
+			.map((line) => JSON.parse(line))
+			.filter((event) => event.event === "change");
+		expect(changes.map((event) => event.runId)).toEqual(["wanted"]);
+	});
+
+	it("backs off before re-snapshotting after a 410", async () => {
+		// A `410` means the router process started, so a crash-looping router
+		// mints a new epoch every time. Without the sleep this branch would
+		// re-snapshot the whole fleet back-to-back against a failing router.
+		let clock = Date.parse("2026-09-02T00:00:10.000Z");
+		const sleeps: number[] = [];
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[RUNS_PATH]: () => json(page([observation()])),
+			[CHANGES_PATH]: (url) =>
+				url.searchParams.get("from") === "latest"
+					? json(changePage([], cursor("1")))
+					: json({ error: "stream_epoch_changed" }, 410),
+		});
+		const { cmd, out } = command(fetchFn, createRecordingOutput(), {
+			now: () => clock,
+			sleep: async (ms: number) => {
+				sleeps.push(ms);
+				clock += 2_000;
+			},
+		});
+
+		expect(await exitCodeOf(cmd, ["watch", "--json", "--timeout", "5"])).toBe(
+			ExitCode.success,
+		);
+
+		const resyncs = out.data_
+			.map((line) => JSON.parse(line))
+			.filter((event) => event.event === "resync");
+		expect(resyncs.length).toBeGreaterThan(0);
+		// One pause per resync: the branch never spins.
+		expect(sleeps.length).toBeGreaterThanOrEqual(resyncs.length);
+	});
+
+	it("drains a backlog without waiting a whole interval per page", async () => {
+		// A watch that falls behind gets no signal — the router skips aged-out
+		// entries silently rather than answering 410 — so it must not be capped
+		// at one page per poll.
+		let clock = Date.parse("2026-09-02T00:00:10.000Z");
+		let sleepCount = 0;
+		let backlog = 3;
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[RUNS_PATH]: () => json(page([])),
+			[CHANGES_PATH]: (url) => {
+				if (url.searchParams.get("from") === "latest") {
+					return json(changePage([], cursor("0")));
+				}
+				if (backlog > 0) {
+					const id = String(backlog--);
+					return json(
+						changePage(
+							[
+								{
+									changeId: id,
+									observation: observation({ runId: `run-${id}` }),
+								},
+							],
+							cursor(id),
+						),
+					);
+				}
+				return json(changePage([], cursor("done")));
+			},
+		});
+		const { cmd, out } = command(fetchFn, createRecordingOutput(), {
+			now: () => clock,
+			sleep: async () => {
+				sleepCount++;
+				clock += 2_000;
+			},
+		});
+
+		expect(await exitCodeOf(cmd, ["watch", "--json", "--timeout", "3"])).toBe(
+			ExitCode.success,
+		);
+
+		const changes = out.data_
+			.map((line) => JSON.parse(line))
+			.filter((event) => event.event === "change");
+		// All three drained without a pause between them: capped at one page per
+		// interval, three backlog pages would have cost three sleeps on their own
+		// and the 3s deadline would have cut the backlog short.
+		expect(changes.map((event) => event.runId)).toEqual([
+			"run-3",
+			"run-2",
+			"run-1",
+		]);
+		expect(sleepCount).toBeLessThan(3);
+	});
+
+	it("refuses a stray positional rather than ignoring it", async () => {
+		// `run()` is a public entry point the deprecation shim re-enters by argv,
+		// so Commander's own arity check is not the only way in.
+		const { fetchFn } = router({ [CONTEXT_PATH]: () => json(context()) });
+		const { cmd } = command(fetchFn);
+
+		expect(await exitCodeOf(cmd, ["watch", "NOR-402"])).toBe(ExitCode.usage);
+		expect(await exitCodeOf(cmd, ["list", "NOR-402"])).toBe(ExitCode.usage);
+	});
+
 	it("drops a change from a workspace this invocation is not scoped to", async () => {
 		let clock = Date.parse("2026-09-02T00:00:10.000Z");
 		const { fetchFn } = router({
@@ -864,11 +1034,74 @@ describe("cyrus runs wait", () => {
 		expect(out.diagnostics.join("\n")).toContain("run-404");
 	});
 
-	it("requires a run id", async () => {
+	it("requires a run id, and exactly one", async () => {
 		const { fetchFn } = router({ [CONTEXT_PATH]: () => json(context()) });
 		const { cmd } = command(fetchFn);
 
 		expect(await exitCodeOf(cmd, ["wait"])).toBe(ExitCode.usage);
+		expect(await exitCodeOf(cmd, ["wait", "run-1", "run-2"])).toBe(
+			ExitCode.usage,
+		);
+	});
+
+	it("refuses narrowing filters, which can only make the run vanish", async () => {
+		// A run id is already the narrowest selector, and a filter over a MOVING
+		// fact is worse than useless: `--state active` makes the run invisible the
+		// instant it completes, turning the outcome this command exists to report
+		// into "no such run".
+		const { fetchFn } = router({ [CONTEXT_PATH]: () => json(context()) });
+		const { cmd, out } = command(fetchFn);
+
+		expect(await exitCodeOf(cmd, ["wait", "run-1", "--state", "active"])).toBe(
+			ExitCode.usage,
+		);
+		expect(out.diagnostics.join("\n")).toContain("cyrus runs list");
+	});
+
+	it("still accepts --workspace, which selects authority rather than narrowing", async () => {
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () =>
+				json(
+					context({
+						authorizedWorkspaces: [
+							{ workspaceId: "ws-1", name: "Northrop Digital" },
+							{ workspaceId: "ws-2", name: "Acme" },
+						],
+					}),
+				),
+			[RUNS_PATH]: () => json(page([observation({ lifecycle: "complete" })])),
+			[CHANGES_PATH]: () => json(changePage([], cursor("0"))),
+		});
+		const { cmd } = command(fetchFn);
+
+		expect(
+			await exitCodeOf(cmd, ["wait", "run-1", "--workspace", "ws-1"]),
+		).toBe(ExitCode.success);
+	});
+
+	it("flushes stdout before exiting non-zero", async () => {
+		// `process.exit` does not drain pending writes, and stdout is async when
+		// it is a pipe on macOS — so without an explicit flush the document is
+		// truncated on exactly the paths (`error`, `waiting`, `timeout`) the
+		// `--json` contract exists to serve.
+		let flushed = 0;
+		const out = createRecordingOutput();
+		const recordingFlush = out.flush;
+		out.flush = async () => {
+			flushed++;
+			await recordingFlush();
+		};
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[RUNS_PATH]: () => json(page([observation({ lifecycle: "error" })])),
+			[CHANGES_PATH]: () => json(changePage([], cursor("0"))),
+		});
+		const { cmd } = command(fetchFn, out);
+
+		expect(await exitCodeOf(cmd, ["wait", "run-1", "--json"])).toBe(
+			ExitCode.outcome,
+		);
+		expect(flushed).toBe(1);
 	});
 });
 
