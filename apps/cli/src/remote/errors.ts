@@ -1,24 +1,26 @@
+import { ExitCode } from "./exitCodes.js";
+
 /**
  * Failure vocabulary for the remote-operator commands.
  *
  * An orchestrating agent reads the exit code, not the prose, so the code is a
  * property of the ERROR rather than of the call site that happens to catch it.
- * The categories are fixed by ADR 0011 and are stable API: changing what a code
- * means silently changes what every skill and CI job built on them concludes.
+ * The categories themselves live in {@link ExitCode}; the aliases below are the
+ * names this module shipped with and are kept so existing imports keep working.
  */
 
 /** Success, or a satisfied wait condition. */
-export const EXIT_SUCCESS = 0;
+export const EXIT_SUCCESS = ExitCode.success;
 /** Invalid invocation, invalid configuration, or an unsupported capability. */
-export const EXIT_USAGE = 2;
+export const EXIT_USAGE = ExitCode.usage;
 /** A valid non-success run outcome, or a refused recovery. */
-export const EXIT_OUTCOME = 3;
+export const EXIT_OUTCOME = ExitCode.outcome;
 /** The command's own wait condition was not met in time. */
-export const EXIT_TIMEOUT = 4;
+export const EXIT_TIMEOUT = ExitCode.timeout;
 /** Authentication or authorization failure. */
-export const EXIT_AUTH = 5;
+export const EXIT_AUTH = ExitCode.auth;
 /** A transient router or log-source failure. */
-export const EXIT_TRANSIENT = 6;
+export const EXIT_TRANSIENT = ExitCode.transient;
 
 /**
  * Base class for every failure the remote commands report deliberately.
@@ -64,6 +66,19 @@ export class AuthorizationError extends RemoteOperatorError {
 
 /** The router or log source failed in a way that may succeed on retry. */
 export class TransientError extends RemoteOperatorError {
+	readonly exitCode = EXIT_TRANSIENT;
+}
+
+/**
+ * The change cursor was minted by a previous router process (`410 Gone`).
+ *
+ * Categorized as transient because that is the honest answer if it ever escapes
+ * uncaught — the router is up, and the next attempt succeeds. In practice it
+ * never should: `runs watch` and `runs wait` catch it, emit a `resync`, take a
+ * fresh snapshot, and resume from the new epoch, because the one thing they must
+ * NOT do is claim continuity across the restart interval (ADR 0016).
+ */
+export class StreamEpochChangedError extends RemoteOperatorError {
 	readonly exitCode = EXIT_TRANSIENT;
 }
 

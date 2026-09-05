@@ -42,6 +42,103 @@ The interactive wizard will prompt you for:
 - Workspace directory for git worktrees
 - Whether the repository is active
 
+## Fleet run commands
+
+`cyrus runs` observes agent runs on a **remote** router through a stored
+connection (`cyrus connection add <name> <url> --auth entra`). It never reads
+this device's own enrollment, so it works from an orchestrator host that runs no
+sessions of its own — including under `--profile remote`.
+
+The three subcommands have deliberately different success semantics:
+
+| Command | Question it answers | Ends when |
+| --- | --- | --- |
+| `cyrus runs list` | What is the fleet doing right now? | Every page has been read |
+| `cyrus runs watch` | What is changing? | `--timeout` elapses, or Ctrl-C |
+| `cyrus runs wait <runId>` | Has this one run finished, or does it need input? | The run reaches a terminal or waiting state, or `--timeout` elapses |
+
+```bash
+# Every run in the one authorized workspace. Succeeds whatever states it reports.
+cyrus runs list
+
+# Narrow it. Names must match exactly; an ambiguous one is refused with candidates.
+cyrus runs list --team Platform --state waiting
+cyrus runs list --issue NOR-402 --json
+
+# Follow the fleet for ten minutes, as newline-delimited JSON.
+cyrus runs watch --state active --timeout 600 --json
+
+# Block until one run ends or asks for input.
+cyrus runs wait 019bd6f2-1d1e-7a8e-9f4c-0b7c2a5e91d3 --timeout 900 --json
+
+# Pick the connection and workspace explicitly when more than one is available.
+cyrus runs list --connection prod --workspace ws-1
+```
+
+### Filters
+
+`list` and `watch` share one filter vocabulary: `--run`, `--session`, `--issue`,
+`--state`, `--runner`, `--model`, `--comment`, `--routed-after`, plus `--owner`,
+`--team`, and `--project`.
+
+`wait` takes a run id and nothing else (beyond `--connection`/`--workspace`). A
+run id is already the narrowest selector, and a filter over a fact that moves
+would be actively harmful: `--state active` would make the run invisible the
+moment it completed, turning the outcome the command exists to report into "no
+such run".
+
+`--workspace`, `--owner`, `--team`, and `--project` accept a canonical id **or**
+the display name captured when the run was routed. A name matching more than one
+id is refused with the candidates rather than resolved by position — two Linear
+projects can share a name, and guessing would point a recovery at the wrong one.
+Every output line carries the canonical id beside the captured name.
+
+`--state` is one of `routed`, `active`, `waiting`, `complete`, `error`,
+`stopped`, `unknown`. There is no `stalled`: nothing here infers a verdict from
+elapsed time or silence, and `waiting` appears only because a worker reported it.
+
+### Output
+
+- Interactive default: a human table (`list`) or one line per event (`watch`).
+- `--json`: a single `{ "schemaVersion": 1, … }` document for `list` and `wait`;
+  newline-delimited JSON events for `watch` (`snapshot`, `change`, `resync`,
+  `stopped`).
+- **stdout carries data only; stderr carries diagnostics and deprecations.** A
+  script can pipe stdout straight into a parser.
+
+If the router restarts mid-watch, the stream emits a `resync` event, takes a
+fresh snapshot, and resumes from the new cursor. It does not claim it observed
+the restart interval.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success, or a satisfied wait condition |
+| `2` | Invalid invocation, invalid configuration, or an unsupported router capability |
+| `3` | A valid non-success run outcome (`error`, `stopped`, `unknown`, or a worker-reported `waiting`) |
+| `4` | `runs wait` ran out of time — its **own** condition, never the run's |
+| `5` | Authentication or authorization failure |
+| `6` | A transient router failure; retrying may work |
+
+`list` and `watch` never exit `3` or `4`: an unhealthy fleet is a successful
+read. Codes `3` and `4` are distinct on purpose — a `waiting` run is asking a
+question and needs an answer, while a timeout means this command stopped
+looking.
+
+### Deprecated syntax
+
+`cyrus runs [issue] [--watch]` still parses for one more release and prints a
+deprecation notice on **stderr**. Without `--watch` it runs `list`; with
+`--watch` it resolves the single non-terminal matching run and waits on it,
+exiting `2` with the candidate run ids if more than one matches. `--after` maps
+to `--routed-after`. Migrate to `cyrus runs list` and `cyrus runs wait <runId>`.
+
+**Its exit codes changed.** The old `--watch` exited `1` for any non-`complete`
+outcome and for a timeout. It now uses the table above — `3` for a non-success
+outcome, `4` for a timeout, `2` for an ambiguous match — so a script testing
+`[ $? -eq 1 ]` will no longer fire.
+
 ## Configuration
 
 ### Environment Variables

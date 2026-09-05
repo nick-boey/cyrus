@@ -67,14 +67,6 @@ export const COMMAND_PROFILE_ENV = "CYRUS_COMMAND_PROFILE";
  *
  * `logs`, `recover`, and `skills` are named but not yet implemented — they
  * arrive with CYR-73, CYR-76, and CYR-77.
- *
- * `runs` is named but deliberately NOT yet registered in the remote profile.
- * Today's `RunsCommand` reads `config.router.deviceToken`, the device-enrollment
- * block written only by `cyrus connect` — which the remote profile does not
- * register and `cyrus connection add` deliberately never writes. Registering it
- * here would ship a command that always fails with advice to run a command the
- * profile hides. CYR-70 moves `runs` onto `ConnectionStore`/`OperatorHttpClient`,
- * at which point it joins {@link REMOTE_PROFILE_REGISTERED}.
  */
 export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
 	"connection",
@@ -91,7 +83,10 @@ export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
  * "actually usable in this profile" are two decisions rather than one — a
  * command may be approved long before it can function unattended.
  */
-export const REMOTE_PROFILE_REGISTERED: readonly string[] = ["connection"];
+export const REMOTE_PROFILE_REGISTERED: readonly string[] = [
+	"connection",
+	"runs",
+];
 
 /**
  * Adds the two selection flags every fleet command accepts: which stored
@@ -802,55 +797,285 @@ function registerConnectionCommand(
 		});
 }
 
-/** `cyrus runs …` — inspect work through the connected router. */
+/**
+ * The filters every `runs` subcommand accepts, in the order they are forwarded.
+ *
+ * Declared once and applied to each subcommand so the vocabulary cannot drift
+ * between `list` and `watch` — a filter that exists on one and not the other is
+ * a difference an operator discovers only by having their query silently
+ * answered with a superset.
+ *
+ * `--workspace` is NOT here: it arrives through {@link addFleetSelectionOptions}
+ * as the fleet selection, and `RunsCommand` treats the selected workspace as the
+ * scope of every query.
+ */
+const RUN_FILTER_OPTIONS = [
+	["--run <id>", "Filter by run id"],
+	["--session <id>", "Filter by agent session id"],
+	[
+		"--issue <key>",
+		"Filter by Linear issue identifier (e.g. NOR-402) or issue id",
+	],
+	["--owner <idOrName>", "Filter by the Cyrus user who owns the run"],
+	["--team <idOrName>", "Filter by the Linear team captured when input routed"],
+	[
+		"--project <idOrName>",
+		"Filter by the Linear project captured when input routed",
+	],
+	[
+		"--state <state>",
+		"Filter by run lifecycle: routed, active, waiting, complete, error, stopped, unknown",
+	],
+	["--runner <name>", "Filter by the agent runner that executed the run"],
+	["--model <name>", "Filter by model"],
+	[
+		"--comment <id>",
+		"Filter by the Linear comment that started or joined a run",
+	],
+	[
+		"--routed-after <timestamp>",
+		"Only include runs routed at or after this ISO-8601 instant",
+	],
+] as const;
+
+/** Parsed filter values, keyed by Commander's camelCase option names. */
+interface RunFilterOptionValues {
+	run?: string;
+	session?: string;
+	issue?: string;
+	owner?: string;
+	team?: string;
+	project?: string;
+	state?: string;
+	runner?: string;
+	model?: string;
+	comment?: string;
+	routedAfter?: string;
+}
+
+function addRunFilterOptions(command: Command): Command {
+	for (const [flags, description] of RUN_FILTER_OPTIONS) {
+		command.option(flags, description);
+	}
+	return command;
+}
+
+/**
+ * Translates parsed filter options back into the argv form `RunsCommand`
+ * parses.
+ *
+ * The command owns its own parser so it stays drivable without Commander (and
+ * so the legacy shim can re-enter `list`/`wait` by argv), which means this
+ * function is the one place the two representations meet.
+ */
+function runFilterArgs(cmdOpts: RunFilterOptionValues): string[] {
+	const args: string[] = [];
+	const forward = (flag: string, value?: string): void => {
+		if (value !== undefined) args.push(flag, value);
+	};
+	forward("--run", cmdOpts.run);
+	forward("--session", cmdOpts.session);
+	forward("--issue", cmdOpts.issue);
+	forward("--owner", cmdOpts.owner);
+	forward("--team", cmdOpts.team);
+	forward("--project", cmdOpts.project);
+	forward("--state", cmdOpts.state);
+	forward("--runner", cmdOpts.runner);
+	forward("--model", cmdOpts.model);
+	forward("--comment", cmdOpts.comment);
+	forward("--routed-after", cmdOpts.routedAfter);
+	return args;
+}
+
+/**
+ * `cyrus runs …` — list, watch, and wait on agent runs through a stored
+ * connection.
+ *
+ * The three subcommands have distinct success semantics (see `RunsCommand`),
+ * and a hidden DEFAULT subcommand preserves the previous
+ * `cyrus runs [issue] [--watch]` syntax for one release. Commander dispatches a
+ * default subcommand only when no named one matches, which is exactly the rule
+ * needed here: `cyrus runs list` reaches `list`, and `cyrus runs NOR-402`
+ * reaches the shim.
+ */
 function registerRunsCommand(
 	program: Command,
 	packageJson: { version: string },
 	errorReporter: ErrorReporter,
 ): void {
-	program
-		.command("runs [issue]")
-		.description("List or watch agent runs on the connected Cyrus Router")
-		.option(
-			"--comment <id>",
-			"Filter by the Linear comment that started or joined a run",
-		)
-		.option(
-			"--after <timestamp>",
-			"Only include runs routed at or after this ISO timestamp",
-		)
-		.option("--watch", "Poll until the matching run finishes")
-		.option("--timeout <seconds>", "Stop waiting after this many seconds")
-		.option("--json", "Print JSON; watch mode emits newline-delimited JSON")
-		.action(
-			async (
-				issue: string | undefined,
-				cmdOpts: {
-					comment?: string;
-					after?: string;
-					watch?: boolean;
-					timeout?: string;
-					json?: boolean;
-				},
-			) => {
-				const opts = program.opts();
-				const app = new Application(
-					opts.cyrusHome,
-					opts.envFile,
-					packageJson.version,
-					errorReporter,
-				);
-				const args: string[] = issue ? [issue] : [];
-				if (cmdOpts.comment) args.push("--comment", cmdOpts.comment);
-				if (cmdOpts.after) args.push("--after", cmdOpts.after);
-				if (cmdOpts.watch) args.push("--watch");
-				if (cmdOpts.timeout) args.push("--timeout", cmdOpts.timeout);
-				if (cmdOpts.json) args.push("--json");
-				try {
-					await new RunsCommand(app).execute(args);
-				} finally {
-					app.disposeWatchers();
-				}
-			},
+	const runsCommand = program
+		.command("runs")
+		.description(
+			"List, watch, and wait on agent runs through a stored router connection (see `cyrus connection add`)",
 		);
+
+	/**
+	 * Builds the Application and disposes its watchers so a one-shot run command
+	 * exits instead of idling on live `fs.watch` handles.
+	 */
+	const runRuns = async (
+		argv: string[],
+		selection: { connection?: string; workspace?: string },
+	): Promise<void> => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		try {
+			await new RunsCommand(app).execute(argv, selection);
+		} finally {
+			app.disposeWatchers();
+		}
+	};
+
+	addFleetSelectionOptions(
+		addRunFilterOptions(
+			runsCommand
+				.command("list")
+				.description(
+					"Print every current run observation for one authorized workspace. Succeeds whatever states it reports.",
+				),
+		).option("--json", "Emit one JSON document instead of a table"),
+	).action(
+		async (
+			cmdOpts: RunFilterOptionValues & {
+				json?: boolean;
+				connection?: string;
+				workspace?: string;
+			},
+		) => {
+			await runRuns(
+				[
+					"list",
+					...runFilterArgs(cmdOpts),
+					...(cmdOpts.json ? ["--json"] : []),
+				],
+				{ connection: cmdOpts.connection, workspace: cmdOpts.workspace },
+			);
+		},
+	);
+
+	addFleetSelectionOptions(
+		addRunFilterOptions(
+			runsCommand
+				.command("watch")
+				.description(
+					"Follow material fleet changes until timeout or interruption. Run outcomes never fail this command.",
+				),
+		)
+			.option(
+				"--timeout <seconds>",
+				"Stop watching after this many seconds (exit 0)",
+			)
+			.option("--json", "Emit newline-delimited JSON events instead of lines"),
+	).action(
+		async (
+			cmdOpts: RunFilterOptionValues & {
+				timeout?: string;
+				json?: boolean;
+				connection?: string;
+				workspace?: string;
+			},
+		) => {
+			await runRuns(
+				[
+					"watch",
+					...runFilterArgs(cmdOpts),
+					...(cmdOpts.timeout ? ["--timeout", cmdOpts.timeout] : []),
+					...(cmdOpts.json ? ["--json"] : []),
+				],
+				{ connection: cmdOpts.connection, workspace: cmdOpts.workspace },
+			);
+		},
+	);
+
+	addFleetSelectionOptions(
+		runsCommand
+			.command("wait <runId>")
+			.description(
+				"Wait for one run to reach a terminal state or report that it is waiting on input",
+			)
+			.option(
+				"--timeout <seconds>",
+				"Give up after this many seconds (exit 4, distinct from a worker-reported waiting state)",
+			)
+			.option("--json", "Emit one JSON document instead of prose"),
+	).action(
+		async (
+			runId: string,
+			cmdOpts: {
+				timeout?: string;
+				json?: boolean;
+				connection?: string;
+				workspace?: string;
+			},
+		) => {
+			await runRuns(
+				[
+					"wait",
+					runId,
+					...(cmdOpts.timeout ? ["--timeout", cmdOpts.timeout] : []),
+					...(cmdOpts.json ? ["--json"] : []),
+				],
+				{ connection: cmdOpts.connection, workspace: cmdOpts.workspace },
+			);
+		},
+	);
+
+	// The deprecated pre-CYR-70 form, as a hidden DEFAULT subcommand: Commander
+	// dispatches one only when no named subcommand matches, so `cyrus runs list`
+	// reaches `list` while `cyrus runs NOR-402 --watch` and a bare `cyrus runs`
+	// reach the shim — parsing, with an actionable notice on stderr, instead of
+	// failing outright on upgrade.
+	//
+	// Hanging it off the PARENT command instead (`runsCommand.argument("[issue]")`
+	// plus an action) reads better and would reserve no name, but it is the exact
+	// collision `addFleetSelectionOptions` documents: the shim needs `--comment`
+	// and `--json`, `list` and `watch` declare the same two, and Commander
+	// resolves a parent/child option collision in the PARENT's favour — so
+	// `cyrus runs list --comment c1 --json` silently hands `list` an empty option
+	// set. `enablePositionalOptions()` does not change that. The cost of the
+	// default-subcommand form is one hidden, reachable `cyrus runs __deprecated__`
+	// — a name chosen because no Linear issue identifier can look like it, so it
+	// reserves nothing an operator could otherwise have typed.
+	addFleetSelectionOptions(
+		runsCommand
+			.command("__deprecated__ [issue]", { isDefault: true, hidden: true })
+			.description("Deprecated: use `cyrus runs list|watch|wait`")
+			.option("--comment <id>", "Deprecated: use `--comment` on `runs list`")
+			.option("--after <timestamp>", "Deprecated: use `--routed-after`")
+			.option("--watch", "Deprecated: use `cyrus runs wait <runId>`")
+			.option(
+				"--timeout <seconds>",
+				"Deprecated: use `--timeout` on `runs wait`",
+			)
+			.option("--json", "Emit JSON"),
+	).action(
+		async (
+			issue: string | undefined,
+			cmdOpts: {
+				comment?: string;
+				after?: string;
+				watch?: boolean;
+				timeout?: string;
+				json?: boolean;
+				connection?: string;
+				workspace?: string;
+			},
+		) => {
+			const args: string[] = issue ? [issue] : [];
+			if (cmdOpts.comment) args.push("--comment", cmdOpts.comment);
+			if (cmdOpts.after) args.push("--after", cmdOpts.after);
+			if (cmdOpts.watch) args.push("--watch");
+			if (cmdOpts.timeout) args.push("--timeout", cmdOpts.timeout);
+			if (cmdOpts.json) args.push("--json");
+			await runRuns(args, {
+				connection: cmdOpts.connection,
+				workspace: cmdOpts.workspace,
+			});
+		},
+	);
 }

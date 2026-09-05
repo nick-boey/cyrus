@@ -1404,9 +1404,9 @@ an ephemeral container's is — for example so a session can later be migrated
 from your laptop onto a container — add `"floorSync": true` to the `router`
 block in your `config.json` by hand.
 
-The same saved connection is used by `cyrus runs`; there is no second login or
-router URL to configure. The CLI converts the stored WebSocket URL back to the
-matching HTTP(S) origin and sends the device token as a bearer token.
+`cyrus runs` does **not** use this connection. It reads a NAMED operator
+connection created by `cyrus connection add` instead — see
+[Observe agent runs](#observe-agent-runs) below.
 
 ### 2. Install and OAuth the official Linear MCP locally
 
@@ -1468,22 +1468,70 @@ git worktrees exactly as in single-host mode.
 
 ### Observe agent runs
 
-Use the connection created by `cyrus connect` to see what the router currently
-knows about your runs:
+`cyrus runs` reads the router's Fleet Operations API through a **named operator
+connection**, not through this device's enrollment:
 
 ```bash
-cyrus runs                         # recent runs owned by this user
-cyrus runs NOR-402                 # runs for one issue
-cyrus runs NOR-402 --comment <id>  # the run that received a Linear comment
-cyrus runs NOR-402 --watch         # wait for a terminal outcome
+cyrus connection add prod https://router.example.com --auth entra
 ```
 
-`--after <ISO timestamp>` narrows the result by the time input was last routed.
-It is a fallback for clients that did not retain the Linear comment ID.
-`--json` emits one JSON object per observation (NDJSON while watching), and
-`--timeout <seconds>` bounds a watch. A watch exits successfully only for
-`complete`; `error`, `stopped`, `unknown`, timeout, and connection failure are
-non-zero outcomes. A watch requires an issue or comment filter.
+That is a deliberate separation, not an oversight. The device token from
+`cyrus connect` is scoped to your own work and
+[ADR-0009](adr/0009-separate-remote-observability-principals.md) forbids
+widening it, so fleet observation authenticates as its own principal. The
+consequence for a device user who previously ran `cyrus runs` with nothing but
+`cyrus connect`: you now need an Entra grant, or a token from
+`cyrus router operators create-token`, and `cyrus connection add … --auth local
+--token-env <ENV_NAME>`. In exchange, the same commands work unchanged from an
+orchestrator host that runs no sessions at all, under `cyrus --profile remote`.
+
+```bash
+cyrus runs list                                   # every current run in the workspace
+cyrus runs list --issue NOR-402 --json            # one issue, as a JSON document
+cyrus runs list --team Platform --state waiting   # what is blocked on a person
+cyrus runs watch --timeout 600 --json             # follow the fleet as NDJSON
+cyrus runs wait <runId> --timeout 900             # block on one run
+```
+
+`list` and `watch` share one filter vocabulary: `--run`, `--session`, `--issue`,
+`--state`, `--runner`, `--model`, `--comment`, `--routed-after`, `--owner`,
+`--team`, and `--project`. The last three plus `--workspace` accept a canonical
+id or the name captured when the run was routed; on `list` the router resolves
+these and refuses an ambiguous name with its candidate ids, while on the change
+feed — which takes no filters at all — the CLI matches either side itself.
+`wait` deliberately accepts no filters beyond `--connection`/`--workspace`: a
+run id is already the narrowest selector, and `--state active` would make the
+run invisible the instant it completed. `--connection <name>` and
+`--workspace <id>` are optional when there is exactly one and required when
+there is more than one.
+
+The three commands have three different success semantics, and their exit codes
+say which:
+
+- `list` is a snapshot and always exits `0` on a successful read. A fleet full of
+  errored runs is a successful answer to "what is the fleet doing".
+- `watch` streams material changes from the durable feed (so a transition between
+  two polls is not missed) and exits `0` when `--timeout` elapses or you
+  interrupt it. If the router restarts it emits a `resync` event, re-snapshots,
+  and resumes from the new stream epoch rather than claiming it observed the gap.
+- `wait` is the only one whose exit code describes the WORK: `0` for `complete`,
+  `3` for `error`/`stopped`/`unknown` **or** a worker-reported `waiting`, and `4`
+  when its own timeout elapses. `3` and `4` are distinct because a waiting run is
+  asking a question, while a timeout means the command stopped looking. The full
+  table is `2` usage/config/capability, `5` auth, `6` transient.
+
+`--json` gives one `{"schemaVersion": 1, …}` document for `list` and `wait`, and
+newline-delimited events for `watch`. **stdout carries data only; stderr carries
+diagnostics and deprecations**, so stdout can be piped straight into a parser.
+
+The pre-CYR-70 syntax — `cyrus runs [issue] [--comment <id>] [--after <time>]
+[--watch] [--timeout <seconds>] [--json]` — still parses for one release and
+prints a deprecation notice on stderr. Without `--watch` it runs `list`; with
+`--watch` it resolves the single non-terminal matching run and waits on it,
+exiting `2` with the candidate run ids when more than one matches. Its exit
+codes changed with it: the old `--watch` returned `1` for any non-`complete`
+outcome and for a timeout, and now returns `3`, `4`, or `2` per the table above,
+so a script testing for `1` will no longer fire.
 
 The router records a stable run ID, issue and agent-session IDs, routed input
 references, lifecycle timestamps, the latest successfully published Linear
@@ -1498,9 +1546,11 @@ Terminal observations are retained for 24 hours. If the router loses ownership
 without receiving an exact terminal result, the run becomes `unknown`; that
 means the outcome is unavailable, not necessarily that the work failed.
 
-The underlying `GET /runs` route uses the same device bearer token. A physical
-device token may query its owner's runs; a container token is restricted to its
-own issue. Query parameters are `issueKey`, `commentId`, and `since`.
+`cyrus runs` reads `GET /api/v1/runs` and `GET /api/v1/run-changes`. The older
+`GET /runs` route still exists, still takes a **device** bearer token, and is no
+longer used by any CLI command: a physical device token may query its owner's
+runs and a container token is restricted to its own issue, with query parameters
+`issueKey`, `commentId`, and `since`.
 
 **An agent run waiting is not the same fact as its container being parked.** A
 run waits when it cannot progress until a stated condition changes — today the
@@ -1736,5 +1786,7 @@ handoff mechanism.
 | `cyrus router secrets list <email> [--check-scopes]` | host | List stored secret keys (values masked) + any missing required keys. `--check-scopes` additionally reports the stored `GH_TOKEN`/`GIT_TOKEN` OAuth scopes — advisory only, never rejects a usable token, never prints values. |
 | `cyrus router secrets migrate --from keyvault --to table [--dry-run]` | host | Copy every user's per-user secrets from the Key Vault backend to the Table backend named in `containers`. Never prints values; `--dry-run` lists what would move without writing anything. |
 | `cyrus connect <url> --code <code> [--entra <audience>]` | device | Enroll this device, optionally using an Azure CLI Entra token. |
-| `cyrus runs [issue] [--comment <id>] [--after <time>] [--watch] [--timeout <seconds>] [--json]` | device | Query or watch owner-scoped agent runs using the connection saved by `cyrus connect`. |
+| `cyrus runs list [filters] [--json]` | operator | Print every current run observation for one authorized workspace. Succeeds whatever states it reports. |
+| `cyrus runs watch [filters] [--timeout <seconds>] [--json]` | operator | Follow material fleet changes until timeout or interruption. Run outcomes never fail it. |
+| `cyrus runs wait <runId> [--timeout <seconds>] [--json]` | operator | Block until one run reaches a terminal state or reports it is waiting on input. |
 | `cyrus start` | device | Begin receiving and running your routed sessions. |
