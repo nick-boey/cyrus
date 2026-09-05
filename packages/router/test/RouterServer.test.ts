@@ -361,6 +361,171 @@ describe("RouterServer fleet-operations routes", () => {
 		expect(body.capabilities).toEqual(["runs.list", "runs.changes"]);
 		expect(body.logSource).toBeUndefined();
 	});
+
+	/** The v1 descriptor a deployment renders into router-config.json. */
+	const LOG_SOURCE = {
+		schemaVersion: 1,
+		kind: "azure-log-analytics",
+		displayName: "cyrus-prod",
+		azure: {
+			workspaceId: "99999999-9999-9999-9999-999999999999",
+			table: "ContainerAppConsoleLogs_CL",
+			resourceId:
+				"/subscriptions/99999999-9999-9999-9999-999999999999/resourceGroups/cyrus/providers/Microsoft.OperationalInsights/workspaces/cyrus-logs",
+		},
+		budgets: {
+			defaultLookbackSeconds: 900,
+			maxRangeSeconds: 86_400,
+			maxRecords: 5000,
+			minFollowIntervalSeconds: 15,
+		},
+	} as const;
+
+	function makeLogSourceServer(): RouterServer {
+		return new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			fleetOperations: { logSource: LOG_SOURCE },
+		});
+	}
+
+	it("advertises logs.query and hands the descriptor to an authorized operator", async () => {
+		server = makeLogSourceServer();
+		await server.start();
+		const created = server.store.createOperatorToken({
+			label: "oncall",
+			roles: ["fleet.read"],
+			workspaceIds: ["ws-1"],
+		});
+
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/api/v1/operator/context`,
+			{ headers: { authorization: `Bearer ${created.token}` } },
+		);
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.capabilities).toEqual([
+			"runs.list",
+			"runs.changes",
+			"logs.query",
+		]);
+		expect(body.logSource).toEqual(LOG_SOURCE);
+	});
+
+	it("withholds the descriptor from an anonymous caller on every route it serves", async () => {
+		server = makeLogSourceServer();
+		await server.start();
+
+		for (const route of [
+			"/.well-known/cyrus",
+			"/api/v1/operator/context",
+			"/api/v1/runs",
+			"/api/v1/run-changes",
+			"/healthz",
+		]) {
+			const res = await fetch(`http://127.0.0.1:${server.port}${route}`);
+			const text = await res.text();
+			expect(text).not.toContain(LOG_SOURCE.azure.workspaceId);
+			expect(text).not.toContain(LOG_SOURCE.azure.resourceId);
+		}
+	});
+
+	it("serves no route that accepts a query or returns log records", async () => {
+		// The descriptor is the ENTIRE log surface: the operator's own client
+		// authenticates to the backend and queries it directly. A router-side query
+		// route would need an Azure credential in this process, which is exactly
+		// what makes the descriptor safe to hand over.
+		server = makeLogSourceServer();
+		await server.start();
+		const created = server.store.createOperatorToken({
+			label: "oncall",
+			roles: ["fleet.read"],
+			workspaceIds: ["ws-1"],
+		});
+		const headers = { authorization: `Bearer ${created.token}` };
+
+		for (const route of [
+			"/api/v1/logs",
+			"/api/v1/log-records",
+			"/api/v1/operator/logs",
+			"/api/v1/logs/query",
+		]) {
+			const url = `http://127.0.0.1:${server.port}${route}`;
+			expect((await fetch(url, { headers })).status).toBe(404);
+			const posted = await fetch(url, {
+				method: "POST",
+				headers: { ...headers, "content-type": "application/json" },
+				body: JSON.stringify({
+					query: "ContainerAppConsoleLogs_CL | take 1",
+				}),
+			});
+			expect(posted.status).toBe(404);
+		}
+	});
+
+	it("has no `query` parameter on the routes it does serve, KQL-shaped or not", async () => {
+		// This is the allowlist in `rejectUnknownParameters` doing its ordinary
+		// job, not a KQL-specific defence — there is no KQL detection anywhere and
+		// there should not be. What it pins is that `query` is not a parameter any
+		// route understands, so a later route cannot quietly acquire one.
+		server = makeLogSourceServer();
+		await server.start();
+		const created = server.store.createOperatorToken({
+			label: "oncall",
+			roles: ["fleet.read"],
+			workspaceIds: ["ws-1"],
+		});
+
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/api/v1/runs?query=${encodeURIComponent(
+				"ContainerAppConsoleLogs_CL | take 1",
+			)}`,
+			{ headers: { authorization: `Bearer ${created.token}` } },
+		);
+
+		// Refused rather than ignored: a silently dropped parameter answers 200
+		// with a superset of what was asked for.
+		expect(res.status).toBe(400);
+		expect((await res.json()).error).toBe("invalid_query");
+	});
+
+	it.each([
+		[
+			"reports a configured log source at startup",
+			{ logSource: LOG_SOURCE },
+			`kind ${LOG_SOURCE.kind}, workspace ${LOG_SOURCE.azure.workspaceId}`,
+		],
+		["reports an absent one just as plainly", {}, "not configured"],
+	])("%s", async (_label, fleetOperations, expected) => {
+		// Omitting `observability.logSource` and MISSPELLING its key are otherwise
+		// indistinguishable from outside — both start clean, advertise no
+		// `logs.query`, and disclose nothing — and the config schema strips an
+		// unknown top-level key in silence. Without a line either way, an operator
+		// debugging "my descriptor never arrives" has no evidence to go on.
+		const logger = testLogger();
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { "ws-1": { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => new CLIIssueTrackerService(),
+			fleetOperations,
+			logger,
+		});
+
+		expect(
+			logger.info.mock.calls.some(
+				(call: unknown[]) =>
+					typeof call[0] === "string" &&
+					call[0].includes("log source") &&
+					call[0].includes(expected),
+			),
+		).toBe(true);
+	});
 });
 
 describe("RouterServer /workspaces", () => {

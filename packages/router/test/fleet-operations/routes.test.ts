@@ -291,6 +291,41 @@ describe("fleet-operations routes", () => {
 			expect(body.observedAt).toBe(new Date(NOW).toISOString());
 		});
 
+		it("hands over locating metadata and no way to authenticate to the backend", async () => {
+			// The router never holds an Azure credential, so none can be serialized
+			// into a response. This pins the other half: the descriptor itself must
+			// carry no field a credential could be written into, which is what the
+			// wire schema's strictness enforces and what this asserts is still true.
+			const response = await mount().inject({
+				method: "GET",
+				url: "/api/v1/operator/context",
+				headers: { authorization: "Bearer hdr.reader.sig" },
+			});
+
+			const keys = flatten(response.json().logSource);
+			for (const credentialish of [
+				"sharedKey",
+				"connectionString",
+				"token",
+				"accessToken",
+				"apiKey",
+				"clientSecret",
+				"authorization",
+				"endpoint",
+				"authorityHost",
+			]) {
+				expect(keys).not.toContain(credentialish);
+			}
+			// Every leaf is a locator or a budget, and nothing else.
+			expect(Object.keys(response.json().logSource).sort()).toEqual([
+				"azure",
+				"budgets",
+				"displayName",
+				"kind",
+				"schemaVersion",
+			]);
+		});
+
 		it("grants the recovery capability only to a fleet.recover principal", async () => {
 			const response = await mount().inject({
 				method: "GET",

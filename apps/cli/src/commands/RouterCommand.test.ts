@@ -1485,6 +1485,402 @@ describe("RouterCommand", () => {
 		});
 	});
 
+	describe("observability.logSource", () => {
+		const WORKSPACE_GUID = "99999999-9999-9999-9999-999999999999";
+		const RESOURCE_ID = `/subscriptions/${WORKSPACE_GUID}/resourceGroups/cyrus/providers/Microsoft.OperationalInsights/workspaces/cyrus-logs`;
+
+		/** Writes a minimal router config with `observability` folded in. */
+		function writeObservabilityConfig(observability: unknown): void {
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					...(observability === undefined ? {} : { observability }),
+				}),
+			);
+		}
+
+		function readConfig(): any {
+			return (
+				new RouterCommand(createMockApp(cyrusHome) as any) as any
+			).readRouterConfig();
+		}
+
+		function expectRejected(observability: unknown): void {
+			writeObservabilityConfig(observability);
+			expect(() => readConfig()).toThrow("Invalid router config");
+		}
+
+		it("leaves the router unconfigured when no log source is declared", () => {
+			writeObservabilityConfig(undefined);
+
+			const config = readConfig();
+
+			// The acceptance criterion is "starts unchanged": no `fleetOperations`
+			// invented, so `RouterServer.servedOperatorCapabilities` never advertises
+			// `logs.query` and the context document carries no descriptor.
+			expect(config.observability).toBeUndefined();
+			expect(config.fleetOperations).toBeUndefined();
+		});
+
+		it("normalizes an Azure source into the credential-free wire descriptor", () => {
+			writeObservabilityConfig({
+				logSource: {
+					kind: "azure-log-analytics",
+					displayName: "cyrus-prod",
+					workspaceId: WORKSPACE_GUID,
+					resourceId: RESOURCE_ID,
+					cloud: "AzureGovernment",
+					defaults: {
+						lookbackMinutes: 30,
+						maximumRangeHours: 12,
+						maximumRecords: 2500,
+						followPollSeconds: 20,
+					},
+				},
+			});
+
+			const config = readConfig();
+
+			// The friendly alias is CONSUMED: what reaches RouterServerConfig is the
+			// v1 descriptor and nothing else, so there is one shape downstream.
+			expect(config.observability).toBeUndefined();
+			expect(config.fleetOperations?.logSource).toEqual({
+				schemaVersion: 1,
+				kind: "azure-log-analytics",
+				displayName: "cyrus-prod",
+				azure: {
+					workspaceId: WORKSPACE_GUID,
+					// Owned by the adapter, never by router configuration — an operator
+					// cannot name a table and the config has no field to name one in.
+					table: "ContainerAppConsoleLogs_CL",
+					cloud: "AzureUSGovernment",
+					resourceId: RESOURCE_ID,
+				},
+				budgets: {
+					defaultLookbackSeconds: 1800,
+					maxRangeSeconds: 43_200,
+					maxRecords: 2500,
+					minFollowIntervalSeconds: 20,
+				},
+			});
+		});
+
+		it("applies the documented budget defaults when none are declared", () => {
+			writeObservabilityConfig({
+				logSource: { kind: "azure-log-analytics", workspaceId: WORKSPACE_GUID },
+			});
+
+			expect(readConfig().fleetOperations?.logSource).toEqual({
+				schemaVersion: 1,
+				kind: "azure-log-analytics",
+				azure: {
+					workspaceId: WORKSPACE_GUID,
+					table: "ContainerAppConsoleLogs_CL",
+				},
+				budgets: {
+					defaultLookbackSeconds: 900,
+					maxRangeSeconds: 86_400,
+					maxRecords: 5000,
+					minFollowIntervalSeconds: 15,
+				},
+			});
+		});
+
+		it("merges partial defaults over the documented ones rather than dropping the rest", () => {
+			writeObservabilityConfig({
+				logSource: {
+					kind: "azure-log-analytics",
+					workspaceId: WORKSPACE_GUID,
+					defaults: { maximumRecords: 100 },
+				},
+			});
+
+			expect(readConfig().fleetOperations?.logSource.budgets).toEqual({
+				defaultLookbackSeconds: 900,
+				maxRangeSeconds: 86_400,
+				maxRecords: 100,
+				minFollowIntervalSeconds: 15,
+			});
+		});
+
+		it.each([
+			["not a GUID", "cyrus-prod-logs"],
+			["a GUID with surrounding whitespace", ` ${WORKSPACE_GUID} `],
+			["empty", ""],
+			["braced", `{${WORKSPACE_GUID}}`],
+		])("rejects a workspace ID that is %s", (_label, workspaceId) => {
+			// A Log Analytics workspace is addressed by its customer ID. Accepting
+			// anything else defers the failure to the operator's own client, which
+			// fails against Azure with a 404 that reads as a permissions problem.
+			expectRejected({
+				logSource: { kind: "azure-log-analytics", workspaceId },
+			});
+		});
+
+		it.each([
+			// The descriptor's whole safety property is that it cannot carry a way to
+			// reach a backend other than the one the deployment provisioned. A strict
+			// schema is what keeps an endpoint, an authority host, or a credential
+			// from being smuggled in beside the workspace ID.
+			["an endpoint override", { endpoint: "https://attacker.example" }],
+			[
+				"an authority host override",
+				{ authorityHost: "https://attacker.example" },
+			],
+			["a shared key", { sharedKey: "c2VjcmV0" }],
+			["a connection string", { connectionString: "InstrumentationKey=abc" }],
+			["a table override", { table: "Attacker_CL" }],
+			["a raw KQL query", { query: "ContainerAppConsoleLogs_CL | take 1" }],
+		])("refuses %s beside the workspace ID", (_label, extra) => {
+			expectRejected({
+				logSource: {
+					kind: "azure-log-analytics",
+					workspaceId: WORKSPACE_GUID,
+					...extra,
+				},
+			});
+		});
+
+		it.each([
+			["a URL", "https://attacker.example/logs"],
+			["a bare hostname", "attacker.example"],
+			[
+				"another resource provider",
+				`/subscriptions/${WORKSPACE_GUID}/resourceGroups/cyrus/providers/Microsoft.Storage/storageAccounts/exfil`,
+			],
+			["a relative path", "../../attacker"],
+		])("refuses a resource ID that is %s", (_label, resourceId) => {
+			// `resourceId` is the one free-form Azure field, so it is the one place an
+			// endpoint could hide. Pinned to an Operational Insights workspace ARM id.
+			expectRejected({
+				logSource: {
+					kind: "azure-log-analytics",
+					workspaceId: WORKSPACE_GUID,
+					resourceId,
+				},
+			});
+		});
+
+		it("refuses a cloud this adapter does not know", () => {
+			expectRejected({
+				logSource: {
+					kind: "azure-log-analytics",
+					workspaceId: WORKSPACE_GUID,
+					cloud: "https://attacker.example",
+				},
+			});
+		});
+
+		it("refuses a source kind the router cannot describe", () => {
+			expectRejected({
+				logSource: { kind: "splunk", workspaceId: WORKSPACE_GUID },
+			});
+		});
+
+		it.each([
+			["lookbackMinutes", 0],
+			["lookbackMinutes", -1],
+			["lookbackMinutes", 1.5],
+			["lookbackMinutes", 525_601],
+			["maximumRangeHours", 0],
+			["maximumRangeHours", -1],
+			["maximumRangeHours", 0.5],
+			["maximumRangeHours", 8761],
+			["maximumRecords", 0],
+			["maximumRecords", -1],
+			["maximumRecords", 10.5],
+			["maximumRecords", 1_000_001],
+			["followPollSeconds", 0],
+			["followPollSeconds", -1],
+			["followPollSeconds", 2.5],
+			["followPollSeconds", 86_401],
+		])("rejects the budget %s=%s", (field, value) => {
+			expectRejected({
+				logSource: {
+					kind: "azure-log-analytics",
+					workspaceId: WORKSPACE_GUID,
+					defaults: { [field]: value },
+				},
+			});
+		});
+
+		it("rejects a default lookback longer than the maximum range", () => {
+			// The wire schema refuses this too, and `FleetOperations.validateConfig`
+			// runs in its constructor, so either way the router refuses to start.
+			// Caught here the error names `lookbackMinutes` rather than a
+			// `defaultLookbackSeconds` this operator never wrote.
+			expectRejected({
+				logSource: {
+					kind: "azure-log-analytics",
+					workspaceId: WORKSPACE_GUID,
+					defaults: { lookbackMinutes: 120, maximumRangeHours: 1 },
+				},
+			});
+		});
+
+		it("accepts a default lookback exactly equal to the maximum range", () => {
+			writeObservabilityConfig({
+				logSource: {
+					kind: "azure-log-analytics",
+					workspaceId: WORKSPACE_GUID,
+					defaults: { lookbackMinutes: 60, maximumRangeHours: 1 },
+				},
+			});
+
+			expect(readConfig().fleetOperations?.logSource.budgets).toMatchObject({
+				defaultLookbackSeconds: 3600,
+				maxRangeSeconds: 3600,
+			});
+		});
+
+		it("refuses a config that declares the log source twice", () => {
+			// Two spellings of one setting is a silent-precedence bug waiting to
+			// happen: whichever lost would be edited for hours with no effect.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					observability: {
+						logSource: {
+							kind: "azure-log-analytics",
+							workspaceId: WORKSPACE_GUID,
+						},
+					},
+					fleetOperations: {
+						logSource: {
+							schemaVersion: 1,
+							kind: "azure-log-analytics",
+							azure: {
+								workspaceId: WORKSPACE_GUID,
+								table: "ContainerAppConsoleLogs_CL",
+							},
+							budgets: {
+								defaultLookbackSeconds: 900,
+								maxRangeSeconds: 86_400,
+								maxRecords: 5000,
+								minFollowIntervalSeconds: 15,
+							},
+						},
+					},
+				}),
+			);
+
+			expect(() => readConfig()).toThrow("Invalid router config");
+		});
+
+		it("keeps the descriptor form for a deployment that renders it whole", () => {
+			// `main.bicep` renders the v1 descriptor directly into
+			// CYRUS_ROUTER_FLEET_OPERATIONS_JSON, so the alias must not displace it.
+			const logSource = {
+				schemaVersion: 1,
+				kind: "azure-log-analytics",
+				azure: {
+					workspaceId: WORKSPACE_GUID,
+					table: "ContainerAppConsoleLogs_CL",
+					resourceId: RESOURCE_ID,
+				},
+				budgets: {
+					defaultLookbackSeconds: 900,
+					maxRangeSeconds: 86_400,
+					maxRecords: 5000,
+					minFollowIntervalSeconds: 15,
+				},
+			};
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					fleetOperations: { logSource },
+				}),
+			);
+
+			expect(readConfig().fleetOperations?.logSource).toEqual(logSource);
+		});
+
+		it.each([
+			["a workspace ID that is not a GUID", { workspaceId: "cyrus-prod-logs" }],
+			[
+				"a resource ID that is a URL",
+				{ resourceId: "https://attacker.example" },
+			],
+			[
+				"a resource ID carrying a CRLF",
+				{ resourceId: `${RESOURCE_ID}\r\nX-Evil: 1` },
+			],
+		])("refuses %s in the rendered descriptor too", (_label, override) => {
+			// The identifier rules live in the wire contract, not in the friendly
+			// alias, precisely so they hold on THIS path — the one `main.bicep` and
+			// `docker/router/entrypoint.mjs` render straight through, and therefore
+			// the one every Azure and Docker deployment takes. A rule true only of
+			// the hand-written form would be documented rather than enforced.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					fleetOperations: {
+						logSource: {
+							schemaVersion: 1,
+							kind: "azure-log-analytics",
+							azure: {
+								workspaceId: WORKSPACE_GUID,
+								table: "ContainerAppConsoleLogs_CL",
+								...override,
+							},
+							budgets: {
+								defaultLookbackSeconds: 900,
+								maxRangeSeconds: 86_400,
+								maxRecords: 5000,
+								minFollowIntervalSeconds: 15,
+							},
+						},
+					},
+				}),
+			);
+
+			expect(() => readConfig()).toThrow("Invalid router config");
+		});
+
+		it("refuses a rendered descriptor whose default lookback exceeds its range", () => {
+			// The hand-written form gets the wire schema's cross-field rules too,
+			// rather than only the field-by-field shape it used to be checked against.
+			writeFileSync(
+				join(cyrusHome, "router-config.json"),
+				JSON.stringify({
+					port: 8787,
+					workspaces: {},
+					webhook: { verificationMode: "direct", secret: "shh" },
+					fleetOperations: {
+						logSource: {
+							schemaVersion: 1,
+							kind: "azure-log-analytics",
+							azure: {
+								workspaceId: WORKSPACE_GUID,
+								table: "ContainerAppConsoleLogs_CL",
+							},
+							budgets: {
+								defaultLookbackSeconds: 999_999,
+								maxRangeSeconds: 86_400,
+								maxRecords: 5000,
+								minFollowIntervalSeconds: 15,
+							},
+						},
+					},
+				}),
+			);
+
+			expect(() => readConfig()).toThrow("Invalid router config");
+		});
+	});
+
 	describe("missing router database", () => {
 		it.each([
 			[["users", "list"]],

@@ -1070,6 +1070,23 @@ export class RouterServer {
 				`Fleet Operations Entra access enabled (tenant ${entra.tenantId}, audience ${entra.audience}, ${entra.grants.length} grant(s))`,
 			);
 		}
+		// Stated either way, because omitting the config and MISSPELLING its key
+		// are otherwise indistinguishable from outside: both start clean, advertise
+		// no `logs.query`, and disclose nothing. The config schema strips an
+		// unknown top-level key in silence — making that fatal would break every
+		// deployment carrying a stale field — so this line is what tells an
+		// operator whether the block they wrote was read. The workspace id is
+		// logged because it is exactly the value a typo lands in, and it is an
+		// identifier rather than a credential.
+		this.logger.info(
+			fleetConfig.logSource
+				? `Fleet Operations log source configured (kind ${fleetConfig.logSource.kind}${
+						fleetConfig.logSource.azure
+							? `, workspace ${fleetConfig.logSource.azure.workspaceId}`
+							: ""
+					})`
+				: "Fleet Operations log source not configured; no log-query capability will be advertised",
+		);
 	}
 
 	/**

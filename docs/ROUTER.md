@@ -81,6 +81,7 @@ Optional fields (with defaults):
 | `creatorOnlyPrompting` | `true` | Only the session's creator may send it new prompts (see [Creator-only prompting](#creator-only-prompting)). |
 | `heartbeatMs` | `30000` | WebSocket keepalive interval. The router terminates a socket that misses two consecutive pings, and advertises this value in `hello_ack` so each device's watchdog gives up at the same point (see [Device liveness watchdog](#device-liveness-watchdog)). |
 | `host` | `127.0.0.1` | Bind address. Put the router behind a TLS-terminating reverse proxy for `wss://`. |
+| `observability.logSource` | *(none)* | Where this router's historical logs live, advertised to authorized fleet operators. Omitted, nothing changes. See [Advertise the historical log source](#advertise-the-historical-log-source). |
 
 - `verificationMode: "direct"` verifies Linear's webhook signature with `secret`.
   Use `"proxy"` (Bearer token) if the router sits behind the Cyrus proxy.
@@ -1587,6 +1588,105 @@ role-specific command profiles),
 consume a durable change feed). They extend
 [ADR-0008](adr/0008-router-retains-agent-run-observations.md), which established
 that these observations report evidence rather than policy.
+
+### Advertise the historical log source
+
+A run observation says what a run is doing now. The log records behind it live in
+a backend the router does **not** proxy: per
+[ADR-0010](adr/0010-clients-query-log-sources-described-by-router.md) the router
+describes where the logs are and the operator's own client authenticates to that
+backend and queries it directly.
+
+So the router's whole log surface is one credential-free descriptor, disclosed on
+`GET /api/v1/operator/context` and nowhere else. **No router route accepts KQL,
+runs a historical query, or returns a log record**, and none ever will — that is
+what makes the descriptor safe to hand over: the router holds no Azure credential
+that a request or response log could serialize.
+
+Point a router at its Log Analytics workspace with `observability.logSource` in
+`router-config.json`:
+
+```json
+{
+  "observability": {
+    "logSource": {
+      "kind": "azure-log-analytics",
+      "displayName": "cyrus-prod",
+      "workspaceId": "00000000-0000-0000-0000-000000000000",
+      "resourceId": "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<name>"
+    }
+  }
+}
+```
+
+`workspaceId` is the workspace **customer ID** (Azure portal → your Log Analytics
+workspace → *Overview* → *Workspace ID*), not its name and not its resource id.
+`resourceId` is optional and must be that workspace's ARM id; it is what lets a
+client use the resource-centric query API. `cloud` is optional and defaults to the
+public cloud — `"AzurePublic"`, `"AzureGovernment"`, or `"AzureChina"`.
+
+Budgets are advertised with the descriptor and enforced by the querying client,
+which fails a command that would exceed one rather than silently truncating a
+result you would read as complete. Override any subset under `defaults`:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `lookbackMinutes` | `15` | How far back a query reaches when it names no range. |
+| `maximumRangeHours` | `24` | The widest range a single query may ask for. Must be at least `lookbackMinutes`. |
+| `maximumRecords` | `5000` | The most records one query may return. |
+| `followPollSeconds` | `15` | The fastest a follow/tail may re-poll the backend. |
+
+There is **no** `table` field, and that is deliberate:
+`ContainerAppConsoleLogs_CL`, the KQL compiled against it, and the columns that
+come back are the Azure adapter's knowledge, not router configuration. The
+descriptor is strict — an unknown key such as `endpoint`, `authorityHost`, or
+`sharedKey` is refused at startup rather than stripped, so a config that believed
+it was setting one fails loudly instead of running with it silently dropped.
+
+Who receives it is decided per request, not per config. The descriptor is
+withheld from an anonymous caller, from an unauthorized one, and from a **device
+token** — a device token's authority is its owner's own work, and the client
+queries the backend with no router-side filter, so granting it would turn "read
+your own runs" into "read every log line in every workspace" and disclose the
+workspace GUID on the way. Only a principal holding `fleet.read`, and therefore
+the `logs.query` capability, sees it.
+
+Omit `observability` entirely and the router is unchanged: it advertises no
+`logs.query` capability and the context document carries no descriptor.
+
+An Azure deployment does not need this block. `main.bicep` renders the already
+normalized v1 descriptor into `CYRUS_ROUTER_FLEET_OPERATIONS_JSON`, from the
+workspace it created — see
+[`infra/azure/bicep/README.md`](../infra/azure/bicep/README.md). That rendered
+form is still accepted verbatim as `fleetOperations.logSource`, and gets the same
+identifier checks — the GUID and ARM-path rules live in the wire contract, so
+they hold whichever key the source arrives under. Declaring the log source under
+both keys is refused, so there is no silent precedence between them.
+
+**A different backend later.** `kind` selects the adapter, and the run and
+recovery APIs do not mention log sources at all — so a second backend is a new
+`kind` plus its own locator, with nothing else on the wire moving. A non-Azure
+descriptor carries budgets, its own locator block, and no `azure`:
+
+```jsonc
+// Illustrative — Azure Log Analytics is the only backend with an adapter today.
+// The one other kind the schema accepts, "fake", exists for tests: configuring
+// it makes the router advertise a log capability that no client can query.
+{
+  "fleetOperations": {
+    "logSource": {
+      "schemaVersion": 1,
+      "kind": "<a-future-backend>",
+      "budgets": {
+        "defaultLookbackSeconds": 900,
+        "maxRangeSeconds": 86400,
+        "maxRecords": 5000,
+        "minFollowIntervalSeconds": 15
+      }
+    }
+  }
+}
+```
 
 ---
 
