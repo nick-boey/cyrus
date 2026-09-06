@@ -22,6 +22,7 @@ import {
 	type IAgentRunner,
 	type ILogger,
 	type IssueMinimal,
+	type LogEventAttributes,
 	type RepositoryContext,
 	type RunnerType,
 	type SerializedCyrusAgentSession,
@@ -630,6 +631,7 @@ export class AgentSessionManager extends EventEmitter {
 				log.event(
 					CYRUS_EVENTS.sessionTerminalDeferred,
 					cyrusAttributes({
+						...this.runFactAttributes(sessionId),
 						agent_session_id: sessionId,
 						terminal_state: terminalState,
 						session_cron_count: pendingWork.sessionCrons.length,
@@ -743,6 +745,41 @@ export class AgentSessionManager extends EventEmitter {
 		};
 	}
 
+	/**
+	 * The canonical attributes for a worker-emitted lifecycle event (CYR-72).
+	 *
+	 * Deliberately only the three facts the WORKER is the authority on:
+	 *
+	 *  - `session_id` — the Linear agent session id, which is the join key every
+	 *    other canonical column hangs off. Note this is NOT the same id as
+	 *    `agent_session_id` on the runner's own `session.*` events: that one is
+	 *    the agent SDK's session id, the two families do not join, and a KQL
+	 *    query that mixes them returns nothing rather than erroring. Both are
+	 *    emitted so either question can be asked.
+	 *  - `runner` / `model` — execution identity that exists nowhere else. The
+	 *    router learns them only because the worker reports them on a frame; a
+	 *    log line emitted before that frame lands would otherwise have no way to
+	 *    say what was actually running.
+	 *
+	 * The workspace, owner, team, project, run id and device id are deliberately
+	 * ABSENT rather than guessed. The worker has no trustworthy view of them, and
+	 * in router mode `SandboxLogRelay` stamps them from the authenticated device
+	 * and run rows anyway — a worker-supplied copy would be discarded there and
+	 * would only be believed on the one deployment where nothing checks it.
+	 *
+	 * Both run facts are omitted when unknown rather than sent as null: a
+	 * relayed line already gets the full null-filled canonical set from the
+	 * router, so nulls here would be bytes on the wire that change no query.
+	 */
+	private runFactAttributes(sessionId: string): LogEventAttributes {
+		const facts = this.getRunFacts(sessionId);
+		return {
+			session_id: sessionId,
+			...(facts.runner ? { runner: facts.runner } : {}),
+			...(facts.model ? { model: facts.model } : {}),
+		};
+	}
+
 	private consumeStopRequest(linearAgentActivitySessionId: string): boolean {
 		if (!this.stopRequestedSessions.has(linearAgentActivitySessionId)) {
 			return false;
@@ -839,6 +876,10 @@ export class AgentSessionManager extends EventEmitter {
 		this.sessionLog(sessionId).event(
 			CYRUS_EVENTS.sessionTerminalSignalled,
 			cyrusAttributes({
+				// Captured before the session row is torn down, so the runner and
+				// model on the closing record describe the turn that just ended
+				// rather than reading as absent.
+				...this.runFactAttributes(sessionId),
 				agent_session_id: sessionId,
 				terminal_state: state,
 				forced: opts?.force ?? false,

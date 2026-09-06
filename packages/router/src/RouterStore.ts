@@ -3111,6 +3111,38 @@ export class RouterStore {
 	 * Ordered the same way {@link finishAgentRun} orders it, so both see the same
 	 * row for a session that has been routed more than once.
 	 */
+	/**
+	 * The most recent run recorded against a device, in full.
+	 *
+	 * Read on the log-relay path to attribute a sandbox worker's lines to the run
+	 * they belong to. Deliberately the LATEST run rather than the latest
+	 * non-terminal one: the seconds after a run ends are when a worker flushes its
+	 * closing artifacts, and attributing those lines to nothing would blank
+	 * exactly the window an operator investigating a failed run looks at first.
+	 *
+	 * One point read on `idx_agent_runs_device`, and it stays that way: this runs
+	 * per forwarded log line, so anything that turns it into a join or a scan
+	 * becomes a per-line cost on the router's hottest device path.
+	 */
+	getLatestAgentRunForDevice(deviceId: number): AgentRunInfo | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT * FROM agent_runs WHERE device_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
+			)
+			.get(deviceId) as AgentRunRow | undefined;
+		return row === undefined ? undefined : toAgentRunInfo(row);
+	}
+
+	/** The full run row for a session, or undefined when it has never been routed. */
+	getAgentRunForSession(sessionId: string): AgentRunInfo | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT * FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
+			)
+			.get(sessionId) as AgentRunRow | undefined;
+		return row === undefined ? undefined : toAgentRunInfo(row);
+	}
+
 	getLatestAgentRunForSession(
 		sessionId: string,
 	): { deviceId: number; state: string } | undefined {

@@ -1,8 +1,9 @@
 import {
 	createLogger,
-	cyrusAttributes,
 	type ILogger,
 	type LogEventAttributes,
+	type RunAttribution,
+	runAttributionAttributes,
 } from "cyrus-core";
 import type { LogFrame } from "cyrus-router-protocol";
 
@@ -42,11 +43,29 @@ const MAX_STACKTRACE_CHARS = 8_000;
  */
 const MAX_CACHED_LOGGERS = 64;
 
+/**
+ * Trace-correlation keys a worker may never set directly. Unlike the canonical
+ * `cyrus.*` set, these are absent from the built bag whenever the frame carried
+ * no traceparent — so "the key is already taken" is not a sufficient guard for
+ * them.
+ */
+const RESERVED_TRACE_KEYS = new Set(["trace_id", "span_id"]);
+
 /** Identity the ROUTER holds for a device, not anything the device asserted. */
 export interface SandboxLogOrigin {
 	deviceId: number;
 	issueKey?: string;
 	provider?: string;
+	/**
+	 * The canonical facts of the run this device is currently carrying, read
+	 * from the router's own `agent_runs` row.
+	 *
+	 * Optional, and its absence is meaningful rather than a gap to paper over: a
+	 * container logs from the moment it boots, which is before its first route
+	 * creates a run. Those lines get the canonical columns as `null`, never a
+	 * value taken from the frame — see {@link SandboxLogRelay}.
+	 */
+	run?: RunAttribution;
 }
 
 /**
@@ -63,11 +82,19 @@ export interface SandboxLogOrigin {
  * Azure credential inside the sandbox.
  *
  * ── ATTRIBUTION IS ROUTER-SIDE ──
- * `cyrus.device_id` / `cyrus.issue_key` come from the device row the gateway
- * authenticated, NOT from the frame. A worker cannot label its logs with someone
- * else's issue. The device's own `issueIdentifier` is carried separately as
- * `cyrus.reported_issue_identifier` so a mismatch is visible rather than
- * silently resolved one way or the other.
+ * Every canonical attribute — the workspace, owner, team, project, run, session,
+ * issue, device, runner, model and provider — comes from the device row the
+ * gateway authenticated and the run row the router itself wrote, NOT from the
+ * frame. A worker cannot label its logs with someone else's issue, run or
+ * workspace. That guarantee is structural rather than a denylist: the canonical
+ * keys are ALWAYS present (as `null` when unknown), and worker attributes are
+ * merged only into keys the router has not already claimed, so there is no key
+ * for a spoofed value to land in and no list anyone has to remember to extend.
+ *
+ * The device's own `issueIdentifier` and `sessionId` are carried separately as
+ * `cyrus.reported_issue_identifier` / `cyrus.reported_session_id` when they
+ * disagree with the router's view, so a mismatch is visible rather than silently
+ * resolved one way or the other.
  *
  * ── LEVEL MAPPING ──
  * A worker's WARN/ERROR is re-emitted at the SAME level, which means it also
@@ -152,23 +179,35 @@ export class SandboxLogRelay {
 			this.loggers.set(safeComponent, base);
 		}
 
-		// Router-side attribution, namespaced like every other Cyrus-specific
-		// attribute (see `cyrusAttributes`). The structural keys below — `event`,
+		// Router-side attribution, built by the one shared builder every Cyrus
+		// logger uses so a relayed line and a router-emitted one agree key for key
+		// (see `runAttributionAttributes`). The structural keys below — `event`,
 		// `args`, and the W3C trace-context pair — are deliberately NOT namespaced:
 		// `event` and `args` mirror `LogRecord`'s own fields on the direct path, so
 		// namespacing them here would make a relayed line and a locally-emitted one
 		// disagree about the same fact, and `traceparent`/`tracestate` are
 		// standard names owned by W3C rather than by us.
-		const attributes: LogEventAttributes = cyrusAttributes({
-			source: SANDBOX_LOG_SOURCE,
-			device_id: origin.deviceId,
-			issue_key: origin.issueKey ?? null,
-			provider: origin.provider ?? null,
-			// The device's clock, kept alongside the router's own timestamp so a
-			// clock skew between sandbox and router is visible rather than
-			// silently reordering the stream.
-			emitted_at: frame.ts,
-		});
+		//
+		// The device/issue/provider triple is stamped OVER the run's own copy: the
+		// device row is what the gateway authenticated this socket as, which is a
+		// stronger claim than anything derived from a row the run once wrote.
+		const attributes: LogEventAttributes = runAttributionAttributes(
+			{
+				...origin.run,
+				deviceId: origin.deviceId,
+				issueKey: origin.issueKey ?? origin.run?.issueKey ?? null,
+				provider: origin.provider ?? origin.run?.provider ?? null,
+				source: SANDBOX_LOG_SOURCE,
+			},
+			// Derived from the frame's own carrier, which is the only trace context
+			// that describes the worker's call site. `trace_id`/`span_id` land
+			// unnamespaced so they join Azure's `OperationId` directly.
+			{ traceparent: frame.traceparent },
+		);
+		// The device's clock, kept alongside the router's own timestamp so a
+		// clock skew between sandbox and router is visible rather than silently
+		// reordering the stream.
+		attributes["cyrus.emitted_at"] = frame.ts;
 		if (frame.event !== undefined) attributes.event = frame.event;
 		if (frame.args !== undefined) {
 			attributes.args = truncate(frame.args, MAX_ATTRIBUTE_CHARS);
@@ -193,9 +232,26 @@ export class SandboxLogRelay {
 			// the class doc on router-side attribution.
 			attributes["cyrus.reported_issue_identifier"] = frame.issueIdentifier;
 		}
+		if (
+			frame.sessionId !== undefined &&
+			frame.sessionId !== origin.run?.sessionId
+		) {
+			// Same rule as the issue identifier. Worth recording separately because
+			// the two ids disagreeing is exactly what a worker still logging under a
+			// finished session looks like, and `cyrus.session_id` alone would show
+			// the router's (correct, but silent) view of that.
+			attributes["cyrus.reported_session_id"] = frame.sessionId;
+		}
 		for (const [key, value] of boundedEntries(frame.attributes)) {
-			// Worker attributes never override the router's attribution keys.
+			// Worker attributes never override the router's attribution keys. Every
+			// canonical key is already present (as `null` when unknown), so this one
+			// check covers the whole spoof surface without a denylist.
 			if (key in attributes) continue;
+			// The exception the `key in attributes` test cannot cover: trace ids are
+			// emitted only when the ROUTER could derive them, so a frame with no
+			// traceparent leaves the keys free. A forged one would join this line to
+			// a trace it has nothing to do with, which reads as evidence.
+			if (RESERVED_TRACE_KEYS.has(key)) continue;
 			attributes[key] = value;
 		}
 

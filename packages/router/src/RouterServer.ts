@@ -65,6 +65,7 @@ import {
 } from "./RepositoryRegistry.js";
 import { RepositoryResolver } from "./RepositoryResolver.js";
 import { RouterStore } from "./RouterStore.js";
+import { resolveLogRunAttribution, runAttribution } from "./RouterTelemetry.js";
 import { registerRunsRoute } from "./runs.js";
 import { SandboxLogRelay } from "./SandboxLogRelay.js";
 import { SandboxSpanRelay } from "./SandboxSpanRelay.js";
@@ -832,10 +833,22 @@ export class RouterServer {
 		// comes from the device row, never from the frame.
 		this.gateway.on("log", (deviceId: number, frame: LogFrame) => {
 			const info = this.store.getDeviceInfo(deviceId);
+			// The run this line belongs to, so a relayed line carries the same
+			// canonical workspace/owner/team/project/run columns the router's own
+			// lines do and one `where p["cyrus.run_id"] == …` returns both sides.
+			// Undefined before the device's first route, and for any line whose
+			// session the router cannot vouch for — the relay renders that as nulls
+			// rather than guessing.
+			const run = resolveLogRunAttribution(this.store, {
+				deviceId,
+				...(info?.kind ? { kind: info.kind } : {}),
+				...(frame.sessionId ? { sessionId: frame.sessionId } : {}),
+			});
 			this.sandboxLogRelay.relay(frame, {
 				deviceId,
 				...(info?.issueKey ? { issueKey: info.issueKey } : {}),
 				...(info?.provider ? { provider: info.provider } : {}),
+				...(run ? { run: runAttribution(run) } : {}),
 			});
 		});
 		// Sandbox worker spans. Handed straight to the router's own span exporter

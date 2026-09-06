@@ -8,6 +8,7 @@ import {
 	isIssueDeletedWebhook,
 	isIssueStateChangeWebhook,
 	type LogEventAttributes,
+	type RunAttribution,
 	type Webhook,
 } from "cyrus-core";
 import {
@@ -60,7 +61,13 @@ import type {
 import type { AgentRunWait, RouterStore } from "./RouterStore.js";
 import {
 	emitRoutingRejection,
+	emitRunEvent,
 	emitSessionOwnershipRefusal,
+	RUN_EVENTS,
+	type RunEventName,
+	type RunUnknownReason,
+	routingAttribution,
+	runAttribution,
 	type SessionOwnershipRefusal,
 } from "./RouterTelemetry.js";
 import {
@@ -628,7 +635,18 @@ export class EventRouter {
 		refusal: SessionOwnershipRefusal,
 		message: string,
 	): void {
-		emitSessionOwnershipRefusal(this.logger, refusal);
+		// The run the refused claim was aimed at, so a refusal is filterable by the
+		// same workspace/owner/team/project columns as the run itself. Read once
+		// and shared by both halves — the event and the WARN — because an operator
+		// pivoting from one to the other must not find them disagreeing.
+		const run = refusal.sessionId
+			? this.store.getAgentRunForSession(refusal.sessionId)
+			: undefined;
+		const attribution = run ? runAttribution(run) : undefined;
+		emitSessionOwnershipRefusal(this.logger, {
+			...refusal,
+			...(attribution ? { attribution } : {}),
+		});
 		this.logger
 			.withContext({
 				...(refusal.sessionId !== undefined
@@ -851,6 +869,15 @@ export class EventRouter {
 			now,
 			readFrameRunFacts(frame),
 		);
+		// After the write, so the runner and model the terminal frame just supplied
+		// are on the line. For an ordinary run — one that never waited and never
+		// deferred — this frame is the ONLY point those two facts are ever
+		// reported, so emitting before the write would leave every such run's
+		// closing record saying `runner = null`.
+		this.emitRunLifecycle(frame.sessionId, RUN_EVENTS.finished, {
+			terminal_state: frame.state,
+			reporting_device_id: deviceId,
+		});
 		// Granted BEFORE the two releases below, so there is no instant in which
 		// the terminating device owns the session by none of the routes
 		// `getSessionOwner` checks. Unlike the park path, which keeps the issue
@@ -966,6 +993,10 @@ export class EventRouter {
 		for (const { issueId, sessionId } of locks) {
 			if (declared.has(sessionId)) continue;
 			this.store.markAgentRunUnknown(sessionId, this.now());
+			this.emitRunLifecycle(sessionId, RUN_EVENTS.unknown, {
+				reason: "lock_reconciled" satisfies RunUnknownReason,
+				reporting_device_id: deviceId,
+			});
 			this.store.releaseIssueLockForSession(sessionId);
 			this.store.clearSessionAffinity(sessionId);
 			const workspaceId = this.sessionWorkspace.get(sessionId);
@@ -1030,6 +1061,10 @@ export class EventRouter {
 				continue;
 			}
 			this.store.markAgentRunUnknown(sessionId, nowMs);
+			this.emitRunLifecycle(sessionId, RUN_EVENTS.unknown, {
+				reason: "affinity_reconciled" satisfies RunUnknownReason,
+				reporting_device_id: deviceId,
+			});
 			this.store.clearSessionAffinity(sessionId);
 			this.logger.info(
 				`Reclaimed stale affinity for session ${sessionId} on device ${deviceId}: ` +
@@ -1064,6 +1099,10 @@ export class EventRouter {
 			// it isn't held by a session that will never run.
 			if (isAgentSessionCreatedWebhook(session)) {
 				this.store.markAgentRunUnknown(sessionId, now);
+				this.emitRunLifecycle(sessionId, RUN_EVENTS.unknown, {
+					reason: "event_expired" satisfies RunUnknownReason,
+					reporting_device_id: row.deviceId,
+				});
 				this.store.releaseIssueLockForSession(sessionId);
 				this.store.clearSessionAffinity(sessionId);
 			}
@@ -1285,6 +1324,7 @@ export class EventRouter {
 				fillTemplate(NO_REPOSITORIES_MESSAGE, { reason: outcome.reason }),
 			);
 			emitRoutingRejection(this.logger, {
+				attribution: this.rejectionAttribution(webhook, sessionId),
 				reason: "repositories_unavailable",
 				sessionId,
 				...(issueId !== undefined ? { issueId } : {}),
@@ -1700,6 +1740,7 @@ export class EventRouter {
 				fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: invalidIssueKey }),
 			);
 			emitRoutingRejection(this.logger, {
+				attribution: this.rejectionAttribution(webhook, sessionId),
 				reason: "invalid_issue_key",
 				sessionId,
 				...(issueId !== undefined ? { issueId } : {}),
@@ -1718,6 +1759,7 @@ export class EventRouter {
 				fillTemplate(UNENROLLED_CREATOR_MESSAGE, { userName }),
 			);
 			emitRoutingRejection(this.logger, {
+				attribution: this.rejectionAttribution(webhook, sessionId),
 				reason: "unenrolled_creator",
 				sessionId,
 				...(issueId !== undefined ? { issueId } : {}),
@@ -1766,6 +1808,7 @@ export class EventRouter {
 						: ISSUE_LOCKED_MESSAGE,
 				);
 				emitRoutingRejection(this.logger, {
+					attribution: this.rejectionAttribution(webhook, sessionId),
 					reason: "issue_locked",
 					sessionId,
 					issueId,
@@ -1817,6 +1860,52 @@ export class EventRouter {
 		if (issueId !== undefined) {
 			await this.promoteIssue(workspaceId, issueId);
 		}
+	}
+
+	/**
+	 * The canonical attribution to stamp on a routing REJECTION.
+	 *
+	 * Prefers the session's existing run, so a prompt rejected against a session
+	 * that has already been routed carries the same workspace/owner/team/project
+	 * columns as that run's own `run.routed` line — which is what lets one
+	 * `where p["cyrus.session_id"] == …` return the whole story instead of two
+	 * halves that have to be joined by hand.
+	 *
+	 * Falls back to the webhook's own snapshot for a session that never got a
+	 * run, which is the common case: most rejections happen before one exists.
+	 * Everything the snapshot cannot supply stays null. Notably the OWNER: a
+	 * rejection for an unenrolled creator has, by definition, no Cyrus user to
+	 * attribute to, and inventing one from the webhook's actor would put a
+	 * non-existent owner into the column every ownership filter reads.
+	 */
+	private rejectionAttribution(
+		webhook: SessionEvent,
+		sessionId: string,
+	): RunAttribution {
+		const run = this.store.getAgentRunForSession(sessionId);
+		return run
+			? runAttribution(run)
+			: routingAttribution(extractRoutingSnapshot(webhook));
+	}
+
+	/**
+	 * Emit one run-lifecycle event, reading the run back so the attributes are
+	 * the row's, not the caller's idea of it.
+	 *
+	 * The read-back matters: `recordAgentRunRouted` and `finishAgentRun` both
+	 * merge into an existing row, so the facts on the emitted line (the runner a
+	 * terminal frame just supplied, the project a prior enrichment filled in) are
+	 * only correct after the write. A no-op when the run cannot be found —
+	 * a lifecycle event with no run to attribute is not worth a guessed one.
+	 */
+	private emitRunLifecycle(
+		sessionId: string,
+		name: RunEventName,
+		extra?: LogEventAttributes,
+	): void {
+		const run = this.store.getAgentRunForSession(sessionId);
+		if (!run) return;
+		emitRunEvent(this.logger, name, runAttribution(run), extra);
 	}
 
 	/**
@@ -1939,6 +2028,7 @@ export class EventRouter {
 					PROMPT_REJECTION_MESSAGE,
 				);
 				emitRoutingRejection(this.logger, {
+					attribution: this.rejectionAttribution(webhook, sessionId),
 					reason: "non_creator_prompt",
 					sessionId,
 				});
@@ -2174,6 +2264,7 @@ export class EventRouter {
 				fillTemplate(INVALID_ISSUE_KEY_MESSAGE, { issueKey: invalidIssueKey }),
 			);
 			emitRoutingRejection(this.logger, {
+				attribution: this.rejectionAttribution(webhook, sessionId),
 				reason: "invalid_issue_key",
 				sessionId,
 				...(issueId !== undefined ? { issueId } : {}),
@@ -2191,6 +2282,7 @@ export class EventRouter {
 				PROMPT_UNROUTABLE_MESSAGE,
 			);
 			emitRoutingRejection(this.logger, {
+				attribution: this.rejectionAttribution(webhook, sessionId),
 				reason: "prompt_unroutable",
 				sessionId,
 				...(issueId !== undefined ? { issueId } : {}),
@@ -2234,6 +2326,7 @@ export class EventRouter {
 					// this gate rejects them again. Left at `info` with no event,
 					// that loop was invisible from both ends (NOR-402).
 					emitRoutingRejection(this.logger, {
+						attribution: this.rejectionAttribution(webhook, sessionId),
 						reason: "non_creator_prompt",
 						sessionId,
 						...(issueId !== undefined ? { issueId } : {}),
@@ -2370,6 +2463,10 @@ export class EventRouter {
 			// id). Clear it and fall through the chain below instead of
 			// routing into the void.
 			this.store.markAgentRunUnknown(sessionId, this.now());
+			this.emitRunLifecycle(sessionId, RUN_EVENTS.unknown, {
+				reason: "dangling_affinity" satisfies RunUnknownReason,
+				reporting_device_id: affinityDevice,
+			});
 			this.store.clearSessionAffinity(sessionId);
 			this.logger.warn(
 				`Session ${sessionId} affinity pointed at deleted device ${affinityDevice}; clearing and re-resolving`,
@@ -2565,6 +2662,15 @@ export class EventRouter {
 			// for a long-lived physical device, potentially never.
 			workerOnline: this.gateway.isOnline(target.deviceId),
 			...input,
+		});
+		// The run's first appearance in the log stream, and the anchor every later
+		// line about it is correlated to. Emitted BEFORE the enrichment below, so
+		// its project columns can still be null — deliberately: this records what
+		// was known when the route happened, and a line that waited for a Linear
+		// round trip would no longer be that.
+		this.emitRunLifecycle(sessionId, RUN_EVENTS.routed, {
+			target_kind: target.kind,
+			worker_online: this.gateway.isOnline(target.deviceId),
 		});
 		// The project is not on the webhook at any nesting, so it takes a Linear
 		// read. Fire-and-forget and gated on the snapshot still being blank, so it

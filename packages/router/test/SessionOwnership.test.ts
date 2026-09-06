@@ -519,12 +519,64 @@ describe("session-scoped RPC rejection logging (NOR-405)", () => {
 		const event = recorder.sink.find({ event: "session.ownership_refused" });
 		expect(event).toBeDefined();
 		expect(event?.attributes).toEqual({
+			// Pre-CYR-72 keys, unchanged: the saved search reads them by name.
 			"cyrus.reason": "rpc_not_owned",
 			"cyrus.agent_session_id": "sess-not-ours",
 			"cyrus.device_id": 4242,
 			"cyrus.owner_device_id": null,
 			"cyrus.rpc_method": "createAgentActivity",
 			"cyrus.session_state": null,
+			// The canonical set (CYR-72). All null here: this session was never
+			// routed in this harness, so the router has no run to attribute the
+			// refused claim to — and it does not invent one from the frame.
+			"cyrus.session_id": "sess-not-ours",
+			"cyrus.workspace_id": null,
+			"cyrus.workspace_name": null,
+			"cyrus.owner_id": null,
+			"cyrus.owner_name": null,
+			"cyrus.team_id": null,
+			"cyrus.team_name": null,
+			"cyrus.project_id": null,
+			"cyrus.project_name": null,
+			"cyrus.issue_key": null,
+			"cyrus.run_id": null,
+			"cyrus.runner": null,
+			"cyrus.model": null,
+			"cyrus.provider": null,
+			"cyrus.source": "router",
+		});
+	});
+
+	/**
+	 * CYR-72. The refusal above is attributed to nothing because the session was
+	 * never routed in that harness. This one routes first, so the refusal — which
+	 * IS the lost Linear post — carries the run's own workspace, issue and run id
+	 * and can be found by the per-workspace query an operator would actually run,
+	 * rather than only by someone who already knows the session id.
+	 */
+	it("attributes a refused RPC to the run whose activity was dropped", async () => {
+		const h = makeHarness({
+			executorLogger: createLogger({
+				component: "LinearExecutor",
+				level: LogLevel.SILENT,
+			}),
+		});
+		await h.router.route(createdEvent());
+		const mallory = h.deviceId + 1;
+
+		await h.executor.dispatch(mallory, activityFrame());
+
+		const event = recorder.sink.find({ event: "session.ownership_refused" });
+		expect(event?.attributes).toMatchObject({
+			"cyrus.reason": "rpc_not_owned",
+			"cyrus.workspace_id": WS,
+			"cyrus.issue_key": "PAR-275",
+			"cyrus.session_id": SESSION,
+			"cyrus.run_id": expect.any(String),
+			"cyrus.owner_id": "1",
+			"cyrus.source": "router",
+			// The device that made the claim, not the one that holds the session.
+			"cyrus.device_id": mallory,
 		});
 	});
 

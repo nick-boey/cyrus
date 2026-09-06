@@ -1,3 +1,4 @@
+import { CANONICAL_RUN_ATTRIBUTE_KEYS } from "cyrus-core";
 import type { LogFrame } from "cyrus-router-protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SandboxLogRelay } from "../src/SandboxLogRelay.js";
@@ -185,6 +186,193 @@ describe("SandboxLogRelay", () => {
 			event: "sandbox.gauge",
 			traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
 			tracestate: "cyrus=1",
+		});
+	});
+
+	describe("canonical run attribution (CYR-72)", () => {
+		const RUN = {
+			workspaceId: "ws-1",
+			workspaceName: "Northrop Digital",
+			ownerId: "9",
+			ownerName: "nboey",
+			teamId: "team-3",
+			teamName: "Cyrus",
+			projectId: "proj-7",
+			projectName: "Fleet observability",
+			runId: "run-abc",
+			sessionId: "sess-1",
+			runner: "claude",
+			model: "claude-opus-5",
+		};
+
+		it("stamps every canonical attribute from the router's run observation", () => {
+			relay.relay(frame(), {
+				deviceId: 42,
+				issueKey: "CYR-72",
+				provider: "aca",
+				run: RUN,
+			});
+			expect(parseLine(warn)).toMatchObject({
+				"cyrus.workspace_id": "ws-1",
+				"cyrus.workspace_name": "Northrop Digital",
+				"cyrus.owner_id": "9",
+				"cyrus.owner_name": "nboey",
+				"cyrus.team_id": "team-3",
+				"cyrus.team_name": "Cyrus",
+				"cyrus.project_id": "proj-7",
+				"cyrus.project_name": "Fleet observability",
+				"cyrus.issue_key": "CYR-72",
+				"cyrus.run_id": "run-abc",
+				"cyrus.session_id": "sess-1",
+				"cyrus.device_id": 42,
+				"cyrus.runner": "claude",
+				"cyrus.model": "claude-opus-5",
+				"cyrus.provider": "aca",
+				"cyrus.source": "sandbox",
+			});
+		});
+
+		it("emits every canonical key as null when no run is known", () => {
+			// A worker that logs before its first route has no run. The columns must
+			// still exist, or `where isnull(p["cyrus.run_id"])` cannot find it.
+			relay.relay(frame(), { deviceId: 3 });
+			const line = parseLine(warn);
+			for (const key of CANONICAL_RUN_ATTRIBUTE_KEYS) {
+				expect(line).toHaveProperty(key);
+			}
+			expect(line["cyrus.run_id"]).toBeNull();
+			expect(line["cyrus.workspace_id"]).toBeNull();
+			expect(line["cyrus.owner_name"]).toBeNull();
+			// The two the router always knows, even with no run.
+			expect(line["cyrus.device_id"]).toBe(3);
+			expect(line["cyrus.source"]).toBe("sandbox");
+		});
+
+		it("refuses every canonical key a worker tries to supply", () => {
+			// The acceptance criterion: a container cannot label its logs with
+			// another owner, workspace, run, issue or device. The canonical keys are
+			// always present — that is what leaves the worker's copies nowhere to
+			// land, rather than a per-key denylist someone must remember to extend.
+			relay.relay(
+				frame({
+					attributes: {
+						"cyrus.workspace_id": "ws-victim",
+						"cyrus.owner_id": "1",
+						"cyrus.owner_name": "someone-else",
+						"cyrus.team_id": "team-victim",
+						"cyrus.project_id": "proj-victim",
+						"cyrus.run_id": "run-victim",
+						"cyrus.session_id": "sess-victim",
+						"cyrus.device_id": 999,
+						"cyrus.issue_key": "NOR-999",
+						"cyrus.runner": "codex",
+						"cyrus.model": "gpt-5",
+						"cyrus.provider": "spoofed",
+						"cyrus.source": "router",
+					},
+				}),
+				{ deviceId: 42, issueKey: "CYR-72", provider: "aca", run: RUN },
+			);
+			expect(parseLine(warn)).toMatchObject({
+				"cyrus.workspace_id": "ws-1",
+				"cyrus.owner_id": "9",
+				"cyrus.owner_name": "nboey",
+				"cyrus.team_id": "team-3",
+				"cyrus.project_id": "proj-7",
+				"cyrus.run_id": "run-abc",
+				"cyrus.session_id": "sess-1",
+				"cyrus.device_id": 42,
+				"cyrus.issue_key": "CYR-72",
+				"cyrus.runner": "claude",
+				"cyrus.model": "claude-opus-5",
+				"cyrus.provider": "aca",
+				"cyrus.source": "sandbox",
+			});
+		});
+
+		it("keeps a canonical key null rather than accepting the worker's value for it", () => {
+			// The dangerous half of the rule: with no run on record, "unknown" must
+			// stay unknown. Falling back to the frame would make an unrouted worker
+			// the authority on which workspace its own logs belong to.
+			relay.relay(
+				frame({ attributes: { "cyrus.workspace_id": "ws-victim" } }),
+				{ deviceId: 42 },
+			);
+			expect(parseLine(warn)["cyrus.workspace_id"]).toBeNull();
+		});
+
+		it("records a session id the device claims that the router disagrees with", () => {
+			// Same treatment as `issueIdentifier`: the disagreement is visible rather
+			// than silently resolved, and the router's view is the one that filters.
+			relay.relay(frame({ sessionId: "sess-claimed" }), {
+				deviceId: 42,
+				run: RUN,
+			});
+			const line = parseLine(warn);
+			expect(line["cyrus.session_id"]).toBe("sess-1");
+			expect(line["cyrus.reported_session_id"]).toBe("sess-claimed");
+			// Structural context is untouched — it is what the worker's own logger
+			// scoped the line to, and existing queries read it.
+			expect(line.sessionId).toBe("sess-claimed");
+		});
+
+		it("omits cyrus.reported_session_id when the two agree", () => {
+			relay.relay(frame({ sessionId: "sess-1" }), { deviceId: 42, run: RUN });
+			expect(parseLine(warn)).not.toHaveProperty("cyrus.reported_session_id");
+		});
+
+		it("derives trace_id and span_id from the frame's traceparent", () => {
+			relay.relay(
+				frame({
+					traceparent:
+						"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+				}),
+				{ deviceId: 1 },
+			);
+			const line = parseLine(warn);
+			// The raw header stays too: it is what a future relay hop re-injects.
+			expect(line.traceparent).toBe(
+				"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+			);
+			expect(line.trace_id).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+			expect(line.span_id).toBe("00f067aa0ba902b7");
+		});
+
+		it("omits trace_id and span_id when the frame carries no trace context", () => {
+			relay.relay(frame(), { deviceId: 1 });
+			const line = parseLine(warn);
+			expect(line).not.toHaveProperty("trace_id");
+			expect(line).not.toHaveProperty("span_id");
+		});
+
+		it("refuses a trace_id a worker supplies as a plain attribute", () => {
+			relay.relay(
+				frame({
+					traceparent:
+						"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+					attributes: { trace_id: "deadbeefdeadbeefdeadbeefdeadbeef" },
+				}),
+				{ deviceId: 1 },
+			);
+			expect(parseLine(warn).trace_id).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+		});
+
+		it("still carries the worker's non-canonical attributes", () => {
+			// The canonical set is a floor, not a ceiling — an event's own payload
+			// (`cyrus.reason`, `cyrus.sessions`, …) is why the line was worth
+			// forwarding in the first place.
+			relay.relay(
+				frame({
+					event: "sandbox.gauge",
+					attributes: { "cyrus.sessions": 2, "cyrus.reason": "clock_moved" },
+				}),
+				{ deviceId: 1, run: RUN },
+			);
+			expect(parseLine(warn)).toMatchObject({
+				event: "sandbox.gauge",
+				"cyrus.sessions": 2,
+				"cyrus.reason": "clock_moved",
+			});
 		});
 	});
 
