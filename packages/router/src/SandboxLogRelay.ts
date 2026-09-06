@@ -44,12 +44,35 @@ const MAX_STACKTRACE_CHARS = 8_000;
 const MAX_CACHED_LOGGERS = 64;
 
 /**
- * Trace-correlation keys a worker may never set directly. Unlike the canonical
- * `cyrus.*` set, these are absent from the built bag whenever the frame carried
- * no traceparent — so "the key is already taken" is not a sufficient guard for
- * them.
+ * Keys a worker may never set through its attribute bag.
+ *
+ * "The key is already taken" guards the canonical `cyrus.*` set, because those
+ * are built unconditionally. It does NOT guard these, which the relay sets only
+ * when the frame supplies the corresponding field — so a frame that simply omits
+ * the field leaves the key free for the attribute bag to fill.
+ *
+ * `event` is the dangerous one and the reason this list is not optional. A
+ * relayed line now carries authentic, router-stamped `cyrus.run_id` / workspace
+ * / owner / team, so a worker sending `attributes: { event: "run.finished" }`
+ * with no `frame.event` would produce a record indistinguishable from a
+ * router-emitted lifecycle event for its own real run — and
+ * `event startswith "sandbox."` is how every alert rule in `monitoring.bicep`
+ * is scoped. The rest are here because they are equally router-owned: the
+ * dropped count is loss accounting, the `reported_*` pair is the router's record
+ * of a disagreement, and the trace context is what a line joins to a trace by.
  */
-const RESERVED_TRACE_KEYS = new Set(["trace_id", "span_id"]);
+const WORKER_RESERVED_KEYS = new Set([
+	"event",
+	"args",
+	"traceparent",
+	"tracestate",
+	"trace_id",
+	"span_id",
+	"cyrus.dropped",
+	"cyrus.emitted_at",
+	"cyrus.reported_issue_identifier",
+	"cyrus.reported_session_id",
+]);
 
 /** Identity the ROUTER holds for a device, not anything the device asserted. */
 export interface SandboxLogOrigin {
@@ -197,11 +220,22 @@ export class SandboxLogRelay {
 				deviceId: origin.deviceId,
 				issueKey: origin.issueKey ?? origin.run?.issueKey ?? null,
 				provider: origin.provider ?? origin.run?.provider ?? null,
+				// The two exceptions to "the router's copy wins", and they are
+				// exceptions on principle rather than convenience: the WORKER is the
+				// original authority on which agent and model it is running. The
+				// router's copy is only a cache of what a worker previously reported
+				// on a frame, so a null there means "not reported yet", not
+				// "contradicted". Reading the worker's own line for it therefore adds
+				// no trust — a container can only mislabel its own run's execution
+				// identity, which it could already do over the frame channel — and it
+				// covers the window the run row cannot: every line emitted before the
+				// first frame carrying these lands.
+				runner: origin.run?.runner ?? reportedString(frame, "cyrus.runner"),
+				model: origin.run?.model ?? reportedString(frame, "cyrus.model"),
 				source: SANDBOX_LOG_SOURCE,
 			},
 			// Derived from the frame's own carrier, which is the only trace context
-			// that describes the worker's call site. `trace_id`/`span_id` land
-			// unnamespaced so they join Azure's `OperationId` directly.
+			// that describes the worker's call site.
 			{ traceparent: frame.traceparent },
 		);
 		// The device's clock, kept alongside the router's own timestamp so a
@@ -233,25 +267,31 @@ export class SandboxLogRelay {
 			attributes["cyrus.reported_issue_identifier"] = frame.issueIdentifier;
 		}
 		if (
+			origin.run !== undefined &&
 			frame.sessionId !== undefined &&
-			frame.sessionId !== origin.run?.sessionId
+			frame.sessionId !== origin.run.sessionId
 		) {
 			// Same rule as the issue identifier. Worth recording separately because
 			// the two ids disagreeing is exactly what a worker still logging under a
 			// finished session looks like, and `cyrus.session_id` alone would show
 			// the router's (correct, but silent) view of that.
+			//
+			// Gated on the router HAVING a run: without it `origin.run?.sessionId`
+			// is undefined and every session id reads as a disagreement, so the
+			// marker would be stamped on every line a container writes before its
+			// first route. A mismatch signal that fires mostly when nothing
+			// mismatches is one nobody can act on.
 			attributes["cyrus.reported_session_id"] = frame.sessionId;
 		}
 		for (const [key, value] of boundedEntries(frame.attributes)) {
-			// Worker attributes never override the router's attribution keys. Every
-			// canonical key is already present (as `null` when unknown), so this one
-			// check covers the whole spoof surface without a denylist.
+			// Worker attributes never override a key the router already claimed.
+			// Every canonical key is present unconditionally (as `null` when
+			// unknown), so this one check covers that whole set.
 			if (key in attributes) continue;
-			// The exception the `key in attributes` test cannot cover: trace ids are
-			// emitted only when the ROUTER could derive them, so a frame with no
-			// traceparent leaves the keys free. A forged one would join this line to
-			// a trace it has nothing to do with, which reads as evidence.
-			if (RESERVED_TRACE_KEYS.has(key)) continue;
+			// And the keys the router sets only CONDITIONALLY, which the test above
+			// cannot cover — see WORKER_RESERVED_KEYS for why `event` in particular
+			// must be on this list.
+			if (WORKER_RESERVED_KEYS.has(key)) continue;
 			attributes[key] = value;
 		}
 
@@ -282,6 +322,19 @@ function rehydrateError(exception: LogFrame["exception"]): [Error] | [] {
 			? truncate(exception.stacktrace, MAX_STACKTRACE_CHARS)
 			: `${error.name}: ${error.message}`;
 	return [error];
+}
+
+/**
+ * Read one worker-asserted attribute, if it is a non-empty string.
+ *
+ * Only ever used for the two facts the worker is the original authority on
+ * (`cyrus.runner`, `cyrus.model`) — see the call site. Bounded like every other
+ * device-supplied value, because it is one.
+ */
+function reportedString(frame: LogFrame, key: string): string | null {
+	const value = frame.attributes?.[key];
+	if (typeof value !== "string" || value.length === 0) return null;
+	return truncate(value, MAX_ATTRIBUTE_CHARS);
 }
 
 function truncate(text: string, max: number): string {

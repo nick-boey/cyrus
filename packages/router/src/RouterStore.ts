@@ -3061,7 +3061,7 @@ export class RouterStore {
 		state: "complete" | "error" | "stopped",
 		nowMs: number,
 		facts?: { runner?: string; model?: string },
-	): void {
+	): boolean {
 		const latest = this.db
 			.prepare(
 				"SELECT run_id, state FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
@@ -3074,7 +3074,7 @@ export class RouterStore {
 			) &&
 				latest.state !== "unknown")
 		) {
-			return;
+			return false;
 		}
 		// Clears the wait and the pending-work count along with going terminal. A
 		// run that has ENDED cannot be carrying live background work, and asserting
@@ -3093,6 +3093,7 @@ export class RouterStore {
 			},
 			nowMs,
 		);
+		return true;
 	}
 
 	/**
@@ -3109,8 +3110,19 @@ export class RouterStore {
 	 * longer can.
 	 *
 	 * Ordered the same way {@link finishAgentRun} orders it, so both see the same
-	 * row for a session that has been routed more than once.
+	 * row for a session that has been routed more than once — and the same way
+	 * {@link getLatestAgentRunForDevice} orders its own read, so the two cannot
+	 * disagree about which run is current.
 	 */
+	getAgentRunForSession(sessionId: string): AgentRunInfo | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT * FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
+			)
+			.get(sessionId) as AgentRunRow | undefined;
+		return row === undefined ? undefined : toAgentRunInfo(row);
+	}
+
 	/**
 	 * The most recent run recorded against a device, in full.
 	 *
@@ -3131,29 +3143,6 @@ export class RouterStore {
 			)
 			.get(deviceId) as AgentRunRow | undefined;
 		return row === undefined ? undefined : toAgentRunInfo(row);
-	}
-
-	/** The full run row for a session, or undefined when it has never been routed. */
-	getAgentRunForSession(sessionId: string): AgentRunInfo | undefined {
-		const row = this.db
-			.prepare(
-				"SELECT * FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
-			)
-			.get(sessionId) as AgentRunRow | undefined;
-		return row === undefined ? undefined : toAgentRunInfo(row);
-	}
-
-	getLatestAgentRunForSession(
-		sessionId: string,
-	): { deviceId: number; state: string } | undefined {
-		const row = this.db
-			.prepare(
-				"SELECT device_id, state FROM agent_runs WHERE session_id = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
-			)
-			.get(sessionId) as Pick<AgentRunRow, "device_id" | "state"> | undefined;
-		return row === undefined
-			? undefined
-			: { deviceId: row.device_id, state: row.state };
 	}
 
 	/**
@@ -3193,9 +3182,21 @@ export class RouterStore {
 		return latest > 0 ? latest : undefined;
 	}
 
-	markAgentRunUnknown(sessionId: string, nowMs: number): void {
+	/**
+	 * @returns whether a run actually transitioned. `false` means the session's
+	 * latest run was ALREADY terminal and nothing was written — which is a
+	 * routine outcome, not an error: `routePrompted` re-establishes affinity for
+	 * an already-terminal session (PAR-146), so a later reclaim of that row
+	 * reaches here with nothing left to end.
+	 *
+	 * Callers that log a lifecycle event MUST gate on this. Emitting `run.unknown`
+	 * unconditionally would report a healthy completed run as one whose outcome
+	 * nobody observed — the exact misdiagnosis the `finished`/`unknown` split
+	 * exists to prevent.
+	 */
+	markAgentRunUnknown(sessionId: string, nowMs: number): boolean {
 		const runId = this.latestNonTerminalRunId(sessionId);
-		if (!runId) return;
+		if (!runId) return false;
 		this.updateAgentRun(
 			runId,
 			{
@@ -3208,6 +3209,7 @@ export class RouterStore {
 			},
 			nowMs,
 		);
+		return true;
 	}
 
 	listAgentRuns(input: {

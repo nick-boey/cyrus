@@ -394,3 +394,124 @@ describe("resolveLogRunAttribution", () => {
 		).toBeUndefined();
 	});
 });
+
+describe("runAttribution edge cases (review follow-ups)", () => {
+	it("normalises the stored 'unknown' issue-key placeholder back to null", () => {
+		// `recordAgentRunRouted` writes the literal "unknown" when a webhook
+		// carried no issue key. Letting it reach the log stream would both hide
+		// those rows from `isnull(p["cyrus.issue_key"])` and gather every
+		// unrelated key-less run under one plausible-looking issue.
+		const logger = testLogger();
+
+		emitRunEvent(
+			logger,
+			RUN_EVENTS.routed,
+			runAttribution({
+				runId: "run-1",
+				userId: 1,
+				deviceId: 1,
+				issueKey: "unknown",
+				sessionId: "sess-1",
+				state: "active",
+				routing: {},
+				startedMs: 1,
+				lastRoutedMs: 1,
+				inputs: [],
+				executorKind: "container",
+				revision: 1,
+			}),
+		);
+
+		const [, attributes] = logger.event.mock.calls[0] as [
+			string,
+			Record<string, unknown>,
+		];
+		expect(attributes["cyrus.issue_key"]).toBeNull();
+	});
+});
+
+describe("resolveLogRunAttribution fallback (review follow-up)", () => {
+	function lookup(runs: AgentRunInfo[]): RunAttributionLookup {
+		return {
+			getAgentRunForSession: (sessionId) =>
+				runs.find((r) => r.sessionId === sessionId),
+			getLatestAgentRunForDevice: (deviceId) =>
+				runs.filter((r) => r.deviceId === deviceId).at(-1),
+		};
+	}
+
+	function run(over: Partial<AgentRunInfo>): AgentRunInfo {
+		return {
+			runId: "run-1",
+			userId: 9,
+			deviceId: 42,
+			issueKey: "CYR-72",
+			sessionId: "sess-1",
+			state: "active",
+			routing: {},
+			startedMs: 1,
+			lastRoutedMs: 1,
+			inputs: [],
+			executorKind: "container",
+			revision: 1,
+			...over,
+		};
+	}
+
+	it("falls back to a container's own run when a session claim is rejected", () => {
+		// A rejected claim must not blank the line. Returning nothing would hand a
+		// container a way to evade `where p["cyrus.run_id"] == …` — name any
+		// session the router cannot tie to it and every canonical column goes
+		// null, which is the query this whole change exists to enable.
+		const runs = [
+			run({}),
+			run({ runId: "theirs", deviceId: 7, sessionId: "s2" }),
+		];
+
+		expect(
+			resolveLogRunAttribution(lookup(runs), {
+				deviceId: 42,
+				kind: "container",
+				sessionId: "s2",
+			})?.runId,
+		).toBe("run-1");
+	});
+
+	it("still refuses to attribute the line to the claimed run", () => {
+		const runs = [run({ runId: "theirs", deviceId: 7, sessionId: "s2" })];
+
+		expect(
+			resolveLogRunAttribution(lookup(runs), {
+				deviceId: 42,
+				kind: "container",
+				sessionId: "s2",
+			}),
+		).toBeUndefined();
+	});
+
+	it("does not fall back for a physical device whose claim is rejected", () => {
+		const runs = [run({ deviceId: 7, sessionId: "s2" })];
+
+		expect(
+			resolveLogRunAttribution(lookup(runs), {
+				deviceId: 42,
+				kind: "device",
+				sessionId: "s2",
+			}),
+		).toBeUndefined();
+	});
+
+	it("covers a session routed moments ago whose run row is not written yet", () => {
+		// Benign version of the same shape, and the container's own latest run is
+		// the better answer — one the device cannot influence.
+		const runs = [run({})];
+
+		expect(
+			resolveLogRunAttribution(lookup(runs), {
+				deviceId: 42,
+				kind: "container",
+				sessionId: "sess-not-yet-recorded",
+			})?.runId,
+		).toBe("run-1");
+	});
+});

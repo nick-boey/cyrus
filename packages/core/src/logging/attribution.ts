@@ -150,10 +150,11 @@ export function runAttributionAttributes(
 	});
 
 	const ids = resolveTraceIds(trace);
-	// Left UNNAMESPACED, unlike everything above. These are W3C-owned names, not
-	// Cyrus ones, and Azure keys `OperationId` in AppRequests/AppDependencies on
-	// the same trace id — prefixing them would break the join a correlated log
-	// line exists to enable.
+	// Left UNNAMESPACED, unlike everything above. These are W3C-owned names, and
+	// their value is the same trace id Azure surfaces as `OperationId` on span
+	// records — so a query can join a log line to its trace by comparing the two
+	// columns. (It is a manual join: a log record does not itself carry
+	// `OperationId`.) Prefixing would make the pairing non-obvious for no gain.
 	if (ids.traceId !== undefined) attributes.trace_id = ids.traceId;
 	if (ids.spanId !== undefined) attributes.span_id = ids.spanId;
 	return attributes;

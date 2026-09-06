@@ -587,7 +587,11 @@ describe("EventRouter", () => {
 			session_id: "sess-1",
 			device_id: 1,
 			run_id: expect.any(String),
-			issue_key: "unknown",
+			// The run row stores the literal "unknown" for a webhook that carried
+			// no issue key; it is normalised back to null on the way out, so
+			// `isnull(...)` finds these rather than a sentinel gathering every
+			// unrelated key-less run under one plausible-looking issue.
+			issue_key: null,
 			reason: "non_creator_prompt",
 			agent_session_id: "sess-1",
 			issue_id: "ISS-1",
@@ -2910,5 +2914,91 @@ describe("EventRouter canonical run attribution (CYR-72)", () => {
 				expect(attributes).toHaveProperty(key.slice("cyrus.".length));
 			}
 		}
+	});
+});
+
+/**
+ * Review follow-up (CYR-72): a lifecycle event must describe a real transition.
+ *
+ * Both `finishAgentRun` and `markAgentRunUnknown` return early on a run that is
+ * already terminal, and both of those are ROUTINE rather than exceptional —
+ * `routePrompted` re-establishes affinity for an already-terminal session
+ * (PAR-146), and `RouterServer` applies a `session_state` frame before acking
+ * it, so a device replays frames the router already applied. Emitting anyway
+ * would file a healthy completed run under "nobody saw the outcome", which is
+ * exactly the misdiagnosis the finished/unknown split exists to prevent.
+ */
+describe("EventRouter run lifecycle events describe real transitions", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	async function routedAndFinished() {
+		const logger = testLogger();
+		const deviceId = enroll(store, ALICE.email, {
+			name: ALICE.name,
+			linearId: ALICE.id,
+		});
+		const { router } = makeRouter(store, { logger });
+		await router.route(
+			createdEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				identifier: "CYR-72",
+				creator: ALICE,
+			}),
+		);
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+		return { router, logger, deviceId };
+	}
+
+	it("emits nothing when a device replays a terminal frame it already sent", async () => {
+		const { router, logger, deviceId } = await routedAndFinished();
+		expect(eventsNamed(logger, "run.finished")).toHaveLength(1);
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f2",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+
+		expect(eventsNamed(logger, "run.finished")).toHaveLength(1);
+	});
+
+	it("does not report an already-finished run as one nobody observed", async () => {
+		// The PAR-146 shape: affinity survives a terminal session, so a later
+		// reclaim of that row reaches markAgentRunUnknown with nothing left to end.
+		const { router, logger, deviceId } = await routedAndFinished();
+		store.setSessionAffinity("sess-1", deviceId, undefined, 1_000);
+
+		router.reconcileDeviceAffinity(deviceId, [], 1_000 + 600_001);
+
+		expect(eventsNamed(logger, "run.unknown")).toHaveLength(0);
+		expect(eventsNamed(logger, "run.finished")).toHaveLength(1);
+	});
+
+	it("still reports a genuine reclaim of a live run", async () => {
+		// The guard must not suppress the case the event exists for.
+		const logger = testLogger();
+		const deviceId = enroll(store, ALICE.email, {
+			name: ALICE.name,
+			linearId: ALICE.id,
+		});
+		const { router } = makeRouter(store, { logger });
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		router.reconcileDeviceAffinity(deviceId, [], Date.now() + 600_001);
+
+		expect(eventsNamed(logger, "run.unknown")).toHaveLength(1);
 	});
 });

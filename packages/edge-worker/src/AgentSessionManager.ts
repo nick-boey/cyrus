@@ -756,20 +756,25 @@ export class AgentSessionManager extends EventEmitter {
 	 *    the agent SDK's session id, the two families do not join, and a KQL
 	 *    query that mixes them returns nothing rather than erroring. Both are
 	 *    emitted so either question can be asked.
-	 *  - `runner` / `model` — execution identity that exists nowhere else. The
-	 *    router learns them only because the worker reports them on a frame; a
-	 *    log line emitted before that frame lands would otherwise have no way to
-	 *    say what was actually running.
+	 *  - `runner` / `model` — execution identity the worker is the ORIGINAL
+	 *    authority on. The router's copy is only a cache of what a worker
+	 *    previously reported on a frame, so `SandboxLogRelay` reads these two off
+	 *    the line when its own copy is null rather than overwriting them — which
+	 *    is what makes them useful in the window before the first frame carrying
+	 *    them lands. Every other canonical key the router claims outright, so a
+	 *    worker copy of it would be discarded; these two are the deliberate
+	 *    exception and the relay documents why.
 	 *
 	 * The workspace, owner, team, project, run id and device id are deliberately
 	 * ABSENT rather than guessed. The worker has no trustworthy view of them, and
-	 * in router mode `SandboxLogRelay` stamps them from the authenticated device
-	 * and run rows anyway — a worker-supplied copy would be discarded there and
-	 * would only be believed on the one deployment where nothing checks it.
+	 * the relay stamps them from the authenticated device and run rows — a
+	 * worker-supplied copy would be discarded there and would only be believed on
+	 * the one deployment where nothing checks it.
 	 *
-	 * Both run facts are omitted when unknown rather than sent as null: a
-	 * relayed line already gets the full null-filled canonical set from the
-	 * router, so nulls here would be bytes on the wire that change no query.
+	 * The two run facts are omitted when unknown rather than sent as null: the
+	 * relay's null-vs-absent distinction is what lets it tell "the worker did not
+	 * report one" from "the worker reported nothing at all", and a relayed line
+	 * gets the full null-filled canonical set from the router regardless.
 	 */
 	private runFactAttributes(sessionId: string): LogEventAttributes {
 		const facts = this.getRunFacts(sessionId);

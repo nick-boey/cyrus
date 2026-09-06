@@ -51,8 +51,14 @@
 //     another workspace, owner, run, issue or device — the relay claims every
 //     canonical key before merging anything the worker sent.
 //  3. `trace_id` / `span_id` ride alongside when a trace context exists, and are
-//     deliberately NOT under `cyrus.` — they are W3C names and `OperationId` in
-//     AppRequests/AppDependencies is the same value, so they join directly.
+//     deliberately NOT under `cyrus.` — they are W3C names, and their VALUE is
+//     the same W3C trace id that appears as `OperationId` in AppRequests /
+//     AppDependencies. Note the join is a manual one from this table:
+//     `... | extend p = parse_json(Log_s) | join AppRequests on $left.trace_id ==
+//     $right.OperationId`. A console record does not itself carry `OperationId`,
+//     and neither does the OTLP copy in AppTraces — `OtelLogSink` emits without
+//     an OTel context, so a relayed worker's trace id lives only in
+//     `Properties["trace_id"]` there too.
 //
 // Pre-CYR-72 attribute names are all still emitted verbatim
 // (`cyrus.agent_session_id`, `cyrus.issue_id`, `cyrus.held_by_*`, …) so every
@@ -738,6 +744,20 @@ resource runsEndedUnobserved 'Microsoft.OperationalInsights/workspaces/savedSear
 // Run volume and outcome by the dimensions an operator actually reports on.
 // `unobserved` is the share of runs that ended without a terminal report, which
 // is the health number for the fleet rather than for any one run.
+//
+// COLLAPSED TO ONE ROW PER RUN FIRST, and that is not a tidiness step — it is
+// what makes the numbers mean anything. A run's own events legitimately disagree
+// about these dimensions, by design and for reasons documented at both emitters:
+// `run.routed` fires BEFORE the fire-and-forget Linear enrichment, so its
+// project columns are null, and `run.finished` is the only point an ordinary run
+// ever reports its runner and model, so those are null on `run.routed`. Grouping
+// the raw events would therefore put each half of the same run in a different
+// bucket, where `routed` and `finished` can never co-occur and the percentage
+// divides by a zero it then guards into nonsense.
+//
+// `take_any` over the per-run dimensions is safe for the same reason: the
+// columns are ignore-nulls-maxed first, so each run contributes its most
+// complete view of itself once.
 resource runsByDimension 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
   parent: logAnalytics
   name: 'Cyrus-Runs-By-Dimension'
@@ -755,15 +775,28 @@ resource runsByDimension 'Microsoft.OperationalInsights/workspaces/savedSearches
         ],
         canonicalExtend,
         [
-          // A run emits `run.routed` once per input and ends at most once, so
-          // both halves are counted as distinct run ids rather than as rows.
+          '| where isnotempty(run_id)'
+          // One row per run: its outcome, and the most complete value each
+          // dimension ever carried. `max_of`-style coalescing via max() works
+          // because the empty string sorts below any real value.
           '| summarize'
-          '    routed     = dcountif(run_id, event == "run.routed"),'
-          '    finished   = dcountif(run_id, event == "run.finished"),'
-          '    unobserved = dcountif(run_id, event == "run.unknown")'
+          '    routed       = countif(event == "run.routed") > 0,'
+          '    finished     = countif(event == "run.finished") > 0,'
+          '    unobserved   = countif(event == "run.unknown") > 0,'
+          '    workspace_name = max(workspace_name),'
+          '    team_name      = max(team_name),'
+          '    project_name   = max(project_name),'
+          '    runner         = max(runner),'
+          '    model          = max(model)'
+          '  by run_id'
+          '| summarize'
+          '    runs       = count(),'
+          '    routed     = countif(routed),'
+          '    finished   = countif(finished),'
+          '    unobserved = countif(unobserved)'
           '  by workspace_name, team_name, project_name, runner, model'
-          '| extend unobserved_pct = round(100.0 * unobserved / iff(routed == 0, 1, routed), 1)'
-          '| order by routed desc'
+          '| extend unobserved_pct = round(100.0 * unobserved / runs, 1)'
+          '| order by runs desc'
         ]
       ),
       '\n'

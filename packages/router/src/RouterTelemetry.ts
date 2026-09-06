@@ -212,6 +212,13 @@ export function emitSessionOwnershipRefusal(
 export const ROUTER_LOG_SOURCE = "router";
 
 /**
+ * The placeholder `recordAgentRunRouted` writes when a webhook carried no issue
+ * key. Recognised here so it can be normalised back to "not known" on the way
+ * into the log stream — see {@link runAttribution}.
+ */
+const UNKNOWN_ISSUE_KEY = "unknown";
+
+/**
  * The run-lifecycle vocabulary: the three points at which the ROUTER's view of
  * an agent run changes state.
  *
@@ -280,7 +287,13 @@ export function runAttribution(
 ): RunAttribution {
 	return {
 		...routingAttribution(run.routing),
-		issueKey: run.issueKey,
+		// `recordAgentRunRouted` stores the literal `"unknown"` when a webhook
+		// carried no issue key, which predates this and is load-bearing there (the
+		// column is NOT NULL). It must not reach the log stream: CYR-72 promotes
+		// `cyrus.issue_key` to a primary filter, and a sentinel there would both
+		// hide those rows from `isnull(...)` and collect every unrelated
+		// key-less run under one plausible-looking issue.
+		issueKey: run.issueKey === UNKNOWN_ISSUE_KEY ? null : run.issueKey,
 		runId: run.runId,
 		sessionId: run.sessionId,
 		deviceId: run.deviceId,
@@ -358,14 +371,25 @@ export interface RunAttributionLookup {
  *    router's own run row agreeing the session belongs to this device.
  *    `frame.sessionId` is device-supplied, so without that check a worker could
  *    label its lines with another run's id, which is exactly what router-side
- *    attribution exists to prevent. A claim that fails the gate attributes to
- *    nothing; the relay records the disagreement as `cyrus.reported_session_id`.
- *  - When it does not, the device's most recent run — but ONLY for a container.
- *    A container serves exactly one issue for its whole life, so its latest run
- *    is the one its unlabelled boot and teardown lines belong to. A PHYSICAL
- *    device serves many issues and can run several sessions at once, so "latest
- *    run" there would attribute one session's lines to another session's run.
- *    A wrong answer is worse than the null columns declining to answer.
+ *    attribution exists to prevent. The relay records the rejected claim as
+ *    `cyrus.reported_session_id`.
+ *  - When there is no session, or the claimed one failed the gate, the device's
+ *    most recent run — but ONLY for a container. A container serves exactly one
+ *    issue for its whole life, so its latest run is the one its unlabelled boot
+ *    and teardown lines belong to. A PHYSICAL device serves many issues and can
+ *    run several sessions at once, so "latest run" there would attribute one
+ *    session's lines to another session's run. A wrong answer is worse than the
+ *    null columns declining to answer.
+ *
+ * The fallback deliberately also covers a REJECTED session claim, not just an
+ * absent one. Making a failed claim return nothing would hand a container a way
+ * to blank its own attribution — name any session the router cannot tie to it
+ * and every canonical column goes null, evading the very
+ * `where p["cyrus.run_id"] == …` this exists to enable. It also fires benignly:
+ * a session routed moments ago whose run row is not written yet, or a container
+ * destroyed and recreated so the old run's `device_id` no longer matches. In
+ * both cases the container's own latest run is the better answer, and it is
+ * one the device cannot influence.
  */
 export function resolveLogRunAttribution(
 	lookup: RunAttributionLookup,
@@ -376,8 +400,8 @@ export function resolveLogRunAttribution(
 	},
 ): AgentRunInfo | undefined {
 	if (origin.sessionId) {
-		const run = lookup.getAgentRunForSession(origin.sessionId);
-		return run?.deviceId === origin.deviceId ? run : undefined;
+		const claimed = lookup.getAgentRunForSession(origin.sessionId);
+		if (claimed?.deviceId === origin.deviceId) return claimed;
 	}
 	if (origin.kind !== "container") return undefined;
 	return lookup.getLatestAgentRunForDevice(origin.deviceId);

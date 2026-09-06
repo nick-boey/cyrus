@@ -400,3 +400,110 @@ describe("SandboxLogRelay", () => {
 		expect(parseLine(warn).component).toBe("sandbox/unknown");
 	});
 });
+
+/**
+ * Review follow-ups (CYR-72). Each of these is a gap the first implementation
+ * had, kept as its own block so the reason each guard exists stays legible.
+ */
+describe("SandboxLogRelay trust boundary", () => {
+	let warn: ReturnType<typeof vi.spyOn>;
+	let relay: SandboxLogRelay;
+
+	beforeEach(() => {
+		process.env.CYRUS_LOG_FORMAT = "json";
+		process.env.CYRUS_LOG_LEVEL = "DEBUG";
+		warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		relay = new SandboxLogRelay();
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		process.env.CYRUS_LOG_FORMAT = undefined;
+		process.env.CYRUS_LOG_LEVEL = undefined;
+	});
+
+	it("refuses an event name a worker sets through its attribute bag", () => {
+		// The dangerous one. A relayed line carries authentic, router-stamped
+		// run/workspace/owner columns, so a worker that could set `event` could
+		// forge a record indistinguishable from a router-emitted lifecycle event
+		// for its own real run — and `event startswith "sandbox."` is how every
+		// alert rule is scoped. The `key in attributes` guard does not cover it,
+		// because the relay only sets `event` when the FRAME carries one.
+		relay.relay(frame({ attributes: { event: "run.finished" } }), {
+			deviceId: 42,
+			issueKey: "CYR-72",
+		});
+		expect(parseLine(warn)).not.toHaveProperty("event");
+	});
+
+	it.each([
+		"args",
+		"traceparent",
+		"tracestate",
+		"cyrus.dropped",
+		"cyrus.emitted_at",
+		"cyrus.reported_issue_identifier",
+		"cyrus.reported_session_id",
+	])("refuses router-owned key %s from the attribute bag", (key) => {
+		relay.relay(frame({ attributes: { [key]: "forged" } }), { deviceId: 42 });
+		// `cyrus.emitted_at` is set unconditionally, so assert the router's value
+		// rather than the key's absence.
+		expect(parseLine(warn)[key]).not.toBe("forged");
+	});
+
+	it("takes runner and model from the worker when the router has none", () => {
+		// The two facts the WORKER is the original authority on: the router's copy
+		// is only a cache of what a worker previously reported on a frame, so null
+		// there means "not reported yet", not "contradicted". Without this the
+		// worker's own values were discarded in exactly the window they are the
+		// only source for.
+		relay.relay(
+			frame({
+				attributes: { "cyrus.runner": "codex", "cyrus.model": "gpt-5-codex" },
+			}),
+			{ deviceId: 42, run: { runId: "run-1", sessionId: "sess-1" } },
+		);
+		expect(parseLine(warn)).toMatchObject({
+			"cyrus.runner": "codex",
+			"cyrus.model": "gpt-5-codex",
+			"cyrus.run_id": "run-1",
+		});
+	});
+
+	it("still prefers the router's runner and model when it has them", () => {
+		relay.relay(
+			frame({
+				attributes: { "cyrus.runner": "codex", "cyrus.model": "gpt-5-codex" },
+			}),
+			{
+				deviceId: 42,
+				run: {
+					runId: "run-1",
+					sessionId: "sess-1",
+					runner: "claude",
+					model: "claude-opus-5",
+				},
+			},
+		);
+		expect(parseLine(warn)).toMatchObject({
+			"cyrus.runner": "claude",
+			"cyrus.model": "claude-opus-5",
+		});
+	});
+
+	it("ignores a non-string runner a worker sends", () => {
+		relay.relay(frame({ attributes: { "cyrus.runner": 7 } }), { deviceId: 42 });
+		expect(parseLine(warn)["cyrus.runner"]).toBeNull();
+	});
+
+	it("does not flag a reported session id when the router knows of no run", () => {
+		// Every line a container writes before its first route has no run, so
+		// `origin.run?.sessionId` is undefined and any session id would read as a
+		// disagreement. A mismatch marker that fires when nothing mismatches is
+		// one nobody can act on.
+		relay.relay(frame({ sessionId: "sess-1" }), { deviceId: 42 });
+		expect(parseLine(warn)).not.toHaveProperty("cyrus.reported_session_id");
+	});
+});
