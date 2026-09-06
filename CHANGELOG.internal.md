@@ -5,6 +5,92 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Correlated fleet logs with agent runs ([CYR-72](https://linear.app/northrop-digital/issue/CYR-72/emit-canonical-run-and-routing-attributes-in-console-logs), [#66](https://github.com/nick-boey/cyrus/pull/66)).**
+  `runAttributionAttributes` (`packages/core/src/logging/attribution.ts`) is now
+  the one place the sixteen canonical `cyrus.*` correlation keys are built.
+  Before this, each logger spelled its own subset by hand — the relay knew
+  `issue_key`/`device_id`/`provider`, the routing events knew
+  `agent_session_id`/`issue_id`, and nothing knew the workspace, owner, team or
+  project — so a second copy of the key list was already how one emitter would
+  come to say `owner_id` while another said `owner_user_id`.
+
+  **The builder's input is structural, not an `AgentRunInfo`.** `cyrus-core` is
+  depended on by every runner and the CLI and must not learn about the router's
+  SQLite; `RouterTelemetry.runAttribution` does the single row-to-vocabulary
+  mapping. `null` and `undefined` mean the same thing to it, because the two
+  arrive interchangeably from a nullable column (`row.issue_key ?? null`) and an
+  optional field (`run.issueKey`), and treating them differently would make the
+  emitted shape depend on which one a call site happened to hold.
+
+  **Emitting `null` for an unknown fact is load-bearing twice.** It is what makes
+  `where isnull(p["cyrus.project_id"])` work — a dropped key answers that with
+  silence, which reads as "there are none". It is ALSO the anti-spoof mechanism
+  in `SandboxLogRelay`: worker attributes merge only into keys the router has not
+  claimed, so a canonical key that is always present leaves a spoofed value
+  nowhere to land, with no denylist for anyone to remember to extend.
+  `trace_id`/`span_id` are the exception that proves it — they are legitimately
+  absent when no trace exists, so they needed an explicit `RESERVED_TRACE_KEYS`
+  guard.
+
+  **`trace_id`/`span_id` stay unnamespaced.** They are W3C-owned names and
+  `OperationId` in `AppRequests`/`AppDependencies` is the same value, so
+  prefixing them would break the join a correlated log line exists to enable.
+  The relay derives them by parsing the frame's `traceparent`; the router's own
+  events read `activeTraceIds()`, since a live span context knows more than
+  whatever carrier the process is holding. An id that fails validation yields
+  nothing rather than being passed through — an invalid id in the stream would
+  join a line to a trace that does not exist, which looks like an answer.
+
+  **New `run.*` family, and the `finished`/`unknown` split is the point.** Both
+  end a run; only `unknown` means the outcome was never observed. Reasons are a
+  closed set (`lock_reconciled`, `affinity_reconciled`, `dangling_affinity`,
+  `event_expired`) so `summarize by reason` is bounded. Emission order is
+  deliberate at two sites and commented at both: `run.finished` fires AFTER
+  `finishAgentRun` because the terminal frame is the only point an ordinary run
+  ever reports its runner and model (emitting first would leave every such run's
+  closing record saying `runner = null`), and `run.routed` fires BEFORE the
+  fire-and-forget routing enrichment, because it records what was known when the
+  route happened rather than what a Linear round trip later discovered.
+
+  **`resolveLogRunAttribution` is a correctness rule, not an optimisation.** A
+  frame naming a session gets that session's run, gated on the router's own row
+  agreeing the session belongs to this device — `frame.sessionId` is
+  device-supplied. A frame naming none falls back to the device's latest run
+  ONLY for a container, which serves one issue for life. A physical device serves
+  many issues concurrently, so "latest run" there would attribute one session's
+  lines to another session's run: a wrong answer dressed as a measured one, which
+  is worse than null columns declining to answer. Extracted from `RouterServer`
+  onto a narrow `RunAttributionLookup` seam so the rule is testable without
+  standing up a server.
+
+  **`AgentSessionManager` claims only what the worker is the authority on** —
+  the Linear `session_id`, `runner`, `model`. Note `session_id` is NOT the same
+  id as the runner's own `cyrus.agent_session_id` (the agent SDK's); the two
+  families do not join and KQL returns nothing rather than erroring, so both are
+  emitted under distinct names. It deliberately sends no workspace/owner/team/
+  project/run/device: the relay stamps those router-side and would discard a
+  worker's copy, so sending one would only be believed on the deployment where
+  nothing checks it.
+
+  **Every pre-CYR-72 attribute name is still emitted verbatim.**
+  `monitoring.bicep`'s projections gained columns rather than having any
+  substituted, so every existing saved search returns what it did before; the
+  pinned wire-format tests in `RouterTelemetry.test.ts` and
+  `SessionOwnership.test.ts` were extended, not rewritten. One deliberate
+  behaviour change: `routing.rejected` now falls back to the run's issue key when
+  the rejection carries none (the `prompted` path reads it off an activity that
+  need not have one), so `cyrus.issue_key` is populated where it used to be null.
+  Queries filtering on a value gain rows; none lose any.
+
+  **The new saved searches have NOT been run against a live workspace.**
+  `check-bicep.sh` compiles the template, but ARM stores KQL as an opaque string
+  it never validates — the trap CLAUDE.md §12 names, and the one that let
+  `Cyrus-Sessions-Never-Terminal` ship a `leftanti` that was valid KQL answering
+  the wrong question. No Azure credentials exist in the implementation sandbox.
+  Run each of `Cyrus-Run-Timeline`, `Cyrus-Runs-Ended-Unobserved` and
+  `Cyrus-Runs-By-Dimension` with `az monitor log-analytics query` before relying
+  on them.
+
 - **Advertised the configured historical log source ([CYR-71](https://linear.app/northrop-digital/issue/CYR-71/advertise-the-configured-historical-log-source), [#64](https://github.com/nick-boey/cyrus/pull/64)).**
   `router-config.json` gains an `observability.logSource` block that
   `RouterConfigFileSchema` normalizes into a `LogSourceDescriptorV1` on
