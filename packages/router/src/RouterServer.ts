@@ -1105,6 +1105,15 @@ export class RouterServer {
 		this.transport?.removeAllListeners();
 		this.transport = undefined;
 		await this.fastify.close();
+		// AFTER the gateway closes and BEFORE the store does. Closing the gateway
+		// first bounds this wait: it settles every outstanding `awaitOnline` and
+		// `querySessions` as "no answer", so an in-flight recovery unwinds to
+		// `failed` in one step rather than sitting out its reconnect deadline.
+		// Waiting at all is what stops a coordinator mid-release from writing into
+		// a closed database handle — and a recovery that DID release ownership
+		// must get its settle persisted, or it is invisible until
+		// `failInterruptedOperations` mislabels it on the next start.
+		await this.recoveries?.whenIdle();
 		await this.stateBackup?.stop();
 		this.store.close();
 	}
@@ -1262,6 +1271,9 @@ export class RouterServer {
 			...(targets
 				? { executor: { boot: (deviceId) => targets.bootAndWait(deviceId) } }
 				: {}),
+			forgetOwnership: (sessionId, deviceId) => {
+				this.eventRouter.forgetSessionOwnership(sessionId, deviceId);
+			},
 			timeouts: this.recoveryTimeouts,
 			logger: this.logger,
 		});
@@ -1499,6 +1511,10 @@ export class RouterServer {
 			containers.sessionsQueryTimeoutMs ?? DEFAULT_SESSIONS_QUERY_TIMEOUT_MS;
 		this.recoveryTimeouts = {
 			sessionsQueryMs: sessionsQueryTimeoutMs,
+			// The SAME grace `reconcileDeviceAffinity` applies below. Both decide
+			// whether a worker's silence about a session may be believed, and a
+			// deployment that widened it for one meant it for the other.
+			ownershipGraceMs: containers.affinityGraceMs ?? DEFAULT_AFFINITY_GRACE_MS,
 			...(containers.recoveryReconnectTimeoutMs !== undefined
 				? { reconnectMs: containers.recoveryReconnectTimeoutMs }
 				: {}),

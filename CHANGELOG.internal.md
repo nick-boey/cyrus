@@ -40,7 +40,53 @@ This changelog documents internal development changes, refactors, tooling update
   "the run ended" is not "the ownership is gone", and a coordinator that treated
   them as the same would report `recovered` over the exact write-only issue it
   was called about. It refuses a live run (`run_active`) so it cannot become a
-  way around the swap.
+  way around the swap. That also makes it the COMMON path in production — on a
+  session stranded for hours the reconnect reclaim usually wins the race — so
+  what recovery adds over the reconnect pass is the issue lock, the ownership
+  grace, and the park record.
+
+  Its `superseded` guard is the one that stops it deleting live work. The
+  ownership tables are keyed by SESSION and a Linear agent session outlives its
+  turns, so `recordAgentRunRouted` starts a fresh run for the same session on the
+  same device the moment the previous one is terminal — and the device scoping
+  cannot separate them, because the disproved device and the new owner are the
+  same device. Replying in-thread is the documented recovery for a lock
+  rejection, so the user doing exactly that inside the replay window is the
+  likely sequence, not an exotic one.
+
+  Three things the release had to reach beyond affinity and the lock, each found
+  by adversarial review rather than by a failing test. **The ownership grace**:
+  `getSessionOwner` is `affinity ?? lock ?? grace`, and the park path — the
+  canonical shape recovery targets — grants a 24-hour grace and THEN clears
+  affinity, so releasing the first two leaves the disproved device owning the
+  session for the rest of that window. **The park record**:
+  `EventRouter.parkedSessionCreators` is a map, not a row, and it is the only
+  thing the `active` branch consults before an unconditional `setSessionAffinity`
+  — so a late frame from that device re-pins a run that is now `unknown` and can
+  never end again, which is PAR-146 arriving by a new route. It is retired
+  through a narrow `forgetOwnership` seam. **The revision**: see below.
+
+  **`worker_online` and `executor_state` are MATERIAL columns**, and
+  `DeviceGateway.handleHello` writes connectivity before it emits the
+  `deviceConnected` that `awaitOnline` resolves on. Since guard 4 REQUIRES the
+  worker to be offline, the offline→online transition is guaranteed — so a
+  coordinator that compared the raw revision across its own boot would answer
+  `stale_revision` every single time, on the one path the feature exists for.
+  `describeRunFactsChange` compares the run's own facts instead (lifecycle,
+  device, routed input, published activity, wait, pending work) and the swap is
+  handed a revision re-read at the point of decision. The evidence fields are
+  excluded by omission rather than by a deny-list: a new material column is
+  ignored here until somebody decides it belongs, which is the safe default for a
+  guard whose false positives silently disable the feature.
+
+  `describeUnsettledWork` is the CYR-81 guard, absent from the first pass.
+  `deviceConnected` is emitted one line before `deliverPending`, so a cold-booted
+  worker truthfully answers "running nothing" about a session whose event it has
+  not been handed — and about one whose runner is still starting. The router
+  already refuses this same decision on both grounds (`reconcileDeviceLocks` on
+  `hasPendingEvents`, `reconcileDeviceAffinity` on the affinity grace), and
+  recovery must not be the one path that concludes without them. It reuses
+  `containers.affinityGraceMs` rather than inventing a third window.
 
   `recoveryRefusalReasonV1Schema` gains `executor_not_startable`. None of the
   four existing reasons describes an offline physical device, and reporting it as

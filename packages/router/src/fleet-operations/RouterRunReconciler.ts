@@ -80,16 +80,34 @@ export interface RunRecoveryTimeouts {
 	 * an outcome the worker actually reported.
 	 */
 	replayMs: number;
+	/**
+	 * How recently a session may have been claimed and still be treated as one
+	 * the reconnected worker can authoritatively disown.
+	 *
+	 * The same window `EventRouter.reconcileDeviceAffinity` applies to an affinity
+	 * row, and applied here for the same reason: a session routed moments ago has
+	 * its event queued or in the worker's hands but no runner up yet, so the
+	 * worker truthfully reports it is running nothing. Releasing there produces
+	 * CYR-81's disowned session.
+	 */
+	ownershipGraceMs: number;
 }
 
 /**
  * ACA cold boots are ~60s and an image pull can be minutes, so a reconnect
  * deadline shorter than that would report a healthy recovery as failed.
+ *
+ * `sessionsQueryMs` and `ownershipGraceMs` mirror `RouterServer`'s
+ * `DEFAULT_SESSIONS_QUERY_TIMEOUT_MS` and `DEFAULT_AFFINITY_GRACE_MS`. They are
+ * duplicated rather than imported because this module must not depend on the
+ * composition root, and they are only reached on a router with no `containers`
+ * block — where every recovery is refused before any of them is read.
  */
 export const DEFAULT_RUN_RECOVERY_TIMEOUTS: RunRecoveryTimeouts = {
 	reconnectMs: 180_000,
-	sessionsQueryMs: 10_000,
+	sessionsQueryMs: 5_000,
 	replayMs: 5_000,
+	ownershipGraceMs: 600_000,
 };
 
 export interface RouterRunReconcilerOptions {
@@ -101,6 +119,23 @@ export interface RouterRunReconcilerOptions {
 	 * this deployment cannot perform must be told so.
 	 */
 	executor?: RunRecoveryExecutor;
+	/**
+	 * Retires the router's IN-MEMORY ownership records for a session whose
+	 * ownership has just been released.
+	 *
+	 * Not optional for correctness so much as for construction order: the store
+	 * is not the only place ownership lives. `EventRouter.parkedSessionCreators`
+	 * is a map, and it is the only thing the `active` branch consults before
+	 * writing full session affinity — so a stray or late `active` frame from the
+	 * disproved device would re-pin a run this recovery just marked `unknown`,
+	 * and a run that has ended can never end again. That is PAR-146's permanent
+	 * pin, recreated by the tool meant to fix it.
+	 *
+	 * Failures here are swallowed: they happen after the durable write, and an
+	 * operation reported `failed` over a release that did happen is a worse
+	 * outcome than a stale map entry.
+	 */
+	forgetOwnership?: (sessionId: string, deviceId: number) => void;
 	logger?: ILogger;
 	now?: () => number;
 	/**
@@ -143,6 +178,24 @@ export interface RouterRunReconcilerOptions {
  * on an authenticated worker having reconnected and disowned the session, and
  * on a single compare-and-swap that re-checks the revision and the device.
  *
+ * ── WHICH RELEASE PATH ACTUALLY RUNS ──
+ * Worth knowing before reading the two of them. Booting the container is itself
+ * what brings its worker back, and `RouterServer` runs
+ * `EventRouter.reconcileDeviceAffinity` and `reconcileDeviceLocks` on the
+ * `deviceConnected` this coordinator is waiting for — both synchronously ahead
+ * of `awaitOnline`'s own listener. On the canonical shape (a session stranded for
+ * hours, so its affinity row is well past `affinityGraceMs`) that reclaim
+ * therefore usually wins the race, and by the time the replay window closes the
+ * run is already terminal. So the COMMON path is `releaseResidualOwnership`, and
+ * what recovery adds over the reconnect reconciliation is the issue lock, the
+ * ownership grace, and the in-memory park record — none of which that path
+ * touches, and the first of which is what makes the issue write-only.
+ *
+ * `releaseStaleRunOwnership` is still the one that may write `unknown` over a
+ * live run, so it remains the compare-and-swap: it covers the cases where the
+ * reconnect reconciliation did not fire or did not apply, and it is the only
+ * release that is atomic with the outcome it records.
+ *
  * ── WHAT IT CANNOT DO, BY CONSTRUCTION ──
  * It holds no Linear client, no issue-tracker, and no way to stop or destroy an
  * executor. `RunRecoveryExecutor` exposes `boot` and nothing else. So "recovery
@@ -154,6 +207,9 @@ export class RouterRunReconciler implements RunReconciler {
 	private readonly store: RouterStore;
 	private readonly worker: RunRecoveryWorker;
 	private readonly executor: RunRecoveryExecutor | undefined;
+	private readonly forgetOwnership:
+		| ((sessionId: string, deviceId: number) => void)
+		| undefined;
 	private readonly logger: ILogger | undefined;
 	private readonly now: () => number;
 	private readonly delay: (ms: number) => Promise<void>;
@@ -163,6 +219,7 @@ export class RouterRunReconciler implements RunReconciler {
 		this.store = options.store;
 		this.worker = options.worker;
 		this.executor = options.executor;
+		this.forgetOwnership = options.forgetOwnership;
 		this.logger = options.logger;
 		this.now = options.now ?? (() => Date.now());
 		this.delay =
@@ -261,6 +318,25 @@ export class RouterRunReconciler implements RunReconciler {
 		}
 
 		report("reconciling", { deviceId: run.deviceId });
+		// A worker's session list is only authoritative once it has actually
+		// RECEIVED the work it is being asked about. `deviceConnected` — what
+		// `awaitOnline` resolves on — is emitted one line before `deliverPending`,
+		// so a cold-booted sandbox answers "running nothing" while a routed event
+		// is still queued for it, and again while it clones the repository and
+		// starts a runner. Releasing there is CYR-81 exactly: the event still
+		// lands, the session runs DISOWNED with every Linear post refused, and the
+		// idle sweep reads `affinity = 0` and suspends the sandbox mid-work.
+		//
+		// The router already refuses this decision on both grounds elsewhere —
+		// `reconcileDeviceLocks` on `hasPendingEvents`, `reconcileDeviceAffinity`
+		// on the affinity grace — and recovery must not be the one path that
+		// concludes without them.
+		const unsettled = this.describeUnsettledWork(run);
+		if (unsettled) {
+			return failure(
+				`The worker's session list is not yet authoritative: ${unsettled}`,
+			);
+		}
 		const declared = await this.worker.querySessions(
 			run.deviceId,
 			this.timeouts.sessionsQueryMs,
@@ -296,43 +372,117 @@ export class RouterRunReconciler implements RunReconciler {
 		const settled = this.recheck(run, report);
 		if (settled) return settled;
 
+		// Re-read once more, because the revision the swap is conditional on must
+		// be the one this decision was made from — and it is NOT `run.revision`.
+		// `worker_online` and `executor_state` are MATERIAL columns, and
+		// `DeviceGateway.handleHello` writes connectivity before it emits the event
+		// `awaitOnline` resolves on. The offline→online transition is therefore
+		// GUARANTEED by the guard above, so quoting the pre-boot revision would
+		// make every recovery refuse itself with `stale_revision` on the exact path
+		// the feature exists for. `recheck` has already established that nothing
+		// about the run's OWN facts moved; the swap covers the window between that
+		// check and this write.
+		const current = this.store.getAgentRunById(run.runId);
+		if (!current) {
+			return failure("The run aged out before its ownership could be released");
+		}
 		report("releasing_stale_ownership", {
 			deviceId: run.deviceId,
-			revision: run.revision,
+			revision: current.revision,
 		});
 		const outcome = this.store.releaseStaleRunOwnership({
 			runId: run.runId,
-			expectedRevision: run.revision,
+			expectedRevision: current.revision,
 			expectedDeviceId: run.deviceId,
 			nowMs: this.now(),
 		});
 		if (outcome.status === "declined") {
-			return this.declineToTerminal(outcome.reason, outcome.run);
+			return this.declineToTerminal(outcome.reason, outcome.run, run, report);
 		}
 
-		// Emitted only for a release that actually happened, and deliberately as
-		// `run.unknown` rather than a recovery-specific name: the fact being
-		// reported is that a run ended with its outcome never observed, which is
-		// the same fact whatever ended it. The reason is what says recovery did.
-		emitRunEvent(
-			this.logger ?? createNoopLogger(),
-			RUN_EVENTS.unknown,
-			runAttribution(outcome.run),
-			{
-				reason: "recovery_reconciled" satisfies RunUnknownReason,
-				affinity_released: outcome.affinityReleased,
-				lock_released: outcome.lockReleased,
-				principal_id: principal.id,
-			},
-		);
-		this.logger?.info(
-			`Released stale ownership for run ${run.runId} (${run.issueKey}): the reconnected worker on device ${run.deviceId} does not claim session ${run.sessionId}`,
-		);
-
+		this.noteRelease(run, principal, outcome);
 		return {
 			phase: "recovered",
-			detail: `The reconnected worker does not claim this session; released ${describeRelease(outcome.affinityReleased, outcome.lockReleased)} and marked the outcome unknown`,
+			detail: `The reconnected worker does not claim this session; released ${describeRelease(outcome)} and marked the outcome unknown`,
 		};
+	}
+
+	/**
+	 * Records a release that actually happened — and never lets recording it
+	 * change the outcome.
+	 *
+	 * Everything here runs AFTER the durable write. A throwing log sink or a
+	 * retired-park callback that fails would otherwise propagate into
+	 * `RecoveryService.drive`, which settles the operation `failed` — an audit
+	 * that reports "released nothing" over a release that did happen, which is
+	 * worse than no audit at all.
+	 */
+	private noteRelease(
+		run: AgentRunInfo,
+		principal: OperatorPrincipal,
+		outcome: {
+			run: AgentRunInfo;
+			affinityReleased: boolean;
+			lockReleased: boolean;
+			graceReleased: boolean;
+		},
+	): void {
+		try {
+			// The in-memory park record is the LAST ownership route, and it is not in
+			// the store: an `active` frame from this same device redeems it with an
+			// unconditional `setSessionAffinity`, which would re-pin a run that is
+			// now `unknown` and can therefore never end again — PAR-146's permanent
+			// pin, recreated by the tool meant to fix it.
+			this.forgetOwnership?.(run.sessionId, run.deviceId);
+			// Deliberately `run.unknown` rather than a recovery-specific name: the
+			// fact reported is that a run ended with its outcome never observed,
+			// which is the same fact whatever ended it. The reason is what says
+			// recovery did.
+			emitRunEvent(
+				this.logger ?? createNoopLogger(),
+				RUN_EVENTS.unknown,
+				runAttribution(outcome.run),
+				{
+					reason: "recovery_reconciled" satisfies RunUnknownReason,
+					affinity_released: outcome.affinityReleased,
+					lock_released: outcome.lockReleased,
+					grace_released: outcome.graceReleased,
+					principal_id: principal.id,
+				},
+			);
+			this.logger?.info(
+				`Released stale ownership for run ${run.runId} (${run.issueKey}): the reconnected worker on device ${run.deviceId} does not claim session ${run.sessionId}`,
+			);
+		} catch (error) {
+			this.logger?.warn(
+				`Recovery released ownership for run ${run.runId} but could not record it`,
+				error,
+			);
+		}
+	}
+
+	/**
+	 * Why the worker cannot yet be taken at its word, or `undefined` when it can.
+	 *
+	 * Two independent reasons, both already load-bearing elsewhere in the router:
+	 * an undelivered event means the worker has not been told about work it is
+	 * about to start, and a claim established moments ago means the same thing
+	 * with the event already handed over but the runner not yet up.
+	 */
+	private describeUnsettledWork(run: AgentRunInfo): string | undefined {
+		const now = this.now();
+		if (this.store.hasPendingEvents(run.deviceId, now)) {
+			return `device ${run.deviceId} still has undelivered events`;
+		}
+		const affinity = this.store
+			.listSessionAffinityForDevice(run.deviceId)
+			.find((row) => row.sessionId === run.sessionId);
+		const claimedMs = Math.max(affinity?.establishedMs ?? 0, run.lastRoutedMs);
+		const age = now - claimedMs;
+		if (age < this.timeouts.ownershipGraceMs) {
+			return `this session was claimed ${age}ms ago, inside the ${this.timeouts.ownershipGraceMs}ms grace a freshly routed session gets to start`;
+		}
+		return undefined;
 	}
 
 	/**
@@ -365,10 +515,18 @@ export class RouterRunReconciler implements RunReconciler {
 		if (isTerminalRunLifecycleState(settled.state)) {
 			return this.releaseResidualOwnership(run, settled, report);
 		}
-		if (settled.revision !== run.revision) {
+		// Compared on the run's OWN facts, deliberately NOT on the revision.
+		// `worker_online` and `executor_state` are material columns, so the
+		// reconnect this recovery just caused — and the sweep sampling the sandbox
+		// it just started — both bump the number. Refusing on that would be the
+		// coordinator refusing itself, every time, on the one path that matters.
+		// The revision is still what the swap is conditional on; it is just read
+		// fresh at the point of decision rather than carried from before the boot.
+		const moved = describeRunFactsChange(run, settled);
+		if (moved) {
 			return refusal(
 				"stale_revision",
-				`The run moved to revision ${settled.revision} while its container was being reconciled`,
+				`The run's ${moved} changed while its container was being reconciled`,
 			);
 		}
 		const affinityDevice = this.store.getSessionAffinity(run.sessionId);
@@ -401,7 +559,9 @@ export class RouterRunReconciler implements RunReconciler {
 	): RecoveryTerminalResult {
 		const held =
 			this.store.getSessionAffinity(run.sessionId) === run.deviceId ||
-			this.store.getIssueLockDeviceForSession(run.sessionId) === run.deviceId;
+			this.store.getIssueLockDeviceForSession(run.sessionId) === run.deviceId ||
+			this.store.getSessionOwnershipGrace(run.sessionId, this.now()) ===
+				run.deviceId;
 		if (!held) {
 			return {
 				phase: "recovered",
@@ -417,11 +577,27 @@ export class RouterRunReconciler implements RunReconciler {
 			expectedDeviceId: run.deviceId,
 		});
 		if (residual.status === "declined") {
-			// `run_active` means the run went terminal and back inside one tick,
-			// which no worker does; either way, refusing to act on a live run is the
-			// correct outcome and not something to report as success.
-			return failure(
-				`The run's residual ownership could not be released (${residual.reason})`,
+			// `superseded` is the one that matters and it is a REFUSAL, not an
+			// error: the session has started a new run — typically because the
+			// previously-blocked user replied in-thread, which is the documented
+			// recovery for a lock rejection — so the rows named after this session
+			// now belong to live work. `run_active` means the run went terminal and
+			// back inside one tick, which no worker does.
+			return residual.reason === "superseded"
+				? refusal(
+						"worker_owns_active_work",
+						"The session started a new run while its container was being reconciled; that run's ownership is not this recovery's to release",
+					)
+				: failure(
+						`The run's residual ownership could not be released (${residual.reason})`,
+					);
+		}
+		try {
+			this.forgetOwnership?.(run.sessionId, run.deviceId);
+		} catch (error) {
+			this.logger?.warn(
+				`Recovery released residual ownership for run ${run.runId} but could not retire its park record`,
+				error,
 			);
 		}
 		this.logger?.info(
@@ -429,18 +605,19 @@ export class RouterRunReconciler implements RunReconciler {
 		);
 		return {
 			phase: "recovered",
-			detail: `The run reached \`${settled.state}\` while its worker's durable frames replayed; released ${describeRelease(residual.affinityReleased, residual.lockReleased)} it left behind`,
+			detail: `The run reached \`${settled.state}\` while its worker's durable frames replayed; released ${describeRelease(residual)} it left behind`,
 		};
 	}
 
 	/**
 	 * Renders a compare-and-swap decline as an outcome.
 	 *
-	 * `run_terminal` is `recovered` rather than a refusal, and that is the point
-	 * of doing the swap conditionally at all: the worker's own frame won the race,
-	 * the ownership this recovery was called about is gone, and reporting that as
-	 * a failure would send an operator looking for a problem that has resolved
-	 * itself.
+	 * `run_terminal` is not a refusal — the worker's own frame won the race and
+	 * the ownership this recovery was called about may be gone — but it is not
+	 * success on its own either: it routes through the residual pass for exactly
+	 * the reason that pass exists, since "the run ended" is not "the ownership is
+	 * gone". Reporting `recovered` here without checking would leave the write-only
+	 * issue this recovery was called about, and say it had been fixed.
 	 */
 	private declineToTerminal(
 		reason:
@@ -448,18 +625,19 @@ export class RouterRunReconciler implements RunReconciler {
 			| "revision_changed"
 			| "run_terminal"
 			| "ownership_moved",
-		run: AgentRunInfo | undefined,
+		settled: AgentRunInfo | undefined,
+		run: AgentRunInfo,
+		report: (phase: RecoveryPhaseV1, evidence?: unknown) => void,
 	): RecoveryTerminalResult {
 		switch (reason) {
 			case "run_terminal":
-				return {
-					phase: "recovered",
-					detail: `The run reached ${run?.state ?? "a terminal state"} on its own; no ownership needed releasing`,
-				};
+				return settled
+					? this.releaseResidualOwnership(run, settled, report)
+					: failure("The run aged out before its ownership could be released");
 			case "revision_changed":
 				return refusal(
 					"stale_revision",
-					`The run moved to revision ${run?.revision ?? "another revision"} while its container was being reconciled`,
+					`The run moved to revision ${settled?.revision ?? "another revision"} between the decision and the write`,
 				);
 			case "ownership_moved":
 				return refusal(
@@ -489,9 +667,52 @@ function failure(failureMessage: string): RecoveryTerminalResult {
 	return { phase: "failed", failureMessage };
 }
 
-function describeRelease(affinity: boolean, lock: boolean): string {
-	if (affinity && lock) return "the session affinity and the issue lock";
-	if (affinity) return "the session affinity";
-	if (lock) return "the issue lock";
-	return "nothing (both claims were already gone)";
+function describeRelease(released: {
+	affinityReleased: boolean;
+	lockReleased: boolean;
+	graceReleased: boolean;
+}): string {
+	const parts = [
+		released.affinityReleased ? "the session affinity" : undefined,
+		released.lockReleased ? "the issue lock" : undefined,
+		released.graceReleased ? "the ownership grace" : undefined,
+	].filter((part): part is string => part !== undefined);
+	if (parts.length === 0) return "nothing (every claim was already gone)";
+	if (parts.length === 1) return parts[0] as string;
+	return `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
+}
+
+/**
+ * Which of the run's OWN facts moved between two reads, or `undefined` when
+ * none did.
+ *
+ * Deliberately not a revision comparison. The revision also moves for
+ * `worker_online` and `executor_state`, which a recovery CAUSES: it boots the
+ * container and waits for the worker to reconnect, so the transition is
+ * guaranteed rather than incidental. Every field listed here is one a
+ * CONCURRENT actor would have had to change — the run being re-routed, its
+ * worker publishing an activity, it being moved to a different device, its wait
+ * changing — and each is a reason to stop.
+ *
+ * The evidence fields are excluded by omission rather than by a deny-list, so a
+ * new column added to `MATERIAL_RUN_COLUMNS` is ignored here until somebody
+ * decides it belongs. That is the safe default for a guard whose false
+ * positives silently break the feature.
+ */
+function describeRunFactsChange(
+	before: AgentRunInfo,
+	after: AgentRunInfo,
+): string | undefined {
+	if (after.state !== before.state) return `lifecycle (now \`${after.state}\`)`;
+	if (after.deviceId !== before.deviceId) return "device";
+	if (after.lastRoutedMs !== before.lastRoutedMs) return "routed input";
+	if (after.inputs.length !== before.inputs.length) return "input list";
+	if (after.lastAgentActivityMs !== before.lastAgentActivityMs) {
+		return "published activity";
+	}
+	if (after.wait?.reason !== before.wait?.reason) return "wait";
+	if (after.pendingWorkCount !== before.pendingWorkCount) {
+		return "pending work count";
+	}
+	return undefined;
 }

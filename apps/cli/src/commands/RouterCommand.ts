@@ -448,9 +448,9 @@ const RouterConfigFileFieldsSchema = z.object({
 			logSource: logSourceDescriptorV1Schema.optional(),
 			/**
 			 * Whether this router accepts guarded recovery requests. Off unless
-			 * stated, and a router that turns it on without a registered run
-			 * reconciler refuses to start rather than accepting requests nothing
-			 * acts on.
+			 * stated, and the only switch on the router side: the server builds its
+			 * own coordinator, so the capability can never be advertised with
+			 * nothing behind it.
 			 *
 			 * Separate from the Entra `fleet.recover` grant above, which decides who
 			 * could ask: both must be true for a recovery to happen.

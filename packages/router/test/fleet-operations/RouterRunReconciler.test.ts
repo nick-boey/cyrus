@@ -10,6 +10,14 @@ import { RouterStore } from "../../src/RouterStore.js";
 import { eventsNamed, type TestLogger, testLogger } from "../helpers/logger.js";
 
 const NOW = 1_700_000_000_000;
+/**
+ * When the stranded session was routed and claimed. Well outside
+ * `ownershipGraceMs` below, because a claim younger than that is deliberately
+ * NOT one a reconnected worker may disown — see the "not yet authoritative"
+ * tests.
+ */
+const ROUTED_MS = NOW - 3_600_000;
+const OWNERSHIP_GRACE_MS = 600_000;
 const WS = "workspace-a";
 const SESSION = "s-75";
 const ISSUE_ID = "issue-75";
@@ -53,6 +61,8 @@ describe("RouterRunReconciler", () => {
 	};
 	/** Recovery correctness must never depend on anything reaching Linear. */
 	let postActivity: ReturnType<typeof vi.fn>;
+	/** Stands in for `EventRouter.forgetSessionOwnership`. */
+	let forgetOwnership: ReturnType<typeof vi.fn>;
 	let delays: number[];
 
 	beforeEach(() => {
@@ -62,6 +72,7 @@ describe("RouterRunReconciler", () => {
 		details = [];
 		delays = [];
 		postActivity = vi.fn(async () => {});
+		forgetOwnership = vi.fn();
 		executor = {
 			boot: vi.fn(async () => ({ ok: true })),
 			stop: vi.fn(async () => {}),
@@ -87,7 +98,7 @@ describe("RouterRunReconciler", () => {
 			issueKey: ISSUE_KEY,
 			issueId: ISSUE_ID,
 			sessionId: SESSION,
-			routedMs: NOW - 600_000,
+			routedMs: ROUTED_MS,
 			routing: { workspaceId: WS, workspaceName: "Acme" },
 			workerOnline: false,
 		});
@@ -96,9 +107,12 @@ describe("RouterRunReconciler", () => {
 			"";
 	}
 
-	/** The stranded shape: pinned affinity and a held issue lock. */
+	/**
+	 * The stranded shape: pinned affinity and a held issue lock, both claimed
+	 * long enough ago to be outside the grace a freshly routed session gets.
+	 */
 	function strand(device = deviceId) {
-		store.setSessionAffinity(SESSION, device, undefined, NOW - 590_000);
+		store.setSessionAffinity(SESSION, device, undefined, ROUTED_MS);
 		store.acquireIssueLock(ISSUE_ID, SESSION, device);
 	}
 
@@ -120,7 +134,9 @@ describe("RouterRunReconciler", () => {
 				reconnectMs: 90_000,
 				sessionsQueryMs: 5_000,
 				replayMs: 3_000,
+				ownershipGraceMs: OWNERSHIP_GRACE_MS,
 			},
+			forgetOwnership,
 			...overrides,
 		});
 	}
@@ -317,6 +333,52 @@ describe("RouterRunReconciler", () => {
 			expectNoDestructiveCalls();
 		});
 
+		it("does not refuse itself when its own reconnect bumps the revision", async () => {
+			// `worker_online` is a MATERIAL column and `DeviceGateway.handleHello`
+			// writes connectivity before it emits the event `awaitOnline` resolves
+			// on — so the offline→online transition guard 4 REQUIRES is guaranteed
+			// to move the revision. A coordinator that compared the raw revision
+			// across its own boot would answer `stale_revision` every time, on the
+			// one path the whole feature exists for.
+			strand();
+			worker.querySessions.mockResolvedValue([]);
+			worker.awaitOnline.mockImplementation(async () => {
+				store.setRunWorkerConnectivity(deviceId, true, NOW);
+				return true;
+			});
+			const before = store.getAgentRunById(runId)?.revision ?? 0;
+
+			const result = await run();
+
+			expect(store.getAgentRunById(runId)?.revision).toBeGreaterThan(before);
+			expect(result.phase).toBe("recovered");
+			expect(reported).toContain("releasing_stale_ownership");
+			expect(store.getSessionAffinity(SESSION)).toBeUndefined();
+			expect(store.getIssueLock(ISSUE_ID)).toBeUndefined();
+			expect(store.getAgentRunById(runId)?.state).toBe("unknown");
+		});
+
+		it("still refuses when a fact the run OWNS moves during the reconnect", async () => {
+			// The counterpart to the test above: the evidence columns are excluded,
+			// nothing else is. A worker publishing an activity mid-flight is a
+			// concurrent actor and must still win.
+			strand();
+			worker.querySessions.mockResolvedValue([]);
+			worker.awaitOnline.mockImplementation(async () => {
+				store.setRunWorkerConnectivity(deviceId, true, NOW);
+				store.recordAgentRunActivity(SESSION, NOW - 10);
+				return true;
+			});
+
+			const result = await run();
+
+			expect(result).toMatchObject({
+				phase: "refused",
+				refusalReason: "stale_revision",
+			});
+			expectOwnershipIntact();
+		});
+
 		it("records the release as a run.unknown event attributed to recovery", async () => {
 			strand();
 			worker.querySessions.mockResolvedValue([]);
@@ -375,6 +437,90 @@ describe("RouterRunReconciler", () => {
 			// The outcome the earlier reconcile recorded is left exactly as it was.
 			expect(store.getAgentRunById(runId)?.state).toBe("unknown");
 			expect(store.getAgentRunById(runId)?.endedMs).toBe(NOW - 100);
+		});
+
+		it("refuses when the session started a new run during the replay window", async () => {
+			// The user whose comment was rejected at the lock replies in-thread —
+			// the documented recovery for a lock rejection — the moment recovery's
+			// own boot frees the issue. `routePrompted` re-establishes affinity and
+			// the lock and starts a NEW run, on the SAME device. The ownership
+			// tables are keyed by session, so device scoping cannot tell the two
+			// runs apart and a release here would strip live work.
+			strand();
+			worker.querySessions.mockResolvedValue([]);
+			const reprompted = reconciler({
+				delay: async () => {
+					store.markAgentRunUnknown(SESSION, NOW - 200);
+					store.recordAgentRunRouted({
+						deviceId,
+						issueKey: ISSUE_KEY,
+						issueId: ISSUE_ID,
+						sessionId: SESSION,
+						routedMs: NOW - 100,
+						routing: { workspaceId: WS },
+					});
+					store.setSessionAffinity(SESSION, deviceId, undefined, NOW - 100);
+				},
+			});
+
+			const result = await reprompted.reconcile(request(), principal(), report);
+
+			expect(result).toMatchObject({
+				phase: "refused",
+				refusalReason: "worker_owns_active_work",
+			});
+			// The successor keeps everything it needs to run: without affinity the
+			// idle sweep parks its container mid-work, and without the lock a
+			// second session can claim the issue.
+			expect(store.getSessionAffinity(SESSION)).toBe(deviceId);
+			expect(store.getIssueLock(ISSUE_ID)).toMatchObject({
+				sessionId: SESSION,
+			});
+			expect(forgetOwnership).not.toHaveBeenCalled();
+		});
+
+		it("retires the router's in-memory park record for a released session", async () => {
+			// `parkedSessionCreators` is the only thing the `active` branch consults
+			// before writing full affinity, so a late frame from the disproved
+			// device would re-pin a run that is now `unknown` and can never end
+			// again — PAR-146's permanent pin by a new route.
+			strand();
+			worker.querySessions.mockResolvedValue([]);
+
+			await run();
+
+			expect(forgetOwnership).toHaveBeenCalledWith(SESSION, deviceId);
+		});
+
+		it("still reports the release when recording it throws", async () => {
+			// Everything after the durable write is bookkeeping. Letting it decide
+			// the outcome would settle the operation `failed` over a release that
+			// did happen — an audit that is worse than no audit.
+			strand();
+			worker.querySessions.mockResolvedValue([]);
+			forgetOwnership.mockImplementation(() => {
+				throw new Error("event router exploded");
+			});
+
+			const result = await run();
+
+			expect(result.phase).toBe("recovered");
+			expect(store.getSessionAffinity(SESSION)).toBeUndefined();
+			expect(store.getIssueLock(ISSUE_ID)).toBeUndefined();
+		});
+
+		it("releases the ownership grace a parked session left behind", async () => {
+			// A park releases affinity, keeps the issue lock, AND grants a 24h
+			// ownership grace. `getSessionOwner` consults all three, so a release
+			// that leaves the grace keeps the disproved device owning the session.
+			store.acquireIssueLock(ISSUE_ID, SESSION, deviceId);
+			store.grantSessionOwnershipGrace(SESSION, deviceId, NOW + 86_400_000);
+			worker.querySessions.mockResolvedValue([]);
+
+			const result = await run();
+
+			expect(result.phase).toBe("recovered");
+			expect(store.getSessionOwner(SESSION, NOW)).toBeUndefined();
 		});
 
 		it("releases nothing when a replayed terminal frame lands during the wait", async () => {
@@ -445,6 +591,48 @@ describe("RouterRunReconciler", () => {
 			expect(result.phase).toBe("failed");
 			expect(result.failureMessage).toMatch(/did not report/i);
 			expect(reported).toEqual(["starting_executor", "reconciling"]);
+			expectOwnershipIntact();
+		});
+
+		it("fails rather than releasing while the device still has undelivered events", async () => {
+			// `deviceConnected` — what `awaitOnline` resolves on — is emitted one
+			// line before `deliverPending`, so a cold-booted worker truthfully
+			// answers "running nothing" about a session whose event it has not yet
+			// been handed. Releasing there is CYR-81: the event still lands, the
+			// session runs disowned, and the idle sweep suspends its sandbox
+			// mid-work.
+			strand();
+			worker.querySessions.mockResolvedValue([]);
+			store.enqueueEvent(
+				deviceId,
+				JSON.stringify({ kind: "test" }),
+				NOW,
+				3_600_000,
+			);
+
+			const result = await run();
+
+			expect(result.phase).toBe("failed");
+			expect(result.failureMessage).toMatch(/undelivered events/);
+			expect(worker.querySessions).not.toHaveBeenCalled();
+			expectOwnershipIntact();
+		});
+
+		it("fails rather than releasing a session claimed inside the grace", async () => {
+			// The same window `reconcileDeviceAffinity` applies to an affinity row:
+			// a session claimed moments ago has its runner still starting, so its
+			// absence from the worker's list means nothing.
+			strand();
+			store.setSessionAffinity(SESSION, deviceId, undefined, NOW - 1_000);
+			worker.querySessions.mockResolvedValue([]);
+
+			const result = await run({
+				expectedRevision: store.getAgentRunById(runId)?.revision ?? 1,
+			});
+
+			expect(result.phase).toBe("failed");
+			expect(result.failureMessage).toMatch(/claimed 1000ms ago/);
+			expect(worker.querySessions).not.toHaveBeenCalled();
 			expectOwnershipIntact();
 		});
 

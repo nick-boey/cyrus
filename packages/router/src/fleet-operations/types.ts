@@ -93,10 +93,10 @@ export interface FleetOperationsConfig {
 	 *
 	 * OFF by default, and that default is the product decision rather than a
 	 * conservative guess: recovery is the one mutation in the operator contract,
-	 * and a router that advertises it without a verified coordinator behind it
-	 * would accept requests nothing acts on. Turning it on requires a
-	 * {@link RouterServerConfig.runReconciler} to be registered — a router
-	 * configured with one and not the other refuses to start.
+	 * so a deployment turns it on deliberately. It is the ONLY switch on the
+	 * router side — the server builds its own coordinator from the container boot
+	 * path and device gateway it already owns — so there is no configuration under
+	 * which the capability is advertised with nothing behind it.
 	 *
 	 * Independent of the Entra `fleet.recover` GRANT, which decides who could ask.
 	 * Both must be true for a recovery to happen, and neither implies the other.

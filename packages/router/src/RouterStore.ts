@@ -649,12 +649,13 @@ export type StaleOwnershipDeclineReason =
 /**
  * The outcome of one compare-and-swap ownership release.
  *
- * `affinityReleased` / `lockReleased` are reported separately because a run can
- * legitimately hold one without the other: a parked session releases its
- * affinity and KEEPS its issue lock, which is the shape a stranded issue is
- * usually found in. Collapsing them to a single boolean would make "released
- * the lock a parked session was holding" indistinguishable from "released
- * nothing", which is precisely the distinction a recovery audit is read for.
+ * The three flags are reported separately because a run can legitimately hold
+ * any subset: a parked session releases its affinity, KEEPS its issue lock, and
+ * holds a 24-hour ownership grace — which is the shape a stranded issue is
+ * usually found in, and all three are routes `getSessionOwner` consults.
+ * Collapsing them to a single boolean would make "released the lock a parked
+ * session was holding" indistinguishable from "released nothing", which is
+ * precisely the distinction a recovery audit is read for.
  */
 export type StaleOwnershipReleaseOutcome =
 	| {
@@ -663,6 +664,7 @@ export type StaleOwnershipReleaseOutcome =
 			run: AgentRunInfo;
 			affinityReleased: boolean;
 			lockReleased: boolean;
+			graceReleased: boolean;
 	  }
 	| {
 			status: "declined";
@@ -3033,18 +3035,20 @@ export class RouterStore {
 	 *
 	 * ── WHAT THIS REVISION DOES NOT COVER ──
 	 * It moves for DURABLE run facts only, because those are the only ones stored
-	 * on the row. Two of the change kinds `runChangeKindV1Schema` names —
-	 * `worker_connectivity` and `executor_state` — are joined at QUERY time from
-	 * `devices.last_seen_ms` and the sandbox gauge, and are deliberately not
-	 * persisted here (the spec keeps them as evidence, not durable facts). So a
-	 * worker going offline and coming back, or a container's gauge changing,
-	 * leaves the revision where it was.
+	 * on the row — which, since CYR-69, INCLUDES `worker_online` and
+	 * `executor_state`. Only their observation TIMES are excluded, which is what
+	 * keeps a repeated heartbeat or an unchanged gauge sample from growing the
+	 * feed.
 	 *
-	 * That is a real limitation for whoever builds the change feed and the
-	 * `stale_revision` guard on `POST /api/v1/recoveries`: quoting a revision
-	 * proves the RUN's facts have not moved, and proves nothing about the worker's
-	 * connectivity at the instant of the request. A recovery that cares must
-	 * re-read connectivity itself rather than infer it from an unchanged number.
+	 * That has a consequence for anything that quotes a revision to mean "the run
+	 * has not moved", and `RouterRunReconciler` is where it bites: a recovery
+	 * BOOTS the run's container and waits for its worker to reconnect, so it
+	 * causes an offline→online transition itself and the revision is guaranteed to
+	 * change underneath it. A revision comparison across that window is a
+	 * comparison against the coordinator's own side effects, which is why it
+	 * compares the run's own facts instead and re-reads the revision at the point
+	 * of decision. Anything else spanning a connectivity change needs the same
+	 * treatment.
 	 *
 	 * Read-compare-write, so it runs in a transaction: the compare and the write
 	 * must not be separated by another connection's update, and the store's file
@@ -3560,6 +3564,10 @@ export class RouterStore {
 						"DELETE FROM issue_locks WHERE session_id = ? AND device_id = ?",
 					)
 					.run(row.session_id, input.expectedDeviceId).changes > 0;
+			const graceReleased = this.deleteSessionOwnershipGrace(
+				row.session_id,
+				input.expectedDeviceId,
+			);
 			// Bumps the revision and appends the feed entry, in this same
 			// transaction — the run can never be seen released without the entry
 			// that reports it.
@@ -3582,6 +3590,7 @@ export class RouterStore {
 				run: released,
 				affinityReleased,
 				lockReleased,
+				graceReleased,
 			};
 		})();
 	}
@@ -3609,13 +3618,35 @@ export class RouterStore {
 	 * ownership without ending the run is precisely the half-released state the
 	 * compare-and-swap above exists to prevent, and this method must not become a
 	 * way around it.
+	 *
+	 * ── WHY `superseded` IS THE LOAD-BEARING GUARD ──
+	 * The ownership tables are keyed by SESSION, not by run, and a Linear agent
+	 * session outlives its turns: {@link recordAgentRunRouted} starts a fresh run
+	 * for the same session — normally on the SAME device — as soon as the previous
+	 * one is terminal. So "this run has ended" does not imply "the rows named after
+	 * its session belong to it", and the device scoping does not separate them
+	 * either, because the disproved device and the new owner are the same device.
+	 *
+	 * Without this check the sequence is: recovery boots the container, the
+	 * reconnect handshake ends the stranded run, the previously-blocked user
+	 * replies in-thread (the DOCUMENTED recovery for a lock rejection) inside the
+	 * replay window, `routePrompted` re-establishes affinity and the lock and
+	 * starts a new run — and this method then deletes both out from under a live
+	 * session. It reads `affinity = 0`, so the idle sweep parks its container
+	 * mid-work (NOR-366) and every activity it posts is refused (CYR-81), while the
+	 * operation reports `recovered`.
 	 */
-	releaseEndedRunOwnership(input: {
-		runId: string;
-		expectedDeviceId: number;
-	}):
-		| { status: "released"; affinityReleased: boolean; lockReleased: boolean }
-		| { status: "declined"; reason: "run_missing" | "run_active" } {
+	releaseEndedRunOwnership(input: { runId: string; expectedDeviceId: number }):
+		| {
+				status: "released";
+				affinityReleased: boolean;
+				lockReleased: boolean;
+				graceReleased: boolean;
+		  }
+		| {
+				status: "declined";
+				reason: "run_missing" | "run_active" | "superseded";
+		  } {
 		return this.db.transaction(() => {
 			const row = this.db
 				.prepare("SELECT * FROM agent_runs WHERE run_id = ?")
@@ -3626,6 +3657,15 @@ export class RouterStore {
 				row.ended_ms === null
 			) {
 				return { status: "declined", reason: "run_active" } as const;
+			}
+			const latest = this.db
+				.prepare(
+					`SELECT run_id FROM agent_runs WHERE session_id = ?
+					 ORDER BY started_ms DESC, rowid DESC LIMIT 1`,
+				)
+				.get(row.session_id) as Pick<AgentRunRow, "run_id"> | undefined;
+			if (latest?.run_id !== input.runId) {
+				return { status: "declined", reason: "superseded" } as const;
 			}
 			const affinityReleased =
 				this.db
@@ -3639,8 +3679,44 @@ export class RouterStore {
 						"DELETE FROM issue_locks WHERE session_id = ? AND device_id = ?",
 					)
 					.run(row.session_id, input.expectedDeviceId).changes > 0;
-			return { status: "released", affinityReleased, lockReleased } as const;
+			const graceReleased = this.deleteSessionOwnershipGrace(
+				row.session_id,
+				input.expectedDeviceId,
+			);
+			return {
+				status: "released",
+				affinityReleased,
+				lockReleased,
+				graceReleased,
+			} as const;
 		})();
+	}
+
+	/**
+	 * The THIRD ownership route, deleted with the other two.
+	 *
+	 * `getSessionOwner` is `affinity ?? lock ?? grace`, and the park path — the
+	 * canonical shape recovery targets — grants a 24-hour grace and THEN clears
+	 * affinity. Releasing only the first two therefore leaves the disproved device
+	 * still owning the session for the rest of that window: it keeps passing
+	 * `handleSessionState`'s owner gate and keeps authorizing session-scoped RPCs,
+	 * while the recovery's own after-evidence (which reports only affinity and the
+	 * lock) asserts a clean release the store disagrees with.
+	 *
+	 * Scoped by device for the same reason the other two deletes are: a grace row
+	 * granted to somebody else is not this recovery's to drop.
+	 */
+	private deleteSessionOwnershipGrace(
+		sessionId: string,
+		deviceId: number,
+	): boolean {
+		return (
+			this.db
+				.prepare(
+					"DELETE FROM session_ownership_grace WHERE session_id = ? AND device_id = ?",
+				)
+				.run(sessionId, deviceId).changes > 0
+		);
 	}
 
 	listAgentRuns(input: {

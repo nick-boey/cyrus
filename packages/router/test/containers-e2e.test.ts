@@ -827,6 +827,11 @@ describe("guarded recovery e2e (real RouterServer + real WebSocket worker)", () 
 				// window is a real wait, and this suite drives a real worker whose
 				// frames land immediately over localhost.
 				recoveryReplayMs: 50,
+				// This suite strands a session seconds after routing it, whereas the
+				// shape recovery exists for has been stranded for hours. Without this
+				// the freshly-routed guard — correctly — refuses to conclude anything
+				// from the worker's session list.
+				affinityGraceMs: 10,
 			},
 			executorRegistryFactory: () =>
 				new Map<string, ContainerExecutor>([["docker", dockerExec]]),

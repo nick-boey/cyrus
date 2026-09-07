@@ -1626,25 +1626,53 @@ whose worker is offline, the router boots the container (the same idempotent
 path a routed webhook uses, so a recovery arriving mid-boot joins it rather than
 racing it), waits for the worker to reconnect and **authenticate**, asks it which
 sessions it is running, and lets its durably buffered frames replay. Only if that
-worker does not claim the run does the router release the session affinity and
-the issue lock and mark the outcome `unknown` — in one SQLite transaction that
-re-checks the run's revision and device, so a run that moved on mid-flight is
-refused rather than half-released.
+worker does not claim the run does the router release the session affinity, the
+issue lock and the session ownership grace and mark the outcome `unknown` — in
+one SQLite transaction that re-checks the run's own facts and its device, so a
+run that moved on mid-flight is refused rather than half-released.
+
+Note what usually happens in practice: the boot is itself what brings the worker
+back, and the reconnect handshake runs the router's own affinity/lock
+reconciliation first. On a session stranded for hours that reclaim normally wins,
+and the run is already terminal by the time the replay window closes. What
+recovery adds over it is the **issue lock**, the ownership grace, and the
+in-memory park record — none of which the reconnect pass releases, and the first
+of which is what makes the issue write-only.
 
 It declines everything else, and mutates nothing when it does: a connected worker
 (`worker_owns_active_work`), a run waiting on an elicitation (`needs_input`), an
 offline physical device the router cannot start (`executor_not_startable`), and a
-run whose revision has moved (`stale_revision`). A boot that fails, a worker that
-never reconnects, and a worker that will not say what it is running all end the
-operation `failed` with the run's ownership untouched — "did not answer" is never
-read as "running nothing". The coordinator holds no Linear client and no way to
-stop or destroy an executor.
+run whose own facts have moved (`stale_revision`). A boot that fails, a worker
+that never reconnects, and a worker that will not say what it is running all end
+the operation `failed` with the run's ownership untouched — "did not answer" is
+never read as "running nothing". The coordinator holds no Linear client and no
+way to stop or destroy an executor.
+
+**Shapes it deliberately does not handle.**
+
+- **A connected worker, whatever it is doing.** The refusal is on
+  CONNECTIVITY, not on whether the worker claims the run — so the `no_progress`
+  strand (`running && online && sessions > 0`, nothing routed and nothing posted)
+  is refused rather than reconciled, even though it is one of the two shapes
+  `sandbox.stranded_session` reports. Deliberate: a connected worker owning its
+  own run is the invariant every other guard here rests on, and the diagnosis for
+  that shape is the `session.terminal_deferred` / `session.terminal_signalled`
+  pair, not a release.
+- **A container that reports `running` with a dead worker process.**
+  `ensureRunning` returns immediately for it, nothing restarts the process, and
+  the recovery spends its full reconnect deadline before failing. Destroy and
+  re-prompt the container instead.
+- **A worker that has not caught up.** If the device still has undelivered
+  events, or the session was claimed inside `containers.affinityGraceMs`, the
+  operation fails rather than concluding anything from a "running nothing"
+  answer. Retry once the boot has settled.
 
 | Setting | Default | What it decides |
 |---------|---------|-----------------|
 | `containers.recoveryReconnectTimeoutMs` | `180000` | How long a booted container's worker has to reconnect and authenticate. Sized for a cold ACA boot plus an image pull; a shorter value reports a healthy recovery as failed. |
 | `containers.recoveryReplayMs` | `5000` | How long the reconnected worker's buffered frames get to replay before a claim is judged stale. |
 | `containers.sessionsQueryTimeoutMs` | `5000` | How long the worker has to answer the session query. Shared with the idle sweep's affinity reconciler, which asks the same question. |
+| `containers.affinityGraceMs` | `600000` | How recently a session may have been claimed and still be treated as one a reconnected worker can authoritatively disown. Shared with the affinity reconciler for the same reason. |
 
 **What is durable either way.** An accepted request becomes a
 `recovery_operations` row carrying the caller, the target run, the observation
