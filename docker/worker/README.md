@@ -234,6 +234,12 @@ cyrus router secrets set alice@example.com GIT_TOKEN <github-personal-access-tok
 # Optional: a dotfiles repo cloned to ~/dotfiles at boot (its install.sh, if
 # present, is run — failures are logged and never block boot).
 cyrus router secrets set alice@example.com DOTFILES_REPO https://github.com/alice/dotfiles.git
+
+# Optional: authenticate Azure CLI with one read-only service principal.
+# Set all three or none; a partial set stops the worker at boot.
+cyrus router secrets set alice@example.com AZURE_CLIENT_ID <application-id>
+cyrus router secrets set alice@example.com AZURE_CLIENT_SECRET <client-secret>
+cyrus router secrets set alice@example.com AZURE_TENANT_ID <tenant-id>
 ```
 
 Any of these — and any other tool credential a session needs — can be stored
@@ -242,8 +248,8 @@ this way: `cyrus router secrets set <email> <ENV_VAR_NAME> <value>` accepts
 own [reserved keys](#per-user-tool-credentials-and-secrets-management)
 (`CYRUS_ROUTER_URL`, `CYRUS_DEVICE_TOKEN`, etc. — see that section for the
 full list and for `containers.requiredSecretKeys`, `secrets list`, secret
-rotation, and the hosted Linear MCP). The five names above are just the ones
-this walkthrough happens to set up first.
+rotation, and the hosted Linear MCP). The named examples above are just the
+ones this walkthrough happens to set up first.
 
 `alice@example.com` must already be an enrolled router user (`cyrus router
 users add alice@example.com` if not — see
@@ -377,6 +383,7 @@ see the behavior described above — update first.
 | Tool | Why it's baked in |
 |---|---|
 | `git`, `gh`, `curl`, `jq`, `ca-certificates` | The restore ladder (clone, credential helper) and sessions themselves (PR creation, fetching raw files). `ca-certificates` is what makes node's `fetch` able to reach the router at all — `node:22-slim` ships no root store. |
+| `az` + `log-analytics` extension | Azure resource discovery and Log Analytics queries. Both are installed system-wide for the non-root `cyrus` user; service-principal authentication is optional and happens at boot. |
 | `dotnet` (SDK 10.0) | Repos targeting .NET need it to build/test/restore and to run repo-local `dotnet tool`s. |
 | `fleece` (Fleece.Cli) | Fleece issue tracking. Installed via `dotnet tool install --tool-path /usr/local/dotnet-tools` — **not** `-g`, which would put it under build-time `/root` where the non-root `cyrus` user cannot reach it. Unpinned: rebuilding the image picks up the latest published `Fleece.Cli`. |
 | `actionlint` | GitHub Actions workflow linting. Pinned by the `ACTIONLINT_VERSION` build arg, checksum-verified, arch-resolved from `dpkg` so the same Dockerfile produces a working `amd64` (ACA) and `arm64` (local Apple Silicon) image. |
@@ -716,6 +723,9 @@ when a container restarts after being stopped mid-session.
 | `GIT_USER_NAME` | `Cyrus` | `git config --global user.name`. |
 | `GIT_USER_EMAIL` | `cyrus@localhost` | `git config --global user.email`. |
 | `DOTFILES_REPO` | (none) | Git URL cloned to `~/dotfiles`; its `install.sh` is run if present. Failures are logged and do not block boot. |
+| `AZURE_CLIENT_ID` | (none) | Azure service-principal application ID. Must be supplied with `AZURE_CLIENT_SECRET` and `AZURE_TENANT_ID`. |
+| `AZURE_CLIENT_SECRET` | (none) | Azure service-principal client secret. Used only for boot-time login, then removed from the worker environment. |
+| `AZURE_TENANT_ID` | (none) | Azure public-cloud tenant ID. Must be supplied with the other two Azure credential variables. |
 | `CYRUS_WORKSPACES_DIR` | `/workspaces` | Root of the persistent volume. Test seam — the Dockerfile relies on the default. |
 | `CYRUS_REPO_CACHE_DIR` | `/var/cache/repos` | Optional local bare-repo cache used via `git clone --reference-if-able` to speed up repeat clones. |
 
@@ -726,8 +736,21 @@ set for the user — omitted entirely otherwise, in which case the container
 falls back to its own defaults shown above. `CYRUS_WORKSPACES_DIR` and
 `CYRUS_REPO_CACHE_DIR` are never populated by the router at all (`docker
 run`'s env never includes them); the container always falls back to the
-defaults above for those two. You don't set any of these six by hand except
-in the manual smoke test above.
+defaults above for those two. Set those path overrides by hand only in the
+manual smoke test above.
+
+Azure credentials are also ordinary per-user secrets, but they are accepted
+only as a complete three-variable set. Cyrus runs a non-interactive
+service-principal login before repository or dotfiles setup, suppresses normal
+login output, and removes all three raw variables before starting the worker.
+Azure CLI telemetry is disabled. Cyrus does not choose a subscription or Log
+Analytics workspace; grant the principal only the required Azure read roles and
+provide or discover target identifiers separately.
+
+Microsoft documents `az monitor log-analytics query` as GA, while every current
+`log-analytics` extension wheel is still marked preview in Microsoft's extension
+index. The image therefore permits that package metadata and installs the
+current wheel during each image build.
 
 ## ACA Sandboxes
 
@@ -758,6 +781,13 @@ whereas ACA auto-suspend can freeze live work and snapshot restore otherwise
 resets the policy to 300 seconds. The default egress policy is Deny + Full
 inspection. HTTPS clones, package registries, Anthropic/Linear, and router WSS
 are allowlisted; SSH remotes/submodules are not supported.
+
+Azure CLI authentication and reads require these public-cloud HTTPS hosts:
+`login.microsoftonline.com`, `management.azure.com`, `api.loganalytics.io`, and
+its replacement `api.loganalytics.azure.com`. The built-in ACA policy and the
+agent sandbox's `trusted` preset include them. An explicit custom ACA egress
+policy or custom agent network allowlist remains authoritative, so add all four
+hosts yourself when using one.
 
 Explicit snapshots retain memory, disk, and env, including the device token.
 Restore is device-lineage checked. Azure does not collect explicit snapshots,

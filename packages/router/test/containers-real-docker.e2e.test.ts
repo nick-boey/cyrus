@@ -161,6 +161,24 @@ describe.skipIf(!dockerAvailable() || !dedicatedDaemonOptIn())(
 			rmSync(dir, { recursive: true, force: true });
 		});
 
+		it("makes Azure CLI and Log Analytics queries usable without authenticating", () => {
+			expect(() =>
+				execFileSync(
+					"docker",
+					[
+						"run",
+						"--rm",
+						"--entrypoint",
+						"sh",
+						IMAGE,
+						"-c",
+						'test "$AZURE_CORE_COLLECT_TELEMETRY" = no && command -v az && test "$(az extension show --name log-analytics --query name -o tsv)" = log-analytics && az monitor log-analytics query --help >/dev/null',
+					],
+					{ stdio: "pipe" },
+				),
+			).not.toThrow();
+		});
+
 		it("cold boot creates a real container, then idle-stop stops it (volume retained)", async () => {
 			seedSession(tracker, "sess-e2e", "issue-e2e");
 			await server.eventRouter.route(
