@@ -446,6 +446,16 @@ const RouterConfigFileFieldsSchema = z.object({
 			// config violating one used to parse cleanly here and fail later inside
 			// `FleetOperations`.
 			logSource: logSourceDescriptorV1Schema.optional(),
+			/**
+			 * Whether this router accepts guarded recovery requests. Off unless
+			 * stated, and a router that turns it on without a registered run
+			 * reconciler refuses to start rather than accepting requests nothing
+			 * acts on.
+			 *
+			 * Separate from the Entra `fleet.recover` grant above, which decides who
+			 * could ask: both must be true for a recovery to happen.
+			 */
+			recovery: z.object({ enabled: z.boolean() }).optional(),
 			skill: z
 				.object({
 					name: z.string().min(1),

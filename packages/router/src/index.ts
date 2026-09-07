@@ -35,6 +35,25 @@ export {
 	type OperatorAuthorizerOptions,
 } from "./fleet-operations/OperatorAuthorizer.js";
 export {
+	auditRecoveryAccepted,
+	auditRecoveryJoined,
+	auditRecoveryPhase,
+	auditRecoveryRefusal,
+	auditRecoverySettled,
+	RECOVERY_EVENTS,
+	type RecoveryAuditIdentity,
+	type RecoveryEventName,
+	redactAuditText,
+} from "./fleet-operations/RecoveryAudit.js";
+export {
+	type RecoveryAcceptance,
+	RecoveryRequestError,
+	RecoveryService,
+	type RecoveryServiceOptions,
+	type RecoveryTerminalResult,
+	type RunReconciler,
+} from "./fleet-operations/RecoveryService.js";
+export {
 	RunCursorCodec,
 	RunCursorError,
 	type RunPagePosition,
@@ -43,6 +62,7 @@ export {
 	DISCOVERY_ROUTE,
 	type FleetOperationsRoutesOptions,
 	OPERATOR_CONTEXT_ROUTE,
+	RECOVERIES_ROUTE,
 	RUN_CHANGES_ROUTE,
 	RUNS_ROUTE,
 	registerFleetOperationsRoutes,
@@ -109,6 +129,11 @@ export {
 	OPERATOR_TOKEN_PREFIX,
 	type OperatorTokenInfo,
 	type PendingTeardownInfo,
+	type RecoveryOperationClaim,
+	type RecoveryOperationInput,
+	type RecoveryOperationRecord,
+	type RecoveryOperationScope,
+	type RecoveryPhaseRecord,
 	RouterStore,
 	type SessionInfo,
 } from "./RouterStore.js";

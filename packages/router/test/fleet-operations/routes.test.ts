@@ -1,6 +1,10 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	operatorContextV1Schema,
 	publicRouterMetadataV1Schema,
+	recoveryOperationV1Schema,
 	runChangePageV1Schema,
 	runObservationPageV1Schema,
 } from "cyrus-operator-protocol";
@@ -8,6 +12,11 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FleetOperations } from "../../src/fleet-operations/FleetOperations.js";
 import { OperatorAuthorizer } from "../../src/fleet-operations/OperatorAuthorizer.js";
+import {
+	RecoveryService,
+	type RecoveryTerminalResult,
+	type RunReconciler,
+} from "../../src/fleet-operations/RecoveryService.js";
 import { RunCursorCodec } from "../../src/fleet-operations/RunChangeCursor.js";
 import { registerFleetOperationsRoutes } from "../../src/fleet-operations/routes.js";
 import type {
@@ -106,12 +115,25 @@ describe("fleet-operations routes", () => {
 	let containerToken: string;
 	let aliceUserId: number;
 	let aliceDeviceId: number;
+	let dbPath: string;
+	/** The reconciler behind the recovery routes. Replaced per test as needed. */
+	let reconciler: RunReconciler;
+	let recoveries: RecoveryService | undefined;
 
 	beforeEach(() => {
 		// Reset per test: `afterEach` closes the instance, and a closed Fastify
 		// cannot be reopened.
 		fastify = undefined;
-		store = new RouterStore(":memory:");
+		recoveries = undefined;
+		reconciler = { reconcile: async () => ({ phase: "recovered" }) };
+		// File-backed rather than `:memory:`, so a test can close the store and
+		// reopen the same database — which is the only honest way to assert that an
+		// accepted operation survives a router restart.
+		dbPath = join(
+			mkdtempSync(join(tmpdir(), "cyrus-fleet-routes-")),
+			"router.db",
+		);
+		store = new RouterStore(dbPath);
 		const userId = store.addUser({
 			email: "alice@example.com",
 			name: "Alice",
@@ -174,16 +196,37 @@ describe("fleet-operations routes", () => {
 			now: () => NOW,
 		});
 		fastify = Fastify();
+		// Constructed whenever the router advertises the capability, exactly as
+		// `RouterServer` does: a router that says it serves recoveries and has no
+		// coordinator behind it is the "capability with no route" failure the
+		// context document exists to prevent.
+		recoveries = config.capabilities?.includes("recoveries.request")
+			? new RecoveryService({
+					store,
+					reconciler,
+					now: () => NOW,
+					newOperationId: operationIds(),
+				})
+			: undefined;
 		registerFleetOperationsRoutes(fastify, {
 			fleet: new FleetOperations({
 				config,
 				workspaceIds,
 				store,
 				now: () => NOW,
+				...(recoveries ? { recoveries } : {}),
 			}),
 			authorizer,
 		});
 		return fastify;
+	}
+
+	function operationIds(): () => string {
+		let next = 0;
+		return () => {
+			next += 1;
+			return `op-${next}`;
+		};
 	}
 
 	describe("GET /.well-known/cyrus", () => {
@@ -856,6 +899,386 @@ describe("fleet-operations routes", () => {
 
 			expect(response.statusCode).toBe(400);
 			expect(response.json().error).toBe("cursor_query_mismatch");
+		});
+	});
+
+	describe("POST /api/v1/recoveries", () => {
+		/** One recoverable run in `WS_A`, owned by Alice. */
+		function seedRecoverableRun(): { runId: string; revision: number } {
+			store.recordAgentRunRouted({
+				deviceId: aliceDeviceId,
+				issueKey: "CYR-74-A",
+				issueId: "issue-74-a",
+				sessionId: "session-74",
+				routedMs: NOW - 20_000,
+				routing: { workspaceId: WS_A, workspaceName: "Acme" },
+			});
+			const run = store.listFleetAgentRuns({
+				workspaceIds: [WS_A],
+				limit: 1,
+			})[0];
+			if (!run) throw new Error("seed failed");
+			return { runId: run.runId, revision: run.revision };
+		}
+
+		function post(body: unknown, token: string) {
+			return server().inject({
+				method: "POST",
+				url: "/api/v1/recoveries",
+				headers: { authorization: `Bearer ${token}` },
+				payload: body,
+			});
+		}
+
+		function requestBody(
+			overrides: Record<string, unknown> = {},
+		): Record<string, unknown> {
+			const { runId, revision } = seeded;
+			return {
+				schemaVersion: 1,
+				runId,
+				expectedRevision: revision,
+				idempotencyKey: "idem-key-0001",
+				...overrides,
+			};
+		}
+
+		let seeded: { runId: string; revision: number };
+		beforeEach(() => {
+			seeded = seedRecoverableRun();
+		});
+
+		it("accepts an authorized request with 202 and a durable operation", async () => {
+			const response = await post(requestBody(), "hdr.recoverer.sig");
+
+			expect(response.statusCode).toBe(202);
+			const body = response.json();
+			expect(recoveryOperationV1Schema.parse(body)).toEqual(body);
+			expect(body.runId).toBe(seeded.runId);
+			expect(body.phase).toBe("accepted");
+			expect(body.actor).toEqual({
+				principalId: RECOVERER_OID,
+				authMethod: "entra",
+				roles: ["fleet.read", "fleet.recover"],
+			});
+			expect(body.evidenceBefore.revision).toBe(seeded.revision);
+			// A client that lost the response can find the operation again.
+			expect(response.headers.location).toBe(
+				`/api/v1/recoveries/${body.operationId}`,
+			);
+			expect(response.headers["cache-control"]).toBe("no-store");
+			await recoveries?.whenIdle();
+		});
+
+		it("refuses a read-only principal, and records nothing", async () => {
+			const response = await post(requestBody(), "hdr.reader.sig");
+
+			expect(response.statusCode).toBe(403);
+			expect(response.json()).toEqual({ error: "forbidden" });
+			expect(
+				store.getRecoveryOperationByKey(READER_OID, "idem-key-0001"),
+			).toBeUndefined();
+		});
+
+		it("refuses a container device token", async () => {
+			const response = await post(requestBody(), containerToken);
+
+			expect(response.statusCode).toBe(403);
+		});
+
+		it("refuses a user device token, which holds read authority only", async () => {
+			const response = await post(requestBody(), physicalToken);
+
+			expect(response.statusCode).toBe(403);
+			expect(response.json()).toEqual({ error: "forbidden" });
+		});
+
+		it("refuses an anonymous caller", async () => {
+			const response = await server().inject({
+				method: "POST",
+				url: "/api/v1/recoveries",
+				payload: requestBody(),
+			});
+
+			expect(response.statusCode).toBe(401);
+		});
+
+		it("refuses the request when this router does not serve recoveries", async () => {
+			// The production posture until the real coordinator is wired: the
+			// capability is not advertised, so the route refuses rather than
+			// pretending to accept work nothing will do.
+			const response = await mount({
+				capabilities: ["runs.list", "runs.changes"],
+			}).inject({
+				method: "POST",
+				url: "/api/v1/recoveries",
+				headers: { authorization: "Bearer hdr.recoverer.sig" },
+				payload: requestBody(),
+			});
+
+			expect(response.statusCode).toBe(403);
+			expect(response.json()).toEqual({ error: "forbidden" });
+		});
+
+		it("refuses a malformed request without acting on part of it", async () => {
+			// STRICT on purpose: a stripped `expectedRevision` would turn a
+			// conditional recovery into an unconditional one.
+			const response = await post(
+				{ ...requestBody(), expectedRevisionn: 1 },
+				"hdr.recoverer.sig",
+			);
+
+			expect(response.statusCode).toBe(400);
+			expect(response.json().error).toBe("invalid_request");
+		});
+
+		it("answers a run in another workspace exactly as a run that does not exist", async () => {
+			store.recordAgentRunRouted({
+				deviceId: store.createContainerDevice(
+					store.addUser({ email: "bob@example.com" }).userId,
+					"CYR-74-B",
+					"aca",
+				).deviceId,
+				issueKey: "CYR-74-B",
+				issueId: "issue-74-b",
+				sessionId: "session-74-b",
+				routedMs: NOW - 10_000,
+				routing: { workspaceId: WS_B },
+			});
+			const other = store
+				.listFleetAgentRuns({ workspaceIds: [WS_B], limit: 10 })
+				.find((run) => run.issueKey === "CYR-74-B");
+			const reader = mount({
+				access: {
+					entra: {
+						tenantId: TENANT,
+						audience: AUDIENCE,
+						grants: [
+							{
+								principalIds: [RECOVERER_OID],
+								roles: ["fleet.read", "fleet.recover"],
+								workspaceIds: [WS_A],
+							},
+						],
+					},
+				},
+			});
+
+			const crossWorkspace = await reader.inject({
+				method: "POST",
+				url: "/api/v1/recoveries",
+				headers: { authorization: "Bearer hdr.recoverer.sig" },
+				payload: requestBody({
+					runId: other?.runId,
+					expectedRevision: other?.revision,
+				}),
+			});
+			const missing = await reader.inject({
+				method: "POST",
+				url: "/api/v1/recoveries",
+				headers: { authorization: "Bearer hdr.recoverer.sig" },
+				payload: requestBody({
+					runId: "no-such-run",
+					idempotencyKey: "idem-key-0002",
+				}),
+			});
+
+			expect(crossWorkspace.statusCode).toBe(404);
+			expect(crossWorkspace.json()).toEqual(missing.json());
+		});
+
+		it("refuses a stale revision and says which one is current", async () => {
+			store.setAgentRunState("session-74", "active", undefined, NOW - 5_000);
+
+			const response = await post(requestBody(), "hdr.recoverer.sig");
+
+			expect(response.statusCode).toBe(409);
+			expect(response.json().error).toBe("stale_revision");
+			expect(response.json().currentRevision).toBe(seeded.revision + 1);
+		});
+
+		it("joins an identical retry instead of starting a second recovery", async () => {
+			const first = await post(requestBody(), "hdr.recoverer.sig");
+			await recoveries?.whenIdle();
+
+			const retry = await post(requestBody(), "hdr.recoverer.sig");
+
+			expect(retry.statusCode).toBe(200);
+			expect(retry.json().operationId).toBe(first.json().operationId);
+		});
+
+		it("refuses a key rebound to a different target", async () => {
+			await post(requestBody(), "hdr.recoverer.sig");
+			await recoveries?.whenIdle();
+
+			const conflict = await post(
+				requestBody({ expectedRevision: seeded.revision + 5 }),
+				"hdr.recoverer.sig",
+			);
+
+			expect(conflict.statusCode).toBe(409);
+			expect(conflict.json().error).toBe("idempotency_key_conflict");
+		});
+	});
+
+	describe("GET /api/v1/recoveries/:operationId", () => {
+		function seedOperation(): string {
+			store.recordAgentRunRouted({
+				deviceId: aliceDeviceId,
+				issueKey: "CYR-74-A",
+				issueId: "issue-74-a",
+				sessionId: "session-74",
+				routedMs: NOW - 20_000,
+				routing: { workspaceId: WS_A },
+			});
+			return (
+				store.listFleetAgentRuns({ workspaceIds: [WS_A], limit: 1 })[0]
+					?.runId ?? ""
+			);
+		}
+
+		async function accept(token = "hdr.recoverer.sig") {
+			const runId = seedOperation();
+			const run = store.listFleetAgentRuns({
+				workspaceIds: [WS_A],
+				limit: 1,
+			})[0];
+			const response = await server().inject({
+				method: "POST",
+				url: "/api/v1/recoveries",
+				headers: { authorization: `Bearer ${token}` },
+				payload: {
+					schemaVersion: 1,
+					runId,
+					expectedRevision: run?.revision ?? 1,
+					idempotencyKey: "idem-key-0001",
+				},
+			});
+			return response.json().operationId as string;
+		}
+
+		it("returns the operation, and the outcome once it settles", async () => {
+			const operationId = await accept();
+			await recoveries?.whenIdle();
+
+			const response = await server().inject({
+				method: "GET",
+				url: `/api/v1/recoveries/${operationId}`,
+				headers: { authorization: "Bearer hdr.recoverer.sig" },
+			});
+
+			expect(response.statusCode).toBe(200);
+			const body = response.json();
+			expect(recoveryOperationV1Schema.parse(body)).toEqual(body);
+			expect(body.phase).toBe("recovered");
+			expect(body.completedAt).toBe(new Date(NOW).toISOString());
+			expect(body.evidenceAfter).toBeDefined();
+			expect(response.headers["cache-control"]).toBe("no-store");
+		});
+
+		it("reports an injected reconciler failure as a failed operation", async () => {
+			reconciler = {
+				reconcile: async () => {
+					throw new Error("the executor never started");
+				},
+			};
+			const operationId = await accept();
+			await recoveries?.whenIdle();
+
+			const body = (
+				await server().inject({
+					method: "GET",
+					url: `/api/v1/recoveries/${operationId}`,
+					headers: { authorization: "Bearer hdr.recoverer.sig" },
+				})
+			).json();
+
+			// A coordinator that throws must still leave an operation a client can
+			// read an outcome from — never one stuck at `accepted`.
+			expect(body.phase).toBe("failed");
+			expect(body.failure.message).toContain("the executor never started");
+		});
+
+		it("reports each phase the coordinator passed through", async () => {
+			reconciler = {
+				reconcile: async (_request, _principal, report) => {
+					report("starting_executor");
+					report("reconciling");
+					return {
+						phase: "needs_input",
+						detail: "the run is waiting on an answer",
+					} satisfies RecoveryTerminalResult;
+				},
+			};
+			const operationId = await accept();
+			await recoveries?.whenIdle();
+
+			const body = (
+				await server().inject({
+					method: "GET",
+					url: `/api/v1/recoveries/${operationId}`,
+					headers: { authorization: "Bearer hdr.recoverer.sig" },
+				})
+			).json();
+
+			expect(
+				body.phases.map((phase: { phase: string }) => phase.phase),
+			).toEqual([
+				"accepted",
+				"starting_executor",
+				"reconciling",
+				"needs_input",
+			]);
+		});
+
+		it("is inspectable after the router restarts", async () => {
+			reconciler = { reconcile: () => new Promise(() => {}) };
+			const operationId = await accept();
+			// A new process over the same database, with no in-memory coordinator
+			// state: the operation must still be readable, which is the whole
+			// "recovery does not depend on a Linear comment" claim.
+			await fastify?.close();
+			store.close();
+			fastify = undefined;
+			store = new RouterStore(dbPath);
+
+			const response = await mount().inject({
+				method: "GET",
+				url: `/api/v1/recoveries/${operationId}`,
+				headers: { authorization: "Bearer hdr.recoverer.sig" },
+			});
+
+			expect(response.statusCode).toBe(200);
+			expect(response.json().phase).toBe("accepted");
+			expect(response.json().evidenceBefore).toBeDefined();
+		});
+
+		it("withholds an operation from a caller authorized elsewhere", async () => {
+			const operationId = await accept();
+			await recoveries?.whenIdle();
+
+			// The reader holds `fleet.read` over WS_A only, and no recovery
+			// authority at all — so it learns nothing about this operation, not even
+			// that it exists.
+			const response = await server().inject({
+				method: "GET",
+				url: `/api/v1/recoveries/${operationId}`,
+				headers: { authorization: "Bearer hdr.reader.sig" },
+			});
+
+			expect(response.statusCode).toBe(403);
+			expect(flatten(response.json())).not.toContain(operationId);
+		});
+
+		it("answers 404 for an operation id that does not exist", async () => {
+			const response = await server().inject({
+				method: "GET",
+				url: "/api/v1/recoveries/op-nonexistent",
+				headers: { authorization: "Bearer hdr.recoverer.sig" },
+			});
+
+			expect(response.statusCode).toBe(404);
+			expect(response.json()).toEqual({ error: "operation_not_found" });
 		});
 	});
 });

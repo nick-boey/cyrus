@@ -10,9 +10,12 @@ import {
 	operatorSkillCompatibilityV1Schema,
 	type PublicRouterMetadataV1,
 	publicRouterMetadataV1Schema,
+	type RecoveryOperationV1,
+	type RecoveryRequestV1,
 	type RunChangePageV1,
 	type RunObservationPageV1,
 	type RunObservationV1,
+	recoveryOperationV1Schema,
 	runChangePageV1Schema,
 	runObservationPageV1Schema,
 	runObservationV1Schema,
@@ -22,9 +25,12 @@ import {
 	type FleetRunDimension,
 	type FleetRunQuery,
 	OPERATOR_ROLES,
+	type RecoveryOperationRecord,
 	type RouterStore,
 } from "../RouterStore.js";
 import { observeRun, toRunObservationV1 } from "../runs.js";
+import { auditRecoveryRefusal } from "./RecoveryAudit.js";
+import type { RecoveryService } from "./RecoveryService.js";
 import { RunCursorCodec, RunCursorError } from "./RunChangeCursor.js";
 import {
 	AUTH_METHOD_BY_KIND,
@@ -165,6 +171,14 @@ export interface FleetOperationsOptions {
 	 * test can pin the epoch and assert the `410` a restart produces.
 	 */
 	cursors?: RunCursorCodec;
+	/**
+	 * Required to serve the recovery routes, and REQUIRED whenever
+	 * `config.capabilities` advertises `recoveries.request` — see
+	 * {@link FleetOperations.validateConfig}. Absent on every router that keeps
+	 * recovery off, which is every router until CYR-75 wires and verifies the real
+	 * coordinator.
+	 */
+	recoveries?: RecoveryService;
 	logger?: ILogger;
 	now?: () => number;
 }
@@ -184,6 +198,7 @@ export class FleetOperations {
 	private readonly workspaceNames: Record<string, string>;
 	private readonly store: RouterStore | undefined;
 	private readonly cursors: RunCursorCodec | undefined;
+	private readonly recoveries: RecoveryService | undefined;
 	private readonly logger: ILogger | undefined;
 	private readonly now: () => number;
 
@@ -192,6 +207,7 @@ export class FleetOperations {
 		this.workspaceIds = [...options.workspaceIds];
 		this.workspaceNames = options.workspaceNames ?? {};
 		this.store = options.store;
+		this.recoveries = options.recoveries;
 		this.cursors =
 			options.cursors ??
 			(options.store
@@ -335,6 +351,126 @@ export class FleetOperations {
 			// the position it started from, and the client would poll it forever.
 			nextCursor: cursors.encodeChangeCursor(scanned.lastChangeId, fingerprint),
 		} satisfies RunChangePageV1);
+	}
+
+	/**
+	 * Accepts one guarded recovery request from a principal that holds
+	 * `recoveries.request`.
+	 *
+	 * The capability check is HERE, not in {@link RecoveryService}, for the same
+	 * reason every other capability check is: this class is the only place that
+	 * knows what this router serves and what this principal's roles permit, and a
+	 * second component deciding it would be a second place for the two to
+	 * disagree. It is also what makes the feature flag work — a router that does
+	 * not advertise `recoveries.request` refuses here, before the request reaches
+	 * anything that could act on it.
+	 *
+	 * The refusal is audited rather than only logged: an unauthorized attempt at
+	 * the contract's one mutation is exactly what an audit is read for, and the
+	 * response body deliberately says only "forbidden".
+	 */
+	requestRecovery(
+		principal: OperatorPrincipal,
+		request: RecoveryRequestV1,
+	): { operation: RecoveryOperationV1; joined: boolean } {
+		if (!this.capabilitiesFor(principal).includes("recoveries.request")) {
+			auditRecoveryRefusal(
+				this.logger,
+				{
+					runId: request.runId,
+					principalId: principal.id,
+					authMethod: AUTH_METHOD_BY_KIND[principal.authKind],
+					idempotencyKey: request.idempotencyKey,
+					expectedRevision: request.expectedRevision,
+				},
+				{ code: "forbidden", status: 403 },
+			);
+			throw new FleetQueryError(
+				403,
+				"forbidden",
+				`Principal ${principal.id} does not hold recoveries.request`,
+			);
+		}
+		const accepted = this.requireRecoveries().request(
+			principal,
+			this.scopeFor(principal),
+			request,
+		);
+		return {
+			operation: this.renderOperation(accepted.operation),
+			joined: accepted.joined,
+		};
+	}
+
+	/**
+	 * One recovery operation, if this caller may see it.
+	 *
+	 * Gated on the same capability as requesting one. There is no separate
+	 * "read a recovery" capability in the contract, and inventing one here would
+	 * advertise something no client gates on; the effect is that recovery
+	 * operations are visible to the principals who may request them, within the
+	 * workspaces they are authorized over.
+	 */
+	getRecovery(
+		principal: OperatorPrincipal,
+		operationId: string,
+	): RecoveryOperationV1 | undefined {
+		this.requireCapability(principal, "recoveries.request");
+		const operation = this.requireRecoveries().get(
+			this.scopeFor(principal),
+			operationId,
+		);
+		return operation ? this.renderOperation(operation) : undefined;
+	}
+
+	/**
+	 * Projects the stored record into the published v1 document.
+	 *
+	 * Validated before it leaves, like every other document this class builds: the
+	 * schema's cross-field rules (a terminal phase carries a completion instant, a
+	 * refusal states a reason, the history ends at the current phase) are the
+	 * store's invariants restated on the wire, so a violation here means the two
+	 * have drifted and must not be served as though they had not.
+	 */
+	private renderOperation(
+		operation: RecoveryOperationRecord,
+	): RecoveryOperationV1 {
+		return recoveryOperationV1Schema.parse({
+			schemaVersion: 1,
+			operationId: operation.operationId,
+			runId: operation.runId,
+			idempotencyKey: operation.idempotencyKey,
+			actor: {
+				principalId: operation.principalId,
+				authMethod: operation.authMethod,
+				roles: operation.roles,
+			},
+			expectedRevision: operation.expectedRevision,
+			phase: operation.phase,
+			phases: operation.phases.map((phase) => ({
+				phase: phase.phase,
+				enteredAt: new Date(phase.enteredMs).toISOString(),
+				...(phase.detail ? { detail: phase.detail } : {}),
+			})),
+			requestedAt: new Date(operation.requestedMs).toISOString(),
+			updatedAt: new Date(operation.updatedMs).toISOString(),
+			...(operation.completedMs !== undefined
+				? { completedAt: new Date(operation.completedMs).toISOString() }
+				: {}),
+			evidenceBefore: operation.evidenceBefore,
+			...(operation.evidenceAfter
+				? { evidenceAfter: operation.evidenceAfter }
+				: {}),
+			...(operation.refusalReason
+				? { refusalReason: operation.refusalReason }
+				: {}),
+			...(operation.failureMessage
+				? { failure: { message: operation.failureMessage } }
+				: {}),
+			// The caller's own `reason` is deliberately NOT published back. It is
+			// kept for the audit trail; the v1 document has no field for it, and
+			// adding one here would be a wire change made by a renderer.
+		} satisfies RecoveryOperationV1);
 	}
 
 	/**
@@ -528,6 +664,22 @@ export class FleetOperations {
 	}
 
 	/**
+	 * Unreachable in practice: `validateConfig` refuses to construct a router that
+	 * advertises `recoveries.request` without a service, and the capability check
+	 * runs before this. It is an `Error` rather than a `FleetQueryError` for
+	 * exactly that reason — a 403 here would present a wiring bug as an
+	 * authorization decision, which is the hardest kind to diagnose.
+	 */
+	private requireRecoveries(): RecoveryService {
+		if (!this.recoveries) {
+			throw new Error(
+				"FleetOperations was constructed without a recovery service, so it cannot serve recovery operations",
+			);
+		}
+		return this.recoveries;
+	}
+
+	/**
 	 * Rejects a configuration that would compile every request into a 500.
 	 *
 	 * The config file's schema is necessarily looser than the wire's: it cannot
@@ -544,6 +696,20 @@ export class FleetOperations {
 	 * and the `defaultExecutor` registration check.
 	 */
 	private validateConfig(): void {
+		// An advertised capability with nothing behind it is the one failure the
+		// context document exists to prevent: a client gates an optional command on
+		// it, so a router that advertises recovery and then 500s every request
+		// presents to an orchestrating agent as a fleet problem rather than as a
+		// misconfigured router. Refusing to construct makes it a startup failure
+		// instead, alongside the log-source check below.
+		if (
+			this.config.capabilities?.includes("recoveries.request") &&
+			!this.recoveries
+		) {
+			throw new Error(
+				"Invalid fleetOperations configuration: `recoveries.request` is advertised but no recovery service was supplied",
+			);
+		}
 		try {
 			if (this.config.logSource) {
 				logSourceDescriptorV1Schema.parse(this.config.logSource);

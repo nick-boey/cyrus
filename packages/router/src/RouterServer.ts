@@ -54,6 +54,10 @@ import {
 	type EntraOperatorTokenVerifier,
 	OperatorAuthorizer,
 } from "./fleet-operations/OperatorAuthorizer.js";
+import {
+	RecoveryService,
+	type RunReconciler,
+} from "./fleet-operations/RecoveryService.js";
 import { registerFleetOperationsRoutes } from "./fleet-operations/routes.js";
 import type { FleetOperationsConfig } from "./fleet-operations/types.js";
 import { KeyVaultSecretStore } from "./KeyVaultSecretStore.js";
@@ -450,6 +454,17 @@ export interface RouterServerConfig {
 	 */
 	operatorTokenVerifier?: EntraOperatorTokenVerifier;
 	/**
+	 * What actually reconciles a run when a recovery is accepted.
+	 *
+	 * REQUIRED when `fleetOperations.recovery.enabled` is true, and a router
+	 * configured with one and not the other refuses to start: recovery is the
+	 * contract's one mutation, and accepting requests that nothing acts on is
+	 * strictly worse than not offering it. Nothing in this repository registers a
+	 * production coordinator yet — CYR-75 owns that — so today this is supplied
+	 * only by tests, and every real router leaves recovery off.
+	 */
+	runReconciler?: RunReconciler;
+	/**
 	 * Authenticated `/setup*` management UI. Opt-in and off by default.
 	 *
 	 * `setupUi.auth` is deliberately required when enabled: how identity is
@@ -509,6 +524,12 @@ export class RouterServer {
 	 * control that could not work.
 	 */
 	codexTokens: CodexTokenStore | undefined;
+	/**
+	 * The guarded-recovery resource. Set only when recovery is enabled AND a
+	 * coordinator is registered; `undefined` on every router that keeps it off,
+	 * which is why the capability is not advertised there either.
+	 */
+	private recoveries: RecoveryService | undefined;
 	private terminalTeardown?: TerminalTeardown;
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;
@@ -999,6 +1020,13 @@ export class RouterServer {
 		// in the fleet. See `RouterStore.resetRunWorkerConnectivity`.
 		this.store.resetRunWorkerConnectivity();
 
+		// A recovery operation is driven by an in-memory coordinator, so any that
+		// the previous process left in flight has nobody advancing it. Ending them
+		// explicitly is what stops a client polling `accepted` forever. Here rather
+		// than in the constructor for exactly the reason above: this database is
+		// shared with every out-of-process `cyrus router …` subcommand.
+		this.recoveries?.failInterruptedOperations();
+
 		// A build in flight when the previous process exited left a durable
 		// `building` row that nothing alive can now clear, and `created` webhooks
 		// held behind it. Reschedule and release them; the router is
@@ -1064,6 +1092,7 @@ export class RouterServer {
 			...(verifyEntraToken ? { verifyEntraToken } : {}),
 			logger: this.logger,
 		});
+		this.recoveries = this.buildRecoveryService(fleetConfig);
 		const fleet = new FleetOperations({
 			config: {
 				...fleetConfig,
@@ -1071,6 +1100,7 @@ export class RouterServer {
 			},
 			workspaceIds,
 			store: this.store,
+			...(this.recoveries ? { recoveries: this.recoveries } : {}),
 			logger: this.logger,
 		});
 		registerFleetOperationsRoutes(this.fastify, {
@@ -1116,7 +1146,11 @@ export class RouterServer {
 	 * `runs.list` and `runs.changes` are unconditional because their routes are
 	 * registered unconditionally and read the store this server always has —
 	 * there is no configuration under which they are present but unserved.
-	 * `recoveries.request` still has no route, so it is still not advertised.
+	 *
+	 * `recoveries.request` is advertised only when a {@link RecoveryService} was
+	 * actually built, which requires BOTH the opt-in and a registered
+	 * coordinator — so the capability tracks what this router can really do, not
+	 * what its config file asked for.
 	 */
 	private servedOperatorCapabilities(
 		fleetConfig: FleetOperationsConfig,
@@ -1125,7 +1159,40 @@ export class RouterServer {
 			"runs.list",
 			"runs.changes",
 			...(fleetConfig.logSource ? (["logs.query"] as const) : []),
+			...(this.recoveries ? (["recoveries.request"] as const) : []),
 		];
+	}
+
+	/**
+	 * Builds the guarded-recovery resource, when this router is configured to
+	 * serve one.
+	 *
+	 * Refuses to start on the half-configured case rather than degrading: a
+	 * router that advertises recovery with no coordinator behind it would accept
+	 * requests nothing acts on, and an operator would read the resulting stuck
+	 * operations as a fleet problem. The same posture as
+	 * `validateSetupAuthConfig` and the `defaultExecutor` registration check.
+	 */
+	private buildRecoveryService(
+		fleetConfig: FleetOperationsConfig,
+	): RecoveryService | undefined {
+		if (!fleetConfig.recovery?.enabled) {
+			this.logger.info(
+				"Fleet Operations recovery is disabled; no recovery capability will be advertised",
+			);
+			return undefined;
+		}
+		if (!this.config.runReconciler) {
+			throw new Error(
+				"fleetOperations.recovery.enabled is set but no run reconciler is registered; recovery would accept requests nothing can act on",
+			);
+		}
+		this.logger.info("Fleet Operations recovery enabled");
+		return new RecoveryService({
+			store: this.store,
+			reconciler: this.config.runReconciler,
+			logger: this.logger,
+		});
 	}
 
 	/**

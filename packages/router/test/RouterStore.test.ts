@@ -2700,3 +2700,394 @@ describe("change feed regressions (CYR-69 review)", () => {
 		store.close();
 	});
 });
+
+describe("recovery operations (CYR-74)", () => {
+	const EVIDENCE = {
+		observedAt: new Date(1_000).toISOString(),
+		revision: 3,
+		lifecycle: "active" as const,
+		workerOnline: false,
+		executorState: "stopped" as const,
+		sessionAffinityHeld: true,
+		issueLocked: true,
+	};
+
+	/**
+	 * One authorized run in `ws-a`, plus everything a recovery operation is keyed
+	 * on. Uses a file-backed database by default so the restart tests can reopen
+	 * the same file — an in-memory store cannot be reopened.
+	 */
+	function build(dbPath = ":memory:") {
+		const store = new RouterStore(dbPath);
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const deviceId = store.createContainerDevice(
+			userId,
+			"CYR-74",
+			"aca",
+		).deviceId;
+		store.recordAgentRunRouted({
+			deviceId,
+			issueKey: "CYR-74",
+			issueId: "issue-74",
+			sessionId: "s-74",
+			routedMs: 1_000,
+			routing: { workspaceId: "ws-a", workspaceName: "Acme" },
+		});
+		const runId =
+			store.listFleetAgentRuns({ workspaceIds: ["ws-a"], limit: 1 })[0]
+				?.runId ?? "";
+		return { store, userId, deviceId, runId };
+	}
+
+	function claim(
+		store: RouterStore,
+		runId: string,
+		overrides: Partial<
+			Parameters<RouterStore["createRecoveryOperation"]>[0]
+		> = {},
+	) {
+		return store.createRecoveryOperation({
+			operationId: "op-1",
+			runId,
+			idempotencyKey: "idem-key-0001",
+			principalId: "oid-recoverer",
+			authMethod: "entra",
+			roles: ["fleet.read", "fleet.recover"],
+			workspaceId: "ws-a",
+			expectedRevision: 1,
+			evidenceBefore: EVIDENCE,
+			nowMs: 5_000,
+			...overrides,
+		});
+	}
+
+	it("creates an accepted operation carrying its actor, target, and before-evidence", () => {
+		const { store, runId } = build();
+
+		const claimed = claim(store, runId);
+
+		expect(claimed.status).toBe("created");
+		const operation = claimed.operation;
+		expect(operation).toMatchObject({
+			operationId: "op-1",
+			runId,
+			idempotencyKey: "idem-key-0001",
+			principalId: "oid-recoverer",
+			authMethod: "entra",
+			workspaceId: "ws-a",
+			expectedRevision: 1,
+			phase: "accepted",
+			requestedMs: 5_000,
+			updatedMs: 5_000,
+			evidenceBefore: EVIDENCE,
+		});
+		expect(operation.roles).toEqual(["fleet.read", "fleet.recover"]);
+		expect(operation.phases).toEqual([{ phase: "accepted", enteredMs: 5_000 }]);
+		expect(operation.completedMs).toBeUndefined();
+		expect(operation.evidenceAfter).toBeUndefined();
+		store.close();
+	});
+
+	it("reloads an in-flight operation after a router restart", () => {
+		const dir = mkdtempSync(join(tmpdir(), "cyrus-recovery-"));
+		const dbPath = join(dir, "router.db");
+		const { store, runId } = build(dbPath);
+		const { operation } = claim(store, runId) as { operation: unknown };
+		store.advanceRecoveryOperation({
+			operationId: "op-1",
+			phase: "reconciling",
+			atMs: 6_000,
+			detail: "asked the worker to reconcile",
+		});
+		store.close();
+
+		// A new process, the same file: the operation is still inspectable, with
+		// its phase history intact. This is the whole "does not depend on a
+		// Linear comment" claim.
+		const reopened = new RouterStore(dbPath);
+		const reloaded = reopened.getRecoveryOperation("op-1", {
+			workspaceIds: ["ws-a"],
+		});
+		expect(reloaded?.phase).toBe("reconciling");
+		expect(reloaded?.evidenceBefore).toEqual(EVIDENCE);
+		expect(reloaded?.phases).toEqual([
+			{ phase: "accepted", enteredMs: 5_000 },
+			{
+				phase: "reconciling",
+				enteredMs: 6_000,
+				detail: "asked the worker to reconcile",
+			},
+		]);
+		expect(operation).toBeDefined();
+		reopened.close();
+	});
+
+	it("joins the same operation when a caller retries an identical request", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+
+		const again = claim(store, runId, { operationId: "op-2", nowMs: 9_000 });
+
+		expect(again.status).toBe("joined");
+		// The RETRY does not mint a second operation, and does not restamp the
+		// first: two callers competing over one run is exactly what the key exists
+		// to prevent.
+		expect(again.operation?.operationId).toBe("op-1");
+		expect(again.operation?.requestedMs).toBe(5_000);
+		store.close();
+	});
+
+	it("refuses a reused key that names a different target or revision", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+
+		const otherTarget = claim(store, "some-other-run", {
+			operationId: "op-3",
+		});
+		const otherRevision = claim(store, runId, {
+			operationId: "op-4",
+			expectedRevision: 2,
+		});
+
+		expect(otherTarget.status).toBe("conflict");
+		expect(otherTarget.existing?.operationId).toBe("op-1");
+		expect(otherRevision.status).toBe("conflict");
+		store.close();
+	});
+
+	it("lets two callers use the same key independently", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+
+		const other = claim(store, runId, {
+			operationId: "op-5",
+			principalId: "oid-someone-else",
+		});
+
+		expect(other.status).toBe("created");
+		store.close();
+	});
+
+	it("advances phases in order and refuses one that goes backwards", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+
+		store.advanceRecoveryOperation({
+			operationId: "op-1",
+			phase: "starting_executor",
+			atMs: 6_000,
+		});
+		store.advanceRecoveryOperation({
+			operationId: "op-1",
+			phase: "replaying",
+			atMs: 7_000,
+		});
+
+		expect(() =>
+			store.advanceRecoveryOperation({
+				operationId: "op-1",
+				phase: "reconciling",
+				atMs: 8_000,
+			}),
+		).toThrow(/backwards|monotonic/i);
+		// Re-entering the phase it is already in is the same fault: a history that
+		// repeats a phase is not a record of what happened.
+		expect(() =>
+			store.advanceRecoveryOperation({
+				operationId: "op-1",
+				phase: "replaying",
+				atMs: 8_000,
+			}),
+		).toThrow(/backwards|monotonic/i);
+		expect(
+			store.getRecoveryOperation("op-1", { workspaceIds: ["ws-a"] })?.phase,
+		).toBe("replaying");
+		store.close();
+	});
+
+	it("records after-evidence and the completion instant on a terminal phase", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+		const after = {
+			...EVIDENCE,
+			sessionAffinityHeld: false,
+			issueLocked: false,
+		};
+
+		store.advanceRecoveryOperation({
+			operationId: "op-1",
+			phase: "recovered",
+			atMs: 9_000,
+			evidenceAfter: after,
+		});
+
+		const operation = store.getRecoveryOperation("op-1", {
+			workspaceIds: ["ws-a"],
+		});
+		expect(operation?.phase).toBe("recovered");
+		expect(operation?.completedMs).toBe(9_000);
+		expect(operation?.evidenceAfter).toEqual(after);
+		// Before-evidence is not overwritten: the pair is the whole audit value,
+		// and an operation that released a live pin and one that released nothing
+		// are identical without it.
+		expect(operation?.evidenceBefore).toEqual(EVIDENCE);
+		store.close();
+	});
+
+	it("keeps a refusal reason and a failure message with their own phase", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+		store.advanceRecoveryOperation({
+			operationId: "op-1",
+			phase: "refused",
+			atMs: 9_000,
+			refusalReason: "worker_owns_active_work",
+		});
+
+		const refused = store.getRecoveryOperation("op-1", {
+			workspaceIds: ["ws-a"],
+		});
+		expect(refused?.refusalReason).toBe("worker_owns_active_work");
+		expect(refused?.failureMessage).toBeUndefined();
+
+		claim(store, runId, {
+			operationId: "op-6",
+			idempotencyKey: "idem-key-0002",
+		});
+		store.advanceRecoveryOperation({
+			operationId: "op-6",
+			phase: "failed",
+			atMs: 9_500,
+			failureMessage: "the executor never started",
+		});
+		expect(
+			store.getRecoveryOperation("op-6", { workspaceIds: ["ws-a"] })
+				?.failureMessage,
+		).toBe("the executor never started");
+		store.close();
+	});
+
+	it("refuses to move an operation that has already finished", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+		store.advanceRecoveryOperation({
+			operationId: "op-1",
+			phase: "recovered",
+			atMs: 9_000,
+			evidenceAfter: EVIDENCE,
+		});
+
+		for (const next of [
+			{ phase: "reconciling" } as const,
+			{ phase: "failed", failureMessage: "too late" } as const,
+			{ phase: "recovered" } as const,
+		]) {
+			expect(() =>
+				store.advanceRecoveryOperation({
+					operationId: "op-1",
+					atMs: 10_000,
+					...next,
+				}),
+			).toThrow(/terminal/i);
+		}
+		expect(
+			store.getRecoveryOperation("op-1", { workspaceIds: ["ws-a"] })
+				?.completedMs,
+		).toBe(9_000);
+		store.close();
+	});
+
+	it("withholds an operation from a caller authorized over another workspace", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+
+		expect(
+			store.getRecoveryOperation("op-1", { workspaceIds: ["ws-b"] }),
+		).toBeUndefined();
+		expect(
+			store.getRecoveryOperation("op-1", { workspaceIds: [] }),
+		).toBeUndefined();
+		// An owner-scoped caller sees only its own owner's operations.
+		expect(
+			store.getRecoveryOperation("op-1", {
+				workspaceIds: ["ws-a"],
+				ownerScopeUserId: 999,
+			}),
+		).toBeUndefined();
+		store.close();
+	});
+
+	it("appends a recovery entry to the run's change feed without inventing a revision", () => {
+		const { store, runId } = build();
+		const before = store.listFleetAgentRuns({
+			workspaceIds: ["ws-a"],
+			limit: 1,
+		})[0]?.revision;
+
+		store.appendRecoveryRunChange(runId, 7_000);
+
+		const { changes } = store.listAgentRunChanges({
+			limit: 10,
+			workspaceIds: ["ws-a"],
+		});
+		const recovery = changes.filter((change) => change.kind === "recovery");
+		expect(recovery).toHaveLength(1);
+		expect(recovery[0]?.runId).toBe(runId);
+		expect(recovery[0]?.changedMs).toBe(7_000);
+		// The run itself did not change, so its revision must not move: the number
+		// is what a recovery request quotes, and bumping it here would invalidate
+		// the caller's own in-flight request.
+		expect(
+			store.listFleetAgentRuns({ workspaceIds: ["ws-a"], limit: 1 })[0]
+				?.revision,
+		).toBe(before);
+		store.close();
+	});
+
+	it("fails the operations a restart interrupted, and leaves finished ones alone", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+		claim(store, runId, {
+			operationId: "op-7",
+			idempotencyKey: "idem-key-0003",
+		});
+		store.advanceRecoveryOperation({
+			operationId: "op-7",
+			phase: "recovered",
+			atMs: 9_000,
+			evidenceAfter: EVIDENCE,
+		});
+
+		const failed = store.failInterruptedRecoveryOperations(
+			20_000,
+			"the router restarted",
+		);
+
+		expect(failed.map((operation) => operation.operationId)).toEqual(["op-1"]);
+		const interrupted = store.getRecoveryOperation("op-1", {
+			workspaceIds: ["ws-a"],
+		});
+		expect(interrupted?.phase).toBe("failed");
+		expect(interrupted?.completedMs).toBe(20_000);
+		expect(interrupted?.failureMessage).toContain("restarted");
+		expect(interrupted?.phases.at(-1)?.phase).toBe("failed");
+		expect(
+			store.getRecoveryOperation("op-7", { workspaceIds: ["ws-a"] })?.phase,
+		).toBe("recovered");
+		store.close();
+	});
+
+	it("ages an operation out with the run it describes", () => {
+		const { store, runId } = build();
+		claim(store, runId);
+		store.finishAgentRun("s-74", "complete", 10_000);
+
+		expect(store.sweepTerminalAgentRuns(50_000)).toBe(1);
+
+		expect(
+			store.getRecoveryOperation("op-1", { workspaceIds: ["ws-a"] }),
+		).toBeUndefined();
+		expect(runId).not.toBe("");
+		store.close();
+	});
+});
