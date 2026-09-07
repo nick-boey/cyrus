@@ -5,7 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
-- **Queried and followed Log Analytics from the CLI ([CYR-73](https://linear.app/northrop-digital/issue/CYR-73/query-and-follow-log-analytics-directly-from-the-cli)).**
+- **Queried and followed Log Analytics from the CLI ([CYR-73](https://linear.app/northrop-digital/issue/CYR-73/query-and-follow-log-analytics-directly-from-the-cli), [#67](https://github.com/nick-boey/cyrus/pull/67)).**
   `LogSourceAdapter` (`apps/cli/src/remote/logs/`) is the seam every historical
   log backend sits behind. It exists so that "no KQL, no table name, and no
   `Log_s` column reaches `LogsCommand` or the router" is a property you can
