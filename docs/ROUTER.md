@@ -1615,12 +1615,36 @@ does not advertise the `recoveries.request` capability, and
 than a missing route: a client gates the command on the capability it read from
 `/api/v1/operator/context`, so the two answers agree.
 
-Enabling it also requires a run reconciler to be registered on the server (see
-`RouterServerConfig.runReconciler`). A router configured with the flag and no
-reconciler **refuses to start**: accepting requests that nothing can act on
-would leave operations sitting at `accepted` and read as a fleet problem.
-Nothing in this repository registers a production reconciler yet, so the flag is
-not something to turn on in a deployment today.
+Enabling it is the ONLY switch on the router side: the server builds its own
+coordinator (`RouterRunReconciler`) over the container boot path and device
+gateway it already owns, so there is no configuration under which the capability
+is advertised with nothing behind it. `RouterServerConfig.runReconciler` remains
+as a test seam and should not be set in a deployment.
+
+**What a recovery actually does.** For a run whose container is stopped and
+whose worker is offline, the router boots the container (the same idempotent
+path a routed webhook uses, so a recovery arriving mid-boot joins it rather than
+racing it), waits for the worker to reconnect and **authenticate**, asks it which
+sessions it is running, and lets its durably buffered frames replay. Only if that
+worker does not claim the run does the router release the session affinity and
+the issue lock and mark the outcome `unknown` — in one SQLite transaction that
+re-checks the run's revision and device, so a run that moved on mid-flight is
+refused rather than half-released.
+
+It declines everything else, and mutates nothing when it does: a connected worker
+(`worker_owns_active_work`), a run waiting on an elicitation (`needs_input`), an
+offline physical device the router cannot start (`executor_not_startable`), and a
+run whose revision has moved (`stale_revision`). A boot that fails, a worker that
+never reconnects, and a worker that will not say what it is running all end the
+operation `failed` with the run's ownership untouched — "did not answer" is never
+read as "running nothing". The coordinator holds no Linear client and no way to
+stop or destroy an executor.
+
+| Setting | Default | What it decides |
+|---------|---------|-----------------|
+| `containers.recoveryReconnectTimeoutMs` | `180000` | How long a booted container's worker has to reconnect and authenticate. Sized for a cold ACA boot plus an image pull; a shorter value reports a healthy recovery as failed. |
+| `containers.recoveryReplayMs` | `5000` | How long the reconnected worker's buffered frames get to replay before a claim is judged stale. |
+| `containers.sessionsQueryTimeoutMs` | `5000` | How long the worker has to answer the session query. Shared with the idle sweep's affinity reconciler, which asks the same question. |
 
 **What is durable either way.** An accepted request becomes a
 `recovery_operations` row carrying the caller, the target run, the observation

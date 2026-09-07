@@ -552,6 +552,16 @@ const RouterConfigFileFieldsSchema = z.object({
 			sessionNoProgressMs: z.number().int().positive().optional(),
 			sessionsQueryTimeoutMs: z.number().optional(),
 			/**
+			 * Guarded recovery's two waits. Positive integers of MILLISECONDS for
+			 * the same reason as {@link terminalSettleMs}: a zero or negative
+			 * reconnect deadline makes every recovery fail as "the worker did not
+			 * reconnect", which reads as a fleet problem rather than as a typo, and
+			 * a degenerate replay window silently removes the one guard that stops
+			 * recovery overwriting an outcome the worker actually reported.
+			 */
+			recoveryReconnectTimeoutMs: z.number().int().positive().optional(),
+			recoveryReplayMs: z.number().int().positive().optional(),
+			/**
 			 * Rejected rather than coerced when it is not a positive integer of
 			 * MILLISECONDS. Every degenerate value — 0, negative, fractional —
 			 * makes the settle veto unsatisfiable, which is indistinguishable from

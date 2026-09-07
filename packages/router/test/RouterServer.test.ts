@@ -599,13 +599,33 @@ describe("RouterServer fleet-operations routes", () => {
 			expect(await res.json()).toEqual({ error: "forbidden" });
 		});
 
-		it("refuses to start when recovery is enabled with no coordinator behind it", () => {
-			// Accepting requests nothing can act on is strictly worse than not
-			// offering recovery: the operations would sit at `accepted` forever and
-			// read as a fleet problem.
-			expect(() => makeRecoveryServer({ runReconciler: undefined })).toThrow(
-				/no run reconciler is registered/,
-			);
+		it("builds its own coordinator, so the opt-in is the only switch", async () => {
+			// There is no half-configured case left to refuse: enabling recovery
+			// wires a real RouterRunReconciler over this server's gateway and
+			// container boot path, so the capability can never be advertised with
+			// nothing behind it.
+			server = makeRecoveryServer({ runReconciler: undefined });
+			await server.start();
+
+			const { body } = await contextFor(server);
+
+			expect(body.capabilities).toContain("recoveries.request");
+		});
+
+		it("says so when recovery is enabled on a router that cannot start containers", () => {
+			// A device-only deployment can still ACCEPT a recovery — it just refuses
+			// every one of them, since a physical device is not something the router
+			// can start. Stated at startup rather than discovered per-request.
+			const logger = testLogger();
+			server = makeRecoveryServer({ runReconciler: undefined, logger });
+
+			expect(
+				logger.info.mock.calls.some(
+					(call: unknown[]) =>
+						typeof call[0] === "string" &&
+						call[0].includes("no container executor"),
+				),
+			).toBe(true);
 		});
 	});
 });

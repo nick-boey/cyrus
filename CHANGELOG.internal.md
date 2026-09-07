@@ -5,6 +5,60 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Reconciled stranded run ownership on the router ([CYR-75](https://linear.app/northrop-digital/issue/CYR-75/reconcile-stranded-run-ownership-safely-on-the-router)).**
+  `RouterRunReconciler` (`packages/router/src/fleet-operations/`) is the
+  production `RunReconciler` CYR-74 left a seam for. Its safety argument is the
+  ORDER of its guards: revision, terminal, elicitation and worker-connectivity
+  are all checked before anything is started, so a request that was never safe
+  costs nothing and mutates nothing. Everything after that is conditional twice
+  more — on an authenticated worker having reconnected and disowned the session,
+  and on a compare-and-swap.
+
+  Its dependencies are narrowed to the one verb each is allowed. `RunRecoveryExecutor`
+  exposes `boot` and nothing else, so "recovery never terminates live work or
+  destroys an executor" is a property of what the class was handed rather than of
+  what it currently chooses to call; it holds no Linear client at all, which is
+  what makes "correctness never depends on a Linear comment" checkable. Every
+  wait is injected (`delay`, `awaitOnline`), so the unit suite runs with no real
+  sleeps.
+
+  `RouterStore.releaseStaleRunOwnership` is the compare-and-swap, and it is a
+  store method rather than three calls for a reason the affinity reconciler does
+  not share: a recovery decides from evidence an operator read over HTTP, with a
+  container boot and a worker reconnect between the observation and the write. As
+  separate statements, a run that goes terminal or moves device in that window is
+  left half-released — lock gone, affinity kept, a live worker's run marked
+  `unknown` underneath it. It re-checks revision, terminal, and the device inside
+  the transaction, and reports a decline by naming which fact moved.
+
+  `releaseEndedRunOwnership` is the second, narrower operation, and it exists
+  because the e2e found the gap: booting the container is itself what brings its
+  worker back, and the reconnect handshake runs
+  `EventRouter.reconcileDeviceAffinity`, which ends the run and clears affinity
+  while deliberately leaving the ISSUE LOCK — and `reconcileDeviceLocks`, which
+  would have released it, skips a device whose events are still undelivered. So
+  "the run ended" is not "the ownership is gone", and a coordinator that treated
+  them as the same would report `recovered` over the exact write-only issue it
+  was called about. It refuses a live run (`run_active`) so it cannot become a
+  way around the swap.
+
+  `recoveryRefusalReasonV1Schema` gains `executor_not_startable`. None of the
+  four existing reasons describes an offline physical device, and reporting it as
+  `failed` would say something went wrong when the router correctly declined:
+  reconciliation rests entirely on getting an authenticated worker back, and a
+  machine the router cannot start can never supply that answer. Additive to a v1
+  enum with no shipped consumer.
+
+  `ContainerTargetService.bootAndWait` and `DeviceGateway.awaitOnline` are the
+  two new seams. The former shares `inFlightBoots` with the fire-and-forget
+  `boot`, so a recovery arriving mid-boot joins that attempt rather than racing
+  its `mintDeviceToken` and orphaning the container that actually started; it
+  reports failure as a value because every path there is written never to reject.
+  The latter waits on `"deviceConnected"` — emitted only after the device token
+  is verified — never on the raw socket, and keeps its `isOnline` fast path
+  because an already-running container emits no further connect and the wait
+  would otherwise always time out.
+
 - **Queried and followed Log Analytics from the CLI ([CYR-73](https://linear.app/northrop-digital/issue/CYR-73/query-and-follow-log-analytics-directly-from-the-cli), [#67](https://github.com/nick-boey/cyrus/pull/67)).**
   `LogSourceAdapter` (`apps/cli/src/remote/logs/`) is the seam every historical
   log backend sits behind. It exists so that "no KQL, no table name, and no

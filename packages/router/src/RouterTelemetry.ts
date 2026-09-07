@@ -266,7 +266,15 @@ export type RunUnknownReason =
 	/** The affinity reconciler found no live session backing the row. */
 	| "affinity_reconciled"
 	/** A `created` event outlived its TTL before any device took delivery. */
-	| "event_expired";
+	| "event_expired"
+	/**
+	 * A guarded recovery started the run's container, and the worker that
+	 * reconnected did not claim the session. Distinct from
+	 * `affinity_reconciled` — which the idle sweep produces routinely — because
+	 * this one is always operator-initiated, so a series of them is a count of
+	 * how often the fleet needed manual intervention.
+	 */
+	| "recovery_reconciled";
 
 /**
  * Map the router's own run row into the shared canonical attribution shape.

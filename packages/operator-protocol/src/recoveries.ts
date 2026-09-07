@@ -93,6 +93,19 @@ export const recoveryRefusalReasonV1Schema = z.enum([
 	"stale_revision",
 	"run_already_terminal",
 	"not_authorized",
+	/**
+	 * The run's executor is not one the router can start — today, an offline
+	 * physical device: a teammate's own machine, with no control plane the router
+	 * could reach.
+	 *
+	 * A REFUSAL and not a failure, because nothing went wrong. Reconciliation
+	 * rests entirely on getting an authenticated worker back and asking it what
+	 * it is running, and a machine the router cannot start can never supply that
+	 * answer — so the router declines rather than concluding anything from the
+	 * device's silence. The remedy is the device's owner bringing it back online,
+	 * at which point the ordinary reconnect path reconciles the run.
+	 */
+	"executor_not_startable",
 ]);
 export type RecoveryRefusalReasonV1 = z.infer<
 	typeof recoveryRefusalReasonV1Schema

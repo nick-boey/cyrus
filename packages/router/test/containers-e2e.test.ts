@@ -154,6 +154,14 @@ function connectFakeDevice(
 	port: number,
 	deviceToken: string,
 	stateDir: string,
+	/**
+	 * Supplying this is what makes the fake worker ADVERTISE
+	 * `sessions_query` and answer it — `RouterConnection` gates the capability
+	 * on having a provider, since advertising with nothing to answer from would
+	 * make the router wait out its timeout every time. Omitted by the scenarios
+	 * that predate it, so their behaviour is unchanged.
+	 */
+	getActiveSessions?: () => string[],
 ): DeviceStack {
 	mkdirSync(stateDir, { recursive: true });
 	const connection = new RouterConnection({
@@ -162,6 +170,7 @@ function connectFakeDevice(
 		stateDir,
 		reconnectBaseMs: 20,
 		rpcTimeoutMs: 2000,
+		...(getActiveSessions ? { getActiveSessions } : {}),
 	});
 	// Guard against Node throwing on an unhandled "error" emit.
 	connection.on("error", () => {});
@@ -197,6 +206,13 @@ class FakeBootExecutor implements ContainerExecutor {
 		readonly provider: string,
 		private readonly getPort: () => number,
 		private readonly stateDirRoot: string,
+		/**
+		 * What the booted worker declares it is running. Set only by the recovery
+		 * suite, which needs a worker that can be ASKED — a stranded container's
+		 * replacement worker reports nothing, and that is what licenses the
+		 * release.
+		 */
+		private readonly getActiveSessions?: () => string[],
 	) {}
 
 	async ensureRunning(ctx: IssueExecutionContext): Promise<void> {
@@ -209,6 +225,7 @@ class FakeBootExecutor implements ContainerExecutor {
 			this.getPort(),
 			token,
 			join(this.stateDirRoot, ctx.issueKey),
+			this.getActiveSessions,
 		);
 		const connected = once(stack.connection, "connected");
 		stack.connection.connect();
@@ -728,5 +745,277 @@ describe("router container-executor e2e (real RouterServer + fake ContainerExecu
 		await vi.waitFor(() => {
 			expect(gatedExec.resolvedCount).toBe(1);
 		});
+	});
+});
+
+/**
+ * Guarded recovery, end to end (CYR-75).
+ *
+ * The shape this exercises is the one the dev-fleet findings documented and the
+ * router can detect but not fix: a container whose executor is STOPPED, whose
+ * worker is OFFLINE, and whose session still holds affinity and the issue lock.
+ * Linear keeps rendering a live agent session and every new top-level comment on
+ * the issue is rejected at the lock, so the issue is write-only until somebody
+ * intervenes.
+ *
+ * It runs its own {@link RouterServer} because recovery is off by default and
+ * turning it on is a deployment-level decision — which is exactly the property
+ * worth exercising through the real HTTP route rather than by calling the
+ * coordinator directly.
+ */
+describe("guarded recovery e2e (real RouterServer + real WebSocket worker)", () => {
+	let server: RouterServer;
+	let tracker: CLIIssueTrackerService;
+	let stateDir: string;
+	let secretsDir: string;
+	let dockerExec: FakeBootExecutor;
+	let operatorToken: string;
+
+	const ISSUE_KEY = "CYPACK-300";
+	const ISSUE_ID = "issue-recover-1";
+	const SESSION_ID = "sess-recover-1";
+
+	beforeAll(async () => {
+		tracker = new CLIIssueTrackerService();
+		tracker.seedDefaultData();
+		seedSession(tracker, SESSION_ID, ISSUE_ID);
+
+		stateDir = mkdtempSync(join(tmpdir(), "cyrus-router-recovery-e2e-"));
+		secretsDir = mkdtempSync(join(tmpdir(), "cyrus-router-recovery-e2e-sec-"));
+		const secretsPath = join(secretsDir, "user-secrets.json");
+		const secrets = new SecretStore(secretsPath);
+
+		dockerExec = new FakeBootExecutor(
+			"docker",
+			() => server.port,
+			join(stateDir, "docker"),
+			// A container that was stranded and restarted comes back with no
+			// sessions: the worker process that owned the run is gone. That answer
+			// — given by an AUTHENTICATED worker, not inferred from silence — is
+			// what licenses the release.
+			() => [],
+		);
+
+		server = new RouterServer({
+			port: 0,
+			dbPath: ":memory:",
+			workspaces: { [WORKSPACE]: { linearToken: "test-token" } },
+			webhook: { verificationMode: "direct", secret: "test-secret" },
+			trackerFactory: () => tracker,
+			heartbeatMs: 30_000,
+			logger: silentLogger(),
+			// The opt-in, and the ONLY switch: no coordinator is supplied here, so
+			// this pins that a real one is built from the server's own seams.
+			fleetOperations: { recovery: { enabled: true } },
+			containers: {
+				image: "cyrus-worker:test",
+				routerUrlForContainers: "ws://host.docker.internal:3456",
+				repositories: [
+					{
+						name: "cyrus",
+						githubSlug: "ceedaragents/cyrus",
+						linearWorkspaceId: WORKSPACE,
+						baseBranch: "main",
+					},
+				],
+				secretsPath,
+				repositoriesPath: join(stateDir, "repositories.json"),
+				idleStopMs: IDLE_STOP_MS,
+				staleDestroyMs: STALE_DESTROY_MS,
+				offlineAgeOutMs: 3_600_000,
+				// The one knob a test rig legitimately turns right down: the replay
+				// window is a real wait, and this suite drives a real worker whose
+				// frames land immediately over localhost.
+				recoveryReplayMs: 50,
+			},
+			executorRegistryFactory: () =>
+				new Map<string, ContainerExecutor>([["docker", dockerExec]]),
+		});
+		await server.start();
+
+		server.store.addUser({
+			email: "stranded@example.com",
+			linearId: "lin-str",
+		});
+		server.store.setUserExecutor(
+			"stranded@example.com",
+			JSON.stringify({ type: "docker" }),
+		);
+		secrets.set(
+			"stranded@example.com",
+			"claudeOauthToken",
+			"fake-claude-token",
+		);
+		operatorToken = server.store.createOperatorToken({
+			label: "oncall",
+			roles: ["fleet.read", "fleet.recover"],
+			workspaceIds: [WORKSPACE],
+		}).token;
+	});
+
+	afterAll(async () => {
+		dockerExec?.closeAll();
+		await server.stop();
+		rmSync(stateDir, { recursive: true, force: true });
+		rmSync(secretsDir, { recursive: true, force: true });
+	});
+
+	async function post(body: unknown) {
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/api/v1/recoveries`,
+			{
+				method: "POST",
+				headers: {
+					authorization: `Bearer ${operatorToken}`,
+					"content-type": "application/json",
+				},
+				body: JSON.stringify(body),
+			},
+		);
+		return { status: res.status, body: await res.json() };
+	}
+
+	async function operation(operationId: string) {
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/api/v1/recoveries/${operationId}`,
+			{ headers: { authorization: `Bearer ${operatorToken}` } },
+		);
+		return res.json();
+	}
+
+	it("advertises the capability and unblocks a stopped, offline, still-pinned container", async () => {
+		const context = await fetch(
+			`http://127.0.0.1:${server.port}/api/v1/operator/context`,
+			{ headers: { authorization: `Bearer ${operatorToken}` } },
+		).then((res) => res.json());
+		expect(context.capabilities).toContain("recoveries.request");
+
+		// ── Build the stranded shape through the real routing path ──
+		const creator: Creator = {
+			id: "lin-str",
+			email: "stranded@example.com",
+			name: "Stranded",
+		};
+		await server.eventRouter.route(
+			createdFixture({
+				sessionId: SESSION_ID,
+				issue: { id: ISSUE_ID, identifier: ISSUE_KEY, title: "Stranded" },
+				creator,
+			}),
+		);
+		await vi.waitFor(() => {
+			expect(server.store.getContainerDeviceForIssue(ISSUE_KEY)).toBeDefined();
+		});
+		const device = server.store.getContainerDeviceForIssue(ISSUE_KEY);
+		if (!device) throw new Error("no container device");
+		await vi.waitFor(() => {
+			expect(server.isDeviceOnline(device.deviceId)).toBe(true);
+		});
+
+		// The worker goes away and its container is parked, but the affinity and
+		// the issue lock the session took out survive. Nothing in the router will
+		// ever release them on its own — that is the whole failure.
+		dockerExec.stacks.get(ISSUE_KEY)?.connection.close();
+		await dockerExec.stop(ISSUE_KEY);
+		await vi.waitFor(() => {
+			expect(server.isDeviceOnline(device.deviceId)).toBe(false);
+		});
+		expect(server.store.getSessionAffinity(SESSION_ID)).toBe(device.deviceId);
+		expect(server.store.getIssueLock(ISSUE_ID)).toMatchObject({
+			sessionId: SESSION_ID,
+		});
+
+		// ── The operator reads the run, then asks for it to be reconciled ──
+		const run = server.store
+			.listFleetAgentRuns({ workspaceIds: [WORKSPACE], limit: 10 })
+			.find((candidate) => candidate.sessionId === SESSION_ID);
+		if (!run) throw new Error("no run recorded");
+
+		const request = {
+			schemaVersion: 1,
+			runId: run.runId,
+			expectedRevision: run.revision,
+			idempotencyKey: "idem-recovery-e2e-1",
+			reason: "issue is write-only; container stopped with the lock held",
+		};
+		const accepted = await post(request);
+		expect(accepted.status).toBe(202);
+
+		// A retry of the same key joins the operation it already names rather than
+		// starting a competing one — the whole reason the key exists.
+		const rejoined = await post(request);
+		expect(rejoined.status).toBe(200);
+		expect(rejoined.body.operationId).toBe(accepted.body.operationId);
+		// The same key bound to different evidence is a conflict, not a join: a
+		// client that lost a response must not be able to retry its way into
+		// recovering something it never asked about.
+		const rebound = await post({
+			...request,
+			expectedRevision: run.revision + 1,
+		});
+		expect(rebound.status).toBe(409);
+		expect(rebound.body.error).toBe("idempotency_key_conflict");
+
+		await vi.waitFor(
+			async () => {
+				const current = await operation(accepted.body.operationId);
+				expect({
+					phase: current.phase,
+					failure: current.failure?.message,
+				}).toEqual({ phase: "recovered", failure: undefined });
+			},
+			{ timeout: 10_000 },
+		);
+
+		const settled = await operation(accepted.body.operationId);
+		// The prefix is fixed; whether a `releasing_stale_ownership` entry appears
+		// is not, and pinning it would be pinning a race. Booting the container is
+		// itself what brings its worker back, and the reconnect handshake runs the
+		// router's own affinity/lock reconciliation — so the run may already be
+		// terminal by the time the replay window closes. Either way the issue ends
+		// up unlocked, which is what the assertions below hold to.
+		expect(
+			settled.phases.map((entry: { phase: string }) => entry.phase).slice(0, 4),
+		).toEqual(["accepted", "starting_executor", "reconciling", "replaying"]);
+		expect(settled.phases.at(-1).phase).toBe("recovered");
+		// The before/after pair is what proves the operation released a live pin
+		// rather than doing nothing.
+		expect(settled.evidenceBefore).toMatchObject({
+			sessionAffinityHeld: true,
+			issueLocked: true,
+		});
+		expect(settled.evidenceAfter).toMatchObject({
+			sessionAffinityHeld: false,
+			issueLocked: false,
+			lifecycle: "unknown",
+		});
+		// It restarted the container rather than reasoning from a stale gauge, and
+		// it never stopped or destroyed anything.
+		expect(await dockerExec.status(ISSUE_KEY)).toBe("running");
+		expect(dockerExec.destroyCalls).not.toContain(ISSUE_KEY);
+		expect(server.store.getSessionAffinity(SESSION_ID)).toBeUndefined();
+		expect(server.store.getIssueLock(ISSUE_ID)).toBeUndefined();
+	}, 20_000);
+
+	it("will not re-open the run it just recovered", async () => {
+		// Recovery ended this run as `unknown`. A second request quoting it — even
+		// with fresh evidence and a fresh key — is refused rather than acted on:
+		// recovery reconciles ownership, it does not restart work.
+		const run = server.store
+			.listFleetAgentRuns({ workspaceIds: [WORKSPACE], limit: 10 })
+			.find((candidate) => candidate.sessionId === SESSION_ID);
+		if (!run) throw new Error("no run recorded");
+		expect(run.state).toBe("unknown");
+
+		const refused = await post({
+			schemaVersion: 1,
+			runId: run.runId,
+			expectedRevision: run.revision,
+			idempotencyKey: "idem-recovery-e2e-2",
+		});
+
+		expect(refused.status).toBe(409);
+		expect(refused.body.error).toBe("run_already_terminal");
+		expect(dockerExec.destroyCalls).not.toContain(ISSUE_KEY);
 	});
 });

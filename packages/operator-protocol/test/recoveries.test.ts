@@ -258,6 +258,9 @@ describe("RecoveryOperationV1", () => {
 			"stale_revision",
 			"run_already_terminal",
 			"not_authorized",
+			// The router cannot start a teammate's own machine, so it declines
+			// rather than concluding anything from an offline device's silence.
+			"executor_not_startable",
 		]);
 		expect(
 			recoveryRefusalReasonV1Schema.safeParse("try_again_later").success,
