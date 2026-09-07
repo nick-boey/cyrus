@@ -1,7 +1,11 @@
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentEvent, ILogger } from "cyrus-core";
+import {
+	type AgentEvent,
+	CANONICAL_RUN_ATTRIBUTE_KEYS,
+	type ILogger,
+} from "cyrus-core";
 import type {
 	ContainerExecutor,
 	IssueExecutionContext,
@@ -28,10 +32,43 @@ import {
 import { RouterStore } from "../src/RouterStore.js";
 import { SecretStore } from "../src/SecretStore.js";
 import { TerminalTeardown } from "../src/TerminalTeardown.js";
-import { eventsNamed, silentLogger, testLogger } from "./helpers/logger.js";
+import {
+	eventsNamed,
+	silentLogger,
+	type TestLogger,
+	testLogger,
+} from "./helpers/logger.js";
 
 const ROUTE_NOW = 1_000_000;
 const TTL_MS = 60_000;
+
+/**
+ * The canonical attribution bag (CYR-72) as `eventsNamed` renders it — i.e.
+ * with the `cyrus.` prefix stripped — when nothing is known.
+ *
+ * Every router event carries all sixteen keys, `null` for the facts that were
+ * not known at emission time, so `where isnull(p["cyrus.run_id"])` finds the
+ * lines a run never produced. Tests spread this and then state only the facts
+ * their own scenario supplies.
+ */
+const NO_RUN_ATTRIBUTION = {
+	workspace_id: null,
+	workspace_name: null,
+	owner_id: null,
+	owner_name: null,
+	team_id: null,
+	team_name: null,
+	project_id: null,
+	project_name: null,
+	issue_key: null,
+	run_id: null,
+	session_id: null,
+	device_id: null,
+	runner: null,
+	model: null,
+	provider: null,
+	source: "router",
+};
 
 interface Creator {
 	id: string;
@@ -460,10 +497,14 @@ describe("EventRouter", () => {
 
 		expect(eventsNamed(logger, "routing.rejected")).toEqual([
 			{
+				...NO_RUN_ATTRIBUTION,
+				// From the webhook's own routing snapshot: a rejection has no run, so
+				// this is the only workspace the router can honestly attribute it to.
+				workspace_id: "ws-1",
+				session_id: "sess-b",
 				reason: "issue_locked",
 				agent_session_id: "sess-b",
 				issue_id: "ISS-2",
-				issue_key: null,
 				held_by_session_id: "sess-a",
 				held_by_device_id: aliceDevice,
 			},
@@ -491,12 +532,18 @@ describe("EventRouter", () => {
 
 		expect(eventsNamed(logger, "routing.rejected")).toEqual([
 			{
+				...NO_RUN_ATTRIBUTION,
+				workspace_id: "ws-1",
+				session_id: "sess-u",
 				reason: "unenrolled_creator",
 				agent_session_id: "sess-u",
 				issue_id: "ISS-3",
-				issue_key: null,
 				held_by_session_id: null,
 				held_by_device_id: null,
+				// owner_* stays null on purpose: an unenrolled creator is precisely
+				// the case where there is no Cyrus user to attribute the run to, and
+				// naming the webhook's actor would put a non-existent owner into the
+				// column every ownership filter reads.
 			},
 		]);
 	});
@@ -528,11 +575,26 @@ describe("EventRouter", () => {
 			}),
 		);
 
+		// This session WAS routed, so unlike (c2)/(c3) the refusal carries the
+		// canonical facts of the run it was refused against — the property CYR-72
+		// exists for: one `where p["cyrus.run_id"] == …` returns the route, the
+		// refusal, and everything the worker logged in between.
 		expect(eventsNamed(logger, "routing.rejected")).toContainEqual({
+			...NO_RUN_ATTRIBUTION,
+			workspace_id: "ws-1",
+			owner_id: "1",
+			owner_name: "alice@example.com",
+			session_id: "sess-1",
+			device_id: 1,
+			run_id: expect.any(String),
+			// The run row stores the literal "unknown" for a webhook that carried
+			// no issue key; it is normalised back to null on the way out, so
+			// `isnull(...)` finds these rather than a sentinel gathering every
+			// unrelated key-less run under one plausible-looking issue.
+			issue_key: null,
 			reason: "non_creator_prompt",
 			agent_session_id: "sess-1",
 			issue_id: "ISS-1",
-			issue_key: null,
 			held_by_session_id: null,
 			held_by_device_id: null,
 		});
@@ -1232,10 +1294,11 @@ describe("EventRouter container routing", () => {
 		const { containerTargets, secrets } = makeContainerTargets(store);
 		secrets.set("dave@example.com", "claudeOauthToken", "tok-1");
 		const info = vi.fn<(msg: string) => void>();
-		const { router } = makeRouter(store, {
-			containerTargets,
-			logger: { info, warn: () => {} },
-		});
+		// A full logger, not the two methods this assertion reads: routing now also
+		// emits `run.routed`, and a stub missing `event` would fail on that instead
+		// of on the claim the test is making.
+		const logger = testLogger({ info, warn: () => {} });
+		const { router } = makeRouter(store, { containerTargets, logger });
 
 		await router.route(
 			createdEvent({
@@ -2634,5 +2697,308 @@ describe("EventRouter explicit run facts", () => {
 		// idempotent replay must not look like a change to a watching client.
 		router.handleSessionState(deviceId, { ...waiting, id: "f2" });
 		expect(revision()).toBe(before + 1);
+	});
+});
+
+/**
+ * CYR-72: the canonical attribution has to be the SAME set of facts at every
+ * point in a run's life.
+ *
+ * The failure being designed out is not a missing attribute — it is two
+ * emitters that each know a different half. Before this, a route logged a
+ * device and an issue, a terminal frame logged a session id, and neither knew
+ * the workspace, owner, team or project; an operator answering "what happened
+ * to this run?" had to join three partial views by hand and could only do it if
+ * they already knew the session id to start from. These tests assert the join
+ * key survives from route through terminal and through the recovery paths,
+ * because that is the property a query depends on and the one a refactor of any
+ * single emitter would silently break.
+ */
+describe("EventRouter canonical run attribution (CYR-72)", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	async function routedRun(overrides?: { logger?: TestLogger }) {
+		const logger = overrides?.logger ?? testLogger();
+		const deviceId = enroll(store, ALICE.email, {
+			name: ALICE.name,
+			linearId: ALICE.id,
+		});
+		const { router, clock } = makeRouter(store, {
+			logger,
+			// The project is on no webhook at any nesting, so it takes a Linear
+			// read. Supplied here because "the project column is populated" is
+			// exactly the filter dimension CYR-72 adds.
+			fetchRoutingContext: async () => ({
+				linearProjectId: "proj-7",
+				linearProjectName: "Fleet observability",
+			}),
+		});
+		const event = createdEvent({
+			sessionId: "sess-1",
+			issueId: "ISS-1",
+			identifier: "CYR-72",
+			creator: ALICE,
+		}) as unknown as { agentSession: { issue: Record<string, unknown> } };
+		event.agentSession.issue.team = { id: "team-3", name: "Cyrus" };
+		event.agentSession.issue.teamId = "team-3";
+		await router.route(event as unknown as AgentEvent);
+		return { router, logger, deviceId, clock };
+	}
+
+	/** The identity columns a query joins on, from one emitted event. */
+	function joinKey(attributes: Record<string, unknown>) {
+		return {
+			workspace_id: attributes.workspace_id,
+			owner_id: attributes.owner_id,
+			owner_name: attributes.owner_name,
+			team_id: attributes.team_id,
+			team_name: attributes.team_name,
+			issue_key: attributes.issue_key,
+			run_id: attributes.run_id,
+			session_id: attributes.session_id,
+			device_id: attributes.device_id,
+			source: attributes.source,
+		};
+	}
+
+	it("stamps the full canonical set on the route that creates the run", async () => {
+		const { logger, deviceId } = await routedRun();
+
+		const [routed] = eventsNamed(logger, "run.routed");
+		expect(routed).toMatchObject({
+			workspace_id: "ws-1",
+			owner_id: "1",
+			owner_name: ALICE.name,
+			team_id: "team-3",
+			team_name: "Cyrus",
+			issue_key: "CYR-72",
+			session_id: "sess-1",
+			device_id: deviceId,
+			source: "router",
+		});
+		expect(routed?.run_id).toEqual(expect.any(String));
+		// Not yet enriched. `run.routed` records what was known WHEN THE ROUTE
+		// HAPPENED — waiting for the Linear round trip would make it a different
+		// fact — so the project columns are honestly null here and populated on
+		// every later event about the same run.
+		expect(routed?.project_id).toBeNull();
+	});
+
+	it("keeps the join key identical from route to terminal", async () => {
+		const { router, logger, deviceId } = await routedRun();
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "complete",
+			runner: "claude",
+			model: "claude-opus-5",
+		});
+
+		const [routed] = eventsNamed(logger, "run.routed");
+		const [finished] = eventsNamed(logger, "run.finished");
+		expect(routed).toBeDefined();
+		expect(finished).toBeDefined();
+		expect(joinKey(finished ?? {})).toEqual(joinKey(routed ?? {}));
+		expect(finished).toMatchObject({
+			terminal_state: "complete",
+			// The terminal frame is the only point an ordinary run reports these,
+			// which is why the event is emitted after the write rather than before.
+			runner: "claude",
+			model: "claude-opus-5",
+		});
+	});
+
+	it("carries the enriched project onto every event after the enrichment lands", async () => {
+		const { router, logger, deviceId } = await routedRun();
+		// The enrichment is fire-and-forget off the routing path; let it settle.
+		await new Promise((resolve) => setImmediate(resolve));
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+
+		expect(eventsNamed(logger, "run.finished")[0]).toMatchObject({
+			project_id: "proj-7",
+			project_name: "Fleet observability",
+		});
+	});
+
+	it("distinguishes a run the router ended itself from one that reported terminal", async () => {
+		// Both end the run. Only one of them means the outcome was never observed,
+		// and folding them into a single event would bury every silently-lost run
+		// inside the healthy series.
+		const { router, logger, deviceId } = await routedRun();
+		// The device has processed everything queued for it, which is what makes
+		// its declared-session list authoritative enough to reconcile against.
+		store.ackEvent(deviceId, 1);
+
+		await router.reconcileDeviceLocks(deviceId, []);
+
+		const [routed] = eventsNamed(logger, "run.routed");
+		const [unknown] = eventsNamed(logger, "run.unknown");
+		expect(eventsNamed(logger, "run.finished")).toHaveLength(0);
+		expect(unknown).toMatchObject({
+			reason: "lock_reconciled",
+			reporting_device_id: deviceId,
+		});
+		expect(joinKey(unknown ?? {})).toEqual(joinKey(routed ?? {}));
+	});
+
+	it("reports a stale-affinity reclaim under the same run", async () => {
+		const { router, logger, deviceId } = await routedRun();
+
+		// `session_affinity.established_ms` is stamped from the store's own wall
+		// clock, not the router's injectable one, so the reconcile window has to
+		// be measured against `Date.now()` rather than `clock.value`.
+		router.reconcileDeviceAffinity(deviceId, [], Date.now() + 600_001);
+
+		expect(eventsNamed(logger, "run.unknown")[0]).toMatchObject({
+			reason: "affinity_reconciled",
+			session_id: "sess-1",
+			run_id: expect.any(String),
+		});
+	});
+
+	it("attributes an ownership refusal to the run whose activity was refused", async () => {
+		// This refusal IS user-visible data loss (NOR-405). Without attribution it
+		// can only be found by someone who already knows the session id — not by
+		// the per-workspace or per-issue query anyone would actually reach for.
+		const { router, logger, deviceId } = await routedRun();
+		const mallory = deviceId + 1;
+
+		router.handleSessionState(mallory, {
+			type: "session_state",
+			id: "ss-forged",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+
+		expect(eventsNamed(logger, "session.ownership_refused")[0]).toMatchObject({
+			reason: "terminal_not_owned",
+			workspace_id: "ws-1",
+			issue_key: "CYR-72",
+			session_id: "sess-1",
+			run_id: expect.any(String),
+			// The REFUSED device, not the run's owner — the point of the event is
+			// which device made a claim it did not hold.
+			device_id: mallory,
+			owner_device_id: deviceId,
+		});
+	});
+
+	it("emits every canonical key on every run event, so isnull() filters work", async () => {
+		const { router, logger, deviceId } = await routedRun();
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+
+		const emitted = [
+			...eventsNamed(logger, "run.routed"),
+			...eventsNamed(logger, "run.finished"),
+		];
+		expect(emitted).toHaveLength(2);
+		for (const attributes of emitted) {
+			for (const key of CANONICAL_RUN_ATTRIBUTE_KEYS) {
+				expect(attributes).toHaveProperty(key.slice("cyrus.".length));
+			}
+		}
+	});
+});
+
+/**
+ * Review follow-up (CYR-72): a lifecycle event must describe a real transition.
+ *
+ * Both `finishAgentRun` and `markAgentRunUnknown` return early on a run that is
+ * already terminal, and both of those are ROUTINE rather than exceptional —
+ * `routePrompted` re-establishes affinity for an already-terminal session
+ * (PAR-146), and `RouterServer` applies a `session_state` frame before acking
+ * it, so a device replays frames the router already applied. Emitting anyway
+ * would file a healthy completed run under "nobody saw the outcome", which is
+ * exactly the misdiagnosis the finished/unknown split exists to prevent.
+ */
+describe("EventRouter run lifecycle events describe real transitions", () => {
+	let store: RouterStore;
+
+	beforeEach(() => {
+		store = new RouterStore(":memory:");
+	});
+
+	async function routedAndFinished() {
+		const logger = testLogger();
+		const deviceId = enroll(store, ALICE.email, {
+			name: ALICE.name,
+			linearId: ALICE.id,
+		});
+		const { router } = makeRouter(store, { logger });
+		await router.route(
+			createdEvent({
+				sessionId: "sess-1",
+				issueId: "ISS-1",
+				identifier: "CYR-72",
+				creator: ALICE,
+			}),
+		);
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f1",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+		return { router, logger, deviceId };
+	}
+
+	it("emits nothing when a device replays a terminal frame it already sent", async () => {
+		const { router, logger, deviceId } = await routedAndFinished();
+		expect(eventsNamed(logger, "run.finished")).toHaveLength(1);
+
+		router.handleSessionState(deviceId, {
+			type: "session_state",
+			id: "f2",
+			sessionId: "sess-1",
+			state: "complete",
+		});
+
+		expect(eventsNamed(logger, "run.finished")).toHaveLength(1);
+	});
+
+	it("does not report an already-finished run as one nobody observed", async () => {
+		// The PAR-146 shape: affinity survives a terminal session, so a later
+		// reclaim of that row reaches markAgentRunUnknown with nothing left to end.
+		const { router, logger, deviceId } = await routedAndFinished();
+		store.setSessionAffinity("sess-1", deviceId, undefined, 1_000);
+
+		router.reconcileDeviceAffinity(deviceId, [], 1_000 + 600_001);
+
+		expect(eventsNamed(logger, "run.unknown")).toHaveLength(0);
+		expect(eventsNamed(logger, "run.finished")).toHaveLength(1);
+	});
+
+	it("still reports a genuine reclaim of a live run", async () => {
+		// The guard must not suppress the case the event exists for.
+		const logger = testLogger();
+		const deviceId = enroll(store, ALICE.email, {
+			name: ALICE.name,
+			linearId: ALICE.id,
+		});
+		const { router } = makeRouter(store, { logger });
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+
+		router.reconcileDeviceAffinity(deviceId, [], Date.now() + 600_001);
+
+		expect(eventsNamed(logger, "run.unknown")).toHaveLength(1);
 	});
 });

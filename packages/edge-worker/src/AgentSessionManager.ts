@@ -22,6 +22,7 @@ import {
 	type IAgentRunner,
 	type ILogger,
 	type IssueMinimal,
+	type LogEventAttributes,
 	type RepositoryContext,
 	type RunnerType,
 	type SerializedCyrusAgentSession,
@@ -630,6 +631,7 @@ export class AgentSessionManager extends EventEmitter {
 				log.event(
 					CYRUS_EVENTS.sessionTerminalDeferred,
 					cyrusAttributes({
+						...this.runFactAttributes(sessionId),
 						agent_session_id: sessionId,
 						terminal_state: terminalState,
 						session_cron_count: pendingWork.sessionCrons.length,
@@ -743,6 +745,46 @@ export class AgentSessionManager extends EventEmitter {
 		};
 	}
 
+	/**
+	 * The canonical attributes for a worker-emitted lifecycle event (CYR-72).
+	 *
+	 * Deliberately only the three facts the WORKER is the authority on:
+	 *
+	 *  - `session_id` — the Linear agent session id, which is the join key every
+	 *    other canonical column hangs off. Note this is NOT the same id as
+	 *    `agent_session_id` on the runner's own `session.*` events: that one is
+	 *    the agent SDK's session id, the two families do not join, and a KQL
+	 *    query that mixes them returns nothing rather than erroring. Both are
+	 *    emitted so either question can be asked.
+	 *  - `runner` / `model` — execution identity the worker is the ORIGINAL
+	 *    authority on. The router's copy is only a cache of what a worker
+	 *    previously reported on a frame, so `SandboxLogRelay` reads these two off
+	 *    the line when its own copy is null rather than overwriting them — which
+	 *    is what makes them useful in the window before the first frame carrying
+	 *    them lands. Every other canonical key the router claims outright, so a
+	 *    worker copy of it would be discarded; these two are the deliberate
+	 *    exception and the relay documents why.
+	 *
+	 * The workspace, owner, team, project, run id and device id are deliberately
+	 * ABSENT rather than guessed. The worker has no trustworthy view of them, and
+	 * the relay stamps them from the authenticated device and run rows — a
+	 * worker-supplied copy would be discarded there and would only be believed on
+	 * the one deployment where nothing checks it.
+	 *
+	 * The two run facts are omitted when unknown rather than sent as null: the
+	 * relay's null-vs-absent distinction is what lets it tell "the worker did not
+	 * report one" from "the worker reported nothing at all", and a relayed line
+	 * gets the full null-filled canonical set from the router regardless.
+	 */
+	private runFactAttributes(sessionId: string): LogEventAttributes {
+		const facts = this.getRunFacts(sessionId);
+		return {
+			session_id: sessionId,
+			...(facts.runner ? { runner: facts.runner } : {}),
+			...(facts.model ? { model: facts.model } : {}),
+		};
+	}
+
 	private consumeStopRequest(linearAgentActivitySessionId: string): boolean {
 		if (!this.stopRequestedSessions.has(linearAgentActivitySessionId)) {
 			return false;
@@ -839,6 +881,10 @@ export class AgentSessionManager extends EventEmitter {
 		this.sessionLog(sessionId).event(
 			CYRUS_EVENTS.sessionTerminalSignalled,
 			cyrusAttributes({
+				// Captured before the session row is torn down, so the runner and
+				// model on the closing record describe the turn that just ended
+				// rather than reading as absent.
+				...this.runFactAttributes(sessionId),
 				agent_session_id: sessionId,
 				terminal_state: state,
 				forced: opts?.force ?? false,

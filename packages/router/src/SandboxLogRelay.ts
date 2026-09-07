@@ -1,8 +1,9 @@
 import {
 	createLogger,
-	cyrusAttributes,
 	type ILogger,
 	type LogEventAttributes,
+	type RunAttribution,
+	runAttributionAttributes,
 } from "cyrus-core";
 import type { LogFrame } from "cyrus-router-protocol";
 
@@ -42,11 +43,52 @@ const MAX_STACKTRACE_CHARS = 8_000;
  */
 const MAX_CACHED_LOGGERS = 64;
 
+/**
+ * Keys a worker may never set through its attribute bag.
+ *
+ * "The key is already taken" guards the canonical `cyrus.*` set, because those
+ * are built unconditionally. It does NOT guard these, which the relay sets only
+ * when the frame supplies the corresponding field — so a frame that simply omits
+ * the field leaves the key free for the attribute bag to fill.
+ *
+ * `event` is the dangerous one and the reason this list is not optional. A
+ * relayed line now carries authentic, router-stamped `cyrus.run_id` / workspace
+ * / owner / team, so a worker sending `attributes: { event: "run.finished" }`
+ * with no `frame.event` would produce a record indistinguishable from a
+ * router-emitted lifecycle event for its own real run — and
+ * `event startswith "sandbox."` is how every alert rule in `monitoring.bicep`
+ * is scoped. The rest are here because they are equally router-owned: the
+ * dropped count is loss accounting, the `reported_*` pair is the router's record
+ * of a disagreement, and the trace context is what a line joins to a trace by.
+ */
+const WORKER_RESERVED_KEYS = new Set([
+	"event",
+	"args",
+	"traceparent",
+	"tracestate",
+	"trace_id",
+	"span_id",
+	"cyrus.dropped",
+	"cyrus.emitted_at",
+	"cyrus.reported_issue_identifier",
+	"cyrus.reported_session_id",
+]);
+
 /** Identity the ROUTER holds for a device, not anything the device asserted. */
 export interface SandboxLogOrigin {
 	deviceId: number;
 	issueKey?: string;
 	provider?: string;
+	/**
+	 * The canonical facts of the run this device is currently carrying, read
+	 * from the router's own `agent_runs` row.
+	 *
+	 * Optional, and its absence is meaningful rather than a gap to paper over: a
+	 * container logs from the moment it boots, which is before its first route
+	 * creates a run. Those lines get the canonical columns as `null`, never a
+	 * value taken from the frame — see {@link SandboxLogRelay}.
+	 */
+	run?: RunAttribution;
 }
 
 /**
@@ -63,11 +105,19 @@ export interface SandboxLogOrigin {
  * Azure credential inside the sandbox.
  *
  * ── ATTRIBUTION IS ROUTER-SIDE ──
- * `cyrus.device_id` / `cyrus.issue_key` come from the device row the gateway
- * authenticated, NOT from the frame. A worker cannot label its logs with someone
- * else's issue. The device's own `issueIdentifier` is carried separately as
- * `cyrus.reported_issue_identifier` so a mismatch is visible rather than
- * silently resolved one way or the other.
+ * Every canonical attribute — the workspace, owner, team, project, run, session,
+ * issue, device, runner, model and provider — comes from the device row the
+ * gateway authenticated and the run row the router itself wrote, NOT from the
+ * frame. A worker cannot label its logs with someone else's issue, run or
+ * workspace. That guarantee is structural rather than a denylist: the canonical
+ * keys are ALWAYS present (as `null` when unknown), and worker attributes are
+ * merged only into keys the router has not already claimed, so there is no key
+ * for a spoofed value to land in and no list anyone has to remember to extend.
+ *
+ * The device's own `issueIdentifier` and `sessionId` are carried separately as
+ * `cyrus.reported_issue_identifier` / `cyrus.reported_session_id` when they
+ * disagree with the router's view, so a mismatch is visible rather than silently
+ * resolved one way or the other.
  *
  * ── LEVEL MAPPING ──
  * A worker's WARN/ERROR is re-emitted at the SAME level, which means it also
@@ -152,23 +202,46 @@ export class SandboxLogRelay {
 			this.loggers.set(safeComponent, base);
 		}
 
-		// Router-side attribution, namespaced like every other Cyrus-specific
-		// attribute (see `cyrusAttributes`). The structural keys below — `event`,
+		// Router-side attribution, built by the one shared builder every Cyrus
+		// logger uses so a relayed line and a router-emitted one agree key for key
+		// (see `runAttributionAttributes`). The structural keys below — `event`,
 		// `args`, and the W3C trace-context pair — are deliberately NOT namespaced:
 		// `event` and `args` mirror `LogRecord`'s own fields on the direct path, so
 		// namespacing them here would make a relayed line and a locally-emitted one
 		// disagree about the same fact, and `traceparent`/`tracestate` are
 		// standard names owned by W3C rather than by us.
-		const attributes: LogEventAttributes = cyrusAttributes({
-			source: SANDBOX_LOG_SOURCE,
-			device_id: origin.deviceId,
-			issue_key: origin.issueKey ?? null,
-			provider: origin.provider ?? null,
-			// The device's clock, kept alongside the router's own timestamp so a
-			// clock skew between sandbox and router is visible rather than
-			// silently reordering the stream.
-			emitted_at: frame.ts,
-		});
+		//
+		// The device/issue/provider triple is stamped OVER the run's own copy: the
+		// device row is what the gateway authenticated this socket as, which is a
+		// stronger claim than anything derived from a row the run once wrote.
+		const attributes: LogEventAttributes = runAttributionAttributes(
+			{
+				...origin.run,
+				deviceId: origin.deviceId,
+				issueKey: origin.issueKey ?? origin.run?.issueKey ?? null,
+				provider: origin.provider ?? origin.run?.provider ?? null,
+				// The two exceptions to "the router's copy wins", and they are
+				// exceptions on principle rather than convenience: the WORKER is the
+				// original authority on which agent and model it is running. The
+				// router's copy is only a cache of what a worker previously reported
+				// on a frame, so a null there means "not reported yet", not
+				// "contradicted". Reading the worker's own line for it therefore adds
+				// no trust — a container can only mislabel its own run's execution
+				// identity, which it could already do over the frame channel — and it
+				// covers the window the run row cannot: every line emitted before the
+				// first frame carrying these lands.
+				runner: origin.run?.runner ?? reportedString(frame, "cyrus.runner"),
+				model: origin.run?.model ?? reportedString(frame, "cyrus.model"),
+				source: SANDBOX_LOG_SOURCE,
+			},
+			// Derived from the frame's own carrier, which is the only trace context
+			// that describes the worker's call site.
+			{ traceparent: frame.traceparent },
+		);
+		// The device's clock, kept alongside the router's own timestamp so a
+		// clock skew between sandbox and router is visible rather than silently
+		// reordering the stream.
+		attributes["cyrus.emitted_at"] = frame.ts;
 		if (frame.event !== undefined) attributes.event = frame.event;
 		if (frame.args !== undefined) {
 			attributes.args = truncate(frame.args, MAX_ATTRIBUTE_CHARS);
@@ -193,9 +266,32 @@ export class SandboxLogRelay {
 			// the class doc on router-side attribution.
 			attributes["cyrus.reported_issue_identifier"] = frame.issueIdentifier;
 		}
+		if (
+			origin.run !== undefined &&
+			frame.sessionId !== undefined &&
+			frame.sessionId !== origin.run.sessionId
+		) {
+			// Same rule as the issue identifier. Worth recording separately because
+			// the two ids disagreeing is exactly what a worker still logging under a
+			// finished session looks like, and `cyrus.session_id` alone would show
+			// the router's (correct, but silent) view of that.
+			//
+			// Gated on the router HAVING a run: without it `origin.run?.sessionId`
+			// is undefined and every session id reads as a disagreement, so the
+			// marker would be stamped on every line a container writes before its
+			// first route. A mismatch signal that fires mostly when nothing
+			// mismatches is one nobody can act on.
+			attributes["cyrus.reported_session_id"] = frame.sessionId;
+		}
 		for (const [key, value] of boundedEntries(frame.attributes)) {
-			// Worker attributes never override the router's attribution keys.
+			// Worker attributes never override a key the router already claimed.
+			// Every canonical key is present unconditionally (as `null` when
+			// unknown), so this one check covers that whole set.
 			if (key in attributes) continue;
+			// And the keys the router sets only CONDITIONALLY, which the test above
+			// cannot cover — see WORKER_RESERVED_KEYS for why `event` in particular
+			// must be on this list.
+			if (WORKER_RESERVED_KEYS.has(key)) continue;
 			attributes[key] = value;
 		}
 
@@ -226,6 +322,19 @@ function rehydrateError(exception: LogFrame["exception"]): [Error] | [] {
 			? truncate(exception.stacktrace, MAX_STACKTRACE_CHARS)
 			: `${error.name}: ${error.message}`;
 	return [error];
+}
+
+/**
+ * Read one worker-asserted attribute, if it is a non-empty string.
+ *
+ * Only ever used for the two facts the worker is the original authority on
+ * (`cyrus.runner`, `cyrus.model`) — see the call site. Bounded like every other
+ * device-supplied value, because it is one.
+ */
+function reportedString(frame: LogFrame, key: string): string | null {
+	const value = frame.attributes?.[key];
+	if (typeof value !== "string" || value.length === 0) return null;
+	return truncate(value, MAX_ATTRIBUTE_CHARS);
 }
 
 function truncate(text: string, max: number): string {

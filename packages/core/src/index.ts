@@ -17,6 +17,7 @@ export {
 	setGlobalErrorTags,
 } from "./error-reporting/index.js";
 export type {
+	CanonicalRunAttributeKey,
 	CyrusEventName,
 	ILogger,
 	InstalledRecordingLogSink,
@@ -27,8 +28,11 @@ export type {
 	LogRecord,
 	LogRecordQuery,
 	LogSink,
+	RunAttribution,
+	TraceAttribution,
 } from "./logging/index.js";
 export {
+	CANONICAL_RUN_ATTRIBUTE_KEYS,
 	CYRUS_ATTRIBUTE_NAMESPACE,
 	CYRUS_EVENTS,
 	createLogger,
@@ -43,6 +47,7 @@ export {
 	LogLevel,
 	RecordingLogSink,
 	resetGlobalLogSink,
+	runAttributionAttributes,
 	setGlobalLogSink,
 } from "./logging/index.js";
 

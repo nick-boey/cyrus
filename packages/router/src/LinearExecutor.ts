@@ -22,7 +22,10 @@ import {
 	SESSION_SCOPED_RPC_METHODS,
 } from "cyrus-router-protocol";
 import type { RouterStore } from "./RouterStore.js";
-import { emitSessionOwnershipRefusal } from "./RouterTelemetry.js";
+import {
+	emitSessionOwnershipRefusal,
+	runAttribution,
+} from "./RouterTelemetry.js";
 import { ROUTER_SPANS, routerTracer } from "./telemetry/tracing.js";
 
 /** 20 MiB — default ceiling for token-authenticated attachment downloads. */
@@ -189,11 +192,20 @@ export class LinearExecutor {
 					// sandbox's own relayed console — below the WARN threshold a
 					// worker's forwarder ships by default. That is how 161 dropped
 					// posts in a single day went unnoticed (NOR-405).
+					const refusedRun = sessionId
+						? this.store.getAgentRunForSession(sessionId)
+						: undefined;
 					emitSessionOwnershipRefusal(this.logger, {
 						reason: "rpc_not_owned",
 						sessionId,
 						deviceId,
 						rpcMethod: method,
+						// The run whose activity was just dropped. This refusal IS the
+						// data loss — the post never reaches Linear — so it has to be
+						// filterable by the same workspace/owner/team columns as every
+						// other line about that run, or the loss can only be found by
+						// someone who already knows the session id.
+						...(refusedRun ? { attribution: runAttribution(refusedRun) } : {}),
 					});
 					this.logger
 						.withContext({

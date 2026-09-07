@@ -1,4 +1,12 @@
-import { cyrusAttributes, type ILogger } from "cyrus-core";
+import {
+	cyrusAttributes,
+	type ILogger,
+	type LogEventAttributes,
+	type RunAttribution,
+	runAttributionAttributes,
+} from "cyrus-core";
+import { activeTraceIds } from "cyrus-otel-traces";
+import type { AgentRunInfo, AgentRunRouting } from "./RouterStore.js";
 
 /**
  * The routing-decision event vocabulary.
@@ -64,6 +72,13 @@ export interface RoutingRejection {
 	heldBySessionId?: string;
 	/** The device that session is pinned to, for `issue_locked`. */
 	heldByDeviceId?: number;
+	/**
+	 * The workspace/owner/team/project snapshot, when the router could resolve
+	 * one. A rejection has no run by definition, so the run-scoped canonical
+	 * facts stay null here — which is itself the queryable statement that this
+	 * session never got one.
+	 */
+	attribution?: RunAttribution;
 }
 
 /**
@@ -73,6 +88,12 @@ export interface RoutingRejection {
  * the `info` these paths used to carry alone: `event()` is what makes the
  * refusal queryable, and WARN is what makes it visible to an operator reading a
  * console or a sink whose threshold is WARN+ (every sandbox worker's default).
+ *
+ * `agent_session_id` and `issue_id` predate the canonical set and are kept
+ * verbatim: `monitoring.bicep`'s `Cyrus-Routing-Rejections` saved search reads
+ * them by name, and renaming them would silently empty it. `cyrus.session_id`
+ * and `cyrus.issue_key` carry the same two facts under the canonical spelling,
+ * so a query written either way finds this event.
  */
 export function emitRoutingRejection(
 	logger: ILogger,
@@ -80,14 +101,25 @@ export function emitRoutingRejection(
 ): void {
 	logger.event(
 		ROUTING_EVENTS.rejected,
-		cyrusAttributes({
-			reason: rejection.reason,
-			agent_session_id: rejection.sessionId,
-			issue_id: rejection.issueId ?? null,
-			issue_key: rejection.issueKey ?? null,
-			held_by_session_id: rejection.heldBySessionId ?? null,
-			held_by_device_id: rejection.heldByDeviceId ?? null,
-		}),
+		routerAttributes(
+			{
+				...(rejection.attribution ?? { source: ROUTER_LOG_SOURCE }),
+				sessionId: rejection.sessionId,
+				// The rejection's own view first, then the run's. A rejection often
+				// has no issue key to hand (the `prompted` path reads it off an
+				// activity that need not carry one) while the run it refused always
+				// does — and nulling the column there would hide the refusal from the
+				// per-issue query an operator reaches for first.
+				issueKey: rejection.issueKey ?? rejection.attribution?.issueKey ?? null,
+			},
+			{
+				reason: rejection.reason,
+				agent_session_id: rejection.sessionId,
+				issue_id: rejection.issueId ?? null,
+				held_by_session_id: rejection.heldBySessionId ?? null,
+				held_by_device_id: rejection.heldByDeviceId ?? null,
+			},
+		),
 	);
 }
 
@@ -138,6 +170,8 @@ export interface SessionOwnershipRefusal {
 	rpcMethod?: string;
 	/** The frame's declared state, for the three frame reasons. */
 	sessionState?: string;
+	/** Canonical facts of the run the refused claim was aimed at, if any. */
+	attribution?: RunAttribution;
 }
 
 /**
@@ -154,13 +188,231 @@ export function emitSessionOwnershipRefusal(
 ): void {
 	logger.event(
 		SESSION_OWNERSHIP_EVENTS.refused,
-		cyrusAttributes({
-			reason: refusal.reason,
-			agent_session_id: refusal.sessionId ?? null,
-			device_id: refusal.deviceId,
-			owner_device_id: refusal.ownerDeviceId ?? null,
-			rpc_method: refusal.rpcMethod ?? null,
-			session_state: refusal.sessionState ?? null,
-		}),
+		routerAttributes(
+			{
+				...(refusal.attribution ?? { source: ROUTER_LOG_SOURCE }),
+				sessionId: refusal.sessionId ?? null,
+				// The REFUSED device, deliberately, not the run's owner — the whole
+				// point of the event is which device made a claim it did not hold.
+				// `cyrus.owner_device_id` below carries the device that does own it.
+				deviceId: refusal.deviceId,
+			},
+			{
+				reason: refusal.reason,
+				agent_session_id: refusal.sessionId ?? null,
+				owner_device_id: refusal.ownerDeviceId ?? null,
+				rpc_method: refusal.rpcMethod ?? null,
+				session_state: refusal.sessionState ?? null,
+			},
+		),
 	);
+}
+
+/** Which process wrote a log line. Pairs with `sandbox` on relayed lines. */
+export const ROUTER_LOG_SOURCE = "router";
+
+/**
+ * The placeholder `recordAgentRunRouted` writes when a webhook carried no issue
+ * key. Recognised here so it can be normalised back to "not known" on the way
+ * into the log stream — see {@link runAttribution}.
+ */
+const UNKNOWN_ISSUE_KEY = "unknown";
+
+/**
+ * The run-lifecycle vocabulary: the three points at which the ROUTER's view of
+ * an agent run changes state.
+ *
+ * Separate from `ROUTING_EVENTS`, which is about what happened to an inbound
+ * webhook. These are about the run itself, so `event startswith "run."` selects
+ * exactly the series an operator follows to answer "what became of this run?".
+ *
+ * Every one of them carries the full canonical attribution bag (see
+ * {@link runAttribution}), which is what makes that question answerable from
+ * one `where p["cyrus.run_id"] == …` rather than from three partial views
+ * joined by hand.
+ */
+export const RUN_EVENTS = {
+	/**
+	 * An input was routed to a device and recorded against a run. The first one
+	 * for a session creates the run; later ones extend it.
+	 */
+	routed: "run.routed",
+	/**
+	 * The worker reported a terminal state and the router released the run's
+	 * issue lock and affinity. Its ABSENCE for a run that stopped producing
+	 * activity is the signature of a stranded session.
+	 */
+	finished: "run.finished",
+	/**
+	 * The router ended a run WITHOUT a terminal report from its worker — a
+	 * reconnecting device that no longer tracks the session, or an affinity row
+	 * pointing at a device that no longer exists.
+	 *
+	 * Distinct from {@link finished} on purpose: both end the run, but only this
+	 * one means the outcome was never observed, and conflating them would hide
+	 * every silently-lost run inside the healthy series.
+	 */
+	unknown: "run.unknown",
+} as const;
+
+export type RunEventName = (typeof RUN_EVENTS)[keyof typeof RUN_EVENTS];
+
+/** Why the router ended a run it never got a terminal report for. */
+export type RunUnknownReason =
+	/** A device reconnected without declaring a session it holds the lock for. */
+	| "lock_reconciled"
+	/** Affinity pointed at a device row that no longer exists. */
+	| "dangling_affinity"
+	/** The affinity reconciler found no live session backing the row. */
+	| "affinity_reconciled"
+	/** A `created` event outlived its TTL before any device took delivery. */
+	| "event_expired";
+
+/**
+ * Map the router's own run row into the shared canonical attribution shape.
+ *
+ * The ONE place `AgentRunInfo`'s field names are translated into the
+ * `cyrus.*` log vocabulary. Duplicating this mapping is how one emitter comes
+ * to say `owner_user_id` while another says `owner_id` — a divergence that
+ * produces no error, just a saved query that quietly matches fewer rows.
+ *
+ * Note `ownerId` is the router's `users.user_id` rendered as a string, matching
+ * the run row's own `owner_user_id` column rather than the numeric `user_id` on
+ * the run: the two are different keys and only the former is stable across a
+ * device being destroyed and recreated.
+ */
+export function runAttribution(
+	run: AgentRunInfo,
+	overrides?: Partial<RunAttribution>,
+): RunAttribution {
+	return {
+		...routingAttribution(run.routing),
+		// `recordAgentRunRouted` stores the literal `"unknown"` when a webhook
+		// carried no issue key, which predates this and is load-bearing there (the
+		// column is NOT NULL). It must not reach the log stream: CYR-72 promotes
+		// `cyrus.issue_key` to a primary filter, and a sentinel there would both
+		// hide those rows from `isnull(...)` and collect every unrelated
+		// key-less run under one plausible-looking issue.
+		issueKey: run.issueKey === UNKNOWN_ISSUE_KEY ? null : run.issueKey,
+		runId: run.runId,
+		sessionId: run.sessionId,
+		deviceId: run.deviceId,
+		runner: run.runner ?? null,
+		model: run.model ?? null,
+		provider: run.provider ?? null,
+		source: ROUTER_LOG_SOURCE,
+		...overrides,
+	};
+}
+
+/**
+ * The routing half alone, for the paths that have a snapshot but no run yet —
+ * chiefly a routing rejection, which by definition never produced one.
+ */
+export function routingAttribution(
+	routing: AgentRunRouting | undefined,
+): RunAttribution {
+	return {
+		workspaceId: routing?.workspaceId ?? null,
+		workspaceName: routing?.workspaceName ?? null,
+		ownerId: routing?.ownerUserId ?? null,
+		ownerName: routing?.ownerName ?? null,
+		teamId: routing?.linearTeamId ?? null,
+		teamName: routing?.linearTeamName ?? null,
+		projectId: routing?.linearProjectId ?? null,
+		projectName: routing?.linearProjectName ?? null,
+		source: ROUTER_LOG_SOURCE,
+	};
+}
+
+/**
+ * Build the attribute bag for a router-emitted line, correlating it to the
+ * process's currently-active span when there is one.
+ *
+ * The trace ids come from the live span context rather than from a carrier: on
+ * the router side that context IS the authority, whereas a carrier it happens
+ * to be holding may describe the parent of the span actually recording the
+ * line. Absent tracing, `activeTraceIds` returns undefined and nothing is
+ * emitted — an untraced router pays nothing for these call sites.
+ */
+export function routerAttributes(
+	attribution: RunAttribution,
+	extra?: LogEventAttributes,
+): LogEventAttributes {
+	const ids = activeTraceIds();
+	const attributes = runAttributionAttributes(attribution, {
+		traceId: ids?.traceId ?? null,
+		spanId: ids?.spanId ?? null,
+	});
+	// The event's own payload fills in around the canonical set, never over it.
+	// An event that passed `issue_key` would otherwise be free to disagree with
+	// the run row about which issue it describes — and only one of the two can be
+	// the fact every other line was filtered on.
+	for (const [key, value] of Object.entries(cyrusAttributes(extra ?? {}))) {
+		if (key in attributes) continue;
+		attributes[key] = value;
+	}
+	return attributes;
+}
+
+/** The two run reads {@link resolveLogRunAttribution} needs from the store. */
+export interface RunAttributionLookup {
+	getAgentRunForSession(sessionId: string): AgentRunInfo | undefined;
+	getLatestAgentRunForDevice(deviceId: number): AgentRunInfo | undefined;
+}
+
+/**
+ * The run a forwarded log line should be attributed to.
+ *
+ * Two strategies, and the distinction is a correctness one rather than an
+ * optimisation:
+ *
+ *  - When the frame names a session, the run for THAT session — gated on the
+ *    router's own run row agreeing the session belongs to this device.
+ *    `frame.sessionId` is device-supplied, so without that check a worker could
+ *    label its lines with another run's id, which is exactly what router-side
+ *    attribution exists to prevent. The relay records the rejected claim as
+ *    `cyrus.reported_session_id`.
+ *  - When there is no session, or the claimed one failed the gate, the device's
+ *    most recent run — but ONLY for a container. A container serves exactly one
+ *    issue for its whole life, so its latest run is the one its unlabelled boot
+ *    and teardown lines belong to. A PHYSICAL device serves many issues and can
+ *    run several sessions at once, so "latest run" there would attribute one
+ *    session's lines to another session's run. A wrong answer is worse than the
+ *    null columns declining to answer.
+ *
+ * The fallback deliberately also covers a REJECTED session claim, not just an
+ * absent one. Making a failed claim return nothing would hand a container a way
+ * to blank its own attribution — name any session the router cannot tie to it
+ * and every canonical column goes null, evading the very
+ * `where p["cyrus.run_id"] == …` this exists to enable. It also fires benignly:
+ * a session routed moments ago whose run row is not written yet, or a container
+ * destroyed and recreated so the old run's `device_id` no longer matches. In
+ * both cases the container's own latest run is the better answer, and it is
+ * one the device cannot influence.
+ */
+export function resolveLogRunAttribution(
+	lookup: RunAttributionLookup,
+	origin: {
+		deviceId: number;
+		kind?: "device" | "container";
+		sessionId?: string;
+	},
+): AgentRunInfo | undefined {
+	if (origin.sessionId) {
+		const claimed = lookup.getAgentRunForSession(origin.sessionId);
+		if (claimed?.deviceId === origin.deviceId) return claimed;
+	}
+	if (origin.kind !== "container") return undefined;
+	return lookup.getLatestAgentRunForDevice(origin.deviceId);
+}
+
+/** Emit one run-lifecycle event with the full canonical attribution bag. */
+export function emitRunEvent(
+	logger: ILogger,
+	name: RunEventName,
+	attribution: RunAttribution,
+	extra?: LogEventAttributes,
+): void {
+	logger.event(name, routerAttributes(attribution, extra));
 }

@@ -114,10 +114,20 @@ export {
 } from "./RouterStore.js";
 export {
 	emitRoutingRejection,
+	emitRunEvent,
+	ROUTER_LOG_SOURCE,
 	ROUTING_EVENTS,
 	type RoutingEventName,
 	type RoutingRejection,
 	type RoutingRejectReason,
+	RUN_EVENTS,
+	type RunAttributionLookup,
+	type RunEventName,
+	type RunUnknownReason,
+	resolveLogRunAttribution,
+	routerAttributes,
+	routingAttribution,
+	runAttribution,
 } from "./RouterTelemetry.js";
 export {
 	type AgentRunObservation,

@@ -28,6 +28,43 @@
 //     `last_seen_age_ms`, the age of the last heartbeat pong), and the
 //     long-running rule classifies every hit by which of the two disagree.
 //
+// CANONICAL ATTRIBUTES (CYR-72): every router-emitted event and every relayed
+// sandbox log line now carries the same sixteen correlation columns, built by
+// one shared builder (`runAttributionAttributes` in cyrus-core) rather than
+// spelled out per emitter:
+//
+//   cyrus.workspace_id / cyrus.workspace_name
+//   cyrus.owner_id     / cyrus.owner_name      (the router's own users.user_id)
+//   cyrus.team_id      / cyrus.team_name
+//   cyrus.project_id   / cyrus.project_name
+//   cyrus.issue_key    cyrus.run_id            cyrus.session_id
+//   cyrus.device_id    cyrus.runner            cyrus.model
+//   cyrus.provider     cyrus.source            ("router" | "sandbox")
+//
+// Three properties every query below relies on:
+//
+//  1. A fact that was not known at emission time is emitted as an explicit
+//     `null`, never dropped. So `where isnull(p["cyrus.project_id"])` finds runs
+//     on issues that belong to no project; a dropped key would answer that with
+//     silence, which reads as "there are none".
+//  2. They are stamped ROUTER-SIDE. A sandbox worker cannot label its lines with
+//     another workspace, owner, run, issue or device — the relay claims every
+//     canonical key before merging anything the worker sent.
+//  3. `trace_id` / `span_id` ride alongside when a trace context exists, and are
+//     deliberately NOT under `cyrus.` — they are W3C names, and their VALUE is
+//     the same W3C trace id that appears as `OperationId` in AppRequests /
+//     AppDependencies. Note the join is a manual one from this table:
+//     `... | extend p = parse_json(Log_s) | join AppRequests on $left.trace_id ==
+//     $right.OperationId`. A console record does not itself carry `OperationId`,
+//     and neither does the OTLP copy in AppTraces — `OtelLogSink` emits without
+//     an OTel context, so a relayed worker's trace id lives only in
+//     `Properties["trace_id"]` there too.
+//
+// Pre-CYR-72 attribute names are all still emitted verbatim
+// (`cyrus.agent_session_id`, `cyrus.issue_id`, `cyrus.held_by_*`, …) so every
+// query that predates this change returns exactly what it did before. New
+// columns were ADDED to those projections, not substituted.
+//
 // KQL is assembled with join(..., '\n') rather than a Bicep multi-line string,
 // because `'''…'''` does not interpolate and every query needs the app name (and
 // some need the thresholds) substituted in.
@@ -99,6 +136,35 @@ var gaugePrologue = [
   '    uptime_ms        = tolong(p["cyrus.uptime_ms"]),'
   '    last_seen_age_ms = tolong(p["cyrus.last_seen_age_ms"]),'
   '    parked_for_ms    = tolong(p["cyrus.parked_for_ms"])'
+]
+
+// The canonical correlation columns (CYR-72), as a shared `extend` fragment so
+// every query below projects them under the same names. Written once here for
+// the same reason the emitters build them from one shared builder: a second copy
+// is how one query comes to read `owner_user_id` while the emitter writes
+// `owner_id`, and KQL answers a wrong-but-valid key with null rather than an
+// error.
+//
+// Bracket syntax throughout, and that is not a style choice — `p.cyrus.owner_id`
+// parses as a nested lookup and silently returns null.
+var canonicalExtend = [
+  '| extend'
+  '    workspace_id   = tostring(p["cyrus.workspace_id"]),'
+  '    workspace_name = tostring(p["cyrus.workspace_name"]),'
+  '    owner_id       = tostring(p["cyrus.owner_id"]),'
+  '    owner_name     = tostring(p["cyrus.owner_name"]),'
+  '    team_id        = tostring(p["cyrus.team_id"]),'
+  '    team_name      = tostring(p["cyrus.team_name"]),'
+  '    project_id     = tostring(p["cyrus.project_id"]),'
+  '    project_name   = tostring(p["cyrus.project_name"]),'
+  '    issue_key      = tostring(p["cyrus.issue_key"]),'
+  '    run_id         = tostring(p["cyrus.run_id"]),'
+  '    session_id     = tostring(p["cyrus.session_id"]),'
+  '    device_id      = tostring(p["cyrus.device_id"]),'
+  '    runner         = tostring(p["cyrus.runner"]),'
+  '    model          = tostring(p["cyrus.model"]),'
+  '    provider       = tostring(p["cyrus.provider"]),'
+  '    source         = tostring(p["cyrus.source"])'
 ]
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -517,7 +583,15 @@ resource routingRejections 'Microsoft.OperationalInsights/workspaces/savedSearch
         '    issue_key   = tostring(p["cyrus.issue_key"]),'
         '    session_id  = tostring(p["cyrus.agent_session_id"]),'
         '    held_by     = tostring(p["cyrus.held_by_session_id"]),'
-        '    held_device = tostring(p["cyrus.held_by_device_id"])'
+        '    held_device = tostring(p["cyrus.held_by_device_id"]),'
+        // CYR-72, appended so every column this query returned before is
+        // unchanged. `run_id` is null for most rejections by design: a refusal
+        // usually happens before any run exists, and it is populated only when
+        // the refused prompt was aimed at a session already routed.
+        '    workspace_id = tostring(p["cyrus.workspace_id"]),'
+        '    team_name    = tostring(p["cyrus.team_name"]),'
+        '    owner_name   = tostring(p["cyrus.owner_name"]),'
+        '    run_id       = tostring(p["cyrus.run_id"])'
         '| order by TimeGenerated desc'
       ],
       '\n'
@@ -557,9 +631,174 @@ resource sessionOwnershipRefusals 'Microsoft.OperationalInsights/workspaces/save
         '    device_id    = tostring(p["cyrus.device_id"]),'
         '    owner_device = tostring(p["cyrus.owner_device_id"]),'
         '    rpc_method   = tostring(p["cyrus.rpc_method"]),'
-        '    frame_state  = tostring(p["cyrus.session_state"])'
+        '    frame_state  = tostring(p["cyrus.session_state"]),'
+        // CYR-72, appended. `run_id` is what turns a `rpc_not_owned` row from
+        // "an activity was dropped somewhere" into "this run lost this post" —
+        // join it against Cyrus-Run-Timeline below.
+        '    run_id       = tostring(p["cyrus.run_id"]),'
+        '    workspace_id = tostring(p["cyrus.workspace_id"]),'
+        '    issue_key    = tostring(p["cyrus.issue_key"]),'
+        '    owner_name   = tostring(p["cyrus.owner_name"])'
         '| order by TimeGenerated desc'
       ],
+      '\n'
+    )
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Runs (CYR-72)
+////////////////////////////////////////////////////////////////////////////////
+//
+// `run.routed` / `run.finished` / `run.unknown` are the router's own view of an
+// agent run's life. The distinction between the last two is the point of the
+// family: BOTH end a run, but `run.unknown` means the outcome was never
+// observed — the worker never reported a terminal state and the router reclaimed
+// the run itself. Folding them together would bury every silently-lost run
+// inside the healthy series.
+
+// One run, end to end: the route that created it, everything its sandbox worker
+// logged, and how it ended — from a single run id.
+//
+// This is the query CYR-72 exists to make possible. Before it, the router's
+// lines carried a device and an issue, the worker's carried a session id, and
+// neither carried the workspace, owner, team or project, so answering "what
+// happened to this run?" meant joining three partial views by hand and could
+// only be started by someone who already knew the session id.
+resource runTimeline 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Run-Timeline'
+  properties: {
+    category: 'Cyrus Runs'
+    displayName: 'One run, end to end (set target_run_id)'
+    query: join(
+      concat(
+        [
+          // Replace with the run id you are investigating. Left as a `let` so the
+          // saved search opens ready to edit in one place.
+          'let target_run_id = "<run-id>";'
+          'ContainerAppConsoleLogs_CL'
+          appFilter
+          '| extend p = parse_json(Log_s)'
+          '| where tostring(p["cyrus.run_id"]) == target_run_id'
+        ],
+        canonicalExtend,
+        [
+          '| project'
+          '    TimeGenerated,'
+          '    source,'
+          '    event = tostring(p.event),'
+          '    level = tostring(p.level),'
+          '    component = tostring(p.component),'
+          '    message = tostring(p.message),'
+          '    issue_key,'
+          '    runner,'
+          '    model,'
+          '    device_id,'
+          '    trace_id = tostring(p.trace_id)'
+          '| order by TimeGenerated asc'
+        ]
+      ),
+      '\n'
+    )
+  }
+}
+
+// Runs that ended WITHOUT their worker reporting a terminal state, grouped by
+// how the router reclaimed them.
+//
+// Every row is a run whose outcome nobody observed. A rising `event_expired`
+// count means events are not reaching devices at all; `lock_reconciled` means
+// workers are losing their session state across reconnects. Both were previously
+// visible only as prose in an `info` line.
+resource runsEndedUnobserved 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Runs-Ended-Unobserved'
+  properties: {
+    category: 'Cyrus Runs'
+    displayName: 'Runs the router ended without a worker terminal report'
+    query: join(
+      concat(
+        [
+          'ContainerAppConsoleLogs_CL'
+          appFilter
+          '| extend p = parse_json(Log_s)'
+          '| where tostring(p.event) == "run.unknown"'
+        ],
+        canonicalExtend,
+        [
+          '| extend reason = tostring(p["cyrus.reason"])'
+          '| summarize'
+          '    runs = dcount(run_id),'
+          '    last_seen = max(TimeGenerated),'
+          '    sample_issue = any(issue_key)'
+          '  by reason, workspace_name, team_name'
+          '| order by runs desc'
+        ]
+      ),
+      '\n'
+    )
+  }
+}
+
+// Run volume and outcome by the dimensions an operator actually reports on.
+// `unobserved` is the share of runs that ended without a terminal report, which
+// is the health number for the fleet rather than for any one run.
+//
+// COLLAPSED TO ONE ROW PER RUN FIRST, and that is not a tidiness step — it is
+// what makes the numbers mean anything. A run's own events legitimately disagree
+// about these dimensions, by design and for reasons documented at both emitters:
+// `run.routed` fires BEFORE the fire-and-forget Linear enrichment, so its
+// project columns are null, and `run.finished` is the only point an ordinary run
+// ever reports its runner and model, so those are null on `run.routed`. Grouping
+// the raw events would therefore put each half of the same run in a different
+// bucket, where `routed` and `finished` can never co-occur and the percentage
+// divides by a zero it then guards into nonsense.
+//
+// `take_any` over the per-run dimensions is safe for the same reason: the
+// columns are ignore-nulls-maxed first, so each run contributes its most
+// complete view of itself once.
+resource runsByDimension 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Runs-By-Dimension'
+  properties: {
+    category: 'Cyrus Runs'
+    displayName: 'Run volume and outcome by workspace, team, project and runner'
+    query: join(
+      concat(
+        [
+          'ContainerAppConsoleLogs_CL'
+          appFilter
+          '| extend p = parse_json(Log_s)'
+          '| extend event = tostring(p.event)'
+          '| where event startswith "run."'
+        ],
+        canonicalExtend,
+        [
+          '| where isnotempty(run_id)'
+          // One row per run: its outcome, and the most complete value each
+          // dimension ever carried. `max_of`-style coalescing via max() works
+          // because the empty string sorts below any real value.
+          '| summarize'
+          '    routed       = countif(event == "run.routed") > 0,'
+          '    finished     = countif(event == "run.finished") > 0,'
+          '    unobserved   = countif(event == "run.unknown") > 0,'
+          '    workspace_name = max(workspace_name),'
+          '    team_name      = max(team_name),'
+          '    project_name   = max(project_name),'
+          '    runner         = max(runner),'
+          '    model          = max(model)'
+          '  by run_id'
+          '| summarize'
+          '    runs       = count(),'
+          '    routed     = countif(routed),'
+          '    finished   = countif(finished),'
+          '    unobserved = countif(unobserved)'
+          '  by workspace_name, team_name, project_name, runner, model'
+          '| extend unobserved_pct = round(100.0 * unobserved / runs, 1)'
+          '| order by runs desc'
+        ]
+      ),
       '\n'
     )
   }

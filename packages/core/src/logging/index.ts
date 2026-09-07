@@ -1,4 +1,11 @@
 export {
+	CANONICAL_RUN_ATTRIBUTE_KEYS,
+	type CanonicalRunAttributeKey,
+	type RunAttribution,
+	runAttributionAttributes,
+	type TraceAttribution,
+} from "./attribution.js";
+export {
 	CYRUS_ATTRIBUTE_NAMESPACE,
 	CYRUS_EVENTS,
 	type CyrusEventName,
