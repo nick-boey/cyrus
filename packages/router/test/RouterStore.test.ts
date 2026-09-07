@@ -779,6 +779,55 @@ describe("container devices (schema v2)", () => {
 		);
 	});
 
+	it("excludes a parked container that was just routed to, so an in-flight boot keeps its lock (CYR-81)", () => {
+		// A parked sandbox's heartbeat is stale by design, so on `last_seen_ms`
+		// alone a container idle past `eventTtlMs` is permanently eligible for
+		// reclaim — including in the seconds between routing a session to it and
+		// its worker connecting. Going through `enqueueEvent` rather than
+		// `markDeviceRouted` is deliberate: the stamp has to keep riding the real
+		// routing path for the guard to mean anything.
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "CAN-170", "aca");
+		store.touchDevice(deviceId, 1000); // parked long ago
+		store.enqueueEvent(deviceId, '{"n":1}', 9000, 60_000); // routed just now
+
+		expect(
+			store.devicesOfflineSince(5000).map((d) => d.deviceId),
+		).not.toContain(deviceId);
+	});
+
+	it("still reclaims a container dark past the cutoff on both clocks", () => {
+		// The over-correction guard: the offline pass exists for a device that
+		// went dark mid-session, whose route stamp is no later than the moment it
+		// went dark. Both clocks age past the cutoff together.
+		const store = new RouterStore(":memory:");
+		const { userId } = store.addUser({ email: "a@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "CAN-171", "aca");
+		store.enqueueEvent(deviceId, '{"n":1}', 1000, 60_000);
+		store.touchDevice(deviceId, 1000);
+
+		expect(store.devicesOfflineSince(5000).map((d) => d.deviceId)).toContain(
+			deviceId,
+		);
+	});
+
+	it("still reclaims a dark PHYSICAL device that was just routed to (CYR-81)", () => {
+		// `last_routed_ms` is per-device, and a physical device serves every
+		// issue its owner works — so the CYR-81 guard is container-only. Applied
+		// here, routing any session to a dark laptop would refresh the clock
+		// guarding every OTHER lock it holds, and an unrelated issue could stay
+		// locked for as long as its owner keeps being delegated work. A container
+		// device is uniquely one issue, so it has no such bleed.
+		const { store, device } = storeWithDevice();
+		store.touchDevice(device.deviceId, 1000); // dark
+		store.enqueueEvent(device.deviceId, '{"n":1}', 9000, 60_000); // routed just now
+
+		expect(store.devicesOfflineSince(5000).map((d) => d.deviceId)).toContain(
+			device.deviceId,
+		);
+	});
+
 	it("migrates a v1 database in place, preserving device ids and events", () => {
 		// Build a v1 db by hand, then open it with RouterStore and assert the
 		// old device still authenticates and its queued events survive.

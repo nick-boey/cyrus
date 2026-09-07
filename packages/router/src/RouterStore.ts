@@ -4404,6 +4404,59 @@ export class RouterStore {
 			.run(nowMs, deviceId);
 	}
 
+	/**
+	 * Devices dark long enough that the sweep may reclaim their locks.
+	 *
+	 * BOTH clocks have to be past the cutoff, and the second one is not
+	 * belt-and-braces. `last_seen_ms` alone says nothing about whether work is
+	 * on its way to the device: for a container executor a parked sandbox's
+	 * heartbeat is stale BY DESIGN, so a container idle for longer than
+	 * `eventTtlMs` — the common shape, not an edge case — is permanently
+	 * eligible, and a session routed to it seconds ago has its lock and
+	 * affinity torn off while the boot is still in flight. Reclaiming does not
+	 * cancel the queued event, so it still lands and the session runs
+	 * DISOWNED: every `createAgentActivity` it makes is refused, and the idle
+	 * sweep reads `affinity = 0` and suspends the sandbox mid-session. That is
+	 * CYR-81 — 578 dropped Linear posts and two live sessions sharing one
+	 * worktree on CAN-170.
+	 *
+	 * `last_routed_ms` is the fact that was already in the row and not read:
+	 * {@link markDeviceRouted} stamps it inside {@link enqueueEvent}'s
+	 * transaction, so a device with a delivery outstanding always carries a
+	 * fresh one.
+	 *
+	 * The cutoff needs no constant of its own. `eventTtlMs` is already how long
+	 * a queued event may wait for its device, which is exactly the window in
+	 * which a reclaim could be racing a delivery.
+	 *
+	 * **`kind = 'container'` is load-bearing, not a scoping convenience.**
+	 * `last_routed_ms` is per-DEVICE, and a physical device serves every issue
+	 * its owner is working: applied there, routing ANY session to a dark laptop
+	 * would refresh the clock guarding EVERY lock it holds, so a user who keeps
+	 * being delegated work could hold an unrelated issue locked indefinitely and
+	 * nobody else could take it. A container device is uniquely one issue
+	 * (`idx_devices_container_issue`), so per-device IS per-issue and no such
+	 * bleed exists. That one-issue property is upheld by construction, not by
+	 * the index alone: `issue_key` is written once by
+	 * {@link createContainerDevice} and never UPDATEd anywhere, and the single
+	 * `acquireIssueLock` call site (`EventRouter.routeCreated`) locks an issue
+	 * against the device it just resolved FOR that issue. The restriction also
+	 * matches the premise: `last_seen_ms` is stale-by-design only for a sandbox
+	 * that parks to save money. For a physical device dark means dark, the
+	 * heartbeat is a sound liveness signal, and this pass keeps its pre-CYR-81
+	 * behaviour exactly.
+	 *
+	 * This does not weaken the pass for containers either. A container that died
+	 * mid-session was routed to no later than it died, so both clocks age past
+	 * the cutoff together and its locks are still reclaimed — the case that
+	 * matters, since a delivered event is acked out of the queue and this pass
+	 * is then the only thing that can release its lock. A dark container that
+	 * keeps receiving prompts stays held until `eventTtlMs` after the last one:
+	 * bounded, about its own single issue, and the correct reading, because a
+	 * freshly routed event means something IS coming. It is also not the only
+	 * safety net — a container that reconnects has every lock it does not
+	 * declare reconciled away at `hello`.
+	 */
 	devicesOfflineSince(
 		cutoffMs: number,
 	): Array<{ deviceId: number; userId: number; email: string }> {
@@ -4412,9 +4465,14 @@ export class RouterStore {
 				`SELECT d.device_id, d.user_id, u.email
 				 FROM devices d
 				 JOIN users u ON u.user_id = d.user_id
-				 WHERE d.last_seen_ms IS NOT NULL AND d.last_seen_ms < ?`,
+				 WHERE d.last_seen_ms IS NOT NULL AND d.last_seen_ms < ?
+				   AND (
+				     d.kind != 'container'
+				     OR d.last_routed_ms IS NULL
+				     OR d.last_routed_ms < ?
+				   )`,
 			)
-			.all(cutoffMs) as Array<{
+			.all(cutoffMs, cutoffMs) as Array<{
 			device_id: number;
 			user_id: number;
 			email: string;
