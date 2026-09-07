@@ -1209,14 +1209,20 @@ describe("EventRouter", () => {
 		await router.route(
 			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
 		);
-		// Delivered while the device was online.
+		// Delivered while the device was online, and acked — so the queue is
+		// empty and pass 1 has nothing to expire. That isolation is the point of
+		// the test: the lock can only be released by the stale-lock pass.
 		expect(onlineGateway.deliverPending).toHaveBeenCalledWith(aliceDevice);
+		store.ackEvent(aliceDevice, 1);
 
-		// Device goes dark: last_seen well before the TTL cutoff, but the queued
-		// event itself has NOT expired yet (so this exercises the stale-lock path).
-		store.touchDevice(aliceDevice, 900_000);
+		// Device goes dark a second after the route, and stays dark past the TTL.
+		// Both clocks have to age out, not just `last_seen_ms`: darkness that
+		// PRECEDES the route is a device with a boot in flight, which CYR-81 must
+		// not reclaim. The old fixture set `last_seen_ms` to 900_000 — before the
+		// 1_000_000 route it had just asserted was delivered to an online device.
+		store.touchDevice(aliceDevice, ROUTE_NOW + 1_000);
 		postActivity.mockClear();
-		clock.value = 1_030_000; // cutoff = 970_000 > 900_000; event expires 1_060_000 > now
+		clock.value = ROUTE_NOW + TTL_MS + 1_000 + 1; // cutoff is past both stamps
 
 		await router.sweepExpired();
 
@@ -1227,6 +1233,85 @@ describe("EventRouter", () => {
 		);
 		expect(store.getIssueLock("ISS-1")).toBeUndefined();
 		expect(store.acquireIssueLock("ISS-1", "sess-2", aliceDevice)).toBe(true);
+	});
+
+	it("(g2) sweepExpired keeps a long-parked container's lock while a boot it was just routed to is in flight (CYR-81)", async () => {
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "ISS-1", "aca");
+		store.acquireIssueLock("ISS-1", "sess-1", deviceId);
+		store.setSessionAffinity("sess-1", deviceId, undefined, ROUTE_NOW);
+		const { router, postActivity, clock } = makeRouter(store);
+
+		// The row a parked ACA sandbox presents the instant it is routed to: a
+		// heartbeat from long before the cutoff, and a route stamp from a moment
+		// ago while its boot is still in flight. The event has not expired, so
+		// pass 1 cannot be what releases (or spares) the lock.
+		store.touchDevice(deviceId, ROUTE_NOW - 10 * TTL_MS);
+		store.enqueueEvent(deviceId, '{"n":1}', ROUTE_NOW, TTL_MS);
+		clock.value = ROUTE_NOW + 1_000; // cutoff sits between the two stamps
+
+		await router.sweepExpired();
+
+		// Both rows have to survive, and they fail differently. Losing the lock
+		// disowns the session the boot is about to start, so its Linear activity
+		// is refused; losing affinity is what lets the idle sweep read zero and
+		// suspend the sandbox mid-session. On CAN-170 both happened.
+		expect(store.getIssueLock("ISS-1")?.sessionId).toBe("sess-1");
+		expect(store.getSessionAffinity("sess-1")).toBe(deviceId);
+		expect(postActivity).not.toHaveBeenCalledWith(
+			"ws-1",
+			"sess-1",
+			offlineReleaseMessage("alice@example.com"),
+		);
+	});
+
+	it("(g3) sweepExpired still reclaims a dark PHYSICAL device that was just routed to (CYR-81)", async () => {
+		// The counterpart to (g2), and the reason the guard is container-only.
+		// `last_routed_ms` is per-device and a laptop serves every issue its
+		// owner works, so guarding one here would let a user who keeps being
+		// delegated work hold an unrelated issue locked for as long as the
+		// delegations keep coming.
+		const aliceDevice = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router, clock } = makeRouter(store);
+
+		await router.route(
+			createdEvent({ sessionId: "sess-1", issueId: "ISS-1", creator: ALICE }),
+		);
+		expect(store.getIssueLock("ISS-1")?.sessionId).toBe("sess-1");
+
+		// Dark long before the cutoff, routed to a moment ago — the exact row
+		// shape (g2) spares for a container.
+		store.touchDevice(aliceDevice, ROUTE_NOW - 10 * TTL_MS);
+		clock.value = ROUTE_NOW + 1_000;
+
+		await router.sweepExpired();
+
+		expect(store.getIssueLock("ISS-1")).toBeUndefined();
+	});
+
+	it("(g4) sweepExpired still reclaims a dead container's acked session once routing stops (CYR-81)", async () => {
+		// The container-side proof that the guard defers rather than strands. An
+		// acked event is gone from the queue, so pass 1 has nothing to expire and
+		// a permanently disconnected container never reaches the terminal-frame
+		// or hello-reconciliation paths — pass 2 is the only automatic releaser
+		// left, and it must still fire once the route stamp ages out too.
+		const { userId } = store.addUser({ email: "alice@example.com" });
+		const { deviceId } = store.createContainerDevice(userId, "ISS-1", "aca");
+		store.acquireIssueLock("ISS-1", "sess-1", deviceId);
+		store.setSessionAffinity("sess-1", deviceId, undefined, ROUTE_NOW);
+		const { router, clock } = makeRouter(store);
+
+		const seq = store.enqueueEvent(deviceId, '{"n":1}', ROUTE_NOW, TTL_MS);
+		store.ackEvent(deviceId, seq); // delivered, then the container died
+		store.touchDevice(deviceId, ROUTE_NOW + 1_000);
+		clock.value = ROUTE_NOW + 1_000 + TTL_MS + 1; // both stamps past the cutoff
+
+		await router.sweepExpired();
+
+		expect(store.getIssueLock("ISS-1")).toBeUndefined();
+		expect(store.getSessionAffinity("sess-1")).toBeUndefined();
 	});
 });
 
