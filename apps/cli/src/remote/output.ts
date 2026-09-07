@@ -1,5 +1,6 @@
 import type {
 	AuthorizedWorkspaceV1,
+	LogRecordV1,
 	RunChangeKindV1,
 	RunObservationV1,
 } from "cyrus-operator-protocol";
@@ -244,6 +245,83 @@ function describeWaitOutcome(document: RunWaitDocument): string {
 	return document.outcome === "waiting" && wait
 		? `is waiting (${wait.reason}${wait.reportedCondition ? `: ${wait.reportedCondition}` : ""}) since ${wait.since}`
 		: `ended: ${document.outcome}`;
+}
+
+/* ------------------------------------------------------------------- logs */
+
+export interface LogsQueryDocument {
+	schemaVersion: typeof OUTPUT_SCHEMA_VERSION;
+	observedAt: string;
+	workspace: AuthorizedWorkspaceV1;
+	/** The log source, as the ROUTER named it — never a table or a URL. */
+	source: string;
+	/** Echoed so a stored document says which window it answered for. */
+	range: { from: string; to: string };
+	records: LogRecordV1[];
+	backendLatencyMs?: number;
+	/**
+	 * The worst record-clock-to-ingestion-clock gap observed in this answer.
+	 *
+	 * On the document rather than only in a diagnostic because it qualifies the
+	 * RESULT: records written more recently than this may exist and not yet be
+	 * queryable, and a reader deciding whether "no errors" means "no errors"
+	 * needs that number as data, not as prose on another stream.
+	 */
+	ingestionLagMs?: number;
+}
+
+export function logsQueryDocument(input: {
+	observedAt: string;
+	workspace: AuthorizedWorkspaceV1;
+	source: string;
+	range: { from: string; to: string };
+	records: LogRecordV1[];
+	backendLatencyMs?: number;
+	ingestionLagMs?: number;
+}): LogsQueryDocument {
+	return { schemaVersion: OUTPUT_SCHEMA_VERSION, ...input };
+}
+
+/** One NDJSON line of a `logs follow`. */
+export interface LogsFollowEvent {
+	schemaVersion: typeof OUTPUT_SCHEMA_VERSION;
+	event: "record";
+	record: LogRecordV1;
+}
+
+export function logsFollowEvent(record: LogRecordV1): LogsFollowEvent {
+	return { schemaVersion: OUTPUT_SCHEMA_VERSION, event: "record", record };
+}
+
+/**
+ * One human-readable line per log record.
+ *
+ * Fixed-width level and a compact identity suffix rather than a padded table:
+ * a log window is unbounded and streamed, so there is no complete set of rows to
+ * measure column widths against — and `follow` emits records one at a time, when
+ * every earlier width is already printed.
+ *
+ * The identifiers printed are the ones an operator correlates on. They are
+ * appended AFTER the message rather than before it so that the messages line up
+ * and can be skimmed, which is what someone scanning a window is actually doing.
+ */
+export function renderLogRecord(record: LogRecordV1): string {
+	const identity = [
+		record.issueKey,
+		record.runId ? `run=${record.runId}` : undefined,
+		record.attributes?.["cyrus.source"],
+	]
+		.filter((part): part is string => Boolean(part))
+		.join(" ");
+	return [
+		record.timestamp,
+		record.level.toUpperCase().padEnd(5),
+		`[${record.component ?? "-"}]`,
+		record.message,
+		identity ? `(${identity})` : "",
+	]
+		.join("  ")
+		.trimEnd();
 }
 
 /* ------------------------------------------------------------------ table */

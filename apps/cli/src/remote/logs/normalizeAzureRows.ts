@@ -1,0 +1,337 @@
+import { createHash } from "node:crypto";
+import {
+	type LogLevelV1,
+	type LogRecordV1,
+	logLevelV1Schema,
+} from "cyrus-operator-protocol";
+import {
+	collectKnownSecretValues,
+	redactKnownSecrets,
+} from "./redactKnownSecrets.js";
+
+/**
+ * Turns `ContainerAppConsoleLogs_CL` rows into normalized {@link LogRecordV1}s.
+ *
+ * ── THE TWO CLOCKS ──
+ * Every row carries two timestamps and they are not interchangeable.
+ * `TimeGenerated` is when Log Analytics INGESTED the line; `record.timestamp` is
+ * when the emitter wrote it. The gap between them is ingestion lag, routinely
+ * tens of seconds, and it is the single fact a `follow` has to be built around:
+ * a poll that assumed they were the same would query a window the matching
+ * records had not been ingested into yet and report a quiet fleet. The record's
+ * own clock is what an operator reads; the ingestion clock is what `follow`
+ * overlaps for. Both are surfaced — the first on the record, the second as the
+ * observed lag on the result.
+ *
+ * ── DROPPING IS NEVER SILENT ──
+ * A container's stdout also carries lines Cyrus did not write. Those are
+ * reported as a `skipped` count rather than discarded quietly, because an
+ * operator who asked for a window and got fewer records than they expected needs
+ * to know whether the missing ones were never there or were unreadable.
+ *
+ * ── NOTHING UNMAPPED REACHES THE OPERATOR BY ACCIDENT ──
+ * `logRecordV1Schema` is deliberately non-strict, but the mapping here is
+ * closed: named fields are read explicitly, and everything else is copied into
+ * `attributes` only after passing through redaction. An Azure column we never
+ * mapped cannot appear in output.
+ */
+
+/** One row as the SDK hands it back, already projected by our own KQL. */
+export interface AzureLogRow {
+	/** Log Analytics' ingestion timestamp. */
+	timeGenerated: string | Date | undefined;
+	/** The parsed `Log_s` object, or whatever `parse_json` produced. */
+	record: unknown;
+}
+
+export interface NormalizedAzureRows {
+	records: LogRecordV1[];
+	/**
+	 * Rows that carried no readable Cyrus record.
+	 *
+	 * Non-zero is normal — a runtime banner is not a defect — but it is reported
+	 * so a surprisingly empty result is explainable rather than mysterious.
+	 */
+	skipped: number;
+	/**
+	 * The largest `TimeGenerated - timestamp` observed, in milliseconds.
+	 *
+	 * `undefined` when no row carried both clocks. Reported rather than assumed:
+	 * a `follow` that guessed its overlap would either miss records or re-read the
+	 * same window forever, and the honest number is available for free.
+	 */
+	maxIngestionLagMs?: number;
+}
+
+/**
+ * The structural keys the JSON console renderer owns, which are hoisted onto
+ * named fields rather than left in `attributes`.
+ *
+ * They keep their bare Phase 0 names (`component`, not `cyrus.component`) —
+ * see the naming split in CLAUDE.md §13 — and duplicating them into the
+ * attribute bag would make every record carry each identifier twice.
+ */
+const HOISTED_KEYS: ReadonlySet<string> = new Set([
+	"timestamp",
+	"level",
+	"component",
+	"message",
+	"cyrus.workspace_id",
+	"cyrus.owner_id",
+	"cyrus.issue_key",
+	"cyrus.run_id",
+	"cyrus.session_id",
+	"trace_id",
+	"span_id",
+]);
+
+export interface NormalizeOptions {
+	/** Exact secret values to remove from output. See `redactKnownSecrets`. */
+	knownSecretValues?: readonly string[];
+	env?: NodeJS.ProcessEnv;
+}
+
+export function normalizeAzureRows(
+	rows: readonly AzureLogRow[],
+	options: NormalizeOptions = {},
+): NormalizedAzureRows {
+	const knownSecrets =
+		options.knownSecretValues ?? collectKnownSecretValues(options.env);
+
+	const records: LogRecordV1[] = [];
+	let skipped = 0;
+	let maxIngestionLagMs: number | undefined;
+
+	for (const row of rows) {
+		const source = asRecordObject(row.record);
+		if (!source) {
+			skipped++;
+			continue;
+		}
+
+		const ingestedAt = parseInstant(row.timeGenerated);
+		const emittedAt = parseInstant(source.timestamp);
+		// The emitter's own clock when it gave us a usable one, and the ingestion
+		// clock otherwise. Never a synthesised "now": a fabricated timestamp is
+		// indistinguishable from a measured one once it is in the output, and the
+		// whole point of these records is to say when something happened.
+		const timestamp = emittedAt ?? ingestedAt;
+		if (!timestamp) {
+			skipped++;
+			continue;
+		}
+		if (ingestedAt && emittedAt) {
+			const lag = Date.parse(ingestedAt) - Date.parse(emittedAt);
+			// Negative lag means the emitter's clock runs ahead of Azure's. That is a
+			// real thing on a busy host and it is not a lag; clamping it to zero
+			// would report clock skew as freshness.
+			if (
+				lag > 0 &&
+				(maxIngestionLagMs === undefined || lag > maxIngestionLagMs)
+			) {
+				maxIngestionLagMs = lag;
+			}
+		}
+
+		const message = asString(source.message) ?? "";
+		const attributes = collectAttributes(source);
+		const redaction = redactKnownSecrets({ message, attributes }, knownSecrets);
+
+		const record: LogRecordV1 = {
+			schemaVersion: 1,
+			// Fingerprinted from the row's own content rather than assigned, so the
+			// SAME line read by two overlapping `follow` polls yields the same id and
+			// can be recognised as already seen. An assigned id would make every poll
+			// look like new work.
+			recordId: fingerprint(row.timeGenerated, source),
+			timestamp,
+			level: normalizeLevel(source.level),
+			message: redaction.value.message,
+			...optional("component", asString(source.component)),
+			...optional("workspaceId", asString(source["cyrus.workspace_id"])),
+			...optional("ownerUserId", asString(source["cyrus.owner_id"])),
+			...optional("issueKey", asString(source["cyrus.issue_key"])),
+			...optional("runId", asString(source["cyrus.run_id"])),
+			...optional("sessionId", asString(source["cyrus.session_id"])),
+			...optional("traceId", validTraceId(source.trace_id)),
+			...optional("spanId", validSpanId(source.span_id)),
+			...(redaction.value.attributes &&
+			Object.keys(redaction.value.attributes).length > 0
+				? { attributes: redaction.value.attributes }
+				: {}),
+			...(redaction.redacted ? { redacted: true } : {}),
+		};
+
+		records.push(record);
+	}
+
+	return {
+		records,
+		skipped,
+		...(maxIngestionLagMs !== undefined ? { maxIngestionLagMs } : {}),
+	};
+}
+
+/**
+ * A stable id for one row.
+ *
+ * Over the ingestion timestamp AND the whole record, because neither alone is
+ * unique: two identical lines a millisecond apart share their content, and two
+ * different lines routinely share a `TimeGenerated`. 128 bits of SHA-256 is far
+ * past the point where a collision within one query is worth reasoning about,
+ * and a shorter id keeps NDJSON output readable.
+ *
+ * Deliberately NOT a random id and NOT derived from the row's position: a
+ * `follow` recognises a re-read record by this value, so it has to be a pure
+ * function of the record's content.
+ */
+export function fingerprint(
+	timeGenerated: string | Date | undefined,
+	record: Record<string, unknown>,
+): string {
+	const hash = createHash("sha256");
+	hash.update(parseInstant(timeGenerated) ?? "");
+	// A separator that cannot occur in either field, so two rows cannot hash
+	// alike by the boundary falling in a different place. Spelled as an escape
+	// rather than a literal: a literal NUL in a source file makes git, grep, and
+	// GitHub diff views treat the whole module as binary, which is how this file
+	// shipped unreviewable in the first version of this change.
+	hash.update("\u0000");
+	hash.update(stableStringify(record));
+	return hash.digest("hex").slice(0, 32);
+}
+
+/**
+ * Key-sorted JSON, so the fingerprint does not depend on property order.
+ *
+ * Two reads of the same row can legitimately produce differently-ordered
+ * objects — `parse_json` gives no ordering guarantee across queries — and an
+ * order-sensitive hash would make a `follow` re-emit records it had already
+ * shown.
+ */
+function stableStringify(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) {
+		return `[${value.map(stableStringify).join(",")}]`;
+	}
+	const entries = Object.entries(value as Record<string, unknown>).sort(
+		([a], [b]) => (a < b ? -1 : a > b ? 1 : 0),
+	);
+	return `{${entries
+		.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
+		.join(",")}}`;
+}
+
+/**
+ * Everything not hoisted onto a named field, flattened to strings.
+ *
+ * Values are stringified rather than kept as JSON because `LogRecordV1`'s
+ * attribute bag is `Record<string, string>` — an operator scans these, and a
+ * nested object rendered inline is easier to read than one that has to be
+ * expanded. `null` becomes the literal `"null"` on purpose: the canonical
+ * attribution emits `null` for a fact it did not know, and that absence is
+ * itself queryable (see `runAttributionAttributes`), so dropping it would throw
+ * away the distinction between "not known" and "not applicable".
+ */
+function collectAttributes(
+	source: Record<string, unknown>,
+): Record<string, string> {
+	const attributes: Record<string, string> = {};
+	for (const [key, value] of Object.entries(source)) {
+		if (HOISTED_KEYS.has(key)) continue;
+		if (value === undefined) continue;
+		attributes[key] =
+			typeof value === "string" ? value : stableStringify(value);
+	}
+	return attributes;
+}
+
+/**
+ * The level, defaulting to `info` for anything unrecognised.
+ *
+ * A level we cannot read is a rendering problem, not a reason to drop the line —
+ * and defaulting DOWNWARD (to `info` rather than `error`) keeps an unparseable
+ * level from manufacturing alarm. The record still carries its original text in
+ * the attribute bag, so nothing is lost.
+ */
+function normalizeLevel(value: unknown): LogLevelV1 {
+	const parsed = logLevelV1Schema.safeParse(
+		typeof value === "string" ? value.toLowerCase() : value,
+	);
+	return parsed.success ? parsed.data : "info";
+}
+
+/**
+ * The row's parsed record, or `undefined` when the row is not one.
+ *
+ * `parse_json` on a non-JSON line returns the line itself as a scalar rather
+ * than failing, so a type check — not a try/catch — is what separates our
+ * records from a runtime banner. A JSON ARRAY is refused for the same reason: it
+ * parses, but it is not a log record, and treating one as an object would
+ * produce a record whose attributes were array indices.
+ */
+function asRecordObject(value: unknown): Record<string, unknown> | undefined {
+	if (typeof value === "string") {
+		// Some SDK paths hand back the dynamic column as its JSON text.
+		try {
+			return asRecordObject(JSON.parse(value));
+		} catch {
+			return undefined;
+		}
+	}
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	return value as Record<string, unknown>;
+}
+
+/** An ISO-8601 UTC instant, or `undefined` if the value is not a usable time. */
+function parseInstant(value: unknown): string | undefined {
+	if (value instanceof Date) {
+		return Number.isNaN(value.getTime()) ? undefined : value.toISOString();
+	}
+	if (typeof value !== "string" || value.length === 0) return undefined;
+	const parsed = Date.parse(value);
+	if (!Number.isFinite(parsed)) return undefined;
+	// Re-rendered from the parsed value rather than passed through, so every
+	// timestamp on the wire is UTC with a `Z`. `isoTimestampV1Schema` refuses a
+	// numeric offset, and for good reason: these strings are compared
+	// lexicographically, and `+10:00` sorts before `Z` while denoting a later
+	// instant.
+	return new Date(parsed).toISOString();
+}
+
+function asString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * A trace or span id only when it is well-formed.
+ *
+ * An invalid id is dropped rather than passed through, because it would join
+ * the line to a trace that does not exist — which looks like an answer, and is
+ * strictly worse than no correlation at all. Same rule, and same reason, as
+ * `resolveTraceIds` in `cyrus-core`.
+ */
+function validTraceId(value: unknown): string | undefined {
+	const text = asString(value);
+	if (!text || !/^[0-9a-f]{32}$/.test(text) || text === "0".repeat(32)) {
+		return undefined;
+	}
+	return text;
+}
+
+function validSpanId(value: unknown): string | undefined {
+	const text = asString(value);
+	if (!text || !/^[0-9a-f]{16}$/.test(text) || text === "0".repeat(16)) {
+		return undefined;
+	}
+	return text;
+}
+
+function optional<K extends string>(
+	key: K,
+	value: string | undefined,
+): Record<K, string> | Record<string, never> {
+	return value === undefined ? {} : ({ [key]: value } as Record<K, string>);
+}
