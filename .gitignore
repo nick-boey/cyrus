@@ -15,7 +15,11 @@ tempdocs
 .env
 
 # Logs
-logs
+# Anchored to the repo root. A bare `logs` matches a directory at ANY depth,
+# which silently swallowed `apps/cli/src/remote/logs/` — a whole source module —
+# with no error at `git add` and nothing in `git status` to notice. Runtime log
+# directories are written at the root, so anchoring loses nothing.
+/logs
 *.log
 npm-debug.log*
 

@@ -55,6 +55,14 @@ vi.mock("./commands/RunsCommand.js", () => ({
 	}),
 }));
 
+const logsExecute = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
+vi.mock("./commands/LogsCommand.js", () => ({
+	LogsCommand: vi.fn().mockImplementation(function FakeLogsCommand() {
+		return { execute: logsExecute };
+	}),
+}));
+
 const connectionExecute = vi.hoisted(() =>
 	vi.fn().mockResolvedValue(undefined),
 );
@@ -469,6 +477,21 @@ describe("buildProgram — command profiles", () => {
 		expect(REMOTE_PROFILE_COMMANDS).toContain("runs");
 		expect(REMOTE_PROFILE_REGISTERED).toContain("runs");
 		expect(topLevelCommands(newProgram())).toContain("runs");
+	});
+
+	it("exposes `logs` in both profiles", () => {
+		// The same words mean the same thing whichever profile is active, so a
+		// skill written against an orchestrator installation runs unchanged on a
+		// full one. `logs` reads a stored connection and local backend credentials,
+		// so it functions unattended here.
+		const names = topLevelCommands(
+			newProgram({ argv: ["node", "cyrus", "--profile", "remote"] }),
+		);
+
+		expect(names).toContain("logs");
+		expect(REMOTE_PROFILE_COMMANDS).toContain("logs");
+		expect(REMOTE_PROFILE_REGISTERED).toContain("logs");
+		expect(topLevelCommands(newProgram())).toContain("logs");
 	});
 
 	it("cannot invoke router, worker, enrollment, secret, container, or unlock commands in the remote profile", () => {
@@ -918,5 +941,206 @@ describe("buildProgram — Commander wiring for `connection`", () => {
 			"--workspace",
 			"workspace-b",
 		]);
+	});
+});
+
+describe("buildProgram — Commander wiring for `logs`", () => {
+	beforeEach(() => {
+		logsExecute.mockClear();
+		applicationDisposeWatchers.mockClear();
+	});
+
+	it("registers `logs query` with every filter", async () => {
+		await run([
+			"logs",
+			"query",
+			"--issue",
+			"NOR-402",
+			"--owner",
+			"user-1",
+			"--team",
+			"team-1",
+			"--project",
+			"project-1",
+			"--run",
+			"run-1",
+			"--session",
+			"session-1",
+			"--component",
+			"EventRouter",
+			"--trace",
+			"0af7651916cd43dd8448eb211c80319c",
+			"--text",
+			"timed out",
+			"--since",
+			"30m",
+			"--limit",
+			"100",
+			"--json",
+		]);
+
+		expect(logsExecute).toHaveBeenCalledWith(
+			[
+				"query",
+				"--run",
+				"run-1",
+				"--session",
+				"session-1",
+				"--issue",
+				"NOR-402",
+				"--owner",
+				"user-1",
+				"--team",
+				"team-1",
+				"--project",
+				"project-1",
+				"--component",
+				"EventRouter",
+				"--trace",
+				"0af7651916cd43dd8448eb211c80319c",
+				"--text",
+				"timed out",
+				"--since",
+				"30m",
+				"--limit",
+				"100",
+				"--json",
+			],
+			{ connection: undefined, workspace: undefined },
+		);
+		// A one-shot command must not idle on live `fs.watch` handles.
+		expect(applicationDisposeWatchers).toHaveBeenCalledTimes(1);
+	});
+
+	it("accumulates repeated --level flags rather than keeping the last", async () => {
+		// Commander keeps only the LAST occurrence without an accumulator, which
+		// would silently drop half of a two-level filter — narrowing a query the
+		// operator believed they had widened.
+		await run(["logs", "query", "--level", "warn", "--level", "error"]);
+
+		expect(logsExecute).toHaveBeenCalledWith(
+			["query", "--level", "warn", "--level", "error"],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("forwards --show-query", async () => {
+		await run(["logs", "query", "--show-query"]);
+
+		expect(logsExecute).toHaveBeenCalledWith(["query", "--show-query"], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("forwards an explicit window", async () => {
+		await run([
+			"logs",
+			"query",
+			"--from",
+			"2026-09-06T00:00:00Z",
+			"--to",
+			"2026-09-06T01:00:00Z",
+		]);
+
+		expect(logsExecute).toHaveBeenCalledWith(
+			[
+				"query",
+				"--from",
+				"2026-09-06T00:00:00Z",
+				"--to",
+				"2026-09-06T01:00:00Z",
+			],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("forwards --connection and --workspace as the fleet selection", async () => {
+		await run(["logs", "query", "--connection", "prod", "--workspace", "ws-1"]);
+
+		expect(logsExecute).toHaveBeenCalledWith(["query"], {
+			connection: "prod",
+			workspace: "ws-1",
+		});
+	});
+
+	it("registers `logs follow` with an interval and a timeout", async () => {
+		await run([
+			"logs",
+			"follow",
+			"--issue",
+			"NOR-402",
+			"--interval",
+			"30",
+			"--timeout",
+			"600",
+			"--json",
+		]);
+
+		expect(logsExecute).toHaveBeenCalledWith(
+			[
+				"follow",
+				"--issue",
+				"NOR-402",
+				"--json",
+				"--interval",
+				"30",
+				"--timeout",
+				"600",
+			],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("offers the same filter vocabulary on `query` and `follow`", () => {
+		// A filter that exists on one and not the other is a difference an operator
+		// discovers only by having their query silently answered with a superset.
+		const logs = newProgram().commands.find(
+			(command) => command.name() === "logs",
+		);
+		const flagsOf = (name: string): string[] =>
+			(logs?.commands.find((command) => command.name() === name)?.options ?? [])
+				.map((option) => option.long)
+				.filter((flag): flag is string => Boolean(flag))
+				.sort();
+
+		const query = flagsOf("query");
+		const follow = flagsOf("follow");
+
+		expect(query.length).toBeGreaterThan(0);
+		// `follow` adds exactly the two flags a poll needs and drops nothing.
+		expect(follow).toEqual([...query, "--interval", "--timeout"].sort());
+	});
+
+	it("uses the same flag names as `runs` for the dimensions they share", () => {
+		// An operator who found a run with `cyrus runs list --issue NOR-402` reads
+		// its logs with `cyrus logs query --issue NOR-402`; a second spelling for
+		// one concept is a question nobody should look up mid-incident.
+		const program = newProgram();
+		const flagsOf = (parent: string, child: string): Set<string> =>
+			new Set(
+				(
+					program.commands
+						.find((command) => command.name() === parent)
+						?.commands.find((command) => command.name() === child)?.options ??
+					[]
+				).map((option) => option.long),
+			);
+
+		const logs = flagsOf("logs", "query");
+		for (const shared of [
+			"--run",
+			"--session",
+			"--issue",
+			"--owner",
+			"--team",
+			"--project",
+			"--connection",
+			"--workspace",
+			"--json",
+		]) {
+			expect(flagsOf("runs", "list")).toContain(shared);
+			expect(logs).toContain(shared);
+		}
 	});
 });

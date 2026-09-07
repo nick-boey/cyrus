@@ -98,13 +98,18 @@ export function entraScopeFor(audience: string): string {
  * non-remote command in the same binary — never pays to load the Azure SDK.
  */
 export function createDefaultEntraChain(
-	tenantId: string,
+	tenantId?: string,
 ): EntraCredentialCandidate[] {
+	// Omitted entirely rather than passed as `undefined`, because the two are not
+	// the same to the SDK: `{ tenantId: undefined }` is a supplied option on some
+	// credentials and an immediate constructor failure on others. A caller with no
+	// tenant to pin — the log-source credential, whose audience is Azure's rather
+	// than a specific router's — wants each credential's own ambient default.
+	const tenant = tenantId ? { tenantId } : undefined;
 	return [
 		{
 			source: "workload-identity",
-			create: () =>
-				lazyAzureCredential("WorkloadIdentityCredential", { tenantId }),
+			create: () => lazyAzureCredential("WorkloadIdentityCredential", tenant),
 		},
 		{
 			source: "managed-identity",
@@ -116,7 +121,7 @@ export function createDefaultEntraChain(
 		},
 		{
 			source: "azure-cli",
-			create: () => lazyAzureCredential("AzureCliCredential", { tenantId }),
+			create: () => lazyAzureCredential("AzureCliCredential", tenant),
 		},
 	];
 }

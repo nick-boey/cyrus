@@ -226,6 +226,21 @@ describe("LogQueryV1", () => {
 		}
 	});
 
+	it("narrows on the team and project a run was routed under", () => {
+		// The canonical attribution CYR-72 stamps on every line carries these
+		// (`cyrus.team_id` / `cyrus.project_id`), and "everything my team did this
+		// morning" is a question an operator opens the logs to ask. A vocabulary
+		// that omitted them would leave the columns queryable only by someone
+		// hand-writing KQL, which is what this command exists to avoid.
+		expect(
+			logQueryV1Schema.safeParse({
+				...logQuery,
+				teamId: "team-1",
+				projectId: "project-1",
+			}).success,
+		).toBe(true);
+	});
+
 	it("accepts a minimal query carrying only a range", () => {
 		expect(
 			logQueryV1Schema.safeParse({

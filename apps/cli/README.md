@@ -157,6 +157,104 @@ outcome and for a timeout. It now uses the table above — `3` for a non-success
 outcome, `4` for a timeout, `2` for an ambiguous match — so a script testing
 `[ $? -eq 1 ]` will no longer fire.
 
+## Fleet log commands
+
+`cyrus logs` reads the historical logs of a **remote** fleet through the same
+stored connection `cyrus runs` uses. It is available in both command profiles.
+
+Two subcommands, with different semantics:
+
+| Command | Question it answers | Ends when |
+| --- | --- | --- |
+| `cyrus logs query` | What was logged in this window? | The window has been read |
+| `cyrus logs follow` | What is being logged now? | `--timeout` elapses, or Ctrl-C |
+
+```bash
+# The last 15 minutes (the default the router advertises)
+cyrus logs query
+
+# Everything one run logged, router and sandbox alike
+cyrus logs query --run 019bd6f2-1d1e-7a8e-9f4c-0b7c2a5e91d3 --since 2h
+
+# Warnings and errors on one issue, as JSON
+cyrus logs query --issue NOR-402 --level warn --level error --json
+
+# Follow a team's logs, printing the generated backend query to stderr
+cyrus logs follow --team team-1 --interval 30 --show-query
+```
+
+### Where the logs come from
+
+The router does **not** serve log data. It publishes a credential-free
+*descriptor* saying where its logs live, and this CLI authenticates to that
+backend directly with **local** credentials — the same non-interactive Entra
+chain `cyrus connection` uses, against the Log Analytics audience. Log records
+never pass back through the router, which keeps a query that can return
+gigabytes off a hop that would have to buffer it, and means your own Azure
+grant (typically `Log Analytics Reader`) decides what you can read.
+
+You never write a backend query. Every filter is a typed field, compiled into
+the backend's language by an adapter; `--show-query` prints the generated query
+to **stderr** so you can reproduce it in the portal.
+
+### Filters
+
+| Flag | Matches |
+| --- | --- |
+| `--since <duration>` | Look back this far: `30s`, `15m`, `2h`, `1d`, or bare seconds |
+| `--from` / `--to` | An explicit window (ISO-8601 instants) |
+| `--issue <key>` | The Linear issue identifier, e.g. `NOR-402` |
+| `--run <id>` / `--session <id>` | One agent run, or one Linear agent session |
+| `--owner` / `--team` / `--project` | The identities the run was routed under |
+| `--component <name>` | The component that wrote the line, e.g. `EventRouter` |
+| `--level <level>` | `debug`, `info`, `warn`, `error`. Repeatable |
+| `--text <substring>` | Case-insensitive substring of the message |
+| `--trace <id>` | A W3C trace id, to join a log line to its trace |
+| `--limit <count>` | Maximum records. Refused above the source's budget |
+
+Filter names match `cyrus runs` wherever the two share a dimension, so a run
+you found with `cyrus runs list --issue NOR-402` reads with
+`cyrus logs query --issue NOR-402`.
+
+Router lines and relayed sandbox lines are both returned — nothing filters to
+one — and each record carries a `cyrus.source` attribute saying which it was.
+
+### Budgets, and why they refuse rather than truncate
+
+The router advertises a default lookback, a maximum range, a record ceiling, and
+a minimum follow interval. Exceeding any of them **fails with exit `2` and emits
+nothing**, rather than returning a subset.
+
+That is deliberate: a truncated log window reads exactly like a complete one, so
+an operator concludes an error never happened. The same rule applies to a record
+over 256 KiB, a result set over 10 MiB, and a `--limit` or `--interval` outside
+what the source allows — each is refused with a message naming what to narrow.
+Azure partial results are failures for the same reason.
+
+### `follow` is a poll, not a stream
+
+`follow` polls a historical store. Records become queryable only once the
+backend has **ingested** them, which lags the moment they were written. So each
+poll re-reads an overlap of the previous window and suppresses duplicates by a
+content fingerprint, and the command reports the ingestion lag it observed —
+widening its overlap when the backend reports worse. It never presents itself as
+a live router stream, because a quiet screen must not be read as a quiet fleet.
+
+### Redaction
+
+Known secrets are removed before anything is printed: values under
+credential-named keys (`token`, `secret`, `password`, …), credential shapes
+(bearer headers, JWTs, operator tokens), and the exact values of credentials in
+this process's own environment. A record that was altered carries
+`"redacted": true`.
+
+### Exit codes
+
+The same table as `cyrus runs`. `query` and `follow` exit `0` whatever the
+records say — a window full of errors is a successful read — so `3` and `4` do
+not arise here. Budget refusals are `2`, an Azure `401`/`403` is `5`, and a
+partial or failed backend result is `6`.
+
 ## Configuration
 
 ### Environment Variables

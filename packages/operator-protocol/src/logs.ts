@@ -162,6 +162,16 @@ export const logQueryV1Schema = z
 		}),
 		workspaceId: identifierV1Schema.optional(),
 		ownerUserId: identifierV1Schema.optional(),
+		// The team and project a run was routed under. Present because the
+		// canonical attribution CYR-72 stamps on every line carries them
+		// (`cyrus.team_id` / `cyrus.project_id`) and "everything my team did this
+		// morning" is the question an operator opens the logs to ask. Filtering on
+		// a fact the emitter stores is the whole point of that attribution; a
+		// vocabulary that omitted them would leave the columns queryable only by
+		// someone hand-writing KQL, which is exactly what this command exists to
+		// avoid.
+		teamId: identifierV1Schema.optional(),
+		projectId: identifierV1Schema.optional(),
 		issueKey: identifierV1Schema.optional(),
 		runId: identifierV1Schema.optional(),
 		sessionId: identifierV1Schema.optional(),

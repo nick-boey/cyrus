@@ -8,6 +8,7 @@ import { CheckTokensCommand } from "./commands/CheckTokensCommand.js";
 import { ConnectCommand } from "./commands/ConnectCommand.js";
 import { ConnectionCommand } from "./commands/ConnectionCommand.js";
 import { ContainerBootCommand } from "./commands/ContainerBootCommand.js";
+import { LogsCommand } from "./commands/LogsCommand.js";
 import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
 import { RouterCommand } from "./commands/RouterCommand.js";
 import { RunsCommand } from "./commands/RunsCommand.js";
@@ -65,8 +66,8 @@ export const COMMAND_PROFILE_ENV = "CYRUS_COMMAND_PROFILE";
  * cannot be granted by where a `register*` call happens to sit relative to a
  * branch. Adding a command to the remote surface is an edit to this array.
  *
- * `logs`, `recover`, and `skills` are named but not yet implemented — they
- * arrive with CYR-73, CYR-76, and CYR-77.
+ * `recover` and `skills` are named but not yet implemented — they arrive with
+ * CYR-76 and CYR-77.
  */
 export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
 	"connection",
@@ -86,6 +87,7 @@ export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
 export const REMOTE_PROFILE_REGISTERED: readonly string[] = [
 	"connection",
 	"runs",
+	"logs",
 ];
 
 /**
@@ -195,6 +197,7 @@ export function buildProgram(
 		connection: () =>
 			registerConnectionCommand(program, packageJson, errorReporter),
 		runs: () => registerRunsCommand(program, packageJson, errorReporter),
+		logs: () => registerLogsCommand(program, packageJson, errorReporter),
 	};
 
 	for (const [name, register] of Object.entries(remoteVocabulary)) {
@@ -1083,6 +1086,206 @@ function registerRunsCommand(
 				connection: cmdOpts.connection,
 				workspace: cmdOpts.workspace,
 			});
+		},
+	);
+}
+
+/**
+ * The filters `cyrus logs query` and `cyrus logs follow` share.
+ *
+ * Declared once and applied to both so the vocabulary cannot drift between
+ * them — a filter that exists on one and not the other is a difference an
+ * operator discovers only by having their query silently answered with a
+ * superset.
+ *
+ * Mirrors `RUN_FILTER_OPTIONS` where the dimensions overlap, and deliberately
+ * uses the SAME flag names: an operator who found a run with
+ * `cyrus runs list --issue NOR-402` reads its logs with
+ * `cyrus logs query --issue NOR-402`, and a second spelling for one concept is
+ * a question nobody should have to look up mid-incident.
+ *
+ * `--workspace` is not here; it arrives through `addFleetSelectionOptions` as
+ * the fleet selection and scopes every query.
+ */
+const LOG_FILTER_OPTIONS = [
+	["--run <id>", "Filter by run id"],
+	["--session <id>", "Filter by agent session id"],
+	["--issue <key>", "Filter by Linear issue identifier (e.g. NOR-402)"],
+	["--owner <id>", "Filter by the Cyrus user who owns the run"],
+	["--team <id>", "Filter by the Linear team captured when input routed"],
+	["--project <id>", "Filter by the Linear project captured when input routed"],
+	["--component <name>", "Filter by the component that wrote the line"],
+	[
+		"--trace <id>",
+		"Filter by W3C trace id (32 hex characters), to join a log line to its trace",
+	],
+	["--text <substring>", "Only lines whose message contains this text"],
+] as const;
+
+interface LogFilterOptionValues {
+	run?: string;
+	session?: string;
+	issue?: string;
+	owner?: string;
+	team?: string;
+	project?: string;
+	component?: string;
+	trace?: string;
+	text?: string;
+	level?: string[];
+	limit?: string;
+	since?: string;
+	from?: string;
+	to?: string;
+	showQuery?: boolean;
+	json?: boolean;
+	connection?: string;
+	workspace?: string;
+}
+
+function addLogFilterOptions(command: Command): Command {
+	for (const [flags, description] of LOG_FILTER_OPTIONS) {
+		command.option(flags, description);
+	}
+	return command
+		.option(
+			"--level <level>",
+			"Only these levels: debug, info, warn, error. Repeatable.",
+			collect,
+			[],
+		)
+		.option("--since <duration>", "Look back this far, e.g. 30s, 15m, 2h, 1d")
+		.option("--from <timestamp>", "Start of the window (ISO-8601 instant)")
+		.option("--to <timestamp>", "End of the window (ISO-8601 instant)")
+		.option("--limit <count>", "Maximum records to return")
+		.option(
+			"--show-query",
+			"Print the generated backend query to stderr (stdout stays clean)",
+		)
+		.option("--json", "Emit JSON on stdout");
+}
+
+/**
+ * Translates parsed options back into the argv form `LogsCommand` parses.
+ *
+ * The command owns its own parser so it stays drivable without Commander, which
+ * makes this the one place the two representations meet — the same arrangement
+ * `runFilterArgs` has for `runs`.
+ */
+function logFilterArgs(cmdOpts: LogFilterOptionValues): string[] {
+	const args: string[] = [];
+	const forward = (flag: string, value?: string): void => {
+		if (value !== undefined) args.push(flag, value);
+	};
+	forward("--run", cmdOpts.run);
+	forward("--session", cmdOpts.session);
+	forward("--issue", cmdOpts.issue);
+	forward("--owner", cmdOpts.owner);
+	forward("--team", cmdOpts.team);
+	forward("--project", cmdOpts.project);
+	forward("--component", cmdOpts.component);
+	forward("--trace", cmdOpts.trace);
+	forward("--text", cmdOpts.text);
+	forward("--since", cmdOpts.since);
+	forward("--from", cmdOpts.from);
+	forward("--to", cmdOpts.to);
+	forward("--limit", cmdOpts.limit);
+	for (const level of cmdOpts.level ?? []) args.push("--level", level);
+	if (cmdOpts.showQuery) args.push("--show-query");
+	if (cmdOpts.json) args.push("--json");
+	return args;
+}
+
+/**
+ * `cyrus logs …` — query and follow the router's advertised log source.
+ *
+ * Two subcommands with genuinely different semantics rather than one with a
+ * `--follow` flag, for the same reason `runs` has three: `query` is a one-shot
+ * read of a fixed window and succeeds whatever it finds, while `follow` runs
+ * until it is stopped and reports the ingestion lag it is looking through. A
+ * single command whose meaning changed with a flag would give both the same
+ * exit-code contract, and neither would be usable.
+ */
+function registerLogsCommand(
+	program: Command,
+	packageJson: { version: string },
+	errorReporter: ErrorReporter,
+): void {
+	const logsCommand = program
+		.command("logs")
+		.description(
+			"Query and follow fleet logs through a stored router connection (see `cyrus connection add`)",
+		);
+
+	/**
+	 * Builds the Application and disposes its watchers, so a one-shot command
+	 * exits instead of idling on live `fs.watch` handles.
+	 */
+	const runLogs = async (
+		argv: string[],
+		selection: { connection?: string; workspace?: string },
+	): Promise<void> => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		try {
+			await new LogsCommand(app).execute(argv, selection);
+		} finally {
+			app.disposeWatchers();
+		}
+	};
+
+	addFleetSelectionOptions(
+		addLogFilterOptions(
+			logsCommand
+				.command("query")
+				.description(
+					"Read one window of fleet logs. Succeeds whatever the records say.",
+				),
+		),
+	).action(async (cmdOpts: LogFilterOptionValues) => {
+		await runLogs(["query", ...logFilterArgs(cmdOpts)], {
+			connection: cmdOpts.connection,
+			workspace: cmdOpts.workspace,
+		});
+	});
+
+	addFleetSelectionOptions(
+		addLogFilterOptions(
+			logsCommand
+				.command("follow")
+				.description(
+					"Poll the log source until timeout or interruption. This is a historical store on a delay, not a live router stream.",
+				),
+		)
+			.option(
+				"--interval <seconds>",
+				"Seconds between polls. Refused if faster than the source allows.",
+			)
+			.option(
+				"--timeout <seconds>",
+				"Stop following after this many seconds (exit 0)",
+			),
+	).action(
+		async (
+			cmdOpts: LogFilterOptionValues & {
+				interval?: string;
+				timeout?: string;
+			},
+		) => {
+			await runLogs(
+				[
+					"follow",
+					...logFilterArgs(cmdOpts),
+					...(cmdOpts.interval ? ["--interval", cmdOpts.interval] : []),
+					...(cmdOpts.timeout ? ["--timeout", cmdOpts.timeout] : []),
+				],
+				{ connection: cmdOpts.connection, workspace: cmdOpts.workspace },
+			);
 		},
 	);
 }
