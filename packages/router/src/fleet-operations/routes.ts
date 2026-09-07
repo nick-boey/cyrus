@@ -1,10 +1,12 @@
 import type { ILogger } from "cyrus-core";
+import { recoveryRequestV1Schema } from "cyrus-operator-protocol";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { type FleetOperations, FleetQueryError } from "./FleetOperations.js";
 import {
 	OperatorAuthError,
 	type OperatorAuthorizer,
 } from "./OperatorAuthorizer.js";
+import { RecoveryRequestError } from "./RecoveryService.js";
 import { RunCursorError } from "./RunChangeCursor.js";
 import type { OperatorPrincipal } from "./types.js";
 
@@ -16,6 +18,8 @@ export const OPERATOR_CONTEXT_ROUTE = "/api/v1/operator/context";
 export const RUNS_ROUTE = "/api/v1/runs";
 /** The durable, ordered feed of material run changes. */
 export const RUN_CHANGES_ROUTE = "/api/v1/run-changes";
+/** The guarded mutation: ask the router to reconcile one run. */
+export const RECOVERIES_ROUTE = "/api/v1/recoveries";
 
 export interface FleetOperationsRoutesOptions {
 	fleet: FleetOperations;
@@ -167,6 +171,118 @@ export function registerFleetOperationsRoutes(
 			}),
 		);
 	});
+
+	// The one route that mutates. It is ASYNCHRONOUS by contract: the router
+	// accepts the request, persists the operation, and answers `202` — recovery
+	// then outlives the connection that asked for it, and correctness never
+	// depends on the caller still being there.
+	//
+	// Registered unconditionally, exactly like the read routes. A router that does
+	// not serve recovery refuses at the capability check, which is an answer a
+	// client can act on and which matches the context document it already read; a
+	// route that vanished with the feature flag would be indistinguishable from a
+	// router too old to have one.
+	fastify.post<{ Body: unknown }>(RECOVERIES_ROUTE, async (request, reply) => {
+		const principal = await authenticate(
+			authorizer,
+			request.headers,
+			reply,
+			logger,
+		);
+		if (!principal) return reply;
+		// STRICT, and that is a safety property rather than hygiene: a silently
+		// stripped `expectedRevision` would turn the conditional recovery the
+		// caller wrote into an unconditional one.
+		const parsed = recoveryRequestV1Schema.safeParse(request.body);
+		if (!parsed.success) {
+			// Field PATHS only. The caller sent this, so naming the offending field
+			// discloses nothing — but echoing the VALUE would put whatever it was
+			// (an idempotency key derived from a credential, say) into a response.
+			return reply.status(400).send({
+				error: "invalid_request",
+				message: `Invalid recovery request: ${parsed.error.issues
+					.map((issue) => issue.path.join(".") || "(root)")
+					.join(", ")}`,
+			});
+		}
+		try {
+			const { operation, joined } = fleet.requestRecovery(
+				principal,
+				parsed.data,
+			);
+			return reply
+				.status(joined ? 200 : 202)
+				.header("cache-control", "no-store")
+				.header("location", `${RECOVERIES_ROUTE}/${operation.operationId}`)
+				.send(operation);
+		} catch (error) {
+			return renderRecoveryError(reply, logger, error);
+		}
+	});
+
+	fastify.get<{ Params: { operationId: string } }>(
+		`${RECOVERIES_ROUTE}/:operationId`,
+		async (request, reply) => {
+			const principal = await authenticate(
+				authorizer,
+				request.headers,
+				reply,
+				logger,
+			);
+			if (!principal) return reply;
+			try {
+				const operation = fleet.getRecovery(
+					principal,
+					request.params.operationId,
+				);
+				if (!operation) {
+					// The same answer for an operation in another workspace and one that
+					// never existed. Telling them apart would let an operator probe
+					// another workspace's operation ids.
+					return reply.status(404).send({ error: "operation_not_found" });
+				}
+				return reply
+					.status(200)
+					.header("cache-control", "no-store")
+					.send(operation);
+			} catch (error) {
+				return renderRecoveryError(reply, logger, error);
+			}
+		},
+	);
+}
+
+/**
+ * Renders a refusal from the recovery resource.
+ *
+ * A {@link FleetQueryError} keeps the bare `{error}` body every other route
+ * answers with — it is the authorization refusal, and it must not explain
+ * itself. A {@link RecoveryRequestError} DOES explain itself, because every one
+ * of them is something the caller can act on: re-read the run and quote the new
+ * revision, pick a different idempotency key, target a run that has not ended.
+ * `details` carries the one fact that makes the retry possible.
+ */
+function renderRecoveryError(
+	reply: FastifyReply,
+	logger: ILogger | undefined,
+	error: unknown,
+): FastifyReply {
+	if (error instanceof RecoveryRequestError) {
+		logger?.debug(
+			`Recovery request refused (${error.status}): ${error.message}`,
+		);
+		return reply.status(error.status).send({
+			error: error.code,
+			message: error.message,
+			...(error.details ?? {}),
+		});
+	}
+	if (error instanceof FleetQueryError) {
+		logger?.debug(`Recovery denied (${error.status}): ${error.message}`);
+		return reply.status(error.status).send({ error: error.code });
+	}
+	logger?.error("Could not serve the recovery request", error);
+	return reply.status(500).send({ error: "internal error" });
 }
 
 /**

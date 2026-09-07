@@ -1,6 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
-import type { OperatorRoleV1 } from "cyrus-operator-protocol";
+import type {
+	OperatorAuthMethodV1,
+	OperatorRoleV1,
+	RecoveryEvidenceV1,
+	RecoveryPhaseV1,
+	RecoveryRefusalReasonV1,
+} from "cyrus-operator-protocol";
 import type { SandboxGaugeState } from "./SandboxTelemetry.js";
 
 const ENROLLMENT_CODE_TTL_MS = 15 * 60_000;
@@ -212,6 +218,27 @@ CREATE TABLE IF NOT EXISTS agent_run_changes (
   workspace_id TEXT,
   user_id INTEGER
 );
+CREATE TABLE IF NOT EXISTS recovery_operations (
+  operation_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  auth_method TEXT NOT NULL,
+  roles_json TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  owner_user_id INTEGER,
+  expected_revision INTEGER NOT NULL,
+  reason TEXT,
+  phase TEXT NOT NULL,
+  phases_json TEXT NOT NULL,
+  requested_ms INTEGER NOT NULL,
+  updated_ms INTEGER NOT NULL,
+  completed_ms INTEGER,
+  evidence_before_json TEXT NOT NULL,
+  evidence_after_json TEXT,
+  refusal_reason TEXT,
+  failure_message TEXT
+);
 `;
 
 // A user may have at most one physical device row, and an issue may have at
@@ -236,6 +263,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_ended ON agent_runs(ended_ms);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_device ON agent_runs(device_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_page ON agent_runs(started_ms DESC, run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_run_changes_run ON agent_run_changes(run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_operations_key ON recovery_operations(principal_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_recovery_operations_run ON recovery_operations(run_id);
 `;
 
 function sha256Hex(value: string): string {
@@ -621,6 +650,193 @@ export interface AgentRunChange {
 	kind: AgentRunChangeKind;
 	changedMs: number;
 	observation: AgentRunInfo;
+}
+
+/**
+ * One phase an operation entered, and when. `detail` is the coordinator's own
+ * one-line note about that step — never prompt text and never agent-activity
+ * content, both of which this store has never held and must not start holding.
+ */
+export interface RecoveryPhaseRecord {
+	phase: RecoveryPhaseV1;
+	enteredMs: number;
+	detail?: string;
+}
+
+/**
+ * The durable record of one recovery attempt — the router's own copy of
+ * `recoveryOperationV1Schema`, with the store's native units (epoch
+ * milliseconds, a numeric owner id) rather than the wire's.
+ *
+ * It exists so that recovery correctness and progress do not depend on anything
+ * having been posted to Linear (ADR 0013): everything an operator, an audit, or
+ * a restarted router needs to reconstruct what happened is here.
+ */
+export interface RecoveryOperationRecord {
+	operationId: string;
+	runId: string;
+	idempotencyKey: string;
+	/**
+	 * The caller authorization was keyed on, exactly as `OperatorPrincipal.id`
+	 * spells it — an Entra `oid`, or a synthetic `local-token:<id>` /
+	 * `device:<id>`. Half of the idempotency key's uniqueness, which is what lets
+	 * two operators pick the same key without colliding.
+	 */
+	principalId: string;
+	/** The WIRE spelling, stored verbatim so no translation sits on the audit path. */
+	authMethod: OperatorAuthMethodV1;
+	roles: OperatorRoleV1[];
+	/** The authorized workspace the target run was routed under. */
+	workspaceId: string;
+	/**
+	 * Set only for an owner-scoped caller (a device token), and it is what makes
+	 * the owner scope survive: a later read re-applies it rather than trusting
+	 * that whoever wrote the row had already narrowed correctly.
+	 */
+	ownerUserId?: number;
+	/** The observation revision the caller inspected before requesting. */
+	expectedRevision: number;
+	/** The caller's own justification, if it supplied one. */
+	reason?: string;
+	phase: RecoveryPhaseV1;
+	phases: RecoveryPhaseRecord[];
+	requestedMs: number;
+	updatedMs: number;
+	/** Set exactly when {@link phase} is terminal. */
+	completedMs?: number;
+	evidenceBefore: RecoveryEvidenceV1;
+	/** Recorded once, on the terminal transition. */
+	evidenceAfter?: RecoveryEvidenceV1;
+	refusalReason?: RecoveryRefusalReasonV1;
+	failureMessage?: string;
+}
+
+/**
+ * What {@link RouterStore.createRecoveryOperation} did with a request.
+ *
+ * `conflict` carries the EXISTING operation rather than only a flag, because the
+ * caller has to be able to say what the key is already bound to — and because
+ * the audit event for a conflict is worthless without it.
+ */
+export type RecoveryOperationClaim =
+	| { status: "created"; operation: RecoveryOperationRecord }
+	| { status: "joined"; operation: RecoveryOperationRecord }
+	| { status: "conflict"; existing: RecoveryOperationRecord };
+
+export interface RecoveryOperationInput {
+	operationId: string;
+	runId: string;
+	idempotencyKey: string;
+	principalId: string;
+	authMethod: OperatorAuthMethodV1;
+	roles: OperatorRoleV1[];
+	workspaceId: string;
+	ownerUserId?: number;
+	expectedRevision: number;
+	reason?: string;
+	evidenceBefore: RecoveryEvidenceV1;
+	nowMs: number;
+}
+
+/** Who may read a recovery operation. Empty `workspaceIds` authorizes nothing. */
+export interface RecoveryOperationScope {
+	workspaceIds: string[];
+	ownerScopeUserId?: number;
+}
+
+interface RecoveryOperationRow {
+	operation_id: string;
+	run_id: string;
+	idempotency_key: string;
+	principal_id: string;
+	auth_method: string;
+	roles_json: string;
+	workspace_id: string;
+	owner_user_id: number | null;
+	expected_revision: number;
+	reason: string | null;
+	phase: string;
+	phases_json: string;
+	requested_ms: number;
+	updated_ms: number;
+	completed_ms: number | null;
+	evidence_before_json: string;
+	evidence_after_json: string | null;
+	refusal_reason: string | null;
+	failure_message: string | null;
+}
+
+/**
+ * Every recovery phase, its position in the coordinator's sequence, and whether
+ * it ends the operation.
+ *
+ * A `Record` keyed on {@link RecoveryPhaseV1} for the same reason
+ * {@link OPERATOR_ROLE_SET} is: it makes the mirror EXHAUSTIVE, so a phase added
+ * to the wire contract without a rank here is a compile error rather than a
+ * transition this store silently refuses at runtime.
+ *
+ * The four terminal phases share the highest rank because they are reachable
+ * from ANY non-terminal phase — a refusal discovered while replaying is as
+ * legitimate as one discovered before the executor started. Ordering them
+ * against each other would be inventing a sequence the coordinator does not
+ * have.
+ */
+const RECOVERY_PHASES: Record<
+	RecoveryPhaseV1,
+	{ order: number; terminal: boolean }
+> = {
+	accepted: { order: 0, terminal: false },
+	starting_executor: { order: 1, terminal: false },
+	reconciling: { order: 2, terminal: false },
+	replaying: { order: 3, terminal: false },
+	releasing_stale_ownership: { order: 4, terminal: false },
+	recovered: { order: 5, terminal: true },
+	needs_input: { order: 5, terminal: true },
+	refused: { order: 5, terminal: true },
+	failed: { order: 5, terminal: true },
+};
+
+function toRecoveryOperationRecord(
+	row: RecoveryOperationRow,
+): RecoveryOperationRecord {
+	return {
+		operationId: row.operation_id,
+		runId: row.run_id,
+		idempotencyKey: row.idempotency_key,
+		principalId: row.principal_id,
+		authMethod: row.auth_method as OperatorAuthMethodV1,
+		// Filtered on the way out as well as the way in, exactly as
+		// `toOperatorTokenInfo` does: a row written by a newer router must not be
+		// able to introduce a role this process does not understand and would then
+		// carry, unchecked, into an audit record.
+		roles: (JSON.parse(row.roles_json) as string[]).filter(
+			(role): role is OperatorRoleV1 =>
+				(OPERATOR_ROLES as readonly string[]).includes(role),
+		),
+		workspaceId: row.workspace_id,
+		...(row.owner_user_id !== null ? { ownerUserId: row.owner_user_id } : {}),
+		expectedRevision: row.expected_revision,
+		...(row.reason !== null ? { reason: row.reason } : {}),
+		phase: row.phase as RecoveryPhaseV1,
+		phases: JSON.parse(row.phases_json) as RecoveryPhaseRecord[],
+		requestedMs: row.requested_ms,
+		updatedMs: row.updated_ms,
+		...(row.completed_ms !== null ? { completedMs: row.completed_ms } : {}),
+		evidenceBefore: JSON.parse(row.evidence_before_json) as RecoveryEvidenceV1,
+		...(row.evidence_after_json !== null
+			? {
+					evidenceAfter: JSON.parse(
+						row.evidence_after_json,
+					) as RecoveryEvidenceV1,
+				}
+			: {}),
+		...(row.refusal_reason !== null
+			? { refusalReason: row.refusal_reason as RecoveryRefusalReasonV1 }
+			: {}),
+		...(row.failure_message !== null
+			? { failureMessage: row.failure_message }
+			: {}),
+	};
 }
 
 interface AgentRunRow {
@@ -3347,6 +3563,13 @@ export class RouterStore {
 	 * `run_id` no longer exists — is an unindexable full scan of the whole feed
 	 * inside a write transaction, on a 60-second timer, in the process that also
 	 * serves the WebSocket gateway.
+	 *
+	 * Recovery operations expire under the SAME cutoff, and for the same reason as
+	 * the change entries: an operation quotes a revision and an evidence pair that
+	 * only the run can corroborate, so one retained past its run is an audit
+	 * record nothing can be checked against. The structured audit events are the
+	 * durable trail beyond this window — they go to a log backend with its own
+	 * retention, rather than to a SQLite file on ephemeral disk.
 	 */
 	sweepTerminalAgentRuns(cutoffMs: number): number {
 		return this.db.transaction(() => {
@@ -3354,6 +3577,11 @@ export class RouterStore {
 				"SELECT run_id FROM agent_runs WHERE ended_ms IS NOT NULL AND ended_ms < ?";
 			this.db
 				.prepare(`DELETE FROM agent_run_changes WHERE run_id IN (${expiring})`)
+				.run(cutoffMs);
+			this.db
+				.prepare(
+					`DELETE FROM recovery_operations WHERE run_id IN (${expiring})`,
+				)
 				.run(cutoffMs);
 			return this.db
 				.prepare(
@@ -3469,6 +3697,327 @@ export class RouterStore {
 			.prepare("SELECT MAX(change_id) AS latest FROM agent_run_changes")
 			.get() as { latest: number | null };
 		return row.latest ?? 0;
+	}
+
+	/**
+	 * Appends a `recovery` entry for a run whose recovery operation just moved.
+	 *
+	 * Deliberately does NOT touch the run's `revision`. The revision describes the
+	 * RUN's own durable facts and is what an in-flight recovery request quotes;
+	 * bumping it because an operation changed phase would invalidate the caller's
+	 * own request mid-flight, and would make the number mean two different things.
+	 * A recovery that actually changes the run — releasing stale affinity, marking
+	 * an outcome unknown — moves the revision through the ordinary run writes,
+	 * which append their own entries.
+	 *
+	 * A run that has since aged out simply produces no entry: the feed cannot
+	 * describe a run it no longer holds, and the operation record is the durable
+	 * evidence either way.
+	 */
+	appendRecoveryRunChange(runId: string, changedMs: number): void {
+		this.db.transaction(() => {
+			this.appendAgentRunChange(runId, "recovery", changedMs);
+		})();
+	}
+
+	/**
+	 * Claims one recovery attempt, or reports what the caller's key is already
+	 * bound to.
+	 *
+	 * Idempotency is keyed on `(principal, key)` — never on the key alone — so one
+	 * operator's retry can never join, or collide with, another's operation. The
+	 * lookup and the insert share a transaction because the whole point of the key
+	 * is that two concurrent requests must not both start recovery work on the
+	 * same run.
+	 *
+	 * "The same request" means the same TARGET and the same inspected revision.
+	 * Anything else reusing the key is a `conflict` rather than a join: a key
+	 * silently rebound to a different run would let a client that lost a response
+	 * retry its way into recovering something it never asked about.
+	 */
+	createRecoveryOperation(
+		input: RecoveryOperationInput,
+	): RecoveryOperationClaim {
+		return this.db.transaction((): RecoveryOperationClaim => {
+			const existingRow = this.db
+				.prepare(
+					"SELECT * FROM recovery_operations WHERE principal_id = ? AND idempotency_key = ?",
+				)
+				.get(input.principalId, input.idempotencyKey) as
+				| RecoveryOperationRow
+				| undefined;
+			if (existingRow) {
+				const existing = toRecoveryOperationRecord(existingRow);
+				if (
+					existing.runId === input.runId &&
+					existing.expectedRevision === input.expectedRevision
+				) {
+					return { status: "joined", operation: existing };
+				}
+				return { status: "conflict", existing };
+			}
+			const phases: RecoveryPhaseRecord[] = [
+				{ phase: "accepted", enteredMs: input.nowMs },
+			];
+			this.db
+				.prepare(
+					`INSERT INTO recovery_operations
+					 (operation_id, run_id, idempotency_key, principal_id, auth_method,
+					  roles_json, workspace_id, owner_user_id, expected_revision, reason,
+					  phase, phases_json, requested_ms, updated_ms, evidence_before_json)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?)`,
+				)
+				.run(
+					input.operationId,
+					input.runId,
+					input.idempotencyKey,
+					input.principalId,
+					input.authMethod,
+					JSON.stringify(input.roles),
+					input.workspaceId,
+					input.ownerUserId ?? null,
+					input.expectedRevision,
+					input.reason ?? null,
+					JSON.stringify(phases),
+					input.nowMs,
+					input.nowMs,
+					JSON.stringify(input.evidenceBefore),
+				);
+			return {
+				status: "created",
+				operation: toRecoveryOperationRecord(
+					this.db
+						.prepare("SELECT * FROM recovery_operations WHERE operation_id = ?")
+						.get(input.operationId) as RecoveryOperationRow,
+				),
+			};
+		})();
+	}
+
+	/**
+	 * Moves an operation to its next phase, appending to the history that IS the
+	 * audit trail.
+	 *
+	 * Two invariants are enforced here rather than at the route, because they are
+	 * properties of the record rather than of any one caller:
+	 *
+	 *  - **Monotonic.** A phase may only move forward. A history that repeats or
+	 *    rewinds a phase is no longer a record of what happened, and a retrying
+	 *    coordinator re-reporting a step it already reported is exactly the way
+	 *    that happens by accident.
+	 *  - **Terminal is final.** Once an operation has an outcome, nothing may
+	 *    revise it. An outcome that could be overwritten is not evidence.
+	 *
+	 * The refusal reason and the failure message are bound to their own phases for
+	 * the same reason `recoveryOperationV1Schema` binds them: a refusal that does
+	 * not say why, or a failure message attached to a success, is an audit record
+	 * that misleads.
+	 */
+	advanceRecoveryOperation(input: {
+		operationId: string;
+		phase: RecoveryPhaseV1;
+		atMs: number;
+		detail?: string;
+		evidenceAfter?: RecoveryEvidenceV1;
+		refusalReason?: RecoveryRefusalReasonV1;
+		failureMessage?: string;
+	}): RecoveryOperationRecord {
+		const next = RECOVERY_PHASES[input.phase];
+		if ((input.phase === "refused") !== (input.refusalReason !== undefined)) {
+			throw new Error(
+				"A refusal reason belongs to a refused recovery operation, and every refusal states one",
+			);
+		}
+		if ((input.phase === "failed") !== (input.failureMessage !== undefined)) {
+			throw new Error(
+				"A failure message belongs to a failed recovery operation, and every failure states one",
+			);
+		}
+		if (!next.terminal && input.evidenceAfter !== undefined) {
+			throw new Error(
+				"After-evidence is recorded only once a recovery operation finishes",
+			);
+		}
+		return this.db.transaction((): RecoveryOperationRecord => {
+			const row = this.db
+				.prepare("SELECT * FROM recovery_operations WHERE operation_id = ?")
+				.get(input.operationId) as RecoveryOperationRow | undefined;
+			if (!row) {
+				throw new Error(`Unknown recovery operation: ${input.operationId}`);
+			}
+			const current = RECOVERY_PHASES[row.phase as RecoveryPhaseV1];
+			if (current.terminal) {
+				throw new Error(
+					`Recovery operation ${input.operationId} is already terminal (${row.phase}) and cannot advance to ${input.phase}`,
+				);
+			}
+			if (next.order <= current.order) {
+				throw new Error(
+					`Recovery operation ${input.operationId} cannot move backwards from ${row.phase} to ${input.phase}`,
+				);
+			}
+			const phases = JSON.parse(row.phases_json) as RecoveryPhaseRecord[];
+			phases.push({
+				phase: input.phase,
+				enteredMs: input.atMs,
+				...(input.detail ? { detail: input.detail } : {}),
+			});
+			this.db
+				.prepare(
+					`UPDATE recovery_operations
+					 SET phase = ?, phases_json = ?, updated_ms = ?, completed_ms = ?,
+					     evidence_after_json = COALESCE(?, evidence_after_json),
+					     refusal_reason = ?, failure_message = ?
+					 WHERE operation_id = ?`,
+				)
+				.run(
+					input.phase,
+					JSON.stringify(phases),
+					input.atMs,
+					next.terminal ? input.atMs : null,
+					input.evidenceAfter ? JSON.stringify(input.evidenceAfter) : null,
+					input.refusalReason ?? null,
+					input.failureMessage ?? null,
+					input.operationId,
+				);
+			return toRecoveryOperationRecord(
+				this.db
+					.prepare("SELECT * FROM recovery_operations WHERE operation_id = ?")
+					.get(input.operationId) as RecoveryOperationRow,
+			);
+		})();
+	}
+
+	/**
+	 * One operation, if this caller may see it.
+	 *
+	 * Authorization is a WHERE clause rather than a check on the result, for the
+	 * reason every other fleet read applies it that way: "you may not see this"
+	 * and "this does not exist" have to be the SAME answer, or an operator can
+	 * probe another workspace's operation ids for existence.
+	 */
+	getRecoveryOperation(
+		operationId: string,
+		scope: RecoveryOperationScope,
+	): RecoveryOperationRecord | undefined {
+		const clauses = ["operation_id = ?"];
+		const params: Array<string | number> = [operationId];
+		if (scope.workspaceIds.length === 0) {
+			clauses.push("1 = 0");
+		} else {
+			clauses.push(
+				`workspace_id IN (${scope.workspaceIds.map(() => "?").join(", ")})`,
+			);
+			params.push(...scope.workspaceIds);
+		}
+		if (scope.ownerScopeUserId !== undefined) {
+			clauses.push("owner_user_id = ?");
+			params.push(scope.ownerScopeUserId);
+		}
+		const row = this.db
+			.prepare(
+				`SELECT * FROM recovery_operations WHERE ${clauses.join(" AND ")}`,
+			)
+			.get(...params) as RecoveryOperationRow | undefined;
+		return row ? toRecoveryOperationRecord(row) : undefined;
+	}
+
+	/**
+	 * The operation a caller's idempotency key already names, if any.
+	 *
+	 * Scoped to the principal, never to a workspace: the key is caller-private by
+	 * construction, and this read exists so a RETRY can join its own operation
+	 * even when the run it targets has since changed — which is exactly the case
+	 * the key is for, and the one a revision check applied first would break.
+	 */
+	getRecoveryOperationByKey(
+		principalId: string,
+		idempotencyKey: string,
+	): RecoveryOperationRecord | undefined {
+		const row = this.db
+			.prepare(
+				"SELECT * FROM recovery_operations WHERE principal_id = ? AND idempotency_key = ?",
+			)
+			.get(principalId, idempotencyKey) as RecoveryOperationRow | undefined;
+		return row ? toRecoveryOperationRecord(row) : undefined;
+	}
+
+	/**
+	 * One operation, WITHOUT an authorization scope.
+	 *
+	 * For the router acting on its own operation — advancing it, recording what it
+	 * left behind. Never for serving a caller: use {@link getRecoveryOperation},
+	 * which applies the scope in SQL.
+	 */
+	getRecoveryOperationById(
+		operationId: string,
+	): RecoveryOperationRecord | undefined {
+		const row = this.db
+			.prepare("SELECT * FROM recovery_operations WHERE operation_id = ?")
+			.get(operationId) as RecoveryOperationRow | undefined;
+		return row ? toRecoveryOperationRecord(row) : undefined;
+	}
+
+	/**
+	 * Ends every operation this process inherited mid-flight, and returns them so
+	 * the caller can audit each one.
+	 *
+	 * An operation is driven by an in-memory coordinator, so a router that
+	 * restarts leaves any in-flight operation with nobody advancing it. Left
+	 * alone it stays `accepted` forever, which a polling client reads as work
+	 * still in progress — the one thing an operation resource must never do. It is
+	 * `failed` rather than `unknown` because that is what happened from the
+	 * caller's side: nothing more will be attempted under this operation, and a
+	 * fresh request with a fresh key is how recovery is retried.
+	 *
+	 * Called from `RouterServer.start()` and nowhere else, for exactly the reason
+	 * {@link resetRunWorkerConnectivity} is: this database file is shared with
+	 * out-of-process CLI commands, and doing it in the constructor would let
+	 * `cyrus router containers list` fail a live operation belonging to the
+	 * running router.
+	 */
+	failInterruptedRecoveryOperations(
+		nowMs: number,
+		message: string,
+	): RecoveryOperationRecord[] {
+		const terminal = Object.entries(RECOVERY_PHASES)
+			.filter(([, phase]) => phase.terminal)
+			.map(([name]) => name);
+		return this.db.transaction((): RecoveryOperationRecord[] => {
+			const rows = this.db
+				.prepare(
+					`SELECT operation_id FROM recovery_operations
+					 WHERE phase NOT IN (${terminal.map(() => "?").join(", ")})`,
+				)
+				.all(...terminal) as Array<{ operation_id: string }>;
+			return rows.map((row) =>
+				this.advanceRecoveryOperation({
+					operationId: row.operation_id,
+					phase: "failed",
+					atMs: nowMs,
+					failureMessage: message,
+				}),
+			);
+		})();
+	}
+
+	/**
+	 * One run by id, WITHOUT an authorization scope.
+	 *
+	 * For the router reading a run it is already acting on — a recovery capturing
+	 * the ownership it left behind. Never for serving a caller: that is
+	 * {@link listFleetAgentRuns}, which applies the workspace and owner scope in
+	 * the same WHERE clause as every other filter.
+	 */
+	getAgentRunById(runId: string): AgentRunInfo | undefined {
+		const row = this.db
+			.prepare(
+				`SELECT ar.*, d.last_seen_ms FROM agent_runs ar
+				 LEFT JOIN devices d ON d.device_id = ar.device_id
+				 WHERE ar.run_id = ?`,
+			)
+			.get(runId) as AgentRunRow | undefined;
+		return row ? toAgentRunInfo(row) : undefined;
 	}
 
 	private latestNonTerminalRunId(sessionId: string): string | undefined {

@@ -89,6 +89,20 @@ export interface FleetOperationsConfig {
 	 */
 	skill?: OperatorSkillCompatibilityV1;
 	/**
+	 * Whether this router will accept guarded recovery requests.
+	 *
+	 * OFF by default, and that default is the product decision rather than a
+	 * conservative guess: recovery is the one mutation in the operator contract,
+	 * and a router that advertises it without a verified coordinator behind it
+	 * would accept requests nothing acts on. Turning it on requires a
+	 * {@link RouterServerConfig.runReconciler} to be registered — a router
+	 * configured with one and not the other refuses to start.
+	 *
+	 * Independent of the Entra `fleet.recover` GRANT, which decides who could ask.
+	 * Both must be true for a recovery to happen, and neither implies the other.
+	 */
+	recovery?: { enabled: boolean };
+	/**
 	 * What this router ACTUALLY serves, at route granularity.
 	 *
 	 * Supplied by the composition root from the routes it registered, rather

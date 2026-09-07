@@ -81,6 +81,7 @@ Optional fields (with defaults):
 | `creatorOnlyPrompting` | `true` | Only the session's creator may send it new prompts (see [Creator-only prompting](#creator-only-prompting)). |
 | `heartbeatMs` | `30000` | WebSocket keepalive interval. The router terminates a socket that misses two consecutive pings, and advertises this value in `hello_ack` so each device's watchdog gives up at the same point (see [Device liveness watchdog](#device-liveness-watchdog)). |
 | `host` | `127.0.0.1` | Bind address. Put the router behind a TLS-terminating reverse proxy for `wss://`. |
+| `fleetOperations.recovery.enabled` | `false` | Whether this router accepts guarded run-recovery requests. See [Accept guarded recovery requests](#accept-guarded-recovery-requests). |
 | `observability.logSource` | *(none)* | Where this router's historical logs live, advertised to authorized fleet operators. Omitted, nothing changes. See [Advertise the historical log source](#advertise-the-historical-log-source). |
 
 - `verificationMode: "direct"` verifies Linear's webhook signature with `secret`.
@@ -1588,6 +1589,46 @@ role-specific command profiles),
 consume a durable change feed). They extend
 [ADR-0008](adr/0008-router-retains-agent-run-observations.md), which established
 that these observations report evidence rather than policy.
+
+### Accept guarded recovery requests
+
+Recovery is the one operator route that MUTATES. It is off unless you say
+otherwise, and turning it on is two independent switches that both have to be
+closed:
+
+| Switch | Where | What it decides |
+|--------|-------|-----------------|
+| `fleetOperations.recovery.enabled` | `router-config.json` | Whether this router will accept a recovery request at all. |
+| `fleet.recover` in a grant | `fleetOperations.access.entra.grants` (or a locally minted operator token) | Which principals may ask. |
+
+```jsonc
+{
+  "fleetOperations": {
+    "recovery": { "enabled": true }
+  }
+}
+```
+
+With it off — the default, and what every router ships with today — the router
+does not advertise the `recoveries.request` capability, and
+`POST /api/v1/recoveries` answers `403`. That is deliberately a refusal rather
+than a missing route: a client gates the command on the capability it read from
+`/api/v1/operator/context`, so the two answers agree.
+
+Enabling it also requires a run reconciler to be registered on the server (see
+`RouterServerConfig.runReconciler`). A router configured with the flag and no
+reconciler **refuses to start**: accepting requests that nothing can act on
+would leave operations sitting at `accepted` and read as a fleet problem.
+Nothing in this repository registers a production reconciler yet, so the flag is
+not something to turn on in a deployment today.
+
+**What is durable either way.** An accepted request becomes a
+`recovery_operations` row carrying the caller, the target run, the observation
+revision quoted, the idempotency key, every phase entered, and the ownership
+evidence captured before and after — so an operation is inspectable after a
+restart and recovery never depends on anything having been posted to Linear.
+Operations age out with the run they describe (24 hours past terminal); the
+structured `recovery.*` audit events are the trail that outlives them.
 
 ### Advertise the historical log source
 

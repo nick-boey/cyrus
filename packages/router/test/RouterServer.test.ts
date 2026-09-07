@@ -526,6 +526,88 @@ describe("RouterServer fleet-operations routes", () => {
 			),
 		).toBe(true);
 	});
+
+	describe("guarded recovery", () => {
+		function makeRecoveryServer(
+			overrides: Partial<RouterServerConfig> = {},
+		): RouterServer {
+			return new RouterServer({
+				port: 0,
+				dbPath: ":memory:",
+				workspaces: { "ws-1": { linearToken: "test-token" } },
+				webhook: { verificationMode: "direct", secret: "test-secret" },
+				trackerFactory: () => new CLIIssueTrackerService(),
+				fleetOperations: { recovery: { enabled: true } },
+				runReconciler: { reconcile: async () => ({ phase: "recovered" }) },
+				...overrides,
+			});
+		}
+
+		async function contextFor(running: RouterServer) {
+			const created = running.store.createOperatorToken({
+				label: "oncall",
+				roles: ["fleet.read", "fleet.recover"],
+				workspaceIds: ["ws-1"],
+			});
+			const res = await fetch(
+				`http://127.0.0.1:${running.port}/api/v1/operator/context`,
+				{ headers: { authorization: `Bearer ${created.token}` } },
+			);
+			return { body: await res.json(), token: created.token };
+		}
+
+		it("advertises the recovery capability only when it is enabled and wired", async () => {
+			server = makeRecoveryServer();
+			await server.start();
+
+			const { body } = await contextFor(server);
+
+			expect(body.capabilities).toEqual([
+				"runs.list",
+				"runs.changes",
+				"recoveries.request",
+			]);
+		});
+
+		it("keeps recovery off by default, and refuses the route rather than hiding it", async () => {
+			// The production posture until the real coordinator is verified: the
+			// route exists and answers a refusal a client can act on, which matches
+			// the context document it already read.
+			server = makeServer();
+			await server.start();
+			const { body, token } = await contextFor(server);
+
+			expect(body.capabilities).not.toContain("recoveries.request");
+			const res = await fetch(
+				`http://127.0.0.1:${server.port}/api/v1/recoveries`,
+				{
+					method: "POST",
+					headers: {
+						authorization: `Bearer ${token}`,
+						"content-type": "application/json",
+					},
+					body: JSON.stringify({
+						schemaVersion: 1,
+						runId: "run-1",
+						expectedRevision: 1,
+						idempotencyKey: "idem-key-0001",
+					}),
+				},
+			);
+
+			expect(res.status).toBe(403);
+			expect(await res.json()).toEqual({ error: "forbidden" });
+		});
+
+		it("refuses to start when recovery is enabled with no coordinator behind it", () => {
+			// Accepting requests nothing can act on is strictly worse than not
+			// offering recovery: the operations would sit at `accepted` forever and
+			// read as a fleet problem.
+			expect(() => makeRecoveryServer({ runReconciler: undefined })).toThrow(
+				/no run reconciler is registered/,
+			);
+		});
+	});
 });
 
 describe("RouterServer /workspaces", () => {
