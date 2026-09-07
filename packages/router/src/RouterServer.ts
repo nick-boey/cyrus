@@ -58,6 +58,10 @@ import {
 	RecoveryService,
 	type RunReconciler,
 } from "./fleet-operations/RecoveryService.js";
+import {
+	RouterRunReconciler,
+	type RunRecoveryTimeouts,
+} from "./fleet-operations/RouterRunReconciler.js";
 import { registerFleetOperationsRoutes } from "./fleet-operations/routes.js";
 import type { FleetOperationsConfig } from "./fleet-operations/types.js";
 import { KeyVaultSecretStore } from "./KeyVaultSecretStore.js";
@@ -225,6 +229,27 @@ export interface RouterContainersConfig {
 	sessionNoProgressMs?: number;
 	/** Default 5_000 (5 seconds). */
 	sessionsQueryTimeoutMs?: number;
+	/**
+	 * Default 180_000 (3 minutes). How long a guarded recovery waits for a booted
+	 * container's worker to reconnect and AUTHENTICATE before giving up.
+	 *
+	 * Sized against a cold ACA boot plus an image pull, both of which routinely
+	 * run past a minute. A value below that reports a healthy recovery as failed
+	 * and sends an operator toward break-glass for a container that was simply
+	 * still starting.
+	 */
+	recoveryReconnectTimeoutMs?: number;
+	/**
+	 * Default 5_000 (5 seconds). How long a guarded recovery lets a reconnected
+	 * worker's durable frames replay before it judges ownership stale.
+	 *
+	 * A worker's `session_state` frame is buffered and replayed until acked, so a
+	 * terminal frame for the very run being recovered can still be in flight when
+	 * the worker answers the session query. This window is what turns "the worker
+	 * does not claim it" into "the worker is done with it" — shorten it only for a
+	 * test rig.
+	 */
+	recoveryReplayMs?: number;
 	/** Default 120_000 (2 minutes). How long after an agent run on a container
 	 *  ends the lifecycle sweep leaves that container alone, so its worker can
 	 *  flush and get its terminal frame acked before being parked. */
@@ -454,14 +479,13 @@ export interface RouterServerConfig {
 	 */
 	operatorTokenVerifier?: EntraOperatorTokenVerifier;
 	/**
-	 * What actually reconciles a run when a recovery is accepted.
+	 * Overrides what actually reconciles a run when a recovery is accepted.
 	 *
-	 * REQUIRED when `fleetOperations.recovery.enabled` is true, and a router
-	 * configured with one and not the other refuses to start: recovery is the
-	 * contract's one mutation, and accepting requests that nothing acts on is
-	 * strictly worse than not offering it. Nothing in this repository registers a
-	 * production coordinator yet — CYR-75 owns that — so today this is supplied
-	 * only by tests, and every real router leaves recovery off.
+	 * A TEST SEAM. Enabling `fleetOperations.recovery.enabled` builds a real
+	 * {@link RouterRunReconciler} over this server's own gateway and container
+	 * boot path, so a production router never sets this — and, critically, cannot
+	 * end up with recovery advertised and nothing behind it, which is why there is
+	 * no longer a half-configured case to refuse to start on.
 	 */
 	runReconciler?: RunReconciler;
 	/**
@@ -530,6 +554,20 @@ export class RouterServer {
 	 * which is why the capability is not advertised there either.
 	 */
 	private recoveries: RecoveryService | undefined;
+	/**
+	 * The container boot path, kept so guarded recovery can start a stranded
+	 * container. Set only when `containers` is configured; a device-only
+	 * deployment builds a reconciler without one, which then refuses a container
+	 * run rather than pretending it could reconcile it.
+	 */
+	private containerTargets: ContainerTargetService | undefined;
+	/**
+	 * Recovery's tunable waits, resolved from `containers` when it is present.
+	 * `sessionsQueryMs` is deliberately the SAME value the sweep's affinity
+	 * reconciler uses: both are asking one worker the same question, and a
+	 * deployment that tuned it for one meant it for the other.
+	 */
+	private recoveryTimeouts: Partial<RunRecoveryTimeouts> = {};
 	private terminalTeardown?: TerminalTeardown;
 	private readonly config: RouterServerConfig;
 	private readonly fastify: FastifyInstance;
@@ -638,6 +676,7 @@ export class RouterServer {
 			join(dirname(config.dbPath), "artifacts");
 		const built = this.buildContainerTargets(config.containers, artifactsDir);
 		const containerTargets = built?.service;
+		this.containerTargets = containerTargets;
 		// Assigned here rather than inside buildContainerTargets because a
 		// `readonly` field may only be written from the constructor, and the
 		// method early-returns when `containers` is absent.
@@ -1066,6 +1105,15 @@ export class RouterServer {
 		this.transport?.removeAllListeners();
 		this.transport = undefined;
 		await this.fastify.close();
+		// AFTER the gateway closes and BEFORE the store does. Closing the gateway
+		// first bounds this wait: it settles every outstanding `awaitOnline` and
+		// `querySessions` as "no answer", so an in-flight recovery unwinds to
+		// `failed` in one step rather than sitting out its reconnect deadline.
+		// Waiting at all is what stops a coordinator mid-release from writing into
+		// a closed database handle — and a recovery that DID release ownership
+		// must get its settle persisted, or it is invisible until
+		// `failInterruptedOperations` mislabels it on the next start.
+		await this.recoveries?.whenIdle();
 		await this.stateBackup?.stop();
 		this.store.close();
 	}
@@ -1167,11 +1215,10 @@ export class RouterServer {
 	 * Builds the guarded-recovery resource, when this router is configured to
 	 * serve one.
 	 *
-	 * Refuses to start on the half-configured case rather than degrading: a
-	 * router that advertises recovery with no coordinator behind it would accept
-	 * requests nothing acts on, and an operator would read the resulting stuck
-	 * operations as a fleet problem. The same posture as
-	 * `validateSetupAuthConfig` and the `defaultExecutor` registration check.
+	 * The opt-in is the only switch: the coordinator is constructed here from
+	 * seams this server already owns, so there is no way to advertise recovery
+	 * with nothing behind it. It stays OFF by default all the same — recovery is
+	 * the contract's one mutation, and a deployment turns it on deliberately.
 	 */
 	private buildRecoveryService(
 		fleetConfig: FleetOperationsConfig,
@@ -1182,15 +1229,52 @@ export class RouterServer {
 			);
 			return undefined;
 		}
-		if (!this.config.runReconciler) {
-			throw new Error(
-				"fleetOperations.recovery.enabled is set but no run reconciler is registered; recovery would accept requests nothing can act on",
-			);
-		}
-		this.logger.info("Fleet Operations recovery enabled");
+		const reconciler = this.config.runReconciler ?? this.buildRunReconciler();
+		this.logger.info(
+			this.containerTargets
+				? "Fleet Operations recovery enabled"
+				: "Fleet Operations recovery enabled, but this router has no container executor: only physical-device runs can be inspected, and those are always refused",
+		);
 		return new RecoveryService({
 			store: this.store,
-			reconciler: this.config.runReconciler,
+			reconciler,
+			logger: this.logger,
+		});
+	}
+
+	/**
+	 * The production recovery coordinator, built from the seams this server
+	 * already owns.
+	 *
+	 * Each dependency is narrowed to the ONE thing recovery may do with it. The
+	 * gateway is handed over as three read/wait methods and the container service
+	 * as a single `boot`, so "recovery never terminates live work or destroys an
+	 * executor" holds because the coordinator was never given a way to, not
+	 * because it happens not to.
+	 *
+	 * `executor` is omitted on a deployment with no `containers` block. That is
+	 * not a degraded mode to hide: such a router has only physical-device runs,
+	 * every one of which recovery refuses outright, and the coordinator says so
+	 * explicitly rather than reporting a reconciliation it never attempted.
+	 */
+	private buildRunReconciler(): RunReconciler {
+		const targets = this.containerTargets;
+		return new RouterRunReconciler({
+			store: this.store,
+			worker: {
+				isOnline: (deviceId) => this.gateway.isOnline(deviceId),
+				awaitOnline: (deviceId, timeoutMs) =>
+					this.gateway.awaitOnline(deviceId, timeoutMs),
+				querySessions: (deviceId, timeoutMs) =>
+					this.gateway.querySessions(deviceId, timeoutMs),
+			},
+			...(targets
+				? { executor: { boot: (deviceId) => targets.bootAndWait(deviceId) } }
+				: {}),
+			forgetOwnership: (sessionId, deviceId) => {
+				this.eventRouter.forgetSessionOwnership(sessionId, deviceId);
+			},
+			timeouts: this.recoveryTimeouts,
 			logger: this.logger,
 		});
 	}
@@ -1425,6 +1509,19 @@ export class RouterServer {
 
 		const sessionsQueryTimeoutMs =
 			containers.sessionsQueryTimeoutMs ?? DEFAULT_SESSIONS_QUERY_TIMEOUT_MS;
+		this.recoveryTimeouts = {
+			sessionsQueryMs: sessionsQueryTimeoutMs,
+			// The SAME grace `reconcileDeviceAffinity` applies below. Both decide
+			// whether a worker's silence about a session may be believed, and a
+			// deployment that widened it for one meant it for the other.
+			ownershipGraceMs: containers.affinityGraceMs ?? DEFAULT_AFFINITY_GRACE_MS,
+			...(containers.recoveryReconnectTimeoutMs !== undefined
+				? { reconnectMs: containers.recoveryReconnectTimeoutMs }
+				: {}),
+			...(containers.recoveryReplayMs !== undefined
+				? { replayMs: containers.recoveryReplayMs }
+				: {}),
+		};
 		// A settle window shorter than the interval between the ticks that would
 		// observe it cannot do its job: the veto reads a run-end stamp that is
 		// itself up to one tick old, so anything under a tick is off in practice

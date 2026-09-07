@@ -57,6 +57,12 @@ export class DeviceGateway extends EventEmitter {
 		string,
 		{ resolve: (v: string[] | undefined) => void; timer: NodeJS.Timeout }
 	>();
+	/**
+	 * Cancels for outstanding {@link awaitOnline} waiters, so {@link close} can
+	 * settle them. A shutdown must not leave a caller — a recovery coordinator —
+	 * blocked on a reconnect that can no longer happen.
+	 */
+	private readonly pendingConnectWaits = new Set<() => void>();
 	private wss: WebSocketServer | undefined;
 	private heartbeatInterval: NodeJS.Timeout | undefined;
 
@@ -94,6 +100,44 @@ export class DeviceGateway extends EventEmitter {
 	isOnline(deviceId: number): boolean {
 		const ws = this.sockets.get(deviceId);
 		return ws !== undefined && ws.readyState === WebSocket.OPEN;
+	}
+
+	/**
+	 * Resolves once a device holds an AUTHENTICATED socket, or `false` at
+	 * `timeoutMs`.
+	 *
+	 * It waits on `"deviceConnected"`, which {@link handleHello} emits only after
+	 * the device token has been verified — never on the raw WebSocket
+	 * `"connection"`, which proves nothing about who is on the other end. That
+	 * distinction is the whole value of this method to its caller: guarded
+	 * recovery may release a run's ownership only on the word of a worker the
+	 * router has actually authenticated.
+	 *
+	 * The `isOnline` fast path is checked first and again is not a formality — a
+	 * container that was already up (a boot is idempotent and returns immediately
+	 * for one) emits no further `"deviceConnected"`, so waiting for one would
+	 * always time out.
+	 */
+	awaitOnline(deviceId: number, timeoutMs: number): Promise<boolean> {
+		if (this.isOnline(deviceId)) return Promise.resolve(true);
+		return new Promise<boolean>((resolve) => {
+			const settle = (online: boolean) => {
+				clearTimeout(timer);
+				this.off("deviceConnected", onConnected);
+				this.pendingConnectWaits.delete(cancel);
+				resolve(online);
+			};
+			const onConnected = (connected: number) => {
+				if (connected === deviceId) settle(true);
+			};
+			const cancel = () => {
+				settle(false);
+			};
+			const timer = setTimeout(cancel, timeoutMs);
+			timer.unref?.();
+			this.pendingConnectWaits.add(cancel);
+			this.on("deviceConnected", onConnected);
+		});
 	}
 
 	deliverPending(deviceId: number): void {
@@ -199,6 +243,9 @@ export class DeviceGateway extends EventEmitter {
 			clearTimeout(pending.timer);
 			pending.resolve(undefined);
 			this.pendingSessionQueries.delete(id);
+		}
+		for (const cancel of [...this.pendingConnectWaits]) {
+			cancel();
 		}
 		this.capabilities.clear();
 		this.sockets.clear();

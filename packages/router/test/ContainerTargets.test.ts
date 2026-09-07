@@ -407,6 +407,94 @@ describe("ContainerTargetService", () => {
 		expect(postActivity).toHaveBeenCalledTimes(1);
 	});
 
+	describe("bootAndWait (CYR-75)", () => {
+		function enrolled() {
+			const { userId } = store.addUser({ email: "a@example.com" });
+			store.setUserExecutor("a@example.com", '{"type":"docker"}');
+			secrets.set("a@example.com", "CLAUDE_CODE_OAUTH_TOKEN", "claude-tok");
+			return userId;
+		}
+
+		it("resolves ok once the provider reports the container running", async () => {
+			const userId = enrolled();
+			const docker = fakeExecutor("docker");
+			const service = makeService(new Map([["docker", docker]]));
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"CYPACK-1",
+			);
+
+			await expect(service.bootAndWait(deviceId)).resolves.toEqual({
+				ok: true,
+			});
+			expect(docker.ensureRunning).toHaveBeenCalledTimes(1);
+		});
+
+		it("reports the provider's own failure rather than rejecting", async () => {
+			// Every entry point here is written never to reject: the ordinary
+			// callers are detached, where an unhandled rejection takes the router
+			// down. So an awaiting caller gets the outcome as a value.
+			const userId = enrolled();
+			const ensureRunning = vi.fn(async () => {
+				throw new Error("sandbox quota exceeded");
+			});
+			const service = makeService(
+				new Map([["docker", fakeExecutor("docker", { ensureRunning })]]),
+			);
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"CYPACK-1",
+			);
+
+			await expect(service.bootAndWait(deviceId)).resolves.toEqual({
+				ok: false,
+				detail: "sandbox quota exceeded",
+			});
+		});
+
+		it("reports a device that is not a bootable container", async () => {
+			const service = makeService(
+				new Map([["docker", fakeExecutor("docker")]]),
+			);
+
+			const result = await service.bootAndWait(999_999);
+
+			expect(result.ok).toBe(false);
+			expect(result.detail).toContain("not a bootable container device");
+		});
+
+		it("joins a boot already in flight rather than racing its token rotation", async () => {
+			// Two concurrent `ensureRunning`/`mintDeviceToken` pairs invalidate each
+			// other's device token, so a recovery arriving mid-boot must join the
+			// attempt the routed webhook already started.
+			const userId = enrolled();
+			let release: (() => void) | undefined;
+			const ensureRunning = vi.fn(
+				async () =>
+					new Promise<void>((resolve) => {
+						release = resolve;
+					}),
+			);
+			const service = makeService(
+				new Map([["docker", fakeExecutor("docker", { ensureRunning })]]),
+			);
+			const { deviceId } = service.ensureDevice(
+				{ userId, email: "a@example.com" },
+				"CYPACK-1",
+			);
+
+			service.boot(deviceId, { workspaceId: "ws-1", sessionId: "sess-1" });
+			await vi.waitFor(() => expect(ensureRunning).toHaveBeenCalledTimes(1));
+			const joined = service.bootAndWait(deviceId);
+			release?.();
+
+			await expect(joined).resolves.toEqual({ ok: true });
+			// The join confirmed the container is running rather than starting a
+			// second attempt.
+			expect(ensureRunning).toHaveBeenCalledTimes(1);
+		});
+	});
+
 	it("bootForTeardown uses normal env/token booting but only logs failures", async () => {
 		const { userId } = store.addUser({ email: "a@example.com" });
 		store.setUserExecutor("a@example.com", '{"type":"docker"}');

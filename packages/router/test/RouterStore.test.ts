@@ -3139,4 +3139,311 @@ describe("recovery operations (CYR-74)", () => {
 		expect(runId).not.toBe("");
 		store.close();
 	});
+
+	describe("releaseStaleRunOwnership (CYR-75)", () => {
+		/** The full stranded shape: pinned affinity, held lock, non-terminal run. */
+		function stranded() {
+			const built = build();
+			built.store.setSessionAffinity("s-74", built.deviceId, undefined, 1_000);
+			built.store.acquireIssueLock("issue-74", "s-74", built.deviceId);
+			return built;
+		}
+
+		it("releases affinity, the lock, the grace, and the outcome in one transaction", () => {
+			const { store, deviceId, runId } = stranded();
+			store.grantSessionOwnershipGrace("s-74", deviceId, 100_000);
+			const before = store.getAgentRunById(runId);
+
+			const outcome = store.releaseStaleRunOwnership({
+				runId,
+				expectedRevision: before?.revision ?? 0,
+				expectedDeviceId: deviceId,
+				nowMs: 9_000,
+			});
+
+			expect(outcome.status).toBe("released");
+			if (outcome.status !== "released") throw new Error("expected a release");
+			expect(outcome.affinityReleased).toBe(true);
+			expect(outcome.lockReleased).toBe(true);
+			expect(outcome.graceReleased).toBe(true);
+			expect(outcome.run.state).toBe("unknown");
+			expect(outcome.run.endedMs).toBe(9_000);
+			expect(store.getSessionAffinity("s-74")).toBeUndefined();
+			expect(store.getIssueLock("issue-74")).toBeUndefined();
+			// All THREE routes `getSessionOwner` consults are gone; leaving the
+			// grace would keep the disproved device authorizing session-scoped RPCs.
+			expect(store.getSessionOwner("s-74", 9_000)).toBeUndefined();
+			store.close();
+		});
+
+		it("bumps the revision and appends exactly one feed entry for the release", () => {
+			const { store, deviceId, runId } = stranded();
+			const before = store.getAgentRunById(runId);
+			const priorChanges = store.listAgentRunChanges({
+				workspaceIds: ["ws-a"],
+				afterChangeId: 0,
+				limit: 100,
+			}).changes.length;
+
+			store.releaseStaleRunOwnership({
+				runId,
+				expectedRevision: before?.revision ?? 0,
+				expectedDeviceId: deviceId,
+				nowMs: 9_000,
+			});
+
+			const { changes } = store.listAgentRunChanges({
+				workspaceIds: ["ws-a"],
+				afterChangeId: 0,
+				limit: 100,
+			});
+			expect(changes.length).toBe(priorChanges + 1);
+			const latest = changes.at(-1);
+			expect(latest?.kind).toBe("lifecycle");
+			expect(latest?.observation.state).toBe("unknown");
+			expect(latest?.revision).toBe((before?.revision ?? 0) + 1);
+			store.close();
+		});
+
+		it("releases a parked session's lock even though its affinity is already gone", () => {
+			const { store, deviceId, runId } = build();
+			// A parked session releases affinity and KEEPS its issue lock — the
+			// shape a stranded issue is usually found in.
+			store.acquireIssueLock("issue-74", "s-74", deviceId);
+			const before = store.getAgentRunById(runId);
+
+			const outcome = store.releaseStaleRunOwnership({
+				runId,
+				expectedRevision: before?.revision ?? 0,
+				expectedDeviceId: deviceId,
+				nowMs: 9_000,
+			});
+
+			expect(outcome.status).toBe("released");
+			if (outcome.status !== "released") throw new Error("expected a release");
+			expect(outcome.affinityReleased).toBe(false);
+			expect(outcome.lockReleased).toBe(true);
+			store.close();
+		});
+
+		it("declines and mutates nothing when the run moved on", () => {
+			const { store, deviceId, runId } = stranded();
+			const before = store.getAgentRunById(runId);
+
+			const outcome = store.releaseStaleRunOwnership({
+				runId,
+				expectedRevision: (before?.revision ?? 0) + 1,
+				expectedDeviceId: deviceId,
+				nowMs: 9_000,
+			});
+
+			expect(outcome).toMatchObject({
+				status: "declined",
+				reason: "revision_changed",
+			});
+			expect(store.getSessionAffinity("s-74")).toBe(deviceId);
+			expect(store.getIssueLock("issue-74")).toBeDefined();
+			expect(store.getAgentRunById(runId)?.state).toBe("routed");
+			store.close();
+		});
+
+		it("declines when the worker's own terminal frame landed first", () => {
+			const { store, deviceId, runId } = stranded();
+			store.finishAgentRun("s-74", "complete", 8_000);
+			const after = store.getAgentRunById(runId);
+
+			const outcome = store.releaseStaleRunOwnership({
+				runId,
+				expectedRevision: after?.revision ?? 0,
+				expectedDeviceId: deviceId,
+				nowMs: 9_000,
+			});
+
+			expect(outcome).toMatchObject({
+				status: "declined",
+				reason: "run_terminal",
+			});
+			// The outcome the worker reported survives; `unknown` never overwrites it.
+			expect(store.getAgentRunById(runId)?.state).toBe("complete");
+			store.close();
+		});
+
+		it("declines when ownership has moved to another device", () => {
+			const { store, userId, deviceId, runId } = stranded();
+			const otherDeviceId = store.createContainerDevice(
+				userId,
+				"CYR-99",
+				"aca",
+			).deviceId;
+			store.setSessionAffinity("s-74", otherDeviceId, undefined, 5_000);
+			const before = store.getAgentRunById(runId);
+
+			const outcome = store.releaseStaleRunOwnership({
+				runId,
+				expectedRevision: before?.revision ?? 0,
+				expectedDeviceId: deviceId,
+				nowMs: 9_000,
+			});
+
+			expect(outcome).toMatchObject({
+				status: "declined",
+				reason: "ownership_moved",
+			});
+			expect(store.getSessionAffinity("s-74")).toBe(otherDeviceId);
+			expect(store.getIssueLock("issue-74")).toBeDefined();
+			store.close();
+		});
+
+		it("declines for a run that has aged out", () => {
+			const { store, deviceId } = stranded();
+
+			const outcome = store.releaseStaleRunOwnership({
+				runId: "no-such-run",
+				expectedRevision: 1,
+				expectedDeviceId: deviceId,
+				nowMs: 9_000,
+			});
+
+			expect(outcome).toEqual({ status: "declined", reason: "run_missing" });
+			store.close();
+		});
+
+		describe("releaseEndedRunOwnership", () => {
+			it("clears ownership an ended run left behind, without touching the run", () => {
+				const { store, deviceId, runId } = stranded();
+				// The shape `reconcileDeviceAffinity` leaves: run ended, affinity
+				// cleared, issue lock still held.
+				store.markAgentRunUnknown("s-74", 8_000);
+				store.clearSessionAffinity("s-74");
+				const before = store.getAgentRunById(runId);
+
+				const outcome = store.releaseEndedRunOwnership({
+					runId,
+					expectedDeviceId: deviceId,
+				});
+
+				expect(outcome).toEqual({
+					status: "released",
+					affinityReleased: false,
+					lockReleased: true,
+					graceReleased: false,
+				});
+				expect(store.getIssueLock("issue-74")).toBeUndefined();
+				// No state change, no revision bump, no feed entry: nothing about the
+				// run itself moved.
+				expect(store.getAgentRunById(runId)).toEqual(before);
+			});
+
+			it("refuses to strip a live run of its ownership", () => {
+				// Releasing a running run's affinity and lock without ending the run
+				// is the half-released state the compare-and-swap exists to prevent;
+				// this must not become a way around it.
+				const { store, deviceId, runId } = stranded();
+
+				const outcome = store.releaseEndedRunOwnership({
+					runId,
+					expectedDeviceId: deviceId,
+				});
+
+				expect(outcome).toEqual({ status: "declined", reason: "run_active" });
+				expect(store.getSessionAffinity("s-74")).toBe(deviceId);
+				expect(store.getIssueLock("issue-74")).toBeDefined();
+				store.close();
+			});
+
+			it("refuses to strip a successor run of its ownership", () => {
+				// The ownership tables are keyed by SESSION, and a Linear agent
+				// session outlives its turns: once the stranded run is terminal, the
+				// previously-blocked user replying in-thread — the documented
+				// recovery for a lock rejection — starts a NEW run on the SAME
+				// device and re-establishes affinity and the lock. Device scoping
+				// cannot separate the two, so without this check recovery deletes a
+				// live session's ownership and reports success.
+				const { store, deviceId, runId } = stranded();
+				store.markAgentRunUnknown("s-74", 8_000);
+				store.recordAgentRunRouted({
+					deviceId,
+					issueKey: "CYR-74",
+					issueId: "issue-74",
+					sessionId: "s-74",
+					routedMs: 9_000,
+					routing: { workspaceId: "ws-a" },
+				});
+				store.setSessionAffinity("s-74", deviceId, undefined, 9_000);
+
+				const outcome = store.releaseEndedRunOwnership({
+					runId,
+					expectedDeviceId: deviceId,
+				});
+
+				expect(outcome).toEqual({ status: "declined", reason: "superseded" });
+				expect(store.getSessionAffinity("s-74")).toBe(deviceId);
+				expect(store.getIssueLock("issue-74")).toBeDefined();
+				store.close();
+			});
+
+			it("releases the ownership grace a park left behind", () => {
+				// `getSessionOwner` is affinity ?? lock ?? grace, and the park path
+				// grants a 24h grace and THEN clears affinity — so releasing the
+				// first two would leave the disproved device still owning the
+				// session for the rest of that window.
+				const { store, deviceId, runId } = build();
+				store.grantSessionOwnershipGrace("s-74", deviceId, 100_000);
+				store.markAgentRunUnknown("s-74", 8_000);
+
+				const outcome = store.releaseEndedRunOwnership({
+					runId,
+					expectedDeviceId: deviceId,
+				});
+
+				expect(outcome).toMatchObject({
+					status: "released",
+					graceReleased: true,
+				});
+				expect(store.getSessionOwner("s-74", 9_000)).toBeUndefined();
+				store.close();
+			});
+
+			it("leaves rows that belong to a different device alone", () => {
+				const { store, userId, deviceId, runId } = stranded();
+				const otherDeviceId = store.createContainerDevice(
+					userId,
+					"CYR-99",
+					"aca",
+				).deviceId;
+				store.markAgentRunUnknown("s-74", 8_000);
+				store.setSessionAffinity("s-74", otherDeviceId, undefined, 9_000);
+
+				const outcome = store.releaseEndedRunOwnership({
+					runId,
+					expectedDeviceId: deviceId,
+				});
+
+				expect(outcome).toMatchObject({
+					status: "released",
+					affinityReleased: false,
+				});
+				expect(store.getSessionAffinity("s-74")).toBe(otherDeviceId);
+				store.close();
+			});
+		});
+
+		it("is not repeatable: a second release declines on the revision it just moved", () => {
+			const { store, deviceId, runId } = stranded();
+			const before = store.getAgentRunById(runId);
+			const input = {
+				runId,
+				expectedRevision: before?.revision ?? 0,
+				expectedDeviceId: deviceId,
+				nowMs: 9_000,
+			};
+
+			expect(store.releaseStaleRunOwnership(input).status).toBe("released");
+			expect(store.releaseStaleRunOwnership(input)).toMatchObject({
+				status: "declined",
+				reason: "revision_changed",
+			});
+			store.close();
+		});
+	});
 });

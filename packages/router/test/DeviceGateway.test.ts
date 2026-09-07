@@ -869,6 +869,67 @@ describe("DeviceGateway.querySessions", () => {
 		await expect(pending).resolves.toBeUndefined();
 		httpServer.close();
 	});
+
+	describe("awaitOnline (CYR-75)", () => {
+		it("resolves once the device completes its handshake", async () => {
+			const { gateway, device, port, httpServer } = await setup();
+
+			const pending = gateway.awaitOnline(device.deviceId, 5_000);
+			await connectDevice(port, device.deviceToken);
+
+			await expect(pending).resolves.toBe(true);
+			gateway.close();
+			httpServer.close();
+		});
+
+		it("resolves immediately for a device that is already connected", async () => {
+			// A boot is idempotent and returns straight away for a container that
+			// was already up, and such a container emits no further
+			// `deviceConnected` — so without this fast path the caller would always
+			// time out on exactly the cheapest case.
+			const { gateway, device, port, httpServer } = await setup();
+			await connectDevice(port, device.deviceToken);
+
+			await expect(gateway.awaitOnline(device.deviceId, 20)).resolves.toBe(
+				true,
+			);
+			gateway.close();
+			httpServer.close();
+		});
+
+		it("resolves false when the device never arrives", async () => {
+			const { gateway, device, httpServer } = await setup();
+
+			await expect(gateway.awaitOnline(device.deviceId, 20)).resolves.toBe(
+				false,
+			);
+			gateway.close();
+			httpServer.close();
+		});
+
+		it("ignores a different device connecting", async () => {
+			const { gateway, store, device, port, httpServer } = await setup();
+			const userId = store.getDeviceInfo(device.deviceId)?.userId ?? 0;
+			const other = store.createContainerDevice(userId, "CYR-99", "aca");
+
+			const pending = gateway.awaitOnline(999_999, 60);
+			await connectDevice(port, other.deviceToken);
+
+			await expect(pending).resolves.toBe(false);
+			gateway.close();
+			httpServer.close();
+		});
+
+		it("settles a wait in flight when the gateway closes", async () => {
+			const { gateway, device, httpServer } = await setup();
+
+			const pending = gateway.awaitOnline(device.deviceId, 60_000);
+			gateway.close();
+
+			await expect(pending).resolves.toBe(false);
+			httpServer.close();
+		});
+	});
 	// ── logging ─────────────────────────────────────────────────────────────
 	// Device connect/disconnect is the truest liveness signal the router has:
 	// for a container target it is the only proof the sandbox's worker process

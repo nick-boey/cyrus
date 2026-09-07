@@ -67,9 +67,22 @@ const BOOT_JOIN_TIMEOUT_MS = 10 * 60_000;
  */
 const MAX_BOOT_JOINS = 2;
 
+/**
+ * What one boot attempt did.
+ *
+ * `ok: false` never means "threw": every path through the boot is written not
+ * to reject, because the normal callers are detached and an unhandled rejection
+ * takes the router down. So the outcome travels as a value, and `detail` carries
+ * the provider's own message for whoever needs to report it.
+ */
+export interface ContainerBootResult {
+	ok: boolean;
+	detail?: string;
+}
+
 /** An in-progress `bootInner`, with the wall-clock time it started. */
 interface InFlightBoot {
-	promise: Promise<void>;
+	promise: Promise<ContainerBootResult>;
 	startedMs: number;
 }
 
@@ -365,6 +378,32 @@ export class ContainerTargetService {
 	}
 
 	/**
+	 * The same idempotent boot, AWAITED, with its outcome as a value.
+	 *
+	 * For a caller that has to know whether the container came up before it does
+	 * anything else — today, guarded recovery, which may not conclude anything
+	 * about a worker's silence until it has actually started the machine the
+	 * worker runs on. It shares `inFlightBoots` with {@link boot}, so a recovery
+	 * that arrives while a routed webhook is already booting the same device joins
+	 * that attempt rather than racing it and rotating the device token underneath
+	 * it.
+	 *
+	 * Never rejects, matching every other entry point here.
+	 */
+	async bootAndWait(deviceId: number): Promise<ContainerBootResult> {
+		try {
+			return await this.bootStart(deviceId);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			this.deps.logger.error(
+				`Awaited container boot for device ${deviceId} threw unexpectedly`,
+				err,
+			);
+			return { ok: false, detail };
+		}
+	}
+
+	/**
 	 * Resolves the device's issue key and either joins an in-flight boot for
 	 * that issue or starts a new one. Defensive: resolving the device is in
 	 * its own try/catch (not just the one inside {@link bootInner}) so a
@@ -375,7 +414,7 @@ export class ContainerTargetService {
 	private async bootStart(
 		deviceId: number,
 		notify?: { workspaceId: string; sessionId: string },
-	): Promise<void> {
+	): Promise<ContainerBootResult> {
 		let device: ReturnType<RouterStore["getDeviceInfo"]>;
 		try {
 			device = this.deps.store.getDeviceInfo(deviceId);
@@ -384,10 +423,16 @@ export class ContainerTargetService {
 				`Failed to load device ${deviceId} info while booting`,
 				err,
 			);
-			return;
+			return {
+				ok: false,
+				detail: err instanceof Error ? err.message : String(err),
+			};
 		}
 		if (device?.kind !== "container" || !device.issueKey || !device.provider) {
-			return;
+			return {
+				ok: false,
+				detail: `device ${deviceId} is not a bootable container device`,
+			};
 		}
 		const issueKey = device.issueKey;
 		const provider = device.provider;
@@ -431,7 +476,7 @@ export class ContainerTargetService {
 			// grace deadline becomes the only thing that reclaims it. So confirm
 			// the container is actually running, and fall through to boot it for
 			// real if it isn't.
-			if (await this.isRunning(provider, issueKey)) return;
+			if (await this.isRunning(provider, issueKey)) return { ok: true };
 		}
 
 		const attempt = this.bootInner(
@@ -444,7 +489,7 @@ export class ContainerTargetService {
 		const entry: InFlightBoot = { promise: attempt, startedMs: this.now() };
 		this.inFlightBoots.set(deviceId, entry);
 		try {
-			await attempt;
+			return await attempt;
 		} finally {
 			if (this.inFlightBoots.get(deviceId) === entry) {
 				this.inFlightBoots.delete(deviceId);
@@ -465,7 +510,7 @@ export class ContainerTargetService {
 		provider: string,
 		issueKey: string,
 		notify?: { workspaceId: string; sessionId: string },
-	): Promise<void> {
+	): Promise<ContainerBootResult> {
 		// The single most valuable span in the router: a cold ACA boot is ~60s
 		// and an image pull can be minutes, so "why did this take four minutes"
 		// is usually answered here. Note it never records an ERROR status —
@@ -494,7 +539,9 @@ export class ContainerTargetService {
 				span.setAttribute("cyrus.boot_failed", failure !== undefined);
 				if (failure !== undefined) {
 					span.setStatus({ code: SpanStatusCode.ERROR, message: failure });
+					return { ok: false, detail: failure };
 				}
+				return { ok: true };
 			},
 		);
 	}

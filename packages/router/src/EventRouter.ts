@@ -1051,6 +1051,35 @@ export class EventRouter {
 	 *   have been routed seconds ago with the event still queued, so the device
 	 *   genuinely cannot declare it yet.
 	 */
+	/**
+	 * Drops the IN-MEMORY ownership records this router holds for a session whose
+	 * durable ownership has just been released by something outside this class —
+	 * today, guarded recovery.
+	 *
+	 * `parkedSessionCreators` is the reason this exists rather than being folded
+	 * into the store write. It is the only thing the `active` branch of
+	 * {@link handleSessionState} consults before calling `setSessionAffinity`, and
+	 * that call grants the strongest ownership there is with no further check once
+	 * the entry names the reporting device. So a stray or late `active` frame from
+	 * a device whose ownership was just released would re-pin a run that is now
+	 * `unknown` — and a run that has ended can never end again, which is PAR-146's
+	 * permanent pin arriving by a new route.
+	 *
+	 * Scoped by device, matching every durable release: another device's park is
+	 * not this caller's to forget. `notifiedSessions` / `sessionWorkspace` go with
+	 * it, exactly as `reconcileDeviceLocks` clears them on its own reclaim path.
+	 *
+	 * @returns whether a park record was actually retired.
+	 */
+	forgetSessionOwnership(sessionId: string, deviceId: number): boolean {
+		const parked = this.parkedSessionCreators.get(sessionId);
+		const retired = parked?.deviceId === deviceId;
+		if (retired) this.parkedSessionCreators.delete(sessionId);
+		this.notifiedSessions.delete(sessionId);
+		this.sessionWorkspace.delete(sessionId);
+		return retired;
+	}
+
 	reconcileDeviceAffinity(
 		deviceId: number,
 		declared: string[] | undefined,

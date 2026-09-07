@@ -635,6 +635,51 @@ export interface AgentRunInfo {
 	revision: number;
 }
 
+/** Why {@link RouterStore.releaseStaleRunOwnership} released nothing. */
+export type StaleOwnershipDeclineReason =
+	/** The run aged out of retention between the decision and the write. */
+	| "run_missing"
+	/** The run moved on; the caller's evidence no longer describes it. */
+	| "revision_changed"
+	/** The worker's own terminal frame landed first — ownership is already released. */
+	| "run_terminal"
+	/** Affinity, the lock, or the run itself now belongs to a different device. */
+	| "ownership_moved";
+
+/**
+ * The outcome of one compare-and-swap ownership release.
+ *
+ * The three flags are reported separately because a run can legitimately hold
+ * any subset: a parked session releases its affinity, KEEPS its issue lock, and
+ * holds a 24-hour ownership grace — which is the shape a stranded issue is
+ * usually found in, and all three are routes `getSessionOwner` consults.
+ * Collapsing them to a single boolean would make "released the lock a parked
+ * session was holding" indistinguishable from "released nothing", which is
+ * precisely the distinction a recovery audit is read for.
+ */
+export type StaleOwnershipReleaseOutcome =
+	| {
+			status: "released";
+			/** The run as it now stands, `unknown` and ended. */
+			run: AgentRunInfo;
+			affinityReleased: boolean;
+			lockReleased: boolean;
+			graceReleased: boolean;
+	  }
+	| {
+			status: "declined";
+			reason: StaleOwnershipDeclineReason;
+			/** The run as it now stands, when it still exists. */
+			run?: AgentRunInfo;
+	  };
+
+function declined(
+	reason: StaleOwnershipDeclineReason,
+	run: AgentRunInfo | undefined,
+): StaleOwnershipReleaseOutcome {
+	return { status: "declined", reason, ...(run ? { run } : {}) };
+}
+
 /**
  * One durable entry in the append-only material-change feed.
  *
@@ -2990,18 +3035,20 @@ export class RouterStore {
 	 *
 	 * ── WHAT THIS REVISION DOES NOT COVER ──
 	 * It moves for DURABLE run facts only, because those are the only ones stored
-	 * on the row. Two of the change kinds `runChangeKindV1Schema` names —
-	 * `worker_connectivity` and `executor_state` — are joined at QUERY time from
-	 * `devices.last_seen_ms` and the sandbox gauge, and are deliberately not
-	 * persisted here (the spec keeps them as evidence, not durable facts). So a
-	 * worker going offline and coming back, or a container's gauge changing,
-	 * leaves the revision where it was.
+	 * on the row — which, since CYR-69, INCLUDES `worker_online` and
+	 * `executor_state`. Only their observation TIMES are excluded, which is what
+	 * keeps a repeated heartbeat or an unchanged gauge sample from growing the
+	 * feed.
 	 *
-	 * That is a real limitation for whoever builds the change feed and the
-	 * `stale_revision` guard on `POST /api/v1/recoveries`: quoting a revision
-	 * proves the RUN's facts have not moved, and proves nothing about the worker's
-	 * connectivity at the instant of the request. A recovery that cares must
-	 * re-read connectivity itself rather than infer it from an unchanged number.
+	 * That has a consequence for anything that quotes a revision to mean "the run
+	 * has not moved", and `RouterRunReconciler` is where it bites: a recovery
+	 * BOOTS the run's container and waits for its worker to reconnect, so it
+	 * causes an offline→online transition itself and the revision is guaranteed to
+	 * change underneath it. A revision comparison across that window is a
+	 * comparison against the coordinator's own side effects, which is why it
+	 * compares the run's own facts instead and re-reads the revision at the point
+	 * of decision. Anything else spanning a connectivity change needs the same
+	 * treatment.
 	 *
 	 * Read-compare-write, so it runs in a transaction: the compare and the write
 	 * must not be separated by another connection's update, and the store's file
@@ -3426,6 +3473,250 @@ export class RouterStore {
 			nowMs,
 		);
 		return true;
+	}
+
+	/**
+	 * Releases a run's stale session affinity and issue lock and marks its
+	 * outcome `unknown` — ALL OF IT, or NONE OF IT, in one transaction that
+	 * re-checks the evidence the decision was made from.
+	 *
+	 * ── WHY THIS IS A STORE METHOD AND NOT THREE CALLS ──
+	 * The three writes already exist separately (`clearSessionAffinity`,
+	 * `releaseIssueLockForSession`, `markAgentRunUnknown`) and the affinity
+	 * reconciler calls them in sequence, which is correct there: it decides from
+	 * a device's own declaration in the same tick. A RECOVERY decides from
+	 * evidence an operator read over HTTP, minutes and several awaits ago — a
+	 * container boot and a worker reconnect sit between the observation and the
+	 * write. Performed as separate statements, a run that goes terminal (or gets
+	 * re-routed to a new device) in that window is left half-released: the lock
+	 * gone, the affinity kept, and a live worker's run marked `unknown`
+	 * underneath it. So the compare and the swap share one transaction, and no
+	 * caller is given a way to do it any other way.
+	 *
+	 * ── WHAT IS RE-CHECKED, AND WHY EACH ──
+	 * - **Revision.** The caller's whole request is conditional on it. Checked
+	 *   again here rather than only in {@link RecoveryService}, because the
+	 *   coordinator's boot/reconnect/query round trip is exactly long enough for
+	 *   it to move.
+	 * - **Terminal.** The worker's own terminal frame may have replayed while we
+	 *   waited; it released ownership properly, and overwriting the outcome it
+	 *   reported with `unknown` would erase the one fact recovery exists to
+	 *   recover.
+	 * - **The device.** Affinity and the lock are released only if they still
+	 *   point at the device the recovery reconciled. A row that has since moved
+	 *   belongs to a claim nobody has proven stale.
+	 *
+	 * A declined outcome is a routine result, not an error: it names which fact
+	 * moved so the coordinator can report it as evidence rather than guess.
+	 */
+	releaseStaleRunOwnership(input: {
+		runId: string;
+		/** The revision the recovery was authorized against. */
+		expectedRevision: number;
+		/** The device whose ownership was proven stale. */
+		expectedDeviceId: number;
+		nowMs: number;
+	}): StaleOwnershipReleaseOutcome {
+		return this.db.transaction((): StaleOwnershipReleaseOutcome => {
+			const row = this.db
+				.prepare("SELECT * FROM agent_runs WHERE run_id = ?")
+				.get(input.runId) as AgentRunRow | undefined;
+			if (!row) return { status: "declined", reason: "run_missing" };
+
+			const current = () => this.getAgentRunById(input.runId);
+			if ((row.revision ?? 1) !== input.expectedRevision) {
+				return declined("revision_changed", current());
+			}
+			if (
+				!(NON_TERMINAL_RUN_STATES as readonly string[]).includes(row.state) ||
+				row.ended_ms !== null
+			) {
+				return declined("run_terminal", current());
+			}
+			if (row.device_id !== input.expectedDeviceId) {
+				return declined("ownership_moved", current());
+			}
+
+			const affinityDevice = this.getSessionAffinity(row.session_id);
+			if (
+				affinityDevice !== undefined &&
+				affinityDevice !== input.expectedDeviceId
+			) {
+				return declined("ownership_moved", current());
+			}
+			const lockDevice = this.getIssueLockDeviceForSession(row.session_id);
+			if (lockDevice !== undefined && lockDevice !== input.expectedDeviceId) {
+				return declined("ownership_moved", current());
+			}
+
+			// Both deletes are additionally scoped by device id, so even a row
+			// written between the read above and this statement cannot be released
+			// by a decision that was never made about it.
+			const affinityReleased =
+				this.db
+					.prepare(
+						"DELETE FROM session_affinity WHERE session_id = ? AND device_id = ?",
+					)
+					.run(row.session_id, input.expectedDeviceId).changes > 0;
+			const lockReleased =
+				this.db
+					.prepare(
+						"DELETE FROM issue_locks WHERE session_id = ? AND device_id = ?",
+					)
+					.run(row.session_id, input.expectedDeviceId).changes > 0;
+			const graceReleased = this.deleteSessionOwnershipGrace(
+				row.session_id,
+				input.expectedDeviceId,
+			);
+			// Bumps the revision and appends the feed entry, in this same
+			// transaction — the run can never be seen released without the entry
+			// that reports it.
+			this.updateAgentRun(
+				input.runId,
+				{
+					state: "unknown",
+					ended_ms: input.nowMs,
+					wait_reason: null,
+					wait_since_ms: null,
+					wait_condition: null,
+					pending_work_count: null,
+				},
+				input.nowMs,
+			);
+			const released = current();
+			if (!released) return { status: "declined", reason: "run_missing" };
+			return {
+				status: "released",
+				run: released,
+				affinityReleased,
+				lockReleased,
+				graceReleased,
+			};
+		})();
+	}
+
+	/**
+	 * Releases ownership left behind by a run that has ALREADY ended.
+	 *
+	 * ── WHY THIS IS NOT THE SAME METHOD AS THE ONE ABOVE ──
+	 * {@link releaseStaleRunOwnership} refuses to touch a terminal run, and must:
+	 * its whole job is to write `unknown` over an outcome, and a run that reported
+	 * one has to keep it. But "the run ended" and "its ownership was released" are
+	 * two different facts, and the router has a path that produces the first
+	 * without the second — `EventRouter.reconcileDeviceAffinity` marks a run
+	 * `unknown` and clears its affinity while deliberately leaving the ISSUE LOCK,
+	 * and `reconcileDeviceLocks`, which would have released it, skips a device
+	 * whose events are still undelivered. An issue locked by a run that has ended
+	 * is the write-only issue this whole feature exists to unblock, so recovery
+	 * cannot report success while one is sitting there.
+	 *
+	 * It writes nothing to the run — no state, no revision, no feed entry —
+	 * because nothing about the run changes. Only the two ownership rows go, and
+	 * only while they still point at the device whose ownership was disproved.
+	 *
+	 * `run_active` is a REFUSAL to act, not a caller error: releasing a live run's
+	 * ownership without ending the run is precisely the half-released state the
+	 * compare-and-swap above exists to prevent, and this method must not become a
+	 * way around it.
+	 *
+	 * ── WHY `superseded` IS THE LOAD-BEARING GUARD ──
+	 * The ownership tables are keyed by SESSION, not by run, and a Linear agent
+	 * session outlives its turns: {@link recordAgentRunRouted} starts a fresh run
+	 * for the same session — normally on the SAME device — as soon as the previous
+	 * one is terminal. So "this run has ended" does not imply "the rows named after
+	 * its session belong to it", and the device scoping does not separate them
+	 * either, because the disproved device and the new owner are the same device.
+	 *
+	 * Without this check the sequence is: recovery boots the container, the
+	 * reconnect handshake ends the stranded run, the previously-blocked user
+	 * replies in-thread (the DOCUMENTED recovery for a lock rejection) inside the
+	 * replay window, `routePrompted` re-establishes affinity and the lock and
+	 * starts a new run — and this method then deletes both out from under a live
+	 * session. It reads `affinity = 0`, so the idle sweep parks its container
+	 * mid-work (NOR-366) and every activity it posts is refused (CYR-81), while the
+	 * operation reports `recovered`.
+	 */
+	releaseEndedRunOwnership(input: { runId: string; expectedDeviceId: number }):
+		| {
+				status: "released";
+				affinityReleased: boolean;
+				lockReleased: boolean;
+				graceReleased: boolean;
+		  }
+		| {
+				status: "declined";
+				reason: "run_missing" | "run_active" | "superseded";
+		  } {
+		return this.db.transaction(() => {
+			const row = this.db
+				.prepare("SELECT * FROM agent_runs WHERE run_id = ?")
+				.get(input.runId) as AgentRunRow | undefined;
+			if (!row) return { status: "declined", reason: "run_missing" } as const;
+			if (
+				(NON_TERMINAL_RUN_STATES as readonly string[]).includes(row.state) &&
+				row.ended_ms === null
+			) {
+				return { status: "declined", reason: "run_active" } as const;
+			}
+			const latest = this.db
+				.prepare(
+					`SELECT run_id FROM agent_runs WHERE session_id = ?
+					 ORDER BY started_ms DESC, rowid DESC LIMIT 1`,
+				)
+				.get(row.session_id) as Pick<AgentRunRow, "run_id"> | undefined;
+			if (latest?.run_id !== input.runId) {
+				return { status: "declined", reason: "superseded" } as const;
+			}
+			const affinityReleased =
+				this.db
+					.prepare(
+						"DELETE FROM session_affinity WHERE session_id = ? AND device_id = ?",
+					)
+					.run(row.session_id, input.expectedDeviceId).changes > 0;
+			const lockReleased =
+				this.db
+					.prepare(
+						"DELETE FROM issue_locks WHERE session_id = ? AND device_id = ?",
+					)
+					.run(row.session_id, input.expectedDeviceId).changes > 0;
+			const graceReleased = this.deleteSessionOwnershipGrace(
+				row.session_id,
+				input.expectedDeviceId,
+			);
+			return {
+				status: "released",
+				affinityReleased,
+				lockReleased,
+				graceReleased,
+			} as const;
+		})();
+	}
+
+	/**
+	 * The THIRD ownership route, deleted with the other two.
+	 *
+	 * `getSessionOwner` is `affinity ?? lock ?? grace`, and the park path — the
+	 * canonical shape recovery targets — grants a 24-hour grace and THEN clears
+	 * affinity. Releasing only the first two therefore leaves the disproved device
+	 * still owning the session for the rest of that window: it keeps passing
+	 * `handleSessionState`'s owner gate and keeps authorizing session-scoped RPCs,
+	 * while the recovery's own after-evidence (which reports only affinity and the
+	 * lock) asserts a clean release the store disagrees with.
+	 *
+	 * Scoped by device for the same reason the other two deletes are: a grace row
+	 * granted to somebody else is not this recovery's to drop.
+	 */
+	private deleteSessionOwnershipGrace(
+		sessionId: string,
+		deviceId: number,
+	): boolean {
+		return (
+			this.db
+				.prepare(
+					"DELETE FROM session_ownership_grace WHERE session_id = ? AND device_id = ?",
+				)
+				.run(sessionId, deviceId).changes > 0
+		);
 	}
 
 	listAgentRuns(input: {
