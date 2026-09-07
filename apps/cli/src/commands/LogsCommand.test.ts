@@ -753,6 +753,25 @@ describe("cyrus logs follow", () => {
 		);
 	});
 
+	it("refuses --to, which a follow could only ignore", async () => {
+		// A follow recomputes its window end as `now` on every poll, so an accepted
+		// `--to` would parse and do nothing — and a flag that does nothing reads as
+		// an answered question. Same rule that refuses `--interval` on `query`.
+		const { cmd } = build({ now: tickingClock() });
+
+		await expect(
+			cmd.run(["follow", "--to", "2026-09-07T00:00:00Z"]),
+		).rejects.toThrow(/does not apply to `cyrus logs follow`/);
+	});
+
+	it("still accepts --to on a one-shot query", async () => {
+		const { cmd, adapter } = build();
+
+		await cmd.run(["query", "--to", "2026-09-06T01:00:00Z"]);
+
+		expect(adapter.queries[0]?.range.to).toBe("2026-09-06T01:00:00.000Z");
+	});
+
 	it("reads the descriptor once, not on every poll", async () => {
 		const adapter = new FakeLogSourceAdapter({});
 		const { cmd, calls } = build({ adapter, now: tickingClock() });

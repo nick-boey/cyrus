@@ -77,18 +77,32 @@ describe("AzureLogAnalyticsAdapter", () => {
 		expect(calls[0]?.[0]).toBe(descriptor().azure?.workspaceId);
 	});
 
-	it("sends the compiled KQL and the range as a timespan", async () => {
-		// Both: the timespan is what the service enforces, and the range inside the
-		// query text is what makes `--show-query` output reproducible in the portal.
+	it("sends the compiled KQL and the WIDENED scan window as the timespan", async () => {
+		// The timespan bounds `TimeGenerated` — the same column the query text
+		// bounds — and the service enforces it. Sending the operator's narrower
+		// window here would re-impose the ingestion-time cut that widening the scan
+		// exists to remove, and would do it invisibly: the printed query would
+		// still look right.
 		const { adapter, calls } = adapterOver(successTable([]));
 
 		await adapter.query(descriptor(), query());
 
 		expect(calls[0]?.[1]).toContain("ContainerAppConsoleLogs_CL");
 		expect(calls[0]?.[2]).toEqual({
-			startTime: new Date("2026-09-07T00:00:00.000Z"),
-			endTime: new Date("2026-09-07T00:15:00.000Z"),
+			startTime: new Date("2026-09-06T23:45:00.000Z"),
+			endTime: new Date("2026-09-07T00:30:00.000Z"),
 		});
+	});
+
+	it("bounds the window the operator asked for inside the query text", async () => {
+		// The narrowing that the timespan deliberately no longer does.
+		const { adapter, calls } = adapterOver(successTable([]));
+
+		await adapter.query(descriptor(), query());
+
+		expect(calls[0]?.[1]).toContain(
+			'| where cyrus_at >= datetime("2026-09-07T00:00:00.000Z") and cyrus_at < datetime("2026-09-07T00:15:00.000Z")',
+		);
 	});
 
 	it("exposes the query it sent, for --show-query", async () => {
@@ -300,6 +314,88 @@ describe("AzureLogAnalyticsAdapter", () => {
 		expect(calls).toHaveLength(0);
 	});
 
+	it("does not report a stale query for one that was never sent", async () => {
+		// `--show-query` reads `lastQuery` after the call. A request-side budget
+		// failure generates no query, so leaving the previous poll's KQL here
+		// would print it as if it were this one — misleading exactly when the flag
+		// is being used to diagnose.
+		const { adapter } = adapterOver(successTable([]));
+
+		await adapter.query(descriptor(), query());
+		expect(adapter.lastQuery).toBeDefined();
+
+		await expect(
+			adapter.query(descriptor(), query({ limit: 10_000 })),
+		).rejects.toThrow();
+		expect(adapter.lastQuery).toBeUndefined();
+	});
+
+	it("refuses a result the backend capped even when the extra row is unreadable", async () => {
+		// The query takes `limit + 1` ROWS. If the extra one is a row the
+		// normalizer skips, the record count falls back to `limit` and a
+		// record-count budget sees a full-but-not-capped answer.
+		const { adapter } = adapterOver(
+			successTable([
+				{ timeGenerated: "2026-09-07T00:05:42.000Z", record: consoleRow() },
+				{ timeGenerated: "2026-09-07T00:05:43.000Z", record: "startup banner" },
+			]),
+		);
+
+		await expect(
+			adapter.query(descriptor(), query({ limit: 1 })),
+		).rejects.toMatchObject({ exitCode: ExitCode.usage });
+	});
+
+	it("stops waiting when the signal fires mid-query", async () => {
+		// The SDK discards the abort signal it accepts, so without this a `follow`
+		// interrupted during a slow poll blocks until that poll returns.
+		const controller = new AbortController();
+		const { adapter } = adapterOver(
+			() => new Promise<LogsQueryResultLike>(() => undefined),
+		);
+
+		const pending = adapter.query(descriptor(), query(), controller.signal);
+		controller.abort();
+
+		await expect(pending).rejects.toMatchObject({ exitCode: ExitCode.usage });
+	});
+
+	it("reports an abandoned wait as this process's decision, not the backend's", async () => {
+		const controller = new AbortController();
+		const { adapter } = adapterOver(
+			() => new Promise<LogsQueryResultLike>(() => undefined),
+		);
+
+		const pending = adapter.query(descriptor(), query(), controller.signal);
+		controller.abort();
+
+		await expect(pending).rejects.not.toMatchObject({
+			exitCode: ExitCode.transient,
+		});
+	});
+
+	it("removes a known environment secret before returning records", async () => {
+		// Redaction runs through the seam's shared finalizer, so it is a property
+		// of the interface rather than of this adapter's normalizer.
+		const { client } = stubClient(
+			successTable([
+				{
+					timeGenerated: "2026-09-07T00:05:42.000Z",
+					record: consoleRow({ message: "pushing with ghp_realtoken123456" }),
+				},
+			]),
+		);
+		const adapter = new AzureLogAnalyticsAdapter({
+			createClient: async () => client,
+			env: { GITHUB_TOKEN: "ghp_realtoken123456" },
+		});
+
+		const result = await adapter.query(descriptor(), query());
+
+		expect(result.records[0]?.message).not.toContain("ghp_realtoken123456");
+		expect(result.records[0]?.redacted).toBe(true);
+	});
+
 	it("reuses one client across queries, so a follow does not re-authenticate each poll", async () => {
 		const { client } = stubClient(successTable([]));
 		const createClient = vi.fn(async () => client);
@@ -490,20 +586,30 @@ describe("createChainedTokenCredential", () => {
  */
 describeLogSourceAdapterContract("AzureLogAnalyticsAdapter", (records) => {
 	let failure: Error | undefined;
+	let lastRequest: LogQueryV1 | undefined;
 	const client: LogsQueryClientLike = {
 		queryWorkspace: async (_workspaceId, _kql, timespan) => {
 			if (failure) throw failure;
 			const request = lastRequest;
+			// The stub stands in for the service by applying the seam's own reference
+			// semantics on the EMISSION clock — which is what the compiled KQL now
+			// filters and orders on. It is deliberately not proof that the KQL means
+			// the same thing (`compileAzureKql.test.ts` pins the text for that); what
+			// it proves is that the adapter passes the filters down at all, and that
+			// budgets, ordering, cancellation and error mapping behave.
 			const matched = request
 				? records.filter((candidate) => matchesLogQuery(candidate, request))
 				: records;
-			// The service also applies the timespan, so the stub does too — otherwise
-			// the contract's range cases would pass on filtering the adapter never
-			// asked for.
+			// The service applies `timespan` to the INGESTION column, so the stub
+			// does too — against each record's own simulated ingestion time, not its
+			// emission time. That distinction is the point: with a per-record lag,
+			// an adapter that filtered or ordered on ingestion fails the contract's
+			// range and order cases here instead of passing on scaffolding.
 			const inRange = matched.filter((candidate) => {
-				const at = Date.parse(candidate.timestamp);
+				const ingestedAt = Date.parse(ingestionTimeOf(candidate));
 				return (
-					at >= timespan.startTime.getTime() && at < timespan.endTime.getTime()
+					ingestedAt >= timespan.startTime.getTime() &&
+					ingestedAt < timespan.endTime.getTime()
 				);
 			});
 			return successTable(
@@ -511,7 +617,6 @@ describeLogSourceAdapterContract("AzureLogAnalyticsAdapter", (records) => {
 			);
 		},
 	};
-	let lastRequest: LogQueryV1 | undefined;
 	const adapter = new AzureLogAnalyticsAdapter({
 		createClient: async () => client,
 		env: {},
@@ -521,16 +626,6 @@ describeLogSourceAdapterContract("AzureLogAnalyticsAdapter", (records) => {
 			kind: adapter.kind,
 			query: (source, request, signal) => {
 				lastRequest = request;
-				// The SDK's own abort handling is what a live client would use; the
-				// stub has none, so the signal is honoured here for the contract's
-				// cancellation cases.
-				if (signal?.aborted) {
-					return Promise.reject(
-						Object.assign(new Error("aborted"), {
-							exitCode: ExitCode.usage,
-						}),
-					);
-				}
 				return adapter.query(source, request, signal);
 			},
 		},
@@ -541,13 +636,33 @@ describeLogSourceAdapterContract("AzureLogAnalyticsAdapter", (records) => {
 	};
 });
 
+/**
+ * A per-record ingestion time, later than emission by an amount that VARIES.
+ *
+ * Constant lag — or none at all, as the first version of this stub had — makes
+ * ingestion order and emission order the same sequence, so a compiler that
+ * filtered and ordered on `TimeGenerated` passed every ordering and range case
+ * in the contract while producing out-of-order, silently-truncated output
+ * against the real service. The variation is what makes those cases mean
+ * something.
+ */
+function ingestionTimeOf(record: LogRecordV1): string {
+	const lagMs =
+		30_000 +
+		(record.message.length % 7) * 20_000 * (record.level === "error" ? 2 : 1);
+	return new Date(Date.parse(record.timestamp) + lagMs).toISOString();
+}
+
 /** Renders a normalized record back into the console row it came from. */
 function toConsoleRow(record: LogRecordV1): {
 	timeGenerated: string;
 	record: unknown;
 } {
 	return {
-		timeGenerated: record.timestamp,
+		// The row's INGESTION time, deliberately not its emission time — the two
+		// are different clocks and conflating them here is what made an earlier
+		// version of this stub unable to see an adapter reading the wrong one.
+		timeGenerated: ingestionTimeOf(record),
 		record: {
 			timestamp: record.timestamp,
 			level: record.level,

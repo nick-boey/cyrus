@@ -8,12 +8,13 @@ import { TransientError, UsageError } from "../errors.js";
 import {
 	assertQueryRange,
 	compareLogRecords,
-	enforceLogBudgets,
+	finalizeLogRecords,
 	type LogQueryResultV1,
 	type LogSourceAdapter,
 	matchesLogQuery,
 	resolveQueryLimit,
 } from "./LogSourceAdapter.js";
+import { collectKnownSecretValues } from "./redactKnownSecrets.js";
 
 /**
  * An in-memory {@link LogSourceAdapter} over records a test seeds.
@@ -44,16 +45,20 @@ export class FakeLogSourceAdapter implements LogSourceAdapter {
 	private records: LogRecordV1[];
 	private failure?: Error;
 	private readonly backendLatencyMs?: number;
+	private readonly env: NodeJS.ProcessEnv;
 
 	constructor(options: {
 		records?: LogRecordV1[];
 		/** Thrown instead of answering, so a test can drive the failure paths. */
 		failure?: Error;
 		backendLatencyMs?: number;
+		/** Secrets to redact from seeded records; defaults to this process env. */
+		env?: NodeJS.ProcessEnv;
 	}) {
 		this.records = [...(options.records ?? [])];
 		this.failure = options.failure;
 		this.backendLatencyMs = options.backendLatencyMs;
+		this.env = options.env ?? process.env;
 	}
 
 	/** Replaces the seeded records — how a `follow` test advances time. */
@@ -99,10 +104,18 @@ export class FakeLogSourceAdapter implements LogSourceAdapter {
 			// arbitrary prefix", and the budget check below needs to tell them apart.
 			.slice(0, limit + 1);
 
-		enforceLogBudgets(matched, limit);
+		// Through the shared finalizer, exactly as the Azure adapter is. Seeded
+		// records rarely contain a secret, so this is usually a no-op — but running
+		// it here is what makes "an adapter redacts before it returns" a rule the
+		// contract suite can check rather than a property of one backend.
+		const records = finalizeLogRecords(
+			matched,
+			limit,
+			collectKnownSecretValues(this.env),
+		);
 
 		return {
-			records: matched,
+			records,
 			...(this.backendLatencyMs !== undefined
 				? { backendLatencyMs: this.backendLatencyMs }
 				: {}),

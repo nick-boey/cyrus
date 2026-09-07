@@ -14,10 +14,10 @@ import {
 	TransientError,
 	UsageError,
 } from "../errors.js";
-import { compileAzureKql } from "./compileAzureKql.js";
+import { type CompiledAzureQuery, compileAzureKql } from "./compileAzureKql.js";
 import {
 	assertQueryRange,
-	enforceLogBudgets,
+	finalizeLogRecords,
 	type LogQueryResultV1,
 	type LogSourceAdapter,
 	resolveQueryLimit,
@@ -27,6 +27,7 @@ import {
 	type NormalizedAzureRows,
 	normalizeAzureRows,
 } from "./normalizeAzureRows.js";
+import { collectKnownSecretValues } from "./redactKnownSecrets.js";
 
 /**
  * Reads Cyrus logs from Azure Log Analytics, directly.
@@ -98,6 +99,12 @@ export class AzureLogAnalyticsAdapter implements LogSourceAdapter {
 			);
 		}
 
+		// Cleared FIRST. `--show-query` reads this field after the call, and a
+		// query that failed a request-side budget below never generated one — so a
+		// stale value here would print the PREVIOUS poll's KQL as if it were this
+		// one, misleading exactly when the flag is being used to diagnose.
+		this.lastQuery = undefined;
+
 		// Budgets that can be decided from the REQUEST are decided before the
 		// request is made. Discovering after a billed query that its range was
 		// never allowed wastes the query and the operator's time equally.
@@ -112,17 +119,29 @@ export class AzureLogAnalyticsAdapter implements LogSourceAdapter {
 		const result = await this.execute(
 			this.client,
 			azure.workspaceId,
-			compiled.query,
-			query,
+			compiled,
 			signal,
 		);
 		const backendLatencyMs = Date.now() - startedAt;
 
 		const normalized = this.normalize(result);
-		enforceLogBudgets(normalized.records, limit);
+		// Against the ROW count, not the record count. The query took `limit + 1`
+		// rows, and if the extra one is a row `normalizeAzureRows` skipped — a
+		// runtime banner that survived the `dictionary` check — the record count
+		// lands back on `limit` and the budget passes on a result that WAS capped.
+		assertRowBudget(result, limit);
+		// Redaction and the remaining budgets, through the seam's shared finalizer
+		// rather than here, so both are properties of the INTERFACE. (Normalization
+		// already redacted; running it again is idempotent and cheap, and what
+		// matters is that the guarantee does not depend on this adapter.)
+		const records = finalizeLogRecords(
+			normalized.records,
+			limit,
+			collectKnownSecretValues(this.env),
+		);
 
 		return {
-			records: normalized.records,
+			records,
 			backendLatencyMs,
 			...(normalized.skipped > 0 ? { skipped: normalized.skipped } : {}),
 			...(normalized.maxIngestionLagMs !== undefined
@@ -138,20 +157,27 @@ export class AzureLogAnalyticsAdapter implements LogSourceAdapter {
 	private async execute(
 		client: LogsQueryClientLike,
 		workspaceId: string,
-		kql: string,
-		query: LogQueryV1,
+		compiled: CompiledAzureQuery,
 		signal?: AbortSignal,
 	): Promise<LogsQueryResultLike> {
 		let result: LogsQueryResultLike;
 		try {
-			result = await client.queryWorkspace(
-				workspaceId,
-				kql,
-				{
-					startTime: new Date(query.range.from),
-					endTime: new Date(query.range.to),
-				},
-				{ abortSignal: signal },
+			result = await abortable(
+				client.queryWorkspace(
+					workspaceId,
+					compiled.query,
+					// The SCAN window, matching the `TimeGenerated` bound inside the
+					// query text. The service enforces this argument against the same
+					// column, so passing the operator's narrower window here would
+					// re-impose the very cut the widening exists to remove — and would
+					// do it invisibly, since the query text would still look right.
+					{
+						startTime: new Date(compiled.scan.from),
+						endTime: new Date(compiled.scan.to),
+					},
+					{ abortSignal: signal },
+				),
+				signal,
 			);
 		} catch (error) {
 			throw describeAzureFailure(error);
@@ -276,10 +302,27 @@ async function createLogsQueryClient(
 		`${audience}/.default`,
 	);
 	const { LogsQueryClient } = await import("@azure/monitor-query-logs");
+	// `endpoint` and `credentials.scopes`, NOT `audience`. The SDK declares an
+	// `audience` option on its `LogsQueryClientOptions` interface and then never
+	// reads it — `createMonitorQueryLogs` derives its endpoint from
+	// `options.endpoint` and its scopes from `options.credentials.scopes`, and the
+	// string "audience" does not appear anywhere in the shipped JavaScript. Setting
+	// it alone therefore leaves a sovereign-cloud query pointed at the PUBLIC
+	// endpoint while the credential mints a sovereign-audience token, which fails
+	// as a `401` that our own error mapping then reports as a missing role
+	// assignment — the exact misdiagnosis the cloud map exists to prevent.
+	//
+	// The version segment is spelled here because the SDK appends it only when it
+	// is defaulting the endpoint itself: `endpointUrl = options.endpoint ?? ...`
+	// takes an explicit endpoint verbatim.
 	return new LogsQueryClient(credential, {
-		audience,
-	}) as unknown as LogsQueryClientLike;
+		endpoint: `${audience}/${LOG_ANALYTICS_API_VERSION}`,
+		credentials: { scopes: [`${audience}/.default`] },
+	}) satisfies LogsQueryClientLike;
 }
+
+/** The Log Analytics query API version the endpoint path carries. */
+const LOG_ANALYTICS_API_VERSION = "v1";
 
 /** The slice of `@azure/core-auth`'s `TokenCredential` the SDK calls. */
 interface TokenCredentialLike {
@@ -391,6 +434,73 @@ function describeAzureFailure(error: unknown): Error {
 	return new TransientError(`Azure Log Analytics query failed: ${message}`, {
 		cause: error,
 	});
+}
+
+/**
+ * Stops WAITING on a query when the signal fires.
+ *
+ * ── WHY THIS EXISTS RATHER THAN JUST PASSING `abortSignal` ──
+ * `@azure/monitor-query-logs@1.0.0` discards it. `convertToInternalOptions`
+ * rebuilds the options object as `{ prefer, requestOptions }` before handing it
+ * to `operationOptionsToRequestParameters`, so the top-level `abortSignal` never
+ * reaches the pipeline. It is still passed above, so this becomes redundant
+ * rather than wrong if a later version starts honouring it.
+ *
+ * ── WHAT IT DOES AND DOES NOT BUY ──
+ * It abandons the WAIT, not the query: the request continues server-side and is
+ * still billed. That is worth having anyway — a `follow` interrupted mid-poll
+ * exits at once instead of blocking for a query that may run for minutes — but
+ * it is not the same as cancelling, and the comment on `LogSourceAdapter.query`
+ * says so rather than claiming more than this delivers.
+ */
+async function abortable<T>(
+	pending: Promise<T>,
+	signal: AbortSignal | undefined,
+): Promise<T> {
+	if (!signal) return pending;
+	if (signal.aborted) throw abortError();
+	let onAbort: (() => void) | undefined;
+	try {
+		return await Promise.race([
+			pending,
+			new Promise<never>((_resolve, reject) => {
+				onAbort = () => reject(abortError());
+				signal.addEventListener("abort", onAbort, { once: true });
+			}),
+		]);
+	} finally {
+		// Without this the listener outlives the query, and a long `follow` leaks
+		// one per poll onto a signal that lives for the whole run.
+		if (onAbort) signal.removeEventListener("abort", onAbort);
+		// The losing promise is still in flight; swallow its rejection so an
+		// abandoned query cannot surface as an unhandled rejection later.
+		void pending.catch(() => undefined);
+	}
+}
+
+function abortError(): Error {
+	return Object.assign(new Error("The log query was cancelled."), {
+		name: "AbortError",
+	});
+}
+
+/**
+ * Refuses a result the backend capped, counting ROWS rather than records.
+ *
+ * The query asked for `limit + 1` rows. If the extra row is one the normalizer
+ * skips — a line that passed the `dictionary` check but carried no usable
+ * timestamp — the record count falls back to `limit` and the record-count budget
+ * sees a full-but-not-capped answer. Counting rows closes that, because rows are
+ * what the backend actually truncated.
+ */
+function assertRowBudget(result: LogsQueryResultLike, limit: number): void {
+	const rows = result.tables?.[0]?.rows?.length ?? 0;
+	if (rows > limit) {
+		throw new UsageError(
+			`This query matched more than the ${limit} records allowed, so no records were emitted rather than an arbitrary subset. ` +
+				"Narrow the time range, add a filter, or lower --limit to a window you can read in full.",
+		);
+	}
 }
 
 function isAbort(error: unknown): boolean {

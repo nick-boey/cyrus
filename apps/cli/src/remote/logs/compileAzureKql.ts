@@ -38,7 +38,42 @@ export interface CompiledAzureQuery {
 	limit: number;
 	/** `limit + 1` — what the query actually asks for. See {@link compileAzureKql}. */
 	take: number;
+	/**
+	 * The `TimeGenerated` window to SCAN, which is wider than the window the
+	 * operator asked for. See {@link INGESTION_SLACK_MS}.
+	 *
+	 * Returned rather than recomputed by the caller because the SDK's `timespan`
+	 * argument bounds the same column and the service enforces it: a timespan
+	 * narrower than the scan would re-impose the very cut this widening removes.
+	 */
+	scan: { from: string; to: string };
 }
+
+/**
+ * How far outside the requested window the `TimeGenerated` scan reaches.
+ *
+ * ── THE TWO CLOCKS ──
+ * `TimeGenerated` is when Log Analytics INGESTED a line; `p.timestamp` is when
+ * the emitter wrote it. The gap is routinely tens of seconds, and it differs per
+ * source: a router line is ingested almost immediately, while a sandbox line is
+ * relayed through the router's stdout and arrives later.
+ *
+ * The operator asks about EMISSION time — that is the timestamp they read in the
+ * output, and the one `LogsQueryDocument.range` claims the records lie within.
+ * So the filter, the ordering, and the `take` all run on `p.timestamp`. But
+ * `TimeGenerated` is the indexed column, and scanning without a bound on it
+ * would read the whole retention period, so the scan is bounded and merely
+ * WIDENED — enough to catch a record emitted inside the window and ingested
+ * outside it, in either direction, since an emitter's clock can also run ahead.
+ *
+ * Filtering on `TimeGenerated` directly, as this compiler first did, silently
+ * drops records emitted in the window but ingested after it, and returns them in
+ * ingestion order — so output is not chronological once two sources with
+ * different lag are interleaved, and `take` keeps the earliest-INGESTED records
+ * rather than the earliest ones. Every one of those failures looks like a quiet
+ * fleet.
+ */
+export const INGESTION_SLACK_MS = 15 * 60_000;
 
 /**
  * Builds the query text.
@@ -71,35 +106,53 @@ export function compileAzureKql(
 	limit: number,
 ): CompiledAzureQuery {
 	const take = limit + 1;
+	const scan = {
+		from: new Date(
+			Date.parse(query.range.from) - INGESTION_SLACK_MS,
+		).toISOString(),
+		to: new Date(Date.parse(query.range.to) + INGESTION_SLACK_MS).toISOString(),
+	};
+
 	const lines: string[] = [
 		descriptor.table,
-		`| where TimeGenerated >= datetime(${isoLiteral(query.range.from)}) and TimeGenerated < datetime(${isoLiteral(query.range.to)})`,
+		// The SCAN bound, on the indexed ingestion column. Wider than the window
+		// the operator asked for; the emission filter below is what narrows it.
+		`| where TimeGenerated >= datetime(${isoLiteral(scan.from)}) and TimeGenerated < datetime(${isoLiteral(scan.to)})`,
 		"| extend p = parse_json(Log_s)",
 		// A container's stdout also carries lines we did not write as JSON —
 		// runtime banners, a dependency's warning, a crash dump. `parse_json` hands
 		// those back as a scalar rather than failing, so the type check is what
 		// keeps them from consuming the record budget and drowning the answer.
 		'| where gettype(p) == "dictionary"',
+		// The record's OWN clock, falling back to ingestion when it carries none or
+		// carries something unparseable. `todatetime` of a non-time is null rather
+		// than an error, so the coalesce is what keeps such a line in the answer
+		// instead of silently dropping it — matching `normalizeAzureRows`, which
+		// applies the same fallback when it builds the record.
+		"| extend cyrus_at = coalesce(todatetime(p.timestamp), TimeGenerated)",
+		// The window the operator actually asked about. Half-open, matching
+		// `withinLogRange`: a closed upper bound would re-emit the boundary record
+		// on every `follow` poll that resumed from its own previous `to`.
+		`| where cyrus_at >= datetime(${isoLiteral(query.range.from)}) and cyrus_at < datetime(${isoLiteral(query.range.to)})`,
 	];
 
 	for (const clause of whereClauses(query)) lines.push(`| where ${clause}`);
 
 	lines.push(
-		// Ordered before it is taken, and by a total key. `take` without an order
-		// is explicitly non-deterministic in KQL: the same query would return a
-		// different subset each run, and a `follow` built on it would show records
-		// appearing and disappearing. `Log_s` breaks ties on identical timestamps
-		// because it is the whole line, so no two distinct records compare equal.
-		"| order by TimeGenerated asc, Log_s asc",
+		// Ordered before it is taken, and by a total key on the EMISSION clock —
+		// the same order `compareLogRecords` defines, so this adapter and the
+		// reference semantics agree. `Log_s` breaks ties because it is the whole
+		// line, so no two distinct records compare equal; `take` without a total
+		// order is explicitly non-deterministic in KQL.
+		"| order by cyrus_at asc, Log_s asc",
 		`| take ${take}`,
-		// `TimeGenerated` is the INGESTION-side timestamp and is projected beside
-		// the record's own so the client can report observed ingestion lag. They
-		// are different clocks and the gap between them is the thing a `follow`
-		// has to overlap for; collapsing them would hide it.
+		// `TimeGenerated` is projected beside the record's own clock so the client
+		// can report observed ingestion lag. Collapsing them would hide the gap a
+		// `follow` has to overlap for.
 		"| project TimeGenerated, record = p",
 	);
 
-	return { query: lines.join("\n"), limit, take };
+	return { query: lines.join("\n"), limit, take, scan };
 }
 
 /**
@@ -119,7 +172,26 @@ function whereClauses(query: LogQueryV1): string[] {
 		}
 	};
 
-	equals('p["cyrus.workspace_id"]', query.workspaceId);
+	// ── WHY THE WORKSPACE CLAUSE ADMITS UNATTRIBUTED LINES ──
+	// Most of what the router writes is a plain `logger.info`/`warn`/`error`,
+	// which renders as JSON carrying only `timestamp`, `level`, `component`, and
+	// `message`. The canonical `cyrus.*` attribution rides only on `logger.event`
+	// records and relayed sandbox records, and a relayed line whose run cannot be
+	// resolved carries an explicit `null`. `tostring()` of absent-or-null is `""`,
+	// so a bare equality here drops every one of those — including on
+	// `cyrus logs query` with no filters at all, which would then report a quiet
+	// fleet while most of the router's output sat in the table.
+	//
+	// This is a NARROWING filter and not an authorization boundary: the operator
+	// reads the workspace with their own Azure grant, so admitting a line that
+	// belongs to no workspace discloses nothing the grant did not already allow.
+	// The explicit filters below are different — asking for `--team X` means a
+	// line with no team is not a match — so only this one is widened.
+	if (query.workspaceId !== undefined) {
+		clauses.push(
+			`(isempty(tostring(p["cyrus.workspace_id"])) or tostring(p["cyrus.workspace_id"]) == ${kqlString(query.workspaceId)})`,
+		);
+	}
 	equals('p["cyrus.owner_id"]', query.ownerUserId);
 	equals('p["cyrus.team_id"]', query.teamId);
 	equals('p["cyrus.project_id"]', query.projectId);

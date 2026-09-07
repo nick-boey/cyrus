@@ -267,6 +267,12 @@ export class LogsCommand extends BaseCommand {
 				? undefined
 				: this.now() + options.timeoutMs;
 		const interrupt = this.installInterruptHandler();
+		// Ctrl-C stops the WAIT on an in-flight poll, not just the loop between
+		// polls. Without this an interrupt during a slow query is invisible until
+		// that query returns, which on a backend answering in minutes is
+		// indistinguishable from a hung command.
+		const cancel = new AbortController();
+		interrupt.onRequest(() => cancel.abort());
 
 		// The first poll covers the operator's requested lookback; every later one
 		// resumes from the previous window's end, minus the overlap.
@@ -302,7 +308,25 @@ export class LogsCommand extends BaseCommand {
 				}
 
 				const query = this.buildQuery(options, workspace, { from, to });
-				const result = await this.ask(adapter, descriptor, query, options);
+				let result: Awaited<ReturnType<LogSourceAdapter["query"]>>;
+				try {
+					result = await this.ask(
+						adapter,
+						descriptor,
+						query,
+						options,
+						cancel.signal,
+					);
+				} catch (error) {
+					// An interrupt aborted this poll on purpose. Report it as the clean
+					// stop it is rather than as a failed query — an operator who pressed
+					// Ctrl-C has not encountered an error.
+					if (interrupt.requested) {
+						this.emitFollowStop(options, "interrupted");
+						return;
+					}
+					throw error;
+				}
 				this.reportSkipped(result.skipped);
 
 				for (const record of result.records) {
@@ -488,9 +512,10 @@ export class LogsCommand extends BaseCommand {
 		descriptor: LogSourceDescriptorV1,
 		query: LogQueryV1,
 		options: LogsOptions,
+		signal?: AbortSignal,
 	): Promise<Awaited<ReturnType<LogSourceAdapter["query"]>>> {
 		try {
-			return await adapter.query(descriptor, query);
+			return await adapter.query(descriptor, query, signal);
 		} finally {
 			this.showQuery(options, adapter, query);
 		}
@@ -597,9 +622,18 @@ export class LogsCommand extends BaseCommand {
 	 * next loop check the process is uninterruptible — up to a full poll interval.
 	 * An operator pressing Ctrl-C twice must never have to reach for `kill`.
 	 */
-	private installInterruptHandler(): { requested: boolean; dispose(): void } {
+	private installInterruptHandler(): {
+		requested: boolean;
+		/** Runs on the FIRST interrupt; used to abandon an in-flight poll. */
+		onRequest(listener: () => void): void;
+		dispose(): void;
+	} {
+		const listeners: Array<() => void> = [];
 		const state = {
 			requested: false,
+			onRequest(listener: () => void): void {
+				listeners.push(listener);
+			},
 			dispose(): void {
 				process.off("SIGINT", onInterrupt);
 			},
@@ -611,6 +645,7 @@ export class LogsCommand extends BaseCommand {
 				return;
 			}
 			state.requested = true;
+			for (const listener of listeners) listener();
 		};
 		process.on("SIGINT", onInterrupt);
 		return state;
@@ -738,6 +773,16 @@ function parseLogsOptions(
 				options.from = requireInstant(argv[++i], "--from");
 				break;
 			case "--to":
+				// Refused on `follow` for the same reason `--interval` is refused on
+				// `query`: a follow recomputes its window end as `now` on every poll,
+				// so an accepted `--to` would parse and do nothing — and a flag that
+				// does nothing reads as an answered question.
+				if (spec.allowInterval) {
+					throw new UsageError(
+						"--to does not apply to `cyrus logs follow`, which always follows up to the present. " +
+							"Use `cyrus logs query --from … --to …` for a fixed window, or `--timeout` to bound how long the follow runs.",
+					);
+				}
 				options.to = requireInstant(argv[++i], "--to");
 				break;
 			case "--interval":

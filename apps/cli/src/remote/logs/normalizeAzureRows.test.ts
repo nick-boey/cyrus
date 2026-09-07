@@ -350,3 +350,32 @@ describe("normalizeAzureRows", () => {
 		expect(normalizeAzureRows([])).toEqual({ records: [], skipped: 0 });
 	});
 });
+
+describe("the source of this module", () => {
+	it("contains no literal control characters", async () => {
+		// A regression guard for a real defect: `fingerprint` originally used a
+		// literal NUL as its field separator, which made git, grep, and GitHub's
+		// diff view treat the whole file as binary — so the module shipped
+		// unreviewable and `git diff` reported only `Bin 0 -> 12202 bytes`. Nothing
+		// about that failure is visible in the code, and a linter does not catch
+		// it, so it is asserted here. Control characters belong in source as
+		// escapes.
+		const { readFile, readdir } = await import("node:fs/promises");
+		const { dirname, join } = await import("node:path");
+		const { fileURLToPath } = await import("node:url");
+
+		const here = dirname(fileURLToPath(import.meta.url));
+		const offenders: string[] = [];
+		for (const entry of await readdir(here)) {
+			if (!entry.endsWith(".ts")) continue;
+			const text = await readFile(join(here, entry), "utf8");
+			const literal = [...text].filter((character) => {
+				const code = character.codePointAt(0) ?? 0;
+				return code < 32 && character !== "\n" && character !== "\t";
+			});
+			if (literal.length > 0) offenders.push(entry);
+		}
+
+		expect(offenders).toEqual([]);
+	});
+});

@@ -202,7 +202,7 @@ to **stderr** so you can reproduce it in the portal.
 | Flag | Matches |
 | --- | --- |
 | `--since <duration>` | Look back this far: `30s`, `15m`, `2h`, `1d`, or bare seconds |
-| `--from` / `--to` | An explicit window (ISO-8601 instants) |
+| `--from` / `--to` | An explicit window (ISO-8601 instants). `--to` is `query` only — a follow always follows up to the present |
 | `--issue <key>` | The Linear issue identifier, e.g. `NOR-402` |
 | `--run <id>` / `--session <id>` | One agent run, or one Linear agent session |
 | `--owner` / `--team` / `--project` | The identities the run was routed under |
@@ -218,6 +218,12 @@ you found with `cyrus runs list --issue NOR-402` reads with
 
 Router lines and relayed sandbox lines are both returned — nothing filters to
 one — and each record carries a `cyrus.source` attribute saying which it was.
+
+Lines carrying no workspace attribution are returned too. Most of what the
+router writes is an ordinary log line with no run attached, so scoping them out
+would hide most of its output behind a filter you did not type. The workspace
+scope narrows; it is not an authorization boundary, since the backend is read
+with your own grant.
 
 ### Budgets, and why they refuse rather than truncate
 
@@ -239,6 +245,16 @@ poll re-reads an overlap of the previous window and suppresses duplicates by a
 content fingerprint, and the command reports the ingestion lag it observed —
 widening its overlap when the backend reports worse. It never presents itself as
 a live router stream, because a quiet screen must not be read as a quiet fleet.
+
+Timestamps you see, and the windows you ask for, are always the times the lines
+were **written** — never when the backend happened to ingest them. Those are two
+different clocks and the gap between them differs per source, so ordering by
+ingestion would interleave router and sandbox lines out of order and would drop
+records written inside your window but ingested after it.
+
+Ctrl-C stops a follow at once, including during a poll. Note that abandoning the
+wait is not the same as cancelling the query: the Azure client cannot cancel an
+in-flight request, so it finishes server-side.
 
 ### Redaction
 

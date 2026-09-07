@@ -5,6 +5,7 @@ import type {
 	LogSourceKindV1,
 } from "cyrus-operator-protocol";
 import { UsageError } from "../errors.js";
+import { redactKnownSecrets } from "./redactKnownSecrets.js";
 
 /**
  * The seam every historical log backend sits behind.
@@ -35,10 +36,17 @@ export interface LogSourceAdapter {
 	/**
 	 * Reads the records matching `query`.
 	 *
-	 * @param signal aborts an in-flight backend request. A `follow` that is
-	 * interrupted mid-poll must not leave a request running against a billed
-	 * backend, and a poll that outlives its own interval must be abandoned rather
-	 * than allowed to overlap the next one.
+	 * @param signal stops WAITING on an in-flight query, so a `follow` that is
+	 * interrupted mid-poll exits at once rather than blocking for a query that may
+	 * run for minutes.
+	 *
+	 * Read that precisely: it abandons the wait, not necessarily the query. Whether
+	 * the request is actually cancelled depends on the backend client, and
+	 * `@azure/monitor-query-logs@1.0.0` discards the abort signal it accepts — so
+	 * on that path the query continues server-side and is still billed. The signal
+	 * is passed to the client regardless, so a later version that honours it needs
+	 * no change here. An adapter that CAN cancel should; none may claim to have
+	 * cancelled when it has only stopped listening.
 	 *
 	 * @throws {UsageError} when a budget in {@link LogQueryBudgetsV1} is exceeded.
 	 * Never truncates: a short answer an operator reads as complete is the one
@@ -221,6 +229,48 @@ export function enforceLogBudgets(
 	assertSizeBudget(records);
 }
 
+/**
+ * The last thing every adapter does before returning: redact, then enforce.
+ *
+ * ── WHY REDACTION IS PART OF THE SEAM ──
+ * "Known secrets are removed before output" has to be a property of the
+ * INTERFACE, not of whichever adapter happened to implement it. Leaving it
+ * inside the Azure normalizer made it true of today's only production path and
+ * guaranteed of nothing — the next backend would have to rediscover it, and the
+ * failure mode is a credential in a CI log rather than a test going red.
+ *
+ * ── WHY REDACT BEFORE ENFORCING ──
+ * Redaction changes a record's serialized size, and the size budget is about
+ * what will actually be written. Enforcing first would refuse a record for bytes
+ * that were about to be removed, and — worse — would let one through that grew.
+ */
+export function finalizeLogRecords(
+	records: readonly LogRecordV1[],
+	limit: number,
+	knownSecretValues: readonly string[],
+): LogRecordV1[] {
+	const redacted = records.map((record) => {
+		const result = redactKnownSecrets(
+			{
+				message: record.message,
+				...(record.attributes ? { attributes: record.attributes } : {}),
+			},
+			knownSecretValues,
+		);
+		if (!result.redacted) return record;
+		return {
+			...record,
+			message: result.value.message,
+			...(result.value.attributes
+				? { attributes: result.value.attributes }
+				: {}),
+			redacted: true,
+		};
+	});
+	enforceLogBudgets(redacted, limit);
+	return redacted;
+}
+
 /* -------------------------------------------------- reference filter semantics */
 
 /**
@@ -270,7 +320,13 @@ function matchesLogFilters(record: LogRecordV1, query: LogQueryV1): boolean {
 	): boolean => expected === undefined || expected === actual;
 
 	return (
-		equals(query.workspaceId, record.workspaceId) &&
+		// The workspace scope admits a record carrying NO workspace attribution,
+		// unlike every explicit filter below. Most router lines are plain
+		// `logger.info` calls that carry only the structural keys, so a strict
+		// equality here hides most of the router's output behind a scope the
+		// operator did not type — and it is not an authorization boundary in any
+		// case, since the backend is read with the operator's own grant.
+		matchesScope(query.workspaceId, record.workspaceId) &&
 		equals(query.ownerUserId, record.ownerUserId) &&
 		equals(query.issueKey, record.issueKey) &&
 		equals(query.runId, record.runId) &&
@@ -289,6 +345,22 @@ function matchesLogFilters(record: LogRecordV1, query: LogQueryV1): boolean {
 		(query.text === undefined ||
 			record.message.toLowerCase().includes(query.text.toLowerCase()))
 	);
+}
+
+/**
+ * The workspace scope: a record belonging to that workspace, or to none.
+ *
+ * Deliberately looser than {@link matchesLogQuery}'s other comparisons. A record
+ * with no workspace attribution is infrastructure output that belongs to no
+ * workspace, not output belonging to a different one, and excluding it answers
+ * "what happened in my workspace" by hiding most of what the router said.
+ */
+function matchesScope(
+	requested: string | undefined,
+	actual: string | undefined,
+): boolean {
+	if (requested === undefined) return true;
+	return actual === undefined || actual === "" || actual === requested;
 }
 
 /**

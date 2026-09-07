@@ -1108,8 +1108,20 @@ describe("buildProgram — Commander wiring for `logs`", () => {
 		const follow = flagsOf("follow");
 
 		expect(query.length).toBeGreaterThan(0);
-		// `follow` adds exactly the two flags a poll needs and drops nothing.
-		expect(follow).toEqual([...query, "--interval", "--timeout"].sort());
+		// `follow` differs from `query` in exactly three flags, and each difference
+		// is a real semantic one rather than an oversight: it adds `--interval` and
+		// `--timeout`, which only a poll has, and it drops `--to`, because a follow
+		// always follows up to the present — declaring it would accept a flag the
+		// command could only ignore. Every FILTER is shared.
+		expect(follow).toEqual(
+			[
+				...query.filter((flag) => flag !== "--to"),
+				"--interval",
+				"--timeout",
+			].sort(),
+		);
+		expect(query).toContain("--to");
+		expect(follow).not.toContain("--to");
 	});
 
 	it("uses the same flag names as `runs` for the dimensions they share", () => {

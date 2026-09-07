@@ -179,6 +179,72 @@ export function describeLogSourceAdapterContract(
 			});
 		});
 
+		describe("workspace scope", () => {
+			it("keeps a record carrying no workspace attribution", () => {
+				// The workspace is the implicit scope every query carries, and most of
+				// what the router writes is a plain `logger.info` with no `cyrus.*`
+				// attribution at all. Treating the scope as a strict equality dropped
+				// every one of those — including from a query with no filters — so
+				// `cyrus logs query` reported a quiet fleet while the table was full.
+				const { adapter, descriptor } = create([
+					at(1, { workspaceId: undefined }),
+					at(2, { workspaceId: "ws-1" }),
+					at(3, { workspaceId: "ws-other" }),
+				]);
+
+				return adapter
+					.query(descriptor, query({ workspaceId: "ws-1" }))
+					.then((result) => {
+						expect(ids(result.records)).toEqual(["record-1", "record-2"]);
+					});
+			});
+
+			it("still excludes a record belonging to a DIFFERENT workspace", () => {
+				// Widened, not removed.
+				const { adapter, descriptor } = create([
+					at(1, { workspaceId: "ws-other" }),
+				]);
+
+				return adapter
+					.query(descriptor, query({ workspaceId: "ws-1" }))
+					.then((result) => {
+						expect(result.records).toEqual([]);
+					});
+			});
+
+			it("does not widen the explicit narrowing filters the same way", async () => {
+				// Asking for `--team X` means a line with no team is not a match. Only
+				// the implicit workspace scope admits the unattributed.
+				const { adapter, descriptor } = create([at(1, { attributes: {} })]);
+
+				const result = await adapter.query(
+					descriptor,
+					query({ teamId: "team-1" }),
+				);
+
+				expect(result.records).toEqual([]);
+			});
+		});
+
+		describe("redaction", () => {
+			it("removes a credential-named attribute before returning", async () => {
+				// Part of the seam, not of one adapter: "known secrets are removed
+				// before output" has to be a property of the interface, or the next
+				// backend rediscovers it and the failure mode is a credential in a CI
+				// log rather than a test going red.
+				const { adapter, descriptor } = create([
+					at(1, { attributes: { "cyrus.access_token": "aaaa1111bbbb" } }),
+				]);
+
+				const result = await adapter.query(descriptor, query());
+
+				expect(result.records[0]?.attributes?.["cyrus.access_token"]).toBe(
+					"[redacted]",
+				);
+				expect(result.records[0]?.redacted).toBe(true);
+			});
+		});
+
 		describe("order", () => {
 			it("returns records oldest first", async () => {
 				const { adapter, descriptor } = create([at(3), at(1), at(2)]);

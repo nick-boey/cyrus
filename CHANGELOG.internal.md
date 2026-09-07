@@ -76,6 +76,65 @@ This changelog documents internal development changes, refactors, tooling update
   exists to avoid.
 
 ### Fixed
+- **Log queries filtered, ordered, and truncated on the wrong clock
+  ([CYR-73](https://linear.app/northrop-digital/issue/CYR-73/query-and-follow-log-analytics-directly-from-the-cli),
+  [#67](https://github.com/nick-boey/cyrus/pull/67)).** The first version of
+  `compileAzureKql` bounded and ordered on `TimeGenerated` — INGESTION time —
+  while the records it returned, and the range the output document claims they
+  lie in, are on the emitter's clock. Ingestion lag is tens of seconds and
+  differs per source (a router line lands almost immediately; a sandbox line is
+  relayed through the router's stdout), so a record written inside the window
+  and ingested after it was silently dropped, output stopped being chronological
+  once the two interleaved, and `take` kept the earliest-INGESTED records rather
+  than the earliest. The query now scans a WIDENED `TimeGenerated` window — the
+  indexed column, so the scan stays bounded — and filters, orders, and takes on
+  `coalesce(todatetime(p.timestamp), TimeGenerated)`. The contract stub that hid
+  this gave every row `timeGenerated: record.timestamp`, making ingestion order
+  and emission order the same sequence; it now applies a per-record varying lag.
+- **The workspace scope dropped almost every router log line
+  ([#67](https://github.com/nick-boey/cyrus/pull/67)).** Every query carries an
+  implicit `cyrus.workspace_id` clause, but that attribute rides only on
+  `logger.event` records and relayed sandbox records — the ~200 plain
+  `logger.info`/`warn`/`error` calls render with only the structural keys, and
+  `tostring()` of an absent key is `""`. A bare equality therefore excluded all
+  of them, including from `cyrus logs query` with no filters, which then
+  reported a quiet fleet. The scope now admits records carrying no workspace
+  attribution; the explicit filters (`--team`, `--owner`, …) are deliberately
+  NOT widened the same way, since asking for a team means a line with no team is
+  not a match. It is a narrowing filter, not an authorization boundary — the
+  backend is read with the operator's own grant.
+- **`{ audience }` is dead config in `@azure/monitor-query-logs@1.0.0`
+  ([#67](https://github.com/nick-boey/cyrus/pull/67)).** The option exists on
+  the SDK's TypeScript interface and is never read: `createMonitorQueryLogs`
+  derives its endpoint from `options.endpoint` and its scopes from
+  `options.credentials.scopes`, and the string never appears in the shipped
+  JavaScript. A sovereign-cloud descriptor therefore minted a token for
+  `api.loganalytics.us` and sent it to the public endpoint, failing as a `401`
+  that our own error mapping reported as a missing `Log Analytics Reader` role —
+  the exact misdiagnosis the cloud map exists to prevent. Now sets `endpoint`
+  and `credentials.scopes`, and the `as unknown as` cast that was disabling the
+  structural check is gone.
+- **Cancellation was documented, contract-tested, and non-functional
+  ([#67](https://github.com/nick-boey/cyrus/pull/67)).** Three breaks in one
+  chain: the command never passed a signal, the SDK discards the one it accepts
+  (`convertToInternalOptions` rebuilds the options as `{ prefer, requestOptions }`
+  before `operationOptionsToRequestParameters` can read `abortSignal`), and the
+  contract's cancellation cases passed because the test wrapper short-circuited
+  before delegating. Ctrl-C now aborts an in-flight poll, the adapter stops
+  waiting via `Promise.race`, and the interface comment says plainly that this
+  abandons the WAIT rather than the query — the request finishes server-side and
+  is still billed.
+- **Three narrower ones ([#67](https://github.com/nick-boey/cyrus/pull/67)).**
+  `--to` parsed on `cyrus logs follow` and did nothing, which
+  `parseLogsOptions`' own rule forbids — refused now, and no longer declared on
+  that subcommand. `--show-query` could print the PREVIOUS poll's KQL for a
+  query that failed a request-side budget and generated none; `lastQuery` is
+  cleared first. The record-count budget counted readable RECORDS while the
+  query took `limit + 1` ROWS, so a capped result whose extra row was unreadable
+  passed the check — it now gates on the row count too. And redaction moved from
+  the Azure normalizer into the seam's shared `finalizeLogRecords`, so "known
+  secrets are removed before output" is a property of the interface rather than
+  of today's only production adapter.
 - **A bare `logs` in `.gitignore` was swallowing source directories.** It
   matched `apps/cli/src/remote/logs/` — an entire module — with no error at
   `git add` and nothing in `git status` to notice. Anchored to `/logs`, which

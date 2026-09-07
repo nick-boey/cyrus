@@ -1156,7 +1156,6 @@ function addLogFilterOptions(command: Command): Command {
 		)
 		.option("--since <duration>", "Look back this far, e.g. 30s, 15m, 2h, 1d")
 		.option("--from <timestamp>", "Start of the window (ISO-8601 instant)")
-		.option("--to <timestamp>", "End of the window (ISO-8601 instant)")
 		.option("--limit <count>", "Maximum records to return")
 		.option(
 			"--show-query",
@@ -1246,7 +1245,11 @@ function registerLogsCommand(
 				.description(
 					"Read one window of fleet logs. Succeeds whatever the records say.",
 				),
-		),
+		)
+			// Only `query` has a window END to name. `follow` always follows up to
+			// the present, so declaring `--to` on it would accept a flag it could
+			// only ignore.
+			.option("--to <timestamp>", "End of the window (ISO-8601 instant)"),
 	).action(async (cmdOpts: LogFilterOptionValues) => {
 		await runLogs(["query", ...logFilterArgs(cmdOpts)], {
 			connection: cmdOpts.connection,
