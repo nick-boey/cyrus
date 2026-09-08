@@ -1674,6 +1674,24 @@ way to stop or destroy an executor.
 | `containers.sessionsQueryTimeoutMs` | `5000` | How long the worker has to answer the session query. Shared with the idle sweep's affinity reconciler, which asks the same question. |
 | `containers.affinityGraceMs` | `600000` | How recently a session may have been claimed and still be treated as one a reconnected worker can authoritatively disown. Shared with the affinity reconciler for the same reason. |
 
+**How an operator asks.** Through `cyrus recover`, which is the only client for
+this route and is available in both command profiles:
+
+```bash
+cyrus recover <runId>                          # read the revision, ask, follow to the end
+cyrus recover --issue NOR-402                  # only if exactly one unfinished run matches
+cyrus recover <runId> --no-wait --json         # return with an operation id
+cyrus recover status <operationId> --wait      # pick that operation back up
+```
+
+It exits `0` on `recovered`, `3` on `needs_input`/`refused`/`failed` and on a
+`stale_revision` or `run_already_terminal` refusal, `4` when it stops watching
+(the recovery keeps running), `5` on a credential failure, `6` on a transient
+router failure, and `2` for a bad invocation, an ambiguous `--issue`, or a router
+that does not advertise `recoveries.request`. It carries no `--force`, no unlock,
+and no executor control — see
+[the CLI README](../apps/cli/README.md#guarded-run-recovery).
+
 **What is durable either way.** An accepted request becomes a
 `recovery_operations` row carrying the caller, the target run, the observation
 revision quoted, the idempotency key, every phase entered, and the ownership

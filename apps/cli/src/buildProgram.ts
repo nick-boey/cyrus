@@ -9,6 +9,7 @@ import { ConnectCommand } from "./commands/ConnectCommand.js";
 import { ConnectionCommand } from "./commands/ConnectionCommand.js";
 import { ContainerBootCommand } from "./commands/ContainerBootCommand.js";
 import { LogsCommand } from "./commands/LogsCommand.js";
+import { RecoverCommand } from "./commands/RecoverCommand.js";
 import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
 import { RouterCommand } from "./commands/RouterCommand.js";
 import { RunsCommand } from "./commands/RunsCommand.js";
@@ -66,8 +67,7 @@ export const COMMAND_PROFILE_ENV = "CYRUS_COMMAND_PROFILE";
  * cannot be granted by where a `register*` call happens to sit relative to a
  * branch. Adding a command to the remote surface is an edit to this array.
  *
- * `recover` and `skills` are named but not yet implemented — they arrive with
- * CYR-76 and CYR-77.
+ * `skills` is named but not yet implemented — it arrives with CYR-77.
  */
 export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
 	"connection",
@@ -88,6 +88,7 @@ export const REMOTE_PROFILE_REGISTERED: readonly string[] = [
 	"connection",
 	"runs",
 	"logs",
+	"recover",
 ];
 
 /**
@@ -198,6 +199,7 @@ export function buildProgram(
 			registerConnectionCommand(program, packageJson, errorReporter),
 		runs: () => registerRunsCommand(program, packageJson, errorReporter),
 		logs: () => registerLogsCommand(program, packageJson, errorReporter),
+		recover: () => registerRecoverCommand(program, packageJson, errorReporter),
 	};
 
 	for (const [name, register] of Object.entries(remoteVocabulary)) {
@@ -1286,6 +1288,176 @@ function registerLogsCommand(
 					...logFilterArgs(cmdOpts),
 					...(cmdOpts.interval ? ["--interval", cmdOpts.interval] : []),
 					...(cmdOpts.timeout ? ["--timeout", cmdOpts.timeout] : []),
+				],
+				{ connection: cmdOpts.connection, workspace: cmdOpts.workspace },
+			);
+		},
+	);
+}
+
+/**
+ * `cyrus recover …` — the one guarded mutation the remote vocabulary carries.
+ *
+ * Two forms with genuinely different jobs, so two commands rather than one with
+ * a mode flag: the default form REQUESTS a recovery and its exit code describes
+ * the recovery, while `status` READS an operation that already exists and can
+ * be run repeatedly against the same id without consequence.
+ *
+ * What is deliberately absent is as much of the design as what is here. There
+ * is no `--force`, no unlock, no container destroy, and no way to name an
+ * internal step: the router's safety argument is the ORDER of its guards, and a
+ * flag that skipped to one would be a way around them. Adding a subcommand or a
+ * flag here is the edit that would have to be justified.
+ *
+ * The request form is a hidden DEFAULT subcommand rather than an action on the
+ * parent, for the exact reason `addFleetSelectionOptions` documents and `runs`
+ * already works around: `status` needs `--json`, `--ndjson`, `--timeout`,
+ * `--connection`, and `--workspace`, the request form needs the same five, and
+ * Commander resolves a parent/child option collision in the PARENT's favour —
+ * so `cyrus recover status op-1 --json` reaches `status` with `--json`
+ * swallowed, and the operation is rendered as prose to a caller that asked for
+ * a document. (Measured, not assumed: `enablePositionalOptions()` on this
+ * command does not fix it either, and the program-level form breaks
+ * `cyrus start --cyrus-home`.) Commander dispatches a default subcommand only
+ * when no named one matches, which is precisely the rule needed — `cyrus
+ * recover status …` reaches `status`, and `cyrus recover run-1 …` reaches the
+ * request form. The cost is one hidden, reachable `cyrus recover __request__`,
+ * a name no operator could otherwise have typed.
+ */
+function registerRecoverCommand(
+	program: Command,
+	packageJson: { version: string },
+	errorReporter: ErrorReporter,
+): void {
+	const recoverCommand = program
+		.command("recover")
+		.description(
+			"Ask a router to safely reconcile one agent run whose ownership, worker, and executor evidence disagree (see `cyrus connection add`)",
+		);
+
+	/**
+	 * Builds the Application and disposes its watchers so a one-shot recovery
+	 * command exits instead of idling on live `fs.watch` handles.
+	 */
+	const runRecover = async (
+		argv: string[],
+		selection: { connection?: string; workspace?: string },
+	): Promise<void> => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		try {
+			await new RecoverCommand(app).execute(argv, selection);
+		} finally {
+			app.disposeWatchers();
+		}
+	};
+
+	addFleetSelectionOptions(
+		recoverCommand
+			.command("__request__ [runId]", { isDefault: true, hidden: true })
+			.description(
+				"Request a guarded recovery of one run (this is `cyrus recover <runId>`)",
+			),
+	)
+		.option(
+			"--issue <key>",
+			"Recover the single non-terminal run of this Linear issue. Refused with the candidates if more than one matches.",
+		)
+		.option(
+			"--expected-revision <n>",
+			"The `revision` of the observation you read. Omit it and a fresh one is read immediately before the request.",
+		)
+		.option(
+			"--idempotency-key <key>",
+			"Retrying with the same key joins the same operation instead of starting a competing one. Generated and reported if omitted.",
+		)
+		.option(
+			"--no-wait",
+			"Return as soon as the router accepts, leaving an operation id for `cyrus recover status`",
+		)
+		.option(
+			"--timeout <seconds>",
+			"Give up watching after this many seconds (exit 4). The recovery keeps running on the router.",
+		)
+		.option("--json", "Emit one JSON document instead of prose")
+		.option("--ndjson", "Emit one newline-delimited JSON event per phase")
+		.action(
+			async (
+				runId: string | undefined,
+				cmdOpts: {
+					issue?: string;
+					expectedRevision?: string;
+					idempotencyKey?: string;
+					// Commander turns `--no-wait` into `wait: false`, not `noWait: true`.
+					wait?: boolean;
+					timeout?: string;
+					json?: boolean;
+					ndjson?: boolean;
+					connection?: string;
+					workspace?: string;
+				},
+			) => {
+				await runRecover(
+					[
+						...(runId ? [runId] : []),
+						...(cmdOpts.issue ? ["--issue", cmdOpts.issue] : []),
+						...(cmdOpts.expectedRevision
+							? ["--expected-revision", cmdOpts.expectedRevision]
+							: []),
+						...(cmdOpts.idempotencyKey
+							? ["--idempotency-key", cmdOpts.idempotencyKey]
+							: []),
+						...(cmdOpts.wait === false ? ["--no-wait"] : []),
+						...(cmdOpts.timeout ? ["--timeout", cmdOpts.timeout] : []),
+						...(cmdOpts.json ? ["--json"] : []),
+						...(cmdOpts.ndjson ? ["--ndjson"] : []),
+					],
+					{ connection: cmdOpts.connection, workspace: cmdOpts.workspace },
+				);
+			},
+		);
+
+	addFleetSelectionOptions(
+		recoverCommand
+			.command("status <operationId>")
+			.description(
+				"Report a persisted recovery operation, and optionally resume following it",
+			)
+			.option(
+				"--wait",
+				"Follow the operation until it finishes, instead of reading it once",
+			)
+			.option(
+				"--timeout <seconds>",
+				"With --wait, give up after this many seconds (exit 4)",
+			)
+			.option("--json", "Emit one JSON document instead of prose")
+			.option("--ndjson", "Emit one newline-delimited JSON event per phase"),
+	).action(
+		async (
+			operationId: string,
+			cmdOpts: {
+				wait?: boolean;
+				timeout?: string;
+				json?: boolean;
+				ndjson?: boolean;
+				connection?: string;
+				workspace?: string;
+			},
+		) => {
+			await runRecover(
+				[
+					"status",
+					operationId,
+					...(cmdOpts.wait ? ["--wait"] : []),
+					...(cmdOpts.timeout ? ["--timeout", cmdOpts.timeout] : []),
+					...(cmdOpts.json ? ["--json"] : []),
+					...(cmdOpts.ndjson ? ["--ndjson"] : []),
 				],
 				{ connection: cmdOpts.connection, workspace: cmdOpts.workspace },
 			);

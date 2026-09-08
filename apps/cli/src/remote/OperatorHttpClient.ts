@@ -7,14 +7,18 @@ import {
 	operatorContextV1Schema,
 	type PublicRouterMetadataV1,
 	publicRouterMetadataV1Schema,
+	type RecoveryOperationV1,
+	type RecoveryRequestV1,
 	type RunChangePageV1,
 	type RunObservationPageV1,
+	recoveryOperationV1Schema,
 	runChangePageV1Schema,
 	runObservationPageV1Schema,
 } from "cyrus-operator-protocol";
 import type { OperatorCredentialProvider } from "./credentials.js";
 import {
 	AuthorizationError,
+	OutcomeError,
 	StreamEpochChangedError,
 	summarizeBody,
 	TransientError,
@@ -29,6 +33,8 @@ export const OPERATOR_CONTEXT_PATH = "/api/v1/operator/context";
 export const RUNS_PATH = "/api/v1/runs";
 /** The durable, ordered feed of material run changes. */
 export const RUN_CHANGES_PATH = "/api/v1/run-changes";
+/** The one guarded mutation: ask the router to reconcile a run. */
+export const RECOVERIES_PATH = "/api/v1/recoveries";
 
 /**
  * Operator interface versions this CLI can speak.
@@ -55,6 +61,20 @@ export interface OperatorHttpClientOptions {
 export interface OperatorContextResult {
 	context: OperatorContextV1;
 	authSource: string;
+}
+
+/**
+ * What accepting a recovery request produced.
+ *
+ * `joined` distinguishes the router's `200` — this key was already bound to an
+ * operation, and you are watching that one — from its `202`. The two are not
+ * cosmetic: a joined operation may already be finished, so a caller that read
+ * them as the same thing would report a refusal it is holding as a fresh
+ * acceptance.
+ */
+export interface RecoveryAcceptance {
+	operation: RecoveryOperationV1;
+	joined: boolean;
 }
 
 /**
@@ -190,6 +210,102 @@ export class OperatorHttpClient {
 		return parsed.data;
 	}
 
+	/**
+	 * Asks the router to reconcile ONE run, and returns the operation it
+	 * persisted.
+	 *
+	 * The request carries exactly the four fields the contract defines, and the
+	 * route parses it STRICTLY — so there is no field this client could add that
+	 * would select a restart, a redelivery, an unlock, or an executor teardown.
+	 * That property belongs to the wire contract rather than to this method, which
+	 * is why the request is passed through rather than assembled here.
+	 *
+	 * Retrying across the credential chain is safe on this POST specifically
+	 * because a 401/403 means the router refused before accepting anything, and
+	 * because the idempotency key makes a second acceptance a JOIN rather than a
+	 * second recovery.
+	 */
+	async requestRecovery(
+		request: RecoveryRequestV1,
+	): Promise<RecoveryAcceptance> {
+		const { response } = await this.authorizedRequest(
+			RECOVERIES_PATH,
+			{},
+			{ method: "POST", body: JSON.stringify(request) },
+		);
+		const body = await this.readRecoveryJson(response, RECOVERIES_PATH);
+		return {
+			operation: this.parseOperation(body, RECOVERIES_PATH),
+			// The route answers `200` for a joined operation and `202` for a new
+			// one, and this is the only place that distinction is observable.
+			joined: response.status === 200,
+		};
+	}
+
+	/** One persisted recovery operation, if this connection may read it. */
+	async getRecovery(operationId: string): Promise<RecoveryOperationV1> {
+		const path = `${RECOVERIES_PATH}/${encodeURIComponent(operationId)}`;
+		const { response } = await this.authorizedRequest(path);
+		const body = await this.readRecoveryJson(response, path);
+		return this.parseOperation(body, path);
+	}
+
+	private parseOperation(body: unknown, path: string): RecoveryOperationV1 {
+		const parsed = recoveryOperationV1Schema.safeParse(body);
+		if (!parsed.success) {
+			throw new UsageError(
+				`${this.baseUrl}${path} returned an invalid recovery operation: ${describeIssues(parsed.error)}`,
+			);
+		}
+		return parsed.data;
+	}
+
+	/**
+	 * Reads a recovery response, mapping the resource's own refusals onto the
+	 * category an orchestrator should act on.
+	 *
+	 * The distinction {@link readJson} cannot make on its own is the important
+	 * one. A `409 stale_revision` and a `409 run_already_terminal` are the router
+	 * DECIDING something — the run moved, the run ended — and each is a valid
+	 * non-success answer to "recover this run", so they are `outcome` (exit 3),
+	 * not `usage`. A `409 idempotency_key_conflict` is the opposite: the caller
+	 * reused a key it had already bound to something else, and no retry of the
+	 * same invocation will ever succeed, so it is `usage` (exit 2).
+	 *
+	 * Both `details` fields the router attaches are folded into the message,
+	 * because each is the one fact that makes the next attempt possible: the
+	 * current revision to re-quote, or the lifecycle that ended the run.
+	 */
+	private async readRecoveryJson(
+		response: Response,
+		path: string,
+	): Promise<unknown> {
+		if (response.ok) return this.readJson(response, path);
+
+		// Cloned so the shared `readJson` fallback below can still read the body.
+		const text = await response
+			.clone()
+			.text()
+			.catch(() => "");
+		const refusal = parseRefusal(text);
+		if (refusal && (response.status === 409 || response.status === 404)) {
+			const detail = describeRefusalDetail(refusal);
+			const message = `${this.baseUrl}${path} refused the recovery (${refusal.error}): ${summarizeBody(refusal.message ?? refusal.error)}${detail}`;
+			throw RECOVERY_OUTCOME_CODES.has(refusal.error)
+				? new OutcomeError(message)
+				: new UsageError(message);
+		}
+		if (response.status === 404) {
+			// No recognizable refusal on a 404 means the ROUTE is missing, not the
+			// run. Reachable only if a router advertises `recoveries.request` and
+			// does not serve the resource, which is a router defect worth naming.
+			throw new UsageError(
+				`${this.baseUrl} does not serve ${path}, although it advertises the "recoveries.request" capability. The router is misconfigured or too old.`,
+			);
+		}
+		return this.readJson(response, path);
+	}
+
 	private async readAuthorizedJson(
 		path: string,
 		query: Record<string, string>,
@@ -220,6 +336,7 @@ export class OperatorHttpClient {
 	private async authorizedRequest(
 		path: string,
 		query: Record<string, string> = {},
+		send?: RequestPayload,
 	): Promise<{ response: Response; source: string }> {
 		if (!this.credentials) {
 			throw new UsageError(
@@ -234,6 +351,7 @@ export class OperatorHttpClient {
 				path,
 				{ authorization: authorization.header },
 				query,
+				send,
 			);
 			if (response.status !== 401 && response.status !== 403) {
 				return { response, source };
@@ -267,12 +385,19 @@ export class OperatorHttpClient {
 		path: string,
 		headers: Record<string, string>,
 		query: Record<string, string> = {},
+		send?: RequestPayload,
 	): Promise<Response> {
 		const search = new URLSearchParams(query).toString();
 		const url = `${this.baseUrl}${path}${search ? `?${search}` : ""}`;
 		try {
 			return await this.fetchFn(url, {
-				headers: { accept: "application/json", ...headers },
+				method: send?.method ?? "GET",
+				headers: {
+					accept: "application/json",
+					...(send ? { "content-type": "application/json" } : {}),
+					...headers,
+				},
+				...(send ? { body: send.body } : {}),
 				signal: AbortSignal.timeout(this.timeoutMs),
 			});
 		} catch (error) {
@@ -327,6 +452,66 @@ export class OperatorHttpClient {
 			});
 		}
 	}
+}
+
+/** A request that carries a body. Only the recovery resource has one. */
+interface RequestPayload {
+	method: "POST";
+	body: string;
+}
+
+/**
+ * The refusal codes that are a router DECISION about the run rather than a
+ * defect in the invocation.
+ *
+ * Both are re-readable: the caller takes a fresh observation and quotes the new
+ * revision, or accepts that the run has ended. Neither is a reason to change the
+ * command line, which is what separates them from
+ * `idempotency_key_conflict` — a key already bound to a different run, where
+ * repeating the same invocation can only fail identically forever.
+ */
+const RECOVERY_OUTCOME_CODES: ReadonlySet<string> = new Set([
+	"stale_revision",
+	"run_already_terminal",
+]);
+
+interface RecoveryRefusalBody {
+	error: string;
+	message?: string;
+	currentRevision?: number;
+	lifecycle?: string;
+}
+
+/** The router's structured refusal, or `undefined` for anything else. */
+function parseRefusal(body: string): RecoveryRefusalBody | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(body);
+	} catch {
+		return undefined;
+	}
+	const refusal = parsed as Partial<RecoveryRefusalBody> | null;
+	return typeof refusal?.error === "string"
+		? (refusal as RecoveryRefusalBody)
+		: undefined;
+}
+
+/**
+ * The one fact from a refusal's `details` that makes the retry possible.
+ *
+ * Folded into the message rather than left on a structure nobody reads: the
+ * refusal surfaces as an exit code and a line on stderr, and an operator told
+ * only "this run has changed" has to make another request to learn what to
+ * quote next.
+ */
+function describeRefusalDetail(refusal: RecoveryRefusalBody): string {
+	if (typeof refusal.currentRevision === "number") {
+		return ` The run is now at revision ${refusal.currentRevision}.`;
+	}
+	if (typeof refusal.lifecycle === "string") {
+		return ` The run is \`${refusal.lifecycle}\`.`;
+	}
+	return "";
 }
 
 /**
