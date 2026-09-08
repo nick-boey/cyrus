@@ -63,6 +63,14 @@ vi.mock("./commands/LogsCommand.js", () => ({
 	}),
 }));
 
+const recoverExecute = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
+vi.mock("./commands/RecoverCommand.js", () => ({
+	RecoverCommand: vi.fn().mockImplementation(function FakeRecoverCommand() {
+		return { execute: recoverExecute };
+	}),
+}));
+
 const connectionExecute = vi.hoisted(() =>
 	vi.fn().mockResolvedValue(undefined),
 );
@@ -492,6 +500,20 @@ describe("buildProgram — command profiles", () => {
 		expect(REMOTE_PROFILE_COMMANDS).toContain("logs");
 		expect(REMOTE_PROFILE_REGISTERED).toContain("logs");
 		expect(topLevelCommands(newProgram())).toContain("logs");
+	});
+
+	it("exposes `recover` in both profiles", () => {
+		// The one guarded mutation the remote vocabulary carries. It reads a stored
+		// connection and the router authorizes it, so it functions unattended here
+		// — and the same words mean the same thing in the full profile.
+		const names = topLevelCommands(
+			newProgram({ argv: ["node", "cyrus", "--profile", "remote"] }),
+		);
+
+		expect(names).toContain("recover");
+		expect(REMOTE_PROFILE_COMMANDS).toContain("recover");
+		expect(REMOTE_PROFILE_REGISTERED).toContain("recover");
+		expect(topLevelCommands(newProgram())).toContain("recover");
 	});
 
 	it("cannot invoke router, worker, enrollment, secret, container, or unlock commands in the remote profile", () => {
@@ -1154,5 +1176,212 @@ describe("buildProgram — Commander wiring for `logs`", () => {
 			expect(flagsOf("runs", "list")).toContain(shared);
 			expect(logs).toContain(shared);
 		}
+	});
+});
+
+describe("buildProgram — Commander wiring for `recover`", () => {
+	beforeEach(() => {
+		recoverExecute.mockClear();
+		routerExecute.mockClear();
+		runsExecute.mockClear();
+		containerBootExecute.mockClear();
+		connectionExecute.mockClear();
+	});
+
+	/**
+	 * The request form is a hidden DEFAULT subcommand — see the comment on
+	 * `registerRecoverCommand` for why it cannot be an action on the parent.
+	 */
+	const REQUEST_SHIM = "__request__";
+
+	/** The `recover` command as Commander would dispatch it. */
+	function recoverCommand(profile?: "remote") {
+		const program = newProgram(
+			profile ? { argv: ["node", "cyrus", "--profile", profile] } : undefined,
+		);
+		const command = program.commands.find((cmd) => cmd.name() === "recover");
+		if (!command) throw new Error("`recover` is not registered");
+		return command;
+	}
+
+	it("registers `recover <runId>` and forwards it as string args", async () => {
+		await run(["recover", "run-1"]);
+		expect(recoverExecute).toHaveBeenCalledWith(["run-1"], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("forwards every option of the default form", async () => {
+		await run([
+			"recover",
+			"run-1",
+			"--expected-revision",
+			"7",
+			"--idempotency-key",
+			"attempt-3",
+			"--timeout",
+			"120",
+			"--json",
+		]);
+		expect(recoverExecute).toHaveBeenCalledWith(
+			[
+				"run-1",
+				"--expected-revision",
+				"7",
+				"--idempotency-key",
+				"attempt-3",
+				"--timeout",
+				"120",
+				"--json",
+			],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("forwards `--issue` as the target instead of a run id", async () => {
+		await run(["recover", "--issue", "NOR-402"]);
+		expect(recoverExecute).toHaveBeenCalledWith(["--issue", "NOR-402"], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("forwards `--no-wait`", async () => {
+		// Commander turns `--no-wait` into `wait: false` rather than a
+		// `noWait: true` option, which is exactly the kind of translation that
+		// silently drops a flag if it is not asserted.
+		await run(["recover", "run-1", "--no-wait"]);
+		expect(recoverExecute).toHaveBeenCalledWith(["run-1", "--no-wait"], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("forwards --connection and --workspace as the fleet selection", async () => {
+		await run([
+			"recover",
+			"run-1",
+			"--connection",
+			"prod",
+			"--workspace",
+			"ws-1",
+		]);
+		expect(recoverExecute).toHaveBeenCalledWith(["run-1"], {
+			connection: "prod",
+			workspace: "ws-1",
+		});
+	});
+
+	it("registers `recover status <operationId>`", async () => {
+		await run(["recover", "status", "op-1", "--wait", "--json"]);
+		expect(recoverExecute).toHaveBeenCalledWith(
+			["status", "op-1", "--wait", "--json"],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("does not let a run id shadow the `status` subcommand", async () => {
+		await run(["recover", "status", "op-1"]);
+		expect(recoverExecute).toHaveBeenCalledWith(["status", "op-1"], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("exposes no break-glass subcommand", () => {
+		// The acceptance criterion in code: this command asks for semantic run
+		// recovery and cannot choose an internal restart, redeliver, or unlock
+		// step. EXACT, including the hidden request shim — a subset assertion
+		// would pass for a `recover unlock` registered beside it, which is the one
+		// thing this is here to catch.
+		expect(
+			recoverCommand()
+				.commands.map((cmd) => cmd.name())
+				.sort(),
+		).toEqual([REQUEST_SHIM, "status"].sort());
+	});
+
+	it("reserves no name an operator could otherwise have typed", async () => {
+		// The shim is reachable, so it must not shadow anything real. No Linear
+		// issue identifier and no run id can look like `__request__`.
+		expect(REQUEST_SHIM).toMatch(/^__[a-z]+__$/);
+		await run(["recover", REQUEST_SHIM, "run-1"]);
+		expect(recoverExecute).toHaveBeenCalledWith(["run-1"], {
+			connection: undefined,
+			workspace: undefined,
+		});
+	});
+
+	it("offers no flag that could force, unlock, or destroy", () => {
+		const flags = (command: import("commander").Command): string[] => [
+			...command.options.map((option) => option.long ?? ""),
+			...command.commands.flatMap((child) => flags(child)),
+		];
+		const declared = flags(recoverCommand()).join(" ").toLowerCase();
+		for (const forbidden of [
+			"force",
+			"unlock",
+			"destroy",
+			"restart",
+			"redeliver",
+			"terminate",
+			"stop",
+			"comment",
+		]) {
+			expect(declared).not.toContain(forbidden);
+		}
+	});
+
+	it("registers the same tree in the remote profile", () => {
+		expect(
+			recoverCommand("remote")
+				.commands.map((cmd) => cmd.name())
+				.sort(),
+		).toEqual([REQUEST_SHIM, "status"].sort());
+	});
+
+	it("forwards an empty option value rather than dropping it", async () => {
+		// `--expected-revision "$REV"` with REV unset arrives as `""`. Dropped by a
+		// truthiness check, the command would substitute a fresh read of its own
+		// for the caller's evidence — silently turning a conditional recovery into
+		// an unconditional one. It must reach `RecoverCommand`, which refuses it.
+		await run(["recover", "run-1", "--expected-revision", ""]);
+		expect(recoverExecute).toHaveBeenCalledWith(
+			["run-1", "--expected-revision", ""],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("exits 2 for a Commander parse failure, not Commander's own 1", async () => {
+		// Without this the ADR-0011 contract stops at the command's front door:
+		// `RecoverCommand` computes `2` for an unknown option, but Commander
+		// detects it first and exits `1`, so the code the command chose is never
+		// reached. Driven through the real program — an `execute()`-level test
+		// asserts a path the shipped binary never takes.
+		const program = newProgram();
+		const { UsageError: Usage } = await import("./remote/errors.js");
+		program.configureOutput({ writeErr: () => {}, writeOut: () => {} });
+		for (const argv of [
+			["recover", "run-1", "--force"],
+			["recover", "status"],
+			["recover", "run-1", "extra"],
+		]) {
+			const failure = await program
+				.parseAsync(["node", "cyrus", ...argv])
+				.then(() => undefined)
+				.catch((error) => error);
+			expect(failure, `\`cyrus ${argv.join(" ")}\``).toBeInstanceOf(Usage);
+			expect((failure as { exitCode: number }).exitCode).toBe(2);
+		}
+		expect(recoverExecute).not.toHaveBeenCalled();
+	});
+
+	it("never constructs a router, container, or Linear command", async () => {
+		await run(["recover", "run-1"]);
+		expect(routerExecute).not.toHaveBeenCalled();
+		expect(containerBootExecute).not.toHaveBeenCalled();
+		expect(runsExecute).not.toHaveBeenCalled();
+		expect(connectionExecute).not.toHaveBeenCalled();
 	});
 });

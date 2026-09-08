@@ -157,6 +157,132 @@ outcome and for a timeout. It now uses the table above — `3` for a non-success
 outcome, `4` for a timeout, `2` for an ambiguous match — so a script testing
 `[ $? -eq 1 ]` will no longer fire.
 
+## Guarded run recovery
+
+`cyrus recover` asks a **remote** router to reconcile one agent run whose
+ownership, worker, and executor evidence no longer agree — the state where a
+Linear issue is still showing a live agent session that nothing is working on,
+and new comments on it are rejected because the issue lock is still held. It
+uses the same stored connection as `cyrus runs`, and is available in both
+command profiles.
+
+```bash
+# Recover one run, reading its current revision first, and follow it to the end
+cyrus recover 019bd6f2-1d1e-7a8e-9f4c-0b7c2a5e91d3
+
+# Recover the single non-terminal run of an issue
+cyrus recover --issue NOR-402
+
+# Quote the revision you already read, and return as soon as it is accepted
+cyrus recover 019bd6f2-… --expected-revision 12 --no-wait --json
+
+# Pick that operation back up
+cyrus recover status 019bd7a1-… --wait
+```
+
+### It asks for one thing
+
+The command says *reconcile this run safely* and nothing else. Which internal
+steps that involves — starting the executor, requesting session reconciliation,
+letting durable frames replay, releasing stale affinity and the issue lock — is
+the router's decision, and this command only reports which one it is on.
+
+There is deliberately **no** `--force`, no unlock, no executor destroy, and no
+way to select a step. The router's safety argument is the *order* of its guards,
+so a flag that skipped to one would be a way around them. Unlock-only, forced
+termination, and executor destruction remain separate break-glass commands on
+the router host. The command also never posts to Linear; a skill may summarize a
+completed operation afterwards.
+
+### A stale observation never mutates anything
+
+Every request quotes the `revision` it was decided from, and the router refuses
+if the run has moved since. Without `--expected-revision`, the command reads a
+fresh observation **immediately before** posting. With it, your own reading is
+quoted verbatim and nothing is re-read.
+
+`--issue <key>` acts only when exactly one **non-terminal** run matches. Zero or
+more than one exits `2`, lists the candidate run ids with their revisions, and
+performs no mutation.
+
+An empty value is refused rather than treated as absent — `--expected-revision
+"$REV"` with `REV` unset exits `2` instead of quietly falling back to a fresh
+read, which would replace the evidence you meant to quote with whatever is true
+now.
+
+Note that `recover --issue` considers **every** non-terminal run, while `cyrus
+runs list` shows only the current run of each agent session. Use `cyrus runs
+list --issue <key> --all-runs` to see the same set a refusal names.
+
+### Idempotency
+
+Every request carries an idempotency key, and retrying with the same key
+**joins** the same operation instead of starting a competing one. A key is
+generated if you do not supply one and is reported in the output, so a retry is
+possible after the fact; supply `--idempotency-key` yourself when the retry has
+to survive a process restart. A key already bound to a different run or revision
+is refused with exit `2`.
+
+### Waiting, and not waiting
+
+By default the command follows the operation and reports each phase as it lands:
+`accepted`, `starting_executor`, `reconciling`, `replaying`,
+`releasing_stale_ownership`, then one of `recovered`, `needs_input`, `refused`,
+or `failed`. It waits up to 10 minutes by default (`--timeout <seconds>`),
+because recovery boots a container and waits for an authenticated reconnect.
+
+`--no-wait` returns as soon as the router accepts. Either way the output always
+carries an `operationId` that `cyrus recover status <operationId>` can inspect,
+and `--wait` on `status` resumes following. Recovery needs no interactive
+confirmation and never prompts.
+
+`--timeout` bounds a wait, so it is refused where there is no wait to bound —
+alongside `--no-wait`, or on a `status` that is not `--wait`ing. `recover status`
+also does not require `--workspace`, even on a connection authorizing several:
+an operation id is globally unique and the route is not workspace-scoped.
+
+### Output
+
+- Interactive default: one line per phase, then a sentence saying how it ended.
+- `--json`: a single `{ "schemaVersion": 1, … }` document, including the
+  operation's full phase history and before/after evidence.
+- `--ndjson`: one event per line. A **request** emits `accepted`, one `phase` per
+  transition, then `result` — the opening `accepted` carries the operation id
+  before any phase is known, so a reader killed mid-recovery still knows what to
+  resume. `recover status` emits no `accepted`, because it makes no request;
+  every field that event would have carried is on its `result`.
+- **stdout carries data only; stderr carries diagnostics.**
+
+The two free-text fields a router controls — an operation's failure message and
+a phase's detail — are stripped of credential material before they are printed,
+on stdout as well as stderr and in all three modes. A value that was removed
+shows as `[redacted]` rather than vanishing.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | `recovered`, or a successful read of an operation still in flight |
+| `2` | Invalid invocation, an ambiguous or unmatched `--issue`, a reused idempotency key, or a router without the `recoveries.request` capability |
+| `3` | `needs_input`, `refused`, `failed`, or a refusal for a stale revision or an already-ended run |
+| `4` | This command stopped watching. The recovery is **still running** — resume with `recover status --wait` |
+| `5` | Authentication or authorization failure |
+| `6` | A transient router failure; retrying may work |
+
+Codes `3` and `4` are distinct on purpose. A refusal is a decision the router
+made and re-running the same command will reproduce it; a timeout is only this
+command losing patience, and says nothing about the recovery's outcome.
+
+Note that `0` covers both "recovered" and "still running" under `--no-wait` or a
+one-shot `status`, because both are successful. The document's `complete` and
+`outcome` fields are what tell them apart.
+
+Recovery cannot manufacture an answer a run is waiting for: a run blocked on an
+elicitation comes back `needs_input`, and the remedy is to answer it in Linear.
+A run whose executor the router cannot start — an offline physical device — is
+`refused` with `executor_not_startable`, and the remedy is its owner bringing it
+back online.
+
 ## Fleet log commands
 
 `cyrus logs` reads the historical logs of a **remote** fleet through the same
