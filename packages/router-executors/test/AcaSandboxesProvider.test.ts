@@ -1616,6 +1616,8 @@ describe("AcaSandboxesProvider", () => {
 			// repo cannot build without the former.
 			expect(patterns).toContain("index.crates.io");
 			expect(patterns).toContain("static.rust-lang.org");
+			// The Argos CLI's upload endpoint — see docker/worker/Dockerfile.
+			expect(patterns).toContain("api.argos-ci.com");
 			expect(patterns).toEqual(
 				expect.arrayContaining([
 					"login.microsoftonline.com",
