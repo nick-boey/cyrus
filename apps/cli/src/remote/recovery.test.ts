@@ -21,6 +21,7 @@ import {
 	emitNewPhases,
 	followRecoveryOperation,
 	generateIdempotencyKey,
+	MAX_TRANSIENT_POLL_FAILURES,
 	type RecoveryClient,
 	resolveRecoveryTarget,
 } from "./recovery.js";
@@ -472,13 +473,42 @@ describe("followRecoveryOperation", () => {
 		expect(router.polls).toBe(2);
 	});
 
-	it("gives up as transient once the router keeps failing", async () => {
+	it("gives up as transient after exactly MAX_TRANSIENT_POLL_FAILURES attempts", async () => {
 		const router = client({
 			getRecovery: () =>
 				Promise.reject(new TransientError("router.example.com failed (503)")),
 		});
-		const followed = follow(router, operation({ phases: ["accepted"] }));
+		const followed = follow(router, operation({ phases: ["accepted"] }), {
+			// Far larger than the failure budget, so the bound — not the deadline —
+			// is what ends this. Without pinning the count, the test would pass
+			// identically if the retry loop had been removed entirely.
+			timeoutMs: 60_000_000,
+		});
 		await expect(followed.result).rejects.toBeInstanceOf(TransientError);
+		expect(router.polls).toBe(MAX_TRANSIENT_POLL_FAILURES);
+	});
+
+	it("counts transient failures consecutively, not cumulatively", async () => {
+		// A router that fails once every few polls over a long recovery must not
+		// eventually exhaust a budget it recovered from every time.
+		let call = 0;
+		const router = client({
+			getRecovery: () => {
+				call++;
+				if (call % 2 === 1 && call < 12) {
+					return Promise.reject(new TransientError("failed (503)"));
+				}
+				return call < 12
+					? operation({ phases: ["accepted", "reconciling"] })
+					: operation({ phases: ["accepted", "reconciling", "recovered"] });
+			},
+		});
+		const followed = follow(router, operation({ phases: ["accepted"] }), {
+			timeoutMs: 60_000_000,
+		});
+		const { operation: final } = await followed.result;
+		expect(final.phase).toBe("recovered");
+		expect(router.polls).toBeGreaterThan(MAX_TRANSIENT_POLL_FAILURES);
 	});
 
 	it("stops at once on an authorization failure rather than retrying", async () => {
@@ -526,29 +556,72 @@ describe("followRecoveryOperation", () => {
 /* --------------------------------------------------- what it cannot reach */
 
 describe("the recovery workflow's seam", () => {
-	it("asks the router for nothing but observations and the recovery resource", async () => {
-		// `RecoveryClient` is the whole surface the workflow can reach. A structural
-		// assertion rather than a comment: if a later change gives the workflow a
-		// way to stop, destroy, unlock, or comment, it has to widen this type first.
-		const surface: RecoveryClient = {
-			listRuns: async () => page([]),
+	it("calls nothing on its client but the three operations it declares", async () => {
+		// The runtime half of the `RecoveryClient` constraint: a Proxy that records
+		// every property the workflow reaches for, driven through a whole recovery.
+		// The compile-time half is the type itself — widening it is what a change
+		// that wanted `stop`, `destroy`, or `unlock` would have to do first — but a
+		// type alone cannot catch a cast, and asserting the keys of an object the
+		// test wrote constrains nothing at all.
+		const touched = new Set<string>();
+		const backing: RecoveryClient = {
+			listRuns: async () => page([observation()]),
 			requestRecovery: async () => ({
 				operation: operation({ phases: ["accepted"] }),
 				joined: false,
 			}),
 			getRecovery: async () => operation({ phases: ["accepted", "recovered"] }),
 		};
-		expect(Object.keys(surface).sort()).toEqual([
+		const spy = new Proxy(backing, {
+			get(target, property, receiver) {
+				if (typeof property === "string") touched.add(property);
+				return Reflect.get(target, property, receiver);
+			},
+		}) as RecoveryClient;
+
+		const target = await resolveRecoveryTarget(spy, {
+			workspaceId: "ws-1",
+			issue: "NOR-402",
+		});
+		await spy.requestRecovery({
+			schemaVersion: 1,
+			runId: target.runId,
+			expectedRevision: target.expectedRevision,
+			idempotencyKey: "cyrec_0123456789abcdef",
+		});
+		await followRecoveryOperation(spy, {
+			operation: operation({ phases: ["accepted"] }),
+			onPhase: () => {},
+			now: () => 0,
+			sleep: async () => {},
+			intervalMs: 1,
+			timeoutMs: 60_000,
+		});
+
+		expect([...touched].sort()).toEqual([
 			"getRecovery",
 			"listRuns",
 			"requestRecovery",
 		]);
 	});
 
-	it("never converts a refusal into a usage error", async () => {
-		// A refused recovery is a valid answer the router gave deliberately, so it
-		// belongs to the `outcome` category and not to `usage`.
-		const refused = new OutcomeError("refused");
-		expect(refused.exitCode).toBe(ExitCode.outcome);
+	it("reports a refusal as an outcome, never as a usage error", async () => {
+		// Exercised through the workflow rather than by constructing an error: a
+		// refusal is a valid answer the router gave deliberately, so it must keep
+		// the `outcome` category all the way out. `resolveRecoveryTarget`'s own
+		// refusals are the opposite — an ambiguous issue IS a mistyped command.
+		const router = client({
+			listRuns: () =>
+				page([
+					observation({ runId: "run-a" }),
+					observation({ runId: "run-b", lifecycle: "waiting" }),
+				]),
+		});
+		const ambiguous = await resolveRecoveryTarget(router, {
+			workspaceId: "ws-1",
+			issue: "NOR-402",
+		}).catch((thrown) => thrown);
+		expect((ambiguous as UsageError).exitCode).toBe(ExitCode.usage);
+		expect(new OutcomeError("refused").exitCode).toBe(ExitCode.outcome);
 	});
 });

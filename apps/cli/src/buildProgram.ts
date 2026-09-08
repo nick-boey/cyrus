@@ -119,6 +119,38 @@ export function addFleetSelectionOptions(command: Command): Command {
 }
 
 /**
+ * Makes Commander's OWN parse failures exit with the remote-operator category,
+ * for a command and everything under it.
+ *
+ * Without this the ADR-0011 contract stops at the command's front door.
+ * `RunsCommand`, `LogsCommand`, and `RecoverCommand` each refuse an unknown
+ * option or a surplus argument as a {@link UsageError} — but Commander detects
+ * both first and exits `1` on its own, so the code those commands compute is
+ * never reached and every README that documents `2` for "invalid invocation" is
+ * wrong about the case an orchestrator hits most.
+ *
+ * Scoped to the remote vocabulary rather than installed on the program, because
+ * these are the commands whose exit codes are a published contract; `cyrus
+ * start` and `cyrus router …` keep Commander's `1` and are not part of it.
+ *
+ * A zero-exit "error" is help or `--version` — Commander has already written
+ * the output and is only asking to exit, so it exits successfully. Anything else
+ * becomes a `UsageError`, which `app.ts` maps to exit `2` alongside every
+ * refusal the commands raise themselves.
+ */
+function applyOperatorExitCodes(command: Command): Command {
+	command.exitOverride((error) => {
+		if (error.exitCode === 0) process.exit(0);
+		throw new UsageError(error.message);
+	});
+	// Applied to descendants explicitly: Commander runs the override belonging to
+	// the command that DETECTED the error, which for an unknown option on
+	// `recover status` is the subcommand, not this one.
+	for (const child of command.commands) applyOperatorExitCodes(child);
+	return command;
+}
+
+/**
  * Resolves the profile BEFORE the program is built, because the profile decides
  * which commands exist and Commander cannot report an option it has not parsed
  * yet. Explicit `--profile` beats the environment default, so one installation
@@ -207,6 +239,13 @@ export function buildProgram(
 			continue;
 		}
 		register();
+		// AFTER registration, so the whole subtree exists to walk. These are the
+		// commands whose exit codes are a published contract, and Commander's own
+		// `1` for an unknown option would otherwise contradict it.
+		const registered = program.commands.find(
+			(command) => command.name() === name,
+		);
+		if (registered) applyOperatorExitCodes(registered);
 	}
 
 	if (profile === "remote") {
@@ -1404,16 +1443,19 @@ function registerRecoverCommand(
 			) => {
 				await runRecover(
 					[
-						...(runId ? [runId] : []),
-						...(cmdOpts.issue ? ["--issue", cmdOpts.issue] : []),
-						...(cmdOpts.expectedRevision
-							? ["--expected-revision", cmdOpts.expectedRevision]
-							: []),
-						...(cmdOpts.idempotencyKey
-							? ["--idempotency-key", cmdOpts.idempotencyKey]
-							: []),
+						...(runId !== undefined ? [runId] : []),
+						// `!== undefined`, never truthiness. Commander yields `""` for
+						// `--expected-revision ""` — which is what
+						// `--expected-revision "$REV"` produces when `REV` is unset — and
+						// dropping it there would silently replace the caller's
+						// conditional request with one conditional on whatever the run
+						// looks like now. `RecoverCommand` refuses the empty value; this
+						// is what lets it see it at all.
+						...forwardValue("--issue", cmdOpts.issue),
+						...forwardValue("--expected-revision", cmdOpts.expectedRevision),
+						...forwardValue("--idempotency-key", cmdOpts.idempotencyKey),
 						...(cmdOpts.wait === false ? ["--no-wait"] : []),
-						...(cmdOpts.timeout ? ["--timeout", cmdOpts.timeout] : []),
+						...forwardValue("--timeout", cmdOpts.timeout),
 						...(cmdOpts.json ? ["--json"] : []),
 						...(cmdOpts.ndjson ? ["--ndjson"] : []),
 					],
@@ -1455,7 +1497,7 @@ function registerRecoverCommand(
 					"status",
 					operationId,
 					...(cmdOpts.wait ? ["--wait"] : []),
-					...(cmdOpts.timeout ? ["--timeout", cmdOpts.timeout] : []),
+					...forwardValue("--timeout", cmdOpts.timeout),
 					...(cmdOpts.json ? ["--json"] : []),
 					...(cmdOpts.ndjson ? ["--ndjson"] : []),
 				],
@@ -1463,4 +1505,17 @@ function registerRecoverCommand(
 			);
 		},
 	);
+}
+
+/**
+ * Re-emits a parsed option value as argv, preserving an EMPTY one.
+ *
+ * A command owns its own argv parser (so it stays drivable without Commander),
+ * which makes every `register*` function a place where a value can be lost in
+ * translation. Truthiness loses `""`, and a dropped flag is indistinguishable
+ * from one never typed — so a shell that expanded an unset variable gets the
+ * command's default behaviour instead of an error.
+ */
+function forwardValue(flag: string, value: string | undefined): string[] {
+	return value === undefined ? [] : [flag, value];
 }

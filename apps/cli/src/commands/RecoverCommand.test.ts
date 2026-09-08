@@ -613,6 +613,51 @@ describe("cyrus recover — exit categories", () => {
 		expect(await exitCodeOf(cmd, ["run-1"])).toBe(ExitCode.transient);
 	});
 
+	it("reports a router that advertises recovery but does not serve it as a misconfiguration", async () => {
+		// Fastify's own 404 body is `{"error":"Not Found",…}`. Read as a refusal it
+		// would reach the operator as `refused the recovery (Not Found)` — a
+		// routing failure rendered as a decision the router made about their run —
+		// and would retire the message that names the real problem.
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[RUNS_PATH]: () => json(page([observation()])),
+			[RECOVERIES_PATH]: () =>
+				json(
+					{
+						message: "Route POST:/api/v1/recoveries not found",
+						error: "Not Found",
+						statusCode: 404,
+					},
+					404,
+				),
+		});
+		const { cmd, out } = command(fetchFn);
+		expect(await exitCodeOf(cmd, ["run-1"])).toBe(ExitCode.usage);
+		const diagnostics = out.diagnostics.join("\n");
+		expect(diagnostics).toContain("does not serve");
+		expect(diagnostics).not.toContain("refused the recovery");
+	});
+
+	it("still reports a run the connection cannot see as a refusal", async () => {
+		// The other 404 on the same route, and the reason the check is a closed set
+		// of codes rather than a blanket "any 404 is a routing failure".
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[RUNS_PATH]: () => json(page([observation()])),
+			[RECOVERIES_PATH]: () =>
+				json(
+					{
+						error: "run_not_found",
+						message: "No such run, or it is not one this principal may read",
+					},
+					404,
+				),
+		});
+		const { cmd, out } = command(fetchFn);
+		expect(await exitCodeOf(cmd, ["run-1"])).toBe(ExitCode.usage);
+		expect(out.diagnostics.join("\n")).toContain("No such run");
+	});
+
 	it("exits 2 when the router does not serve guarded recovery, before any request", async () => {
 		const { fetchFn, calls } = router({
 			[CONTEXT_PATH]: () =>
@@ -741,6 +786,67 @@ describe("cyrus recover status <operationId>", () => {
 		const { cmd } = command(fetchFn);
 		expect(await exitCodeOf(cmd, ["status"])).toBe(ExitCode.usage);
 	});
+
+	it("emits no `accepted` event under --ndjson, because it accepted nothing", async () => {
+		// A read is not a request. An `accepted` line here would make a stored
+		// stream of a status read indistinguishable from one of a mutation.
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[`${RECOVERIES_PATH}/:id`]: () =>
+				json(operation({ phases: ["accepted", "recovered"] })),
+		});
+		const { cmd, out } = command(fetchFn);
+		await exitCodeOf(cmd, ["status", "op-1", "--ndjson"]);
+		const events = out.data_.map((line) => JSON.parse(line));
+		expect(events.map((event) => event.event)).toEqual([
+			"phase",
+			"phase",
+			"result",
+		]);
+		// `result` still carries every field `accepted` would have, so nothing a
+		// reader needs is lost by its absence.
+		expect(events[events.length - 1]).toMatchObject({
+			operationId: "op-1",
+			runId: "run-1",
+			idempotencyKey: expect.any(String),
+			expectedRevision: expect.any(Number),
+		});
+	});
+
+	it("does not demand --workspace on a connection authorizing several", async () => {
+		// The route takes no workspace and an operation id is globally unique, so
+		// requiring one would block an orchestrator resuming the id `--no-wait`
+		// handed it — to narrow a request with nothing to narrow.
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () =>
+				json(
+					context({
+						authorizedWorkspaces: [
+							{ workspaceId: "ws-1", name: "One" },
+							{ workspaceId: "ws-2", name: "Two" },
+						],
+					}),
+				),
+			[`${RECOVERIES_PATH}/:id`]: () =>
+				json(operation({ phases: ["accepted", "recovered"] })),
+		});
+		const { cmd } = command(fetchFn);
+		expect(await exitCodeOf(cmd, ["status", "op-1"])).toBe(ExitCode.success);
+	});
+
+	it("still refuses a --workspace that is not authorized", async () => {
+		// Skipping the requirement must not mean skipping the validation: a
+		// misspelled workspace silently ignored is its own trap.
+		const { fetchFn } = router({
+			[CONTEXT_PATH]: () => json(context()),
+			[`${RECOVERIES_PATH}/:id`]: () =>
+				json(operation({ phases: ["accepted", "recovered"] })),
+		});
+		const { cmd } = command(fetchFn);
+		expect(
+			await exitCodeOf(cmd, ["status", "op-1"], { workspace: "ws-typo" }),
+		).toBe(ExitCode.usage);
+	});
 });
 
 /* ----------------------------------------------------------------- output */
@@ -807,9 +913,49 @@ describe("cyrus recover — output modes", () => {
 	});
 
 	it("refuses an unknown option rather than ignoring it", async () => {
+		// This drives `execute()` directly, so it covers the command's OWN parser —
+		// which is what a caller re-entering by argv reaches, and the layer that
+		// still decides combinations Commander cannot see (an empty value, or
+		// `--timeout` beside `--no-wait`). Through the shipped binary, Commander
+		// rejects `--force` before this code runs; that path is asserted in
+		// `buildProgram.test.ts`, which is where the exit code an operator
+		// actually receives is pinned.
 		const { fetchFn } = recoveringRouter();
 		const { cmd } = command(fetchFn);
 		expect(await exitCodeOf(cmd, ["run-1", "--force"])).toBe(ExitCode.usage);
+	});
+
+	it.each([
+		["--expected-revision"],
+		["--idempotency-key"],
+		["--issue"],
+		["--timeout"],
+	])("refuses an empty %s rather than treating it as absent", async (flag) => {
+		// `--expected-revision "$REV"` with REV unset reaches here as an empty
+		// string. Dropping it would substitute the command's own fresh read for
+		// the caller's evidence — the exact substitution the flag exists to
+		// prevent — and an empty `--idempotency-key` would start a competing
+		// operation where the caller meant to join their own.
+		const { fetchFn, calls } = recoveringRouter();
+		const { cmd } = command(fetchFn);
+		expect(await exitCodeOf(cmd, ["run-1", flag, ""])).toBe(ExitCode.usage);
+		expect(calls.some((call) => call.method === "POST")).toBe(false);
+	});
+
+	it("refuses --timeout with --no-wait, which has no wait to bound", async () => {
+		const { fetchFn } = recoveringRouter();
+		const { cmd } = command(fetchFn);
+		expect(
+			await exitCodeOf(cmd, ["run-1", "--no-wait", "--timeout", "30"]),
+		).toBe(ExitCode.usage);
+	});
+
+	it("refuses --timeout on a status read that is not following", async () => {
+		const { fetchFn } = recoveringRouter();
+		const { cmd } = command(fetchFn);
+		expect(await exitCodeOf(cmd, ["status", "op-1", "--timeout", "30"])).toBe(
+			ExitCode.usage,
+		);
 	});
 
 	it("keeps every diagnostic off stdout", async () => {
@@ -853,9 +999,52 @@ describe("cyrus recover — what it must never print", () => {
 		);
 	});
 
+	// The two fields on an operation whose text the ROUTER composes, and so the
+	// only places a credential from a failing call can ride back to us. Everything
+	// else on the document is a closed enum, an id, a boolean, or a number.
+	const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJlaGVyZQ";
+	const LEAKY_OPERATION = () =>
+		operation({
+			phases: ["accepted", "starting_executor", "failed"],
+			failure: { message: `azure call failed: Bearer ${JWT}` },
+		});
+
+	it.each(["--json", "--ndjson", "--human"])(
+		"redacts a credential the router put in a failure message (%s)",
+		async (mode) => {
+			const leaky = LEAKY_OPERATION();
+			// The phase detail is the same class of field, so it carries a second
+			// credential shape — an operator token — to prove both are covered.
+			const withDetail = {
+				...leaky,
+				phases: leaky.phases.map((phase, index) =>
+					index === 1
+						? { ...phase, detail: `booting with ${OPERATOR_TOKEN}` }
+						: phase,
+				),
+			};
+			const { fetchFn } = recoveringRouter({ polled: [withDetail] });
+			const { cmd, out } = command(fetchFn);
+			await exitCodeOf(cmd, mode === "--human" ? ["run-1"] : ["run-1", mode]);
+
+			const printed = [...out.data_, ...out.diagnostics].join("\n");
+			// stdout is the half that was leaking: `--json` and `--ndjson` serialize
+			// the operation whole, and those are the modes an orchestrator pipes.
+			expect(printed).not.toContain(JWT);
+			expect(printed).not.toContain(OPERATOR_TOKEN);
+			// Redacted, not dropped — the operator still has to see that the call
+			// failed and that something was removed.
+			expect(printed).toContain("azure call failed");
+			expect(printed).toContain("[redacted]");
+		},
+	);
+
 	it("prints no prompt text or comment body", async () => {
 		// A run observation carries no prompt text by contract; this asserts the
-		// command does not go looking for any either.
+		// command does not go looking for any either. Weak on its own — nothing
+		// here could emit those literals — so it is paired with the redaction
+		// tests above, which put real credential shapes in the fields that CAN
+		// carry them.
 		const { fetchFn } = recoveringRouter();
 		const { cmd, out } = command(fetchFn);
 		await exitCodeOf(cmd, ["run-1", "--json"]);

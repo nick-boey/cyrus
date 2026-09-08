@@ -30,6 +30,7 @@ import {
 	type RecoveryOutcome,
 	recoveryDocument,
 	recoveryResultEvent,
+	redactRecoveryPhaseTransition,
 	renderRecoveryOutcome,
 	renderRecoveryPhase,
 } from "../remote/output.js";
@@ -176,7 +177,13 @@ export class RecoverCommand extends BaseCommand {
 	): Promise<void> {
 		const options = parseOptions(argv, {
 			usage: RECOVER_USAGE,
-			allow: ["issue", "expectedRevision", "idempotencyKey", "noWait"],
+			allow: [
+				"issue",
+				"expectedRevision",
+				"idempotencyKey",
+				"noWait",
+				"timeout",
+			],
 			positionals: 1,
 		});
 		const runId = options.positional[0];
@@ -189,12 +196,16 @@ export class RecoverCommand extends BaseCommand {
 		// nothing. A listing is needed only when a revision has to be read.
 		const needsListing =
 			options.expectedRevision === undefined || !!options.issue;
-		const { client, workspace } = await this.connect(context, options, [
-			"recoveries.request",
-			...(needsListing ? (["runs.list"] as const) : []),
-		]);
+		const { client, workspace } = await this.connect(
+			context,
+			options,
+			["recoveries.request", ...(needsListing ? (["runs.list"] as const) : [])],
+			needsListing,
+		);
 		const target = await resolveRecoveryTarget(client, {
-			workspaceId: workspace.workspaceId,
+			// `needsListing` decides both the scope and whether a listing happens,
+			// so a workspace is present exactly when one will be queried.
+			workspaceId: workspace?.workspaceId,
 			...(runId !== undefined ? { runId } : {}),
 			...(options.issue !== undefined ? { issue: options.issue } : {}),
 			...(options.expectedRevision !== undefined
@@ -260,15 +271,21 @@ export class RecoverCommand extends BaseCommand {
 	): Promise<void> {
 		const options = parseOptions(argv, {
 			usage: STATUS_USAGE,
-			allow: ["wait"],
+			allow: ["wait", "timeout"],
 			positionals: 1,
 		});
 		const operationId = options.positional[0];
 		if (!operationId) throw new UsageError(`Usage: ${STATUS_USAGE}`);
 
-		const { client } = await this.connect(context, options, [
-			"recoveries.request",
-		]);
+		// Unscoped: an operation id is globally unique, the route takes no
+		// workspace, and the router authorizes the read against the caller's own
+		// authority. See `connect`.
+		const { client } = await this.connect(
+			context,
+			options,
+			["recoveries.request"],
+			false,
+		);
 		const operation = await client.getRecovery(operationId);
 		const report = this.reporter(options);
 
@@ -363,18 +380,22 @@ export class RecoverCommand extends BaseCommand {
 				);
 			},
 			phase: (operation, transition) => {
+				// Redacted HERE, not only in the final document: a phase is emitted
+				// as it lands, straight off the operation the router just returned,
+				// so this event never passes through `recoveryDocument`. `detail` is
+				// router-composed free text and carries whatever a failing call put
+				// in an exception message.
+				const safe = redactRecoveryPhaseTransition(transition);
 				ndjson({
 					schemaVersion: 1,
 					event: "phase",
-					observedAt: transition.enteredAt,
+					observedAt: safe.enteredAt,
 					operationId: operation.operationId,
-					phase: transition.phase,
-					...(transition.detail !== undefined
-						? { detail: transition.detail }
-						: {}),
+					phase: safe.phase,
+					...(safe.detail !== undefined ? { detail: safe.detail } : {}),
 				});
 				if (options.json || options.ndjson) return;
-				this.out.data(renderRecoveryPhase(transition));
+				this.out.data(renderRecoveryPhase(safe));
 			},
 			result: (document) => {
 				if (options.ndjson) {
@@ -404,7 +425,26 @@ export class RecoverCommand extends BaseCommand {
 		context: RecoverCommandContext,
 		options: RecoverOptions,
 		capabilities: readonly OperatorCapabilityV1[],
-	): Promise<{ client: OperatorHttpClient; workspace: AuthorizedWorkspaceV1 }> {
+		/**
+		 * Whether this invocation will actually SCOPE anything to a workspace.
+		 *
+		 * `selectWorkspace` refuses when a connection authorizes more than one and
+		 * none was named, which is right for a query that has to be scoped and
+		 * wrong for one that never is: `recover status <operationId>` reads a
+		 * globally unique id off a route that takes no workspace, and
+		 * `recover <runId> --expected-revision <n>` makes no query at all. Demanding
+		 * `--workspace` there would block an orchestrator resuming an operation id
+		 * that `--no-wait` handed it, to narrow a request that has nothing to
+		 * narrow.
+		 *
+		 * An explicitly NAMED workspace is still validated either way — silently
+		 * ignoring a misspelled one would be its own trap.
+		 */
+		scoped: boolean,
+	): Promise<{
+		client: OperatorHttpClient;
+		workspace: AuthorizedWorkspaceV1 | undefined;
+	}> {
 		const record = this.store.select(options.connection ?? context.connection);
 		const client = new OperatorHttpClient({
 			baseUrl: record.connection.url,
@@ -418,10 +458,11 @@ export class RecoverCommand extends BaseCommand {
 		for (const capability of capabilities) {
 			requireCapability(operatorContext, capability);
 		}
-		const workspace = selectWorkspace(
-			operatorContext,
-			options.workspace ?? context.workspace,
-		);
+		const requested = options.workspace ?? context.workspace;
+		const workspace =
+			scoped || requested !== undefined
+				? selectWorkspace(operatorContext, requested)
+				: undefined;
 		return { client, workspace };
 	}
 }
@@ -523,7 +564,12 @@ function parseOptions(
 	spec: {
 		usage: string;
 		allow: ReadonlyArray<
-			"issue" | "expectedRevision" | "idempotencyKey" | "noWait" | "wait"
+			| "issue"
+			| "expectedRevision"
+			| "idempotencyKey"
+			| "noWait"
+			| "wait"
+			| "timeout"
 		>;
 		positionals: number;
 	},
@@ -540,8 +586,15 @@ function parseOptions(
 	const refuse = (flag: string): never => {
 		throw new UsageError(`${flag} does not apply here. Usage: ${spec.usage}`);
 	};
+	// An EMPTY value is refused, not treated as absent, and on this command that
+	// is a safety property rather than tidiness. `--expected-revision ""` — what
+	// `--expected-revision "$REV"` produces when `REV` is unset — would otherwise
+	// drop the flag and let the command read a revision of its own, silently
+	// turning the caller's conditional request into one conditional on whatever
+	// is true now. `--idempotency-key ""` would mint a fresh key and start a
+	// COMPETING operation where the caller meant to join their own.
 	const value = (raw: string | undefined, flag: string): string => {
-		if (raw === undefined || raw.startsWith("-")) {
+		if (raw === undefined || raw.length === 0 || raw.startsWith("-")) {
 			throw new UsageError(`${flag} requires a value.`);
 		}
 		return raw;
@@ -590,6 +643,7 @@ function parseOptions(
 				options.idempotencyKey = value(argv[++i], arg);
 				break;
 			case "--timeout": {
+				if (!permits("timeout")) refuse(arg);
 				const raw = value(argv[++i], arg);
 				const seconds = Number(raw);
 				if (!Number.isFinite(seconds) || seconds <= 0) {
@@ -620,6 +674,20 @@ function parseOptions(
 		// caller that asked for both has a parser expecting one of them.
 		throw new UsageError(
 			"--json and --ndjson cannot be combined: --json emits one document, --ndjson emits one event per line.",
+		);
+	}
+	// The same rule as an unknown option, applied to a combination: a `--timeout`
+	// beside `--no-wait` bounds a wait that never happens, and one on a `status`
+	// that is not following bounds a single request. Both parse and do nothing,
+	// which reads to whoever typed them as a bound that was applied.
+	if (
+		options.timeoutMs !== undefined &&
+		(options.noWait || (spec.allow.includes("wait") && !options.wait))
+	) {
+		throw new UsageError(
+			options.noWait
+				? "--timeout does not apply with --no-wait: there is no wait to bound."
+				: "--timeout applies only with --wait. `cyrus recover status <operationId>` reads the operation once.",
 		);
 	}
 	if (options.positional.length > spec.positionals) {

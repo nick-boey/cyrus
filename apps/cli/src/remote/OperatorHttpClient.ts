@@ -282,11 +282,9 @@ export class OperatorHttpClient {
 	): Promise<unknown> {
 		if (response.ok) return this.readJson(response, path);
 
-		// Cloned so the shared `readJson` fallback below can still read the body.
-		const text = await response
-			.clone()
-			.text()
-			.catch(() => "");
+		// Read ONCE. The body has to be inspected before we know whether the
+		// generic mapping applies, and a `Response` body cannot be read twice.
+		const text = await this.bodyText(response);
 		const refusal = parseRefusal(text);
 		if (refusal && (response.status === 409 || response.status === 404)) {
 			const detail = describeRefusalDetail(refusal);
@@ -296,14 +294,22 @@ export class OperatorHttpClient {
 				: new UsageError(message);
 		}
 		if (response.status === 404) {
-			// No recognizable refusal on a 404 means the ROUTE is missing, not the
-			// run. Reachable only if a router advertises `recoveries.request` and
-			// does not serve the resource, which is a router defect worth naming.
+			// No RECOGNIZED refusal on a 404 means the route is missing, not the
+			// run — reachable when a router advertises `recoveries.request` and does
+			// not serve the resource. Distinguishing the two is why `parseRefusal`
+			// matches a closed set of codes instead of any body with an `error`
+			// string: Fastify's own 404 is `{"error":"Not Found",…}`, which would
+			// otherwise be rendered to an operator as
+			// `refused the recovery (Not Found)` — a router misconfiguration
+			// reported as a decision about their run.
 			throw new UsageError(
 				`${this.baseUrl} does not serve ${path}, although it advertises the "recoveries.request" capability. The router is misconfigured or too old.`,
 			);
 		}
-		return this.readJson(response, path);
+		this.throwForStatus(response.status, text, path);
+		// Unreachable: `throwForStatus` always throws on a non-2xx status, and
+		// `response.ok` was checked above.
+		return undefined;
 	}
 
 	private async readAuthorizedJson(
@@ -418,31 +424,7 @@ export class OperatorHttpClient {
 	 */
 	private async readJson(response: Response, path: string): Promise<unknown> {
 		if (!response.ok) {
-			const text = await response.text().catch(() => "");
-			const body = summarizeBody(text);
-			const detail = body ? `: ${body}` : "";
-			if (response.status === 401 || response.status === 403) {
-				throw new AuthorizationError(
-					`${this.baseUrl}${path} refused the request (${response.status})${detail}`,
-				);
-			}
-			if (response.status === 429 || response.status >= 500) {
-				throw new TransientError(
-					`${this.baseUrl}${path} failed (${response.status})${detail}`,
-				);
-			}
-			// A cursor from a previous router process. Its own category, because a
-			// watch RECOVERS from it — re-snapshot and resume — while every other
-			// 4xx here is the operator's to fix.
-			if (response.status === 410) {
-				throw new StreamEpochChangedError(
-					`${this.baseUrl}${path} no longer serves that cursor (410); the router restarted${detail}`,
-				);
-			}
-			throw new UsageError(
-				describeAmbiguousName(text) ??
-					`${this.baseUrl}${path} rejected the request (${response.status})${detail}`,
-			);
+			this.throwForStatus(response.status, await this.bodyText(response), path);
 		}
 		try {
 			return await response.json();
@@ -451,6 +433,48 @@ export class OperatorHttpClient {
 				cause: error,
 			});
 		}
+	}
+
+	/** The response body as text, or `""` if it could not be read. */
+	private async bodyText(response: Response): Promise<string> {
+		return response.text().catch(() => "");
+	}
+
+	/**
+	 * Maps a non-2xx status onto the category an orchestrator should act on.
+	 *
+	 * Takes the body as TEXT rather than a `Response` so a caller that has
+	 * already inspected the body can reuse it. A body can only be read once, and
+	 * the recovery path has to look inside it before deciding whether this
+	 * generic mapping applies at all.
+	 *
+	 * @returns never — declared `void` only so callers read as statements.
+	 */
+	private throwForStatus(status: number, text: string, path: string): void {
+		const body = summarizeBody(text);
+		const detail = body ? `: ${body}` : "";
+		if (status === 401 || status === 403) {
+			throw new AuthorizationError(
+				`${this.baseUrl}${path} refused the request (${status})${detail}`,
+			);
+		}
+		if (status === 429 || status >= 500) {
+			throw new TransientError(
+				`${this.baseUrl}${path} failed (${status})${detail}`,
+			);
+		}
+		// A cursor from a previous router process. Its own category, because a
+		// watch RECOVERS from it — re-snapshot and resume — while every other
+		// 4xx here is the operator's to fix.
+		if (status === 410) {
+			throw new StreamEpochChangedError(
+				`${this.baseUrl}${path} no longer serves that cursor (410); the router restarted${detail}`,
+			);
+		}
+		throw new UsageError(
+			describeAmbiguousName(text) ??
+				`${this.baseUrl}${path} rejected the request (${status})${detail}`,
+		);
 	}
 }
 
@@ -475,6 +499,26 @@ const RECOVERY_OUTCOME_CODES: ReadonlySet<string> = new Set([
 	"run_already_terminal",
 ]);
 
+/**
+ * Every refusal code the recovery resource emits, and nothing else.
+ *
+ * A CLOSED set rather than "any body carrying an `error` string", because the
+ * things that answer a 404 on this path are not all the router's recovery
+ * resource. Fastify's own not-found body is
+ * `{"message":"Route GET:… not found","error":"Not Found","statusCode":404}` —
+ * which parses as a refusal under the permissive rule and reaches the operator
+ * as `refused the recovery (Not Found)`. That reads as a decision the router
+ * made about their run, when it is a router that does not serve the route at
+ * all, and it silently retires the message that says so.
+ */
+const RECOVERY_REFUSAL_CODES: ReadonlySet<string> = new Set([
+	"stale_revision",
+	"run_already_terminal",
+	"idempotency_key_conflict",
+	"run_not_found",
+	"operation_not_found",
+]);
+
 interface RecoveryRefusalBody {
 	error: string;
 	message?: string;
@@ -491,7 +535,8 @@ function parseRefusal(body: string): RecoveryRefusalBody | undefined {
 		return undefined;
 	}
 	const refusal = parsed as Partial<RecoveryRefusalBody> | null;
-	return typeof refusal?.error === "string"
+	return typeof refusal?.error === "string" &&
+		RECOVERY_REFUSAL_CODES.has(refusal.error)
 		? (refusal as RecoveryRefusalBody)
 		: undefined;
 }

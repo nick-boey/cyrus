@@ -1341,6 +1341,42 @@ describe("buildProgram — Commander wiring for `recover`", () => {
 		).toEqual([REQUEST_SHIM, "status"].sort());
 	});
 
+	it("forwards an empty option value rather than dropping it", async () => {
+		// `--expected-revision "$REV"` with REV unset arrives as `""`. Dropped by a
+		// truthiness check, the command would substitute a fresh read of its own
+		// for the caller's evidence — silently turning a conditional recovery into
+		// an unconditional one. It must reach `RecoverCommand`, which refuses it.
+		await run(["recover", "run-1", "--expected-revision", ""]);
+		expect(recoverExecute).toHaveBeenCalledWith(
+			["run-1", "--expected-revision", ""],
+			{ connection: undefined, workspace: undefined },
+		);
+	});
+
+	it("exits 2 for a Commander parse failure, not Commander's own 1", async () => {
+		// Without this the ADR-0011 contract stops at the command's front door:
+		// `RecoverCommand` computes `2` for an unknown option, but Commander
+		// detects it first and exits `1`, so the code the command chose is never
+		// reached. Driven through the real program — an `execute()`-level test
+		// asserts a path the shipped binary never takes.
+		const program = newProgram();
+		const { UsageError: Usage } = await import("./remote/errors.js");
+		program.configureOutput({ writeErr: () => {}, writeOut: () => {} });
+		for (const argv of [
+			["recover", "run-1", "--force"],
+			["recover", "status"],
+			["recover", "run-1", "extra"],
+		]) {
+			const failure = await program
+				.parseAsync(["node", "cyrus", ...argv])
+				.then(() => undefined)
+				.catch((error) => error);
+			expect(failure, `\`cyrus ${argv.join(" ")}\``).toBeInstanceOf(Usage);
+			expect((failure as { exitCode: number }).exitCode).toBe(2);
+		}
+		expect(recoverExecute).not.toHaveBeenCalled();
+	});
+
 	it("never constructs a router, container, or Linear command", async () => {
 		await run(["recover", "run-1"]);
 		expect(routerExecute).not.toHaveBeenCalled();

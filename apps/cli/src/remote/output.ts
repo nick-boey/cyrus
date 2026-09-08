@@ -6,6 +6,7 @@ import type {
 	RunChangeKindV1,
 	RunObservationV1,
 } from "cyrus-operator-protocol";
+import { redactSecrets } from "./errors.js";
 import type { RunFilters } from "./runFilters.js";
 
 /**
@@ -307,17 +308,62 @@ export function recoveryDocument(input: {
 		joined: input.joined,
 		complete: input.outcome !== "pending" && input.outcome !== "timeout",
 		outcome: input.outcome,
-		operation: input.operation,
+		operation: redactRecoveryOperation(input.operation),
 	};
+}
+
+/**
+ * Strips credential material out of the two free-text fields a router controls
+ * on a recovery operation.
+ *
+ * These are the ONLY places on the document where text the router composed —
+ * rather than a closed enum, an id, or a number — reaches an operator, and both
+ * carry whatever a failing call put in an exception message. A coordinator that
+ * reports "azure call failed: Bearer eyJ…" writes a live token to stdout, into
+ * a CI log that outlives it.
+ *
+ * Applied where the DOCUMENT is built rather than where a line is printed, and
+ * that placement is the point: `--json` and `--ndjson` serialize the operation
+ * whole, so redacting only in the human renderer would leave the two modes an
+ * orchestrator actually pipes as the unredacted ones. It is deliberately
+ * separate from {@link RemoteOperatorError} redaction, which covers stderr —
+ * this is the stdout half of the same rule, and the leak this closes was
+ * precisely a message that was redacted on one stream and not the other.
+ */
+export function redactRecoveryOperation(
+	operation: RecoveryOperationV1,
+): RecoveryOperationV1 {
+	return {
+		...operation,
+		phases: operation.phases.map(redactRecoveryPhaseTransition),
+		...(operation.failure
+			? { failure: { message: redactSecrets(operation.failure.message) } }
+			: {}),
+	};
+}
+
+/** The same rule for one transition, whose `detail` the router also composes. */
+export function redactRecoveryPhaseTransition(
+	transition: RecoveryPhaseTransitionV1,
+): RecoveryPhaseTransitionV1 {
+	return transition.detail === undefined
+		? transition
+		: { ...transition, detail: redactSecrets(transition.detail) };
 }
 
 /**
  * One NDJSON line of a `cyrus recover`.
  *
- * The stream opens with `accepted` — which carries the operation id BEFORE any
+ * A REQUEST opens with `accepted` — which carries the operation id BEFORE any
  * phase is known, so a reader killed mid-recovery still has the id it needs to
- * resume — then one `phase` per transition, and closes with a `result`. A
- * truncated stream is therefore distinguishable from a finished one.
+ * resume — then one `phase` per transition, and closes with a `result`.
+ *
+ * `recover status` emits no `accepted`, and deliberately: it makes no request,
+ * so there is nothing for the router to have accepted, and an event saying
+ * otherwise would make a read indistinguishable from a mutation in a stored
+ * stream. It has no need for the early id either — the caller typed it. Both
+ * forms close with `result`, so a truncated stream is still distinguishable
+ * from a finished one in either.
  */
 export type RecoveryEvent =
 	| {
@@ -348,13 +394,19 @@ export function recoveryResultEvent(document: RecoveryDocument): RecoveryEvent {
 	return { schemaVersion: OUTPUT_SCHEMA_VERSION, event: "result", ...rest };
 }
 
-/** One human line per phase the operation entered. */
+/**
+ * One human line per phase the operation entered.
+ *
+ * Redacts here as well as in {@link redactRecoveryOperation}, because the human
+ * path renders a transition as it lands rather than off the finished document —
+ * so this is a second entry point for the same router-composed text, not a
+ * duplicate of a check already made.
+ */
 export function renderRecoveryPhase(
 	transition: RecoveryPhaseTransitionV1,
 ): string {
-	return [transition.enteredAt, transition.phase, transition.detail ?? ""]
-		.join("  ")
-		.trimEnd();
+	const safe = redactRecoveryPhaseTransition(transition);
+	return [safe.enteredAt, safe.phase, safe.detail ?? ""].join("  ").trimEnd();
 }
 
 /**

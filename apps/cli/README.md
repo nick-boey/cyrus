@@ -205,6 +205,15 @@ quoted verbatim and nothing is re-read.
 more than one exits `2`, lists the candidate run ids with their revisions, and
 performs no mutation.
 
+An empty value is refused rather than treated as absent — `--expected-revision
+"$REV"` with `REV` unset exits `2` instead of quietly falling back to a fresh
+read, which would replace the evidence you meant to quote with whatever is true
+now.
+
+Note that `recover --issue` considers **every** non-terminal run, while `cyrus
+runs list` shows only the current run of each agent session. Use `cyrus runs
+list --issue <key> --all-runs` to see the same set a refusal names.
+
 ### Idempotency
 
 Every request carries an idempotency key, and retrying with the same key
@@ -227,15 +236,27 @@ carries an `operationId` that `cyrus recover status <operationId>` can inspect,
 and `--wait` on `status` resumes following. Recovery needs no interactive
 confirmation and never prompts.
 
+`--timeout` bounds a wait, so it is refused where there is no wait to bound —
+alongside `--no-wait`, or on a `status` that is not `--wait`ing. `recover status`
+also does not require `--workspace`, even on a connection authorizing several:
+an operation id is globally unique and the route is not workspace-scoped.
+
 ### Output
 
 - Interactive default: one line per phase, then a sentence saying how it ended.
 - `--json`: a single `{ "schemaVersion": 1, … }` document, including the
   operation's full phase history and before/after evidence.
-- `--ndjson`: one event per line — `accepted`, one `phase` per transition, then
-  `result`. The opening `accepted` carries the operation id before any phase is
-  known, so a reader killed mid-recovery still knows what to resume.
+- `--ndjson`: one event per line. A **request** emits `accepted`, one `phase` per
+  transition, then `result` — the opening `accepted` carries the operation id
+  before any phase is known, so a reader killed mid-recovery still knows what to
+  resume. `recover status` emits no `accepted`, because it makes no request;
+  every field that event would have carried is on its `result`.
 - **stdout carries data only; stderr carries diagnostics.**
+
+The two free-text fields a router controls — an operation's failure message and
+a phase's detail — are stripped of credential material before they are printed,
+on stdout as well as stderr and in all three modes. A value that was removed
+shows as `[redacted]` rather than vanishing.
 
 ### Exit codes
 

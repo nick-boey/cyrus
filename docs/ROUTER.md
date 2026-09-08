@@ -1692,6 +1692,10 @@ that does not advertise `recoveries.request`. It carries no `--force`, no unlock
 and no executor control — see
 [the CLI README](../apps/cli/README.md#guarded-run-recovery).
 
+`recover status` takes no `--workspace`: an operation id is globally unique and
+`GET /api/v1/recoveries/:id` is authorized against the caller's own authority
+rather than scoped to a workspace.
+
 **What is durable either way.** An accepted request becomes a
 `recovery_operations` row carrying the caller, the target run, the observation
 revision quoted, the idempotency key, every phase entered, and the ownership

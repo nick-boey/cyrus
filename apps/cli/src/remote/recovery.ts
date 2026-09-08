@@ -9,6 +9,7 @@ import {
 	type RunObservationV1,
 } from "cyrus-operator-protocol";
 import { TransientError, UsageError } from "./errors.js";
+import { looksLikeIssueIdentifier } from "./runFilters.js";
 
 /**
  * The guarded run-recovery workflow: pick a target, quote the revision it was
@@ -47,13 +48,14 @@ export const DEFAULT_RECOVERY_POLL_INTERVAL_MS = 2_000;
 export const DEFAULT_RECOVERY_TIMEOUT_MS = 600_000;
 
 /**
- * Consecutive transient poll failures tolerated before the follow gives up.
+ * How many consecutive transient poll failures end the follow.
  *
  * A poll is a READ of an operation the router is already driving, so a 503 in
  * the middle of one says nothing about the recovery — abandoning on the first
  * would convert a momentary router hiccup into an exit `6` over work that
  * completed fine. Bounded so a router that has genuinely gone away is still
- * reported rather than waited out to the timeout.
+ * reported rather than waited out to the timeout. Four failures are tolerated
+ * and the fifth is reported.
  */
 export const MAX_TRANSIENT_POLL_FAILURES = 5;
 
@@ -62,6 +64,18 @@ export const MAX_TRANSIENT_POLL_FAILURES = 5;
  * returning the same cursor cannot spin the resolution forever.
  */
 const MAX_LIST_PAGES = 1_000;
+
+/**
+ * The listing command a refusal points an operator at.
+ *
+ * `--all-runs` is not decoration. `cyrus runs list` collapses to the CURRENT run
+ * of each agent session, while resolution here considers every non-terminal run
+ * — so a run stranded under a session that later opened a newer one is named by
+ * a refusal and absent from the listing the refusal recommends. That is exactly
+ * the shape this feature exists for, and sending someone to a command that hides
+ * it reads as the refusal having been about nothing.
+ */
+const LISTING_HINT = "cyrus runs list --all-runs";
 
 /**
  * Everything the recovery workflow is able to ask a router for.
@@ -122,7 +136,12 @@ export function generateIdempotencyKey(
 export async function resolveRecoveryTarget(
 	client: RecoveryClient,
 	input: {
-		workspaceId: string;
+		/**
+		 * Absent only on the one path that queries nothing — a run id with an
+		 * explicit revision. Required for any listing, and its absence there is a
+		 * caller defect rather than an operator one.
+		 */
+		workspaceId?: string;
 		runId?: string;
 		issue?: string;
 		expectedRevision?: number;
@@ -147,14 +166,14 @@ export async function resolveRecoveryTarget(
 			return { runId: input.runId, expectedRevision: input.expectedRevision };
 		}
 		const runs = await listAllRuns(client, {
-			workspace: input.workspaceId,
+			workspace: requireWorkspace(input.workspaceId),
 			runId: input.runId,
 		});
 		const run = runs.find((candidate) => candidate.runId === input.runId);
 		if (!run) {
 			throw new UsageError(
 				`No run ${input.runId} is visible on this connection. It may be mistyped, belong to another workspace, ` +
-					"or have aged out of the router's retention window. `cyrus runs list` shows what is visible.",
+					`or have aged out of the router's retention window. \`${LISTING_HINT}\` shows what is visible.`,
 			);
 		}
 		return { runId: run.runId, expectedRevision: run.revision, run };
@@ -162,7 +181,7 @@ export async function resolveRecoveryTarget(
 
 	const issue = input.issue as string;
 	const runs = await listAllRuns(client, {
-		workspace: input.workspaceId,
+		workspace: requireWorkspace(input.workspaceId),
 		[looksLikeIssueIdentifier(issue) ? "issueKey" : "issueId"]: issue,
 	});
 	const live = runs.filter(
@@ -174,9 +193,8 @@ export async function resolveRecoveryTarget(
 				(runs.length > 0
 					? `${runs.length} run(s) matched, all of them ended. `
 					: "") +
-				"`cyrus runs list --issue " +
-				issue +
-				"` shows what is visible; a run that has ended cannot be recovered.",
+				`\`cyrus runs list --issue ${issue} --all-runs\` shows what is visible; ` +
+				"a run that has ended cannot be recovered.",
 		);
 	}
 	if (live.length > 1) {
@@ -316,11 +334,19 @@ async function listAllRuns(
 }
 
 /**
- * `NOR-402`, `CYPACK-1478` — a Linear issue identifier rather than an id.
+ * Asserts the caller supplied the workspace every listing is scoped to.
  *
- * The same rule `runFilters` uses. The two shapes do not overlap (an id is a
- * UUID), so the choice of query parameter is decidable rather than a guess.
+ * A programming error rather than an operator one: `RecoverCommand` decides
+ * whether a listing will happen and resolves a workspace on exactly that
+ * condition. Checked anyway because the alternative is a query with
+ * `workspace=undefined` in it, which the router answers `400` for — reporting a
+ * CLI defect as though the operator had typed something wrong.
  */
-function looksLikeIssueIdentifier(value: string): boolean {
-	return /^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(value);
+function requireWorkspace(workspaceId: string | undefined): string {
+	if (workspaceId === undefined) {
+		throw new Error(
+			"resolveRecoveryTarget needs a workspace to scope a run listing to",
+		);
+	}
+	return workspaceId;
 }

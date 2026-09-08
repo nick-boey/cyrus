@@ -167,8 +167,15 @@ export function toRunsQuery(
 	return query;
 }
 
-/** `NOR-402`, `CYPACK-1478` — a Linear issue identifier rather than an id. */
-function looksLikeIssueIdentifier(value: string): boolean {
+/**
+ * `NOR-402`, `CYPACK-1478` — a Linear issue identifier rather than an id.
+ *
+ * Exported because `recovery.ts` has to make the same `issueKey`-vs-`issueId`
+ * choice against the same route. Two copies of this regex would diverge silently
+ * — and the failure would be a query sent under the wrong parameter name, which
+ * the router answers with an empty page rather than an error.
+ */
+export function looksLikeIssueIdentifier(value: string): boolean {
 	return /^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(value);
 }
 
