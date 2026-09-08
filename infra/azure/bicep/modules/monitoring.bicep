@@ -462,6 +462,137 @@ resource sandboxStranded 'Microsoft.OperationalInsights/workspaces/savedSearches
   }
 }
 
+// Sandboxes the sweep reclaimed out from behind a stale device row (CYR-84),
+// and the reclaims it abandoned at the last moment.
+//
+// Every reclaim is a container that had been claimed by a session and quiet on
+// EVERY clock — no route, no heartbeat, no agent activity, no run, no fresh
+// claim — for `reclaimStrandedMs`. It is the backstop behind
+// `sandbox.stranded_session`, so a reclaim with no preceding stranded report is
+// worth a look: the report window is meant to be an order of magnitude shorter,
+// and if it never fired, the reclaim clock and the report clock disagree.
+//
+// `skipped` rows are the pre-destroy re-check firing. `activity_observed` there
+// is a session claiming the container during the sweep's round trip to the
+// device — the fix working. A device that skips on every cycle forever is not:
+// that is a container the gate keeps electing and the veto keeps sparing, which
+// means the two are reading different clocks.
+resource sandboxReclaimed 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Sandbox-Stranded-Reclaims'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Stranded sandboxes reclaimed (and reclaims abandoned)'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "sandbox.reclaim_skipped"'
+        '    or (tostring(p.event) == "sandbox.destroyed" and tostring(p["cyrus.reason"]) == "stranded")'
+        '| extend outcome = iff(tostring(p.event) == "sandbox.destroyed", "reclaimed", "skipped")'
+        '| project'
+        '    TimeGenerated,'
+        '    outcome,'
+        '    issue_key = tostring(p["cyrus.issue_key"]),'
+        '    device_id = tostring(p["cyrus.device_id"]),'
+        '    provider  = tostring(p["cyrus.provider"]),'
+        // Only one of the two is ever set: the destroy carries the reclaim
+        // reason, the skip carries the guard that fired.
+        '    skip_reason = iff(outcome == "skipped", tostring(p["cyrus.reason"]), ""),'
+        '    quiet_for = tolong(p["cyrus.quiet_for_ms"]) * 1ms,'
+        '    threshold = tolong(p["cyrus.reclaim_stranded_ms"]) * 1ms,'
+        '    sessions  = toint(p["cyrus.sessions"]),'
+        '    state     = tostring(p["cyrus.state"])'
+        '| order by TimeGenerated desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Registered disk images (CYR-84)
+////////////////////////////////////////////////////////////////////////////////
+//
+// A disk image is registered once per worker build and referenced by nothing
+// until a sandbox boots from it, so the sandbox group accumulates them silently:
+// the 2026-09-08 audit found fourteen totalling 68 GB, eight of them collectable.
+// These two searches are how that stays visible without another audit.
+
+// Storage reclaimed per GC cycle. The one number an operator wants, and the one
+// that says whether the GC is doing anything at all: a long run of cycles with
+// `deleted = 0` and a large `kept` is either a healthy fleet or a protection
+// that has become unconditional, and `Cyrus-Disk-Image-Decisions` below says
+// which.
+resource diskImageGc 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Disk-Image-GC'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Disk-image GC cycles and storage reclaimed'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "sandbox.image_gc_completed"'
+        '| project'
+        '    TimeGenerated,'
+        '    images   = toint(p["cyrus.images"]),'
+        '    deleted  = toint(p["cyrus.deleted"]),'
+        '    kept     = toint(p["cyrus.kept"]),'
+        '    reclaimed_mb = tolong(p["cyrus.reclaimed_mb"]),'
+        '    retention = tolong(p["cyrus.retention_ms"]) * 1ms,'
+        '    retention_count = toint(p["cyrus.retention_count"]),'
+        // A run of cycles with dry_run = true is a deployment still evaluating
+        // the GC, not one whose fleet happens to have nothing collectable.
+        '    dry_run   = tobool(p["cyrus.dry_run"]),'
+        '    duration  = tolong(p["cyrus.duration_ms"]) * 1ms'
+        '| order by TimeGenerated desc'
+      ],
+      '\n'
+    )
+  }
+}
+
+// Why each registered image is still there — or is not.
+//
+// The keep decisions are the point, not the deletes. A wrongly-DELETED rollback
+// image is invisible in any rollup and surfaces only as a boot that cannot find
+// its disk, so the protection that spared each image has to be written down at
+// the time. `retained` is the age-based floor and should churn as builds age
+// out; a reference-based reason (`sandbox_source`, `issue_pin`,
+// `cache_reference`) that never clears is an image pinned by a row that outlived
+// whatever created it.
+resource diskImageDecisions 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = {
+  parent: logAnalytics
+  name: 'Cyrus-Disk-Image-Decisions'
+  properties: {
+    category: 'Cyrus Sandboxes'
+    displayName: 'Registered disk images, by why they were kept or deleted'
+    query: join(
+      [
+        'ContainerAppConsoleLogs_CL'
+        appFilter
+        '| extend p = parse_json(Log_s)'
+        '| where tostring(p.event) == "sandbox.image_decision"'
+        '| summarize'
+        '    cycles     = count(),'
+        '    first_seen = min(TimeGenerated),'
+        '    last_seen  = max(TimeGenerated),'
+        '    size_mb    = max(tolong(p["cyrus.size_mb"])),'
+        '    state      = any(tostring(p["cyrus.state"]))'
+        '  by disk_name = tostring(p["cyrus.disk_name"]),'
+        '     action    = tostring(p["cyrus.action"]),'
+        '     reason    = tostring(p["cyrus.reason"])'
+        '| order by size_mb desc, last_seen desc'
+      ],
+      '\n'
+    )
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Session termination and routing refusals (NOR-402)
 ////////////////////////////////////////////////////////////////////////////////

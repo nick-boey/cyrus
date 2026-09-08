@@ -150,6 +150,21 @@ CREATE TABLE IF NOT EXISTS issue_disk_images (
   deployment_disk TEXT NOT NULL,
   decided_ms INTEGER NOT NULL
 );
+-- When each registered ACA disk image was FIRST seen by the image GC.
+--
+-- The GC's retention policy needs an age, and the ACA data plane does not
+-- reliably return a creation time for a disk image (the spike recorded only
+-- id, name, labels, image, status and sizeInMB). Without a fallback the policy
+-- is either unenforceable or — worse — silently deletes an image it cannot
+-- date. Recording first sight makes the age well-defined for
+-- every disk regardless of what the provider reports, and errs the safe way on
+-- a fresh database: everything looks brand new and nothing is collected until
+-- the retention window has actually elapsed under observation.
+CREATE TABLE IF NOT EXISTS aca_disk_image_sightings (
+  disk_name TEXT PRIMARY KEY,
+  first_seen_ms INTEGER NOT NULL,
+  last_seen_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pending_devcontainer_builds (
   agent_session_id TEXT PRIMARY KEY,
   issue_key TEXT NOT NULL,
@@ -5508,6 +5523,87 @@ export class RouterStore {
 		this.db
 			.prepare("DELETE FROM issue_disk_images WHERE issue_key = ?")
 			.run(issueKey);
+	}
+
+	/**
+	 * Every live issue→disk pin.
+	 *
+	 * The GC needs the DISK NAMES, and {@link referencedDevcontainerCacheKeys}
+	 * cannot always supply them: a pin outlives its cache row whenever the row is
+	 * collected (or was never written, as for a pin made under a since-removed
+	 * repository), and resolving such a key returns `undefined`. Reading the pins
+	 * directly closes that gap — a pinned disk is protected because it is pinned,
+	 * not because a second table still happens to describe it.
+	 */
+	listIssueDiskImages(): IssueDiskImage[] {
+		const rows = this.db
+			.prepare(
+				"SELECT issue_key, repository_name, cache_key, disk_name, image_ref, deployment_disk, decided_ms FROM issue_disk_images",
+			)
+			.all() as Array<{
+			issue_key: string;
+			repository_name: string;
+			cache_key: string;
+			disk_name: string;
+			image_ref: string;
+			deployment_disk: string;
+			decided_ms: number;
+		}>;
+		return rows.map((row) => ({
+			issueKey: row.issue_key,
+			repositoryName: row.repository_name,
+			cacheKey: row.cache_key,
+			diskName: row.disk_name,
+			imageRef: row.image_ref,
+			deploymentDisk: row.deployment_disk,
+			decidedMs: row.decided_ms,
+		}));
+	}
+
+	/**
+	 * Record that these disk images exist right now, and return when each was
+	 * FIRST seen.
+	 *
+	 * One transaction, one round trip, because it is called with the provider's
+	 * whole inventory. Disks absent from `diskNames` have their sightings dropped:
+	 * a disk that is deleted and a disk name that is later re-registered are
+	 * different images, and inheriting the old first-sight would make a brand-new
+	 * image immediately collectable — the single worst way for this table to be
+	 * wrong.
+	 */
+	recordDiskImageSightings(
+		diskNames: readonly string[],
+		nowMs: number,
+	): Map<string, number> {
+		const present = [...new Set(diskNames)];
+		const txn = this.db.transaction(() => {
+			const upsert = this.db.prepare(
+				`INSERT INTO aca_disk_image_sightings (disk_name, first_seen_ms, last_seen_ms)
+				 VALUES (?, ?, ?)
+				 ON CONFLICT(disk_name) DO UPDATE SET last_seen_ms = excluded.last_seen_ms`,
+			);
+			for (const name of present) upsert.run(name, nowMs, nowMs);
+			// Deleting by "not in the current listing" rather than by age: an age
+			// cutoff would keep rows for disks that are long gone, and the whole
+			// point of the row is to describe a disk that exists.
+			const known = this.db
+				.prepare("SELECT disk_name FROM aca_disk_image_sightings")
+				.all() as Array<{ disk_name: string }>;
+			const presentSet = new Set(present);
+			const drop = this.db.prepare(
+				"DELETE FROM aca_disk_image_sightings WHERE disk_name = ?",
+			);
+			for (const row of known) {
+				if (!presentSet.has(row.disk_name)) drop.run(row.disk_name);
+			}
+			const rows = this.db
+				.prepare(
+					"SELECT disk_name, first_seen_ms FROM aca_disk_image_sightings",
+				)
+				.all() as Array<{ disk_name: string; first_seen_ms: number }>;
+			return new Map(rows.map((r) => [r.disk_name, r.first_seen_ms]));
+		});
+		return txn();
 	}
 
 	/** Cache keys still referenced by a live issue pin — the GC's floor. */

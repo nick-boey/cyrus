@@ -67,6 +67,16 @@ export interface AcaDiskImage {
 	image?: string | { base?: string };
 	status?: string | { state?: string; errorMessage?: string };
 	sizeInMB?: number;
+	/**
+	 * NOT observed. The spike recorded `{id, name, labels, image, status,
+	 * sizeInMB}` and no timestamp — unlike {@link AcaSnapshot}, which does return
+	 * one. Declared so the disk-image GC's read of it is an explicit, typed bet on
+	 * a preview API rather than an untyped property access on the index
+	 * signature, and so anyone who later confirms or refutes it has somewhere to
+	 * record that. Treat any value as unverified: `DiskImageCollector` bounds it
+	 * to a plausible range and falls back to its own first-sight record.
+	 */
+	createdAtUtc?: string;
 	[x: string]: any;
 }
 

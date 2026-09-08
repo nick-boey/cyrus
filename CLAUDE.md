@@ -624,6 +624,76 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      `RouterStore.listSessions`' orphan-lock query behind
      `cyrus router sessions list`. Do not read the detector as covering every
      unreachable issue.
+   - **`reclaimStranded` MUST run below the `affinity > 0` gate, and scoping it
+     above that gate makes it unreachable while its tests still pass.**
+     `resolveAffinity` returns non-zero in exactly two situations and each is
+     individually incompatible with a multi-hour quiet threshold: an ONLINE
+     device, whose `last_seen_ms` `DeviceGateway`'s pong handler restamps every
+     30s (so the clock is never over ~90s old), and an OFFLINE device whose
+     newest claim is inside `offlineAgeOutMs`, which the clock folds in. The
+     first cut of CYR-84 shipped it inside the pinned branch and it could never
+     have fired; the tests passed on an `isOnline: true` fixture with a
+     day-stale heartbeat, a state the gateway makes impossible. Any test for this
+     path needs `isOnline: () => false` or a real `touchDevice` stamp.
+     What it actually bounds is the OTHER side of that gate: a leaked affinity
+     row ages out after `offlineAgeOutMs` and the container then sits on
+     `staleDestroyMs`'s three-column, 14-DAY clock (`last_routed_ms`,
+     `last_seen_ms`, `created_ms`) — CYR-84's audit found sandboxes alive for
+     work finished days earlier. The reclaim is the same destroy on 72h, bought
+     with `quietSince`: those three plus `last_progress_ms`, `parked_at_ms`, the
+     newest agent-run stamp and the newest session claim. Three things about that
+     clock are load-bearing. It EXCLUDES `last_active_ms` — the sweep stamps that
+     every pinned tick, so the loop would reset the clock it reads, the same trap
+     `no_progress` documents. It INCLUDES `last_seen_ms`, which `no_progress`
+     excludes, and that is what keeps the `no_progress` shape (live worker
+     holding an issue it stopped working on) detection-only: a heartbeating
+     worker is a live process holding a workspace, and "is it making progress" is
+     a question for a human, not for a destroy. And it is SPLIT —
+     `quietSinceOnRow` (row columns only) before `resolveAffinity`'s round trip
+     to the device, the full version immediately before the destroy — because
+     adjacent checks are theatre: only a gate and a veto on opposite sides of an
+     await can let a session claimed during that await veto anything.
+     `reclaimStrandedMs` must sit strictly between `sessionNoProgressMs` and
+     `staleDestroyMs`, and the constructor warns at BOTH ends: below the first the
+     destroy beats the report a human would act on, at or above the second
+     stale-destroy reaches the row first and the reclaim is inert. `0` disables.
+   - **The disk-image GC had never run in the deployment that needed it, and the
+     reason was the gate, not the algorithm.** It hung off
+     `DevcontainerImageService`, constructed only when `containers.devcontainers`
+     is set — a field `RouterConfigFileSchema` does not model at all, so Zod
+     strips it and no `router-config.json` can enable it. Meanwhile the images
+     that accumulate are the DEPLOYMENT worker images
+     `scripts/deploy-worker-image.sh` registers out of band, one per build, which
+     have no `repo_devcontainer_images` row and so were not candidates under the
+     old cache-table iteration either (14 images / 68 GB, 8 collectable).
+     `DiskImageCollector` reconciles the PROVIDER's inventory and
+     `RouterServer.scheduleDiskImageGc` gates on `containers.aca`; when the
+     devcontainer service exists its collector is REUSED, never a second one.
+     Three invariants inside it. TWO FLOORS, and neither subsumes the other: a
+     staged build and a rollback candidate are both referenced by nothing, so a
+     pure reference count deletes the deploy about to go out and the one you
+     would fall back to (`imageRetentionMs`, 7d) — but an age window alone makes
+     rollback DEPTH a function of deploy cadence, so a deployment shipping less
+     often than the window is long silently keeps nothing
+     (`imageRetentionCount`, 3, counted over unreferenced images only). Second,
+     `aca_disk_image_sightings` exists because the ACA data plane does not date a
+     disk image — the spike recorded `{id, name, labels, image, status,
+     sizeInMB}` and no timestamp — so a policy reading only the wire is silently
+     either a no-op or unbounded depending on what the preview API returns. Age
+     is `min(provider timestamp, first sight)`; a disk absent from a listing has
+     its sighting DROPPED so a re-registered name is dated anew rather than
+     inheriting a first-sight that would make a brand-new image instantly
+     collectable. Third — and this is the one first-sight cannot cover — that
+     `min` means an unsanitised provider timestamp can only ever make an image
+     look OLDER, so it is BOUNDED to a plausible range: the field is undeclared
+     and unobserved, and .NET's `DateTime.MinValue` sentinel parses cleanly and
+     would empty the group in one cycle. Keeps are recorded as fully as deletes
+     (`sandbox.image_decision` carries the protection that applied): a
+     wrongly-deleted rollback image is invisible in a rollup and surfaces only as
+     a boot that cannot find its disk. One router per sandbox group — every
+     store-side protection is read from that router's own DB — which was already
+     true before disk images, since the orphan GC destroys any sandbox with no
+     device row of its own.
    - **A session's terminal signal can be withheld indefinitely, and that is the
      leading suspect whenever an issue goes unreachable.**
      `AgentSessionManager.completeSession` defers `emitTerminalOnce` while the

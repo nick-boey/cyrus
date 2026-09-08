@@ -391,11 +391,15 @@ lookup and silently returns null — so read them with bracket syntax:
 | `sandbox.parked` | a session blocked on a user answer and released affinity. Despite the name this is the **run** waiting, not a container stop — nothing is stopped here, and the container keeps running (and billing) until the idle sweep stops it as `sandbox.idle_stopped`. See [Observe agent runs](#observe-agent-runs) |
 | `sandbox.unparked` | a park was reversed and the agent went back to work |
 | `sandbox.idle_stopped` | the lifecycle sweep parked an affinity-free sandbox past `idleStopMs` |
-| `sandbox.destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown` or `provider_switch` |
+| `sandbox.idle_stop_skipped` | the sweep reached an affinity-free sandbox past `idleStopMs` and spared it anyway. `cyrus.reason` is `row_deleted`, `clock_moved`, `claimed_mid_sweep` or `terminal_settle` |
+| `sandbox.destroyed` | the sandbox and its disk were removed; `reason` is `stale`, `orphan`, `terminal_teardown`, `provider_switch` or `stranded` |
+| `sandbox.reclaim_skipped` | a `stranded` reclaim was abandoned at the pre-destroy re-check. `cyrus.reason` is `row_deleted`, `pending_teardown`, `activity_observed` or `provider_unreadable` |
 | `sandbox.teardown_completed` | a terminal teardown finished; carries `action` and whether the worker's callback or the grace deadline triggered it |
 | `sandbox.stranded_session` | a sandbox holds session affinity it is not working on. `cyrus.reason` is `offline_pinned` (stopped and disconnected, past `strandedSessionGraceMs`) or `no_progress` (running and connected, but nothing routed to it and nothing posted by it past `containers.sessionNoProgressMs`, default 4h). Detection only — neither boots nor releases anything |
 | `sandbox.gauge` | once per sandbox per 60s lifecycle sweep — the point-in-time inventory |
 | `sandbox.sweep_completed` | once per completed sweep, even with zero sandboxes — the fleet rollup. The sweep is non-reentrant, so a tick that fires while the previous one is still running is skipped and logs a warning instead |
+| `sandbox.image_decision` | once per registered disk image per GC cycle. `cyrus.action` is `kept` or `deleted`; on a keep, `cyrus.reason` names the protection that spared it |
+| `sandbox.image_gc_completed` | once per disk-image GC cycle — how many images were inspected, deleted, and how many MB were reclaimed |
 
 Two attributes on `sandbox.gauge` are easy to confuse and mean different things:
 
@@ -1039,6 +1043,32 @@ newest ready image for its repository, or if it is the deployment's own default.
   plans orphan cleanup (`--yes` applies it). Published pricing does not identify
   a snapshot-storage meter, so snapshot cost after preview is unquantified, not
   proven to be free or equivalent to ordinary Blob pricing.
+- Registered **disk images** are reclaimed on their own slow cycle
+  (`containers.aca.imageGcIntervalMs`, default 6 hours), gated on ACA being
+  configured at all rather than on per-repository devcontainer builds — the
+  images that accumulate are the deployment worker images that
+  `scripts/deploy-worker-image.sh` registers, one per build. An image is deleted
+  only when it is named `cyrus-*`, its import is not still in progress, it is
+  referenced by no sandbox, no snapshot lineage, no issue pin and no devcontainer
+  cache row, it is not the deployment disk, it is not one of the
+  `containers.aca.imageRetentionCount` newest unreferenced images (default 3),
+  and it is older than `containers.aca.imageRetentionMs` (default 7 days).
+  The last two floors are both needed and neither subsumes the other: a staged
+  build and a rollback candidate are referenced by nothing, so a pure reference
+  count would delete the deployment about to go out and the one you would fall
+  back to — and an age window alone makes rollback depth depend on how often you
+  deploy, so a deployment shipping less often than the window is long would keep
+  nothing. Set `containers.aca.imageGcDryRun: true` to watch a cycle decide
+  without deleting, or `containers.aca.imageGcEnabled: false` to switch it off.
+  Every keep and delete is reported as `sandbox.image_decision` with the
+  protection that applied.
+- **One router per sandbox group.** Every store-side protection is read from that
+  router's own database, so two routers pointed at the same
+  `containers.aca.sandboxGroup` will each collect the other's disk images. This
+  was already true of sandboxes before disk images joined them — the lifecycle
+  sweep's orphan GC destroys any sandbox in the group with no device row of its
+  own — so a shared group has always been unsafe. The Bicep stack creates one
+  group per deployment.
 
 ### Key Vault and Entra operations
 
@@ -1146,6 +1176,31 @@ OAuth identity, and sends none for the `duplicate` state. Those cases wait for
 the 14-day stale-destroy backstop unless an operator destroys the container.
 Router restart during the in-memory teardown grace also loses that immediate
 callback registration; idle-stop and stale GC still bound it.
+
+That backstop reads three columns — `last_routed_ms`, `last_seen_ms` and
+`created_ms` — and so has to wait 14 days to be sure of anything.
+`containers.reclaimStrandedMs` (default 72 hours, `0` disables) is the same
+destroy on a much shorter window and much stronger evidence: those three columns
+plus the agent's own activity, the newest agent run on the device, any park, and
+the newest session claim. A container quiet on **all** of them is `destroy()`ed,
+snapshots included, and its device row deleted — which releases the affinity rows
+and the issue lock with it.
+
+That is what actually bounds a leaked affinity row. Such a row ages out of the
+sweep's affinity gate after `containers.offlineAgeOutMs` (1 hour), and the
+container then sat on the 14-day clock; the 2026-09-08 audit found ACA sandboxes
+alive for work finished days earlier. It deliberately does **not** reclaim the
+shape that looks alive: a container whose worker is connected has its heartbeat
+restamped every 30 seconds, so it can never reach the threshold. That case is
+`sandbox.stranded_session` with `cyrus.reason = no_progress`, and it stays
+detection-only.
+
+Keep the value between `containers.sessionNoProgressMs` (default 4 hours) and
+`containers.staleDestroyMs` (default 14 days). Below the first, a container would
+be destroyed at or before the moment it is first reported, removing the only
+chance a human has to look at it; at or above the second, stale-destroy reaches
+the container first and reclamation can never fire at all. The router warns at
+startup in either case.
 
 Before deleting Azure infrastructure, follow the ordered sweep in
 [`infra/azure/README.md`](../infra/azure/README.md#teardown): destroy all
