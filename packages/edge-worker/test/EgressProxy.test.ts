@@ -363,6 +363,17 @@ describe("EgressProxy", () => {
 		it("contains expected number of trusted domains", () => {
 			expect(TRUSTED_DOMAINS.length).toBeGreaterThan(180);
 		});
+
+		it("includes Azure public-cloud authentication, resource, and Log Analytics hosts", () => {
+			expect(TRUSTED_DOMAINS).toEqual(
+				expect.arrayContaining([
+					"login.microsoftonline.com",
+					"management.azure.com",
+					"api.loganalytics.io",
+					"api.loganalytics.azure.com",
+				]),
+			);
+		});
 	});
 
 	describe("SOCKS5 proxy", () => {

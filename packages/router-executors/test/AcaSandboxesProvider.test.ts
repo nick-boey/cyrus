@@ -1590,7 +1590,7 @@ describe("AcaSandboxesProvider", () => {
 	});
 
 	describe("D7 default egress allowlist", () => {
-		it("includes GitHub, Anthropic (api+console), Linear (mcp+api), pypi, Rust (index.crates.io + static.rust-lang.org), and the router host from routerUrlForContainers", async () => {
+		it("includes agent services, Azure read access, package registries, and the router host", async () => {
 			const { client, calls } = fakeClient({
 				diskImages: [{ name: "disk-v1" }],
 			});
@@ -1616,6 +1616,14 @@ describe("AcaSandboxesProvider", () => {
 			// repo cannot build without the former.
 			expect(patterns).toContain("index.crates.io");
 			expect(patterns).toContain("static.rust-lang.org");
+			expect(patterns).toEqual(
+				expect.arrayContaining([
+					"login.microsoftonline.com",
+					"management.azure.com",
+					"api.loganalytics.io",
+					"api.loganalytics.azure.com",
+				]),
+			);
 			expect(rules).toContainEqual({
 				pattern: "router.example.com",
 				action: "Allow",

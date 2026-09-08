@@ -51,14 +51,22 @@ RUN apt-get update \
 # image's Debian release (12/bookworm) — update the feed URL if the base moves.
 # `powershell` (pwsh) comes from the same feed — repos that ship .ps1 build or
 # deploy scripts need it, and it publishes for both amd64 and arm64 on
-# bookworm, so no arch special-casing is required. Left unpinned like the SDK
-# above; `apt-get install powershell=<ver>` if you need a reproducible pin.
+# bookworm, so no arch special-casing is required. Azure CLI uses its own
+# Microsoft apt repository; the Log Analytics extension is installed in the
+# system extension directory so the non-root cyrus user can load it. Microsoft
+# documents its query command as GA, but currently marks every published wheel
+# as preview in the extension index, so installation must allow that metadata.
+# All three tools and the extension are intentionally unpinned: the immutable
+# image digest fixes each build.
+ENV AZURE_CORE_COLLECT_TELEMETRY=no
 RUN curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -o /tmp/packages-microsoft-prod.deb \
 	&& dpkg -i /tmp/packages-microsoft-prod.deb \
 	&& rm /tmp/packages-microsoft-prod.deb \
+	&& printf 'Types: deb\nURIs: https://packages.microsoft.com/repos/azure-cli/\nSuites: bookworm\nComponents: main\nArchitectures: %s\nSigned-By: /usr/share/keyrings/microsoft-prod.gpg\n' "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/azure-cli.sources \
 	&& apt-get update \
-	&& apt-get install -y --no-install-recommends dotnet-sdk-10.0 powershell \
-	&& rm -rf /var/lib/apt/lists/*
+	&& apt-get install -y --no-install-recommends azure-cli dotnet-sdk-10.0 powershell \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& az extension add --name log-analytics --system --allow-preview true --yes --only-show-errors
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
 	DOTNET_NOLOGO=1 \
 	DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1

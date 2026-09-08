@@ -81,6 +81,24 @@ const okProbe = async () => ({
 	scopeHeader: "repo, read:org",
 });
 
+const AZURE_ENV_KEYS = [
+	"AZURE_CLIENT_ID",
+	"AZURE_CLIENT_SECRET",
+	"AZURE_TENANT_ID",
+	"AZURE_CORE_COLLECT_TELEMETRY",
+] as const;
+const originalAzureEnv = Object.fromEntries(
+	AZURE_ENV_KEYS.map((key) => [key, process.env[key]]),
+);
+
+afterEach(() => {
+	for (const key of AZURE_ENV_KEYS) {
+		const original = originalAzureEnv[key];
+		if (original === undefined) delete process.env[key];
+		else process.env[key] = original;
+	}
+});
+
 describe("findMissingEnvVars", () => {
 	it("returns an empty array when every required var is present", () => {
 		expect(findMissingEnvVars(baseEnv())).toEqual([]);
@@ -283,6 +301,139 @@ describe("ContainerBootCommand.execute — env validation", () => {
 		expect(logger.error).toHaveBeenCalledWith(
 			expect.stringContaining("CYRUS_ISSUE_KEY"),
 		);
+	});
+});
+
+describe("ContainerBootCommand.execute — Azure authentication", () => {
+	let workspacesDir: string;
+	let homeDir: string;
+
+	beforeEach(() => {
+		workspacesDir = mkdtempSync(join(tmpdir(), "cyrus-boot-azure-ws-"));
+		homeDir = mkdtempSync(join(tmpdir(), "cyrus-boot-azure-home-"));
+	});
+
+	afterEach(() => {
+		rmSync(workspacesDir, { recursive: true, force: true });
+		rmSync(homeDir, { recursive: true, force: true });
+	});
+
+	function command(
+		env: NodeJS.ProcessEnv,
+		exec: ExecFn,
+		logger = silentLogger(),
+	) {
+		return {
+			command: new ContainerBootCommand({
+				env,
+				exec,
+				homeDir,
+				logger,
+				downloadBundleFn: vi.fn().mockResolvedValue(false),
+				restoreBundleFn: vi.fn(),
+			}),
+			logger,
+		};
+	}
+
+	it("leaves non-Azure boots unauthenticated and disables Azure CLI telemetry", async () => {
+		const env = baseEnv({ CYRUS_WORKSPACES_DIR: workspacesDir });
+		const { exec, calls } = makeFakeExec();
+		const { command: cmd } = command(env, exec);
+
+		await cmd.execute(["--restore-only"]);
+
+		expect(calls.some(({ cmd: executable }) => executable === "az")).toBe(
+			false,
+		);
+		expect(env.AZURE_CORE_COLLECT_TELEMETRY).toBe("no");
+		expect(process.env.AZURE_CORE_COLLECT_TELEMETRY).toBe("no");
+	});
+
+	it("logs in non-interactively once and scrubs every credential variable", async () => {
+		const credentials = {
+			AZURE_CLIENT_ID: "00000000-0000-0000-0000-000000000001",
+			AZURE_CLIENT_SECRET: "synthetic-secret",
+			AZURE_TENANT_ID: "00000000-0000-0000-0000-000000000002",
+		};
+		const env = baseEnv({
+			CYRUS_WORKSPACES_DIR: workspacesDir,
+			...credentials,
+		});
+		Object.assign(process.env, credentials);
+		const { exec, calls } = makeFakeExec();
+		const { command: cmd } = command(env, exec);
+
+		await cmd.execute(["--restore-only"]);
+
+		expect(calls).toEqual([
+			{
+				cmd: "az",
+				args: [
+					"login",
+					"--service-principal",
+					`--username=${credentials.AZURE_CLIENT_ID}`,
+					`--password=${credentials.AZURE_CLIENT_SECRET}`,
+					`--tenant=${credentials.AZURE_TENANT_ID}`,
+					"--output",
+					"none",
+					"--only-show-errors",
+				],
+			},
+		]);
+		for (const key of Object.keys(credentials)) {
+			expect(env[key]).toBeUndefined();
+			expect(process.env[key]).toBeUndefined();
+		}
+	});
+
+	it("fails on a partial credential set, names missing variables, and scrubs the supplied value", async () => {
+		const clientId = "00000000-0000-0000-0000-000000000001";
+		const env = baseEnv({
+			CYRUS_WORKSPACES_DIR: workspacesDir,
+			AZURE_CLIENT_ID: clientId,
+		});
+		process.env.AZURE_CLIENT_ID = clientId;
+		const { exec } = makeFakeExec();
+		const { command: cmd } = command(env, exec);
+
+		await expect(cmd.execute(["--restore-only"])).rejects.toThrow(
+			/AZURE_CLIENT_SECRET, AZURE_TENANT_ID/,
+		);
+		expect(env.AZURE_CLIENT_ID).toBeUndefined();
+		expect(process.env.AZURE_CLIENT_ID).toBeUndefined();
+	});
+
+	it("stops on login failure without exposing any credential value", async () => {
+		const credentials = {
+			AZURE_CLIENT_ID: "synthetic-client-id",
+			AZURE_CLIENT_SECRET: "synthetic-secret",
+			AZURE_TENANT_ID: "synthetic-tenant-id",
+		};
+		const env = baseEnv({
+			CYRUS_WORKSPACES_DIR: workspacesDir,
+			...credentials,
+		});
+		Object.assign(process.env, credentials);
+		const { exec } = makeFakeExec((cmd) =>
+			cmd === "az"
+				? {
+						exitCode: 1,
+						stderr: `login rejected ${credentials.AZURE_CLIENT_ID} ${credentials.AZURE_CLIENT_SECRET} ${credentials.AZURE_TENANT_ID}`,
+					}
+				: undefined,
+		);
+		const { command: cmd, logger } = command(env, exec);
+
+		const error = await cmd
+			.execute(["--restore-only"])
+			.catch((caught) => caught);
+		const diagnostics = `${String(error)} ${JSON.stringify(logger.error.mock.calls)}`;
+		expect(diagnostics).toContain("Azure service-principal login failed");
+		expect(diagnostics).toContain("***");
+		for (const value of Object.values(credentials)) {
+			expect(diagnostics).not.toContain(value);
+		}
 	});
 });
 

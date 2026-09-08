@@ -70,6 +70,12 @@ const RUNNER_REQUIRED_ENV_VARS: Record<string, readonly string[]> = {
 	cursor: [],
 };
 
+const AZURE_CREDENTIAL_ENV_VARS = [
+	"AZURE_CLIENT_ID",
+	"AZURE_CLIENT_SECRET",
+	"AZURE_TENANT_ID",
+] as const;
+
 export const DEFAULT_WORKSPACES_DIR = "/workspaces";
 export const DEFAULT_REPO_CACHE_DIR = "/var/cache/repos";
 
@@ -389,6 +395,8 @@ export class ContainerBootCommand implements ICommand {
 			return;
 		}
 
+		await this.authenticateAzure();
+
 		this.linkClaudeProjects(workspacesDir);
 		await this.restoreState({
 			workspacesDir,
@@ -471,10 +479,73 @@ export class ContainerBootCommand implements ICommand {
 		}
 	}
 
-	/** Redacts a secret from a string before it can reach a log line or thrown error. */
-	private redact(text: string, secret?: string): string {
-		if (!secret) return text;
-		return text.split(secret).join("***");
+	/** Redacts secrets from a string before it can reach a log line or thrown error. */
+	private redact(text: string, ...secrets: (string | undefined)[]): string {
+		return secrets.reduce<string>(
+			(redacted, secret) =>
+				secret ? redacted.split(secret).join("***") : redacted,
+			text,
+		);
+	}
+
+	/** Authenticates the image's Azure CLI when a complete service-principal tuple is present. */
+	private async authenticateAzure(): Promise<void> {
+		this.env.AZURE_CORE_COLLECT_TELEMETRY = "no";
+		process.env.AZURE_CORE_COLLECT_TELEMETRY = "no";
+
+		const credentials = Object.fromEntries(
+			AZURE_CREDENTIAL_ENV_VARS.map((key) => [key, this.env[key]]),
+		) as Record<(typeof AZURE_CREDENTIAL_ENV_VARS)[number], string | undefined>;
+		for (const key of AZURE_CREDENTIAL_ENV_VARS) {
+			delete this.env[key];
+			delete process.env[key];
+		}
+
+		const configured = AZURE_CREDENTIAL_ENV_VARS.filter(
+			(key) => credentials[key],
+		);
+		if (configured.length === 0) return;
+
+		const missing = AZURE_CREDENTIAL_ENV_VARS.filter(
+			(key) => !credentials[key],
+		);
+		if (missing.length > 0) {
+			throw new Error(
+				`Azure authentication requires AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, and AZURE_TENANT_ID together. Missing: ${missing.join(", ")}`,
+			);
+		}
+
+		const values = Object.values(credentials);
+		let result: Awaited<ReturnType<ExecFn>>;
+		try {
+			result = await this.exec("az", [
+				"login",
+				"--service-principal",
+				`--username=${credentials.AZURE_CLIENT_ID}`,
+				`--password=${credentials.AZURE_CLIENT_SECRET}`,
+				`--tenant=${credentials.AZURE_TENANT_ID}`,
+				"--output",
+				"none",
+				"--only-show-errors",
+			]);
+		} catch (error) {
+			throw new Error(
+				this.redact(
+					`Azure service-principal login failed: ${error instanceof Error ? error.message : String(error)}`,
+					...values,
+				),
+			);
+		}
+
+		if (result.exitCode !== 0) {
+			const detail = result.stderr.trim();
+			throw new Error(
+				this.redact(
+					`Azure service-principal login failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
+					...values,
+				),
+			);
+		}
 	}
 
 	/**
