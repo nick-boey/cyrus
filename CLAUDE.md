@@ -624,6 +624,54 @@ The agent automatically moves issues to the "started" state when assigned. Linea
      `RouterStore.listSessions`' orphan-lock query behind
      `cyrus router sessions list`. Do not read the detector as covering every
      unreachable issue.
+   - **A CLAIMED device row was not a delayed reclaim, it was an exemption — and
+     `reclaimStranded` is the only path that can reach one.** The stale-destroy
+     backstop and the idle stop both sit BELOW `sweepOnce`'s `affinity > 0` gate,
+     so a leaked affinity row did not push reclamation out to the 14-day
+     backstop; it removed reclamation entirely, for as long as the row survived.
+     Nothing clears such a row — it is released by a terminal `session_state`
+     frame, and the fault IS that no terminal frame arrives (CYR-84's audit found
+     live sandboxes for work finished days earlier). The clock is
+     `quietSince`, and three things about it are load-bearing. It EXCLUDES
+     `last_active_ms`: the sweep stamps that on every pinned tick, so including
+     it would have the loop reset the clock it reads and the branch could never
+     fire — the same trap `no_progress` documents. It INCLUDES `last_seen_ms`,
+     which `no_progress` excludes, because a heartbeating worker is a live
+     process holding a workspace and "is it making progress" is a question for a
+     human, not for a destroy. And it is SPLIT — `quietSinceOnRow` (row columns
+     only) is taken before `resolveAffinity`'s round trip to the device and the
+     full version immediately before the destroy, because adjacent checks are
+     theatre: only a gate and a veto on opposite sides of an await can let a
+     session claimed during that await veto anything. `reclaimStrandedMs`
+     defaults to 24h, an order of magnitude above `sessionNoProgressMs`, so the
+     report always precedes the destroy; the constructor warns when a deployment
+     inverts them, and `0` disables.
+   - **The disk-image GC had never run in the deployment that needed it, and the
+     reason was the gate, not the algorithm.** It hung off
+     `DevcontainerImageService`, constructed only when `containers.devcontainers`
+     is set — a field `RouterConfigFileSchema` does not model at all, so Zod
+     strips it and no `router-config.json` can enable it. Meanwhile the images
+     that accumulate are the DEPLOYMENT worker images
+     `scripts/deploy-worker-image.sh` registers out of band, one per build, which
+     have no `repo_devcontainer_images` row and so were not candidates under the
+     old cache-table iteration either (14 images / 68 GB, 8 collectable).
+     `DiskImageCollector` reconciles the PROVIDER's inventory and
+     `RouterServer.scheduleDiskImageGc` gates on `containers.aca`; when the
+     devcontainer service exists its collector is REUSED, never a second one.
+     Two invariants inside it. The AGE FLOOR (`containers.aca.imageRetentionMs`,
+     7d) is not slack: a staged build and a rollback candidate are both
+     referenced by nothing, so a pure reference count deletes the deploy about to
+     go out and the one you would fall back to. And `aca_disk_image_sightings`
+     exists because the ACA data plane does not date a disk image — the spike
+     recorded `{id, name, labels, image, status, sizeInMB}` and no timestamp — so
+     a policy reading only the wire is silently either a no-op or unbounded
+     depending on what the preview API returns. Age is `min(provider timestamp,
+     first sight)`, and a disk absent from a listing has its sighting DROPPED, so
+     a re-registered name is dated anew rather than inheriting a first-sight that
+     would make a brand-new image instantly collectable. Keeps are recorded as
+     fully as deletes (`sandbox.image_decision` carries the protection that
+     applied): a wrongly-deleted rollback image is invisible in a rollup and
+     surfaces only as a boot that cannot find its disk.
    - **A session's terminal signal can be withheld indefinitely, and that is the
      leading suspect whenever an issue goes unreachable.**
      `AgentSessionManager.completeSession` defers `emitTerminalOnce` while the
