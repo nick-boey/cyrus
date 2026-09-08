@@ -15,6 +15,7 @@ import { RouterCommand } from "./commands/RouterCommand.js";
 import { RunsCommand } from "./commands/RunsCommand.js";
 import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
 import { SelfAuthCommand } from "./commands/SelfAuthCommand.js";
+import { SkillsCommand } from "./commands/SkillsCommand.js";
 import { StartCommand } from "./commands/StartCommand.js";
 import { UsageError } from "./remote/errors.js";
 
@@ -67,7 +68,7 @@ export const COMMAND_PROFILE_ENV = "CYRUS_COMMAND_PROFILE";
  * cannot be granted by where a `register*` call happens to sit relative to a
  * branch. Adding a command to the remote surface is an edit to this array.
  *
- * `skills` is named but not yet implemented — it arrives with CYR-77.
+ * `skills` installs only artifacts resolved through the built-in trusted registry.
  */
 export const REMOTE_PROFILE_COMMANDS: readonly string[] = [
 	"connection",
@@ -89,6 +90,7 @@ export const REMOTE_PROFILE_REGISTERED: readonly string[] = [
 	"runs",
 	"logs",
 	"recover",
+	"skills",
 ];
 
 /**
@@ -232,6 +234,7 @@ export function buildProgram(
 		runs: () => registerRunsCommand(program, packageJson, errorReporter),
 		logs: () => registerLogsCommand(program, packageJson, errorReporter),
 		recover: () => registerRecoverCommand(program, packageJson, errorReporter),
+		skills: () => registerSkillsCommand(program, packageJson, errorReporter),
 	};
 
 	for (const [name, register] of Object.entries(remoteVocabulary)) {
@@ -839,6 +842,53 @@ function registerConnectionCommand(
 		.action(async (name: string) => {
 			await runConnection(["remove", name]);
 		});
+}
+
+function registerSkillsCommand(
+	program: Command,
+	packageJson: { version: string },
+	errorReporter: ErrorReporter,
+): void {
+	const skills = program
+		.command("skills")
+		.description("List and install trusted Cyrus operator skills");
+	const run = async (argv: string[], connection?: string): Promise<void> => {
+		const opts = program.opts();
+		const app = new Application(
+			opts.cyrusHome,
+			opts.envFile,
+			packageJson.version,
+			errorReporter,
+		);
+		try {
+			await new SkillsCommand(app).execute(argv, { connection });
+		} finally {
+			app.disposeWatchers();
+		}
+	};
+	addFleetSelectionOptions(
+		skills
+			.command("list")
+			.description(
+				"List trusted compatible fleet skills from authenticated router context",
+			),
+	).action(async (options: { connection?: string }) =>
+		run(["list"], options.connection),
+	);
+	addFleetSelectionOptions(
+		skills
+			.command("install <name>")
+			.description(
+				"Download, verify, and atomically install a trusted fleet skill",
+			)
+			.requiredOption(
+				"--target <claude|codex>",
+				"Agent skill directory to install into",
+			),
+	).action(
+		async (name: string, options: { target: string; connection?: string }) =>
+			run(["install", name, "--target", options.target], options.connection),
+	);
 }
 
 /**

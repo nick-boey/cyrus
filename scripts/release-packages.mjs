@@ -1,8 +1,97 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+export const trustedSkillName = "cyrus-fleet-operator";
+
+export function createTrustedSkillArchive(version, outputDirectory) {
+	if (!exactSemver.test(version))
+		throw new Error(
+			`Version must be an exact semantic version without a leading v; received ${version}.`,
+		);
+	const source = join(repositoryRoot, "skills", trustedSkillName);
+	const files = walkFiles(source).sort();
+	const blocks = [];
+	for (const relativePath of files) {
+		const data = readFileSync(join(source, relativePath));
+		blocks.push(
+			tarHeader(`${trustedSkillName}/${relativePath}`, data.length),
+			data,
+			Buffer.alloc((512 - (data.length % 512)) % 512),
+		);
+	}
+	blocks.push(Buffer.alloc(1024));
+	mkdirSync(outputDirectory, { recursive: true });
+	const filename = `${trustedSkillName}-${version}.tar.gz`;
+	const archivePath = join(outputDirectory, filename);
+	const archive = gzipSync(Buffer.concat(blocks), { level: 9, mtime: 0 });
+	writeFileSync(archivePath, archive);
+	const digest = createHash("sha256").update(archive).digest("hex");
+	writeFileSync(`${archivePath}.sha256`, `${digest}  ${filename}\n`);
+	return {
+		archivePath,
+		checksumPath: `${archivePath}.sha256`,
+		checksum: `sha256:${digest}`,
+	};
+}
+
+function walkFiles(directory, prefix = "") {
+	const files = [];
+	for (const entry of readdirSync(directory, { withFileTypes: true })) {
+		const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+		if (entry.isSymbolicLink())
+			throw new Error(
+				`Trusted skill source contains a symlink: ${relativePath}`,
+			);
+		if (entry.isDirectory())
+			files.push(...walkFiles(join(directory, entry.name), relativePath));
+		else if (entry.isFile()) files.push(relativePath);
+		else
+			throw new Error(
+				`Trusted skill source contains an unsupported entry: ${relativePath}`,
+			);
+	}
+	return files;
+}
+
+function tarHeader(name, size) {
+	if (Buffer.byteLength(name) > 100)
+		throw new Error(`Trusted skill archive path is too long: ${name}`);
+	const header = Buffer.alloc(512);
+	header.write(name, 0, 100, "utf8");
+	writeOctal(header, 100, 8, 0o644);
+	writeOctal(header, 108, 8, 0);
+	writeOctal(header, 116, 8, 0);
+	writeOctal(header, 124, 12, size);
+	writeOctal(header, 136, 12, 0);
+	header.fill(0x20, 148, 156);
+	header[156] = "0".charCodeAt(0);
+	header.write("ustar\0", 257, 6, "ascii");
+	header.write("00", 263, 2, "ascii");
+	header.write("cyrus", 265, 5, "ascii");
+	header.write("cyrus", 297, 5, "ascii");
+	writeOctal(
+		header,
+		148,
+		8,
+		header.reduce((sum, byte) => sum + byte, 0),
+	);
+	return header;
+}
+
+function writeOctal(buffer, offset, length, value) {
+	const text = value.toString(8).padStart(length - 1, "0");
+	buffer.write(`${text}\0`, offset, length, "ascii");
+}
 
 export const repositoryUrl = "git+https://github.com/cyrusagents/cyrus.git";
 
@@ -214,6 +303,17 @@ function run() {
 		for (const { directory, name } of releasePackages) {
 			console.log(`${directory}\t${name}`);
 		}
+		return;
+	}
+	if (command === "skill-archive") {
+		if (!version || !process.argv[4])
+			throw new Error(
+				"Usage: node scripts/release-packages.mjs skill-archive <version> <output-directory>",
+			);
+		const result = createTrustedSkillArchive(version, resolve(process.argv[4]));
+		console.log(
+			`${result.archivePath}\n${result.checksumPath}\n${result.checksum}`,
+		);
 		return;
 	}
 	if (!version) {

@@ -404,5 +404,5 @@ function describeSkill(context: OperatorContextV1): string {
 	// The checksum is printed because it is what the CLI verifies the published
 	// skill against — advertising is not trust (ADR 0010), and an operator
 	// comparing it by eye is doing the same check for the same reason.
-	return `${skill.name} ${skill.version} (${skill.checksum})`;
+	return `${skill.name} ${skill.version} (${skill.checksum}) ${skill.releaseUrl}`;
 }

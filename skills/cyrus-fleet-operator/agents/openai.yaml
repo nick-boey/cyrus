@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cyrus Fleet Operator"
+  short_description: "Observe and safely recover Cyrus fleet runs"
+  default_prompt: "Use $cyrus-fleet-operator to observe this fleet issue and recover it only within the guarded workflow."

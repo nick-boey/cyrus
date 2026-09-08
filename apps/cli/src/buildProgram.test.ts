@@ -64,10 +64,16 @@ vi.mock("./commands/LogsCommand.js", () => ({
 }));
 
 const recoverExecute = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const skillsExecute = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock("./commands/RecoverCommand.js", () => ({
 	RecoverCommand: vi.fn().mockImplementation(function FakeRecoverCommand() {
 		return { execute: recoverExecute };
+	}),
+}));
+vi.mock("./commands/SkillsCommand.js", () => ({
+	SkillsCommand: vi.fn().mockImplementation(function FakeSkillsCommand() {
+		return { execute: skillsExecute };
 	}),
 }));
 
@@ -829,6 +835,39 @@ describe("buildProgram — Commander wiring for `runs`", () => {
 		expect(runsExecute).toHaveBeenCalledWith(
 			["list", "--comment", "comment-1", "--json"],
 			{ connection: undefined, workspace: undefined },
+		);
+	});
+});
+
+describe("buildProgram — Commander wiring for `skills`", () => {
+	beforeEach(() => {
+		skillsExecute.mockClear();
+		applicationDisposeWatchers.mockClear();
+	});
+
+	it("registers list in the remote profile", async () => {
+		await newProgram({
+			argv: ["node", "cyrus", "--profile", "remote"],
+		}).parseAsync(["node", "cyrus", "skills", "list", "--connection", "prod"]);
+		expect(skillsExecute).toHaveBeenCalledWith(["list"], {
+			connection: "prod",
+		});
+		expect(applicationDisposeWatchers).toHaveBeenCalledTimes(1);
+	});
+
+	it("registers trusted install with an explicit target", async () => {
+		await run([
+			"skills",
+			"install",
+			"cyrus-fleet-operator",
+			"--target",
+			"codex",
+			"--connection",
+			"prod",
+		]);
+		expect(skillsExecute).toHaveBeenCalledWith(
+			["install", "cyrus-fleet-operator", "--target", "codex"],
+			{ connection: "prod" },
 		);
 	});
 });

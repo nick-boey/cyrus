@@ -560,6 +560,7 @@ describe("ConnectionCommand show", () => {
 		expect(output).toContain("azure-log-analytics");
 		expect(output).toContain("cyrus-fleet-operator 0.2.71");
 		expect(output).toContain(`sha256:${"a".repeat(64)}`);
+		expect(output).toContain(contextDocument.skill?.releaseUrl);
 	});
 
 	it("prints no credential material", async () => {

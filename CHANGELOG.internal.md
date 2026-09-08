@@ -5,6 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- **Published and securely installed the trusted fleet-operator skill ([CYR-77](https://linear.app/northrop-digital/issue/CYR-77/publish-and-install-the-trusted-fleet-operator-skill), [#73](https://github.com/nick-boey/cyrus/pull/73)).** Added a deterministic ustar/gzip release builder, GitHub release assets and checksum, a hard-coded official release registry, guarded archive extraction, atomic agent-target installation, remote-profile command wiring, structural/security tests, and an F1 validation record.
 - **Reconciled stranded run ownership on the router ([CYR-75](https://linear.app/northrop-digital/issue/CYR-75/reconcile-stranded-run-ownership-safely-on-the-router), [#70](https://github.com/nick-boey/cyrus/pull/70)).**
   `RouterRunReconciler` (`packages/router/src/fleet-operations/`) is the
   production `RunReconciler` CYR-74 left a seam for. Its safety argument is the
