@@ -550,6 +550,15 @@ const RouterConfigFileFieldsSchema = z.object({
 			 * storm that reads as a fleet-wide outage.
 			 */
 			sessionNoProgressMs: z.number().int().positive().optional(),
+			/**
+			 * How long a claimed-but-quiet container survives before its sandbox is
+			 * destroyed. `0` is MEANINGFUL here and is the documented off switch, so
+			 * unlike the thresholds above this is non-negative rather than positive.
+			 * Negative and fractional are still rejected: a negative value would
+			 * make every pinned container instantly reclaimable, which is the one
+			 * mistake in this file that deletes running work.
+			 */
+			reclaimStrandedMs: z.number().int().nonnegative().optional(),
 			sessionsQueryTimeoutMs: z.number().optional(),
 			/**
 			 * Guarded recovery's two waits. Positive integers of MILLISECONDS for
@@ -621,6 +630,16 @@ const RouterConfigFileFieldsSchema = z.object({
 					resumeConnectPollMs: z.number().positive().default(2_000),
 					apiVersion: z.string().optional(),
 					managementEndpoint: z.string().optional(),
+					/**
+					 * Disk-image GC cadence and retention. Positive integers of
+					 * MILLISECONDS, rejected rather than coerced: a zero or negative
+					 * retention makes every unreferenced image collectable on the first
+					 * cycle, which would delete the staged build about to go out and the
+					 * one an operator would roll back to — the one mistake in this file
+					 * that is not recoverable from within the router.
+					 */
+					imageGcIntervalMs: z.number().int().positive().optional(),
+					imageRetentionMs: z.number().int().positive().optional(),
 				})
 				.optional(),
 		})

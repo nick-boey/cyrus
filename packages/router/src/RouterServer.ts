@@ -43,6 +43,7 @@ import {
 	createArmTokenProvider,
 } from "./devcontainer/AcrDevcontainerBuilder.js";
 import { DevcontainerImageService } from "./devcontainer/DevcontainerImageService.js";
+import { DiskImageCollector } from "./devcontainer/DiskImageCollector.js";
 import { EventRouter } from "./EventRouter.js";
 import {
 	type EntraTokenVerifier,
@@ -227,6 +228,23 @@ export interface RouterContainersConfig {
 	 * the router a way to see the deferral.
 	 */
 	sessionNoProgressMs?: number;
+	/**
+	 * Default 86_400_000 (24 hours). How long a container may hold session
+	 * affinity with EVERY observable clock still — nothing routed, no worker
+	 * heartbeat, no agent activity, no agent run, no fresh session claim — before
+	 * its sandbox is destroyed (snapshots included) and its device row deleted.
+	 *
+	 * Set `0` to disable reclamation and keep the previous behaviour, in which a
+	 * claimed row is never reclaimed at all: the stale-destroy backstop and the
+	 * idle stop both sit below the affinity gate, so a leaked affinity row does
+	 * not delay reclamation, it removes it.
+	 *
+	 * Should stay comfortably ABOVE {@link sessionNoProgressMs}: the report is
+	 * what gives a human the chance to look at a strand before it is destroyed,
+	 * and `no_progress` knowingly cannot separate a strand from a session waiting
+	 * on a long cron.
+	 */
+	reclaimStrandedMs?: number;
 	/** Default 5_000 (5 seconds). */
 	sessionsQueryTimeoutMs?: number;
 	/**
@@ -287,12 +305,6 @@ export interface RouterContainersConfig {
 		workerUser?: string;
 		/** Seconds. Default 5400 (90 minutes); ACR's own ceiling is 6 hours. */
 		buildTimeoutSeconds?: number;
-		/**
-		 * How often unreferenced disk images are collected. Default 6 hours —
-		 * deliberately far away from the 60s lifecycle sweep, which is
-		 * non-reentrant by contract.
-		 */
-		gcIntervalMs?: number;
 	};
 	/**
 	 * Extra env-var names a user must have stored before any container boots
@@ -379,6 +391,27 @@ export interface RouterContainersConfig {
 		apiVersion?: string;
 		/** Override the per-region `management.{region}.azuredevcompute.io` base. */
 		managementEndpoint?: string;
+		/**
+		 * How often registered disk images are reconciled against what references
+		 * them. Default 6 hours — deliberately far away from the 60s lifecycle
+		 * sweep, which is non-reentrant by contract.
+		 */
+		imageGcIntervalMs?: number;
+		/**
+		 * How long an unreferenced disk image is kept anyway. Default 7 days.
+		 *
+		 * A staged deployment image and a rollback candidate are both, by
+		 * definition, referenced by nothing — no sandbox, no snapshot, no pin — so a
+		 * pure reference count would delete the build about to go out AND the one
+		 * you would fall back to. Lower it only if you are certain nothing stages
+		 * images ahead of a deploy.
+		 *
+		 * Both knobs live here rather than under `devcontainers` because the GC is
+		 * gated on ACA, not on per-repository image builds: the images that
+		 * accumulate are the deployment worker images, which exist in every ACA
+		 * deployment.
+		 */
+		imageRetentionMs?: number;
 	};
 }
 
@@ -1473,6 +1506,7 @@ export class RouterServer {
 		});
 
 		this.devcontainerImages = this.buildDevcontainerImages(containers);
+		this.scheduleDiskImageGc(containers);
 
 		const containerTargets = new ContainerTargetService({
 			store: this.store,
@@ -1553,6 +1587,9 @@ export class RouterServer {
 				: {}),
 			...(containers.terminalSettleMs !== undefined
 				? { terminalSettleMs: containers.terminalSettleMs }
+				: {}),
+			...(containers.reclaimStrandedMs !== undefined
+				? { reclaimStrandedMs: containers.reclaimStrandedMs }
 				: {}),
 			logger: this.logger,
 			sessionReconciler: {
@@ -1656,22 +1693,69 @@ export class RouterServer {
 			workerFeatureVersion: cfg.workerFeatureVersion,
 			workerPayloadTarball: cfg.workerPayloadTarball,
 			...(cfg.workerUser ? { workerUser: cfg.workerUser } : {}),
+			...(containers.aca.imageRetentionMs !== undefined
+				? { imageRetentionMs: containers.aca.imageRetentionMs }
+				: {}),
 			registryLoginServer: cfg.loginServer,
 		});
-		// Slow by design and well away from the 60s lifecycle sweep: a disk
-		// deletion is cheap, but listing snapshots and disk images is not, and
-		// getting a reference count wrong is expensive in exactly one direction.
-		const gcIntervalMs = cfg.gcIntervalMs ?? 6 * 60 * 60 * 1000;
-		this.devcontainerGcInterval = setInterval(() => {
-			void service.collectGarbage().catch((error: unknown) => {
-				this.logger.error("Devcontainer disk-image GC failed", error);
-			});
-		}, gcIntervalMs);
-		this.devcontainerGcInterval.unref?.();
 		this.logger.info(
 			`Per-repository devcontainer images enabled (registry ${cfg.loginServer}, worker feature ${cfg.workerFeatureRef})`,
 		);
 		return service;
+	}
+
+	/**
+	 * Periodic reclamation of registered ACA disk images (CYR-84).
+	 *
+	 * Gated on `containers.aca`, NOT on `containers.devcontainers`, and that is
+	 * the load-bearing part. The GC used to hang off the devcontainer service, so
+	 * it existed only for deployments that build per-repository images — while the
+	 * images that actually accumulate are the DEPLOYMENT worker images that
+	 * `scripts/deploy-worker-image.sh` registers out of band, one per build, in
+	 * every ACA deployment. The 2026-09-08 audit found fourteen of them totalling
+	 * 68 GB in a deployment where this had never once run.
+	 *
+	 * One collector, whichever way we get here: when the devcontainer service
+	 * exists it already owns one, and scheduling a second would put two cycles on
+	 * the same inventory, each deleting against the other's view of it.
+	 *
+	 * Slow by design and well away from the 60s lifecycle sweep: a disk deletion
+	 * is cheap, but listing sandboxes, snapshots and disk images is not, and
+	 * getting a reference count wrong is expensive in exactly one direction.
+	 */
+	private scheduleDiskImageGc(containers: RouterContainersConfig): void {
+		const aca = containers.aca;
+		if (!aca) return;
+		const collect = this.devcontainerImages
+			? (): Promise<unknown> =>
+					(this.devcontainerImages as DevcontainerImageService).collectGarbage()
+			: ((): (() => Promise<unknown>) => {
+					const collector = new DiskImageCollector({
+						store: this.store,
+						logger: this.logger,
+						aca: new AcaSandboxClient({
+							subscriptionId: aca.subscriptionId,
+							resourceGroup: aca.resourceGroup,
+							sandboxGroup: aca.sandboxGroup,
+							region: aca.region,
+							tokenProvider: createDefaultTokenProvider(),
+							apiVersion: aca.apiVersion,
+							baseUrl: aca.managementEndpoint,
+						}),
+						deploymentDisk: aca.disk,
+						...(aca.imageRetentionMs !== undefined
+							? { imageRetentionMs: aca.imageRetentionMs }
+							: {}),
+					});
+					return () => collector.collect();
+				})();
+		const gcIntervalMs = aca.imageGcIntervalMs ?? 6 * 60 * 60 * 1000;
+		this.devcontainerGcInterval = setInterval(() => {
+			void collect().catch((error: unknown) => {
+				this.logger.error("Disk-image GC failed", error);
+			});
+		}, gcIntervalMs);
+		this.devcontainerGcInterval.unref?.();
 	}
 
 	/**

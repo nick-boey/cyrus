@@ -16,6 +16,7 @@ const logger = {
 	warn: vi.fn(),
 	error: vi.fn(),
 	debug: vi.fn(),
+	event: vi.fn(),
 } as unknown as ILogger;
 
 const REPO: RegisteredRepository = {
@@ -61,6 +62,9 @@ function harness(
 		buildResult?: DevcontainerBuildResult;
 		snapshots?: Array<{ labels: Record<string, string> }>;
 		deploymentDisk?: string;
+		/** Fixed clock, so the GC's retention window is deterministic. */
+		now?: () => number;
+		imageRetentionMs?: number;
 	} = {},
 ): Harness {
 	const builds: string[] = [];
@@ -125,6 +129,10 @@ function harness(
 			deletedDisks.push(id);
 		},
 		listSnapshots: async () => opts.snapshots ?? [],
+		// The GC protects any disk a live sandbox boots from, so it lists them.
+		// A fake missing this method makes the whole cycle report the inventory as
+		// unreadable, which looks exactly like "nothing was collectable".
+		listSandboxes: async () => [],
 	} as unknown as Parameters<typeof DevcontainerImageService> extends never
 		? never
 		: never;
@@ -143,6 +151,10 @@ function harness(
 		registryLoginServer: "acr.azurecr.io",
 		diskReadyTimeoutMs: 1000,
 		diskReadyPollMs: 0,
+		...(opts.now ? { now: opts.now } : {}),
+		...(opts.imageRetentionMs !== undefined
+			? { imageRetentionMs: opts.imageRetentionMs }
+			: {}),
 	});
 
 	return {
@@ -313,7 +325,7 @@ describe("collectGarbage", () => {
 		expect(h.deletedDisks).toEqual([]);
 	});
 
-	it("collects a superseded image once nothing references it", async () => {
+	it("collects a superseded image once nothing references it AND it is past retention", async () => {
 		const h = harness({ devcontainer: '{"image":"node:22-slim"}' });
 		await h.service.ensureForIssue("NOR-1", REPO);
 		await h.settle();
@@ -321,14 +333,31 @@ describe("collectGarbage", () => {
 		store.deleteIssueDiskImage("NOR-1");
 
 		// A newer build for the same repository takes over as "newest ready".
-		const newer = harness({ devcontainer: '{"image":"node:24-slim"}' });
+		const newer = harness({
+			devcontainer: '{"image":"node:24-slim"}',
+			// Superseded is not the same as collectable: a build from an hour ago is
+			// still a plausible rollback target, so the reference count alone must
+			// not delete it.
+			imageRetentionMs: 3_600_000,
+			now: () => 0,
+		});
 		newer.diskImages.push(...h.diskImages.map((d) => ({ ...d })));
 		await newer.service.ensureForIssue("NOR-2", REPO);
 		await newer.settle();
 		await newer.service.ensureForIssue("NOR-2", REPO);
 		store.deleteIssueDiskImage("NOR-2");
 		await newer.service.collectGarbage();
-		expect(newer.deletedDisks.length).toBe(1);
+		expect(newer.deletedDisks).toEqual([]);
+
+		// Same store, same disks, one tick past the retention window.
+		const aged = harness({
+			devcontainer: '{"image":"node:24-slim"}',
+			imageRetentionMs: 3_600_000,
+			now: () => 3_600_001,
+		});
+		aged.diskImages.push(...newer.diskImages.map((d) => ({ ...d })));
+		await aged.service.collectGarbage();
+		expect(aged.deletedDisks.length).toBe(1);
 	});
 
 	it("skips the sweep entirely when the snapshot listing cannot be read", async () => {

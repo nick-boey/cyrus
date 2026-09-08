@@ -11,6 +11,10 @@ import {
 	ignoredFieldsIn,
 	validateDevcontainer,
 } from "./config.js";
+import {
+	DiskImageCollector,
+	type DiskImageGcSummary,
+} from "./DiskImageCollector.js";
 
 /**
  * Tasks 4, 6 and 7 (NOR-309): turning "this repository declares an environment"
@@ -64,6 +68,11 @@ export interface DevcontainerImageServiceDeps {
 	/** Deadline for the synchronous ACA disk import. Default 900s. */
 	diskReadyTimeoutMs?: number;
 	diskReadyPollMs?: number;
+	/**
+	 * How long an unreferenced disk image is kept anyway, as a possible staged or
+	 * rollback build. Forwarded to {@link DiskImageCollector}; default 7 days.
+	 */
+	imageRetentionMs?: number;
 }
 
 /** ACR's OAuth2 exchange always uses this sentinel as the username. */
@@ -79,9 +88,21 @@ export class DevcontainerImageService {
 	 * row its own process is still working on from one abandoned by a restart.
 	 */
 	private readonly inFlight = new Set<string>();
+	/** Owns {@link collectGarbage}; see that method for why it is separate. */
+	private readonly collector: DiskImageCollector;
 
 	constructor(private readonly deps: DevcontainerImageServiceDeps) {
 		this.workerUser = deps.workerUser ?? "cyrus";
+		this.collector = new DiskImageCollector({
+			store: deps.store,
+			logger: deps.logger,
+			aca: deps.aca,
+			deploymentDisk: deps.deploymentDisk,
+			...(deps.imageRetentionMs !== undefined
+				? { imageRetentionMs: deps.imageRetentionMs }
+				: {}),
+			...(deps.now ? { now: deps.now } : {}),
+		});
 	}
 
 	/**
@@ -495,73 +516,21 @@ export class DevcontainerImageService {
 	}
 
 	/**
-	 * Task 6: deletes disk images and cache rows that nothing references.
+	 * Task 6, extended by CYR-84: delete disk images and cache rows that nothing
+	 * references.
 	 *
-	 * Four floors, and none of them is optional:
-	 *  - a disk any live issue is pinned to, whether or not its container is up;
-	 *  - a disk any snapshot was taken from, since a snapshot restores the image
-	 *    lineage it came from and would resurrect a deleted one;
-	 *  - the newest ready image per repository, so the next issue on that
-	 *    repository does not have to rebuild what we just deleted;
-	 *  - and the deployment's own default disk, always.
+	 * The work itself lives in {@link DiskImageCollector}, because the images that
+	 * actually accumulate are the DEPLOYMENT worker images registered out of band
+	 * by `scripts/deploy-worker-image.sh` — and those exist in every ACA
+	 * deployment, including the ones that never build a per-repository image and
+	 * so never construct this service at all. Keeping the entry point here means a
+	 * deployment that does both gets exactly ONE collector rather than two racing
+	 * over the same inventory; see `RouterServer.scheduleDiskImageGc`.
 	 *
-	 * Runs on a slow cadence, well away from the 60s lifecycle sweep, which is
-	 * non-reentrant by contract.
+	 * Runs on a slow cadence, well away from the 60s lifecycle sweep.
 	 */
-	async collectGarbage(): Promise<void> {
-		const keep = new Set<string>([this.deps.deploymentDisk]);
-		for (const key of this.deps.store.referencedDevcontainerCacheKeys()) {
-			const row = this.deps.store.getDevcontainerImage(key);
-			if (row) keep.add(row.diskName);
-		}
-		try {
-			for (const snapshot of await this.deps.aca.listSnapshots({
-				"cyrus.managed": "true",
-			})) {
-				const disk = snapshot.labels?.["cyrus.disk"];
-				if (disk) keep.add(disk);
-			}
-		} catch (error) {
-			// A snapshot listing we could not read is not evidence that nothing
-			// references these disks. Skipping the whole sweep costs one slow
-			// cycle; guessing costs a resurrected sandbox that cannot restore.
-			this.deps.logger.warn(
-				"Skipping devcontainer disk GC: the snapshot listing could not be read",
-				error,
-			);
-			return;
-		}
-		const newestPerRepository = new Map<string, string>();
-		for (const row of this.deps.store.listDevcontainerImages()) {
-			if (row.state !== "ready") continue;
-			// `listDevcontainerImages` is ordered newest-first, so the first
-			// ready row seen for a repository is the one to keep.
-			if (!newestPerRepository.has(row.repositoryName)) {
-				newestPerRepository.set(row.repositoryName, row.diskName);
-				keep.add(row.diskName);
-			}
-		}
-
-		// Listed ONCE, outside the loop: this is an ARM call, and a sweep over a
-		// deployment's worth of rows made one per row.
-		const registeredDisks = await this.deps.aca.listDiskImages();
-		for (const row of this.deps.store.listDevcontainerImages()) {
-			if (row.state === "building") continue;
-			if (keep.has(row.diskName)) continue;
-			const registered = findDiskImage(registeredDisks, row.diskName);
-			if (registered?.id) {
-				await this.deps.aca.deleteDiskImage(registered.id).catch((error) => {
-					this.deps.logger.warn(
-						`could not delete disk image ${row.diskName}`,
-						error,
-					);
-				});
-			}
-			this.deps.store.deleteDevcontainerImage(row.cacheKey);
-			this.deps.logger.info(
-				`Collected unreferenced devcontainer image ${row.diskName} for ${row.repositoryName}`,
-			);
-		}
+	collectGarbage(): Promise<DiskImageGcSummary> {
+		return this.collector.collect();
 	}
 }
 

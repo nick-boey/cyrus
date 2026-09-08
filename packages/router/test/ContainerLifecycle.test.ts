@@ -2643,4 +2643,255 @@ describe("ContainerLifecycle", () => {
 			});
 		});
 	});
+
+	/**
+	 * CYR-84. Every other reclamation path in the sweep — the stale-destroy
+	 * backstop and the idle stop — sits BELOW the `affinity > 0` gate, so a leaked
+	 * affinity row did not delay reclamation, it removed it: the 14-day backstop
+	 * was unreachable and the sandbox billed until a human noticed. The 2026-09-08
+	 * audit found several, for issues that had been finished or wedged for days.
+	 */
+	describe("reclaiming a stranded sandbox behind a stale device row", () => {
+		const RECLAIM_MS = 24 * 3_600_000;
+
+		/** A container pinned by an affinity row nothing will ever release. */
+		function strandedRow(issueKey: string) {
+			const { deviceId, createdMs } = makeContainerDevice(issueKey, "aca");
+			const aca = fakeExecutor("aca", {
+				status: "running",
+				listStates: [{ issueKey, status: "running" }],
+			});
+			store.setSessionAffinity("leaked", deviceId, undefined, createdMs);
+			return { deviceId, createdMs, aca };
+		}
+
+		function reclaimLifecycle(
+			aca: ContainerExecutor,
+			now: () => number,
+			overrides: Partial<
+				ConstructorParameters<typeof ContainerLifecycle>[0]
+			> = {},
+		) {
+			return new ContainerLifecycle({
+				store,
+				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
+				idleStopMs: 300_000,
+				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				offlineAgeOutMs: 3_600_000,
+				sessionNoProgressMs: 4 * 3_600_000,
+				reclaimStrandedMs: RECLAIM_MS,
+				logger,
+				now,
+				// Online with a live claim, so the affinity gate holds and the row is
+				// genuinely pinned rather than quietly aged out.
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+				...overrides,
+			});
+		}
+
+		it("destroys the sandbox and deletes the row once every clock has been quiet", async () => {
+			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+
+			await reclaimLifecycle(aca, () => createdMs + RECLAIM_MS + 1).sweep();
+
+			// `destroy()` rather than a bespoke deletion, so the provider's own
+			// snapshot cleanup runs — a snapshot left behind restores the lineage it
+			// came from and resurrects the sandbox on the next boot.
+			expect(aca.destroy).toHaveBeenCalledWith("NOR-402");
+			expect(store.getContainerDevice(deviceId)).toBeUndefined();
+			// The affinity row AND the issue lock go with it; without that the issue
+			// stays unreachable with nothing left alive to release it.
+			expect(store.countSessionAffinityForDevice(deviceId)).toBe(0);
+			expect(eventsNamed(logger, "sandbox.destroyed")[0]).toMatchObject({
+				issue_key: "NOR-402",
+				device_id: deviceId,
+				reason: "stranded",
+				sessions: 1,
+				quiet_for_ms: RECLAIM_MS + 1,
+				reclaim_stranded_ms: RECLAIM_MS,
+			});
+		});
+
+		it("counts what it reclaimed in the per-tick rollup", async () => {
+			const { createdMs, aca } = strandedRow("NOR-402");
+			await reclaimLifecycle(aca, () => createdMs + RECLAIM_MS + 1).sweep();
+			expect(eventsNamed(logger, "sandbox.sweep_completed")[0]).toMatchObject({
+				reclaimed: 1,
+			});
+		});
+
+		it("leaves it alone inside the window", async () => {
+			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			await reclaimLifecycle(aca, () => createdMs + RECLAIM_MS).sweep();
+			expect(aca.destroy).not.toHaveBeenCalled();
+			expect(store.getContainerDevice(deviceId)).toBeDefined();
+		});
+
+		it("retains a container whose worker is still heartbeating", async () => {
+			// `last_seen_ms` is excluded from the `no_progress` detector, because a
+			// wedged worker heartbeats as faithfully as a working one. It is INCLUDED
+			// here for exactly that reason: a heartbeating worker is a live process
+			// holding a workspace, and whether it is making progress is a question
+			// for a human rather than for a destroy.
+			const { createdMs, aca } = strandedRow("NOR-402");
+			const now = createdMs + RECLAIM_MS + 1;
+			store.touchDevice(
+				store.getContainerDeviceForIssue("NOR-402")!.deviceId,
+				now - 1_000,
+			);
+
+			await reclaimLifecycle(aca, () => now).sweep();
+
+			expect(aca.destroy).not.toHaveBeenCalled();
+		});
+
+		it("retains a container with a recent agent run", async () => {
+			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const now = createdMs + RECLAIM_MS + 1;
+			store.recordAgentRunRouted({
+				deviceId,
+				issueKey: "NOR-402",
+				sessionId: "s-1",
+				routedMs: createdMs,
+			});
+			store.finishAgentRun("s-1", "complete", now - 5_000);
+
+			await reclaimLifecycle(aca, () => now).sweep();
+
+			expect(aca.destroy).not.toHaveBeenCalled();
+		});
+
+		it("retains a container the router routed to recently", async () => {
+			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const now = createdMs + RECLAIM_MS + 1;
+			store.markDeviceRouted(deviceId, now - 1_000);
+			await reclaimLifecycle(aca, () => now).sweep();
+			expect(aca.destroy).not.toHaveBeenCalled();
+		});
+
+		it("retains a container whose session was claimed recently", async () => {
+			// A second session claiming a device that had been quiet for a day is a
+			// container going back to work, not a strand.
+			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const now = createdMs + RECLAIM_MS + 1;
+			store.setSessionAffinity("fresh", deviceId, undefined, now - 1_000);
+			await reclaimLifecycle(aca, () => now).sweep();
+			expect(aca.destroy).not.toHaveBeenCalled();
+		});
+
+		it("leaves a container with a pending terminal teardown to that coordinator", async () => {
+			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const now = createdMs + RECLAIM_MS + 1;
+			store.upsertPendingTeardown({
+				issueKey: "NOR-402",
+				deviceId,
+				action: "closed",
+				registeredMs: now,
+				deadlineMs: now + 600_000,
+			});
+
+			await reclaimLifecycle(aca, () => now).sweep();
+
+			// TerminalTeardown owns this container from here, and its own grace
+			// deadline is what force-destroys it.
+			expect(aca.destroy).not.toHaveBeenCalled();
+			expect(store.getContainerDevice(deviceId)).toBeDefined();
+		});
+
+		it("does not act on a provider it could not read this tick", async () => {
+			// `unknown` describes the control plane, not the container. Destroying on
+			// the strength of a listing that failed is a control-plane call made from
+			// a control plane we just failed to read.
+			const { createdMs } = strandedRow("NOR-402");
+			const unreadable = fakeExecutor("aca", {
+				listManagedImpl: vi.fn(async () => {
+					throw new Error("Too many requests");
+				}),
+			});
+
+			await reclaimLifecycle(
+				unreadable,
+				() => createdMs + RECLAIM_MS + 1,
+			).sweep();
+
+			expect(unreadable.destroy).not.toHaveBeenCalled();
+			expect(eventsNamed(logger, "sandbox.reclaim_skipped")[0]).toMatchObject({
+				reason: "provider_unreadable",
+			});
+		});
+
+		it("is disabled by reclaimStrandedMs = 0", async () => {
+			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			await reclaimLifecycle(aca, () => createdMs + 400 * 24 * 3_600_000, {
+				reclaimStrandedMs: 0,
+				// Far past the age-out, so the pin is the only thing holding the row.
+				offlineAgeOutMs: 500 * 24 * 3_600_000,
+			}).sweep();
+			expect(aca.destroy).not.toHaveBeenCalled();
+			expect(store.getContainerDevice(deviceId)).toBeDefined();
+		});
+
+		it("does not reset its own clock by stamping last_active_ms every tick", async () => {
+			// The sweep marks a pinned device active on EVERY tick, which is what
+			// keeps the idle clock honest while an agent works. Folding that column
+			// into the reclaim clock would mean the loop resetting the very value it
+			// reads, and this branch could never fire at all — the same trap
+			// `noteStranded` documents for `no_progress`.
+			const { createdMs, aca } = strandedRow("NOR-402");
+			let now = createdMs + 1;
+			const lifecycle = reclaimLifecycle(aca, () => now);
+
+			await lifecycle.sweep();
+			expect(aca.destroy).not.toHaveBeenCalled();
+
+			now = createdMs + RECLAIM_MS + 1;
+			await lifecycle.sweep();
+			expect(aca.destroy).toHaveBeenCalledWith("NOR-402");
+		});
+
+		it("skips a container claimed while the sweep was deciding", async () => {
+			// The re-check immediately before the destroy. `resolveAffinity` queries
+			// the DEVICE and sits between the gate and this point, so a session that
+			// claimed the container during it is invisible to the gate — the same
+			// TOCTOU shape, and the same remedy, as the pre-stop re-check on the idle
+			// path.
+			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const now = createdMs + RECLAIM_MS + 1;
+
+			await reclaimLifecycle(aca, () => now, {
+				sessionReconciler: {
+					isOnline: () => true,
+					reconcile: async () => {
+						store.setSessionAffinity("arrived", deviceId, undefined, now);
+						return 2;
+					},
+				},
+			}).sweep();
+
+			expect(aca.destroy).not.toHaveBeenCalled();
+			expect(store.getContainerDevice(deviceId)).toBeDefined();
+			expect(eventsNamed(logger, "sandbox.reclaim_skipped")[0]).toMatchObject({
+				issue_key: "NOR-402",
+				device_id: deviceId,
+				reason: "activity_observed",
+				reclaim_stranded_ms: RECLAIM_MS,
+			});
+		});
+
+		it("warns when the reclaim window is not comfortably behind the report", async () => {
+			// The report is what gives a human the chance to look at a strand before
+			// it is destroyed, and `no_progress` knowingly cannot separate a strand
+			// from a session waiting on a long cron.
+			const { aca } = strandedRow("NOR-402");
+			reclaimLifecycle(aca, () => 0, {
+				reclaimStrandedMs: 3_600_000,
+				sessionNoProgressMs: 4 * 3_600_000,
+			});
+			expect(
+				logger.warn.mock.calls.filter(([m]) =>
+					String(m).includes("is not greater than"),
+				),
+			).toHaveLength(1);
+		});
+	});
 });

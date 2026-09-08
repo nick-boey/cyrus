@@ -90,6 +90,17 @@ export const SANDBOX_EVENTS = {
 	 * of a container that was just routed to and has not dialled back yet.
 	 */
 	strandedSession: "sandbox.stranded_session",
+	/**
+	 * The sweep found a sandbox whose device row is stale — session affinity
+	 * held, every observable clock quiet past `reclaimStrandedMs` — and
+	 * abandoned the reclaim anyway. `reason` says which guard fired.
+	 *
+	 * Emitted ONLY when the reclaim gate passed and the immediate pre-destroy
+	 * re-check then vetoed. The ordinary "this device is still active" outcome
+	 * is not an event: it is the steady state of every healthy pinned sandbox,
+	 * and emitting it per tick would bury the races this exists to show.
+	 */
+	reclaimSkipped: "sandbox.reclaim_skipped",
 	/** The sandbox (and its disk/volume) was destroyed. `reason` says why. */
 	destroyed: "sandbox.destroyed",
 	/** A terminal teardown finished: worker cleaned up and the row was deleted. */
@@ -98,6 +109,18 @@ export const SANDBOX_EVENTS = {
 	gauge: "sandbox.gauge",
 	/** Per-tick rollup of the gauge samples: how many sandboxes are open. */
 	sweepCompleted: "sandbox.sweep_completed",
+	/**
+	 * One registered ACA disk image the image GC decided about. `cyrus.action`
+	 * is `deleted` or `kept`, and `cyrus.reason` says why.
+	 *
+	 * Per-image rather than rollup-only because the expensive mistake here is
+	 * silent and singular: one wrongly-deleted rollback image is invisible in a
+	 * count, and the first anyone hears of it is a boot that cannot find its
+	 * disk. A keep decision is as much of a record as a delete.
+	 */
+	imageDecision: "sandbox.image_decision",
+	/** Per-cycle rollup of the disk-image GC: what it reclaimed, and how much. */
+	imageGcCompleted: "sandbox.image_gc_completed",
 } as const;
 
 export type SandboxEventName =
@@ -109,7 +132,33 @@ export type SandboxDestroyReason =
 	| "stale"
 	| "orphan"
 	| "terminal_teardown"
-	| "provider_switch";
+	| "provider_switch"
+	/**
+	 * The device row was still there, still holding session affinity, and every
+	 * clock the agent or the router could have moved had been quiet past
+	 * `reclaimStrandedMs`. Distinct from `stale` because `stale` describes a row
+	 * nothing claims: a claimed row never reaches that path at all, which is
+	 * exactly how a leaked affinity row shielded a sandbox indefinitely.
+	 */
+	| "stranded";
+
+/**
+ * Why a stranded-sandbox reclaim was abandoned at the last moment. Closed for
+ * the same reason {@link SandboxIdleStopSkipReason} is.
+ *
+ *  - `row_deleted`: the device row went away mid-tick (terminal teardown).
+ *  - `pending_teardown`: a terminal teardown was registered for the issue while
+ *    the sweep was deciding; that coordinator owns the container from then on.
+ *  - `activity_observed`: a clock moved — a route, a heartbeat, an agent
+ *    activity, a run, or a fresh session claim.
+ *  - `provider_unreadable`: the provider could not be listed this tick, so
+ *    nothing is known about the sandbox this row names.
+ */
+export type SandboxReclaimSkipReason =
+	| "row_deleted"
+	| "pending_teardown"
+	| "activity_observed"
+	| "provider_unreadable";
 
 /**
  * Why an idle-stop was abandoned. Closed for the same reason
@@ -128,6 +177,34 @@ export type SandboxIdleStopSkipReason =
 	| "clock_moved"
 	| "claimed_mid_sweep"
 	| "terminal_settle";
+
+/**
+ * Why the disk-image GC spared a registered image. Closed set, ordered by the
+ * precedence the GC applies them in, so `summarize by reason` reads as the
+ * protection that actually saved each image rather than an arbitrary one of
+ * several that would have.
+ *
+ *  - `unmanaged`: not a Cyrus-registered disk name. Somebody else's image in
+ *    the sandbox group, and never ours to delete.
+ *  - `deployment_disk`: the disk this deployment boots by default.
+ *  - `sandbox_source`: a live sandbox was created from it.
+ *  - `snapshot_lineage`: a snapshot restores this image lineage.
+ *  - `issue_pin`: an issue is pinned to it.
+ *  - `cache_reference`: a devcontainer cache row still names it — the newest
+ *    ready build for its repository, or a build in flight.
+ *  - `not_ready`: still importing, or failed and not yet observed long enough.
+ *    A deployment in flight looks exactly like this.
+ *  - `retained`: young enough to still be a staged or rollback candidate.
+ */
+export type SandboxImageKeepReason =
+	| "unmanaged"
+	| "deployment_disk"
+	| "sandbox_source"
+	| "snapshot_lineage"
+	| "issue_pin"
+	| "cache_reference"
+	| "not_ready"
+	| "retained";
 
 /**
  * The subset of a container device row every sandbox event carries, so an
