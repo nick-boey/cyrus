@@ -148,6 +148,9 @@ jobs:
               --out "$RELEASE_ARTIFACTS/%s-%v.tgz"
           done < <(node scripts/release-packages.mjs list)
 
+      - name: Build deterministic trusted skill artifact and checksum
+        run: node scripts/release-packages.mjs skill-archive "$REQUESTED_VERSION" "$RELEASE_ARTIFACTS"
+
       - name: Inspect package manifests
         shell: bash
         run: |
@@ -195,7 +198,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: cyrus-${{ inputs.version }}-packages
-          path: ${{ runner.temp }}/cyrus-release/*.tgz
+          path: |
+            ${{ runner.temp }}/cyrus-release/*.tgz
+            ${{ runner.temp }}/cyrus-release/cyrus-fleet-operator-*.tar.gz
+            ${{ runner.temp }}/cyrus-release/cyrus-fleet-operator-*.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -287,7 +293,9 @@ jobs:
           gh release create "v${REQUESTED_VERSION}" \
             --verify-tag \
             --title "v${REQUESTED_VERSION}" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "$RELEASE_ARTIFACTS/cyrus-fleet-operator-${REQUESTED_VERSION}.tar.gz" \
+            "$RELEASE_ARTIFACTS/cyrus-fleet-operator-${REQUESTED_VERSION}.tar.gz.sha256"
 
       - name: Write release summary
         if: always()

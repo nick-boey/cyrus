@@ -1,6 +1,8 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { createTrustedSkillArchive } from "../../scripts/release-packages.mjs";
 
 const repositoryRoot = resolve(import.meta.dirname, "../..");
 const workflow = readFileSync(
@@ -189,6 +191,34 @@ describe("trusted Cyrus release workflow", () => {
 		expect(workflow).toMatch(/git tag --annotate "v\$\{REQUESTED_VERSION\}"/);
 		expect(workflow).toMatch(/git push origin "v\$\{REQUESTED_VERSION\}"/);
 		expect(workflow).toMatch(/gh release create "v\$\{REQUESTED_VERSION\}"/);
+	});
+
+	it("builds and publishes a deterministic trusted skill archive and checksum", () => {
+		expect(workflow).toContain(
+			'release-packages.mjs skill-archive "$REQUESTED_VERSION" "$RELEASE_ARTIFACTS"',
+		);
+		expect(workflow).toContain(
+			["cyrus-fleet-operator-", "$", "{REQUESTED_VERSION}.tar.gz"].join(""),
+		);
+		expect(workflow).toContain(
+			["cyrus-fleet-operator-", "$", "{REQUESTED_VERSION}.tar.gz.sha256"].join(
+				"",
+			),
+		);
+		const first = createTrustedSkillArchive(
+			"0.2.70",
+			mkdtempSync(resolve(tmpdir(), "skill-release-a-")),
+		);
+		const second = createTrustedSkillArchive(
+			"0.2.70",
+			mkdtempSync(resolve(tmpdir(), "skill-release-b-")),
+		);
+		expect(readFileSync(first.archivePath)).toEqual(
+			readFileSync(second.archivePath),
+		);
+		expect(readFileSync(first.checksumPath, "utf8")).toBe(
+			readFileSync(second.checksumPath, "utf8"),
+		);
 	});
 
 	it("documents the npm trust identity and complete release lifecycle", () => {
