@@ -82,6 +82,11 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	{ pattern: "repo1.maven.org", action: "Allow" },
 	{ pattern: "api.nuget.org", action: "Allow" },
 	{ pattern: "*.nuget.org", action: "Allow" },
+	// The Argos visual-testing CLI baked into the worker image. `argos upload`
+	// authenticates and uploads against api.argos-ci.com; without this entry
+	// `ARGOS_TOKEN` is set and every call is denied, which reads as an auth
+	// failure rather than an egress one.
+	{ pattern: "api.argos-ci.com", action: "Allow" },
 ];
 
 /** Normalised label keys the provider stamps on every managed resource. */

@@ -94,9 +94,10 @@ RUN set -eu; \
 	tar -xzf "${tarball}" actionlint; \
 	install -m 0755 actionlint /usr/local/bin/actionlint; \
 	rm -f "${tarball}" "actionlint_${ACTIONLINT_VERSION}_checksums.txt" actionlint
-# Agent CLIs on PATH: `codex` and `opencode`. Both npm packages resolve their
-# native binary through per-platform optionalDependencies, so `npm install -g`
-# picks the right linux-x64/linux-arm64 build without arch special-casing here.
+# npm-installed CLIs on PATH: `codex`, `opencode` and `argos`. The two agent
+# CLI packages resolve their native binary through per-platform
+# optionalDependencies, so `npm install -g` picks the right
+# linux-x64/linux-arm64 build without arch special-casing here.
 #
 # `codex` is deliberately installed a second time even though `@openai/codex`
 # already ships inside /app as a transitive dependency of cyrus-codex-runner:
@@ -117,11 +118,19 @@ RUN set -eu; \
 # `$CODEX_HOME/auth.json` at 0600 before launching the session. `OPENAI_API_KEY`
 # remains supported as the metered fallback. See
 # docs/adr/0005-codex-authenticates-by-router-held-subscription-tokens.md.
+#
+# `argos` is the Argos visual-testing CLI — the upload half of the Playwright
+# screenshots the browser layer below exists for. It authenticates purely from
+# the session env (`ARGOS_TOKEN`), which reaches the sandbox from the user's
+# secret bundle, and talks to `api.argos-ci.com`, allowlisted in
+# `DEFAULT_EGRESS_HOSTS` because ACA sandboxes deny egress by default.
 ARG CODEX_VERSION=0.144.6
 ARG OPENCODE_VERSION=1.18.13
+ARG ARGOS_CLI_VERSION=6.9.2
 RUN npm install -g \
 		"@openai/codex@${CODEX_VERSION}" \
 		"opencode-ai@${OPENCODE_VERSION}" \
+		"@argos-ci/cli@${ARGOS_CLI_VERSION}" \
 	&& rm -rf /root/.npm
 RUN useradd --create-home --uid 1001 cyrus \
 	&& mkdir -p /workspaces /var/cache/repos \
