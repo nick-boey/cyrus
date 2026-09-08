@@ -73,6 +73,10 @@ export interface DevcontainerImageServiceDeps {
 	 * rollback build. Forwarded to {@link DiskImageCollector}; default 7 days.
 	 */
 	imageRetentionMs?: number;
+	/** How many unreferenced images are kept regardless of age. Default 3. */
+	imageRetentionCount?: number;
+	/** Report disk-image GC decisions and delete nothing. */
+	imageGcDryRun?: boolean;
 }
 
 /** ACR's OAuth2 exchange always uses this sentinel as the username. */
@@ -100,6 +104,12 @@ export class DevcontainerImageService {
 			deploymentDisk: deps.deploymentDisk,
 			...(deps.imageRetentionMs !== undefined
 				? { imageRetentionMs: deps.imageRetentionMs }
+				: {}),
+			...(deps.imageRetentionCount !== undefined
+				? { imageRetentionCount: deps.imageRetentionCount }
+				: {}),
+			...(deps.imageGcDryRun !== undefined
+				? { dryRun: deps.imageGcDryRun }
 				: {}),
 			...(deps.now ? { now: deps.now } : {}),
 		});

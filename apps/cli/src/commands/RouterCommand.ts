@@ -631,15 +631,23 @@ const RouterConfigFileFieldsSchema = z.object({
 					apiVersion: z.string().optional(),
 					managementEndpoint: z.string().optional(),
 					/**
-					 * Disk-image GC cadence and retention. Positive integers of
-					 * MILLISECONDS, rejected rather than coerced: a zero or negative
+					 * Disk-image GC. `imageGcEnabled: false` is the off switch and
+					 * `imageGcDryRun: true` reports every decision without deleting —
+					 * this is destructive work that runs unattended, so a deployment must
+					 * be able to watch a cycle before trusting it.
+					 *
+					 * The two windows are positive integers of MILLISECONDS and a
+					 * positive count, rejected rather than coerced: a zero or negative
 					 * retention makes every unreferenced image collectable on the first
-					 * cycle, which would delete the staged build about to go out and the
-					 * one an operator would roll back to — the one mistake in this file
-					 * that is not recoverable from within the router.
+					 * cycle, which deletes the staged build about to go out and the one
+					 * an operator would roll back to — the one mistake in this file that
+					 * is not recoverable from within the router.
 					 */
+					imageGcEnabled: z.boolean().optional(),
+					imageGcDryRun: z.boolean().optional(),
 					imageGcIntervalMs: z.number().int().positive().optional(),
 					imageRetentionMs: z.number().int().positive().optional(),
+					imageRetentionCount: z.number().int().positive().optional(),
 				})
 				.optional(),
 		})

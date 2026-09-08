@@ -94,9 +94,22 @@ function acaFake(opts: {
 	return { client, deleted, calls, deleteDiskImage };
 }
 
+/**
+ * `imageRetentionCount` defaults to **0** here, not to the production 3.
+ *
+ * The two floors are independent and every test should say which one it is
+ * about. Left at the production default, the count floor would spare the single
+ * unreferenced image in almost every case below and each of those tests would
+ * pass for a reason it never states.
+ */
 function collector(
 	aca: AcaFake,
-	opts: { now?: () => number; imageRetentionMs?: number } = {},
+	opts: {
+		now?: () => number;
+		imageRetentionMs?: number;
+		imageRetentionCount?: number;
+		dryRun?: boolean;
+	} = {},
 ): DiskImageCollector {
 	return new DiskImageCollector({
 		store,
@@ -104,6 +117,8 @@ function collector(
 		aca: aca.client,
 		deploymentDisk: DEPLOYMENT_DISK,
 		imageRetentionMs: opts.imageRetentionMs ?? HOUR,
+		imageRetentionCount: opts.imageRetentionCount ?? 0,
+		...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
 		now: opts.now ?? (() => 0),
 	});
 }
@@ -296,7 +311,7 @@ describe("DiskImageCollector", () => {
 		});
 	});
 
-	it("leaves an image that is not Ready alone — a deployment in flight looks like this", async () => {
+	it("leaves an import still in flight alone — a deployment looks like this", async () => {
 		const aca = acaFake({
 			disks: [
 				disk(DEPLOYMENT_DISK),
@@ -312,6 +327,47 @@ describe("DiskImageCollector", () => {
 			diskName: "cyrus-worker-sha-importing",
 			reason: "not_ready",
 		});
+	});
+
+	it("collects a FAILED import once it is past retention", async () => {
+		// A failed import will never become Ready, so protecting every non-Ready
+		// state indefinitely would leak its storage forever. The in-flight
+		// protection is for imports that can still succeed.
+		const aca = acaFake({
+			disks: [
+				disk(DEPLOYMENT_DISK),
+				disk("cyrus-worker-sha-broken", {
+					status: { state: "Failed", errorMessage: "pull denied" },
+				}),
+			],
+		});
+		seenAtZero([DEPLOYMENT_DISK, "cyrus-worker-sha-broken"]);
+
+		await collector(aca, { now: () => 10 * HOUR }).collect();
+
+		expect(aca.deleted).toEqual(["id-cyrus-worker-sha-broken"]);
+	});
+
+	it("deletes nothing under dryRun, but reports what it would have", async () => {
+		// This is destructive work that runs unattended on a 6-hour timer, so a
+		// deployment has to be able to watch a cycle before trusting it.
+		const aca = acaFake({
+			disks: [
+				disk(DEPLOYMENT_DISK),
+				disk("cyrus-worker-sha-old", { sizeInMB: 4_200 }),
+			],
+		});
+		seenAtZero([DEPLOYMENT_DISK, "cyrus-worker-sha-old"]);
+
+		const summary = await collector(aca, {
+			now: () => 10 * HOUR,
+			dryRun: true,
+		}).collect();
+
+		expect(aca.deleteDiskImage).not.toHaveBeenCalled();
+		expect(summary.dryRun).toBe(true);
+		expect(summary.deleted).toEqual(["cyrus-worker-sha-old"]);
+		expect(summary.reclaimedMb).toBe(4_200);
 	});
 
 	describe("retention", () => {
@@ -346,20 +402,151 @@ describe("DiskImageCollector", () => {
 			expect(aca.deleted).toEqual([]);
 		});
 
-		it("prefers the provider's own creation time when it reports one", async () => {
+		it("prefers the provider's own creation time when it reports a plausible one", async () => {
 			// First sight can only ever be LATER than creation, so an image the
-			// provider dates as ancient must not be kept alive by the router having
-			// only just noticed it.
+			// provider dates as old must not be kept alive by the router having only
+			// just noticed it.
 			const aca = acaFake({
 				disks: [
 					disk(DEPLOYMENT_DISK),
 					disk("cyrus-worker-sha-dated", {
-						createdAtUtc: new Date(0).toISOString(),
+						createdAtUtc: "2026-01-01T00:00:00.000Z",
 					}),
 				],
 			});
-			await collector(aca, { now: () => 10 * HOUR }).collect();
+			await collector(aca, {
+				now: () => Date.parse("2026-02-01T00:00:00.000Z"),
+				imageRetentionMs: 7 * 24 * HOUR,
+			}).collect();
 			expect(aca.deleted).toEqual(["id-cyrus-worker-sha-dated"]);
+		});
+
+		it("refuses a sentinel creation time rather than dating every image as ancient", async () => {
+			// The dangerous direction, and the one first-sight cannot cover on its
+			// own: the caller takes the EARLIER of the two, so an unsanitised
+			// provider value can only ever make an image look older. The field is
+			// undeclared on the preview API and has never been observed, so the
+			// realistic failure is not a wrong date but a sentinel — .NET's
+			// `DateTime.MinValue` parses cleanly and would empty the sandbox group
+			// in a single cycle.
+			const aca = acaFake({
+				disks: [
+					disk(DEPLOYMENT_DISK, { createdAtUtc: "0001-01-01T00:00:00+00:00" }),
+					disk("cyrus-worker-sha-a", {
+						createdAtUtc: "0001-01-01T00:00:00+00:00",
+					}),
+					disk("cyrus-worker-sha-b", {
+						createdAtUtc: "0001-01-01T00:00:00+00:00",
+					}),
+				],
+			});
+			// First seen just now, so first-sight alone would spare all of them.
+			await collector(aca, { now: () => 10 * HOUR }).collect();
+			expect(aca.deleted).toEqual([]);
+			expect(
+				logger.warn.mock.calls.filter(([m]) =>
+					String(m).includes("implausible creation time"),
+				).length,
+			).toBeGreaterThan(0);
+		});
+
+		it("refuses a creation time in the future", async () => {
+			// The mirror failure: a future timestamp would pin an image open forever.
+			const aca = acaFake({
+				disks: [
+					disk(DEPLOYMENT_DISK),
+					disk("cyrus-worker-sha-future", {
+						createdAtUtc: "2099-01-01T00:00:00.000Z",
+					}),
+				],
+			});
+			seenAtZero([DEPLOYMENT_DISK, "cyrus-worker-sha-future"]);
+			await collector(aca, { now: () => 10 * HOUR }).collect();
+			expect(aca.deleted).toEqual(["id-cyrus-worker-sha-future"]);
+		});
+
+		it("keeps the newest N unreferenced images whatever their age", async () => {
+			// The age floor alone makes rollback depth a function of deploy cadence:
+			// a deployment shipping less often than the window is long ends up with
+			// nothing to roll back to, silently. The 2026-09-08 audit kept the three
+			// newest by hand for exactly this reason.
+			const aca = acaFake({
+				disks: [
+					disk(DEPLOYMENT_DISK),
+					disk("cyrus-worker-sha-1"),
+					disk("cyrus-worker-sha-2"),
+					disk("cyrus-worker-sha-3"),
+					disk("cyrus-worker-sha-4"),
+				],
+			});
+			// Built up cumulatively, oldest first: `first_seen_ms` is set on insert
+			// only, and a name left out of a call has its sighting dropped. `sha-4`
+			// is therefore the oldest and `sha-1` the newest — deliberately the
+			// reverse of the listing order, so the floor has to sort by age rather
+			// than take the first N it sees.
+			const seen = [DEPLOYMENT_DISK, "cyrus-worker-sha-4"];
+			store.recordDiskImageSightings(seen, 100);
+			for (const [name, at] of [
+				["cyrus-worker-sha-3", 200],
+				["cyrus-worker-sha-2", 300],
+				["cyrus-worker-sha-1", 400],
+			] as Array<[string, number]>) {
+				seen.push(name);
+				store.recordDiskImageSightings(seen, at);
+			}
+
+			const summary = await collector(aca, {
+				now: () => 10 * HOUR,
+				imageRetentionCount: 2,
+			}).collect();
+
+			// All four are far past the age window; the two newest survive on the
+			// count floor alone.
+			expect(
+				summary.kept
+					.filter((k) => k.reason === "rollback_floor")
+					.map((k) => k.diskName)
+					.sort(),
+			).toEqual(["cyrus-worker-sha-1", "cyrus-worker-sha-2"]);
+			expect(aca.deleted.sort()).toEqual([
+				"id-cyrus-worker-sha-3",
+				"id-cyrus-worker-sha-4",
+			]);
+		});
+
+		it("does not let a referenced image consume a rollback slot", async () => {
+			// A referenced image is already protected; spending a slot on it would
+			// shrink the rollback set for no benefit.
+			const aca = acaFake({
+				disks: [
+					disk(DEPLOYMENT_DISK),
+					disk("cyrus-worker-sha-live"),
+					disk("cyrus-worker-sha-old"),
+				],
+				sandboxes: [
+					{
+						id: "sb-1",
+						state: "Running",
+						labels: { "cyrus.disk": "cyrus-worker-sha-live" },
+					},
+				] as unknown as AcaSandbox[],
+			});
+			seenAtZero([
+				DEPLOYMENT_DISK,
+				"cyrus-worker-sha-live",
+				"cyrus-worker-sha-old",
+			]);
+
+			const summary = await collector(aca, {
+				now: () => 10 * HOUR,
+				imageRetentionCount: 1,
+			}).collect();
+
+			expect(aca.deleted).toEqual([]);
+			expect(summary.kept).toContainEqual({
+				diskName: "cyrus-worker-sha-old",
+				reason: "rollback_floor",
+			});
 		});
 
 		it("forgets a disk that disappears, so a re-registered name is new again", async () => {

@@ -544,6 +544,10 @@ resource diskImageGc 'Microsoft.OperationalInsights/workspaces/savedSearches@202
         '    kept     = toint(p["cyrus.kept"]),'
         '    reclaimed_mb = tolong(p["cyrus.reclaimed_mb"]),'
         '    retention = tolong(p["cyrus.retention_ms"]) * 1ms,'
+        '    retention_count = toint(p["cyrus.retention_count"]),'
+        // A run of cycles with dry_run = true is a deployment still evaluating
+        // the GC, not one whose fleet happens to have nothing collectable.
+        '    dry_run   = tobool(p["cyrus.dry_run"]),'
         '    duration  = tolong(p["cyrus.duration_ms"]) * 1ms'
         '| order by TimeGenerated desc'
       ],

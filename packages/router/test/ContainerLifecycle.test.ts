@@ -1184,6 +1184,10 @@ describe("ContainerLifecycle", () => {
 		});
 
 		it("emits a destroy event naming why the container was reclaimed", async () => {
+			// `stale` is still reachable, but only where reclamation is not: here
+			// with reclamation switched off. In a default deployment the shorter,
+			// better-evidenced `stranded` window reaches an abandoned container
+			// first — see the reclaim suite below.
 			const { createdMs } = makeContainerDevice("NOR-1", "aca");
 			const aca = fakeExecutor("aca", {
 				listStates: [{ issueKey: "NOR-1", status: "stopped" }],
@@ -1195,6 +1199,7 @@ describe("ContainerLifecycle", () => {
 				idleStopMs: 300_000,
 				staleDestroyMs,
 				offlineAgeOutMs: 3_600_000,
+				reclaimStrandedMs: 0,
 				logger,
 				now: () => createdMs + staleDestroyMs + 1_000,
 			});
@@ -2645,23 +2650,29 @@ describe("ContainerLifecycle", () => {
 	});
 
 	/**
-	 * CYR-84. Every other reclamation path in the sweep — the stale-destroy
-	 * backstop and the idle stop — sits BELOW the `affinity > 0` gate, so a leaked
-	 * affinity row did not delay reclamation, it removed it: the 14-day backstop
-	 * was unreachable and the sandbox billed until a human noticed. The 2026-09-08
-	 * audit found several, for issues that had been finished or wedged for days.
+	 * CYR-84. A leaked session-affinity row on an OFFLINE device ages out of
+	 * `resolveAffinity` after `offlineAgeOutMs`, and the row then falls through to
+	 * a stale-destroy clock that reads only `last_routed_ms` / `last_seen_ms` /
+	 * `created_ms` and waits 14 DAYS. That is the shielding the 2026-09-08 audit
+	 * found: ACA sandboxes alive for work finished days earlier.
+	 *
+	 * The reclaim is the same destroy on a shorter window and stronger evidence,
+	 * and it runs for pinned and unpinned rows alike. Scoping it to the pinned
+	 * branch made it unreachable — `resolveAffinity` returns non-zero only for an
+	 * ONLINE device (whose `last_seen_ms` the gateway restamps every 30s) or for an
+	 * OFFLINE device whose newest claim is inside `offlineAgeOutMs`, and the clock
+	 * folds both of those in.
 	 */
-	describe("reclaiming a stranded sandbox behind a stale device row", () => {
-		const RECLAIM_MS = 24 * 3_600_000;
+	describe("reclaiming an abandoned container", () => {
+		const RECLAIM_MS = 72 * 3_600_000;
+		const STALE_MS = 14 * 24 * 3_600_000;
 
-		/** A container pinned by an affinity row nothing will ever release. */
-		function strandedRow(issueKey: string) {
+		function abandoned(issueKey: string) {
 			const { deviceId, createdMs } = makeContainerDevice(issueKey, "aca");
 			const aca = fakeExecutor("aca", {
-				status: "running",
-				listStates: [{ issueKey, status: "running" }],
+				status: "stopped",
+				listStates: [{ issueKey, status: "stopped" }],
 			});
-			store.setSessionAffinity("leaked", deviceId, undefined, createdMs);
 			return { deviceId, createdMs, aca };
 		}
 
@@ -2676,21 +2687,21 @@ describe("ContainerLifecycle", () => {
 				store,
 				executors: new Map<string, ContainerExecutor>([["aca", aca]]),
 				idleStopMs: 300_000,
-				staleDestroyMs: 14 * 24 * 60 * 60_000,
+				staleDestroyMs: STALE_MS,
 				offlineAgeOutMs: 3_600_000,
 				sessionNoProgressMs: 4 * 3_600_000,
 				reclaimStrandedMs: RECLAIM_MS,
 				logger,
 				now,
-				// Online with a live claim, so the affinity gate holds and the row is
-				// genuinely pinned rather than quietly aged out.
-				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+				// Offline is the shape this path is for. An ONLINE device is
+				// unreclaimable by construction — see the heartbeat test below.
+				sessionReconciler: { isOnline: () => false, reconcile: async () => 0 },
 				...overrides,
 			});
 		}
 
-		it("destroys the sandbox and deletes the row once every clock has been quiet", async () => {
-			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+		it("destroys the sandbox and deletes the row long before the stale backstop", async () => {
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
 
 			await reclaimLifecycle(aca, () => createdMs + RECLAIM_MS + 1).sweep();
 
@@ -2699,21 +2710,34 @@ describe("ContainerLifecycle", () => {
 			// came from and resurrects the sandbox on the next boot.
 			expect(aca.destroy).toHaveBeenCalledWith("NOR-402");
 			expect(store.getContainerDevice(deviceId)).toBeUndefined();
-			// The affinity row AND the issue lock go with it; without that the issue
-			// stays unreachable with nothing left alive to release it.
-			expect(store.countSessionAffinityForDevice(deviceId)).toBe(0);
 			expect(eventsNamed(logger, "sandbox.destroyed")[0]).toMatchObject({
 				issue_key: "NOR-402",
 				device_id: deviceId,
 				reason: "stranded",
-				sessions: 1,
 				quiet_for_ms: RECLAIM_MS + 1,
 				reclaim_stranded_ms: RECLAIM_MS,
 			});
 		});
 
+		it("reclaims a container a leaked affinity row had left on the 14-day clock", async () => {
+			// The audited shape. The claim is older than `offlineAgeOutMs`, so
+			// `resolveAffinity` discounts it and the row is no longer pinned — which
+			// is exactly why the reclaim cannot live behind the affinity gate.
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
+			store.setSessionAffinity("leaked", deviceId, undefined, createdMs);
+			const now = createdMs + RECLAIM_MS + 1;
+
+			await reclaimLifecycle(aca, () => now).sweep();
+
+			expect(aca.destroy).toHaveBeenCalledWith("NOR-402");
+			expect(store.getContainerDevice(deviceId)).toBeUndefined();
+			// The row is gone, so the affinity row and the issue lock it was holding
+			// go with it and the issue is reachable again.
+			expect(store.countSessionAffinityForDevice(deviceId)).toBe(0);
+		});
+
 		it("counts what it reclaimed in the per-tick rollup", async () => {
-			const { createdMs, aca } = strandedRow("NOR-402");
+			const { createdMs, aca } = abandoned("NOR-402");
 			await reclaimLifecycle(aca, () => createdMs + RECLAIM_MS + 1).sweep();
 			expect(eventsNamed(logger, "sandbox.sweep_completed")[0]).toMatchObject({
 				reclaimed: 1,
@@ -2721,32 +2745,34 @@ describe("ContainerLifecycle", () => {
 		});
 
 		it("leaves it alone inside the window", async () => {
-			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
 			await reclaimLifecycle(aca, () => createdMs + RECLAIM_MS).sweep();
 			expect(aca.destroy).not.toHaveBeenCalled();
 			expect(store.getContainerDevice(deviceId)).toBeDefined();
 		});
 
-		it("retains a container whose worker is still heartbeating", async () => {
-			// `last_seen_ms` is excluded from the `no_progress` detector, because a
-			// wedged worker heartbeats as faithfully as a working one. It is INCLUDED
-			// here for exactly that reason: a heartbeating worker is a live process
-			// holding a workspace, and whether it is making progress is a question
-			// for a human rather than for a destroy.
-			const { createdMs, aca } = strandedRow("NOR-402");
-			const now = createdMs + RECLAIM_MS + 1;
-			store.touchDevice(
-				store.getContainerDeviceForIssue("NOR-402")!.deviceId,
-				now - 1_000,
-			);
+		it("never reclaims a container whose worker is connected", async () => {
+			// `DeviceGateway` restamps `last_seen_ms` on every pong, so a connected
+			// worker's clock is never more than ~90s old and this threshold is
+			// unreachable for it BY CONSTRUCTION. That is the `no_progress` shape
+			// (NOR-402) and it stays detection-only: a heartbeating worker is a live
+			// process holding a workspace, and whether it is making progress is a
+			// question for a human rather than for a destroy.
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
+			const now = createdMs + 40 * 24 * 3_600_000;
+			store.setSessionAffinity("live", deviceId, undefined, now - 1_000);
+			store.touchDevice(deviceId, now - 30_000);
 
-			await reclaimLifecycle(aca, () => now).sweep();
+			await reclaimLifecycle(aca, () => now, {
+				sessionReconciler: { isOnline: () => true, reconcile: async () => 1 },
+			}).sweep();
 
 			expect(aca.destroy).not.toHaveBeenCalled();
+			expect(store.getContainerDevice(deviceId)).toBeDefined();
 		});
 
 		it("retains a container with a recent agent run", async () => {
-			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
 			const now = createdMs + RECLAIM_MS + 1;
 			store.recordAgentRunRouted({
 				deviceId,
@@ -2762,7 +2788,7 @@ describe("ContainerLifecycle", () => {
 		});
 
 		it("retains a container the router routed to recently", async () => {
-			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
 			const now = createdMs + RECLAIM_MS + 1;
 			store.markDeviceRouted(deviceId, now - 1_000);
 			await reclaimLifecycle(aca, () => now).sweep();
@@ -2770,9 +2796,9 @@ describe("ContainerLifecycle", () => {
 		});
 
 		it("retains a container whose session was claimed recently", async () => {
-			// A second session claiming a device that had been quiet for a day is a
-			// container going back to work, not a strand.
-			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			// A session claiming a container that had been quiet for days is work
+			// arriving, not an abandonment.
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
 			const now = createdMs + RECLAIM_MS + 1;
 			store.setSessionAffinity("fresh", deviceId, undefined, now - 1_000);
 			await reclaimLifecycle(aca, () => now).sweep();
@@ -2780,7 +2806,7 @@ describe("ContainerLifecycle", () => {
 		});
 
 		it("leaves a container with a pending terminal teardown to that coordinator", async () => {
-			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
 			const now = createdMs + RECLAIM_MS + 1;
 			store.upsertPendingTeardown({
 				issueKey: "NOR-402",
@@ -2802,7 +2828,7 @@ describe("ContainerLifecycle", () => {
 			// `unknown` describes the control plane, not the container. Destroying on
 			// the strength of a listing that failed is a control-plane call made from
 			// a control plane we just failed to read.
-			const { createdMs } = strandedRow("NOR-402");
+			const { createdMs } = abandoned("NOR-402");
 			const unreadable = fakeExecutor("aca", {
 				listManagedImpl: vi.fn(async () => {
 					throw new Error("Too many requests");
@@ -2820,12 +2846,10 @@ describe("ContainerLifecycle", () => {
 			});
 		});
 
-		it("is disabled by reclaimStrandedMs = 0", async () => {
-			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
-			await reclaimLifecycle(aca, () => createdMs + 400 * 24 * 3_600_000, {
+		it("is disabled by reclaimStrandedMs = 0, leaving the stale backstop alone", async () => {
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
+			await reclaimLifecycle(aca, () => createdMs + RECLAIM_MS + 1, {
 				reclaimStrandedMs: 0,
-				// Far past the age-out, so the pin is the only thing holding the row.
-				offlineAgeOutMs: 500 * 24 * 3_600_000,
 			}).sweep();
 			expect(aca.destroy).not.toHaveBeenCalled();
 			expect(store.getContainerDevice(deviceId)).toBeDefined();
@@ -2835,15 +2859,26 @@ describe("ContainerLifecycle", () => {
 			// The sweep marks a pinned device active on EVERY tick, which is what
 			// keeps the idle clock honest while an agent works. Folding that column
 			// into the reclaim clock would mean the loop resetting the very value it
-			// reads, and this branch could never fire at all — the same trap
-			// `noteStranded` documents for `no_progress`.
-			const { createdMs, aca } = strandedRow("NOR-402");
+			// reads, and this branch could never fire — the same trap `noteStranded`
+			// documents for `no_progress`.
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
+			store.setSessionAffinity("leaked", deviceId, undefined, createdMs);
 			let now = createdMs + 1;
-			const lifecycle = reclaimLifecycle(aca, () => now);
+			// Online for the first tick, so the pinned branch runs and stamps
+			// `last_active_ms`; offline by the second, as a dead worker would be.
+			let online = true;
+			const lifecycle = reclaimLifecycle(aca, () => now, {
+				sessionReconciler: {
+					isOnline: () => online,
+					reconcile: async () => 1,
+				},
+			});
 
 			await lifecycle.sweep();
 			expect(aca.destroy).not.toHaveBeenCalled();
+			expect(store.getContainerDevice(deviceId)?.lastActiveMs).toBe(now);
 
+			online = false;
 			now = createdMs + RECLAIM_MS + 1;
 			await lifecycle.sweep();
 			expect(aca.destroy).toHaveBeenCalledWith("NOR-402");
@@ -2855,7 +2890,8 @@ describe("ContainerLifecycle", () => {
 			// claimed the container during it is invisible to the gate — the same
 			// TOCTOU shape, and the same remedy, as the pre-stop re-check on the idle
 			// path.
-			const { deviceId, createdMs, aca } = strandedRow("NOR-402");
+			const { deviceId, createdMs, aca } = abandoned("NOR-402");
+			store.setSessionAffinity("leaked", deviceId, undefined, createdMs);
 			const now = createdMs + RECLAIM_MS + 1;
 
 			await reclaimLifecycle(aca, () => now, {
@@ -2882,7 +2918,7 @@ describe("ContainerLifecycle", () => {
 			// The report is what gives a human the chance to look at a strand before
 			// it is destroyed, and `no_progress` knowingly cannot separate a strand
 			// from a session waiting on a long cron.
-			const { aca } = strandedRow("NOR-402");
+			const { aca } = abandoned("NOR-402");
 			reclaimLifecycle(aca, () => 0, {
 				reclaimStrandedMs: 3_600_000,
 				sessionNoProgressMs: 4 * 3_600_000,
@@ -2890,6 +2926,18 @@ describe("ContainerLifecycle", () => {
 			expect(
 				logger.warn.mock.calls.filter(([m]) =>
 					String(m).includes("is not greater than"),
+				),
+			).toHaveLength(1);
+		});
+
+		it("warns when the window is so wide that stale-destroy always wins first", async () => {
+			// Silently inert is the exact failure this whole change exists to fix, so
+			// a configuration that can never fire has to say so.
+			const { aca } = abandoned("NOR-402");
+			reclaimLifecycle(aca, () => 0, { reclaimStrandedMs: STALE_MS });
+			expect(
+				logger.warn.mock.calls.filter(([m]) =>
+					String(m).includes("is not below"),
 				),
 			).toHaveLength(1);
 		});

@@ -192,8 +192,11 @@ export type SandboxIdleStopSkipReason =
  *  - `issue_pin`: an issue is pinned to it.
  *  - `cache_reference`: a devcontainer cache row still names it — the newest
  *    ready build for its repository, or a build in flight.
- *  - `not_ready`: still importing, or failed and not yet observed long enough.
- *    A deployment in flight looks exactly like this.
+ *  - `not_ready`: the import is still in progress. A deployment in flight looks
+ *    exactly like this. A FAILED import is deliberately not covered — it will
+ *    never become ready, and protecting it forever leaks its storage.
+ *  - `rollback_floor`: one of the N newest unreferenced images, kept whatever
+ *    its age so rollback depth does not depend on deploy cadence.
  *  - `retained`: young enough to still be a staged or rollback candidate.
  */
 export type SandboxImageKeepReason =
@@ -204,6 +207,7 @@ export type SandboxImageKeepReason =
 	| "issue_pin"
 	| "cache_reference"
 	| "not_ready"
+	| "rollback_floor"
 	| "retained";
 
 /**

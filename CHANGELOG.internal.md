@@ -7,15 +7,36 @@ This changelog documents internal development changes, refactors, tooling update
 ### Added
 - **Reclaimed stranded sandboxes and obsolete disk images ([CYR-84](https://linear.app/northrop-digital/issue/CYR-84/sweep-stale-aca-sandboxes-and-obsolete-disk-images-automatically), [#75](https://github.com/nick-boey/cyrus/pull/75)).**
 
-  - **A claimed device row was not a delay, it was an exemption.** The
-    stale-destroy backstop and the idle stop both sit BELOW `sweepOnce`'s
-    `affinity > 0` gate, so a leaked affinity row did not push reclamation out to
-    14 days — it removed reclamation entirely, for as long as the row survived.
-    Nothing clears such a row: it is released by a terminal `session_state`
-    frame, and the whole of NOR-402 is that no terminal frame arrives. The
-    2026-09-08 audit found live sandboxes for work finished or wedged days
-    earlier. `ContainerLifecycle.reclaimStranded` is the third path, and the only
-    one a claimed row can reach.
+  - **`reclaimStranded` is a shorter stale-destroy bought with stronger
+    evidence.** `staleDestroyMs` reads three columns — `last_routed_ms`,
+    `last_seen_ms`, `created_ms` — and therefore has to wait 14 days; the reclaim
+    reads those plus `last_progress_ms`, `parked_at_ms`, the newest agent-run
+    stamp on the device and the newest session claim, and fires at 72h. That is
+    what "proving there is no active or recent session ownership" costs, and it
+    is what pays for the shorter window. The leak it bounds: a leaked affinity
+    row on an OFFLINE device ages out of `resolveAffinity` after
+    `offlineAgeOutMs` (1h), after which the container sat on the three-column
+    14-day clock. The 2026-09-08 audit found ACA sandboxes alive for work
+    finished days earlier.
+
+  - **It runs BELOW the `affinity > 0` gate, and the first cut did not — which
+    made it unreachable in production while passing its own tests.**
+    `resolveAffinity` returns non-zero in exactly two situations, and each is
+    individually incompatible with the threshold: for an ONLINE device, whose
+    `last_seen_ms` `DeviceGateway`'s pong handler restamps every 30s (so the
+    clock is never more than ~90s old), and for an OFFLINE device whose newest
+    claim is inside `offlineAgeOutMs`, which the clock folds in. The tests passed
+    because their fixture — `isOnline: () => true` with a 24h-stale
+    `last_seen_ms` — is a state the gateway makes impossible. Caught in
+    implementation review; the suite now uses `isOnline: () => false` and stamps
+    real heartbeats.
+
+  - **The `no_progress` shape is deliberately NOT reclaimed.** A connected
+    worker's heartbeat keeps `last_seen_ms` fresh, so it can never reach the
+    threshold. `last_seen_ms` is excluded from `no_progress` and included here
+    for the same reason read two ways: a heartbeating worker is a live process
+    holding a workspace, and whether it is making progress is a question for a
+    human rather than for a destroy.
 
   - **`quietSince` is split in two, and the split is the TOCTOU fix.**
     `quietSinceOnRow` is pure arithmetic over the row's own columns and is taken
@@ -27,14 +48,13 @@ This changelog documents internal development changes, refactors, tooling update
     re-check on the idle path.
 
   - **`last_active_ms` is excluded, and including it would have silently disabled
-    the whole branch.** The sweep stamps it on every pinned tick (that is the
-    NOR-366 idle-clock reset), so the loop would reset the clock it reads and the
-    condition could never fire. `last_seen_ms` is INCLUDED here and excluded from
-    `no_progress`, deliberately: a heartbeating worker is a live process holding a
-    workspace, and whether it is making progress is a question for a human rather
-    than for a destroy. Default 24h — an order of magnitude above
-    `sessionNoProgressMs`, so the report always precedes the destroy; the
-    constructor warns when a deployment inverts them.
+    the branch a second time.** The sweep stamps it on every pinned tick (that is
+    the NOR-366 idle-clock reset), so the loop would reset the clock it reads.
+    The constructor warns at BOTH ends of the range: at or below
+    `sessionNoProgressMs` the destroy lands before the report a human would act
+    on, and at or above `staleDestroyMs` the reclaim can never fire because
+    stale-destroy reaches the row first. Silently inert is the failure this
+    change exists to fix, so a configuration that cannot fire has to say so.
 
   - **The disk-image GC had never run in the deployment it was needed in.** It
     hung off `DevcontainerImageService`, which is constructed only when
@@ -63,10 +83,35 @@ This changelog documents internal development changes, refactors, tooling update
     created since is created from a disk a pin or the deployment disk already
     protects.
 
-  - **The age floor is not slack.** A staged build and a rollback candidate are
-    both referenced by nothing, so a pure reference count deletes the deploy about
-    to go out and the one you would fall back to. Default 7 days, sized in
-    deployments rather than bytes.
+  - **TWO floors, and neither subsumes the other.** A staged build and a rollback
+    candidate are both referenced by nothing, so a pure reference count deletes
+    the deploy about to go out and the one you would fall back to — hence
+    `imageRetentionMs` (7 days). But an age window alone makes rollback DEPTH a
+    function of deploy cadence, silently: a deployment shipping monthly holds the
+    current disk and nothing else seven days after each deploy. Hence
+    `imageRetentionCount` (3, what the audit kept by hand), counted over
+    unreferenced images only so a protected one cannot consume a slot.
+
+  - **A `Failed` import is not "not ready".** Protecting every non-`Ready` state
+    indefinitely leaks the storage of an import that will never succeed; the
+    protection is for imports still IN PROGRESS, which is what a deployment in
+    flight looks like. A failed one falls through to the two floors.
+
+  - **`imageGcEnabled` / `imageGcDryRun`.** Moving the gate from
+    `containers.devcontainers` to `containers.aca` turns destructive, unattended
+    work ON by default on upgrade, and the first cycle lands 6h after boot with
+    nobody watching. Dry-run reports every decision and deletes nothing;
+    disabling logs a warning, because a deployment that has switched this off
+    accumulates an image per build and it took an audit to notice that state the
+    first time.
+
+  - **The snapshot listing is now UNFILTERED, matching the sandbox listing.**
+    Filtering on `cyrus.managed` missed a hand-taken snapshot — the documented
+    break-glass before `router containers destroy` — whose source sandbox is then
+    destroyed and whose issue pin goes with the device row, leaving the source
+    image collectable and the snapshot unrestorable. Same single ARM call either
+    way, and the justification the sandbox listing already carried applies
+    verbatim.
 
   - **`aca_disk_image_sightings` exists because the provider does not date its
     disk images.** The ACA spike recorded `{id, name, labels, image, status,
@@ -78,6 +123,18 @@ This changelog documents internal development changes, refactors, tooling update
     anew; inheriting the old first-sight would make a brand-new image immediately
     collectable, which is the worst way for the table to be wrong.
 
+  - **The provider timestamp is BOUNDED, and first sight does not cover this.**
+    Because the two are combined with `min`, an unsanitised provider value can
+    only ever make an image look OLDER — so the fallback gives no protection in
+    the dangerous direction. The field is undeclared on the preview API and has
+    never been observed, so the realistic failure is not a wrong date but a
+    sentinel: .NET's `DateTime.MinValue` (`0001-01-01T00:00:00+00:00`) parses
+    cleanly and would delete the entire unreferenced set in one cycle. Values
+    before 2020 or in the future are rejected with a warning and fall back to
+    first sight. `createdAtUtc` is now declared on `AcaDiskImage` so the read is
+    an explicit typed bet on a preview API rather than an untyped index-signature
+    access. Caught in implementation review.
+
   - **Keeps are recorded as fully as deletes.** `sandbox.image_decision` carries
     `action` plus the protection that applied, because a wrongly-DELETED rollback
     image is invisible in any rollup and surfaces only as a boot that cannot find
@@ -88,6 +145,20 @@ This changelog documents internal development changes, refactors, tooling update
     emitted ONLY when the gate passed and the pre-destroy re-check then vetoed —
     the steady state is every healthy pinned container on every tick, and emitting
     that would bury the races the event exists to show.
+
+  - **`containers.devcontainers.gcIntervalMs` was REMOVED**, replaced by
+    `containers.aca.imageGcIntervalMs`. It was unreachable — `devcontainers` is
+    not modelled in `RouterConfigFileSchema`, so Zod stripped it — and keeping
+    both would have been two spellings of one setting, the silent-precedence
+    shape this file warns about elsewhere. A deployment that somehow set it will
+    now get the 6-hour default.
+
+  - **One router per ACA sandbox group.** Every store-side protection is read from
+    that router's own SQLite DB, so two routers on one group would each collect
+    the other's images. Documented in `docs/ROUTER.md` rather than guarded in
+    code, because a shared group was ALREADY unsafe before this change — the
+    lifecycle sweep's orphan GC destroys any sandbox in the group with no device
+    row of its own — and the Bicep stack creates one group per deployment.
 
   - **`./scripts/check-bicep.sh` was NOT run** — `bicep` is absent from the
     implementation sandbox and `az bicep install` is blocked by egress. Per

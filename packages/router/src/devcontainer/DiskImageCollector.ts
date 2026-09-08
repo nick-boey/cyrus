@@ -60,6 +60,33 @@ export const DEFAULT_IMAGE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
  */
 export const MANAGED_DISK_PREFIX = "cyrus-";
 
+/**
+ * 3 — default {@link DiskImageCollectorDeps.imageRetentionCount}.
+ *
+ * How many unreferenced images are kept regardless of age, newest first.
+ *
+ * The age floor alone is cadence-dependent, and that dependency is invisible
+ * until it bites: a deployment that ships weekly keeps several rollback
+ * candidates inside a 7-day window, while one that ships monthly keeps ZERO —
+ * seven days after each deploy the group holds exactly the current deployment
+ * disk and nothing to fall back to. A count floor makes rollback depth a
+ * property of the policy rather than of how often anyone happens to deploy.
+ *
+ * 3 is what the 2026-09-08 audit kept by hand, for the same reason.
+ */
+export const DEFAULT_IMAGE_RETENTION_COUNT = 3;
+
+/**
+ * The earliest instant a disk-image creation timestamp may plausibly claim.
+ *
+ * See {@link providerCreatedMs}. The field this bounds is undeclared on the
+ * preview API and has never been observed; a zero/unset value serialised as
+ * .NET's `DateTime.MinValue` (`0001-01-01T00:00:00Z`) parses cleanly and would
+ * date every image as ancient, which deletes the whole unreferenced set in one
+ * cycle. Anything before Cyrus existed is a sentinel, not a date.
+ */
+const EARLIEST_PLAUSIBLE_CREATED_MS = Date.UTC(2020, 0, 1);
+
 export interface DiskImageCollectorDeps {
 	store: RouterStore;
 	logger: ILogger;
@@ -69,6 +96,13 @@ export interface DiskImageCollectorDeps {
 	deploymentDisk: string;
 	/** Default {@link DEFAULT_IMAGE_RETENTION_MS}. */
 	imageRetentionMs?: number;
+	/** Default {@link DEFAULT_IMAGE_RETENTION_COUNT}. */
+	imageRetentionCount?: number;
+	/**
+	 * Report every decision and delete nothing. The way to watch a cycle before
+	 * trusting it with a deployment's images; see {@link DiskImageGcSummary}.
+	 */
+	dryRun?: boolean;
 	now?: () => number;
 }
 
@@ -76,12 +110,14 @@ export interface DiskImageCollectorDeps {
 export interface DiskImageGcSummary {
 	/** Registered disk images the provider reported this cycle. */
 	inspected: number;
-	/** Names of the images deleted. */
+	/** Names of the images deleted — or, under `dryRun`, that would have been. */
 	deleted: string[];
 	/** Storage reclaimed, summed from the provider's own `sizeInMB`. */
 	reclaimedMb: number;
 	/** Every image that was spared, and the protection that spared it. */
 	kept: Array<{ diskName: string; reason: SandboxImageKeepReason }>;
+	/** True when nothing was actually deleted because `dryRun` is set. */
+	dryRun?: boolean;
 	/**
 	 * Set when the cycle did no work. `in_flight` means a previous cycle was
 	 * still running; `inventory_unreadable` means a provider listing failed and
@@ -118,10 +154,19 @@ export class DiskImageCollector {
 	 *  - any disk an issue is pinned to, or that a devcontainer cache row still
 	 *    names — a build in flight, or the newest ready build for a repository so
 	 *    the next issue on it does not rebuild what we just deleted;
-	 *  - anything not `Ready`, which is what a deployment in flight looks like;
+	 *  - anything whose import is still in progress, which is what a deployment in
+	 *    flight looks like (a FAILED import is not covered — it will never become
+	 *    ready, and protecting it forever leaks its storage);
+	 *  - the newest {@link DiskImageCollectorDeps.imageRetentionCount}
+	 *    unreferenced images, whatever their age;
 	 *  - and anything inside {@link DiskImageCollectorDeps.imageRetentionMs},
 	 *    because a staged or rollback image is by definition referenced by
 	 *    nothing yet.
+	 *
+	 * The last two are both needed and neither subsumes the other: the age floor
+	 * covers a burst of deploys inside one window, and the count floor is what
+	 * stops rollback depth from silently becoming zero on a deployment that ships
+	 * less often than the window is long.
 	 *
 	 * Exactly one provider read per resource type per cycle — disks, snapshots,
 	 * sandboxes — because each is an ARM call and the previous implementation made
@@ -158,6 +203,10 @@ export class DiskImageCollector {
 
 	private get retentionMs(): number {
 		return this.deps.imageRetentionMs ?? DEFAULT_IMAGE_RETENTION_MS;
+	}
+
+	private get retentionCount(): number {
+		return this.deps.imageRetentionCount ?? DEFAULT_IMAGE_RETENTION_COUNT;
 	}
 
 	private async collectOnce(): Promise<DiskImageGcSummary> {
@@ -197,6 +246,13 @@ export class DiskImageCollector {
 			named.map((d) => d.diskName),
 			now,
 		);
+		const createdMs = new Map(
+			named.map(({ disk, diskName }) => [
+				diskName,
+				this.createdMsFor(disk, firstSeen.get(diskName) ?? now, now),
+			]),
+		);
+		const rollbackFloor = this.rollbackFloor(named, byProvider, createdMs);
 
 		const deleted: string[] = [];
 		const kept: Array<{ diskName: string; reason: SandboxImageKeepReason }> =
@@ -207,7 +263,8 @@ export class DiskImageCollector {
 				disk,
 				diskName,
 				byProvider,
-				firstSeen.get(diskName) ?? now,
+				rollbackFloor,
+				createdMs.get(diskName) ?? now,
 				now,
 			);
 			if (reason) {
@@ -235,11 +292,16 @@ export class DiskImageCollector {
 				);
 				continue;
 			}
-			try {
-				await this.deps.aca.deleteDiskImage(disk.id);
-			} catch (error) {
-				this.deps.logger.warn(`could not delete disk image ${diskName}`, error);
-				continue;
+			if (!this.deps.dryRun) {
+				try {
+					await this.deps.aca.deleteDiskImage(disk.id);
+				} catch (error) {
+					this.deps.logger.warn(
+						`could not delete disk image ${diskName}`,
+						error,
+					);
+					continue;
+				}
 			}
 			deleted.push(diskName);
 			reclaimedMb += disk.sizeInMB ?? 0;
@@ -256,16 +318,88 @@ export class DiskImageCollector {
 				kept: kept.length,
 				reclaimed_mb: reclaimedMb,
 				retention_ms: this.retentionMs,
+				retention_count: this.retentionCount,
+				dry_run: this.deps.dryRun === true,
 				duration_ms: this.now() - now,
 			}),
 		);
 		this.deps.logger.info(
-			`Disk-image GC reclaimed ${deleted.length} of ${named.length} registered ` +
-				`images (${reclaimedMb} MB)${
+			`Disk-image GC ${this.deps.dryRun ? "would have reclaimed" : "reclaimed"} ` +
+				`${deleted.length} of ${named.length} registered images ` +
+				`(${reclaimedMb} MB)${
 					deleted.length > 0 ? `: ${deleted.join(", ")}` : ""
 				}`,
 		);
-		return { inspected: named.length, deleted, reclaimedMb, kept };
+		return {
+			inspected: named.length,
+			deleted,
+			reclaimedMb,
+			kept,
+			...(this.deps.dryRun ? { dryRun: true } : {}),
+		};
+	}
+
+	/**
+	 * When this image came into existence, as well as we can establish it.
+	 *
+	 * The EARLIER of the provider's own timestamp and first sight, because first
+	 * sight can only ever be later than creation — so trusting it where a real
+	 * timestamp exists would keep an image past its window. The provider value is
+	 * bounded first (see {@link providerCreatedMs}); an implausible one is
+	 * discarded rather than allowed to date an image as ancient.
+	 */
+	private createdMsFor(
+		disk: AcaDiskImage,
+		firstSeenMs: number,
+		nowMs: number,
+	): number {
+		const reported = providerCreatedMs(disk, nowMs, (raw) => {
+			this.deps.logger.warn(
+				`Disk image ${diskNameOf(disk) ?? disk.id} reports an implausible ` +
+					`creation time (${raw}); dating it from when this router first saw ` +
+					`it instead`,
+			);
+		});
+		return Math.min(reported ?? firstSeenMs, firstSeenMs);
+	}
+
+	/**
+	 * The newest {@link DiskImageCollectorDeps.imageRetentionCount} unreferenced
+	 * images, kept regardless of age.
+	 *
+	 * The age floor alone makes rollback depth a function of DEPLOY CADENCE, and
+	 * silently so: a deployment shipping weekly keeps several candidates inside a
+	 * 7-day window, one shipping monthly keeps none at all — seven days after each
+	 * deploy the group holds the current deployment disk and nothing to fall back
+	 * to. Counting is what makes the depth a property of the policy.
+	 *
+	 * Only UNREFERENCED images are counted, because a referenced one is already
+	 * protected and letting it consume a slot would shrink the rollback set for no
+	 * benefit. Non-`Ready` images are excluded for the same reason.
+	 */
+	private rollbackFloor(
+		named: ReadonlyArray<{ disk: AcaDiskImage; diskName: string }>,
+		byProvider: ReadonlyMap<string, SandboxImageKeepReason>,
+		createdMs: ReadonlyMap<string, number>,
+	): Set<string> {
+		if (this.retentionCount <= 0) return new Set();
+		const byStore = this.storeProtections();
+		return new Set(
+			named
+				.filter(
+					({ disk, diskName }) =>
+						diskName.startsWith(MANAGED_DISK_PREFIX) &&
+						!byProvider.has(diskName) &&
+						!byStore.has(diskName) &&
+						diskImageState(disk) === "Ready",
+				)
+				.sort(
+					(a, b) =>
+						(createdMs.get(b.diskName) ?? 0) - (createdMs.get(a.diskName) ?? 0),
+				)
+				.slice(0, this.retentionCount)
+				.map((d) => d.diskName),
+		);
 	}
 
 	/**
@@ -280,22 +414,25 @@ export class DiskImageCollector {
 		disk: AcaDiskImage,
 		diskName: string,
 		byProvider: ReadonlyMap<string, SandboxImageKeepReason>,
-		firstSeenMs: number,
+		rollbackFloor: ReadonlySet<string>,
+		createdMs: number,
 		now: number,
 	): SandboxImageKeepReason | undefined {
 		if (!diskName.startsWith(MANAGED_DISK_PREFIX)) return "unmanaged";
 		const referenced =
 			byProvider.get(diskName) ?? this.storeProtections().get(diskName);
 		if (referenced) return referenced;
-		if (diskImageState(disk) !== "Ready") return "not_ready";
-		// The provider's own creation time when it reports one, and first sight
-		// otherwise. Taking the EARLIER of the two rather than preferring one is
-		// deliberate: first sight can only ever be later than creation, so trusting
-		// it where a real timestamp exists would keep an image past its window.
-		const createdMs = Math.min(
-			providerCreatedMs(disk) ?? firstSeenMs,
-			firstSeenMs,
-		);
+		const state = diskImageState(disk);
+		// A `Failed`/`Error` import is a dead resource that still occupies storage,
+		// and it is never going to become `Ready`. Protecting every non-`Ready`
+		// state indefinitely would leak exactly those forever, so the protection is
+		// for imports that are still IN PROGRESS — which is what a deployment in
+		// flight looks like. A failed one falls through to the age floors and is
+		// collected on the same terms as any other unreferenced image.
+		if (state !== "Ready" && state !== "Failed" && state !== "Error") {
+			return "not_ready";
+		}
+		if (rollbackFloor.has(diskName)) return "rollback_floor";
 		if (now - createdMs < this.retentionMs) return "retained";
 		return undefined;
 	}
@@ -334,9 +471,13 @@ export class DiskImageCollector {
 				protect(nameById.get(source.id), "sandbox_source");
 			}
 		}
-		for (const snapshot of await this.deps.aca.listSnapshots({
-			"cyrus.managed": "true",
-		})) {
+		// UNFILTERED, for exactly the reason the sandbox listing is. Filtering on
+		// `cyrus.managed` would miss a snapshot taken by hand — the documented
+		// break-glass before a `router containers destroy` — whose source sandbox
+		// is then destroyed and whose issue pin goes with the device row. Seven
+		// days later the source image would be deleted and that snapshot could
+		// never be restored. It is the same single ARM call either way.
+		for (const snapshot of await this.deps.aca.listSnapshots()) {
 			protect(snapshot.labels?.["cyrus.disk"], "snapshot_lineage");
 		}
 		return found;
@@ -460,17 +601,43 @@ function diskImageState(disk: AcaDiskImage): string {
 }
 
 /**
- * The provider's own creation timestamp, when it reports one.
+ * The provider's own creation timestamp, when it reports a PLAUSIBLE one.
  *
  * Deliberately tolerant about the field name and about its absence: the ACA
  * spike recorded no timestamp on a disk image at all, and the retention policy
  * must not silently become a no-op — or, worse, delete everything — depending on
  * which of those the preview API happens to return this month. `undefined` sends
  * the caller to the router's own first-sight record instead.
+ *
+ * The bounds are the load-bearing part, because the caller takes the EARLIER of
+ * this and first sight: an unsanitised value can only ever make an image look
+ * OLDER, never younger, so first sight provides no protection in the dangerous
+ * direction. The field is undeclared on the preview API and has never been
+ * observed, so the realistic failure is not a wrong date but a SENTINEL —
+ * .NET's `DateTime.MinValue` serialises as `0001-01-01T00:00:00+00:00`, which
+ * `Date.parse` accepts happily and which would date every unreferenced image as
+ * ancient and delete the entire set in one cycle. A future timestamp is rejected
+ * for the mirror reason: it would pin an image open forever.
+ *
+ * A rejected value is reported, not swallowed: a preview API that starts
+ * emitting one is something an operator wants to know about before the next
+ * cycle, not after.
  */
-function providerCreatedMs(disk: AcaDiskImage): number | undefined {
+function providerCreatedMs(
+	disk: AcaDiskImage,
+	nowMs: number,
+	onRejected?: (raw: string) => void,
+): number | undefined {
 	const raw = disk.createdAtUtc ?? disk.createdAt;
 	if (typeof raw !== "string") return undefined;
 	const parsed = Date.parse(raw);
-	return Number.isNaN(parsed) ? undefined : parsed;
+	if (Number.isNaN(parsed)) {
+		onRejected?.(raw);
+		return undefined;
+	}
+	if (parsed < EARLIEST_PLAUSIBLE_CREATED_MS || parsed > nowMs) {
+		onRejected?.(raw);
+		return undefined;
+	}
+	return parsed;
 }

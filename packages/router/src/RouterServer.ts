@@ -392,6 +392,17 @@ export interface RouterContainersConfig {
 		/** Override the per-region `management.{region}.azuredevcompute.io` base. */
 		managementEndpoint?: string;
 		/**
+		 * Reclaim registered disk images that nothing references. Default `true`.
+		 *
+		 * Set `false` to switch the GC off entirely — this is destructive work that
+		 * runs unattended, and a deployment that wants to watch a cycle first should
+		 * be able to. Prefer {@link imageGcDryRun} for that: it reports every
+		 * decision and deletes nothing.
+		 */
+		imageGcEnabled?: boolean;
+		/** Report every keep/delete decision and delete nothing. Default `false`. */
+		imageGcDryRun?: boolean;
+		/**
 		 * How often registered disk images are reconciled against what references
 		 * them. Default 6 hours — deliberately far away from the 60s lifecycle
 		 * sweep, which is non-reentrant by contract.
@@ -405,13 +416,23 @@ export interface RouterContainersConfig {
 		 * pure reference count would delete the build about to go out AND the one
 		 * you would fall back to. Lower it only if you are certain nothing stages
 		 * images ahead of a deploy.
+		 */
+		imageRetentionMs?: number;
+		/**
+		 * How many unreferenced images are kept regardless of age, newest first.
+		 * Default 3.
 		 *
-		 * Both knobs live here rather than under `devcontainers` because the GC is
+		 * The companion to {@link imageRetentionMs}, and not redundant with it: the
+		 * age floor alone makes rollback depth a function of deploy CADENCE, so a
+		 * deployment that ships less often than the window is long silently ends up
+		 * with nothing to roll back to.
+		 *
+		 * These knobs live here rather than under `devcontainers` because the GC is
 		 * gated on ACA, not on per-repository image builds: the images that
 		 * accumulate are the deployment worker images, which exist in every ACA
 		 * deployment.
 		 */
-		imageRetentionMs?: number;
+		imageRetentionCount?: number;
 	};
 }
 
@@ -1696,6 +1717,12 @@ export class RouterServer {
 			...(containers.aca.imageRetentionMs !== undefined
 				? { imageRetentionMs: containers.aca.imageRetentionMs }
 				: {}),
+			...(containers.aca.imageRetentionCount !== undefined
+				? { imageRetentionCount: containers.aca.imageRetentionCount }
+				: {}),
+			...(containers.aca.imageGcDryRun !== undefined
+				? { imageGcDryRun: containers.aca.imageGcDryRun }
+				: {}),
 			registryLoginServer: cfg.loginServer,
 		});
 		this.logger.info(
@@ -1726,6 +1753,18 @@ export class RouterServer {
 	private scheduleDiskImageGc(containers: RouterContainersConfig): void {
 		const aca = containers.aca;
 		if (!aca) return;
+		if (aca.imageGcEnabled === false) {
+			// Said out loud. This is the only thing that reclaims registered disk
+			// images, and a deployment that has turned it off will accumulate one
+			// per worker build indefinitely — which is precisely the state CYR-84
+			// found, and it took an audit to notice.
+			this.logger.warn(
+				"Disk-image GC is disabled (containers.aca.imageGcEnabled = false); " +
+					"registered disk images will accumulate one per worker build until " +
+					"an operator removes them by hand",
+			);
+			return;
+		}
 		const collect = this.devcontainerImages
 			? (): Promise<unknown> =>
 					(this.devcontainerImages as DevcontainerImageService).collectGarbage()
@@ -1745,6 +1784,12 @@ export class RouterServer {
 						deploymentDisk: aca.disk,
 						...(aca.imageRetentionMs !== undefined
 							? { imageRetentionMs: aca.imageRetentionMs }
+							: {}),
+						...(aca.imageRetentionCount !== undefined
+							? { imageRetentionCount: aca.imageRetentionCount }
+							: {}),
+						...(aca.imageGcDryRun !== undefined
+							? { dryRun: aca.imageGcDryRun }
 							: {}),
 					});
 					return () => collector.collect();

@@ -65,6 +65,7 @@ function harness(
 		/** Fixed clock, so the GC's retention window is deterministic. */
 		now?: () => number;
 		imageRetentionMs?: number;
+		imageRetentionCount?: number;
 	} = {},
 ): Harness {
 	const builds: string[] = [];
@@ -155,6 +156,11 @@ function harness(
 		...(opts.imageRetentionMs !== undefined
 			? { imageRetentionMs: opts.imageRetentionMs }
 			: {}),
+		// 0 rather than the production 3: these tests are about the reference
+		// count and the age window, and the rollback floor would spare the single
+		// unreferenced image in each of them for a reason they do not state.
+		// `DiskImageCollector.test.ts` owns the count floor.
+		imageRetentionCount: opts.imageRetentionCount ?? 0,
 	});
 
 	return {

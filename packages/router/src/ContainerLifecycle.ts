@@ -136,38 +136,46 @@ const DEFAULT_TERMINAL_SETTLE_MS = 120_000;
 const DEFAULT_SESSION_NO_PROGRESS_MS = 4 * 3_600_000;
 
 /**
- * 24 hours — default {@link ContainerLifecycleOptions.reclaimStrandedMs}.
+ * 72 hours — default {@link ContainerLifecycleOptions.reclaimStrandedMs}.
  *
- * The window a container may hold session affinity while EVERY clock that
- * either the agent or the router could move stays still, before its sandbox is
- * destroyed and its row deleted.
+ * How long a container may sit with EVERY clock the agent or the router could
+ * move standing still, before its sandbox is destroyed and its device row
+ * deleted. In practice it supersedes
+ * {@link ContainerLifecycleOptions.staleDestroyMs} as the backstop: a much
+ * shorter window, bought with much stronger evidence.
  *
- * This exists because the `affinity > 0` gate `continue`s above both the
- * stale-destroy backstop and the idle stop, so a leaked affinity row does not
- * merely delay reclamation to the 14-day backstop — it removes reclamation
- * entirely, for as long as the row survives. Nothing clears such a row: it is
- * released by a terminal `session_state` frame, and the whole of NOR-402 is a
- * session that never sends one. That is why the 2026-09-08 audit found live ACA
- * sandboxes for work that had been finished or wedged for days.
+ * The evidence IS the difference. `staleDestroyMs` reads three columns —
+ * `last_routed_ms`, `last_seen_ms`, `created_ms` — and therefore has to wait 14
+ * days to be sure of anything; this reads those plus `last_progress_ms`,
+ * `parked_at_ms`, the newest agent-run stamp on the device and the newest
+ * session claim. That is what "proving there is no active or recent session
+ * ownership" costs, and it is what pays for the shorter window.
  *
- * Sized an order of magnitude above {@link DEFAULT_SESSION_NO_PROGRESS_MS}, and
- * that gap is the design rather than caution. `no_progress` reports at 4 hours
- * precisely BECAUSE it cannot separate a strand from a session deliberately
- * waiting on a cron — it says so and asks a human. This destroys a sandbox, so
- * it cannot ask, and its inputs are correspondingly wider: a heartbeat, a run
- * stamp or a fresh session claim all reset it, none of which feed the
- * `no_progress` clock. A deliberately-waiting session on a live worker
- * heartbeats and is never reclaimed here at all.
+ * The leak it closes: a leaked session-affinity row on an OFFLINE device ages
+ * out of `resolveAffinity` after `offlineAgeOutMs` (1h by default), after which
+ * the row falls through to that three-column 14-day clock. The container is
+ * parked by then, so it costs disk rather than vCPU — but the 2026-09-08 audit
+ * still found ACA sandboxes alive for work finished days earlier.
  *
- * Erring long is the cheap direction: the cost of waiting is a parked sandbox's
- * disk, while the cost of being wrong is a running agent's workspace deleted
- * mid-task. The persistence floor bounds even that — the branch and the artifact
- * bundle survive a destroy, so a later prompt rebuilds from the restore ladder —
- * but it is still work redone.
+ * What it deliberately does NOT reclaim is the shape that looks alive. A
+ * container whose worker is connected has `last_seen_ms` restamped every 30s by
+ * `DeviceGateway`'s pong handler, so it can never reach this threshold at all.
+ * That is `noteStranded`'s `no_progress` case (NOR-402), and it stays DETECTION
+ * ONLY on purpose: a heartbeating worker is a live process holding a workspace,
+ * and whether it is making progress is a question for a human, not for a
+ * destroy.
+ *
+ * Erring long is the cheap direction. Waiting costs a parked sandbox's disk;
+ * being wrong destroys a live workspace AND the snapshot that would have made
+ * its restore warm. Three days of total silence is unambiguous, and still nearly
+ * five times faster than the backstop it supersedes. The persistence floor
+ * bounds the downside either way — the branch and the artifact bundle survive a
+ * destroy, so a later prompt rebuilds from the restore ladder — but a cold start
+ * is work redone.
  *
  * `0` disables reclamation, restoring the previous behaviour exactly.
  */
-const DEFAULT_RECLAIM_STRANDED_MS = 24 * 3_600_000;
+const DEFAULT_RECLAIM_STRANDED_MS = 72 * 3_600_000;
 
 /**
  * Why a device is stranded. Two genuinely different faults, kept as one event
@@ -216,12 +224,13 @@ export interface ContainerLifecycleOptions {
 	 *  constant for why it is that high and what must be true before lowering it.
 	 *  Operator-settable as `containers.sessionNoProgressMs`. */
 	sessionNoProgressMs?: number;
-	/** How long a container may hold session affinity with EVERY observable clock
-	 *  quiet — nothing routed, no heartbeat, no agent activity, no run, no fresh
-	 *  claim — before its sandbox is destroyed and its device row deleted.
-	 *  `0` disables reclamation.
-	 *  Default: {@link DEFAULT_RECLAIM_STRANDED_MS} (24 hours) — see that constant
-	 *  for why a claimed row is otherwise never reclaimed at all.
+	/** How long a container may sit with EVERY observable clock quiet — nothing
+	 *  routed, no heartbeat, no agent activity, no run, no session claim — before
+	 *  its sandbox is destroyed and its device row deleted. `0` disables it,
+	 *  leaving {@link staleDestroyMs} as the only backstop.
+	 *  Default: {@link DEFAULT_RECLAIM_STRANDED_MS} (72 hours) — see that constant
+	 *  for why the window can be this much shorter than `staleDestroyMs`, and for
+	 *  the one shape it deliberately never reclaims.
 	 *  Operator-settable as `containers.reclaimStrandedMs`. */
 	reclaimStrandedMs?: number;
 	/** Omitted (e.g. in tests) leaves today's behaviour: affinity is trusted as-is. */
@@ -264,13 +273,15 @@ export interface SandboxObservation {
  *    `revokeDevice` (a physical-device swap, e.g. a new laptop) is scoped to
  *    `kind = 'device'` and never touches a user's container rows, so it does
  *    NOT feed this path — see its doc comment in `RouterStore`.
- *  - Stranded reclaim: the one path a CLAIMED row can reach. Both paths above
- *    sit below the `affinity > 0` gate, so a leaked affinity row did not delay
- *    reclamation — it removed it, and the sandbox billed until an operator
- *    noticed (the 2026-09-08 audit found several). A container whose every
- *    observable clock has been still for `reclaimStrandedMs` is `destroy()`ed
- *    and its row deleted, which also releases the issue lock the strand held.
- *    See {@link reclaimStranded} and {@link quietSince}.
+ *  - Stranded reclaim: the same destroy on a much shorter window and much
+ *    stronger evidence. Stale-destroy reads three columns and so has to wait 14
+ *    days; this reads every clock the store keeps — including agent activity,
+ *    agent runs and session claims — and reclaims at `reclaimStrandedMs` (72h).
+ *    It is what actually bounds a leaked affinity row: such a row ages out of
+ *    `resolveAffinity` after `offlineAgeOutMs` and the container then sat on
+ *    the 14-day clock, which is how the 2026-09-08 audit found ACA sandboxes
+ *    alive for work finished days earlier. See {@link reclaimStranded} and
+ *    {@link quietSince}.
  *
  * A device with active session affinity is NEVER STOPPED, regardless of
  * timestamps — this is the safety invariant that keeps work in progress from
@@ -283,16 +294,16 @@ export interface SandboxObservation {
  * {@link ContainerLifecycleOptions.sessionNoProgressMs} — is reported by
  * {@link noteStranded}.
  *
- * The pin used to be unconditional in the other direction too, and that is what
- * changed: seeing a strand was the ONLY defence against it, so a leaked affinity
- * row kept its sandbox alive for as long as the row survived, and nothing clears
- * such a row (it is released by a terminal frame, and the fault IS that no
- * terminal frame arrives). {@link reclaimStranded} is the backstop, and it is
- * deliberately a different question from the report: it destroys only after
- * {@link ContainerLifecycleOptions.reclaimStrandedMs} — an order of magnitude
- * longer — and its clock includes the heartbeat and the run stamps that
- * `no_progress` excludes, so a live worker is never reclaimed on the strength of
- * its silence alone.
+ * The pin is not a defence against reclamation, though, and never was a durable
+ * one: a leaked affinity row on an offline device ages out of
+ * {@link resolveAffinity} after `offlineAgeOutMs`, after which the container
+ * waits on the 14-day stale clock. {@link reclaimStranded} bounds that, and it
+ * is deliberately a different question from the report: it destroys only after
+ * {@link ContainerLifecycleOptions.reclaimStrandedMs}, and its clock INCLUDES
+ * the heartbeat and the run stamps that `no_progress` excludes. A worker that is
+ * connected restamps `last_seen_ms` every 30s, so the `no_progress` shape — a
+ * live worker holding an issue it has stopped working on — is never reclaimed
+ * here at all, and stays detection-only.
  *
  * Every value the STOP and DESTROY decisions are made from is read inside the
  * row's own iteration, never from the tick's opening snapshot. A tick is
@@ -398,6 +409,22 @@ export class ContainerLifecycle {
 					`sandbox will be destroyed at or before the moment it is first ` +
 					`reported. Reclamation is meant to be the backstop behind the report, ` +
 					`not a substitute for it`,
+			);
+		}
+		// The other end: a reclaim window at or above the stale-destroy backstop
+		// can never fire, because `staleDestroyMs` reaches an affinity-free row
+		// first and deletes it. Silently inert is the failure mode this whole
+		// change exists to fix, so say so rather than let a deployment believe it
+		// has a 72-hour backstop it does not have.
+		if (
+			this.reclaimStrandedMs > 0 &&
+			this.reclaimStrandedMs >= this.staleDestroyMs
+		) {
+			this.logger.warn(
+				`reclaimStrandedMs (${this.reclaimStrandedMs}) is not below ` +
+					`staleDestroyMs (${this.staleDestroyMs}), so stale-destroy will always ` +
+					`reach an affinity-free container first and reclamation can never ` +
+					`fire. Lower it, or set it to 0 to disable it deliberately`,
 			);
 		}
 		this.sessionReconciler = opts.sessionReconciler;
@@ -925,14 +952,15 @@ export class ContainerLifecycle {
 	}
 
 	/**
-	 * Destroy a container whose device row still claims sessions but which
-	 * nothing has touched for {@link ContainerLifecycleOptions.reclaimStrandedMs}.
+	 * Destroy a container that nothing has touched for
+	 * {@link ContainerLifecycleOptions.reclaimStrandedMs}, on the strength of
+	 * every clock the store keeps rather than the three the stale-destroy
+	 * backstop reads.
 	 *
-	 * This is the ONLY reclamation path a claimed row can reach. Both of the
-	 * others — the stale-destroy backstop and the idle stop — sit below the
-	 * `affinity > 0` gate in {@link sweepOnce}, so before this existed a leaked
-	 * affinity row did not delay reclamation, it removed it: the 14-day backstop
-	 * was unreachable and the sandbox billed until an operator noticed.
+	 * Called for pinned and unpinned rows alike — see the comment at its call
+	 * site in {@link sweepOnce} for why scoping it to the pinned branch made it
+	 * unreachable, and why the leak it is aimed at lives on the other side of
+	 * that gate.
 	 *
 	 * `executor.destroy()` rather than a bespoke deletion, so the provider's own
 	 * snapshot cleanup runs (an ACA snapshot restores the image lineage it was
@@ -953,8 +981,8 @@ export class ContainerLifecycle {
 		if (this.reclaimStrandedMs <= 0) return false;
 		// The gate, computed from the row's own columns BEFORE `resolveAffinity`
 		// queried the device. Silent when it declines: that is the ordinary state
-		// of every healthy pinned container, once per tick each, and an event per
-		// tick per container would bury the races below.
+		// of every healthy container, once per tick each, and an event per tick per
+		// container would bury the races below.
 		if (quietForMs <= this.reclaimStrandedMs) return false;
 		// Re-read everything immediately before the destroy, against a fresh row
 		// and a fresh clock. `resolveAffinity` sits between the two and queries the
@@ -1303,27 +1331,45 @@ export class ContainerLifecycle {
 					this.store.markDeviceActive(row.deviceId, rowNow);
 					this.notePinned(row.deviceId, row.issueKey);
 					this.noteStranded(row, state, affinity, rowNow);
-					// The backstop behind that report. Reached only when every clock
-					// the agent or the router could move has been still for
-					// `reclaimStrandedMs` — an order of magnitude past the point the
-					// report first fired, so an operator has had the whole of that
-					// window to look at it first.
-					if (
-						await this.reclaimStranded(
-							executor,
-							row,
-							state,
-							affinity,
-							rowNow,
-							rowQuietForMs,
-						)
-					) {
-						reclaimed += 1;
-					}
+				} else {
+					this.noteUnpinned(row.deviceId);
+					this.strandedDevices.delete(row.deviceId);
+				}
+				// Reclaim runs for BOTH branches, and that is the fix rather than a
+				// convenience. Scoped to the pinned branch it could not fire at all:
+				// `resolveAffinity` returns a non-zero count only when the device is
+				// ONLINE — and an online device's `last_seen_ms` is stamped by
+				// `DeviceGateway`'s pong handler every 30s, so the clock below is
+				// never more than ~90s old — or when an OFFLINE device's newest
+				// claim is inside `offlineAgeOutMs` (1h by default), which
+				// `quietSince` folds in and which is two orders of magnitude under
+				// the reclaim window. Both branches were individually incompatible
+				// with the threshold, so the whole path was unreachable in
+				// production while passing tests built on an `isOnline: true` fake
+				// that never stamped a heartbeat.
+				//
+				// Below the gate it is reachable and it is also where the leak
+				// actually lives: a leaked affinity row on an offline device ages
+				// out after `offlineAgeOutMs` and the row then falls through to a
+				// stale-destroy clock that reads only `lastRouted`/`lastSeen`/
+				// `created` and waits 14 DAYS. That is the shielding CYR-84
+				// describes. The pinned case is still covered — a pinned row whose
+				// every clock has genuinely stopped reaches this too — it is simply
+				// no longer the only case.
+				if (
+					await this.reclaimStranded(
+						executor,
+						row,
+						state,
+						affinity,
+						rowNow,
+						rowQuietForMs,
+					)
+				) {
+					reclaimed += 1;
 					continue;
 				}
-				this.noteUnpinned(row.deviceId);
-				this.strandedDevices.delete(row.deviceId);
+				if (affinity > 0) continue;
 				const lastTouch = Math.max(
 					row.lastRoutedMs ?? 0,
 					row.lastSeenMs ?? 0,
