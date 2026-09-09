@@ -46,6 +46,8 @@
 		"@types/node": "^20.19.43",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.10",
+		"cyrus-ai": "workspace:*",
+		"cyrus-operator-protocol": "workspace:*",
 		"cyrus-router-client": "workspace:*"
 	},
 	"engines": {

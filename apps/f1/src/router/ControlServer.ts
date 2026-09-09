@@ -86,6 +86,61 @@ export async function startControlServer(opts: {
 		reply.send({ ok: true });
 	});
 
+	// Puts an issue into the shape guarded recovery exists for: a routed,
+	// non-terminal run on a container device whose worker never dialled back,
+	// with the session affinity and issue lock still held. Routing IS the whole
+	// setup — the run row, the affinity and the lock are all written by
+	// `EventRouter` on the way through — so this endpoint fabricates no state
+	// the product does not produce itself. It only records the executor's own
+	// last-known state and hands back the run facts a drive cannot otherwise
+	// see: `cyrus recover` takes a run id, and nothing on the operator surface
+	// will hand one out for a run the caller has not already listed.
+	fastify.post("/router/strand-run", async (request, reply) => {
+		const b = request.body as InjectBody & {
+			executorState?: "running" | "stopped" | "absent" | "unknown";
+		};
+		seedSession(opts.rig.tracker, b.sessionId, b.issueId);
+		await opts.rig.server.eventRouter.route(
+			createdFixture({
+				sessionId: b.sessionId,
+				issue: { id: b.issueId, identifier: b.identifier, title: b.title },
+				creator: b.creator,
+			}),
+		);
+		const store = opts.rig.server.store;
+		const run = store.getAgentRunForSession(b.sessionId);
+		if (!run) {
+			// The route was rejected — an unenrolled creator, a locked issue, a
+			// missing required secret. Saying so beats returning a half-built
+			// scenario a drive would then blame recovery for.
+			reply.code(409).send({
+				ok: false,
+				error: `Session ${b.sessionId} was not routed, so no run exists to strand`,
+			});
+			return;
+		}
+		store.setRunExecutorState(
+			run.deviceId,
+			b.executorState ?? "stopped",
+			Date.now(),
+		);
+		// Re-read: `setRunExecutorState` writes a MATERIAL column, so the
+		// revision a drive has to quote is the one AFTER it, not the one the
+		// route produced.
+		const current = store.getAgentRunById(run.runId) ?? run;
+		reply.send({
+			ok: true,
+			runId: current.runId,
+			sessionId: current.sessionId,
+			deviceId: current.deviceId,
+			issueKey: current.issueKey,
+			state: current.state,
+			revision: current.revision,
+			workerOnline: current.workerOnline,
+			executorState: current.executorState,
+		});
+	});
+
 	fastify.post("/router/enroll", async (request, reply) => {
 		const b = request.body as { email: string };
 		const code = opts.rig.server.store.mintEnrollmentCode(b.email, Date.now());

@@ -124,6 +124,68 @@ describe("control server", () => {
 		expect(stored.LINEAR_API_TOKEN).toBe("lin_api_1");
 	});
 
+	it("strands a routed run and reports the facts a recovery needs", async () => {
+		const strand = await fetch(`${control.url}/router/strand-run`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer secret-token",
+			},
+			body: JSON.stringify({
+				kind: "created",
+				sessionId: "sess-strand",
+				issueId: "issue-strand",
+				identifier: "CYPACK-STRAND",
+				title: "Stranded",
+				creator: { id: "lin-cold", email: "cold@example.com", name: "Cold" },
+			}),
+		});
+		expect(strand.status).toBe(200);
+		const body = (await strand.json()) as {
+			runId: string;
+			deviceId: number;
+			revision: number;
+			workerOnline: boolean;
+			executorState?: string;
+		};
+		expect(body.runId).toBeTruthy();
+		// The strand's defining facts: nothing is connected, and the container is
+		// recorded as stopped.
+		expect(body.workerOnline).toBe(false);
+		expect(body.executorState).toBe("stopped");
+		// The affinity and the issue lock the route wrote are still held — which
+		// is what makes the issue unreachable and the recovery necessary.
+		expect(rig.server.store.getSessionAffinity("sess-strand")).toBe(
+			body.deviceId,
+		);
+		expect(rig.server.store.getIssueLock("issue-strand")?.sessionId).toBe(
+			"sess-strand",
+		);
+	});
+
+	it("refuses to report a strand for a session that was never routed", async () => {
+		const strand = await fetch(`${control.url}/router/strand-run`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer secret-token",
+			},
+			body: JSON.stringify({
+				kind: "created",
+				sessionId: "sess-unrouted",
+				issueId: "issue-unrouted",
+				identifier: "CYPACK-UNROUTED",
+				title: "Unrouted",
+				creator: {
+					id: "lin-nobody",
+					email: "nobody@example.com",
+					name: "Nobody",
+				},
+			}),
+		});
+		expect(strand.status).toBe(409);
+	});
+
 	it("rejects /router/enroll without the bearer token", async () => {
 		const res = await fetch(`${control.url}/router/enroll`, {
 			method: "POST",

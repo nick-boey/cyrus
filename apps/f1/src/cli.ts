@@ -23,6 +23,7 @@ import { createRouterArtifactCommand } from "./commands/router/artifact.js";
 import { createRouterEnrollCommand } from "./commands/router/enroll.js";
 import { createRouterInjectCommand } from "./commands/router/inject.js";
 import { createRouterSeedUserCommand } from "./commands/router/seedUser.js";
+import { createRouterStrandRunCommand } from "./commands/router/strandRun.js";
 import { createStartChatSessionCommand } from "./commands/startChatSession.js";
 import { createStartSessionCommand } from "./commands/startSession.js";
 import { createStatusCommand } from "./commands/status.js";
@@ -83,6 +84,7 @@ program.addCommand(createRouterEnrollCommand());
 program.addCommand(createRouterInjectCommand());
 program.addCommand(createRouterSeedUserCommand());
 program.addCommand(createRouterArtifactCommand());
+program.addCommand(createRouterStrandRunCommand());
 
 // Parse arguments
 program.parse();

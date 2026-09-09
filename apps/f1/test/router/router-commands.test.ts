@@ -7,6 +7,7 @@ import {
 	createRouterSeedUserCommand,
 	parseEnvPairs,
 } from "../../src/commands/router/seedUser.js";
+import { createRouterStrandRunCommand } from "../../src/commands/router/strandRun.js";
 
 describe("router:* commands", () => {
 	it("expose the expected command names and required options", () => {
@@ -14,6 +15,7 @@ describe("router:* commands", () => {
 		expect(createRouterSeedUserCommand().name()).toBe("router:seed-user");
 		expect(createRouterArtifactCommand().name()).toBe("router:artifact");
 		expect(createRouterEnrollCommand().name()).toBe("router:enroll");
+		expect(createRouterStrandRunCommand().name()).toBe("router:strand-run");
 		const inject = createRouterInjectCommand();
 		const names = inject.options.map((o) => o.long);
 		expect(names).toContain("--session-id");
@@ -21,6 +23,11 @@ describe("router:* commands", () => {
 		const enroll = createRouterEnrollCommand();
 		const enrollNames = enroll.options.map((o) => o.long);
 		expect(enrollNames).toContain("--email");
+		const strand = createRouterStrandRunCommand();
+		const strandNames = strand.options.map((o) => o.long);
+		expect(strandNames).toContain("--session-id");
+		expect(strandNames).toContain("--executor-state");
+		expect(strandNames).toContain("--json");
 	});
 });
 

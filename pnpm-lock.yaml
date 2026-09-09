@@ -185,6 +185,12 @@ importers:
       '@types/node':
         specifier: ^20.19.43
         version: 20.19.43
+      cyrus-ai:
+        specifier: workspace:*
+        version: link:../cli
+      cyrus-operator-protocol:
+        specifier: workspace:*
+        version: link:../../packages/operator-protocol
       cyrus-router-client:
         specifier: workspace:*
         version: link:../../packages/router-client

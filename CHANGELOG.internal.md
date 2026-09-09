@@ -4,6 +4,61 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Added
+- **The remote-operator surface now has an end-to-end F1 matrix, and the
+  dev-fleet half of its gate is explicitly still open
+  ([CYR-78](https://linear.app/northrop-digital/issue/CYR-78/validate-observability-commands-with-f1-and-the-dev-fleet)).**
+
+  - **`apps/f1/test/router/observability-commands.test.ts` drives the SHIPPED
+    CLI command classes against a real `RouterServer` over a real socket.** The
+    unit suites on either side are each stronger at what they cover and share
+    one blind spot: the two halves disagreeing. A command that asks for
+    `?state=` where the router reads `?lifecycle=`, a capability advertised in
+    one vocabulary and gated in another, a cursor the router mints and the
+    client cannot parse — each passes both suites and fails in a fleet. So
+    nothing in the file fakes a router document: every run row is produced by
+    routing a real webhook through `EventRouter`, and every assertion reads it
+    back over HTTP. 40 scenarios covering anonymous discovery's non-disclosure,
+    all five principal kinds, the remote command tree, the full lifecycle set
+    through `runs list`/`watch`/`wait`, the post-restart `410`, log-descriptor
+    resolution with budget and redaction, nine guarded-recovery outcomes, and
+    trusted-skill checksum enforcement.
+  - **The recovery scenarios use a fake ACA control plane with the REAL
+    device-side WebSocket stack**, because `RouterRunReconciler` decides on
+    `DeviceGateway.isOnline` and on the worker's own `sessions_report`, neither
+    of which a stubbed executor can produce. Writing it surfaced the thing worth
+    knowing: a fake worker with no `"event"` consumer never acks the router's
+    queued event, so `hasPendingEvents` stays true and every recovery correctly
+    refuses to judge that worker's silence — the same shape a cold-booted
+    sandbox produces. The strand is therefore built the way a real one occurs
+    (route, boot, connect, drain, then kill the worker); a run whose event was
+    never delivered is un-started, not stranded, and testing that refusal while
+    calling it recovery was the easy mistake here.
+  - **`./f1 router:strand-run`** (with a `POST /router/strand-run` control
+    endpoint) routes an issue and reports the run id, revision, device id,
+    worker connectivity, and executor state a guarded recovery needs. It
+    fabricates no state — `EventRouter` writes the run row, the affinity, and
+    the issue lock on the way through — and exists only because `cyrus recover`
+    takes a run id that the operator surface will not hand out for a run the
+    caller has not already listed. It refuses with `409` rather than reporting a
+    half-built scenario when the route was rejected.
+  - **`RouterRig` gained the fleet seams the matrix needs**: multiple served
+    workspaces, a `fleetOperations` block, an injected Entra token verifier
+    (claims only — `OperatorAuthorizer` still re-checks tenant, issuer,
+    audience, expiry, `oid`, and `idtyp` itself), a `runReconciler` override,
+    and the three recovery timing knobs. `createdFixture`/`promptedFixture`
+    take a workspace and team, without which a rig serving one workspace cannot
+    distinguish a router that narrows a grant from one that ignores it.
+  - **Recovery stays disabled everywhere, and the docs now say why.**
+    `docs/ROUTER.md`, `apps/cli/README.md`, and
+    `infra/azure/bicep/main.bicepparam.example` each record that the F1 matrix
+    is the automated half of CYR-78 and not the gate: no Entra token was minted
+    for a router audience, no Log Analytics workspace was read, and no recovery
+    was run against `rg-cyrus-dev`. `enableFleetRecovery` remains `false` and
+    needs the controlled dev-fleet drive plus a separately authorized rollout.
+    The outstanding steps are enumerated in
+    `apps/f1/test-drives/2026-09-09-observability-commands.md`.
+
 ### Fixed
 - **Playwright's browser revision is the repository's to decide, and the image
   is only a cache ([CYR-87](https://linear.app/northrop-digital/issue/CYR-87/playwright-cannot-launch-in-the-sandbox-the-image-bakes-chromium-1234),

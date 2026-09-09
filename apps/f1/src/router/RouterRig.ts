@@ -7,11 +7,14 @@ import {
 	type ILogger,
 } from "cyrus-core";
 import {
+	type EntraOperatorTokenVerifier,
 	encodeDefaultRunnerJson,
+	type FleetOperationsConfig,
 	parseCodexAuthPaste,
 	parseSelection,
 	RouterServer,
 	RUNNER_CATALOG,
+	type RunReconciler,
 	SecretStore,
 	type SetupUiConfig,
 } from "cyrus-router";
@@ -97,6 +100,48 @@ export interface RouterRigOptions {
 	 * issue to carry.
 	 */
 	wrapTracker?: (base: CLIIssueTrackerService) => IIssueTrackerService;
+	/**
+	 * Linear workspace ids this router serves. Defaults to the single
+	 * {@link WORKSPACE} every other fixture uses.
+	 *
+	 * A second workspace is what makes the operator surface's workspace
+	 * selection observable at all: with one served workspace every principal is
+	 * unambiguous, so a drive cannot tell a router that narrows a grant from one
+	 * that ignores the request.
+	 */
+	workspaces?: string[];
+	/**
+	 * Forwarded verbatim to `RouterServerConfig.fleetOperations`. Absent (the
+	 * default) leaves the operator API exactly as it is today: discovery serves,
+	 * every authenticated route refuses, and no recovery capability is
+	 * advertised.
+	 */
+	fleetOperations?: FleetOperationsConfig;
+	/**
+	 * Verifies an Entra operator ACCESS token in place of a remote JWKS. The
+	 * same seam `RouterServerConfig.operatorTokenVerifier` exists for: it returns
+	 * CLAIMS, and `OperatorAuthorizer` re-checks tenant, issuer, audience,
+	 * expiry, `oid`, and `idtyp` itself — so a drive supplying one is exercising
+	 * the real authorization decision, not bypassing it.
+	 */
+	operatorTokenVerifier?: EntraOperatorTokenVerifier;
+	/**
+	 * Replaces what a guarded recovery actually reconciles. Omit it and the
+	 * router builds its real coordinator from its own gateway and container
+	 * service, which is what a drive normally wants.
+	 */
+	runReconciler?: RunReconciler;
+	/**
+	 * How recently a session may have been claimed and still be treated as one a
+	 * reconnected worker can authoritatively disown (`containers.affinityGraceMs`).
+	 * Defaults to ten minutes, which no test can outwait — a drive exercising the
+	 * release path sets it to `0`.
+	 */
+	affinityGraceMs?: number;
+	/** `containers.recoveryReplayMs`: the durable-frame replay window. */
+	recoveryReplayMs?: number;
+	/** `containers.recoveryReconnectTimeoutMs`: how long a boot may take to reconnect. */
+	recoveryReconnectTimeoutMs?: number;
 }
 
 export async function createRouterRig(
@@ -116,7 +161,12 @@ export async function createRouterRig(
 		// the container on Linux). Only the F1 control plane binds 127.0.0.1.
 		host: opts.host ?? "0.0.0.0",
 		dbPath: opts.dbPath,
-		workspaces: { [WORKSPACE]: { linearToken: "unused" } },
+		workspaces: Object.fromEntries(
+			(opts.workspaces ?? [WORKSPACE]).map((id) => [
+				id,
+				{ linearToken: "unused" },
+			]),
+		),
 		webhook: { verificationMode: "direct", secret: "f1-router-secret" },
 		trackerFactory: () =>
 			opts.wrapTracker ? opts.wrapTracker(tracker) : tracker,
@@ -138,6 +188,15 @@ export async function createRouterRig(
 			idleStopMs: opts.idleStopMs,
 			staleDestroyMs: opts.staleDestroyMs,
 			requiredSecretKeys: opts.requiredSecretKeys,
+			...(opts.affinityGraceMs !== undefined
+				? { affinityGraceMs: opts.affinityGraceMs }
+				: {}),
+			...(opts.recoveryReplayMs !== undefined
+				? { recoveryReplayMs: opts.recoveryReplayMs }
+				: {}),
+			...(opts.recoveryReconnectTimeoutMs !== undefined
+				? { recoveryReconnectTimeoutMs: opts.recoveryReconnectTimeoutMs }
+				: {}),
 			// Always on: without it `RouterServer` builds no `CodexTokenStore`, and
 			// a Codex user silently degrades to the `OPENAI_API_KEY` path instead
 			// of the subscription path a drive is here to exercise.
@@ -153,6 +212,11 @@ export async function createRouterRig(
 			},
 		},
 		...(opts.setupUi ? { setupUi: opts.setupUi } : {}),
+		...(opts.fleetOperations ? { fleetOperations: opts.fleetOperations } : {}),
+		...(opts.operatorTokenVerifier
+			? { operatorTokenVerifier: opts.operatorTokenVerifier }
+			: {}),
+		...(opts.runReconciler ? { runReconciler: opts.runReconciler } : {}),
 		...(executors ? { executorRegistryFactory: () => executors } : {}),
 	});
 	await server.start();
