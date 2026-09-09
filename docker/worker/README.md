@@ -383,9 +383,13 @@ see the behavior described above — update first.
 | Tool | Why it's baked in |
 |---|---|
 | `git`, `gh`, `curl`, `jq`, `ca-certificates` | The restore ladder (clone, credential helper) and sessions themselves (PR creation, fetching raw files). `ca-certificates` is what makes node's `fetch` able to reach the router at all — `node:22-slim` ships no root store. |
-| `az` + `log-analytics` extension | Azure resource discovery and Log Analytics queries. Both are installed system-wide for the non-root `cyrus` user; service-principal authentication is optional and happens at boot. |
-| `dotnet` (SDK 10.0) | Repos targeting .NET need it to build/test/restore and to run repo-local `dotnet tool`s. |
+| `az` + `log-analytics` and `application-insights` extensions | Azure resource discovery, Log Analytics queries, and `az monitor app-insights query`. All are installed system-wide for the non-root `cyrus` user; service-principal authentication is optional and happens at boot. The Application Insights extension is load-bearing rather than convenient: without it the CLI cannot resolve the command, and a shell pipeline wrapping it reports an **empty result rather than an error** — which is exactly the answer that authorises deleting a component believed to emit no telemetry. |
+| `bicep` | ARM template compilation. On `PATH` with `AZURE_BICEP_USE_BINARY_FROM_PATH=true`, so `az bicep build` uses this binary and never tries to install or version-check its own — a call to `https://aka.ms/BicepLatestRelease` that a Deny-by-default sandbox answers with `403`, failing at bootstrap before a single template is parsed. Pinned by `BICEP_VERSION` **together with** `BICEP_SHA256_AMD64`/`BICEP_SHA256_ARM64`: `Azure/bicep` publishes no checksums file, so unlike `actionlint` the digests cannot be derived at build time and must move with the version. Take the replacements from the release API's per-asset `digest` field. |
+| `dotnet` (SDK 10.0 + ASP.NET Core runtime 8.0) | Repos targeting .NET need it to build/test/restore and to run repo-local `dotnet tool`s. The 8.0 runtime is separate because the 10 SDK can *build* `net8.0` (targeting packs come from NuGet) but cannot *run* it — `dotnet test -f net8.0` otherwise dies with `Framework 'Microsoft.NETCore.App', version '8.0.0'`. The ASP.NET Core variant is installed rather than the bare runtime it depends on, so web test projects work too. |
 | `fleece` (Fleece.Cli) | Fleece issue tracking. Installed via `dotnet tool install --tool-path /usr/local/dotnet-tools` — **not** `-g`, which would put it under build-time `/root` where the non-root `cyrus` user cannot reach it. Unpinned: rebuilding the image picks up the latest published `Fleece.Cli`. |
+| `dotnet-affected` | Computes which projects a diff touches; repos drive their tier-1 test lane off it. On the same shared `--tool-path` as `fleece`, because a runtime `dotnet tool install --global` appears to succeed and then leaves the command unresolvable — `~/.dotnet/tools` is not on the session's `PATH`, so the repo's own script reports the tool as missing until `PATH` is amended by hand. |
+| `pester` (PowerShell) | The PowerShell test framework, installed `-Scope AllUsers` so the non-root `cyrus` user can load it. Baked rather than bootstrapped, because a repo's `bootstrap.ps1` reaching PowerShell Gallery fails at `Get-PackageSource: Unable to find repository 'PSGallery'` and the endpoint set behind it is a moving target — Microsoft retired the `*.azureedge.net` CDN hosts its own firewall guidance named for years. Unpinned, which resolves to Pester 5.x. |
+| `pnpm`, `yarn` (via corepack) | `node:22-slim` ships corepack but does not activate it, and `corepack enable` **cannot** be left to the session: it writes its shims next to `node`, in root-owned `/usr/local/bin`, so running it as `cyrus` fails with `EACCES … symlink … -> '/usr/local/bin/pnpm'`. Which pnpm actually runs is still the repository's decision — corepack reads its `packageManager` field and fetches that version from the allowlisted npm registry. `PNPM_VERSION` only supplies the global default for a repo that pins nothing, so bumping it cannot break a pinned repo. |
 | `actionlint` | GitHub Actions workflow linting. Pinned by the `ACTIONLINT_VERSION` build arg, checksum-verified, arch-resolved from `dpkg` so the same Dockerfile produces a working `amd64` (ACA) and `arm64` (local Apple Silicon) image. |
 | `pwsh` (PowerShell 7) | Repos that ship `.ps1` build or deploy scripts. From the same Microsoft feed as the .NET SDK, which publishes `powershell` for both `amd64` and `arm64` on bookworm — no arch special-casing. Unpinned, like the SDK. |
 | `cargo`, `rustc`, `rustfmt`, `clippy` | Repos with Cargo crates need them to build and test. Installed by rustup into `RUSTUP_HOME=/usr/local/rustup` and `CARGO_HOME=/usr/local/cargo` (shared, chowned to `cyrus`) rather than `~/.cargo`, for the same `$HOME`-is-`/root`-at-build-time reason as `fleece`. `--profile minimal` plus explicit `rustfmt`/`clippy` — no `rust-docs`. The toolchain is `stable` and unpinned, like the .NET SDK; set the `RUST_TOOLCHAIN` build arg to pin. See the caveats below. |
@@ -399,12 +403,27 @@ Override a pinned version at build time without editing the Dockerfile:
 ```bash
 docker build -f docker/worker/Dockerfile \
   --build-arg ACTIONLINT_VERSION=1.7.12 \
+  --build-arg BICEP_VERSION=0.47.16 \
+  --build-arg BICEP_SHA256_AMD64=64c345a58e0c3e48b1bc98a4e62d6b3adb1d238281297de3400aeafb2697aa5a \
+  --build-arg BICEP_SHA256_ARM64=4406214cc274cfac7c821552aec2178b80aec637d91ed8b244282964c1cf24e3 \
   --build-arg CODEX_VERSION=0.144.6 \
   --build-arg OPENCODE_VERSION=1.18.13 \
   --build-arg PLAYWRIGHT_VERSION=1.60.0 \
+  --build-arg PNPM_VERSION=10.33.1 \
   --build-arg RUST_TOOLCHAIN=stable \
   -t cyrus-worker:dev .
 ```
+
+> **`BICEP_VERSION` and its two digests are one pin, not three.** `Azure/bicep`
+> publishes no checksums file beside its release assets, so the digests cannot
+> be derived at build time the way `actionlint`'s are. Bumping the version
+> without them fails the build loudly — which is intended — and the
+> replacements come from the release API:
+>
+> ```bash
+> curl -s https://api.github.com/repos/Azure/bicep/releases/tags/v0.47.16 \
+>   | jq -r '.assets[] | select(.name|startswith("bicep-linux")) | "\(.name) \(.digest)"'
+> ```
 
 > **`codex` is on `PATH` and is authenticated at boot, not at build.** Nothing
 > is authenticated at build time — credentials are a runtime concern, and
@@ -832,6 +851,29 @@ its replacement `api.loganalytics.azure.com`. The built-in ACA policy and the
 agent sandbox's `trusted` preset include them. An explicit custom ACA egress
 policy or custom agent network allowlist remains authoritative, so add all four
 hosts yourself when using one.
+
+Three more host groups exist for repository quality gates, and each is the
+*second* half of a fix whose first half is baked into the image (CYR-88):
+
+- **Application Insights** — `api.applicationinsights.io` and
+  `api.applicationinsights.azure.com`, the data plane behind
+  `az monitor app-insights query`. A different host from the Log Analytics
+  pair; neither covers the other.
+- **Azure CLI extensions** — `aka.ms`, `go.microsoft.com`,
+  `azcliextensionsync.blob.core.windows.net`, `azcliprod.blob.core.windows.net`.
+  `az extension add` resolves its index through the `aka.ms` shortener and
+  pulls wheels from the CLI's storage account. The two extensions Cyrus knows
+  a repo needs are baked in, so these exist for the ones it does not.
+- **PowerShell Gallery** — `*.powershellgallery.com`,
+  `www.powershellgallery.com`, `cdn.powershellgallery.com`, `cdn.oneget.org`.
+  These let a repo install its *own* modules; they are **not** what makes a
+  Pester suite runnable, which is why Pester is baked. Microsoft retired the
+  `psg-prod-*.azureedge.net` hosts its own guidance named for years, so treat
+  this list as current-best-known rather than settled.
+
+`bicep` needs no host at all, which is the point: the binary is on `PATH` and
+`AZURE_BICEP_USE_BINARY_FROM_PATH=true` stops `az bicep` reaching for
+`aka.ms/BicepLatestRelease` on every invocation.
 
 Explicit snapshots retain memory, disk, and env, including the device token.
 Restore is device-lineage checked. Azure does not collect explicit snapshots,

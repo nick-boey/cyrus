@@ -65,6 +65,23 @@ export const TRUSTED_DOMAINS: readonly string[] = [
 	"management.azure.com",
 	"api.loganalytics.io",
 	"api.loganalytics.azure.com",
+	// Application Insights' data plane, read by `az monitor app-insights
+	// query`. A different host from the Log Analytics pair above; neither
+	// covers the other. Kept in step with DEFAULT_EGRESS_HOSTS in
+	// cyrus-router-executors — a host allowed by the ACA policy and denied
+	// here is still denied (CYR-88).
+	"api.applicationinsights.io",
+	"api.applicationinsights.azure.com",
+	// `az extension add` resolves its index through the `aka.ms` shortener and
+	// pulls each wheel from the CLI's own storage account. Without these it
+	// fails with `Unable to get extension index. Server returned status code
+	// 403`, which reads as an upstream outage rather than as egress. `aka.ms`
+	// and `go.microsoft.com` are shared Microsoft shorteners that many
+	// Microsoft installers (Bicep's included) redirect through.
+	"aka.ms",
+	"go.microsoft.com",
+	"azcliextensionsync.blob.core.windows.net",
+	"azcliprod.blob.core.windows.net",
 	"packages.microsoft.com",
 	"dotnet.microsoft.com",
 	"dot.net",
@@ -180,6 +197,16 @@ export const TRUSTED_DOMAINS: readonly string[] = [
 	// Swift
 	"swift.org",
 	"www.swift.org",
+	// PowerShell. Pester is baked into the worker image, so these exist for a
+	// repo installing its OWN modules; the symptom when they are missing is
+	// `Get-PackageSource: Unable to find repository 'PSGallery'`, which names
+	// no host at all. Microsoft retired the `psg-prod-*.azureedge.net` hosts
+	// its own firewall guidance named for years, so treat this as
+	// current-best-known rather than settled (CYR-88).
+	"*.powershellgallery.com",
+	"www.powershellgallery.com",
+	"cdn.powershellgallery.com",
+	"cdn.oneget.org",
 
 	// ── Linux distributions ─────────────────────────────────────────────
 	"archive.ubuntu.com",

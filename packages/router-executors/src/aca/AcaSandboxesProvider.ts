@@ -61,6 +61,40 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	{ pattern: "management.azure.com", action: "Allow" },
 	{ pattern: "api.loganalytics.io", action: "Allow" },
 	{ pattern: "api.loganalytics.azure.com", action: "Allow" },
+	// Application Insights' own data plane, which `az monitor app-insights
+	// query` reads — a different host from the Log Analytics pair above, and
+	// not covered by either. The extension that provides that command is baked
+	// into the worker image, so this is the half of the pair that has to be
+	// solved here rather than in the Dockerfile.
+	{ pattern: "api.applicationinsights.io", action: "Allow" },
+	{ pattern: "api.applicationinsights.azure.com", action: "Allow" },
+	// Azure CLI's extension machinery. `az extension add` resolves its index
+	// through `https://aka.ms/azure-cli-extension-index-v1`, which redirects to
+	// the sync blob, and then pulls each wheel from the CLI's own storage
+	// account. Without all three, adding ANY extension a session turns out to
+	// need fails with `Unable to get extension index. Server returned status
+	// code 403` — an error that reads as an upstream outage rather than as
+	// egress (CYR-88). `aka.ms` is a shared Microsoft shortener and is also
+	// what Bicep's own installer and version check use; the worker image sets
+	// `AZURE_BICEP_USE_BINARY_FROM_PATH` so `az bicep` never needs it, but a
+	// repo invoking the installer directly still does.
+	{ pattern: "aka.ms", action: "Allow" },
+	{ pattern: "go.microsoft.com", action: "Allow" },
+	{ pattern: "azcliextensionsync.blob.core.windows.net", action: "Allow" },
+	{ pattern: "azcliprod.blob.core.windows.net", action: "Allow" },
+	// PowerShell Gallery. Pester is baked into the worker image precisely
+	// because this endpoint set is a moving target — Microsoft retired the
+	// `psg-prod-*.azureedge.net` hosts its own firewall guidance named for
+	// years — so treat these as enabling a repo to install its OWN modules,
+	// not as the thing that makes a Pester suite runnable. The symptom when
+	// they are missing is `Get-PackageSource: Unable to find repository
+	// 'PSGallery'`, which names no host at all. `cdn.oneget.org` is where the
+	// NuGet package provider bootstraps from, and PowerShellGet fetches it
+	// before it fetches anything else.
+	{ pattern: "*.powershellgallery.com", action: "Allow" },
+	{ pattern: "www.powershellgallery.com", action: "Allow" },
+	{ pattern: "cdn.powershellgallery.com", action: "Allow" },
+	{ pattern: "cdn.oneget.org", action: "Allow" },
 	{ pattern: "registry.npmjs.org", action: "Allow" },
 	{ pattern: "*.npmjs.org", action: "Allow" },
 	{ pattern: "registry.yarnpkg.com", action: "Allow" },

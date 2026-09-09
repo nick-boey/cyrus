@@ -374,6 +374,27 @@ describe("EgressProxy", () => {
 				]),
 			);
 		});
+
+		// The repository-gate hosts, kept in step with DEFAULT_EGRESS_HOSTS in
+		// cyrus-router-executors. Two independent enforcement layers: a host
+		// the ACA policy allows and this preset denies is still denied, so an
+		// entry added to only one of them fixes nothing (CYR-88).
+		it("includes Application Insights, az extension, and PowerShell Gallery hosts", () => {
+			expect(TRUSTED_DOMAINS).toEqual(
+				expect.arrayContaining([
+					"api.applicationinsights.io",
+					"api.applicationinsights.azure.com",
+					"aka.ms",
+					"go.microsoft.com",
+					"azcliextensionsync.blob.core.windows.net",
+					"azcliprod.blob.core.windows.net",
+					"*.powershellgallery.com",
+					"www.powershellgallery.com",
+					"cdn.powershellgallery.com",
+					"cdn.oneget.org",
+				]),
+			);
+		});
 	});
 
 	describe("SOCKS5 proxy", () => {
