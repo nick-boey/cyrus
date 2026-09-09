@@ -184,6 +184,16 @@ export async function createRouterRig(
 				},
 			],
 			secretsPath: opts.secretsPath,
+			// Explicit for the same reason as `codex.localKeyPath` below: the
+			// default derives from `dbPath`, and every rig passes `":memory:"`,
+			// whose `dirname` is `"."`. That makes ONE `apps/f1/repositories.json`
+			// shared by every rig in the run — and since a non-empty registry is
+			// authoritative, the first rig to seed decides the repositories every
+			// later rig sees, however its own `repositories` are configured. A rig
+			// asking for a second workspace then finds nothing registered for it
+			// and its webhooks are held, undetectably, until the stray file is
+			// deleted.
+			repositoriesPath: join(dirname(opts.secretsPath), "repositories.json"),
 			artifactsDir: opts.artifactsDir,
 			idleStopMs: opts.idleStopMs,
 			staleDestroyMs: opts.staleDestroyMs,

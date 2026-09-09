@@ -111,6 +111,19 @@ This changelog documents internal development changes, refactors, tooling update
     `apps/f1/test-drives/2026-09-09-observability-commands.md`.
 
 ### Fixed
+- **Every F1 router rig shared one repository registry file, so the first rig
+  to seed decided the repositories every later rig saw
+  ([#77](https://github.com/nick-boey/cyrus/pull/77)).** `RouterRig` left
+  `repositoriesPath` to its default, which derives from `dbPath` — and every
+  rig passes `":memory:"`, whose `dirname` is `"."`. All of them therefore
+  wrote and read one `apps/f1/repositories.json` in the package directory. A
+  non-empty registry is authoritative, so a rig configured for a second
+  workspace found nothing registered for it, held its webhooks at the
+  repository gate, and reported the run as never routed. It survived because
+  the stray file persists between runs: once a rig that wanted both workspaces
+  had seeded it, every later local run passed, and only a clean checkout — CI —
+  saw the failure. The rig now derives the path from its own temp home, as it
+  already did for the Codex KEK for exactly this reason.
 - **The guarded-recovery e2e stranded a session its own fake worker had
   already disowned ([#77](https://github.com/nick-boey/cyrus/pull/77)).** The
   worker declared an empty `sessions_query` answer from its very first hello,
