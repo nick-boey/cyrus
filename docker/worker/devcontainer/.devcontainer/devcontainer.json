@@ -35,7 +35,7 @@
 			"opencodeVersion": "1.18.13"
 		},
 		"./features/playwright-chromium": {
-			"version": "1.62.0"
+			"version": "1.60.0"
 		}
 	},
 	// The worker feature creates the `cyrus` user, and rust/github-cli/node all

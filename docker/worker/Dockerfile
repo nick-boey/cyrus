@@ -198,19 +198,41 @@ RUN set -eu; \
 	chown -R cyrus:cyrus "${RUSTUP_HOME}" "${CARGO_HOME}"; \
 	rustc --version; \
 	cargo --version
-# Chromium for Playwright. Baked in rather than fetched on demand: ACA
-# sandboxes run a Deny-by-default egress policy whose allowlist
-# (DEFAULT_EGRESS_HOSTS in cyrus-router-executors) has no Playwright CDN
-# entry, so a session's own `playwright install` would hang there.
-# --with-deps is the part sessions genuinely cannot do themselves — it
-# apt-installs Chromium's shared libraries and fonts, which needs root, and
-# this image drops to `cyrus` below.
+# Chromium for Playwright. Two halves, and only one of them is a version pin.
+#
+# The half that MUST be baked is `--with-deps`: it apt-installs Chromium's
+# shared libraries and fonts, which needs root, and this image drops to `cyrus`
+# below. That half is revision-independent — the same Mesa/X11/font packages
+# serve any Chromium build — so it never drifts.
+#
+# The browser binary itself is only a WARM CACHE. Which revision Playwright
+# will actually launch is decided by the REPOSITORY's `playwright-core` pin,
+# not by this image: every Playwright version ships its own `browsers.json`,
+# and Playwright ignores a browser directory whose revision does not match
+# rather than falling back to it. So a repo pinning a different Playwright than
+# the ARG below sees the baked browser as dead weight and asks for a
+# `playwright install`. That is now survivable: every Playwright download host
+# is in DEFAULT_EGRESS_HOSTS (cyrus-router-executors) — `cdn.playwright.dev`
+# and `playwright.download.prss.microsoft.com` for >=1.50, plus the three
+# `*.azureedge.net` mirrors <=1.49 is hard-coded to — so the mismatch costs a
+# one-time download into the shared /ms-playwright instead of failing the suite
+# outright (CYR-87).
+#
+# Keep PLAYWRIGHT_VERSION matched to the pin of the repository whose sessions
+# actually run Playwright here, so the common case needs no download — but
+# treat that as an optimisation, not a correctness requirement. No cross-repo
+# lockstep is enforceable from inside this image (it cannot see a downstream
+# repo's package.json), which is why the CDN allowlist, not this ARG, is what
+# makes a bump safe. A repo that wants the reconcile to be automatic rather
+# than agent-initiated should run `playwright install chromium` from its
+# `cyrus-setup.sh`; it is a no-op when the revision below already matches.
+#
 # PLAYWRIGHT_BROWSERS_PATH puts the browsers at a shared path (instead of
 # ~/.cache/ms-playwright) so they survive regardless of which user or repo
-# invokes Playwright; it is chowned to `cyrus` so a session can still add a
-# browser build at runtime if its repo pins a Playwright whose Chromium
-# revision differs from the one baked here.
-ARG PLAYWRIGHT_VERSION=1.62.0
+# invokes Playwright, and so a runtime `playwright install` is paid once per
+# sandbox rather than once per worktree; it is chowned to `cyrus` because that
+# install runs as `cyrus`.
+ARG PLAYWRIGHT_VERSION=1.60.0
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npm install -g "playwright@${PLAYWRIGHT_VERSION}" \
 	&& playwright install --with-deps chromium \

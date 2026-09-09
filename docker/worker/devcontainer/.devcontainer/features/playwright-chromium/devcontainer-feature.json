@@ -1,13 +1,13 @@
 {
 	"id": "playwright-chromium",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"name": "Playwright + Chromium",
-	"description": "Bakes Chromium in rather than leaving it to be fetched on demand: a running sandbox's deny-by-default egress allowlist has no Playwright CDN entry, so a session's own `playwright install` would hang there.",
+	"description": "Bakes Chromium's root-only OS dependencies plus one browser revision as a warm cache. The revision Playwright actually launches is set by the repository's own pin; a mismatch is fetched on demand from the allowlisted Playwright CDN.",
 	"options": {
 		"version": {
 			"type": "string",
-			"default": "1.62.0",
-			"description": "Playwright version."
+			"default": "1.60.0",
+			"description": "Playwright version to bake. Only decides which browser revision is pre-cached — a repository pinning a different Playwright fetches its own from the CDN."
 		}
 	},
 	"containerEnv": {

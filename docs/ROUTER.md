@@ -1032,10 +1032,17 @@ newest ready image for its repository, or if it is the deployment's own default.
   default. The provider reapplies the disabled policy on every create path;
   `idleStopMs` remains the recommended, affinity-aware controller.
 - Egress defaults to **Deny** with `Full` inspection and an HTTP/WSS allowlist
-  for the router, GitHub, Anthropic API and OAuth refresh, Linear, and supported
-  package registries. The spike confirmed WSS works. Blocked HTTP hosts return
-  403. `Full` inspection blocks non-HTTP TCP/UDP, including SSH on port 22, so
-  `git@...` and `git+ssh://` remotes/submodules are unsupported; use HTTPS.
+  for the router, GitHub, Anthropic API and OAuth refresh, Linear, supported
+  package registries, Azure authentication and reads, the Argos upload API, and
+  the Playwright browser CDN. The spike confirmed WSS works. Blocked HTTP hosts
+  return 403. `Full` inspection blocks non-HTTP TCP/UDP, including SSH on port
+  22, so `git@...` and `git+ssh://` remotes/submodules are unsupported; use
+  HTTPS. `DEFAULT_EGRESS_HOSTS` in `cyrus-router-executors` is the authoritative
+  list — a custom `containers.aca.egress.hostRules` **replaces** it rather than
+  extending it, so diff the two when you upgrade. Cyrus sets the policy at
+  create time on both the disk-image and snapshot-restore paths, and never
+  updates a live sandbox, so a new entry reaches an existing issue only after
+  `cyrus router containers destroy <issueKey>` and a re-prompt.
 - Explicit snapshots preserve memory, disk, and environment, including the
   device token. Cyrus restores one only when its `cyrus.device-id` lineage
   matches the current row. Azure does not garbage-collect explicit snapshots;

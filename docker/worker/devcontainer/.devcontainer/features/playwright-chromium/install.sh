@@ -3,13 +3,18 @@
 #
 # `--with-deps` is the part sessions genuinely cannot do for themselves: it
 # apt-installs Chromium's shared libraries and fonts, which needs root, and the
-# image drops to a non-root user. PLAYWRIGHT_BROWSERS_PATH puts the browsers at
-# a shared path so they survive whichever user or repo invokes Playwright, and
-# the tree is chowned so a session can still add a browser build at runtime if
-# its repo pins a Playwright whose Chromium revision differs from this one.
+# image drops to a non-root user. That half is revision-independent.
+#
+# The browser binary is only a warm cache: the revision Playwright launches is
+# decided by the repository's own `playwright-core` pin, and a mismatch is
+# survivable because the Playwright CDN is allowlisted for sandbox egress
+# (CYR-87). PLAYWRIGHT_BROWSERS_PATH puts the browsers at a shared path so they
+# survive whichever user or repo invokes Playwright and a runtime install is
+# paid once per container; the tree is chowned because that install runs as the
+# non-root user.
 set -eu
 
-PLAYWRIGHT_VERSION="${VERSION:-1.62.0}"
+PLAYWRIGHT_VERSION="${VERSION:-1.60.0}"
 BROWSERS_PATH=/ms-playwright
 # _REMOTE_USER is supplied by the devcontainer CLI from the config's
 # remoteUser/containerUser. It is empty only when nothing set either, in which

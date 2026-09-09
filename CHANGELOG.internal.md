@@ -4,6 +4,80 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Fixed
+- **Playwright's browser revision is the repository's to decide, and the image
+  is only a cache ([CYR-87](https://linear.app/northrop-digital/issue/CYR-87/playwright-cannot-launch-in-the-sandbox-the-image-bakes-chromium-1234),
+  [#76](https://github.com/nick-boey/cyrus/pull/76)).**
+
+  - **The two halves of the Playwright bake have different lifetimes, and only
+    one of them is a version pin.** `--with-deps` apt-installs Chromium's
+    shared libraries and fonts — root-only, revision-independent, genuinely
+    un-fixable at runtime because sessions run as `cyrus`. The browser binary
+    is not in that category: which revision Playwright launches is read from
+    the REPOSITORY's `playwright-core` `browsers.json`, and Playwright ignores
+    a non-matching directory rather than falling back to it. So the image's
+    `PLAYWRIGHT_VERSION` does not decide anything; it only decides whether the
+    repository's choice happens to be pre-cached. Verified against the shipped
+    package: `playwright-core@1.60.0` asks for chromium/headless-shell 1223,
+    `1.62.0` for 1234, and both ask for ffmpeg 1011 — which is why the reported
+    evidence showed ffmpeg matching while chromium did not.
+  - **No cross-repo lockstep is enforceable from inside the image, so the CDN
+    allowlist — not the build arg — is what makes a Playwright bump safe.** The
+    image cannot see a downstream repository's `package.json`, and the original
+    issue correctly flagged that the "keep in lockstep" half needs an owner or
+    it recurs on the next bump. There is no owner to give it. Instead the
+    failure mode is downgraded: with `cdn.playwright.dev` and
+    `playwright.download.prss.microsoft.com` in `DEFAULT_EGRESS_HOSTS`, drift
+    costs one download into the shared `/ms-playwright` instead of an
+    unrunnable suite. `PLAYWRIGHT_VERSION` is now 1.60.0 to match the consuming
+    repository's pin, but it is an optimisation and is documented as one. A
+    repository wanting the reconcile to be automatic rather than
+    agent-initiated puts `playwright install chromium` in its
+    `cyrus-setup.sh` — the seam that already exists, run per worktree, a no-op
+    when the revision matches, and the only place that can see the pin. Its two
+    holes are documented rather than papered over: `createSingleRepoWorktree`
+    early-returns on an existing worktree, so a container recreated over a warm
+    volume skips the hook while `/ms-playwright` (an image layer, not part of
+    that volume) has reverted to the baked revision; and a failing setup script
+    is non-blocking, so a failed download surfaces only as a Linear activity.
+  - **All five download hosts go in, because the version is the repository's
+    choice and Playwright has used two different mirror sets.** >= 1.50 ships
+    `cdn.playwright.dev` and `playwright.download.prss.microsoft.com`, and
+    neither covers for the other: on x64 the Chromium builds resolve through
+    the Chrome-for-Testing path, whose only mirror override is the former,
+    while ffmpeg and arm64 Chromium fall through the mirror list and can land
+    on either. <= 1.49 knows only the three `*.azureedge.net` mirrors —
+    dismissing those as legacy was wrong, since a repo pinning an older
+    Playwright would have been left on the original failure with no
+    self-healing, and they still resolve (re-fronted by Azure Front Door).
+    Verified by unpacking 1.44/1.46/1.48/1.49/1.50/1.60/1.62 from npm; the
+    mirror-set switch lands in 1.50.0. As with every other entry: a missing
+    host costs a destroy-and-recreate of every affected sandbox while a
+    redundant one costs nothing.
+  - **Egress is set on BOTH create paths, not just create-from-image.** The
+    snapshot-restore path passed `lifecycle` but not `egressPolicy`, which is
+    spike finding F2 — create-from-snapshot does not carry a policy over —
+    applied to a cost control but missed for a security one. Restoring is the
+    path an EXISTING issue takes, so this was the difference between "the
+    Playwright CDN is allowlisted" and "the Playwright CDN is allowlisted for
+    issues created after the upgrade"; the fallback when the field is absent is
+    also not our Deny-by-default policy. The F2 lifecycle test now asserts
+    egress alongside it, and was confirmed to fail without the fix.
+  - **"Egress has no update API" was wrong, and is corrected wherever it
+    appears.** ACA exposes `POST /sandboxes/{id}/egresspolicy` and the
+    2026-07-25 spike verified it live, applying within seconds with a negative
+    control. The true statement is narrower: `AcaSandboxClient` implements no
+    such call, so Cyrus reaches only sandboxes created after the change. That
+    keeps the "a missing host is expensive" conclusion intact while not
+    prescribing a fleet-wide destroy as though the platform left no choice —
+    wiring the endpoint up is the obvious follow-up if allowlist churn becomes
+    routine.
+  - **Not covered: boot-time visibility.** The issue's fourth criterion is
+    explicitly conditional on CYR-16's capability probe, which has not landed —
+    there is no boot probe to add a browser-revision check to. A mismatch is now
+    self-healing rather than fatal, which lowers the stakes, but it is still
+    discovered at first use.
+
 ### Added
 - **Reclaimed stranded sandboxes and obsolete disk images ([CYR-84](https://linear.app/northrop-digital/issue/CYR-84/sweep-stale-aca-sandboxes-and-obsolete-disk-images-automatically), [#75](https://github.com/nick-boey/cyrus/pull/75)).**
 

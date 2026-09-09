@@ -87,6 +87,38 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	// `ARGOS_TOKEN` is set and every call is denied, which reads as an auth
 	// failure rather than an egress one.
 	{ pattern: "api.argos-ci.com", action: "Allow" },
+	// Playwright's browser CDN. The worker image bakes one Chromium revision,
+	// but the revision Playwright will actually launch is decided by the
+	// REPOSITORY's `playwright-core` pin — every version ships its own
+	// `browsers.json`, and Playwright ignores a browser directory whose revision
+	// does not match rather than falling back to it. So a repo pinning a
+	// different Playwright than the image sees the baked browser as dead weight
+	// and asks for a `playwright install`. Without these entries that download
+	// is denied and the repo's Playwright-backed suites cannot run at all
+	// (CYR-87); with them the mismatch degrades to a one-time fetch into the
+	// shared `/ms-playwright`.
+	//
+	// Five hosts, because Playwright has used two different mirror sets and two
+	// different code paths, and which one applies is the REPOSITORY's choice:
+	//   - >=1.50 ships `cdn.playwright.dev` and
+	//     `playwright.download.prss.microsoft.com` as `PLAYWRIGHT_CDN_MIRRORS`.
+	//     Neither covers for the other: on x64 the Chromium builds resolve
+	//     through the Chrome-for-Testing path, whose only mirror override is
+	//     `cdn.playwright.dev`, while ffmpeg and the arm64 Chromium builds fall
+	//     through the mirror list and can land on either.
+	//   - <=1.49 knows only the three `*.azureedge.net` mirrors. They still
+	//     resolve (re-fronted by Azure Front Door), so a repo on an older pin
+	//     gets served rather than being left on the original CYR-87 failure.
+	// Cyrus applies egress at sandbox-CREATE time and implements no update
+	// call, so a missing entry costs a destroy-and-recreate of every affected
+	// sandbox while a redundant one costs nothing. (ACA itself does expose
+	// `POST /sandboxes/{id}/egresspolicy`, verified against a live sandbox in
+	// the 2026-07-25 spike — `AcaSandboxClient` just does not call it yet.)
+	{ pattern: "cdn.playwright.dev", action: "Allow" },
+	{ pattern: "playwright.download.prss.microsoft.com", action: "Allow" },
+	{ pattern: "playwright.azureedge.net", action: "Allow" },
+	{ pattern: "playwright-akamai.azureedge.net", action: "Allow" },
+	{ pattern: "playwright-verizon.azureedge.net", action: "Allow" },
 ];
 
 /** Normalised label keys the provider stamps on every managed resource. */
@@ -410,6 +442,14 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 				snapshotId: snap.id,
 				lifecycle: this.lifecyclePolicy(),
 				labels: this.labels(ctx.issueKey, deviceId, disk),
+				// Same reason `lifecyclePolicy()` is passed here: F2 established
+				// that create-from-snapshot does not carry the policy over, and
+				// egress is a security control rather than a cost one, so the
+				// failure is worse in both directions — a restored sandbox
+				// either keeps a stale allowlist (and silently never receives a
+				// newly-added host, e.g. the Playwright CDN) or falls back to
+				// ACA's default, which is not Deny.
+				egressPolicy: this.egressPolicy,
 			});
 			// No re-mint: env/token inherited (spike S3b), AND the device-id
 			// label matches the live row (lineage filter above).
