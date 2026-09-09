@@ -211,10 +211,12 @@ RUN set -eu; \
 # and Playwright ignores a browser directory whose revision does not match
 # rather than falling back to it. So a repo pinning a different Playwright than
 # the ARG below sees the baked browser as dead weight and asks for a
-# `playwright install`. That is now survivable: `cdn.playwright.dev` and
-# `playwright.download.prss.microsoft.com` are in DEFAULT_EGRESS_HOSTS
-# (cyrus-router-executors), so the mismatch costs a one-time download into the
-# shared /ms-playwright instead of failing the suite outright (CYR-87).
+# `playwright install`. That is now survivable: every Playwright download host
+# is in DEFAULT_EGRESS_HOSTS (cyrus-router-executors) — `cdn.playwright.dev`
+# and `playwright.download.prss.microsoft.com` for >=1.50, plus the three
+# `*.azureedge.net` mirrors <=1.49 is hard-coded to — so the mismatch costs a
+# one-time download into the shared /ms-playwright instead of failing the suite
+# outright (CYR-87).
 #
 # Keep PLAYWRIGHT_VERSION matched to the pin of the repository whose sessions
 # actually run Playwright here, so the common case needs no download — but
