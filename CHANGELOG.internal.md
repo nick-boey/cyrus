@@ -6,7 +6,8 @@ This changelog documents internal development changes, refactors, tooling update
 
 ### Fixed
 - **Playwright's browser revision is the repository's to decide, and the image
-  is only a cache ([CYR-87](https://linear.app/northrop-digital/issue/CYR-87/playwright-cannot-launch-in-the-sandbox-the-image-bakes-chromium-1234)).**
+  is only a cache ([CYR-87](https://linear.app/northrop-digital/issue/CYR-87/playwright-cannot-launch-in-the-sandbox-the-image-bakes-chromium-1234),
+  [#76](https://github.com/nick-boey/cyrus/pull/76)).**
 
   - **The two halves of the Playwright bake have different lifetimes, and only
     one of them is a version pin.** `--with-deps` apt-installs Chromium's
