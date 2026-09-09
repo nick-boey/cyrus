@@ -1653,6 +1653,35 @@ describe("AcaSandboxesProvider", () => {
 					"api.loganalytics.azure.com",
 				]),
 			);
+			// The repository-gate hosts (CYR-88). Application Insights' data
+			// plane is a different host from the Log Analytics pair above;
+			// the az extension index and the PowerShell Gallery are what
+			// `az extension add` and `Install-Module` need. Asserted as whole
+			// rules for the same reason the Playwright block is: a pattern
+			// present with action "Deny" would satisfy a pattern-only check
+			// while denying the very request the entry exists to permit.
+			//
+			// `mcr.microsoft.com` is the one that looks like it belongs to
+			// something else. Bicep's `br/public:` alias expands to
+			// `mcr.microsoft.com/bicep/`, so without it a template using any
+			// Azure Verified Module fails at module restore with a BCP192/403
+			// — baking the compiler into the image does not cover that half.
+			for (const pattern of [
+				"api.applicationinsights.io",
+				"api.applicationinsights.azure.com",
+				"mcr.microsoft.com",
+				"*.data.mcr.microsoft.com",
+				"aka.ms",
+				"go.microsoft.com",
+				"azcliextensionsync.blob.core.windows.net",
+				"azcliprod.blob.core.windows.net",
+				"*.powershellgallery.com",
+				"www.powershellgallery.com",
+				"cdn.powershellgallery.com",
+				"cdn.oneget.org",
+			]) {
+				expect(rules).toContainEqual({ pattern, action: "Allow" });
+			}
 			expect(rules).toContainEqual({
 				pattern: "router.example.com",
 				action: "Allow",

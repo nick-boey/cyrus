@@ -1033,8 +1033,13 @@ newest ready image for its repository, or if it is the deployment's own default.
   `idleStopMs` remains the recommended, affinity-aware controller.
 - Egress defaults to **Deny** with `Full` inspection and an HTTP/WSS allowlist
   for the router, GitHub, Anthropic API and OAuth refresh, Linear, supported
-  package registries, Azure authentication and reads, the Argos upload API, and
-  the Playwright browser CDN. The spike confirmed WSS works. Blocked HTTP hosts
+  package registries, Azure authentication and reads, the Argos upload API, the
+  Playwright browser CDN, and the hosts a repository's own quality gates need:
+  the Application Insights data plane (`az monitor app-insights query`), the
+  Azure CLI extension index, the PowerShell Gallery, and Microsoft Artifact
+  Registry — the last of which is what Bicep's `br/public:` alias resolves to,
+  so a template using an Azure Verified Module fails at module restore without
+  it. The spike confirmed WSS works. Blocked HTTP hosts
   return 403. `Full` inspection blocks non-HTTP TCP/UDP, including SSH on port
   22, so `git@...` and `git+ssh://` remotes/submodules are unsupported; use
   HTTPS. `DEFAULT_EGRESS_HOSTS` in `cyrus-router-executors` is the authoritative

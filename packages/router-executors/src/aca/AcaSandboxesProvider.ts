@@ -61,6 +61,58 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	{ pattern: "management.azure.com", action: "Allow" },
 	{ pattern: "api.loganalytics.io", action: "Allow" },
 	{ pattern: "api.loganalytics.azure.com", action: "Allow" },
+	// Application Insights' own data plane, which `az monitor app-insights
+	// query` reads — a different host from the Log Analytics pair above, and
+	// not covered by either. The extension that provides that command is baked
+	// into the worker image, so this is the half of the pair that has to be
+	// solved here rather than in the Dockerfile.
+	//
+	// Everything from here down is mirrored in TRUSTED_DOMAINS (cyrus-core).
+	// The two are NOT belt-and-braces on one sandbox: THIS list is what an ACA
+	// sandbox is created with, always, while TRUSTED_DOMAINS applies only where
+	// an operator sets `sandbox.networkPolicy.preset: "trusted"` — nothing in
+	// the router or CLI sets it. So an entry here is what makes an ACA sandbox
+	// work, and the mirror is what stops the preset from being the thing that
+	// blocks it. Both, for it to work everywhere.
+	{ pattern: "api.applicationinsights.io", action: "Allow" },
+	{ pattern: "api.applicationinsights.azure.com", action: "Allow" },
+	// Microsoft Artifact Registry, which is where `br/public:` resolves to:
+	// the alias expands to `mcr.microsoft.com/bicep/`, so a template
+	// referencing any Azure Verified Module fails during MODULE RESTORE —
+	// before a single line is compiled, and with a `BCP192 … Status: 403
+	// (Forbidden)` that names the registry rather than the sandbox. Baking the
+	// Bicep CLI into the image does not help with this half: the compiler is
+	// present and still cannot reach its own module registry. `*.data.` is the
+	// blob CDN the manifest redirects layer pulls to.
+	{ pattern: "mcr.microsoft.com", action: "Allow" },
+	{ pattern: "*.data.mcr.microsoft.com", action: "Allow" },
+	// Azure CLI's extension machinery. `az extension add` resolves its index
+	// through `https://aka.ms/azure-cli-extension-index-v1`, which redirects to
+	// the sync blob, and then pulls each wheel from the CLI's own storage
+	// account. Without all three, adding ANY extension a session turns out to
+	// need fails with `Unable to get extension index. Server returned status
+	// code 403` — an error that reads as an upstream outage rather than as
+	// egress (CYR-88). `aka.ms` is a shared Microsoft shortener and is also
+	// what Bicep's own installer and version check use; the worker image sets
+	// `AZURE_BICEP_USE_BINARY_FROM_PATH` so `az bicep` never needs it, but a
+	// repo invoking the installer directly still does.
+	{ pattern: "aka.ms", action: "Allow" },
+	{ pattern: "go.microsoft.com", action: "Allow" },
+	{ pattern: "azcliextensionsync.blob.core.windows.net", action: "Allow" },
+	{ pattern: "azcliprod.blob.core.windows.net", action: "Allow" },
+	// PowerShell Gallery. Pester is baked into the worker image precisely
+	// because this endpoint set is a moving target — Microsoft retired the
+	// `psg-prod-*.azureedge.net` hosts its own firewall guidance named for
+	// years — so treat these as enabling a repo to install its OWN modules,
+	// not as the thing that makes a Pester suite runnable. The symptom when
+	// they are missing is `Get-PackageSource: Unable to find repository
+	// 'PSGallery'`, which names no host at all. `cdn.oneget.org` is where the
+	// NuGet package provider bootstraps from, and PowerShellGet fetches it
+	// before it fetches anything else.
+	{ pattern: "*.powershellgallery.com", action: "Allow" },
+	{ pattern: "www.powershellgallery.com", action: "Allow" },
+	{ pattern: "cdn.powershellgallery.com", action: "Allow" },
+	{ pattern: "cdn.oneget.org", action: "Allow" },
 	{ pattern: "registry.npmjs.org", action: "Allow" },
 	{ pattern: "*.npmjs.org", action: "Allow" },
 	{ pattern: "registry.yarnpkg.com", action: "Allow" },

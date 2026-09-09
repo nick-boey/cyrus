@@ -4,6 +4,96 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Fixed
+- **The worker image now carries the Bicep, PowerShell, pnpm and .NET 8
+  toolchains, and the sandbox can reach the three registries their gates need
+  ([CYR-88](https://linear.app/northrop-digital/issue/CYR-88/sandbox-cannot-run-the-bicep-powershell-pnpm-or-net-8-repository-gates),
+  [#78](https://github.com/nick-boey/cyrus/pull/78)).** All four gates failed at
+  *bootstrap* rather than failing a check, which is a different and worse
+  thing: the gate was absent, and a `check-all.sh`-style script aborts at the
+  first missing tool, so every later step silently never ran.
+
+  - **`corepack enable` had to move to build time, and the reason is
+    permissions, not egress.** `registry.npmjs.org` was allowlisted the whole
+    time — the reported "`corepack enable` fails (cannot fetch pnpm)" is
+    actually `EACCES: permission denied, symlink … -> '/usr/local/bin/pnpm'`,
+    because corepack writes its shims next to `node` in a root-owned directory
+    and sessions run as `cyrus`. Diagnosing this from the reported symptom
+    leads to the wrong fix. Node 22's corepack creates only
+    `pnpm`/`pnpx`/`yarn`/`yarnpkg` — not an `npm` shim — so it cannot shadow
+    the image's own npm. `PNPM_VERSION` is the global default for a repo that
+    pins nothing; a repo's `packageManager` field still wins and is fetched on
+    demand.
+
+  - **Baking `az bicep install` would not have worked.** It writes to
+    `~/.azure/bin`, and `$HOME` is `/root` at build time — the same trap
+    `fleece`'s `--tool-path` avoids. The binary goes on `PATH` instead, with
+    `AZURE_BICEP_USE_BINARY_FROM_PATH=true`, which `run_bicep_command` reads as
+    "the user manages the Bicep CLI" and which disables the version check
+    outright rather than merely caching it. Set via the env var — Azure CLI
+    maps `AZURE_<SECTION>_<OPTION>` onto config — so it stays independent of
+    `AZURE_CONFIG_DIR`, which is per-user and is where a runtime `az login`
+    writes.
+
+  - **`BICEP_VERSION` and its two per-arch digests are ONE pin, not three.**
+    `Azure/bicep` publishes no checksums file beside its release assets, so
+    unlike `actionlint` there is nothing to derive them from at build time.
+    A bump that lands the version without the digests fails the build loudly,
+    which is intended. The replacements come from the release API's per-asset
+    `digest` field; `docker/worker/README.md` carries the command.
+
+  - **Pester is baked rather than allowlisted, deliberately.** The PowerShell
+    Gallery endpoint set is a moving target — Microsoft retired the
+    `psg-prod-*.azureedge.net` hosts its own firewall guidance named for years
+    — so the gate is made a property of the image rather than of the network.
+    The Gallery hosts are still allowlisted, but for a repo installing its
+    *own* modules. `Install-PSResource` rather than `Install-Module`: the
+    latter bootstraps the NuGet package provider from a second CDN and prompts.
+    The import runs as a separate invocation and is the actual gate — it proves
+    the module resolves from a clean session rather than from the state the
+    install left behind.
+
+  - **Baking the Bicep compiler is only half the Bicep gate.** `br/public:` is
+    an alias for `mcr.microsoft.com/bicep/`, so a template referencing any
+    Azure Verified Module fails during *module restore* — before compilation,
+    with a `BCP192 … Status: 403 (Forbidden)` that names the registry rather
+    than the sandbox. Found in review, reproduced against a live sandbox.
+
+  - **`DEFAULT_EGRESS_HOSTS` and `TRUSTED_DOMAINS` are NOT two locks on one
+    door**, and an earlier draft of this change asserted that they were. The
+    ACA list is applied to every sandbox at create time; `TRUSTED_DOMAINS`
+    expands only when an operator sets `sandbox.networkPolicy.preset:
+    "trusted"`, which nothing in the router or CLI does by itself. So the ACA
+    entry is what makes a gate work and the mirror is what stops the preset
+    becoming the thing that blocks it. Both lists were updated; only the
+    rationale was wrong. (CYR-87 added the Playwright hosts to the ACA list
+    alone and is not broken.)
+
+  - **`az monitor app-insights query` does NOT return an empty result when its
+    extension is missing** — it exits 2 with `ERROR: 'app-insights' is
+    misspelled or not recognized`. The empty result is produced by the shell
+    pipeline that wraps it and keeps only stdout. The distinction matters
+    because the original framing states it as a property of the CLI, which is
+    the kind of confidently-wrong comment someone later relies on.
+
+  - **`docker/worker/devcontainer/` is now marked frozen at the NOR-309
+    snapshot.** It was never a product artifact, has never carried the Azure
+    CLI, and `containers.devcontainers` is not modelled by
+    `RouterConfigFileSchema`, so Zod strips it and no `router-config.json` can
+    select that path. `features/src/cyrus-worker/install.sh` correctly needed
+    no change either: it is boot-contract-only (`ca-certificates curl git jq
+    tar xz socat bubblewrap`), with the language toolchain owned by the
+    repository's own devcontainer per ADR 0006. The "two image paths" rule in
+    CLAUDE.md §15 is scoped to the boot prerequisites, not the toolchain.
+
+  - **Image growth is unaccounted for against the ACA disk-import ceiling.**
+    The bicep binary is ~118 MB, `aspnetcore-runtime-8.0` ~130 MB, plus Pester,
+    `dotnet-affected` and a pre-installed pnpm — roughly 250–300 MB uncompressed
+    on an image already past the 1.71 GB that `scripts/deploy-worker-image.sh`
+    measured at 99 s. That script issues ONE PUT with no retry, and its failure
+    reads as a network blip (NOR-295). Time the next deploy rather than
+    discovering it.
+
 ### Added
 - **The remote-operator surface now has an end-to-end F1 matrix, and the
   dev-fleet half of its gate is explicitly still open

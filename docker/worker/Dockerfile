@@ -52,31 +52,140 @@ RUN apt-get update \
 # `powershell` (pwsh) comes from the same feed — repos that ship .ps1 build or
 # deploy scripts need it, and it publishes for both amd64 and arm64 on
 # bookworm, so no arch special-casing is required. Azure CLI uses its own
-# Microsoft apt repository; the Log Analytics extension is installed in the
-# system extension directory so the non-root cyrus user can load it. Microsoft
-# documents its query command as GA, but currently marks every published wheel
-# as preview in the extension index, so installation must allow that metadata.
-# All three tools and the extension are intentionally unpinned: the immutable
-# image digest fixes each build.
+# Microsoft apt repository; the Log Analytics and Application Insights
+# extensions are installed in the system extension directory so the non-root
+# cyrus user can load them. Microsoft documents their query commands as GA, but
+# currently marks every published wheel as preview in the extension index, so
+# installation must allow that metadata. All three tools and both extensions are
+# intentionally unpinned: the immutable image digest fixes each build.
+#
+# `application-insights` is not a nice-to-have. It is what provides
+# `az monitor app-insights query` — the command a repository's telemetry-estate
+# inventory uses to decide whether a component still emits anything. The CLI
+# itself does fail loudly without it (`ERROR: 'app-insights' is misspelled or
+# not recognized`, exit 2), but that command is almost always run inside a
+# shell pipeline that keeps stdout and discards the rest, and THAT reports an
+# empty result (CYR-88) — precisely the answer that authorises deleting the
+# component. A gate that reports "nothing found" is worse than one that fails.
+#
+# `aspnetcore-runtime-8.0` sits alongside the .NET 10 SDK because the SDK can
+# BUILD `net8.0` (targeting packs come from NuGet) but cannot RUN it: `dotnet
+# test -f net8.0` dies with "You must install or update .NET to run this
+# application… Framework 'Microsoft.NETCore.App', version '8.0.0'". A repo with
+# a tier-1 lane still on `net8.0` therefore has no runnable test suite here at
+# all. The ASP.NET Core variant is installed rather than the bare
+# `dotnet-runtime-8.0` it depends on, because a web test project additionally
+# needs `Microsoft.AspNetCore.App` and the bare runtime alone fails it the same
+# way.
 ENV AZURE_CORE_COLLECT_TELEMETRY=no
 RUN curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -o /tmp/packages-microsoft-prod.deb \
 	&& dpkg -i /tmp/packages-microsoft-prod.deb \
 	&& rm /tmp/packages-microsoft-prod.deb \
 	&& printf 'Types: deb\nURIs: https://packages.microsoft.com/repos/azure-cli/\nSuites: bookworm\nComponents: main\nArchitectures: %s\nSigned-By: /usr/share/keyrings/microsoft-prod.gpg\n' "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/azure-cli.sources \
 	&& apt-get update \
-	&& apt-get install -y --no-install-recommends azure-cli dotnet-sdk-10.0 powershell \
+	&& apt-get install -y --no-install-recommends azure-cli dotnet-sdk-10.0 aspnetcore-runtime-8.0 powershell \
 	&& rm -rf /var/lib/apt/lists/* \
-	&& az extension add --name log-analytics --system --allow-preview true --yes --only-show-errors
+	&& az extension add --name log-analytics --system --allow-preview true --yes --only-show-errors \
+	&& az extension add --name application-insights --system --allow-preview true --yes --only-show-errors
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
 	DOTNET_NOLOGO=1 \
 	DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
-# Fleece CLI: installed to a shared --tool-path rather than `-g`. A global
-# install lands in $HOME/.dotnet/tools, and $HOME is /root at build time —
-# unreachable for the non-root `cyrus` user this image actually runs as.
-# Intentionally unpinned (tracks the latest published Fleece.Cli); pin the
-# version here if you need byte-identical rebuilds.
+# Bicep CLI, and the config that stops Azure CLI trying to fetch its own.
+#
+# `az bicep build` auto-installs on first use, and that install — plus the
+# upgrade check it runs on every subsequent invocation — goes to
+# `https://aka.ms/BicepLatestRelease`, which a Deny-by-default sandbox answers
+# with `403 Client Error: Forbidden`. The failure is at BOOTSTRAP, before a
+# single template is parsed, so the gate is not failing: it is absent, and a PR
+# can carry infrastructure changes validated by nothing (CYR-88, NOR-334).
+#
+# Baking `az bicep install` would not fix it: that writes to `~/.azure/bin`,
+# and $HOME is /root at build time — the same trap the Fleece CLI's --tool-path
+# avoids. So the binary goes on PATH and `bicep.use_binary_from_path` is set,
+# which `run_bicep_command` reads as "the user manages the Bicep CLI" and which
+# disables the version check outright rather than merely caching it. Setting it
+# via the env var (Azure CLI maps `AZURE_<SECTION>_<OPTION>` onto config, the
+# same mechanism as AZURE_CORE_COLLECT_TELEMETRY above) rather than
+# `az config set` keeps it independent of AZURE_CONFIG_DIR, which is per-user
+# and is where a runtime `az login` writes.
+#
+# Pinned, and the checksums are pinned WITH it: Azure/bicep publishes no
+# checksums file beside its release assets, so unlike actionlint above there is
+# nothing to derive them from at build time. BICEP_VERSION and the two digests
+# describe one release and must move together — a bump that lands the version
+# without the digests fails the build loudly, which is the intended behaviour.
+# Get the replacements from the release API's per-asset `digest` field:
+#   curl -s https://api.github.com/repos/Azure/bicep/releases/tags/v<VERSION> \
+#     | jq -r '.assets[] | select(.name|startswith("bicep-linux")) | "\(.name) \(.digest)"'
+# The binary is a self-contained AOT publish and does not use the .NET runtime
+# installed above.
+ARG BICEP_VERSION=0.47.16
+ARG BICEP_SHA256_AMD64=64c345a58e0c3e48b1bc98a4e62d6b3adb1d238281297de3400aeafb2697aa5a
+ARG BICEP_SHA256_ARM64=4406214cc274cfac7c821552aec2178b80aec637d91ed8b244282964c1cf24e3
+ENV AZURE_BICEP_USE_BINARY_FROM_PATH=true
+RUN set -eu; \
+	arch="$(dpkg --print-architecture)"; \
+	case "${arch}" in \
+		amd64) asset='bicep-linux-x64'; expected="${BICEP_SHA256_AMD64}" ;; \
+		arm64) asset='bicep-linux-arm64'; expected="${BICEP_SHA256_ARM64}" ;; \
+		*) echo "no Bicep CLI build for architecture ${arch}" >&2; exit 1 ;; \
+	esac; \
+	cd /tmp; \
+	curl -fsSLO "https://github.com/Azure/bicep/releases/download/v${BICEP_VERSION}/${asset}"; \
+	actual="$(sha256sum "${asset}" | awk '{print $1}')"; \
+	if [ "${expected}" != "${actual}" ]; then \
+		echo "bicep ${BICEP_VERSION} ${arch} checksum mismatch: expected '${expected}', got '${actual}'" >&2; \
+		exit 1; \
+	fi; \
+	install -m 0755 "${asset}" /usr/local/bin/bicep; \
+	rm -f "${asset}"; \
+	bicep --version
+# Pester, the PowerShell test framework, installed for AllUsers.
+#
+# This one CANNOT be left to runtime under any allowlist we control with
+# confidence. A repo's `bootstrap.ps1` reaching PSGallery fails at
+# `Get-PackageSource: Unable to find repository 'PSGallery'`, and the endpoint
+# set behind it is a moving target — Microsoft retired the `*.azureedge.net`
+# CDN hosts its own firewall guidance named for years. DEFAULT_EGRESS_HOSTS
+# carries the currently-documented set as a convenience for repos installing
+# their own modules, but the gate itself is made a property of the image rather
+# than of the network (CYR-88).
+#
+# AllUsers puts it under /usr/local/share/powershell/Modules, readable by the
+# non-root `cyrus` user; the default (CurrentUser) would land in /root, which
+# is the same $HOME-at-build-time trap the Fleece CLI's --tool-path avoids.
+# Unpinned, like pwsh itself — that resolves to Pester 5.x, whose syntax is what
+# current suites are written against.
+#
+# `Install-PSResource` (PSResourceGet, shipped with pwsh since 7.4) rather than
+# PowerShellGet's `Install-Module`: the latter bootstraps the NuGet package
+# provider from a separate CDN on first use, adding a second network dependency
+# and an interactive prompt to a build that can answer neither.
+# `-TrustRepository` is what suppresses the untrusted-repository confirmation
+# that would otherwise block forever.
+#
+# The import runs as a SEPARATE invocation, and is the actual gate: it proves
+# the module resolves from a clean session rather than from the state the
+# install left behind, and it fails the build if AllUsers ever stops being a
+# path pwsh searches.
+RUN pwsh -NoProfile -NonInteractive -Command "Install-PSResource -Name Pester -Scope AllUsers -TrustRepository -ErrorAction Stop" \
+	&& pwsh -NoProfile -NonInteractive -Command "Import-Module Pester -ErrorAction Stop; Write-Output (Get-Module Pester).Version.ToString()"
+# .NET global tools: installed to a shared --tool-path rather than `-g`. A
+# global install lands in $HOME/.dotnet/tools, and $HOME is /root at build
+# time — unreachable for the non-root `cyrus` user this image actually runs as.
+# Intentionally unpinned; pin the versions here if you need byte-identical
+# rebuilds.
+#
+# `dotnet-affected` computes which projects a diff touches, and repos drive
+# their tier-1 test lane off it. Installing it at runtime with
+# `dotnet tool install --global` appears to succeed and then leaves the command
+# unresolvable, because ~/.dotnet/tools is not on the session's PATH — so the
+# repo's own script reports the tool as missing until PATH is amended by hand
+# (CYR-88). Putting it on the same --tool-path as Fleece, which IS on PATH
+# below, removes the manual step entirely.
 ENV PATH="/usr/local/dotnet-tools:${PATH}"
 RUN dotnet tool install Fleece.Cli --tool-path /usr/local/dotnet-tools \
+	&& dotnet tool install dotnet-affected --tool-path /usr/local/dotnet-tools \
 	&& rm -rf /root/.nuget/packages /tmp/NuGetScratch
 # actionlint: GitHub Actions workflow linter. No Debian package exists, so we
 # pull the pinned release tarball and verify its published checksum. Arch is
@@ -137,6 +246,38 @@ RUN useradd --create-home --uid 1001 cyrus \
 	&& chown -R cyrus:cyrus /workspaces /var/cache/repos \
 	&& printf '#!/bin/sh\nexec node /app/dist/src/app.js "$@"\n' > /usr/local/bin/cyrus \
 	&& chmod +x /usr/local/bin/cyrus
+# pnpm, by way of corepack, which node:22-slim ships but does not activate.
+#
+# `corepack enable` has to happen HERE, at build time as root, and not be left
+# to the session: it writes its shims next to the `node` binary, i.e. into
+# root-owned /usr/local/bin, so the same command run as `cyrus` dies with
+# `EACCES: permission denied, symlink … -> '/usr/local/bin/pnpm'`. That is the
+# whole of the "pnpm: command not found; corepack enable fails" report in
+# CYR-88 — the npm registry was reachable all along, the shim directory was
+# not. It sits after `useradd` only because COREPACK_HOME below is chowned.
+#
+# Which pnpm actually runs is still the REPOSITORY's decision, exactly as with
+# Playwright's browser revision: corepack reads the `packageManager` field of
+# the project it is invoked in and fetches that version from
+# `registry.npmjs.org`, which is allowlisted. PNPM_VERSION only supplies the
+# global default for a repo that pins nothing, so a bump here cannot break a
+# pinned repo — and pre-installing it means the common unpinned case costs no
+# download at all.
+#
+# COREPACK_HOME is moved off ~/.cache so the download is paid once per sandbox
+# rather than once per worktree, the same reasoning as
+# PLAYWRIGHT_BROWSERS_PATH; it is chowned to `cyrus` because that is who
+# fetches a pinned version at runtime. COREPACK_ENABLE_DOWNLOAD_PROMPT=0 is
+# required for the non-interactive case: without it corepack stops and waits
+# for a "do you want to download pnpm@x.y.z?" confirmation that a session has
+# no way to answer, which presents as a hang rather than as a prompt.
+ARG PNPM_VERSION=10.33.1
+ENV COREPACK_HOME=/usr/local/corepack \
+	COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable \
+	&& corepack install --global "pnpm@${PNPM_VERSION}" \
+	&& chown -R cyrus:cyrus "${COREPACK_HOME}" \
+	&& pnpm --version
 # Rust toolchain: repos with Cargo crates need `cargo`/`rustc` to build and
 # test. Installed via rustup into shared paths under /usr/local rather than
 # rustup's default ~/.cargo, for the same reason the Fleece CLI is: $HOME is
