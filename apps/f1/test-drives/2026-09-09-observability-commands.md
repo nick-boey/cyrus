@@ -6,12 +6,14 @@
 observation, log queries, guarded recovery, and trusted skill installation —
 against deterministic F1 fixtures, before recovery is enabled anywhere.
 
-> **Read the scope line first.** This drive covers the **automated F1 matrix**
-> only. The **controlled dev-fleet drive** (steps 1–9 of CYR-78) was **not run**
-> and is recorded as outstanding in [Not covered](#not-covered-and-why). Nothing
-> below is evidence about Azure, Log Analytics, Entra tenant configuration, or
-> the deployed `rg-cyrus-dev` router. **Production recovery remains disabled**,
-> and this drive does not authorize enabling it.
+> **Read the scope line first.** This drive has two halves. The **automated F1
+> matrix** ran in full. The **controlled dev-fleet drive** (steps 1–9 of CYR-78)
+> ran only in part, **read-only**, against the live `rg-cyrus` router — steps 3
+> and 4 partially, steps 1 and 2 blocked by deployment configuration, and steps
+> 5–9 not run at all. What was and was not reached is enumerated in
+> [Controlled dev-fleet drive](#controlled-dev-fleet-drive--partial-read-only).
+> Nothing was deployed, enabled, unlocked or destroyed. **Recovery remains
+> disabled**, and this drive does not authorize enabling it.
 
 ## Environment
 
@@ -205,47 +207,229 @@ router configuration rather than guessed at.
 ./f1 router:strand-run --session-id sess-1 --issue-id issue-1   --identifier CYOBS-1 --creator-id lin-1 --creator-email dev@example.com   --timeout 60 --json
 ```
 
-## Not covered, and why
+## Controlled dev-fleet drive — partial, read-only
 
-The **controlled dev-fleet drive** — CYR-78 steps 1 through 9 — was **not run**.
-It requires provisioning that this session could not perform and that is not the
-agent's to authorize:
+Run 2026-09-09 05:5x–06:33Z against the **live** dev fleet, subscription
+`dit-development`, resource group `rg-cyrus`, router
+`app-cyrus-dev-router.calmsea-e4dd7bc4.australiaeast.azurecontainerapps.io`,
+revision `app-cyrus-dev-router--0000039`, image
+`ghcr.io/nick-boey/cyrus-router:sha-a51fcca`. That image is built from `a51fccad`
+(PR #74), so it carries the whole CYR-64…CYR-77 operator surface — it is new
+enough for this drive.
 
-1. Deploying read-only observation/log capabilities to the `rg-cyrus-dev` router.
-2. An Entra read principal, its grant, and an `az login` able to mint a token for
-   the router audience. (`cyrus connection add --auth entra` is refused in this
-   environment; fleet CLI access there goes through `az containerapp exec`.)
-3. Read-only `az monitor log-analytics query` runs against `rg-cyrus-dev` /
-   `ContainerAppConsoleLogs_CL`, compared field-by-field to source rows —
-   including correlation fields, trace IDs, redaction, budgets, and ingestion lag.
-4. Network/audit evidence that the CLI reached Azure directly and the router
-   returned only the descriptor.
-5. Enabling `fleet.recover` for an isolated test workspace/principal, running a
-   live recovery, and **disabling the grant again** afterwards.
+**Every action below is a read.** Nothing was deployed, enabled, unlocked,
+destroyed or written. `enableFleetRecovery` was not touched.
 
-Consequences, stated plainly:
+### The deployment's own posture, read rather than assumed
 
-- **`enableFleetRecovery` stays `false`.** The deployment-side kill switch is
-  unchanged by this drive, and this drive is not the evidence that unlocks it.
-- The **Azure Log Analytics adapter** is exercised only by its own unit and
-  contract suites (`apps/cli/src/remote/logs/*.test.ts`), never against a live
-  workspace. Ingestion lag, redaction over real rows, and the KQL the adapter
-  compiles remain unverified end to end.
-- **Entra token acquisition** — the credential chain, the audience, the tenant's
-  app registration — is unverified. What is verified is the router's *decision*
-  given claims, which is the half F1 can own.
-- Concurrency shapes that need two real racing clients (concurrent recovery of
-  one run, concurrent revision change mid-flight) are covered by
-  `packages/router/test/fleet-operations/RecoveryService.test.ts` and
-  `RouterRunReconciler.test.ts` at the unit level, not here.
+`az containerapp show` reports **no `CYRUS_ROUTER_FLEET_OPERATIONS_JSON` env var
+at all**, so the router runs with no `fleetOperations` block: no Entra grants, no
+log source, no recovery. That is the safe default holding in production, and it
+is what the two gaps below follow from.
+
+```bash
+az containerapp show -g rg-cyrus -n app-cyrus-dev-router \
+  --query "properties.template.containers[0].env[].name" -o tsv
+```
+
+### F1 matrix predictions, checked against the real router
+
+Each of these is an assertion in `observability-commands.test.ts`, re-run by hand
+against the deployment. All matched.
+
+| Prediction | Live result |
+| --- | --- |
+| Discovery answers anonymously with identity and auth methods only | `{"schemaVersion":1,"routerId":"cyrus-router","operatorApiVersions":["v1"],"authentication":{"methods":["device-token","local-operator-token"]}}` — HTTP 200 |
+| Discovery leaks no scoped data | No workspace id, issue key, session id, principal id, `logSource`, `budgets` or `capabilities` in the body |
+| `entra` advertised only when configured | Absent, and the deployment has no grants — consistent |
+| Unauthenticated operator routes refuse without explaining | `/api/v1/operator/context`, `/api/v1/runs`, `/api/v1/run-changes` → `401 {"error":"unauthorized"}` |
+| The router serves no route returning log records | `/api/v1/logs` → `404 Route GET:/api/v1/logs not found` |
+
+```bash
+ROUTER=https://app-cyrus-dev-router.calmsea-e4dd7bc4.australiaeast.azurecontainerapps.io
+curl -sS -w "\nHTTP %{http_code}\n" "$ROUTER/.well-known/cyrus"
+for p in /api/v1/operator/context /api/v1/runs /api/v1/run-changes /api/v1/logs; do
+  curl -sS -o /tmp/body -w "%{http_code}" "$ROUTER$p"; head -c 120 /tmp/body; done
+```
+
+### The router's own view of the fleet
+
+```bash
+MSYS_NO_PATHCONV=1 az containerapp exec -g rg-cyrus -n app-cyrus-dev-router \
+  --command "cyrus router sessions list"
+MSYS_NO_PATHCONV=1 az containerapp exec -g rg-cyrus -n app-cyrus-dev-router \
+  --command "cyrus router containers list"
+MSYS_NO_PATHCONV=1 az containerapp exec -g rg-cyrus -n app-cyrus-dev-router \
+  --command "cyrus router operators list"
+```
+
+21 ACA containers, 4 sessions (one `locked`, three `running`), 2 pre-existing
+`fleet.read` operator tokens over workspace
+`75294f85-72ad-42ef-b9d7-c6ded611fc42`.
+
+### CYR-72's canonical attribution, verified on live rows
+
+Every `cyrus.*` field CYR-72 specifies is present on a real
+`session.terminal_signalled` record emitted by a sandbox minutes earlier:
+
+```
+cyrus.workspace_id, cyrus.workspace_name, cyrus.owner_id, cyrus.owner_name,
+cyrus.team_id, cyrus.team_name, cyrus.project_id, cyrus.project_name,
+cyrus.issue_key, cyrus.run_id, cyrus.session_id, cyrus.device_id,
+cyrus.runner, cyrus.model, cyrus.provider, cyrus.source, cyrus.emitted_at
+```
+
+This is the correlation set the runs API and the log commands both key on, and it
+is the one CYR-78 asks to "verify new correlation fields" for.
+
+### Ingestion lag, measured
+
+| Source | Rows (1h) | p50 | p95 | max |
+| --- | --- | --- | --- | --- |
+| `router` | 6 | 713 ms | 1181 ms | 1181 ms |
+| `sandbox` | 456 | 756 ms | 1237 ms | 2745 ms |
+| (unattributed) | 1406 | 924 ms | 1268 ms | 1751 ms |
+
+Newest record emitted 5 s before the query. A backend lagging reality by about a
+second is comfortably inside anything `logs follow` would need, and it is a real
+number rather than the assumption the F1 fake stands in for.
+
+### Verbatim Log Analytics invocations
+
+All read-only, against workspace `7f02622b-26ce-47b0-8cd1-ded57e9053b4`
+(`log-cyrus-dev`), table `ContainerAppConsoleLogs_CL`:
+
+```bash
+PYTHONIOENCODING=utf-8 MSYS_NO_PATHCONV=1 az monitor log-analytics query \
+  --workspace 7f02622b-26ce-47b0-8cd1-ded57e9053b4 \
+  --analytics-query "$(cat q.kql)" -o table
+```
+
+with `q.kql` in turn:
+
+```kusto
+// 1. Which events the router family emits, sandbox.gauge excluded (it is one row
+//    per device per minute and drowns everything).
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(2h)
+| where ContainerName_s == "router"
+| extend p = parse_json(Log_s)
+| where isnotempty(tostring(p["event"]))
+| where tostring(p["event"]) !startswith "sandbox.gauge"
+| summarize count() by event = tostring(p["event"])
+| order by count_ desc
+| take 30
+
+// 2. Which sandboxes the stranded-session detector is firing on, and for how long.
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(4h)
+| extend p = parse_json(Log_s)
+| where tostring(p["event"]) == "sandbox.stranded_session"
+| summarize events = count(),
+            lastSeen = max(TimeGenerated),
+            maxNoProgressMs = max(tolong(p["cyrus.no_progress_for_ms"])),
+            maxStrandedMs = max(tolong(p["cyrus.stranded_for_ms"]))
+    by issueKey = tostring(p["cyrus.issue_key"]),
+       deviceId = tostring(p["cyrus.device_id"]),
+       reason = tostring(p["cyrus.reason"]),
+       state = tostring(p["cyrus.state"]),
+       online = tostring(p["cyrus.online"])
+| order by events desc
+
+// 3. The deferred/signalled disambiguation CLAUDE.md gates `cyrus router unlock`
+//    on. Compared BY TIME, never by membership.
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(14d)
+| extend p = parse_json(Log_s)
+| where tostring(p["event"]) in ("session.terminal_deferred", "session.terminal_signalled")
+| where tostring(p["cyrus.issue_key"]) in ("NOR-402", "NOR-373", "PAR-200")
+| summarize lastDeferred = maxif(TimeGenerated, tostring(p["event"]) == "session.terminal_deferred"),
+            lastSignalled = maxif(TimeGenerated, tostring(p["event"]) == "session.terminal_signalled"),
+            deferrals = countif(tostring(p["event"]) == "session.terminal_deferred")
+    by issueKey = tostring(p["cyrus.issue_key"]),
+       sessionId = tostring(p["cyrus.session_id"])
+| extend stillWaiting = iff(isnull(lastSignalled) or lastDeferred > lastSignalled, "DEFERRED (waiting)", "signalled")
+| order by issueKey asc
+
+// 4. Ingestion lag by source.
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(1h)
+| extend p = parse_json(Log_s)
+| where isnotempty(tostring(p["event"]))
+| extend emittedAt = todatetime(p["timestamp"])
+| extend ingestionLagMs = datetime_diff('millisecond', TimeGenerated, emittedAt)
+| summarize rows = count(),
+            p50 = percentile(ingestionLagMs, 50),
+            p95 = percentile(ingestionLagMs, 95),
+            maxLag = max(ingestionLagMs),
+            newestEmitted = max(emittedAt)
+    by source = tostring(p["cyrus.source"])
+```
+
+**One query wrote itself wrong before it wrote itself right, and the failure mode
+is worth recording**: keying on `p["cyrus.issue"]` returned rows with an empty
+issue column rather than an error. `cyrus.issue` is the ACA **sandbox label**;
+the **log attribute** is `cyrus.issue_key`. A mistyped `cyrus.*` key in KQL is
+silently null, exactly as CLAUDE.md §13 warns about dot syntax — so an operator
+query that looks like it found nothing may simply be asking for a field that does
+not exist. Read the raw `Log_s` of one row before trusting a summarize.
+
+### Two live findings, reported and NOT acted on
+
+1. **`NOR-402`'s sandbox (device 151) has been stranded for 6.1 days.**
+   `sandbox.stranded_session reason=no_progress`, `state=running`, `online=true`,
+   `sessions=1`, `cyrus.no_progress_for_ms = 528,095,176` against a 4-hour
+   threshold — still firing every minute at 06:31Z, 235 events in four hours. The
+   issue it belongs to (now `CYR-1`) has been **Done since 2026-09-03**. It has
+   no `session.terminal_deferred` in 14 days, so it is not waiting on pending
+   work — it simply never signalled terminal.
+   The deployed router predates **CYR-84** (`c181b249`, PR #75), whose
+   `reclaimStranded` destroys a container quiet for 72 h. Deploying current
+   `main` would reclaim this one. That is the fix; no manual destroy is needed.
+
+2. **`PAR-200`'s issue lock is held by a session whose container is stopped and
+   offline.** `cyrus router sessions list` shows session
+   `6af36850-4991-45aa-b1ad-807d999fa24d` `locked` on issue
+   `686e298f-8da3-419c-bff9-af17c886df86` = PAR-200, and the detector reported
+   `reason=offline_pinned`, `state=stopped`, `online=false` 28 times between
+   05:18Z and 05:47Z. PAR-200 is **In Progress with Cyrus delegated**. Per
+   `CLAUDE.md` §12 a new top-level comment on it would be rejected at the lock;
+   replying inside the existing thread still reaches it.
+   **Not unlocked.** `cyrus router unlock` is a mutation on a live fleet and is
+   gated on confirming the session is not waiting; that confirmation belongs to
+   the operator, not to this drive.
+
+### What this drive still could NOT reach
+
+| CYR-78 step | Status |
+| --- | --- |
+| 1. Deploy read-only observation/log capabilities | **Not run.** Read instead: the deployment already has no `fleetOperations` block, which is the safe posture, so nothing needed deploying to observe it. A *log* capability would need a real deploy. |
+| 2. Connect an Entra read principal; prove workspace denial/ambiguity | **Blocked.** `main.bicep` renders the Entra block only when `fleetOperatorGrants` is non-empty, and `northrop-dev.bicepparam` does not set it — so the router advertises no `entra` method and `cyrus connection add --auth entra` is refused. Adding the grant is a deploy. |
+| 3. Narrow read-only Log Analytics queries; correlation fields, redaction, budgets, ingestion lag | **Mostly done** — see above. **Redaction and budgets were not exercised through `cyrus logs`**, because the router advertises no log source; they are covered only by `apps/cli/src/remote/logs/*.test.ts` and the F1 fake. |
+| 4. Prove with network/audit evidence that the CLI contacted Azure directly and the router returned only the descriptor | **Blocked** by the same missing `logSource`: with none advertised, `cyrus logs` refuses at the capability check rather than querying. What *is* proven is the half that does not need it — the router serves no log-records route at all (404). |
+| 5-9. Enable recovery for an isolated principal, run `cyrus recover`, negative cases, skill install from a versioned release, disable the grant | **Not run, and not authorized.** Each needs a deploy that turns `fleet.recover` on. |
+
+The **`cyrus runs list` / `watch` / `wait` half of steps 2-4 is reachable without
+any deploy** — a locally minted `fleet.read` operator token authenticates against
+this router today, and two such tokens already exist. It was not run here only
+because minting one is a write that the session's own tooling refused; see the
+handover note in the pull request.
 
 ## Cleanup
 
-Every scenario allocates its own temp directory (`f1-obs-*`), its own ephemeral
-port, and an in-memory SQLite database except the restart case, which uses a file
-database in its own temp directory. All are removed in `afterEach`/`finally`.
-Device sockets are closed by the harness's `stop()`. Nothing outside the temp
-directories is written, and no external service is contacted.
+**F1 half.** Every scenario allocates its own temp directory (`f1-obs-*`), its
+own ephemeral port, and an in-memory SQLite database except the two restart
+cases, which use file databases in their own temp directories. All are removed in
+`afterEach`/`finally`. Device sockets are closed by the harness's `stop()`.
+Nothing outside the temp directories is written, and no external service is
+contacted.
+
+**Dev-fleet half.** Nothing to clean up: every action was a read. No operator
+token was minted, no connection was stored on this machine (`~/.cyrus/config.json`
+does not exist), no container app was updated, no lock was released, and no
+Log Analytics query wrote anything. The two pre-existing operator tokens
+(`nboey-laptop`, `orca-observer`) were listed but not used — their raw values are
+not recoverable after minting — and were left in place.
 
 ## Independent review
 
@@ -286,15 +470,26 @@ suites named above.
 
 ## Retrospective
 
-Pass, for the automated matrix, after the review pass. The integration seam
-earned its keep twice over: writing it surfaced that a fake worker with no event
-consumer leaves the router's queue unacked, which makes every recovery refuse —
-the same shape a real cold-booted sandbox produces, and precisely the guard
-CYR-81 added — and reviewing it surfaced that the F1 command shipped alongside
-the matrix reproduced that un-started shape rather than the strand. Nothing in
-the CLI or the router had to change to make the matrix pass, which is the outcome
-expected if the two halves already agreed; the value of the file is that a future
-disagreement now fails here rather than in a fleet.
+Pass for the automated matrix, after the review pass. Partial for the dev fleet,
+read-only, with the blocked steps named rather than glossed.
 
-The project's exit criterion is **not** met by this document alone. CYR-78 asks
-for both halves, and the dev-fleet half is outstanding.
+The integration seam earned its keep three times over. Writing it surfaced that a
+fake worker with no event consumer leaves the router's queue unacked, which makes
+every recovery refuse — the same shape a real cold-booted sandbox produces, and
+precisely the guard CYR-81 added. Reviewing it surfaced that the F1 command
+shipped alongside the matrix reproduced that un-started shape rather than the
+strand. And running its predictions against the live router found two genuine
+operational faults that no test could have: a sandbox stranded for six days on a
+closed issue, and an issue lock held by a stopped container on work that is
+currently in progress.
+
+Nothing in the CLI or the router had to change to make the matrix pass, and every
+prediction it makes about discovery, refusals and route absence held against the
+real deployment. That is the outcome expected if the two halves already agreed;
+the value of the file is that a future disagreement now fails there rather than
+in a fleet.
+
+The project's exit criterion is **not** met. CYR-78 asks for both halves in full,
+and steps 1, 2 and 5-9 of the fleet drive are outstanding — each blocked on a
+deployment change (`fleetOperatorGrants`, a `logSource`, `enableFleetRecovery`)
+that is a separately authorized rollout, not an agent's to make.

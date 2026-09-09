@@ -66,6 +66,19 @@ This changelog documents internal development changes, refactors, tooling update
     comment" claim — previously a scan of stdout for `linear.app`, which proves
     nothing — is now an assertion that every request the process made went to the
     router's own origin.
+  - **Part of the controlled dev-fleet drive ran, read-only, against the live
+    `rg-cyrus` router**, and the F1 matrix's predictions held there: anonymous
+    discovery returns identity and auth methods and nothing scoped, the three
+    authenticated routes answer a bare `401 {"error":"unauthorized"}`, and there
+    is no route serving log records at all (`/api/v1/logs` → 404). CYR-72's whole
+    canonical attribution set was confirmed present on live sandbox records, and
+    ingestion lag measured at p50 ~0.8 s / p95 ~1.2 s. The drive also found two
+    real faults it deliberately did not act on: a sandbox stranded `no_progress`
+    for 6.1 days on an issue closed since 2026-09-03 (the deployed router
+    predates CYR-84's 72-hour reclaim, so deploying current main fixes it), and
+    an issue lock held on in-progress work by a stopped, offline container.
+    Steps 1, 2 and 5-9 remain blocked on deployment changes — `fleetOperatorGrants`,
+    a `logSource`, and `enableFleetRecovery` — none of which an agent may make.
   - **Recovery stays disabled everywhere, and the docs now say why.**
     `docs/ROUTER.md`, `apps/cli/README.md`, and
     `infra/azure/bicep/main.bicepparam.example` each record that the F1 matrix
