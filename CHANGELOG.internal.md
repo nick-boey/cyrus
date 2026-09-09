@@ -34,16 +34,44 @@ This changelog documents internal development changes, refactors, tooling update
     repository wanting the reconcile to be automatic rather than
     agent-initiated puts `playwright install chromium` in its
     `cyrus-setup.sh` — the seam that already exists, run per worktree, a no-op
-    when the revision matches, and the only place that can see the pin.
-  - **Both CDN mirrors go in, not just the first.** `PLAYWRIGHT_CDN_MIRRORS` in
-    `playwright-core` is tried in order, so allowlisting only
-    `cdn.playwright.dev` works until the day it does not. Confirmed from the
-    installed 1.60.0 package that these are the only two download hosts —
-    `playwright.azureedge.net`, which the issue's evidence probed, is legacy and
-    is not in the mirror list. Both were 403 from a live worker sandbox, so
-    neither would have covered for the other. As with every other entry: egress
-    is applied at sandbox-CREATE time and has no update API, so a missing host
-    costs a fleet-wide destroy-and-recreate while a redundant one costs nothing.
+    when the revision matches, and the only place that can see the pin. Its two
+    holes are documented rather than papered over: `createSingleRepoWorktree`
+    early-returns on an existing worktree, so a container recreated over a warm
+    volume skips the hook while `/ms-playwright` (an image layer, not part of
+    that volume) has reverted to the baked revision; and a failing setup script
+    is non-blocking, so a failed download surfaces only as a Linear activity.
+  - **All five download hosts go in, because the version is the repository's
+    choice and Playwright has used two different mirror sets.** >= 1.50 ships
+    `cdn.playwright.dev` and `playwright.download.prss.microsoft.com`, and
+    neither covers for the other: on x64 the Chromium builds resolve through
+    the Chrome-for-Testing path, whose only mirror override is the former,
+    while ffmpeg and arm64 Chromium fall through the mirror list and can land
+    on either. <= 1.49 knows only the three `*.azureedge.net` mirrors —
+    dismissing those as legacy was wrong, since a repo pinning an older
+    Playwright would have been left on the original failure with no
+    self-healing, and they still resolve (re-fronted by Azure Front Door).
+    Verified by unpacking 1.44/1.46/1.48/1.49/1.50/1.60/1.62 from npm; the
+    mirror-set switch lands in 1.50.0. As with every other entry: a missing
+    host costs a destroy-and-recreate of every affected sandbox while a
+    redundant one costs nothing.
+  - **Egress is set on BOTH create paths, not just create-from-image.** The
+    snapshot-restore path passed `lifecycle` but not `egressPolicy`, which is
+    spike finding F2 — create-from-snapshot does not carry a policy over —
+    applied to a cost control but missed for a security one. Restoring is the
+    path an EXISTING issue takes, so this was the difference between "the
+    Playwright CDN is allowlisted" and "the Playwright CDN is allowlisted for
+    issues created after the upgrade"; the fallback when the field is absent is
+    also not our Deny-by-default policy. The F2 lifecycle test now asserts
+    egress alongside it, and was confirmed to fail without the fix.
+  - **"Egress has no update API" was wrong, and is corrected wherever it
+    appears.** ACA exposes `POST /sandboxes/{id}/egresspolicy` and the
+    2026-07-25 spike verified it live, applying within seconds with a negative
+    control. The true statement is narrower: `AcaSandboxClient` implements no
+    such call, so Cyrus reaches only sandboxes created after the change. That
+    keeps the "a missing host is expensive" conclusion intact while not
+    prescribing a fleet-wide destroy as though the platform left no choice —
+    wiring the endpoint up is the obvious follow-up if allowlist churn becomes
+    routine.
   - **Not covered: boot-time visibility.** The issue's fourth criterion is
     explicitly conditional on CYR-16's capability probe, which has not landed —
     there is no boot probe to add a browser-revision check to. A mismatch is now

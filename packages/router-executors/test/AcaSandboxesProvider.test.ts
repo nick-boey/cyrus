@@ -876,6 +876,16 @@ describe("AcaSandboxesProvider", () => {
 			expect(
 				calls.createSandbox[0]?.lifecycle?.autoSuspendPolicy?.enabled,
 			).toBe(false);
+			// ...and so must egress, for the same F2 reason. Restoring is the
+			// path an EXISTING issue takes, so omitting it here would mean a
+			// newly-added allowlist host (e.g. the Playwright CDN, CYR-87)
+			// silently never reached the sandboxes that predate it — and
+			// whatever ACA falls back to when the field is absent is not our
+			// Deny-by-default policy.
+			expect(calls.createSandbox[0]?.egressPolicy?.defaultAction).toBe("Deny");
+			expect(
+				calls.createSandbox[0]?.egressPolicy?.hostRules?.map((r) => r.pattern),
+			).toContain("cdn.playwright.dev");
 			expect(calls.createSandbox[0]?.labels?.["cyrus.device-id"]).toBe("dev-1");
 			// ensureDisk NOT called on a snapshot restore
 			expect(calls.listDiskImages).toBe(0);
@@ -1618,16 +1628,23 @@ describe("AcaSandboxesProvider", () => {
 			expect(patterns).toContain("static.rust-lang.org");
 			// The Argos CLI's upload endpoint — see docker/worker/Dockerfile.
 			expect(patterns).toContain("api.argos-ci.com");
-			// Both Playwright CDN mirrors, not just the first: playwright-core
-			// falls through PLAYWRIGHT_CDN_MIRRORS in order, and egress has no
-			// update API, so a host missed here costs a fleet-wide recreate
-			// (CYR-87).
-			expect(patterns).toEqual(
-				expect.arrayContaining([
-					"cdn.playwright.dev",
-					"playwright.download.prss.microsoft.com",
-				]),
-			);
+			// Every Playwright download host, across both mirror sets: >=1.50
+			// uses cdn.playwright.dev + prss (neither covers for the other —
+			// x64 Chromium only ever tries the former), <=1.49 knows only the
+			// three azureedge mirrors. Which applies is the repository's pin,
+			// not ours, and a host missed here costs a destroy-and-recreate
+			// (CYR-87). Asserted as whole rules: a pattern present with
+			// action "Deny" would satisfy a pattern-only check while denying
+			// exactly the download the entry exists to permit.
+			for (const pattern of [
+				"cdn.playwright.dev",
+				"playwright.download.prss.microsoft.com",
+				"playwright.azureedge.net",
+				"playwright-akamai.azureedge.net",
+				"playwright-verizon.azureedge.net",
+			]) {
+				expect(rules).toContainEqual({ pattern, action: "Allow" });
+			}
 			expect(patterns).toEqual(
 				expect.arrayContaining([
 					"login.microsoftonline.com",

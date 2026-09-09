@@ -436,13 +436,14 @@ docker build -f docker/worker/Dockerfile \
   `playwright-core` pin names, not `PLAYWRIGHT_VERSION` here — so if a repo
   pins a different Playwright, the baked browser is dead weight for it and its
   suites will ask for a `playwright install`.
-- **A mismatch is survivable, not fatal.** `cdn.playwright.dev` and
-  `playwright.download.prss.microsoft.com` — both `PLAYWRIGHT_CDN_MIRRORS` in
-  `playwright-core` — are in `DEFAULT_EGRESS_HOSTS` (`cyrus-router-executors`),
-  so a session can fetch the revision its repo actually needs. `/ms-playwright`
+- **A mismatch is survivable, not fatal.** Every Playwright download host is in
+  `DEFAULT_EGRESS_HOSTS` (`cyrus-router-executors`), so a session can fetch the
+  revision its repo actually needs: `cdn.playwright.dev` and
+  `playwright.download.prss.microsoft.com` for Playwright >= 1.50, and the three
+  `*.azureedge.net` mirrors that <= 1.49 is hard-coded to use. `/ms-playwright`
   is shared and writable by `cyrus`, so that download is paid once per sandbox,
-  not once per worktree. Before CYR-87 neither was true and the suite simply
-  could not run.
+  not once per worktree. Before CYR-87 none of this was true and the suite
+  simply could not run.
 - **Keeping the two matched is an optimisation, and it is the repository's
   job.** This image cannot see a downstream repo's `package.json`, so no
   lockstep is enforceable from here — which is exactly why the CDN allowlist,
@@ -453,7 +454,14 @@ docker build -f docker/worker/Dockerfile \
   the reconcile to happen automatically rather than when an agent notices
   should put `playwright install chromium` in its `cyrus-setup.sh` — Cyrus runs
   that script in each new worktree, and it is a no-op when the baked revision
-  already matches.
+  already matches. Two limits on that, both worth knowing before relying on it:
+  the script runs when a worktree is *created*, so a container recreated over a
+  warm `/workspaces` volume skips it while `/ms-playwright` — an image layer,
+  not part of that volume — has reverted to the baked revision; and a failing
+  setup script does not block the session, so a download that fails leaves the
+  suite broken with only a Linear activity to say so. Neither makes the hook
+  useless, but an agent hitting a missing browser should re-run the install
+  rather than conclude the hook ran.
 - **Only Chromium is installed.** Firefox and WebKit are not; a repo whose
   Playwright config runs the full three-browser matrix will fail on the other
   two. Add them in an overlay image if you need them.
@@ -795,11 +803,28 @@ inspection. HTTPS clones, package registries, the Playwright browser CDN,
 Anthropic/Linear, and router WSS are allowlisted; SSH remotes/submodules are
 not supported.
 
-**Egress is applied at sandbox-create time and has no update API.** Adding a
-host to `DEFAULT_EGRESS_HOSTS` (or to a custom policy) reaches only sandboxes
-created afterwards — like Key Vault rotation below, existing ones keep the
-policy they were born with. Run `cyrus router containers destroy <issueKey>`
-and re-prompt to pick up a new entry.
+**Cyrus applies egress at sandbox-create time and never updates it.** Adding a
+host to `DEFAULT_EGRESS_HOSTS` therefore reaches only sandboxes created
+afterwards — like Key Vault rotation below, existing ones keep the policy they
+were born with. Run `cyrus router containers destroy <issueKey>` and re-prompt
+to pick up a new entry. That includes snapshot restores: the provider sets the
+policy explicitly on *both* create paths, because create-from-snapshot does not
+carry it over (the same F2 finding that forces the lifecycle policy to be
+re-set).
+
+This is a limitation of `AcaSandboxClient`, not of ACA: the platform exposes
+`POST /sandboxes/{id}/egresspolicy` to replace the policy on a **live**
+sandbox, verified in the 2026-07-25 spike to apply within seconds with a
+negative control. Cyrus does not call it yet. Wiring it up would make an
+allowlist change reach running sandboxes without destroying them, and is the
+obvious follow-up if allowlist churn becomes routine.
+
+**A custom `containers.aca.egress.hostRules` replaces the built-in list
+outright — it does not merge.** If you run one, every host above is yours to
+maintain, including new ones added by a Cyrus upgrade. Diff
+`DEFAULT_EGRESS_HOSTS` against your policy when you upgrade; the symptom of
+missing an entry is a plain 403 from inside the sandbox, which reads as an
+auth or upstream failure rather than an egress one.
 
 Azure CLI authentication and reads require these public-cloud HTTPS hosts:
 `login.microsoftonline.com`, `management.azure.com`, `api.loganalytics.io`, and

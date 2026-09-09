@@ -98,13 +98,27 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	// (CYR-87); with them the mismatch degrades to a one-time fetch into the
 	// shared `/ms-playwright`.
 	//
-	// Both hosts are `PLAYWRIGHT_CDN_MIRRORS` in playwright-core — it tries them
-	// in order, so allowlisting only the first works until the day it doesn't.
-	// Egress is applied at sandbox-CREATE time and has no update API, so a
-	// missing entry costs a fleet-wide destroy-and-recreate while a redundant
-	// one costs nothing.
+	// Five hosts, because Playwright has used two different mirror sets and two
+	// different code paths, and which one applies is the REPOSITORY's choice:
+	//   - >=1.50 ships `cdn.playwright.dev` and
+	//     `playwright.download.prss.microsoft.com` as `PLAYWRIGHT_CDN_MIRRORS`.
+	//     Neither covers for the other: on x64 the Chromium builds resolve
+	//     through the Chrome-for-Testing path, whose only mirror override is
+	//     `cdn.playwright.dev`, while ffmpeg and the arm64 Chromium builds fall
+	//     through the mirror list and can land on either.
+	//   - <=1.49 knows only the three `*.azureedge.net` mirrors. They still
+	//     resolve (re-fronted by Azure Front Door), so a repo on an older pin
+	//     gets served rather than being left on the original CYR-87 failure.
+	// Cyrus applies egress at sandbox-CREATE time and implements no update
+	// call, so a missing entry costs a destroy-and-recreate of every affected
+	// sandbox while a redundant one costs nothing. (ACA itself does expose
+	// `POST /sandboxes/{id}/egresspolicy`, verified against a live sandbox in
+	// the 2026-07-25 spike — `AcaSandboxClient` just does not call it yet.)
 	{ pattern: "cdn.playwright.dev", action: "Allow" },
 	{ pattern: "playwright.download.prss.microsoft.com", action: "Allow" },
+	{ pattern: "playwright.azureedge.net", action: "Allow" },
+	{ pattern: "playwright-akamai.azureedge.net", action: "Allow" },
+	{ pattern: "playwright-verizon.azureedge.net", action: "Allow" },
 ];
 
 /** Normalised label keys the provider stamps on every managed resource. */
@@ -428,6 +442,14 @@ export class AcaSandboxesProvider implements ContainerExecutor {
 				snapshotId: snap.id,
 				lifecycle: this.lifecyclePolicy(),
 				labels: this.labels(ctx.issueKey, deviceId, disk),
+				// Same reason `lifecyclePolicy()` is passed here: F2 established
+				// that create-from-snapshot does not carry the policy over, and
+				// egress is a security control rather than a cost one, so the
+				// failure is worse in both directions — a restored sandbox
+				// either keeps a stale allowlist (and silently never receives a
+				// newly-added host, e.g. the Playwright CDN) or falls back to
+				// ACA's default, which is not Deny.
+				egressPolicy: this.egressPolicy,
 			});
 			// No re-mint: env/token inherited (spike S3b), AND the device-id
 			// label matches the live row (lineage filter above).
