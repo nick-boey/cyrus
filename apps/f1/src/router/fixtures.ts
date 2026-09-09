@@ -22,19 +22,44 @@ const WORKSPACE = "ws-1";
  */
 let activitySeq = 0;
 
-export function createdFixture(opts: {
-	sessionId: string;
-	issue: { id: string; identifier: string; title: string };
-	creator: Creator;
-}): AgentEvent {
+/** Linear team carried on a fixture's issue, and so onto the run's routing snapshot. */
+export interface FixtureTeam {
+	id: string;
+	key: string;
+	name: string;
+}
+
+const DEFAULT_TEAM: FixtureTeam = { id: "team-1", key: "DEF", name: "Default" };
+
+/**
+ * Overrides shared by both event fixtures.
+ *
+ * `workspace` and `team` exist for the fleet-operations drives: the operator
+ * API's workspace narrowing and its team filter are both read off the routing
+ * snapshot captured at route time, so a rig serving one workspace with one team
+ * cannot distinguish a router that applies them from one that ignores them.
+ */
+interface FixtureScope {
+	workspace?: string;
+	team?: FixtureTeam;
+}
+
+export function createdFixture(
+	opts: {
+		sessionId: string;
+		issue: { id: string; identifier: string; title: string };
+		creator: Creator;
+	} & FixtureScope,
+): AgentEvent {
+	const workspace = opts.workspace ?? WORKSPACE;
 	return {
 		type: "AgentSessionEvent",
 		action: "created",
-		organizationId: WORKSPACE,
+		organizationId: workspace,
 		createdAt: new Date().toISOString(),
 		agentSession: {
 			id: opts.sessionId,
-			organizationId: WORKSPACE,
+			organizationId: workspace,
 			status: "active",
 			type: "issue",
 			creator: opts.creator,
@@ -44,24 +69,27 @@ export function createdFixture(opts: {
 				identifier: opts.issue.identifier,
 				title: opts.issue.title,
 				url: `linear://issue/${opts.issue.identifier}`,
-				team: { id: "team-1", key: "DEF", name: "Default" },
+				team: opts.team ?? DEFAULT_TEAM,
 			},
 		},
 		guidance: [],
 	} as unknown as AgentEvent;
 }
 
-export function promptedFixture(opts: {
-	sessionId: string;
-	actorUserId: string;
-	creator: Creator;
-	issue: { id: string; identifier: string; title: string };
-	body: string;
-}): AgentEvent {
+export function promptedFixture(
+	opts: {
+		sessionId: string;
+		actorUserId: string;
+		creator: Creator;
+		issue: { id: string; identifier: string; title: string };
+		body: string;
+	} & FixtureScope,
+): AgentEvent {
+	const workspace = opts.workspace ?? WORKSPACE;
 	return {
 		type: "AgentSessionEvent",
 		action: "prompted",
-		organizationId: WORKSPACE,
+		organizationId: workspace,
 		createdAt: new Date().toISOString(),
 		agentActivity: {
 			id: `act-${opts.sessionId}-${opts.actorUserId}-${++activitySeq}`,
@@ -70,7 +98,7 @@ export function promptedFixture(opts: {
 		},
 		agentSession: {
 			id: opts.sessionId,
-			organizationId: WORKSPACE,
+			organizationId: workspace,
 			status: "active",
 			type: "issue",
 			creator: opts.creator,
@@ -80,7 +108,7 @@ export function promptedFixture(opts: {
 				identifier: opts.issue.identifier,
 				title: opts.issue.title,
 				url: `linear://issue/${opts.issue.identifier}`,
-				team: { id: "team-1", key: "DEF", name: "Default" },
+				team: opts.team ?? DEFAULT_TEAM,
 			},
 		},
 	} as unknown as AgentEvent;

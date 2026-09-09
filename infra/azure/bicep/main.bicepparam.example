@@ -213,6 +213,15 @@ param fleetOperatorGrants = []
 // gate. While false, `fleet.recover` is STRIPPED from every rendered grant — a
 // read+recover principal keeps working read-only and a recovery-only grant
 // disappears — without touching the Entra assignment.
+//
+// STILL FALSE, and the automated evidence does not change that. The F1 matrix
+// (apps/f1/test/router/observability-commands.test.ts, reported in
+// apps/f1/test-drives/2026-09-09-observability-commands.md) pins the router's
+// recovery decisions end to end against a real router process — but it says
+// nothing about this deployment: no Entra token was minted for the router
+// audience, no Log Analytics workspace was read, and no recovery was run
+// against rg-cyrus-dev. Flipping this needs the controlled dev-fleet drive
+// (CYR-78 steps 1-9) and a separately authorized rollout carrying its evidence.
 param enableFleetRecovery = false
 
 // 2. What the operator's OWN client may read from Log Analytics. Log records

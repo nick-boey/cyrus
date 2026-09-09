@@ -4,7 +4,135 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Added
+- **The remote-operator surface now has an end-to-end F1 matrix, and the
+  dev-fleet half of its gate is explicitly still open
+  ([CYR-78](https://linear.app/northrop-digital/issue/CYR-78/validate-observability-commands-with-f1-and-the-dev-fleet),
+  [#77](https://github.com/nick-boey/cyrus/pull/77)).** The deployment-gated
+  remainder is
+  [CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery).
+
+  - **`apps/f1/test/router/observability-commands.test.ts` drives the SHIPPED
+    CLI command classes against a real `RouterServer` over a real socket.** The
+    unit suites on either side are each stronger at what they cover and share
+    one blind spot: the two halves disagreeing. A command that asks for
+    `?state=` where the router reads `?lifecycle=`, a capability advertised in
+    one vocabulary and gated in another, a cursor the router mints and the
+    client cannot parse — each passes both suites and fails in a fleet. So
+    nothing in the file fakes a router document: every run row is produced by
+    routing a real webhook through `EventRouter`, and every assertion reads it
+    back over HTTP. 40 scenarios covering anonymous discovery's non-disclosure,
+    all five principal kinds, the remote command tree, the full lifecycle set
+    through `runs list`/`watch`/`wait`, the post-restart `410`, log-descriptor
+    resolution with budget and redaction, nine guarded-recovery outcomes, and
+    trusted-skill checksum enforcement.
+  - **The recovery scenarios use a fake ACA control plane with the REAL
+    device-side WebSocket stack**, because `RouterRunReconciler` decides on
+    `DeviceGateway.isOnline` and on the worker's own `sessions_report`, neither
+    of which a stubbed executor can produce. Writing it surfaced the thing worth
+    knowing: a fake worker with no `"event"` consumer never acks the router's
+    queued event, so `hasPendingEvents` stays true and every recovery correctly
+    refuses to judge that worker's silence — the same shape a cold-booted
+    sandbox produces. The strand is therefore built the way a real one occurs
+    (route, boot, connect, drain, then kill the worker); a run whose event was
+    never delivered is un-started, not stranded, and testing that refusal while
+    calling it recovery was the easy mistake here.
+  - **`./f1 router:strand-run`** (with a `POST /router/strand-run` control
+    endpoint) routes an issue and reports whether the resulting run has reached
+    the strand a guarded recovery needs — run id, revision, device id, worker
+    connectivity, queued-event state, affinity and issue-lock holders, and how
+    long ago the session was claimed. It **observes and never fabricates**: what
+    makes a run stranded is the worker going away, which is the drive's act, so
+    the command waits for that and reports `recoverable: false` with `blockedBy`
+    when it has not happened. (The first cut wrote `executor_state = 'stopped'`
+    and returned at once — recording a fact about an executor nobody stopped, and
+    handing back a run whose event was still queued, which the reconciler
+    correctly refuses to judge. A drive would have read that refusal as a
+    recovery bug.) It refuses with `409` when the route was rejected outright.
+  - **`RouterRig` gained the fleet seams the matrix needs**: multiple served
+    workspaces, a `fleetOperations` block, an injected Entra token verifier
+    (claims only — `OperatorAuthorizer` still re-checks tenant, issuer,
+    audience, expiry, `oid`, and `idtyp` itself), a `runReconciler` override,
+    and the three recovery timing knobs. `createdFixture`/`promptedFixture`
+    take a workspace and team, without which a rig serving one workspace cannot
+    distinguish a router that narrows a grant from one that ignores it.
+  - **An independent cross-model review (Codex, read-only) found three real
+    defects in the first cut, all fixed and mutation-checked**: the strand
+    control above; a `runs watch` assertion satisfied by the opening snapshot
+    and a `runs wait` scenario racing a 20ms wall-clock delay, both of which now
+    mutate from inside the injected `sleep` and assert on the change event
+    itself; and a restart scenario that called the store's cleanup directly
+    rather than starting a second `RouterServer` on the same file database — it
+    would have kept passing if `RouterServer.start()` stopped calling it. Each
+    fix was verified by mutating the production code or the fixture and watching
+    the assertion fail. `logs follow` coverage was added, and the "no Linear
+    comment" claim — previously a scan of stdout for `linear.app`, which proves
+    nothing — is now an assertion that every request the process made went to the
+    router's own origin.
+  - **Part of the controlled dev-fleet drive ran, read-only, against the live
+    `rg-cyrus` router**, and the F1 matrix's predictions held there: anonymous
+    discovery returns identity and auth methods and nothing scoped, the three
+    authenticated routes answer a bare `401 {"error":"unauthorized"}`, and there
+    is no route serving log records at all (`/api/v1/logs` → 404). CYR-72's whole
+    canonical attribution set was confirmed present on live sandbox records, and
+    ingestion lag measured at p50 ~0.8 s / p95 ~1.2 s. The drive also found two
+    real faults it deliberately did not act on: a sandbox stranded `no_progress`
+    for 6.1 days on an issue closed since 2026-09-03 (the deployed router
+    predates CYR-84's 72-hour reclaim, so deploying current main fixes it), and
+    an issue lock held on in-progress work by a stopped, offline container.
+    Steps 1, 2 and 5-9 remain blocked on deployment changes — `fleetOperatorGrants`,
+    a `logSource`, and `enableFleetRecovery` — none of which an agent may make.
+  - **The `cyrus runs` half of the drive then ran against that router with a
+    real `fleet.read` operator token**, and behaved as the matrix predicts:
+    `connection add --auth local` verified and stored, `connection show` reporting
+    exactly `runs.list, runs.changes` with no log source and no advertised skill,
+    `runs list` resolving every canonical routing field including team and project
+    names, `--issue` filtering, and `runs wait` on a terminal run returning a full
+    observation document at exit 0. `logs query` exited **2** naming the missing
+    `logs.query` capability — CYR-78's unsupported-capability negative case,
+    observed live rather than inferred.
+  - **The drive found a live instance of the strand it had only ever built as a
+    fixture**: `PAR-200`'s run is `active` with a stopped container, an offline
+    worker and the issue lock held — the exact shape `strandRun()` constructs.
+    It also found that `NOR-402`'s six-day strand is **invisible to `cyrus runs`**
+    (0 rows even with `--all-runs`): its run rows aged out 24 hours past terminal
+    while the container and its affinity survived. That is not a defect in a
+    command that observes runs, but it is a hole in the `runs list` → investigate
+    → recover workflow the operator skill scripts, and it is recorded as a product
+    question for the project rather than fixed here.
+  - **Recovery stays disabled everywhere, and the docs now say why.**
+    `docs/ROUTER.md`, `apps/cli/README.md`, and
+    `infra/azure/bicep/main.bicepparam.example` each record that the F1 matrix
+    is the automated half of CYR-78 and not the gate: no Entra token was minted
+    for a router audience, no Log Analytics workspace was read, and no recovery
+    was run against `rg-cyrus-dev`. `enableFleetRecovery` remains `false` and
+    needs the controlled dev-fleet drive plus a separately authorized rollout.
+    The outstanding steps are enumerated in
+    `apps/f1/test-drives/2026-09-09-observability-commands.md`.
+
 ### Fixed
+- **Every F1 router rig shared one repository registry file, so the first rig
+  to seed decided the repositories every later rig saw
+  ([#77](https://github.com/nick-boey/cyrus/pull/77)).** `RouterRig` left
+  `repositoriesPath` to its default, which derives from `dbPath` — and every
+  rig passes `":memory:"`, whose `dirname` is `"."`. All of them therefore
+  wrote and read one `apps/f1/repositories.json` in the package directory. A
+  non-empty registry is authoritative, so a rig configured for a second
+  workspace found nothing registered for it, held its webhooks at the
+  repository gate, and reported the run as never routed. It survived because
+  the stray file persists between runs: once a rig that wanted both workspaces
+  had seeded it, every later local run passed, and only a clean checkout — CI —
+  saw the failure. The rig now derives the path from its own temp home, as it
+  already did for the Codex KEK for exactly this reason.
+- **The guarded-recovery e2e stranded a session its own fake worker had
+  already disowned ([#77](https://github.com/nick-boey/cyrus/pull/77)).** The
+  worker declared an empty `sessions_query` answer from its very first hello,
+  so the hello-time affinity reconcile — running on the suite's deliberately
+  tiny 10ms grace — reclaimed the pin before the test asserted it was still
+  held. It passed only when the boot handshake beat the grace, which a loaded
+  CI runner does not. The worker now declares the session it is actually
+  running and empties that list at the strand, which is both what a real worker
+  reports and what makes the release the recovery performs meaningful.
 - **Playwright's browser revision is the repository's to decide, and the image
   is only a cache ([CYR-87](https://linear.app/northrop-digital/issue/CYR-87/playwright-cannot-launch-in-the-sandbox-the-image-bakes-chromium-1234),
   [#76](https://github.com/nick-boey/cyrus/pull/76)).**

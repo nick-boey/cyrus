@@ -1766,6 +1766,24 @@ restart and recovery never depends on anything having been posted to Linear.
 Operations age out with the run they describe (24 hours past terminal); the
 structured `recovery.*` audit events are the trail that outlives them.
 
+**Validation status — recovery is verified against F1, not against a fleet.**
+`apps/f1/test/router/observability-commands.test.ts` drives the shipped
+`cyrus recover` against a real `RouterServer`, a real `RouterStore`, and a real
+device-side WebSocket, and pins every outcome above: the elicitation
+`needs_input`, the connected-worker refusal, the stale revision, the idempotent
+join, the strand released, the strand that must NOT be released, the disabled
+default, and the restart-interrupted operation. The drive report is
+[`apps/f1/test-drives/2026-09-09-observability-commands.md`](../apps/f1/test-drives/2026-09-09-observability-commands.md).
+
+That is the automated half of CYR-78 and not the whole gate. The controlled
+dev-fleet drive — a live Entra principal, real Log Analytics reads, and one
+recovery against `rg-cyrus-dev` — has **not** been run, so
+`enableFleetRecovery` stays `false` in
+[`infra/azure/bicep/main.bicepparam.example`](../infra/azure/bicep/main.bicepparam.example)
+and recovery stays off in every deployment. Turn it on only behind a separately
+authorized rollout carrying that drive's evidence; the F1 matrix is a
+prerequisite for it, not a substitute.
+
 ### Advertise the historical log source
 
 A run observation says what a run is doing now. The log records behind it live in

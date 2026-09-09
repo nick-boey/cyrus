@@ -283,6 +283,20 @@ A run whose executor the router cannot start — an offline physical device — 
 `refused` with `executor_not_startable`, and the remedy is its owner bringing it
 back online.
 
+### Verified behaviour, and what is still gated
+
+Every exit code, refusal, and outcome above is pinned end to end by
+`apps/f1/test/router/observability-commands.test.ts`, which runs this command
+against a real router process rather than a stub — see the drive report,
+[`apps/f1/test-drives/2026-09-09-observability-commands.md`](../f1/test-drives/2026-09-09-observability-commands.md).
+
+**Recovery is nonetheless off in every deployment.** A router serves it only when
+`fleetOperations.recovery.enabled` is set, and no shipped configuration sets it:
+the Azure deployment's `enableFleetRecovery` is `false` until a controlled
+dev-fleet drive has been run and separately authorized. Against such a router
+this command exits `2` and names the missing `recoveries.request` capability,
+which is the expected answer today rather than a misconfiguration.
+
 ## Fleet log commands
 
 `cyrus logs` reads the historical logs of a **remote** fleet through the same

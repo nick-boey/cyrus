@@ -124,6 +124,76 @@ describe("control server", () => {
 		expect(stored.LINEAR_API_TOKEN).toBe("lin_api_1");
 	});
 
+	it("reports the run facts a recovery needs, and why it is not yet recoverable", async () => {
+		const strand = await fetch(`${control.url}/router/strand-run`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer secret-token",
+			},
+			body: JSON.stringify({
+				kind: "created",
+				sessionId: "sess-strand",
+				issueId: "issue-strand",
+				identifier: "CYPACK-STRAND",
+				title: "Stranded",
+				creator: { id: "lin-cold", email: "cold@example.com", name: "Cold" },
+			}),
+		});
+		expect(strand.status).toBe(200);
+		const body = (await strand.json()) as {
+			runId: string;
+			deviceId: number;
+			revision: number;
+			workerOnline: boolean;
+			executorState?: string;
+			pendingEvents: boolean;
+			sessionAffinityDeviceId?: number;
+			issueLockSessionId?: string;
+			recoverable: boolean;
+			blockedBy?: string;
+		};
+		expect(body.runId).toBeTruthy();
+		expect(body.workerOnline).toBe(false);
+		// The affinity and the issue lock the route wrote are held — which is what
+		// makes the issue unreachable and a recovery necessary.
+		expect(body.sessionAffinityDeviceId).toBe(body.deviceId);
+		expect(body.issueLockSessionId).toBe("sess-strand");
+		// This executor never connects a worker, so the routed event is still
+		// queued and the run is NOT yet recoverable. Reporting that is the whole
+		// point: `RouterRunReconciler` refuses to judge a worker's silence about
+		// work it has not received, and an endpoint that claimed a strand here
+		// would send a drive off to blame recovery for the refusal.
+		expect(body.pendingEvents).toBe(true);
+		expect(body.recoverable).toBe(false);
+		expect(body.blockedBy).toMatch(/undelivered events/i);
+		// And it invents no executor state it did not establish.
+		expect(body.executorState).toBeUndefined();
+	});
+
+	it("refuses to report a strand for a session that was never routed", async () => {
+		const strand = await fetch(`${control.url}/router/strand-run`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: "Bearer secret-token",
+			},
+			body: JSON.stringify({
+				kind: "created",
+				sessionId: "sess-unrouted",
+				issueId: "issue-unrouted",
+				identifier: "CYPACK-UNROUTED",
+				title: "Unrouted",
+				creator: {
+					id: "lin-nobody",
+					email: "nobody@example.com",
+					name: "Nobody",
+				},
+			}),
+		});
+		expect(strand.status).toBe(409);
+	});
+
 	it("rejects /router/enroll without the bearer token", async () => {
 		const res = await fetch(`${control.url}/router/enroll`, {
 			method: "POST",
