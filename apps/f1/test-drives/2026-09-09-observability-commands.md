@@ -520,9 +520,26 @@ contacted.
 outstanding:
 
 - A `fleet.read` operator token `cyr-78-drive` (**token id 3**) was minted on the
-  router. It holds no recovery authority and is scoped to one workspace.
-  **It must be revoked**: `cyrus router operators revoke-token 3` on the router
-  host. Until that runs it is a live read credential.
+  router, scoped to one workspace and holding no recovery authority. It was
+  **revoked at 06:51:03Z** (`cyrus router operators revoke 3`), and the
+  revocation was then verified from outside:
+
+  ```
+  curl -H "authorization: Bearer cyop_…" $ROUTER/api/v1/operator/context
+  → 401 {"error":"unauthorized"}
+  ```
+
+  Note the body: a revoked token gets the SAME opaque refusal an unknown one
+  gets, which is `getOperatorTokenByToken` resolving a revoked row to
+  `undefined` on purpose — telling them apart would confirm to the holder of a
+  stolen token that it was once valid. That security property is now verified
+  live, not just in the unit suite.
+
+  One caveat the CLI prints itself and which this drive did not test: the router
+  database is on ephemeral storage and backed up periodically, so a restore from
+  before 06:51Z would resurrect the token. Immaterial for a read credential that
+  never left one machine; it is why a genuine compromise wants rotation rather
+  than revocation.
 - A local connection `cyrus-dev` was written to `~/.cyrus/config.json` and has
   been **removed** (`cyrus connection remove cyrus-dev`); `connection list` now
   reports none. The token value was passed by environment variable and was never
