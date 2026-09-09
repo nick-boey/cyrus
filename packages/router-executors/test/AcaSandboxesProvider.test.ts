@@ -1618,6 +1618,16 @@ describe("AcaSandboxesProvider", () => {
 			expect(patterns).toContain("static.rust-lang.org");
 			// The Argos CLI's upload endpoint — see docker/worker/Dockerfile.
 			expect(patterns).toContain("api.argos-ci.com");
+			// Both Playwright CDN mirrors, not just the first: playwright-core
+			// falls through PLAYWRIGHT_CDN_MIRRORS in order, and egress has no
+			// update API, so a host missed here costs a fleet-wide recreate
+			// (CYR-87).
+			expect(patterns).toEqual(
+				expect.arrayContaining([
+					"cdn.playwright.dev",
+					"playwright.download.prss.microsoft.com",
+				]),
+			);
 			expect(patterns).toEqual(
 				expect.arrayContaining([
 					"login.microsoftonline.com",

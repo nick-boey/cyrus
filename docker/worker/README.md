@@ -392,7 +392,7 @@ see the behavior described above — update first.
 | `build-essential`, `pkg-config`, `libssl-dev` | Pulled in by the Rust toolchain, but useful to any native build. `rustc` shells out to `cc` to link, so without them every `cargo build` fails with ``linker `cc` not found``; `-sys` crates that wrap C libraries also need `pkg-config` and headers. |
 | `codex` (`@openai/codex`) | The Codex agent CLI, on `PATH` for sessions. Pinned by the `CODEX_VERSION` build arg — keep it in step with the `@openai/codex` version resolved in `pnpm-lock.yaml`. Authentication is not set up yet; see the note below. |
 | `opencode` (`opencode-ai`) | The OpenCode agent CLI. Pinned by the `OPENCODE_VERSION` build arg. Like `codex`, it resolves its native binary through per-platform `optionalDependencies`, so `npm install -g` gets the right `linux-x64`/`linux-arm64` build. |
-| `playwright` + Chromium | Browser automation. Pinned by the `PLAYWRIGHT_VERSION` build arg; the browser lives at `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, owned by `cyrus`. See the caveats below. |
+| `playwright` + Chromium | Browser automation. `--with-deps` installs Chromium's shared libraries and fonts, which needs root and so genuinely has to be baked; the browser binary itself is only a warm cache for the revision named by the `PLAYWRIGHT_VERSION` build arg. Browsers live at `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, owned by `cyrus` so a session can add the revision its own repo pins. See the caveats below. |
 
 Override a pinned version at build time without editing the Dockerfile:
 
@@ -401,7 +401,7 @@ docker build -f docker/worker/Dockerfile \
   --build-arg ACTIONLINT_VERSION=1.7.12 \
   --build-arg CODEX_VERSION=0.144.6 \
   --build-arg OPENCODE_VERSION=1.18.13 \
-  --build-arg PLAYWRIGHT_VERSION=1.62.0 \
+  --build-arg PLAYWRIGHT_VERSION=1.60.0 \
   --build-arg RUST_TOOLCHAIN=stable \
   -t cyrus-worker:dev .
 ```
@@ -429,19 +429,31 @@ docker build -f docker/worker/Dockerfile \
 
 ### Playwright caveats
 
-- **The browser is baked in because it cannot be fetched later on ACA.** ACA
-  sandboxes run Deny-by-default egress and the built-in allowlist
-  (`DEFAULT_EGRESS_HOSTS` in `cyrus-router-executors`) has no Playwright CDN
-  entry, so a session running `playwright install` inside an ACA sandbox will
-  fail to download. Under the `docker` executor it would work (no egress
-  policy), which is exactly the kind of drift baking it in avoids.
-- **Version mismatch is possible.** Playwright refuses to run against a
-  Chromium revision it did not ship with. If a repo pins a Playwright far from
-  the image's `PLAYWRIGHT_VERSION`, its tests will ask for a
-  `playwright install`. `/ms-playwright` is writable by `cyrus` so that
-  install can succeed — but on ACA it will be blocked by egress (above). The
-  durable fix for a repo like that is an overlay image (option 1 below) that
-  installs the matching browser at build time.
+- **The image pins a revision; the repository decides which one is used.**
+  Playwright refuses to launch a Chromium revision its own `browsers.json` did
+  not ask for, and it ignores a non-matching directory rather than falling back
+  to it. The revision that matters is therefore the one the *repository's*
+  `playwright-core` pin names, not `PLAYWRIGHT_VERSION` here — so if a repo
+  pins a different Playwright, the baked browser is dead weight for it and its
+  suites will ask for a `playwright install`.
+- **A mismatch is survivable, not fatal.** `cdn.playwright.dev` and
+  `playwright.download.prss.microsoft.com` — both `PLAYWRIGHT_CDN_MIRRORS` in
+  `playwright-core` — are in `DEFAULT_EGRESS_HOSTS` (`cyrus-router-executors`),
+  so a session can fetch the revision its repo actually needs. `/ms-playwright`
+  is shared and writable by `cyrus`, so that download is paid once per sandbox,
+  not once per worktree. Before CYR-87 neither was true and the suite simply
+  could not run.
+- **Keeping the two matched is an optimisation, and it is the repository's
+  job.** This image cannot see a downstream repo's `package.json`, so no
+  lockstep is enforceable from here — which is exactly why the CDN allowlist,
+  and not the build arg, is what makes a Playwright bump safe. Set
+  `PLAYWRIGHT_VERSION` to the pin of whichever repo actually runs Playwright in
+  these sandboxes so the common case needs no download; when that repo bumps,
+  the worst case is one download until this is bumped too. A repo that wants
+  the reconcile to happen automatically rather than when an agent notices
+  should put `playwright install chromium` in its `cyrus-setup.sh` — Cyrus runs
+  that script in each new worktree, and it is a no-op when the baked revision
+  already matches.
 - **Only Chromium is installed.** Firefox and WebKit are not; a repo whose
   Playwright config runs the full three-browser matrix will fail on the other
   two. Add them in an overlay image if you need them.
@@ -779,8 +791,15 @@ of treating infrastructure state as worker liveness.
 Leave `autoSuspendSeconds: 0`: the router's `idleStopMs` is affinity-aware,
 whereas ACA auto-suspend can freeze live work and snapshot restore otherwise
 resets the policy to 300 seconds. The default egress policy is Deny + Full
-inspection. HTTPS clones, package registries, Anthropic/Linear, and router WSS
-are allowlisted; SSH remotes/submodules are not supported.
+inspection. HTTPS clones, package registries, the Playwright browser CDN,
+Anthropic/Linear, and router WSS are allowlisted; SSH remotes/submodules are
+not supported.
+
+**Egress is applied at sandbox-create time and has no update API.** Adding a
+host to `DEFAULT_EGRESS_HOSTS` (or to a custom policy) reaches only sandboxes
+created afterwards — like Key Vault rotation below, existing ones keep the
+policy they were born with. Run `cyrus router containers destroy <issueKey>`
+and re-prompt to pick up a new entry.
 
 Azure CLI authentication and reads require these public-cloud HTTPS hosts:
 `login.microsoftonline.com`, `management.azure.com`, `api.loganalytics.io`, and

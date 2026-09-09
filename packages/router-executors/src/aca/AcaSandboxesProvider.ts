@@ -87,6 +87,24 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	// `ARGOS_TOKEN` is set and every call is denied, which reads as an auth
 	// failure rather than an egress one.
 	{ pattern: "api.argos-ci.com", action: "Allow" },
+	// Playwright's browser CDN. The worker image bakes one Chromium revision,
+	// but the revision Playwright will actually launch is decided by the
+	// REPOSITORY's `playwright-core` pin — every version ships its own
+	// `browsers.json`, and Playwright ignores a browser directory whose revision
+	// does not match rather than falling back to it. So a repo pinning a
+	// different Playwright than the image sees the baked browser as dead weight
+	// and asks for a `playwright install`. Without these entries that download
+	// is denied and the repo's Playwright-backed suites cannot run at all
+	// (CYR-87); with them the mismatch degrades to a one-time fetch into the
+	// shared `/ms-playwright`.
+	//
+	// Both hosts are `PLAYWRIGHT_CDN_MIRRORS` in playwright-core — it tries them
+	// in order, so allowlisting only the first works until the day it doesn't.
+	// Egress is applied at sandbox-CREATE time and has no update API, so a
+	// missing entry costs a fleet-wide destroy-and-recreate while a redundant
+	// one costs nothing.
+	{ pattern: "cdn.playwright.dev", action: "Allow" },
+	{ pattern: "playwright.download.prss.microsoft.com", action: "Allow" },
 ];
 
 /** Normalised label keys the provider stamps on every managed resource. */

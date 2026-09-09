@@ -4,6 +4,51 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Fixed
+- **Playwright's browser revision is the repository's to decide, and the image
+  is only a cache ([CYR-87](https://linear.app/northrop-digital/issue/CYR-87/playwright-cannot-launch-in-the-sandbox-the-image-bakes-chromium-1234)).**
+
+  - **The two halves of the Playwright bake have different lifetimes, and only
+    one of them is a version pin.** `--with-deps` apt-installs Chromium's
+    shared libraries and fonts — root-only, revision-independent, genuinely
+    un-fixable at runtime because sessions run as `cyrus`. The browser binary
+    is not in that category: which revision Playwright launches is read from
+    the REPOSITORY's `playwright-core` `browsers.json`, and Playwright ignores
+    a non-matching directory rather than falling back to it. So the image's
+    `PLAYWRIGHT_VERSION` does not decide anything; it only decides whether the
+    repository's choice happens to be pre-cached. Verified against the shipped
+    package: `playwright-core@1.60.0` asks for chromium/headless-shell 1223,
+    `1.62.0` for 1234, and both ask for ffmpeg 1011 — which is why the reported
+    evidence showed ffmpeg matching while chromium did not.
+  - **No cross-repo lockstep is enforceable from inside the image, so the CDN
+    allowlist — not the build arg — is what makes a Playwright bump safe.** The
+    image cannot see a downstream repository's `package.json`, and the original
+    issue correctly flagged that the "keep in lockstep" half needs an owner or
+    it recurs on the next bump. There is no owner to give it. Instead the
+    failure mode is downgraded: with `cdn.playwright.dev` and
+    `playwright.download.prss.microsoft.com` in `DEFAULT_EGRESS_HOSTS`, drift
+    costs one download into the shared `/ms-playwright` instead of an
+    unrunnable suite. `PLAYWRIGHT_VERSION` is now 1.60.0 to match the consuming
+    repository's pin, but it is an optimisation and is documented as one. A
+    repository wanting the reconcile to be automatic rather than
+    agent-initiated puts `playwright install chromium` in its
+    `cyrus-setup.sh` — the seam that already exists, run per worktree, a no-op
+    when the revision matches, and the only place that can see the pin.
+  - **Both CDN mirrors go in, not just the first.** `PLAYWRIGHT_CDN_MIRRORS` in
+    `playwright-core` is tried in order, so allowlisting only
+    `cdn.playwright.dev` works until the day it does not. Confirmed from the
+    installed 1.60.0 package that these are the only two download hosts —
+    `playwright.azureedge.net`, which the issue's evidence probed, is legacy and
+    is not in the mirror list. Both were 403 from a live worker sandbox, so
+    neither would have covered for the other. As with every other entry: egress
+    is applied at sandbox-CREATE time and has no update API, so a missing host
+    costs a fleet-wide destroy-and-recreate while a redundant one costs nothing.
+  - **Not covered: boot-time visibility.** The issue's fourth criterion is
+    explicitly conditional on CYR-16's capability probe, which has not landed —
+    there is no boot probe to add a browser-revision check to. A mismatch is now
+    self-healing rather than fatal, which lowers the stakes, but it is still
+    discovered at first use.
+
 ### Added
 - **Reclaimed stranded sandboxes and obsolete disk images ([CYR-84](https://linear.app/northrop-digital/issue/CYR-84/sweep-stale-aca-sandboxes-and-obsolete-disk-images-automatically), [#75](https://github.com/nick-boey/cyrus/pull/75)).**
 
