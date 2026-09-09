@@ -17,7 +17,7 @@ against deterministic F1 fixtures, before recovery is enabled anywhere.
 
 | Fact | Value |
 | --- | --- |
-| Commit | `1cb084fe` (`main`) |
+| Commit under test | `3c21e0a5` (branch `nboey/cyr-78-validate-observability-commands-with-f1-and-the-dev-fleet`, base `main` @ `1cb084fe`) |
 | Node | v22.20.0 |
 | pnpm | 10.33.1 |
 | Platform | Windows 11 Pro 10.0.26200 |
@@ -37,7 +37,7 @@ pnpm typecheck
 pnpm test:packages:run
 ```
 
-Result at 2026-09-09T05:2xZ:
+Result at 2026-09-09T05:36Z (re-run after the review fixes below):
 
 ```
  Test Files  1 passed (1)
