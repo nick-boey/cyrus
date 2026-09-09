@@ -2,6 +2,8 @@
 
 **Date**: 2026-09-09 (UTC)
 **Issue**: CYR-78 — Validate observability commands with F1 and the dev fleet
+**Pull request**: [#77](https://github.com/nick-boey/cyrus/pull/77)
+**Follow-up**: [CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery) — everything below that is gated on a deployment change
 **Goal**: Prove the remote-operator workflow — discovery, authorization, run
 observation, log queries, guarded recovery, and trusted skill installation —
 against deterministic F1 fixtures, before recovery is enabled anywhere.

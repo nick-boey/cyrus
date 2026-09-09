@@ -7,7 +7,10 @@ This changelog documents internal development changes, refactors, tooling update
 ### Added
 - **The remote-operator surface now has an end-to-end F1 matrix, and the
   dev-fleet half of its gate is explicitly still open
-  ([CYR-78](https://linear.app/northrop-digital/issue/CYR-78/validate-observability-commands-with-f1-and-the-dev-fleet)).**
+  ([CYR-78](https://linear.app/northrop-digital/issue/CYR-78/validate-observability-commands-with-f1-and-the-dev-fleet),
+  [#77](https://github.com/nick-boey/cyrus/pull/77)).** The deployment-gated
+  remainder is
+  [CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery).
 
   - **`apps/f1/test/router/observability-commands.test.ts` drives the SHIPPED
     CLI command classes against a real `RouterServer` over a real socket.** The
