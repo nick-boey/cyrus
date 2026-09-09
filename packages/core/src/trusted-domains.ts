@@ -68,8 +68,12 @@ export const TRUSTED_DOMAINS: readonly string[] = [
 	// Application Insights' data plane, read by `az monitor app-insights
 	// query`. A different host from the Log Analytics pair above; neither
 	// covers the other. Kept in step with DEFAULT_EGRESS_HOSTS in
-	// cyrus-router-executors — a host allowed by the ACA policy and denied
-	// here is still denied (CYR-88).
+	// cyrus-router-executors, but note the two are not equivalent: that list
+	// is applied to every ACA sandbox at create time, whereas this one applies
+	// only where an operator sets `sandbox.networkPolicy.preset: "trusted"`.
+	// An entry here alone therefore protects nothing on ACA — but a sandbox
+	// that DOES run the preset needs it, or the preset becomes what blocks the
+	// gate (CYR-88).
 	"api.applicationinsights.io",
 	"api.applicationinsights.azure.com",
 	// `az extension add` resolves its index through the `aka.ms` shortener and
@@ -82,6 +86,9 @@ export const TRUSTED_DOMAINS: readonly string[] = [
 	"go.microsoft.com",
 	"azcliextensionsync.blob.core.windows.net",
 	"azcliprod.blob.core.windows.net",
+	// `mcr.microsoft.com` (already listed under container registries above) is
+	// also what Bicep's `br/public:` alias expands to, so it carries Azure
+	// Verified Module restores as well as image pulls.
 	"packages.microsoft.com",
 	"dotnet.microsoft.com",
 	"dot.net",

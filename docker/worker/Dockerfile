@@ -61,11 +61,12 @@ RUN apt-get update \
 #
 # `application-insights` is not a nice-to-have. It is what provides
 # `az monitor app-insights query` — the command a repository's telemetry-estate
-# inventory uses to decide whether a component still emits anything. When the
-# extension is absent that query surfaces as an EMPTY RESULT rather than as an
-# error (CYR-88), and an empty result is precisely the answer that authorises
-# deleting the component. A missing gate that reports "nothing found" is worse
-# than one that fails.
+# inventory uses to decide whether a component still emits anything. The CLI
+# itself does fail loudly without it (`ERROR: 'app-insights' is misspelled or
+# not recognized`, exit 2), but that command is almost always run inside a
+# shell pipeline that keeps stdout and discards the rest, and THAT reports an
+# empty result (CYR-88) — precisely the answer that authorises deleting the
+# component. A gate that reports "nothing found" is worse than one that fails.
 #
 # `aspnetcore-runtime-8.0` sits alongside the .NET 10 SDK because the SDK can
 # BUILD `net8.0` (targeting packs come from NuGet) but cannot RUN it: `dotnet

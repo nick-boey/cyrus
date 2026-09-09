@@ -383,8 +383,8 @@ see the behavior described above — update first.
 | Tool | Why it's baked in |
 |---|---|
 | `git`, `gh`, `curl`, `jq`, `ca-certificates` | The restore ladder (clone, credential helper) and sessions themselves (PR creation, fetching raw files). `ca-certificates` is what makes node's `fetch` able to reach the router at all — `node:22-slim` ships no root store. |
-| `az` + `log-analytics` and `application-insights` extensions | Azure resource discovery, Log Analytics queries, and `az monitor app-insights query`. All are installed system-wide for the non-root `cyrus` user; service-principal authentication is optional and happens at boot. The Application Insights extension is load-bearing rather than convenient: without it the CLI cannot resolve the command, and a shell pipeline wrapping it reports an **empty result rather than an error** — which is exactly the answer that authorises deleting a component believed to emit no telemetry. |
-| `bicep` | ARM template compilation. On `PATH` with `AZURE_BICEP_USE_BINARY_FROM_PATH=true`, so `az bicep build` uses this binary and never tries to install or version-check its own — a call to `https://aka.ms/BicepLatestRelease` that a Deny-by-default sandbox answers with `403`, failing at bootstrap before a single template is parsed. Pinned by `BICEP_VERSION` **together with** `BICEP_SHA256_AMD64`/`BICEP_SHA256_ARM64`: `Azure/bicep` publishes no checksums file, so unlike `actionlint` the digests cannot be derived at build time and must move with the version. Take the replacements from the release API's per-asset `digest` field. |
+| `az` + `log-analytics` and `application-insights` extensions | Azure resource discovery, Log Analytics queries, and `az monitor app-insights query`. All are installed system-wide for the non-root `cyrus` user; service-principal authentication is optional and happens at boot. The Application Insights extension is load-bearing rather than convenient: without it the CLI cannot resolve the command (`ERROR: 'app-insights' is misspelled or not recognized`, exit 2), and a shell pipeline wrapping it — keeping stdout, discarding the rest — reports an **empty result rather than an error**, which is exactly the answer that authorises deleting a component believed to emit no telemetry. |
+| `bicep` | ARM template compilation. On `PATH` with `AZURE_BICEP_USE_BINARY_FROM_PATH=true`, so `az bicep build` uses this binary and never tries to install or version-check its own — a call to `https://aka.ms/BicepLatestRelease` that a Deny-by-default sandbox answers with `403`, failing at bootstrap before a single template is parsed. Pinned by `BICEP_VERSION` **together with** `BICEP_SHA256_AMD64`/`BICEP_SHA256_ARM64`: `Azure/bicep` publishes no checksums file, so unlike `actionlint` the digests cannot be derived at build time and must move with the version. Take the replacements from the release API's per-asset `digest` field. Baking the compiler is only half the gate — `br/public:` expands to `mcr.microsoft.com/bicep/`, so a template using any Azure Verified Module also needs that host reachable (see the egress section). |
 | `dotnet` (SDK 10.0 + ASP.NET Core runtime 8.0) | Repos targeting .NET need it to build/test/restore and to run repo-local `dotnet tool`s. The 8.0 runtime is separate because the 10 SDK can *build* `net8.0` (targeting packs come from NuGet) but cannot *run* it — `dotnet test -f net8.0` otherwise dies with `Framework 'Microsoft.NETCore.App', version '8.0.0'`. The ASP.NET Core variant is installed rather than the bare runtime it depends on, so web test projects work too. |
 | `fleece` (Fleece.Cli) | Fleece issue tracking. Installed via `dotnet tool install --tool-path /usr/local/dotnet-tools` — **not** `-g`, which would put it under build-time `/root` where the non-root `cyrus` user cannot reach it. Unpinned: rebuilding the image picks up the latest published `Fleece.Cli`. |
 | `dotnet-affected` | Computes which projects a diff touches; repos drive their tier-1 test lane off it. On the same shared `--tool-path` as `fleece`, because a runtime `dotnet tool install --global` appears to succeed and then leaves the command unresolvable — `~/.dotnet/tools` is not on the session's `PATH`, so the repo's own script reports the tool as missing until `PATH` is amended by hand. |
@@ -852,13 +852,19 @@ agent sandbox's `trusted` preset include them. An explicit custom ACA egress
 policy or custom agent network allowlist remains authoritative, so add all four
 hosts yourself when using one.
 
-Three more host groups exist for repository quality gates, and each is the
+Four more host groups exist for repository quality gates, and each is the
 *second* half of a fix whose first half is baked into the image (CYR-88):
 
 - **Application Insights** — `api.applicationinsights.io` and
   `api.applicationinsights.azure.com`, the data plane behind
   `az monitor app-insights query`. A different host from the Log Analytics
   pair; neither covers the other.
+- **Bicep's public module registry** — `mcr.microsoft.com` and
+  `*.data.mcr.microsoft.com`. `br/public:` is an alias for
+  `mcr.microsoft.com/bicep/`, so a template referencing any Azure Verified
+  Module fails during *module restore*, before compilation, with
+  `BCP192 … Status: 403 (Forbidden)` naming the registry rather than the
+  sandbox. Baking the compiler does not cover this.
 - **Azure CLI extensions** — `aka.ms`, `go.microsoft.com`,
   `azcliextensionsync.blob.core.windows.net`, `azcliprod.blob.core.windows.net`.
   `az extension add` resolves its index through the `aka.ms` shortener and
@@ -871,9 +877,17 @@ Three more host groups exist for repository quality gates, and each is the
   `psg-prod-*.azureedge.net` hosts its own guidance named for years, so treat
   this list as current-best-known rather than settled.
 
-`bicep` needs no host at all, which is the point: the binary is on `PATH` and
-`AZURE_BICEP_USE_BINARY_FROM_PATH=true` stops `az bicep` reaching for
-`aka.ms/BicepLatestRelease` on every invocation.
+`bicep` needs no host to *start*, which is the point of baking it: the binary is
+on `PATH` and `AZURE_BICEP_USE_BINARY_FROM_PATH=true` stops `az bicep` reaching
+for `aka.ms/BicepLatestRelease` on every invocation. Restoring a public module
+is a separate matter, hence `mcr.microsoft.com` above.
+
+These groups are also mirrored in `TRUSTED_DOMAINS` (`cyrus-core`), but the two
+lists are **not** two locks on the same door. `DEFAULT_EGRESS_HOSTS` is applied
+to every ACA sandbox at create time; `TRUSTED_DOMAINS` applies only where an
+operator sets `sandbox.networkPolicy.preset: "trusted"`, which nothing in the
+router or CLI does by itself. So the ACA entry is what makes the gate work, and
+the mirror is what stops the preset becoming the thing that blocks it.
 
 Explicit snapshots retain memory, disk, and env, including the device token.
 Restore is device-lineage checked. Azure does not collect explicit snapshots,

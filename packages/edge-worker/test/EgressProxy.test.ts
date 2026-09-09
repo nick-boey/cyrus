@@ -376,9 +376,10 @@ describe("EgressProxy", () => {
 		});
 
 		// The repository-gate hosts, kept in step with DEFAULT_EGRESS_HOSTS in
-		// cyrus-router-executors. Two independent enforcement layers: a host
-		// the ACA policy allows and this preset denies is still denied, so an
-		// entry added to only one of them fixes nothing (CYR-88).
+		// cyrus-router-executors. The two lists are not equivalent — that one
+		// is applied to every ACA sandbox at create time, this one only where
+		// an operator sets `sandbox.networkPolicy.preset: "trusted"` — so this
+		// assertion covers the preset half only (CYR-88).
 		it("includes Application Insights, az extension, and PowerShell Gallery hosts", () => {
 			expect(TRUSTED_DOMAINS).toEqual(
 				expect.arrayContaining([

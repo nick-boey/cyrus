@@ -66,8 +66,26 @@ const DEFAULT_EGRESS_HOSTS: { pattern: string; action: "Allow" | "Deny" }[] = [
 	// not covered by either. The extension that provides that command is baked
 	// into the worker image, so this is the half of the pair that has to be
 	// solved here rather than in the Dockerfile.
+	//
+	// Everything from here down is mirrored in TRUSTED_DOMAINS (cyrus-core).
+	// The two are NOT belt-and-braces on one sandbox: THIS list is what an ACA
+	// sandbox is created with, always, while TRUSTED_DOMAINS applies only where
+	// an operator sets `sandbox.networkPolicy.preset: "trusted"` — nothing in
+	// the router or CLI sets it. So an entry here is what makes an ACA sandbox
+	// work, and the mirror is what stops the preset from being the thing that
+	// blocks it. Both, for it to work everywhere.
 	{ pattern: "api.applicationinsights.io", action: "Allow" },
 	{ pattern: "api.applicationinsights.azure.com", action: "Allow" },
+	// Microsoft Artifact Registry, which is where `br/public:` resolves to:
+	// the alias expands to `mcr.microsoft.com/bicep/`, so a template
+	// referencing any Azure Verified Module fails during MODULE RESTORE —
+	// before a single line is compiled, and with a `BCP192 … Status: 403
+	// (Forbidden)` that names the registry rather than the sandbox. Baking the
+	// Bicep CLI into the image does not help with this half: the compiler is
+	// present and still cannot reach its own module registry. `*.data.` is the
+	// blob CDN the manifest redirects layer pulls to.
+	{ pattern: "mcr.microsoft.com", action: "Allow" },
+	{ pattern: "*.data.mcr.microsoft.com", action: "Allow" },
 	// Azure CLI's extension machinery. `az extension add` resolves its index
 	// through `https://aka.ms/azure-cli-extension-index-v1`, which redirects to
 	// the sync blob, and then pulls each wheel from the CLI's own storage

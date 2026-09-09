@@ -6,6 +6,16 @@
 	// a falsification exercise, not a product artifact — see
 	// docs/spikes/2026-09-01-nor-309-devcontainer-spike.md for the verdict and
 	// for what remains unverified.
+	//
+	// FROZEN AT THE NOR-309 SNAPSHOT. It is no longer a faithful expression of
+	// docker/worker/Dockerfile and is not maintained as one: it has never
+	// carried the Azure CLI, and CYR-88 added bicep, the .NET 8 runtime,
+	// Pester, corepack/pnpm, dotnet-affected and the application-insights
+	// extension to the Dockerfile without mirroring them here. Nothing can
+	// select this path today either — `containers.devcontainers` is not
+	// modelled by `RouterConfigFileSchema`, so Zod strips it. If this is ever
+	// revived as a product artifact, reconcile the whole toolchain against the
+	// Dockerfile first rather than trusting the list below.
 	"name": "cyrus-default-worker",
 	// node:22-slim, matching the Dockerfile's runtime stage. Deliberately NOT an
 	// mcr.microsoft.com/devcontainers/* base: those already carry a non-root
