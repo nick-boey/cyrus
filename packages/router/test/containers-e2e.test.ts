@@ -774,6 +774,15 @@ describe("guarded recovery e2e (real RouterServer + real WebSocket worker)", () 
 	const ISSUE_KEY = "CYPACK-300";
 	const ISSUE_ID = "issue-recover-1";
 	const SESSION_ID = "sess-recover-1";
+	/**
+	 * What the container's worker declares over `sessions_query`. The worker
+	 * that runs the session declares it — anything else is a worker lying about
+	 * its own run, and the hello-time affinity reconcile (correctly) reclaims
+	 * the pin this scenario is built to strand. Emptied at the strand: the
+	 * replacement worker recovery boots has no memory of the run, and that
+	 * answer is what licenses the release.
+	 */
+	let workerSessions: string[] = [SESSION_ID];
 
 	beforeAll(async () => {
 		tracker = new CLIIssueTrackerService();
@@ -789,11 +798,9 @@ describe("guarded recovery e2e (real RouterServer + real WebSocket worker)", () 
 			"docker",
 			() => server.port,
 			join(stateDir, "docker"),
-			// A container that was stranded and restarted comes back with no
-			// sessions: the worker process that owned the run is gone. That answer
-			// — given by an AUTHENTICATED worker, not inferred from silence — is
-			// what licenses the release.
-			() => [],
+			// Given by an AUTHENTICATED worker, not inferred from silence — that
+			// is what licenses the release.
+			() => workerSessions,
 		);
 
 		server = new RouterServer({
@@ -920,6 +927,7 @@ describe("guarded recovery e2e (real RouterServer + real WebSocket worker)", () 
 		// The worker goes away and its container is parked, but the affinity and
 		// the issue lock the session took out survive. Nothing in the router will
 		// ever release them on its own — that is the whole failure.
+		workerSessions = [];
 		dockerExec.stacks.get(ISSUE_KEY)?.connection.close();
 		await dockerExec.stop(ISSUE_KEY);
 		await vi.waitFor(() => {

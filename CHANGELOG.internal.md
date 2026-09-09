@@ -111,6 +111,15 @@ This changelog documents internal development changes, refactors, tooling update
     `apps/f1/test-drives/2026-09-09-observability-commands.md`.
 
 ### Fixed
+- **The guarded-recovery e2e stranded a session its own fake worker had
+  already disowned ([#77](https://github.com/nick-boey/cyrus/pull/77)).** The
+  worker declared an empty `sessions_query` answer from its very first hello,
+  so the hello-time affinity reconcile — running on the suite's deliberately
+  tiny 10ms grace — reclaimed the pin before the test asserted it was still
+  held. It passed only when the boot handshake beat the grace, which a loaded
+  CI runner does not. The worker now declares the session it is actually
+  running and empties that list at the strand, which is both what a real worker
+  reports and what makes the release the recovery performs meaningful.
 - **Playwright's browser revision is the repository's to decide, and the image
   is only a cache ([CYR-87](https://linear.app/northrop-digital/issue/CYR-87/playwright-cannot-launch-in-the-sandbox-the-image-bakes-chromium-1234),
   [#76](https://github.com/nick-boey/cyrus/pull/76)).**
