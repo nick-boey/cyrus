@@ -399,21 +399,113 @@ not exist. Read the raw `Log_s` of one row before trusting a summarize.
    gated on confirming the session is not waiting; that confirmation belongs to
    the operator, not to this drive.
 
+### The CLI, driven against the live router
+
+A `fleet.read` operator token (`cyr-78-drive`, token id 3) was minted on the
+router at 06:42Z, over workspace `75294f85-72ad-42ef-b9d7-c6ded611fc42`, and
+used from this machine. Its value never entered a file in this repository.
+
+```bash
+# Minted on the router host (a write; run by the operator, not the agent)
+MSYS_NO_PATHCONV=1 az containerapp exec -g rg-cyrus -n app-cyrus-dev-router \
+  --command "cyrus router operators create-token --label cyr-78-drive \
+             --role fleet.read --workspace 75294f85-72ad-42ef-b9d7-c6ded611fc42"
+
+export CYRUS_OPERATOR_TOKEN='cyop_…'
+node apps/cli/dist/src/app.js connection add cyrus-dev \
+  https://app-cyrus-dev-router.calmsea-e4dd7bc4.australiaeast.azurecontainerapps.io \
+  --auth local --token-env CYRUS_OPERATOR_TOKEN
+```
+
+| Command | Expected | Live result |
+| --- | --- | --- |
+| `connection add … --auth local` | verifies against the router and stores nothing privileged | `Connection "cyrus-dev" verified against cyrus-router and saved.` — `local-token:3`, `fleet.read`, 1 workspace |
+| `connection show cyrus-dev` | the principal's own authority, and only it | Capabilities exactly `runs.list, runs.changes`; `Log source: none (this connection cannot query logs)`; `Operator skill: none advertised` |
+| `runs list` | one row per session, canonical routing resolved | 30 runs, every one carrying workspace, owner, team **and project names**, runner/model, executor kind+state, worker connectivity, routedAt |
+| `runs list --issue CYR-87 --json` | exact-key filter | 1 run |
+| `runs list --issue PAR-200 --json` | exact-key filter | 2 runs |
+| `runs wait <terminal runId> --json` | exit 0, outcome `complete`, one full `RunObservationV1` | exit 0; document carries `revision: 489`, `endedAt`, `lastPublishedActivityAt`, the whole routing block |
+| `logs query --since 15m` | refuse: the router advertises no log source | `This router connection does not provide the "logs.query" capability. Available: runs.list, runs.changes.` — **exit 2** |
+| `skills list` | nothing advertised, and say so rather than installing | `No trusted compatible fleet skills are advertised…` — exit 0 |
+
+The `logs query` row is CYR-78's **"unsupported capability" negative case, live**:
+the client gates on the capability it read from `/api/v1/operator/context`,
+names what it needs and what it has, and exits `2` — the code ADR 0011 fixes for
+it. It never reached a backend.
+
+`cyrus recover` was **not** run against the live router. It would refuse at the
+same capability check (`recoveries.request` is not advertised), and that path is
+covered by the F1 matrix's recovery-disabled scenario, but the invocation was
+blocked by this session's own tooling and is recorded as unrun rather than
+inferred.
+
+### Two findings the CLI surfaced that the logs did not
+
+**1. `PAR-200` is a live, naturally occurring instance of the exact strand
+guarded recovery exists for.**
+
+```
+runId       4ddc55fd-afe8-4d46-bfad-0bcdeb86a97e
+lifecycle   active
+executor    container / stopped
+worker      offline
+issue lock  held by session 6af36850-4991-45aa-b1ad-807d999fa24d
+```
+
+A non-terminal run, a stopped container, an offline worker, and the issue lock
+still held — byte for byte the fixture `strandRun()` builds in the F1 matrix,
+happening on its own. If recovery were enabled, this is the run
+`cyrus recover 4ddc55fd-…` would reconcile. It is the strongest available
+evidence that the fixture models something real, and it was found by the
+operator surface rather than constructed.
+
+**2. `NOR-402`'s six-day strand is INVISIBLE to `cyrus runs`.**
+
+```
+$ cyrus runs list --issue NOR-402 --json            → 0 runs
+$ cyrus runs list --issue NOR-402 --all-runs --json → 0 runs
+```
+
+The filter is not at fault: `--issue CYR-87` returns 1 and `--issue PAR-200`
+returns 2. NOR-402 genuinely has no `agent_runs` row — runs are swept 24 hours
+past terminal — while its **container and its session affinity have survived six
+days**, which is why `sandbox.stranded_session` fires on it every minute.
+
+This is a real seam in the observability story, and worth stating precisely
+rather than as an alarm:
+
+- It is not a bug in `cyrus runs`. That command observes RUNS, and this run
+  ended six days ago. Its retention is deliberate.
+- It IS a gap in the workflow the fleet-operator skill scripts, which is
+  `runs list` → investigate → recover. An operator following it sees nothing for
+  the single worst-stranded sandbox on the fleet, and would reasonably conclude
+  there is nothing to look at.
+- The container-lifecycle half of the system does see it — `sandbox.stranded_session`
+  with `reason=no_progress` — and **CYR-84's `reclaimStranded` would destroy it**
+  after 72 hours quiet. That fix exists on `main` and is simply not deployed
+  (the router runs PR #74; the reclaim landed in PR #75).
+- So the residual question is a product one, not a defect: should the operator
+  surface expose a container holding affinity for a run that no longer exists —
+  through `runs`, through a `containers` view, or not at all — given that the
+  reclaim will collect it unattended once deployed. That belongs in the project's
+  follow-up, not in this drive.
+
 ### What this drive still could NOT reach
 
 | CYR-78 step | Status |
 | --- | --- |
 | 1. Deploy read-only observation/log capabilities | **Not run.** Read instead: the deployment already has no `fleetOperations` block, which is the safe posture, so nothing needed deploying to observe it. A *log* capability would need a real deploy. |
-| 2. Connect an Entra read principal; prove workspace denial/ambiguity | **Blocked.** `main.bicep` renders the Entra block only when `fleetOperatorGrants` is non-empty, and `northrop-dev.bicepparam` does not set it — so the router advertises no `entra` method and `cyrus connection add --auth entra` is refused. Adding the grant is a deploy. |
+| 2. Connect an Entra read principal; prove workspace denial/ambiguity | **Partly done, by a different credential.** A **local** operator token connected, and its context proved the narrowing works — one workspace, `fleet.read`, and exactly the two capabilities the router serves. The **Entra** half is still blocked: `main.bicep` renders that block only when `fleetOperatorGrants` is non-empty and `northrop-dev.bicepparam` does not set it, so the router advertises no `entra` method and `cyrus connection add --auth entra` is refused. Workspace **ambiguity** is unprovable here at all: this router serves exactly one workspace, so no principal can be ambiguous. |
 | 3. Narrow read-only Log Analytics queries; correlation fields, redaction, budgets, ingestion lag | **Mostly done** — see above. **Redaction and budgets were not exercised through `cyrus logs`**, because the router advertises no log source; they are covered only by `apps/cli/src/remote/logs/*.test.ts` and the F1 fake. |
-| 4. Prove with network/audit evidence that the CLI contacted Azure directly and the router returned only the descriptor | **Blocked** by the same missing `logSource`: with none advertised, `cyrus logs` refuses at the capability check rather than querying. What *is* proven is the half that does not need it — the router serves no log-records route at all (404). |
-| 5-9. Enable recovery for an isolated principal, run `cyrus recover`, negative cases, skill install from a versioned release, disable the grant | **Not run, and not authorized.** Each needs a deploy that turns `fleet.recover` on. |
+| 4. Prove with network/audit evidence that the CLI contacted Azure directly and the router returned only the descriptor | **Blocked** by the same missing `logSource`, and the refusal was observed rather than assumed: `cyrus logs query --since 15m` exits `2` naming the missing capability. Two halves *are* proven — the router serves no log-records route at all (404), and the client refuses before touching any backend. What is unproven is the positive path, where a descriptor exists and the CLI queries Azure with its own credentials. |
+| 5-9. Enable recovery for an isolated principal, run `cyrus recover`, negative cases, skill install from a versioned release, disable the grant | **Not run, and not authorized.** Each needs a deploy that turns `fleet.recover` on. The *target* for step 5 now exists naturally and did not need constructing — `PAR-200`'s run `4ddc55fd-…` is `active` with a stopped container, an offline worker and the issue lock held. `skills list` reports nothing advertised, so step 8's install has nothing to resolve against on this deployment. |
 
-The **`cyrus runs list` / `watch` / `wait` half of steps 2-4 is reachable without
-any deploy** — a locally minted `fleet.read` operator token authenticates against
-this router today, and two such tokens already exist. It was not run here only
-because minting one is a write that the session's own tooling refused; see the
-handover note in the pull request.
+The `cyrus runs` half needed no deploy and **was run**: see
+[The CLI, driven against the live router](#the-cli-driven-against-the-live-router)
+above. Everything still outstanding is gated on a deployment change —
+`fleetOperatorGrants` for Entra, a `logSource` for logs, `enableFleetRecovery`
+for recovery — each a separately authorized rollout rather than an agent's to
+make.
 
 ## Cleanup
 
@@ -424,12 +516,23 @@ cases, which use file databases in their own temp directories. All are removed i
 Nothing outside the temp directories is written, and no external service is
 contacted.
 
-**Dev-fleet half.** Nothing to clean up: every action was a read. No operator
-token was minted, no connection was stored on this machine (`~/.cyrus/config.json`
-does not exist), no container app was updated, no lock was released, and no
-Log Analytics query wrote anything. The two pre-existing operator tokens
-(`nboey-laptop`, `orca-observer`) were listed but not used — their raw values are
-not recoverable after minting — and were left in place.
+**Dev-fleet half.** Two writes happened, both deliberate, and one is still
+outstanding:
+
+- A `fleet.read` operator token `cyr-78-drive` (**token id 3**) was minted on the
+  router. It holds no recovery authority and is scoped to one workspace.
+  **It must be revoked**: `cyrus router operators revoke-token 3` on the router
+  host. Until that runs it is a live read credential.
+- A local connection `cyrus-dev` was written to `~/.cyrus/config.json` and has
+  been **removed** (`cyrus connection remove cyrus-dev`); `connection list` now
+  reports none. The token value was passed by environment variable and was never
+  written to this repository.
+
+Nothing else was mutated: no container app update, no revision change, no issue
+lock released, no container stopped or destroyed, and no Log Analytics query
+writes. The two pre-existing operator tokens (`nboey-laptop`, `orca-observer`)
+were listed but not used — a token's value is unrecoverable after minting — and
+were left in place.
 
 ## Independent review
 

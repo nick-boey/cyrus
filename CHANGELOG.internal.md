@@ -79,6 +79,24 @@ This changelog documents internal development changes, refactors, tooling update
     an issue lock held on in-progress work by a stopped, offline container.
     Steps 1, 2 and 5-9 remain blocked on deployment changes — `fleetOperatorGrants`,
     a `logSource`, and `enableFleetRecovery` — none of which an agent may make.
+  - **The `cyrus runs` half of the drive then ran against that router with a
+    real `fleet.read` operator token**, and behaved as the matrix predicts:
+    `connection add --auth local` verified and stored, `connection show` reporting
+    exactly `runs.list, runs.changes` with no log source and no advertised skill,
+    `runs list` resolving every canonical routing field including team and project
+    names, `--issue` filtering, and `runs wait` on a terminal run returning a full
+    observation document at exit 0. `logs query` exited **2** naming the missing
+    `logs.query` capability — CYR-78's unsupported-capability negative case,
+    observed live rather than inferred.
+  - **The drive found a live instance of the strand it had only ever built as a
+    fixture**: `PAR-200`'s run is `active` with a stopped container, an offline
+    worker and the issue lock held — the exact shape `strandRun()` constructs.
+    It also found that `NOR-402`'s six-day strand is **invisible to `cyrus runs`**
+    (0 rows even with `--all-runs`): its run rows aged out 24 hours past terminal
+    while the container and its affinity survived. That is not a defect in a
+    command that observes runs, but it is a hole in the `runs list` → investigate
+    → recover workflow the operator skill scripts, and it is recorded as a product
+    question for the project rather than fixed here.
   - **Recovery stays disabled everywhere, and the docs now say why.**
     `docs/ROUTER.md`, `apps/cli/README.md`, and
     `infra/azure/bicep/main.bicepparam.example` each record that the F1 matrix
