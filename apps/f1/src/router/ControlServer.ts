@@ -86,19 +86,27 @@ export async function startControlServer(opts: {
 		reply.send({ ok: true });
 	});
 
-	// Puts an issue into the shape guarded recovery exists for: a routed,
-	// non-terminal run on a container device whose worker never dialled back,
-	// with the session affinity and issue lock still held. Routing IS the whole
-	// setup — the run row, the affinity and the lock are all written by
-	// `EventRouter` on the way through — so this endpoint fabricates no state
-	// the product does not produce itself. It only records the executor's own
-	// last-known state and hands back the run facts a drive cannot otherwise
-	// see: `cyrus recover` takes a run id, and nothing on the operator surface
-	// will hand one out for a run the caller has not already listed.
+	// Routes an issue and reports whether its run has reached the shape guarded
+	// recovery exists for, WITHOUT fabricating any part of it.
+	//
+	// Two preconditions have to hold before a recovery can conclude anything,
+	// and only one of them is F1's to produce. Routing writes the run row, the
+	// session affinity and the issue lock; the executor boots the container and
+	// its worker drains the router's queue. What makes the run STRANDED is the
+	// worker then going away — a container stop, a suspend, a killed process —
+	// which is the drive's own act, not this endpoint's.
+	//
+	// So this waits for the strand rather than asserting one. The earlier
+	// version wrote `executor_state = 'stopped'` and returned: that records a
+	// fact about an executor nobody stopped, and it returns a run whose event is
+	// still queued — which `RouterRunReconciler.describeUnsettledWork` correctly
+	// refuses to judge ("the worker's session list is not yet authoritative"). A
+	// drive would have read that refusal as a recovery bug.
+	//
+	// It exists because `cyrus recover` takes a run id and the operator surface
+	// will not hand one out for a run the caller has not already listed.
 	fastify.post("/router/strand-run", async (request, reply) => {
-		const b = request.body as InjectBody & {
-			executorState?: "running" | "stopped" | "absent" | "unknown";
-		};
+		const b = request.body as InjectBody & { timeoutMs?: number };
 		seedSession(opts.rig.tracker, b.sessionId, b.issueId);
 		await opts.rig.server.eventRouter.route(
 			createdFixture({
@@ -108,8 +116,8 @@ export async function startControlServer(opts: {
 			}),
 		);
 		const store = opts.rig.server.store;
-		const run = store.getAgentRunForSession(b.sessionId);
-		if (!run) {
+		const routed = store.getAgentRunForSession(b.sessionId);
+		if (!routed) {
 			// The route was rejected — an unenrolled creator, a locked issue, a
 			// missing required secret. Saying so beats returning a half-built
 			// scenario a drive would then blame recovery for.
@@ -119,15 +127,28 @@ export async function startControlServer(opts: {
 			});
 			return;
 		}
-		store.setRunExecutorState(
-			run.deviceId,
-			b.executorState ?? "stopped",
-			Date.now(),
-		);
-		// Re-read: `setRunExecutorState` writes a MATERIAL column, so the
-		// revision a drive has to quote is the one AFTER it, not the one the
-		// route produced.
-		const current = store.getAgentRunById(run.runId) ?? run;
+		const deadline = Date.now() + Math.max(0, b.timeoutMs ?? 0);
+		let current = routed;
+		let pendingEvents = true;
+		while (true) {
+			current = store.getAgentRunById(routed.runId) ?? current;
+			pendingEvents = store.hasPendingEvents(routed.deviceId, Date.now());
+			if (!pendingEvents && !current.workerOnline) break;
+			if (Date.now() >= deadline) break;
+			await new Promise((resolve) => setTimeout(resolve, 250));
+		}
+		const affinity = store
+			.listSessionAffinityForDevice(routed.deviceId)
+			.find((row) => row.sessionId === b.sessionId);
+		// Only the two facts this endpoint can actually check. The router's
+		// `containers.affinityGraceMs` is the third precondition and is not
+		// readable from here, so `sessionClaimedMsAgo` is reported raw for the
+		// drive to measure against its own configuration rather than guessed at.
+		const blockedBy = pendingEvents
+			? "the device still has undelivered events, so the worker has not received this work yet"
+			: current.workerOnline
+				? "the worker is still connected; stop its container to strand the run"
+				: undefined;
 		reply.send({
 			ok: true,
 			runId: current.runId,
@@ -138,6 +159,15 @@ export async function startControlServer(opts: {
 			revision: current.revision,
 			workerOnline: current.workerOnline,
 			executorState: current.executorState,
+			pendingEvents,
+			sessionAffinityDeviceId: store.getSessionAffinity(b.sessionId),
+			issueLockSessionId: store.getIssueLock(b.issueId)?.sessionId,
+			sessionClaimedMsAgo:
+				affinity === undefined
+					? undefined
+					: Date.now() - affinity.establishedMs,
+			recoverable: blockedBy === undefined,
+			...(blockedBy ? { blockedBy } : {}),
 		});
 	});
 

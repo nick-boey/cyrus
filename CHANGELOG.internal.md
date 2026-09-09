@@ -35,13 +35,17 @@ This changelog documents internal development changes, refactors, tooling update
     never delivered is un-started, not stranded, and testing that refusal while
     calling it recovery was the easy mistake here.
   - **`./f1 router:strand-run`** (with a `POST /router/strand-run` control
-    endpoint) routes an issue and reports the run id, revision, device id,
-    worker connectivity, and executor state a guarded recovery needs. It
-    fabricates no state — `EventRouter` writes the run row, the affinity, and
-    the issue lock on the way through — and exists only because `cyrus recover`
-    takes a run id that the operator surface will not hand out for a run the
-    caller has not already listed. It refuses with `409` rather than reporting a
-    half-built scenario when the route was rejected.
+    endpoint) routes an issue and reports whether the resulting run has reached
+    the strand a guarded recovery needs — run id, revision, device id, worker
+    connectivity, queued-event state, affinity and issue-lock holders, and how
+    long ago the session was claimed. It **observes and never fabricates**: what
+    makes a run stranded is the worker going away, which is the drive's act, so
+    the command waits for that and reports `recoverable: false` with `blockedBy`
+    when it has not happened. (The first cut wrote `executor_state = 'stopped'`
+    and returned at once — recording a fact about an executor nobody stopped, and
+    handing back a run whose event was still queued, which the reconciler
+    correctly refuses to judge. A drive would have read that refusal as a
+    recovery bug.) It refuses with `409` when the route was rejected outright.
   - **`RouterRig` gained the fleet seams the matrix needs**: multiple served
     workspaces, a `fleetOperations` block, an injected Entra token verifier
     (claims only — `OperatorAuthorizer` still re-checks tenant, issuer,
@@ -49,6 +53,19 @@ This changelog documents internal development changes, refactors, tooling update
     and the three recovery timing knobs. `createdFixture`/`promptedFixture`
     take a workspace and team, without which a rig serving one workspace cannot
     distinguish a router that narrows a grant from one that ignores it.
+  - **An independent cross-model review (Codex, read-only) found three real
+    defects in the first cut, all fixed and mutation-checked**: the strand
+    control above; a `runs watch` assertion satisfied by the opening snapshot
+    and a `runs wait` scenario racing a 20ms wall-clock delay, both of which now
+    mutate from inside the injected `sleep` and assert on the change event
+    itself; and a restart scenario that called the store's cleanup directly
+    rather than starting a second `RouterServer` on the same file database — it
+    would have kept passing if `RouterServer.start()` stopped calling it. Each
+    fix was verified by mutating the production code or the fixture and watching
+    the assertion fail. `logs follow` coverage was added, and the "no Linear
+    comment" claim — previously a scan of stdout for `linear.app`, which proves
+    nothing — is now an assertion that every request the process made went to the
+    router's own origin.
   - **Recovery stays disabled everywhere, and the docs now say why.**
     `docs/ROUTER.md`, `apps/cli/README.md`, and
     `infra/azure/bicep/main.bicepparam.example` each record that the F1 matrix

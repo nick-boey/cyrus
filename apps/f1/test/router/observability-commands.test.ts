@@ -797,18 +797,45 @@ describe("runs list, watch, and wait over the real router", () => {
 			issueId: "issue-wait-ok",
 			identifier: "CY-WAIT-OK",
 		});
-		const { cmd, out } = runsCommand();
-		const finished = exitCodeOf(cmd, ["wait", run.runId, "--json"], {
-			workspace: WS_A,
+		// The run is finished from inside the injected `sleep`, which `wait` reaches
+		// only AFTER its resume cursor and its opening snapshot. A wall-clock delay
+		// here would be a race: a slow first request would let the snapshot see the
+		// terminal run, and the test would pass without the change feed carrying
+		// anything.
+		const out = createRecordingOutput();
+		let sleeps = 0;
+		let lifecycleAtSnapshot: string | undefined;
+		const cmd = new RunsCommand(fakeApp(h.url), {
+			env: { CYRUS_OPERATOR_TOKEN: token },
+			output: out,
+			pollIntervalMs: 0,
+			sleep: async () => {
+				sleeps++;
+				if (sleeps > 1) return;
+				lifecycleAtSnapshot = h.rig.server.store.getAgentRunById(
+					run.runId,
+				)?.state;
+				h.rig.server.store.finishAgentRun(
+					"sess-wait-ok",
+					"complete",
+					Date.now(),
+					{ runner: "claude" },
+				);
+			},
 		});
-		// Finished AFTER the command started, so the outcome has to arrive through
-		// the change feed rather than the opening snapshot.
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		h.rig.server.store.finishAgentRun("sess-wait-ok", "complete", Date.now(), {
-			runner: "claude",
-		});
-		expect(await finished).toBe(ExitCode.success);
-		expect(JSON.parse(out.data_.join("")).outcome).toBe("complete");
+		expect(
+			await exitCodeOf(cmd, ["wait", run.runId, "--json"], {
+				workspace: WS_A,
+			}),
+		).toBe(ExitCode.success);
+		// Reaching `sleep` at all means the snapshot did NOT satisfy the wait, and
+		// the run was still non-terminal at that moment — so the outcome in the
+		// document can only have arrived over `/api/v1/run-changes`.
+		expect(sleeps).toBeGreaterThanOrEqual(1);
+		expect(lifecycleAtSnapshot).toBe("routed");
+		const document = JSON.parse(out.data_.join(""));
+		expect(document.outcome).toBe("complete");
+		expect(document.run.lifecycle).toBe("complete");
 	});
 
 	it("reports an elicitation as an outcome, never as a timeout", async () => {
@@ -888,14 +915,22 @@ describe("runs list, watch, and wait over the real router", () => {
 		});
 		let clock = Date.parse("2026-09-03T00:00:00.000Z");
 		const out = createRecordingOutput();
+		let sleeps = 0;
 		const cmd = new RunsCommand(fakeApp(h.url), {
 			env: { CYRUS_OPERATOR_TOKEN: token },
 			output: out,
 			sleep: async () => {
-				// One poll observes the change; the next crosses the deadline.
-				h.rig.server.store.finishAgentRun("sess-watch", "complete", clock, {
-					runner: "claude",
-				});
+				sleeps++;
+				if (sleeps === 1) {
+					// Inside the FIRST idle poll, so the opening snapshot has already
+					// been emitted. The clock barely moves, leaving the next iteration
+					// inside the deadline to actually read the change.
+					h.rig.server.store.finishAgentRun("sess-watch", "complete", clock, {
+						runner: "claude",
+					});
+					clock += 1_000;
+					return;
+				}
 				clock += 20_000;
 			},
 			now: () => clock,
@@ -906,7 +941,28 @@ describe("runs list, watch, and wait over the real router", () => {
 				workspace: WS_A,
 			}),
 		).toBe(ExitCode.success);
-		expect(out.data_.join("\n")).toContain("CY-WATCH");
+		const events = out.data_.map(
+			(line) =>
+				JSON.parse(line) as {
+					event: string;
+					reason?: string;
+					observation?: { issueKey: string; lifecycle: string };
+				},
+		);
+		// The opening snapshot alone would satisfy a `toContain("CY-WATCH")`, which
+		// is why the assertion is on a `change` event carrying the NEW lifecycle:
+		// only the change feed can produce one.
+		expect(
+			events.find(
+				(event) =>
+					event.event === "change" &&
+					event.observation?.issueKey === "CY-WATCH",
+			)?.observation?.lifecycle,
+		).toBe("complete");
+		expect(events.at(-1)).toMatchObject({
+			event: "stopped",
+			reason: "timeout",
+		});
 	});
 });
 
@@ -1006,6 +1062,78 @@ describe("log commands read the router's descriptor and nothing else", () => {
 			ExitCode.usage,
 		);
 		expect(out.diagnostics.join("\n")).toMatch(/3600|range/i);
+	});
+
+	it("follows the source on a poll, deduplicating what its windows overlap", async () => {
+		// Timestamped against the STUBBED clock, not the wall clock: `follow` asks
+		// for a window ending at `now()`, so a record dated in real time falls
+		// outside every window and the test would assert on an empty result.
+		let clock = Date.parse("2026-09-09T00:00:00.000Z");
+		const first = {
+			schemaVersion: 1 as const,
+			recordId: "record-follow-1",
+			timestamp: new Date(clock - 60_000).toISOString(),
+			level: "info" as const,
+			message: "first line",
+			component: "router",
+			workspaceId: WS_A,
+		};
+		const adapter = new FakeLogSourceAdapter({ env: {}, records: [first] });
+		const registry = new LogAdapterRegistry({
+			factories: { fake: () => adapter },
+		});
+		const out = createRecordingOutput();
+		let polls = 0;
+		const cmd = new LogsCommand(fakeApp(h.url), {
+			env: { CYRUS_OPERATOR_TOKEN: token },
+			output: out,
+			registry,
+			now: () => clock,
+			sleep: async () => {
+				polls++;
+				clock += 10_000;
+				if (polls > 1) return;
+				// Re-served on the next window — which `follow` deliberately overlaps
+				// with the previous one — alongside something genuinely new.
+				adapter.setRecords([
+					first,
+					{
+						...first,
+						recordId: "record-follow-2",
+						timestamp: new Date(clock - 1_000).toISOString(),
+						message: "second line",
+					},
+				]);
+			},
+		});
+		expect(
+			await exitCodeOf(cmd, ["follow", "--interval", "10", "--timeout", "25"]),
+		).toBe(ExitCode.success);
+		const rendered = out.data_.join("\n");
+		// Printed ONCE: without the fingerprint dedup every poll would reprint the
+		// tail of the previous window.
+		expect(rendered.match(/first line/g)).toHaveLength(1);
+		expect(rendered).toContain("second line");
+		expect(polls).toBeGreaterThan(1);
+		// The dedup claim only means something if a later window ACTUALLY re-served
+		// the first record. It did: the second query starts before that record's
+		// timestamp, which is the overlap `follow` re-reads on purpose.
+		expect(adapter.queries.length).toBeGreaterThan(1);
+		expect(
+			Date.parse(adapter.queries[1]?.range.from ?? ""),
+		).toBeLessThanOrEqual(Date.parse(first.timestamp));
+		// It never presents a polled historical store as a live router stream.
+		expect(out.diagnostics.join("\n")).toMatch(
+			/historical store polled on a delay/i,
+		);
+	});
+
+	it("refuses a follow interval faster than the source advertises", async () => {
+		const { cmd, out } = logsCommand();
+		expect(await exitCodeOf(cmd, ["follow", "--interval", "1"])).toBe(
+			ExitCode.usage,
+		);
+		expect(out.diagnostics.join("\n")).toMatch(/no faster than 5s/i);
 	});
 
 	it("redacts a credential that reached the backend's own records", async () => {
@@ -1313,20 +1441,25 @@ describe("guarded recovery over the real router", () => {
 	});
 
 	it("fails an operation interrupted by a router restart rather than leaving it in flight", {
-		timeout: 30_000,
+		timeout: 60_000,
 	}, async () => {
 		// A coordinator held mid-reconciliation is the only way to keep an
-		// operation `accepted` long enough to interrupt it — and it is honest:
+		// operation `accepted` long enough to interrupt it, and it is honest:
 		// what a restart interrupts IS a reconciliation that had not finished.
-		// It is RELEASED before the rig stops, because `RouterServer.stop` waits
-		// for in-flight recoveries on purpose, and a coordinator that could never
-		// finish would hang the shutdown rather than test it.
 		let release!: () => void;
 		const held = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const stuck = await startHarness({
+		const dir = mkdtempSync(join(tmpdir(), "f1-obs-interrupt-"));
+		const dbPath = join(dir, "router.db");
+		// The FILE database is the point: what has to be exercised is the next
+		// process's start-up reading a persisted in-flight operation, not a store
+		// method called on a live one. Asserting on `failInterruptedRecoveryOperations`
+		// directly would keep passing if `RouterServer.start()` stopped calling it.
+		const first = await startHarness({
 			recovery: true,
+			dbPath,
+			dir,
 			runReconciler: {
 				reconcile: async () => {
 					await held;
@@ -1334,20 +1467,21 @@ describe("guarded recovery over the real router", () => {
 				},
 			},
 		});
+		let second: Harness | undefined;
 		try {
 			const token = localToken(
-				stuck,
+				first,
 				"responder",
 				["fleet.read", "fleet.recover"],
 				[WS_A],
 			);
-			const run = await routeRun(stuck, {
+			const run = await routeRun(first, {
 				sessionId: "sess-interrupted",
 				issueId: "issue-interrupted",
 				identifier: "CY-INT",
 			});
 			const accepted = await (
-				await fetch(`${stuck.url}/api/v1/recoveries`, {
+				await fetch(`${first.url}/api/v1/recoveries`, {
 					method: "POST",
 					headers: {
 						authorization: `Bearer ${token}`,
@@ -1363,25 +1497,28 @@ describe("guarded recovery over the real router", () => {
 			).json();
 			expect(accepted.phase).toBe("accepted");
 
-			// What the next router process does on start-up.
-			const failed = stuck.rig.server.store.failInterruptedRecoveryOperations(
-				Date.now(),
-				"the router restarted while this recovery was running",
-			);
-			expect(failed.map((operation) => operation.operationId)).toContain(
-				accepted.operationId,
-			);
-
+			// The next process starts against the same database. `RouterServer.start()`
+			// is what ends operations the previous process left with nobody advancing
+			// them; nothing in this test calls that cleanup itself.
+			//
+			// The first rig is still listening — it is not a crash, and its held
+			// coordinator is what stops it settling the operation on its own. That is
+			// the honest limit of this scenario: it covers the RELOAD, not an abrupt
+			// termination.
+			second = await startHarness({ recovery: true, dbPath, dir });
 			const settled = await (
-				await fetch(`${stuck.url}/api/v1/recoveries/${accepted.operationId}`, {
+				await fetch(`${second.url}/api/v1/recoveries/${accepted.operationId}`, {
 					headers: { authorization: `Bearer ${token}` },
 				})
 			).json();
 			expect(settled.phase).toBe("failed");
+			expect(settled.completedAt).toBeTruthy();
+			expect(String(settled.failure?.message ?? "")).toMatch(/restart/i);
 		} finally {
 			release();
-			await stuck.stop();
-			rmSync(stuck.dir, { recursive: true, force: true });
+			await second?.stop();
+			await first.stop();
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -1395,17 +1532,27 @@ describe("guarded recovery over the real router", () => {
 		h.exec.connectOnBoot = true;
 
 		const out = createRecordingOutput();
+		// Every request the command makes, captured. Scanning its OUTPUT for a
+		// Linear URL would prove nothing — a post leaves no trace in stdout — so
+		// the assertion is on where the process actually went.
+		const origins = new Set<string>();
+		const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			origins.add(new URL(String(input)).origin);
+			return fetch(input, init);
+		}) as typeof fetch;
 		const cmd = new RecoverCommand(fakeApp(h.url), {
 			env: { CYRUS_OPERATOR_TOKEN: recoverToken },
 			output: out,
+			fetchFn,
 			sleep: async () => {},
 			pollIntervalMs: 0,
 		});
 		expect(await exitCodeOf(cmd, [run.runId, "--json"])).toBe(ExitCode.success);
 		const document = JSON.parse(out.data_.join(""));
 		expect(document.operation.phase).toBe("recovered");
-		// The command posts no Linear comment, and has no client that could.
-		expect(out.data_.join("\n")).not.toMatch(/linear\.app/i);
+		// The router and nothing else: no Linear comment, and no client that could
+		// have posted one.
+		expect([...origins]).toEqual([new URL(h.url).origin]);
 	});
 });
 
@@ -1555,7 +1702,16 @@ describe("the trusted operator skill installs only against its published checksu
 
 /* ---------------------------------------------- the skill's scripted decisions */
 
-describe("the shipped fleet-operator skill scripts every branch the drive walks", () => {
+/**
+ * A STRUCTURAL check, and deliberately labelled as one. Whether an agent
+ * FOLLOWS these instructions is a behavioural question no assertion in this
+ * file can answer — CYR-77's drive walked the branches by hand against scripted
+ * responses, and that remains the behavioural evidence. What is checkable here
+ * is that the instructions still name the four paths and still reach for
+ * nothing outside the remote profile, so a later edit cannot quietly delete a
+ * branch or introduce a break-glass command.
+ */
+describe("the shipped fleet-operator skill still names every branch the drive walks", () => {
 	/** SKILL.md plus every reference it delegates to — the instructions as a whole. */
 	function skillCorpus(): string {
 		const root = join(REPO_ROOT, "skills", "cyrus-fleet-operator");
@@ -1568,7 +1724,7 @@ describe("the shipped fleet-operator skill scripts every branch the drive walks"
 		return files.map((file) => readFileSync(file, "utf8")).join("\n");
 	}
 
-	it("scripts an observe path, a narrow-log path, a recover path, and a stop path", () => {
+	it("structurally names an observe path, a narrow-log path, a recover path, and a stop path", () => {
 		const skill = skillCorpus();
 		// OBSERVE and NARROW-LOG: the commands the skill is allowed to reach for.
 		for (const phrase of [

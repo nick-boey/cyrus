@@ -37,26 +37,34 @@ pnpm typecheck
 pnpm test:packages:run
 ```
 
-Result at 2026-09-09T04:47Z:
+Result at 2026-09-09T05:2xZ:
 
 ```
  Test Files  1 passed (1)
-      Tests  40 passed (40)
+      Tests  42 passed (42)
 ```
 
 and for the whole F1 package:
 
 ```
  Test Files  9 passed (9)
-      Tests  84 passed (84)
+      Tests  86 passed (86)
 ```
 
 ## What the matrix actually asserts
 
-Every row below runs the **shipped CLI command classes** against a **real
-`RouterServer`** over a real socket, reading a real `RouterStore` whose rows were
-written by routing real webhooks through `EventRouter`. No router document and no
-router response is faked anywhere in the file.
+Every row below runs against a **real `RouterServer`** over a real socket,
+reading a real `RouterStore` whose rows were written by routing real webhooks
+through `EventRouter`. No router document and no router response is faked
+anywhere in the file.
+
+Two kinds of client appear, and the tables say which. The **runs**, **logs**,
+**recovery-through-`cyrus recover`**, and **skills** rows drive the *shipped CLI
+command classes*. The remaining **recovery** rows and the **discovery**,
+**principal**, and **restart** rows post raw HTTP, because they assert on router
+status codes, response bodies, and refusals the CLI deliberately does not
+surface verbatim. Both halves talk to the same router; only the recovery table
+mixes them, so each of its rows is marked.
 
 ### Public discovery leaks no scoped data
 
@@ -98,17 +106,18 @@ expiry, `oid`, and `idtyp` itself, so the decision under test is the real one.
 | `runs list` with two authorized workspaces and no `--workspace` | exit 2, diagnostic names `--workspace` | ✅ |
 | `runs list --json --workspace ws-2` | only `ws-2`'s run | ✅ |
 | `runs list` over seven seeded runs | `routed`, `waiting` (reason `elicitation`), `active` (pending work), `complete`, `error`, `stopped`, `unknown` | ✅ all seven |
-| `runs wait` on a run that completes after the command started | exit 0, outcome `complete`, observed through the **change feed** | ✅ |
+| `runs wait` on a run that completes after the command started | exit 0, outcome `complete`, and the run was still `routed` when the command's opening snapshot was taken — so the transition can only have arrived over `/api/v1/run-changes` | ✅ (mutation-checked: finishing the run before the command starts fails the assertion) |
 | `runs wait` on an elicitation | exit 3, outcome `waiting` — never a timeout | ✅ |
 | `runs wait` on an `error` run | exit 3, outcome `error` | ✅ |
 | `runs wait --timeout` on a run that never moves | exit 4, outcome `timeout`, last-observed lifecycle reported as an observation not a verdict | ✅ |
-| `runs watch --timeout` | streams the material change and exits 0 | ✅ |
+| `runs watch --timeout` | emits a `change` event carrying the NEW lifecycle (not merely the opening snapshot), then a `stopped`/`timeout` event, and exits 0 | ✅ (mutation-checked: denying the loop a poll inside the deadline fails the assertion) |
 
 ### Router-restart resynchronisation
 
 | Scenario | Expected | Actual |
 | --- | --- | --- |
 | A cursor minted by one router process, replayed against a second process on the **same database** | `410` with `{"error":"stream_gone"}` — signature still valid, only the epoch rotated | ✅ |
+| An in-flight recovery operation persisted by one process, then a second `RouterServer` started on the same database | the new process's start-up cleanup ends it `failed` with a restart message | ✅ (mutation-checked: removing `RouterServer.start()`'s `failInterruptedOperations()` call leaves the operation `accepted` and fails the test) |
 
 ### Log query and follow
 
@@ -117,21 +126,24 @@ expiry, `oid`, and `idtyp` itself, so the decision under test is the real one.
 | `logs query --json` against the advertised `fake` source | resolved by the **shipped** registry; the ONLY router path touched is `/api/v1/operator/context` | ✅ (fetch paths captured and asserted as a single-element list) |
 | `logs query --since 6h` against a 3600s `maxRangeSeconds` budget | exit 2 — refused, never truncated | ✅ |
 | A backend record containing the operator token verbatim | token absent from output, `[redacted]` present, compiled query carries the authorized workspace and no query language | ✅ |
+| `logs follow --interval 10 --timeout 25` over a record re-served by the next, overlapping window | the record prints ONCE, the new one prints, and the second query's window provably starts before the first record's timestamp | ✅ |
+| `logs follow` diagnostics | say it is a historical store polled on a delay, never a live router stream | ✅ |
+| `logs follow --interval 1` against a 5s `minFollowIntervalSeconds` | exit 2, naming the floor | ✅ |
 
 ### Guarded recovery
 
-| Scenario | Expected | Actual |
-| --- | --- | --- |
-| Read-only principal requests recovery | 403 **before** any operation exists; `recovery.refused` audited, `recovery.accepted` not | ✅ |
-| Quoted revision is stale | 409 `stale_revision` | ✅ |
-| Run waiting on an elicitation | terminal phase `needs_input` | ✅ |
-| Worker connected and still claiming the run | terminal phase `refused`, reason `worker_owns_active_work` | ✅ |
-| Same idempotency key retried | first 202, second **200** joining the same `operationId`; `recovery.joined` audited | ✅ |
-| Stranded run (worker ran it, then died; container stopped; affinity + issue lock held) | phases `accepted → starting_executor → reconciling → replaying → recovered`; affinity cleared, issue lock cleared, run marked `unknown`; `recovery.accepted` / `phase_changed` / `settled` audited | ✅ |
-| Same, but the recovered worker still claims the session | `recovered` with "nothing was released"; **no** `releasing_stale_ownership` phase; affinity and run state untouched | ✅ |
-| Recovery left disabled (the shipped default) | `recoveries.request` absent from the context; the route still exists and refuses with 403 | ✅ |
-| Operation interrupted by a router restart | `failInterruptedRecoveryOperations` moves it to `failed`; the operation resource reports `failed` | ✅ |
-| The whole thing through `cyrus recover <runId> --json` | exit 0, `operation.phase = "recovered"`, **no Linear comment** (the command has no Linear client) | ✅ |
+| Scenario | Client | Expected | Actual |
+| --- | --- | --- | --- |
+| Read-only principal requests recovery | HTTP | 403 **before** any operation exists; `recovery.refused` audited, `recovery.accepted` not | ✅ |
+| Quoted revision is stale | HTTP | 409 `stale_revision` | ✅ |
+| Run waiting on an elicitation | HTTP | terminal phase `needs_input` | ✅ |
+| Worker connected and still claiming the run | HTTP | terminal phase `refused`, reason `worker_owns_active_work` | ✅ |
+| Same idempotency key retried | HTTP | first 202, second **200** joining the same `operationId`; `recovery.joined` audited | ✅ |
+| Stranded run (worker ran it, then died; container stopped; affinity + issue lock held) | HTTP | phases `accepted → starting_executor → reconciling → replaying → recovered`; affinity cleared, issue lock cleared, run marked `unknown`; `recovery.accepted` / `phase_changed` / `settled` audited | ✅ |
+| Same, but the recovered worker still claims the session | HTTP | `recovered` with "nothing was released"; **no** `releasing_stale_ownership` phase; affinity and run state untouched | ✅ |
+| Recovery left disabled (the shipped default) | HTTP | `recoveries.request` absent from the context; the route still exists and refuses with 403 | ✅ |
+| Operation interrupted by a router restart | HTTP | a SECOND `RouterServer` starts on the same file database and its start-up cleanup moves the persisted in-flight operation to `failed`; the operation resource on the new process reports it | ✅ |
+| The whole thing through `cyrus recover <runId> --json` | **CLI** | exit 0, `operation.phase = "recovered"`, and every request the process made went to the router's own origin — so no Linear comment, by evidence rather than by output-scanning | ✅ |
 
 The strand is produced the way a real one occurs: route the issue, let the
 container boot, let its worker connect and drain the router's queue, then kill
@@ -149,7 +161,14 @@ been the easy mistake here.
 | Router advertises a checksum the published sidecar disagrees with | exit 2, refused | ✅ |
 | Router advertises a skill version out of lockstep with the CLI | exit 2, refused **before any download** (asserted: zero non-router fetches) | ✅ |
 
-### Scripted skill decisions
+### Skill decisions — a STRUCTURAL check, not a behavioural one
+
+Whether an agent *follows* these instructions is not something an assertion in
+this file can answer. CYR-77's drive
+([`2026-09-08-cyr-77-fleet-skill.md`](2026-09-08-cyr-77-fleet-skill.md)) walked
+the six response branches by hand against scripted JSON, and that remains the
+behavioural evidence. What is checkable here is that a later edit cannot quietly
+delete a branch or introduce a break-glass command.
 
 | Scenario | Expected | Actual |
 | --- | --- | --- |
@@ -159,16 +178,31 @@ been the easy mistake here.
 ## New F1 controls
 
 `./f1 router:strand-run` (and its `POST /router/strand-run` control endpoint)
-routes an issue and reports the run facts a guarded recovery needs — run id,
-revision, device id, worker connectivity, executor state. It fabricates no state:
-`EventRouter` writes the run row, the session affinity, and the issue lock on the
-way through, and the fake executor simply never dials back. It exists because
-`cyrus recover` takes a run id and the operator surface will not hand one out for
-a run the caller has not already listed.
+routes an issue and reports whether the resulting run has reached the strand a
+guarded recovery needs — run id, revision, device id, worker connectivity,
+queued-event state, the affinity and issue-lock holders, and how long ago the
+session was claimed.
+
+It **observes; it does not fabricate**, and that distinction was the review's
+first finding against an earlier version of it. Routing writes the run row, the
+affinity and the issue lock, and the executor boots the container whose worker
+drains the router's queue — but what makes a run *stranded* is that worker then
+going away, which is the drive's own act (stop the container, suspend the
+sandbox, kill the process). The first cut instead wrote
+`executor_state = 'stopped'` and returned immediately, which recorded a fact
+about an executor nobody had stopped and handed back a run whose event was still
+queued — a run `RouterRunReconciler` correctly refuses to judge ("the worker's
+session list is not yet authoritative"). A drive would have read that refusal as
+a recovery bug. It now waits up to `--timeout` for the strand and reports
+`recoverable: false` with `blockedBy` when it has not appeared.
+
+It cannot check the third precondition — `containers.affinityGraceMs`, ten
+minutes by default — because that value is not readable from the control plane,
+so `sessionClaimedMsAgo` is reported raw for the drive to measure against its own
+router configuration rather than guessed at.
 
 ```
-./f1 router:strand-run --session-id sess-1 --issue-id issue-1 \
-  --identifier CYOBS-1 --creator-id lin-1 --creator-email dev@example.com --json
+./f1 router:strand-run --session-id sess-1 --issue-id issue-1   --identifier CYOBS-1 --creator-id lin-1 --creator-email dev@example.com   --timeout 60 --json
 ```
 
 ## Not covered, and why
@@ -213,13 +247,52 @@ database in its own temp directory. All are removed in `afterEach`/`finally`.
 Device sockets are closed by the harness's `stop()`. Nothing outside the temp
 directories is written, and no external service is contacted.
 
+## Independent review
+
+The change was reviewed by an independent cross-model reviewer (Codex CLI,
+read-only, against the branch diff). It returned `inconclusive` with three
+medium findings, all of which were real and all of which are fixed above:
+
+1. **The `router:strand-run` control produced the un-started shape the matrix
+   explicitly excludes** — it wrote an executor state nobody had established and
+   returned a run whose event was still queued. Rewritten to observe and wait.
+2. **The change-feed assertions could pass without observing a change** — the
+   `watch` assertion was satisfied by the opening snapshot, and the `wait`
+   scenario used a 20ms wall-clock delay that a slow first request would lose.
+   Both now mutate from inside the injected `sleep` and assert on the change
+   event itself; both were mutation-checked.
+3. **The restart scenario called the store method rather than exercising
+   start-up** — removing `RouterServer.start()`'s cleanup would have left it
+   passing. It now starts a second `RouterServer` on the same file database, and
+   was mutation-checked against exactly that deletion.
+
+Its remaining next-steps were taken as follows. The missing `logs follow`
+scenarios were added. The documentation claims were narrowed: the CLI-versus-HTTP
+split is now stated per row, and the "no Linear comment" assertion — previously a
+scan of stdout for `linear.app`, which proves nothing, since a post leaves no
+trace in stdout — is now an assertion that every request the process made went to
+the router's own origin. The skill-decision check is relabelled as structural,
+with CYR-77's drive named as the behavioural evidence.
+
+One next-step was **not** adopted: the reviewer flagged clean-checkout CLI build
+ordering as a possible hazard of `cyrus-f1` deep-importing `cyrus-ai/dist`. It is
+not a new one. `cyrus-f1` already resolves every workspace dependency to its
+built `dist` (`cyrus-router`'s `main` is `dist/index.js`), so its tests already
+require a prior `pnpm build`, and CI runs `pnpm build` before `pnpm -r test:run`.
+The reviewer also could not read the repository — its sandbox blocked file
+access — so its verdict is `inconclusive` on evidence completeness rather than on
+a defect, and its concurrency-substitution question was answered from the unit
+suites named above.
+
 ## Retrospective
 
-Pass, for the automated matrix. The integration seam earned its keep: writing it
-surfaced that a fake worker with no event consumer leaves the router's queue
-unacked, which makes every recovery refuse — the same shape a real cold-booted
-sandbox produces, and precisely the guard CYR-81 added. Nothing in the CLI or the
-router had to change to make the matrix pass, which is the outcome that would be
+Pass, for the automated matrix, after the review pass. The integration seam
+earned its keep twice over: writing it surfaced that a fake worker with no event
+consumer leaves the router's queue unacked, which makes every recovery refuse —
+the same shape a real cold-booted sandbox produces, and precisely the guard
+CYR-81 added — and reviewing it surfaced that the F1 command shipped alongside
+the matrix reproduced that un-started shape rather than the strand. Nothing in
+the CLI or the router had to change to make the matrix pass, which is the outcome
 expected if the two halves already agreed; the value of the file is that a future
 disagreement now fails here rather than in a fleet.
 

@@ -26,7 +26,7 @@ describe("router:* commands", () => {
 		const strand = createRouterStrandRunCommand();
 		const strandNames = strand.options.map((o) => o.long);
 		expect(strandNames).toContain("--session-id");
-		expect(strandNames).toContain("--executor-state");
+		expect(strandNames).toContain("--timeout");
 		expect(strandNames).toContain("--json");
 	});
 });

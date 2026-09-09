@@ -124,7 +124,7 @@ describe("control server", () => {
 		expect(stored.LINEAR_API_TOKEN).toBe("lin_api_1");
 	});
 
-	it("strands a routed run and reports the facts a recovery needs", async () => {
+	it("reports the run facts a recovery needs, and why it is not yet recoverable", async () => {
 		const strand = await fetch(`${control.url}/router/strand-run`, {
 			method: "POST",
 			headers: {
@@ -147,20 +147,28 @@ describe("control server", () => {
 			revision: number;
 			workerOnline: boolean;
 			executorState?: string;
+			pendingEvents: boolean;
+			sessionAffinityDeviceId?: number;
+			issueLockSessionId?: string;
+			recoverable: boolean;
+			blockedBy?: string;
 		};
 		expect(body.runId).toBeTruthy();
-		// The strand's defining facts: nothing is connected, and the container is
-		// recorded as stopped.
 		expect(body.workerOnline).toBe(false);
-		expect(body.executorState).toBe("stopped");
-		// The affinity and the issue lock the route wrote are still held — which
-		// is what makes the issue unreachable and the recovery necessary.
-		expect(rig.server.store.getSessionAffinity("sess-strand")).toBe(
-			body.deviceId,
-		);
-		expect(rig.server.store.getIssueLock("issue-strand")?.sessionId).toBe(
-			"sess-strand",
-		);
+		// The affinity and the issue lock the route wrote are held — which is what
+		// makes the issue unreachable and a recovery necessary.
+		expect(body.sessionAffinityDeviceId).toBe(body.deviceId);
+		expect(body.issueLockSessionId).toBe("sess-strand");
+		// This executor never connects a worker, so the routed event is still
+		// queued and the run is NOT yet recoverable. Reporting that is the whole
+		// point: `RouterRunReconciler` refuses to judge a worker's silence about
+		// work it has not received, and an endpoint that claimed a strand here
+		// would send a drive off to blame recovery for the refusal.
+		expect(body.pendingEvents).toBe(true);
+		expect(body.recoverable).toBe(false);
+		expect(body.blockedBy).toMatch(/undelivered events/i);
+		// And it invents no executor state it did not establish.
+		expect(body.executorState).toBeUndefined();
 	});
 
 	it("refuses to report a strand for a session that was never routed", async () => {
