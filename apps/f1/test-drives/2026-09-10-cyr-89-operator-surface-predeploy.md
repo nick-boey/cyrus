@@ -233,7 +233,14 @@ twenty minutes apart with no repository change.
 Fixed here only to the extent that the next failure will be diagnosable: the
 stderr is captured and included, and the message states plainly that this is not
 a media-type problem. **The CD failure itself is being addressed separately and
-is not fixed by this branch.**
+is not fixed by this branch** — deliberately not filed as an issue, because that
+work was already underway in another session when this was found.
+
+The stderr is written inside `$SCRATCH`, which `main()` creates `chmod 700` and
+`cleanup()` removes. That is not incidental tidiness: the captured output of an
+authenticated registry call is exactly the kind of thing that can carry a token,
+and a `${TMPDIR:-/tmp}` fallback would have leaked it outside both the mode and
+the trap.
 
 ### B. The trusted skill registry names a repository this fork does not publish to
 
@@ -244,7 +251,7 @@ workflow runs in — here `nick-boey/cyrus`. A skill advertised by this deployme
 would therefore resolve to a URL that 404s. There is also no `v0.2.70` release,
 so there is nothing to resolve against either way.
 
-Not fixed. Recorded as the reason scope item 4's install half is out of scope.
+Not fixed. Filed as [#81](https://github.com/nick-boey/cyrus/issues/81), and it is the reason scope item 4's install half is out of scope.
 
 ## Scope item outcomes
 
@@ -254,8 +261,8 @@ Not fixed. Recorded as the reason scope item 4's install half is out of scope.
 | 2. Grant Entra operator access, verify the principal matrix live | **Unrun**, and two prerequisites are now known to be missing beyond the deploy — see below. |
 | 3. Enable recovery, run it, disable it | **Unrun.** Was **unreachable** before this branch; is now reachable. |
 | 4. Install the operator skill from a versioned release | **Advertising: done** (`fleetOperatorSkill`). **Install: out of scope**, by explicit decision, for the two reasons in fault B — no release exists to resolve against, and the trusted registry names a different repository. |
-| Fault 1 — NOR-402 | **Carried forward, unresolved and worse** (6.87 days). Baseline captured for the post-deploy comparison. |
-| Fault 2 — PAR-200 | **Carried forward as unconfirmed.** Detector silent since 2026-09-09T05:47Z; silence is not proof the lock was released. |
+| Fault 1 — NOR-402 | **Carried forward, unresolved and worse** (6.87 days) as [#82](https://github.com/nick-boey/cyrus/issues/82), with the baseline captured for the post-deploy comparison. |
+| Fault 2 — PAR-200 | **Carried forward as unconfirmed** in [#83](https://github.com/nick-boey/cyrus/issues/83). Detector silent since 2026-09-09T05:47Z; silence is not proof the lock was released. |
 | The `runs`-visibility question | **Answered** — [ADR-0017](../../../docs/adr/0017-runs-observes-runs-not-containers.md), and the fleet-operator skill updated to match. |
 
 ### Two Entra prerequisites scope item 2 needs, which are not deployment parameters
@@ -331,6 +338,33 @@ pnpm lint                                 → 15 warnings, all pre-existing
 The one script-test failure is `env: timeout: No such file or directory` in case
 21, which predates this branch: GNU `timeout` is not installed on this macOS
 host. Case 21 is untouched here. The new case 23 — added for fault A — passes.
+
+## CYR-89's acceptance evidence, item by item
+
+- [x] **A test-drive document** under `apps/f1/test-drives/` with environment,
+  image/revision, exact commands, expected vs actual, and cleanup — this file.
+- [x] **Each numbered scope item passes with captured output or is explicitly
+  marked out of scope with a reason** — with one honest caveat: items 1, 2 and 3
+  are neither. They are **unrun**, which is a third state the criterion does not
+  offer, because the deployment they depend on has not happened. Item 4's
+  advertise half passes; its install half is marked out of scope with two
+  reasons. Workspace ambiguity is marked out of scope explicitly.
+- [x] **Both live faults confirmed resolved, or carried forward as their own
+  issues** — carried forward as [#82](https://github.com/nick-boey/cyrus/issues/82)
+  (NOR-402) and [#83](https://github.com/nick-boey/cyrus/issues/83) (PAR-200).
+  Neither is resolved. [#81](https://github.com/nick-boey/cyrus/issues/81)
+  carries the registry mismatch this drive found.
+- [x] **The `runs`-visibility question answered in writing** —
+  [ADR-0017](../../../docs/adr/0017-runs-observes-runs-not-containers.md).
+- [x] **Any credential minted for the drive is revoked, and the revocation
+  verified from outside the router** — satisfied vacuously: no credential was
+  minted. See [Cleanup](#cleanup).
+- [x] **No owner, date or estimate is invented** — none appears in this document,
+  in the three issues, or in ADR-0017. The production recovery rollout remains
+  unassigned and unscheduled.
+
+**CYR-89 is not closeable on this evidence.** Its own goal is the post-deployment
+verification, and that has not been performed.
 
 ## What this drive still could NOT reach
 

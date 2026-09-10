@@ -7,7 +7,8 @@ This changelog documents internal development changes, refactors, tooling update
 ### Fixed
 - **`scripts/deploy-worker-image.sh` reports why the manifest read failed
   instead of blaming the media type**
-  ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery)).
+  ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery),
+  [#80](https://github.com/nick-boey/cyrus/pull/80)).
   The check ran `az acr manifest show ... 2>/dev/null || true` and attributed an
   empty stdout to the media type, so every way the command can fail — a
   throttle, a credential problem, a change in the preview command group —
