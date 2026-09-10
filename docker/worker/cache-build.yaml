@@ -1,0 +1,39 @@
+# docker/worker/cache-build.yaml — build the worker image on an ACR Tasks agent,
+# reusing the previous image's layers.
+#
+# WHY THIS FILE EXISTS AT ALL, rather than a flag on `az acr build`: there is no
+# such flag. `az acr build` takes --build-arg, --secret-build-arg and --target,
+# and nothing that reaches `docker build --cache-from`. The multi-step task form
+# is the only way to put that argument on the build, which is why the script
+# calls `az acr run -f` on this file instead.
+#
+# Every agent starts cold, so without a cache source EVERY layer is rebuilt and
+# re-pushed — measured at ~2 GB of new layers per commit even when the commit
+# touched nothing the image reads. The Dockerfile is already ordered correctly
+# (the apt, .NET, Rust and Playwright steps all sit above `COPY --from=build`);
+# the cache was simply never offered to it. With it, a source-only change pushes
+# the app layer alone.
+version: v1.1.0
+
+steps:
+  # ignoreErrors, because a cache miss must never fail a build. There are two
+  # ordinary ways to miss: the first build into a fresh registry has nothing to
+  # pull, and a rebuilt Dockerfile base makes the pulled image useless. Both
+  # should be slow, not fatal. `docker build --cache-from` on an image the
+  # daemon does not hold is itself a no-op, so the build below survives either.
+  - cmd: docker pull {{.Values.cacheRef}}
+    ignoreErrors: true
+
+  # --platform is NOT passed here; `az acr run --platform` already pins the
+  # agent, and naming it twice invites the two to disagree.
+  - build: >-
+      -t $Registry/{{.Values.repo}}:{{.Values.tag}}
+      -f docker/worker/Dockerfile
+      --cache-from {{.Values.cacheRef}}
+      .
+
+  # The push is what populates the run's outputImages, which is where the
+  # calling script reads the digest it pins. Without this step the run succeeds
+  # and reports no image.
+  - push:
+      - $Registry/{{.Values.repo}}:{{.Values.tag}}

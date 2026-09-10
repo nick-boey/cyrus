@@ -372,20 +372,39 @@ Commit or stash, or re-run with --allow-dirty."
     # plain Docker v2 manifest rather than buildx's attestation-bearing OCI
     # index, and it runs natively on amd64 instead of under emulation on an arm64
     # workstation — minutes rather than tens of minutes for an image this size.
+    # The agent runs the classic builder, which is what makes --cache-from below
+    # behave as a plain layer-history match.
     #
     # The digest comes from the build run itself, never from a later
     # `az acr manifest show-metadata …:${tag}` lookup: a tag is a mutable
     # pointer, so two operators building the same clean commit would produce the
     # same tag and different digests, and the first would pin the second's image.
-    digest="$(az acr build \
+    # `az acr run -f`, not `az acr build`, ONLY so the build can be handed a
+    # --cache-from. `az acr build` has no flag that reaches one, and every
+    # agent starts cold, so without it each build re-pushed roughly 2 GB of
+    # layers even for a commit that touched nothing the image reads. See
+    # docker/worker/cache-build.yaml.
+    #
+    # The cache source is whatever the parameter file pins right now, which —
+    # since this runs BEFORE the rewrite below — is the previous build. A ref
+    # that cannot be read or pulled costs a cold build and nothing else, so it
+    # is not worth a branch; the placeholder simply never resolves.
+    local cache_ref
+    cache_ref="$(worker_param_value workerImage)"
+    [[ -n "$cache_ref" ]] || cache_ref="${REGISTRY}.azurecr.io/${REPO}:cache-none"
+    echo "==> caching from ${cache_ref}"
+
+    digest="$(az acr run \
       --registry "$REGISTRY" \
-      --image "${REPO}:${tag}" \
       --platform linux/amd64 \
-      --file docker/worker/Dockerfile \
+      --file docker/worker/cache-build.yaml \
+      --set "repo=${REPO}" \
+      --set "tag=${tag}" \
+      --set "cacheRef=${cache_ref}" \
       --no-logs \
       --query 'outputImages[0].digest' \
       -o tsv \
-      .)" || die "az acr build failed — run 'az acr task logs --registry ${REGISTRY} --run-id <id>' with the run id printed above"
+      .)" || die "az acr run failed — run 'az acr task logs --registry ${REGISTRY} --run-id <id>' with the run id printed above"
 
     [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "build did not report a valid digest for ${REPO}:${tag} (got: '${digest}')"
     echo "==> digest ${digest}"
