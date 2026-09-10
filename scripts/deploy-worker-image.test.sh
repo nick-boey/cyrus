@@ -729,12 +729,13 @@ SPLIT_DISK="cyrus-worker-$(derive_disk_suffix "$SPLIT_REF")"
 
 cat >"$SPLIT/bin/az" <<STUB
 #!/usr/bin/env bash
+[[ -n "\${AZ_ARGV_LOG:-}" ]] && printf '%s\n' "\$@" >>"\$AZ_ARGV_LOG"
 case "\$1 \$2" in
   "account show")
     [[ "\$*" == *"--query id"* ]] && { echo "sub-1234"; exit 0; }
     exit 0 ;;
   "account get-access-token") echo "ACA-BEARER-TOKEN"; exit 0 ;;
-  "acr build")   echo "${SPLIT_DIGEST}"; exit 0 ;;
+  "acr run")     echo "${SPLIT_DIGEST}"; exit 0 ;;
   "acr login")   echo "ACR-REFRESH-TOKEN"; exit 0 ;;
   "acr manifest") echo "application/vnd.docker.distribution.manifest.v2+json"; exit 0 ;;
   "deployment sub")
@@ -757,6 +758,7 @@ split_before="$(cat "$split_params")"
 
 split_out="$SPLIT/stdout"; split_rc=0
 ( cd "$split_repo" && env PATH="$SPLIT/bin:$PATH" PARAMS="$split_params" \
+    AZ_ARGV_LOG="$SPLIT/az-argv" \
     bash "$SPLIT/bin/deploy-worker-image.sh" --build-only ) >"$split_out" 2>&1 || split_rc=$?
 
 if [[ "$split_rc" -eq 0 ]] && [[ "$(tail -1 "$split_out")" == "$SPLIT_REF" ]]; then
@@ -770,6 +772,17 @@ if [[ "$(cat "$split_params")" == "$split_before" ]]; then
   ok "--build-only leaves the parameter file alone"
 else
   fail "--build-only wrote to the parameter file"
+fi
+
+# The cache source has to be the pin the parameter file holds RIGHT NOW, i.e.
+# the previous build — the rewrite that replaces it happens later, in the other
+# half of the run. Point it at the image being built and every build is cold,
+# which is the state this whole mechanism exists to leave.
+if grep -qx "cacheRef=${OLD_WORKER_REF}" "$SPLIT/az-argv"; then
+  ok "--build-only caches from the ref the parameter file still pins"
+else
+  fail "the build was not offered the previous pin as its cache source"
+  grep -F 'cacheRef=' "$SPLIT/az-argv" | sed 's/^/       /' >&2
 fi
 
 split_rc=0
