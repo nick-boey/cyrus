@@ -721,12 +721,50 @@ Item 3 is now blocked on two separate things, and only the first was expected:
    Nothing matches the strand shape of a non-terminal run with a stopped
    container and an offline worker.
 
-So enabling recovery today would have nothing to recover. The options are to wait
-for the shape to occur naturally — it has occurred at least twice in a week, so
-this is likely rather than speculative — or to construct one, which CYR-89
-assumed would not be necessary. That assumption is the second of its premises
-this drive found to be time-dependent rather than wrong-in-principle, the first
-being the reclaim.
+So enabling recovery today would have nothing to recover. That assumption of
+CYR-89's is the second of its premises this drive found to be time-dependent
+rather than wrong-in-principle, the first being the reclaim.
+
+### The decision: run it opportunistically, not on a schedule
+
+Recorded rather than left to drift, and also noted on
+[#82](https://github.com/nick-boey/cyrus/issues/82#issuecomment-5612176516),
+which is the issue most likely to be open when the trigger fires.
+
+**Item 3 is not being scheduled. It runs the next time a strand occurs
+naturally.** The trigger is a run with a non-terminal lifecycle, executor
+`stopped` and worker `offline` — `reason=offline_pinned` in the detector, not
+`no_progress`, which is a different shape and not a recovery target. The drive
+saw five stranded devices in one 24h window, so this is a matter of noticing
+rather than waiting indefinitely.
+
+The judgement behind it: leaving item 3 unrun is low risk **on one condition,
+that `enableFleetRecovery` stays `false`**. An unverified feature that is
+switched off cannot fail, and `cyrus recover` already refuses cleanly — exit 2
+naming the missing `recoveries.request` capability — rather than degrading. The
+remedy for a stranded issue remains manual break-glass on the router host, which
+is what it is today, so nothing regresses.
+
+What the exercise would actually add over CYR-78's F1 matrix is narrow and worth
+naming, because it is also the part most likely to be wrong. The matrix drives
+recovery against a real `RouterServer` over a real socket with the real
+device-side WebSocket stack, including every negative case CYR-89 lists, so the
+**decision logic** is well covered. What no test covers is a **real ACA boot
+inside the phase sequence**: measured ACA operations run ~3m52s (snapshot) and
+~4m09s (stop) against a `resumeConnectTimeoutMs` of 90s and `cyrus recover`'s
+10-minute default wait. Whether the sequence holds across a four-minute cold
+boot, and whether the worker's durable frame replay lands inside that window, is
+untested anywhere.
+
+The failure mode this decision exists to prevent is someone enabling recovery in
+production later on the strength of the F1 matrix alone, citing CYR-89 as
+coverage. It is stated here, in the deployment parameter file, in
+[#87](https://github.com/nick-boey/cyrus/pull/87) and on #82.
+
+One prerequisite is worth settling first:
+[#86](https://github.com/nick-boey/cyrus/issues/86) applies to a `fleet.recover`
+principal exactly as it does to a `fleet.read` one, and means recovery cannot be
+granted to a service principal at all.
 
 Two rows inside item 1 and two inside item 2 are also unreached, for reasons that
 are not about this deployment's configuration: redaction has nothing to act on,
