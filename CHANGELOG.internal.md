@@ -4,6 +4,22 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Added
+- **CYR-89 dev-fleet drive record**
+  ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery)).
+  `apps/f1/test-drives/2026-09-10-cyr-89-operator-surface.md` records the
+  post-deployment verification of the operator surface against `rg-cyrus`:
+  scope items 1 and 2 pass with captured output, item 3 is unrun (recovery
+  stays disabled, and the fleet currently has no strand to recover), item 4's
+  install half is out of scope. Four rows are marked NOT VERIFIABLE rather
+  than passing — redaction has nothing to act on in the source, two Entra rows
+  need Graph changes, and workspace ambiguity is unprovable on a single-workspace
+  router. Three defects found by running it are filed as #85 (a JSON `null`
+  attribute rendered as the string `"null"`), #86 (the `/setup` allowlist
+  gating the operator API through the Easy Auth sidecar) and, correcting
+  CYR-89's own premise, #82 (`reclaimStranded` does not and will not collect a
+  stranded sandbox whose worker is still connected).
+
 ### Fixed
 - **`scripts/deploy-worker-image.sh` reports why the manifest read failed
   instead of blaming the media type**
