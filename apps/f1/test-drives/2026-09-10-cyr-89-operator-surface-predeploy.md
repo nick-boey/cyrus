@@ -198,12 +198,12 @@ unconfirmed rather than reported resolved.
 
 ## Two faults found by this drive that CYR-89 did not anticipate
 
-### A. Deployment CD has been broken since 2026-09-09T11:50Z
+### A. Deployment CD had been broken since 2026-09-09T11:50Z (now fixed, by #79)
 
-`Update Cyrus Pin` in the private deployment repository has failed **36
+`Update Cyrus Pin` in the private deployment repository had failed **36
 consecutive times** — every run since the last success at 11:30Z. So public
-`main` has not reached Azure at all, which is the mechanical reason the fleet is
-still on `sha-a51fcca` and NOR-402 is still stranded.
+`main` was not reaching Azure at all, which is the mechanical reason the fleet
+was still on `sha-a51fcca` while NOR-402 stayed stranded.
 
 The reported error is a red herring:
 
@@ -217,9 +217,10 @@ That manifest reads correctly — `application/vnd.docker.distribution.manifest.
 the expected value — from this machine. The worker image was built and pushed
 successfully; `az acr manifest show` then failed for some other reason, and
 `deploy-worker-image.sh:392` discarded its stderr with `2>/dev/null || true` and
-attributed the empty stdout to the media type. The genuine cause is still
-unknown, which is precisely the point: the script threw away the only evidence
-that would name it.
+attributed the empty stdout to the media type. At the time of writing the
+genuine cause was unknown, which was precisely the point: the script threw away
+the only evidence that would name it. It is known now — see below — and it was
+in that stderr.
 
 An initial hypothesis that the deploy identity lacked an ACR data-plane role was
 checked and **disproved** — `AcrPull` grants `Microsoft.ContainerRegistry/registries/pull/read`
@@ -230,17 +231,22 @@ worth as much as the hypothesis. Timing points at the runner instead: `az acr
 manifest` is a preview command group and the failure began between two runs
 twenty minutes apart with no repository change.
 
-Fixed here only to the extent that the next failure will be diagnosable: the
-stderr is captured and included, and the message states plainly that this is not
-a media-type problem. **The CD failure itself is being addressed separately and
-is not fixed by this branch** — deliberately not filed as an issue, because that
-work was already underway in another session when this was found.
+**Resolved while this branch was in review, and the cause was not what this
+drive guessed.** [#79](https://github.com/nick-boey/cyrus/pull/79) landed on
+`main` and found it: a GitHub Actions OIDC login goes stale about ten minutes
+in, and the worker image no longer builds in ten minutes — so `az acr manifest
+show` was running with an expired credential. It removed the same `2>/dev/null`
+independently, and split the build from the registration so the second half
+gets a fresh credential.
 
-The stderr is written inside `$SCRATCH`, which `main()` creates `chmod 700` and
-`cleanup()` removes. That is not incidental tidiness: the captured output of an
-authenticated registry call is exactly the kind of thing that can carry a token,
-and a `${TMPDIR:-/tmp}` fallback would have leaked it outside both the mode and
-the trap.
+Two things are worth keeping from that. The guess recorded above — a preview
+CLI change on the runner, argued from the timing — was **wrong**, and it was
+argued from exactly the evidence that survived the discard; the real answer was
+in the stderr all along, which is the entire point. And this branch's remaining
+half still earns its place: #79 lets az's error through but leaves the message
+naming the media type, so the reader is still pointed at the image. Both halves
+are needed, and they were written independently, which is some evidence that
+the misdirection was obvious once anyone looked.
 
 ### B. The trusted skill registry names a repository this fork does not publish to
 

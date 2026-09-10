@@ -15,13 +15,16 @@ This changelog documents internal development changes, refactors, tooling update
   surfaced as `could not read the manifest media type`, pointing at an image
   whose type was correct. It stalled the private deployment repository's
   `Update Cyrus Pin` through 36 consecutive runs from 2026-09-09T11:50Z before
-  anyone read the manifest by hand. Stderr is now captured into `$SCRATCH` and
-  included in the failure, and the message states that the image was built and
-  pushed so the reader stops looking at the image. Case 23 in
-  `deploy-worker-image.test.sh` pins it: it asserts the real stderr reaches the
-  operator AND that the message makes no media-type claim. The root cause of
-  the CD failure itself is not addressed here — capturing the evidence is what
-  makes the next occurrence diagnosable at all.
+  anyone read the manifest by hand. #79 removed the redirect independently and
+  landed first; what remains here is the other half — the failure message no
+  longer names the media type at all. By that point the digest is already in
+  the registry, so a failure there is never about the image's kind, and saying
+  so is what sent everyone to inspect an image that was correct. Case 23 in
+  `deploy-worker-image.test.sh` pins both halves: it asserts the real stderr
+  reaches the operator AND that the message makes no media-type claim. #79
+  also found the root cause the message was hiding — a GitHub Actions OIDC
+  login goes stale about ten minutes in, and the image no longer builds in ten
+  minutes.
 - **The worker image now carries the Bicep, PowerShell, pnpm and .NET 8
   toolchains, and the sandbox can reach the three registries their gates need
   ([CYR-88](https://linear.app/northrop-digital/issue/CYR-88/sandbox-cannot-run-the-bicep-powershell-pnpm-or-net-8-repository-gates),
