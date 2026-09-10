@@ -275,9 +275,20 @@ together, and runs a what-if preview via scripts/deploy-azure.sh. Never deploys.
   --allow-dirty       Build despite uncommitted changes. The image is tagged
                       sha-<sha>-dirty-<UTC> so it can never be mistaken for a
                       clean build of that commit.
+  --build-only        Build and push, print the digest ref as the last line of
+                      stdout, and stop before touching the sandbox group or the
+                      parameter file. The other half of the run is then
+                      --image <that ref>. Split them when the caller's Azure
+                      credential is shorter-lived than the build: a GitHub
+                      Actions OIDC login goes stale about ten minutes in, and
+                      this image no longer builds in ten minutes.
   --image <ref>       Skip the build and register an image already in the
-                      registry. This is the recovery path for a build that was
-                      pushed but never registered because the CLI timed out.
+                      registry. This is the second half of --build-only, and
+                      the recovery path for a build that was pushed but never
+                      registered because the CLI timed out.
+  --tag <tag>         The tag <ref> carries, for the provenance comment written
+                      beside workerImage. Only meaningful with --image, which
+                      cannot know it; a build knows its own tag.
   --disk-name <name>  Override the derived disk name.
 
 Environment overrides: REGISTRY, REPO, PARAMS, DISK_PREFIX, API_VERSION,
@@ -288,13 +299,18 @@ USAGE
 }
 
 main() {
-  local allow_dirty=0 prebuilt_ref="" disk_name_override=""
+  local allow_dirty=0 prebuilt_ref="" disk_name_override="" build_only=0 tag_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --allow-dirty) allow_dirty=1; shift ;;
+      --build-only) build_only=1; shift ;;
       --image)
         [[ $# -ge 2 && -n "$2" ]] || die "--image requires an image reference"
         prebuilt_ref="$2"; shift 2
+        ;;
+      --tag)
+        [[ $# -ge 2 && -n "$2" ]] || die "--tag requires a tag"
+        tag_override="$2"; shift 2
         ;;
       --disk-name)
         [[ $# -ge 2 && -n "$2" ]] || die "--disk-name requires a name"
@@ -304,6 +320,7 @@ main() {
       *) usage >&2; die "unknown argument: $1" ;;
     esac
   done
+  [[ "$build_only" -eq 0 || -z "$prebuilt_ref" ]] || die "--build-only and --image are opposites; pass one"
 
   for tool in az git awk jq curl; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found on PATH"
@@ -373,7 +390,17 @@ Commit or stash, or re-run with --allow-dirty."
     [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "build did not report a valid digest for ${REPO}:${tag} (got: '${digest}')"
     echo "==> digest ${digest}"
     ref="${REGISTRY}.azurecr.io/${REPO}@${digest}"
+
+    # The bare ref, last, on its own line, so a caller can take it with
+    # `| tail -1`. Everything above it is progress and is meant to stay
+    # readable in the same stream.
+    if [[ "$build_only" -eq 1 ]]; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
   fi
+
+  [[ -z "$tag_override" ]] || tag="$tag_override"
 
   # The ACR refresh token minted below is scoped to REGISTRY, and an image in a
   # different registry would be pulled with credentials that do not name it. The
@@ -389,7 +416,12 @@ REGISTRY=<acr-name> to match the image."
   # different image that took the tag between the build and this lookup.
   echo "==> verifying manifest media type"
   local media_type
-  media_type="$(az acr manifest show "$ref" --query mediaType -o tsv 2>/dev/null || true)"
+  # stderr is NOT discarded. An empty result here is the difference between "the
+  # image is the wrong kind" and "az could not reach the registry at all", and
+  # only az's own message says which. Discarding it turned a stale-credential
+  # failure into a day and a half of runs that all reported the manifest as
+  # unreadable and none of which said why.
+  media_type="$(az acr manifest show "$ref" --query mediaType -o tsv || true)"
   [[ -n "$media_type" ]] || die "could not read the manifest media type for ${ref}"
   [[ "$media_type" == "$EXPECTED_MEDIA_TYPE" ]] || die "manifest media type is '${media_type}', expected '${EXPECTED_MEDIA_TYPE}'.
 The ACA disk importer cannot consume an OCI image index. Recent 'docker buildx

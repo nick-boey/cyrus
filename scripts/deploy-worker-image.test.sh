@@ -708,6 +708,104 @@ else
   sed 's/^/       /' "$e2e_out" >&2
 fi
 
+################################################################################
+# --build-only / --image --tag: the two halves of a split run
+################################################################################
+
+# The split exists because the caller's credential can be shorter-lived than the
+# build (a GitHub Actions OIDC login goes stale about ten minutes in). Two things
+# have to hold for it to be worth having: the first half must print a ref a
+# caller can actually take with `tail -1` and must NOT touch the parameter file,
+# and the second half must be able to name the tag the first half chose — the
+# provenance comment is a lie otherwise, and it is the only record tying a digest
+# in the parameter file back to a commit.
+SPLIT="$WORK/split"; mkdir -p "$SPLIT/bin"
+cp "${SCRIPT_DIR}/deploy-worker-image.sh" "$SPLIT/bin/"
+cp "$E2E/bin/deploy-azure.sh" "$SPLIT/bin/"
+cp "$E2E/bin/curl" "$SPLIT/bin/"
+SPLIT_DIGEST="sha256:$(printf 'f%.0s' {1..64})"
+SPLIT_REF="acrexample.azurecr.io/cyrus-worker@${SPLIT_DIGEST}"
+SPLIT_DISK="cyrus-worker-$(derive_disk_suffix "$SPLIT_REF")"
+
+cat >"$SPLIT/bin/az" <<STUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "account show")
+    [[ "\$*" == *"--query id"* ]] && { echo "sub-1234"; exit 0; }
+    exit 0 ;;
+  "account get-access-token") echo "ACA-BEARER-TOKEN"; exit 0 ;;
+  "acr build")   echo "${SPLIT_DIGEST}"; exit 0 ;;
+  "acr login")   echo "ACR-REFRESH-TOKEN"; exit 0 ;;
+  "acr manifest") echo "application/vnd.docker.distribution.manifest.v2+json"; exit 0 ;;
+  "deployment sub")
+    echo '{"resourceGroupName":{"value":"rg-cyrus"},"sandboxGroupName":{"value":"sg-cyrus"},"managementEndpoint":{"value":"https://management.australiaeast.azuredevcompute.io"}}'
+    exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$SPLIT/bin/az"
+
+# A real repository, because the build half reads the commit it is tagging and
+# refuses a dirty tree.
+split_repo="$SPLIT/repo"; mkdir -p "$split_repo"
+git -C "$split_repo" init -q
+git -C "$split_repo" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+split_params="$SPLIT/main.bicepparam"
+make_fixture "$split_params"
+printf "param project = 'cyrus'\nparam environment = 'dev'\n" >>"$split_params"
+split_before="$(cat "$split_params")"
+
+split_out="$SPLIT/stdout"; split_rc=0
+( cd "$split_repo" && env PATH="$SPLIT/bin:$PATH" PARAMS="$split_params" \
+    bash "$SPLIT/bin/deploy-worker-image.sh" --build-only ) >"$split_out" 2>&1 || split_rc=$?
+
+if [[ "$split_rc" -eq 0 ]] && [[ "$(tail -1 "$split_out")" == "$SPLIT_REF" ]]; then
+  ok "--build-only prints the digest ref as its last line"
+else
+  fail "--build-only did not end with the digest ref (exit ${split_rc})"
+  sed 's/^/       /' "$split_out" >&2
+fi
+
+if [[ "$(cat "$split_params")" == "$split_before" ]]; then
+  ok "--build-only leaves the parameter file alone"
+else
+  fail "--build-only wrote to the parameter file"
+fi
+
+split_rc=0
+env PATH="$SPLIT/bin:$PATH" \
+    CURL_ARGV_LOG="$SPLIT/curl-argv" CURL_CONFIG_LOG="$SPLIT/curl-config" \
+    CURL_URL_LOG="$SPLIT/curl-urls" CURL_BODY_COPY="$SPLIT/put-body.json" \
+    CURL_STATE="$SPLIT/registered" \
+    E2E_DISK="$SPLIT_DISK" E2E_REF="$SPLIT_REF" \
+    PARAMS="$split_params" READY_POLL_INTERVAL=1 \
+    bash "$SPLIT/bin/deploy-worker-image.sh" --image "$SPLIT_REF" --tag sha-9f49d67 \
+    >"$split_out" 2>&1 || split_rc=$?
+
+if [[ "$split_rc" -eq 0 ]] && grep -qF "param workerImage = '${SPLIT_REF}'" "$split_params"; then
+  ok "--image registers and repins the ref --build-only produced"
+else
+  fail "the register half did not repin the built ref (exit ${split_rc})"
+  sed 's/^/       /' "$split_out" >&2
+fi
+
+if grep -qF '// This digest is tagged sha-9f49d67 in acrexample.' "$split_params"; then
+  ok "--tag names the built tag in the provenance comment"
+else
+  fail "--tag did not reach the provenance comment"
+  grep -n 'This digest is tagged' "$split_params" | sed 's/^/       /' >&2
+fi
+
+split_rc=0
+env PATH="$SPLIT/bin:$PATH" PARAMS="$split_params" \
+    bash "$SPLIT/bin/deploy-worker-image.sh" --build-only --image "$SPLIT_REF" \
+    >"$split_out" 2>&1 || split_rc=$?
+if [[ "$split_rc" -ne 0 ]] && grep -qF 'are opposites' "$split_out"; then
+  ok "refuses --build-only together with --image"
+else
+  fail "accepted --build-only with --image"
+fi
+
 if [[ "$FAILURES" -gt 0 ]]; then
   echo "${FAILURES} test(s) failed" >&2
   exit 1
