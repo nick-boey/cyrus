@@ -279,6 +279,41 @@ param enableFleetRecovery bool = false
 @description('Entra principal/group object ids granted the Azure Log Analytics Reader data-plane role at the workspace scope, so an authorized operator can query the advertised log source with their own credential. SEPARATE from fleetOperatorGrants on purpose: neither role implies the other. Empty assigns nothing. When manageRoleAssignments=false, these are applied by scripts/bootstrap-azure-role-assignments.sh instead.')
 param fleetOperatorLogReaderPrincipalIds array = []
 
+// Advertising is not trust. The CLI resolves the release against its OWN
+// trusted registry and verifies the published checksum, so a router naming a
+// URL cannot make a client install instructions from it — which is why these
+// values are safe in a plain env var and why none of them is validated against
+// a network here.
+//
+// Typed for the same reason `fleetOperatorGrant` is: every field below is
+// required by the router's Zod schema, so a missing key would otherwise render
+// into CYRUS_ROUTER_FLEET_OPERATIONS_JSON and crash-loop the revision instead
+// of failing at compile time.
+type fleetOperatorSkillRelease = {
+  @description('Skill name. The CLI refuses anything outside its trusted registry, so today this is `cyrus-fleet-operator`.')
+  @minLength(1)
+  name: string
+
+  @description('Exact semantic version of the release. Skills ship in lockstep with the CLI, which refuses a version that is not its own.')
+  @minLength(1)
+  version: string
+
+  @description('Advertised release URL. Informational: the CLI builds its own download URL from its trusted registry and ignores this for resolution.')
+  @minLength(1)
+  releaseUrl: string
+
+  @description('`sha256:` prefixed lowercase hex digest of the release archive, exactly as published alongside it.')
+  @minLength(71)
+  @maxLength(71)
+  checksum: string
+
+  @description('Oldest CLI version this skill supports. Omit when any CLI that trusts the release may install it.')
+  minCliVersion: string?
+}
+
+@description('Operator skill this router expects its clients to run, rendered into CYRUS_ROUTER_FLEET_OPERATIONS_JSON as `skill` and disclosed only on the authenticated operator context route. Advertising is not trust: the CLI verifies the release against its own trusted registry and the published checksum. Requires fleetOperatorGrants, because an unconfigured deployment renders no fleetOperations block for the skill to sit in.')
+param fleetOperatorSkill fleetOperatorSkillRelease?
+
 ////////////////////////////////////////////////////////////////////////////////
 // Setup management UI (/setup) — STAGED ROLLOUT (D7)
 //
@@ -530,6 +565,10 @@ var parameterViolations = concat(
   !enableSetupUi || setupUiAuthMode != 'entra-token' || !empty(setupUiIdTokenAudience) || !empty(setupUiClientId) ? [] : ['setupUiAuthMode=entra-token needs an ID token audience: set setupUiClientId (the audience defaults to it) or override setupUiIdTokenAudience explicitly.'],
   !enableSetupTableBackend || enableSetupSecretStore ? [] : ['enableSetupTableBackend requires enableSetupSecretStore=true. The selector points the router at a Table and a KEK that the creation flag provisions; without it the rendered config would name resources that do not exist.'],
   empty(fleetOperatorGrants) || (!empty(entraTenantId) && !empty(entraAudience)) ? [] : ['fleetOperatorGrants requires entraTenantId and entraAudience. Operator access tokens are verified against the same app registration as /enroll, so a grant table with no tenant and no audience to check claims against would authorize nobody.'],
+  fleetOperatorSkill == null || !empty(fleetOperatorGrants) ? [] : ['fleetOperatorSkill requires fleetOperatorGrants. The whole fleetOperations block renders only when operators are configured, so a skill advertised on its own would be silently dropped and `cyrus skills list` would keep reporting nothing advertised.'],
+  fleetOperatorSkill == null || startsWith(fleetOperatorSkill!.checksum, 'sha256:') ? [] : ['fleetOperatorSkill.checksum must be a `sha256:` prefixed digest. The router rejects any other shape at startup, which surfaces as a crash-looping revision rather than a parameter error.'],
+  fleetOperatorSkill == null || toLower(fleetOperatorSkill!.checksum) == fleetOperatorSkill!.checksum ? [] : ['fleetOperatorSkill.checksum must be LOWERCASE hex. The router\'s schema is /^sha256:[0-9a-f]{64}$/, and the two tools most likely to have produced the digest by hand — certutil and PowerShell Get-FileHash — both emit uppercase, which is the same length and the same prefix and fails only at startup.'],
+  fleetOperatorSkill == null || startsWith(fleetOperatorSkill!.releaseUrl, 'https://') ? [] : ['fleetOperatorSkill.releaseUrl must be an https:// URL. The router parses it with Zod\'s url(), so a bare path or a package name renders cleanly here and crash-loops the revision.'],
   !setupUiAutoProvisionUsers || setupUiAllowedPrincipalsConfigured || setupUiAssignmentRequiredVerified ? [] : ['setupUiAutoProvisionUsers=true requires a membership gate: populate setupUiAllowedGroupObjectIds / setupUiAllowedPrincipalObjectIds, or perform the Entra assignment steps in README section 11 step 3 and set setupUiAssignmentRequiredVerified=true. By default ANY account in the tenant can obtain a token for the app, and setupUiAllowedDomain cannot tell an assigned teammate from any other account in the same tenant.']
 )
 
@@ -748,8 +787,11 @@ var routerContainersConfig = union(
 // nothing touched the grants, so a misspelled key rendered verbatim into
 // CYRUS_ROUTER_FLEET_OPERATIONS_JSON, failed the router's Zod parse at startup,
 // and surfaced as a crash-looping revision instead of a parameter error.
-// Dereferencing unconditionally moves that to `az deployment sub what-if`,
-// which routine CD always runs first. The `fleetOperatorGrant` type above
+// Dereferencing unconditionally moves that forward to deployment time. Note
+// that it does NOT reach `az deployment sub what-if`: what-if evaluates no
+// `parameterGuard` violation at all (measured 2026-09-10), which is why
+// `scripts/deploy-azure.sh` runs `az deployment sub validate` on both paths —
+// validate is what turns a guard into a gate. The `fleetOperatorGrant` type above
 // catches the rest — a missing key, a misspelled role, an emptied list — so the
 // router's schema is now a backstop rather than the first line of defence.
 var fleetGrants = filter(
@@ -793,18 +835,36 @@ var fleetLogSource = {
 // operators. Withholding the descriptor from a caller who may not read it is
 // `FleetOperations.context()`'s job (it gates on the `logs.query` capability),
 // not this template's.
+// `recovery.enabled` is the ONLY switch the router reads. Stripping
+// `fleet.recover` from the grants above decides who could ASK; this decides
+// whether the router builds a RecoveryService at all, and without it the
+// capability is never advertised and every request is refused. Rendering both
+// from the same parameter is what makes `enableFleetRecovery` mean what its
+// name says — a template that stripped roles but never emitted this authorized
+// a principal for a mutation the router had already declined to serve.
+//
+// Emitted unconditionally rather than only when true, so `az containerapp show`
+// reports the posture explicitly. An absent key and a false one are the same to
+// the router, but only one of them is legible to the operator reading it back.
+var fleetOperationsWithoutSkill = {
+  logSource: fleetLogSource
+  recovery: {
+    enabled: enableFleetRecovery
+  }
+  access: {
+    entra: {
+      tenantId: entraTenantId
+      audience: entraAudience
+      grants: fleetGrants
+    }
+  }
+}
+
 var fleetOperationsConfig = empty(fleetOperatorGrants)
   ? {}
-  : {
-      logSource: fleetLogSource
-      access: {
-        entra: {
-          tenantId: entraTenantId
-          audience: entraAudience
-          grants: fleetGrants
-        }
-      }
-    }
+  : (fleetOperatorSkill == null
+      ? fleetOperationsWithoutSkill
+      : union(fleetOperationsWithoutSkill, { skill: fleetOperatorSkill! }))
 
 var fleetOperationsJson = empty(fleetOperationsConfig) ? '' : string(fleetOperationsConfig)
 

@@ -236,6 +236,27 @@ param enableFleetRecovery = false
 //    it — README §12 step 3.
 param fleetOperatorLogReaderPrincipalIds = []
 
+// 3. Which operator skill this router expects its clients to run. Omit it and
+//    `cyrus skills list` reports nothing advertised, which is the correct
+//    posture until a release exists to point at.
+//
+//    Advertising is NOT trust. The CLI resolves the download from its own
+//    trusted registry and verifies the published checksum, so a router naming
+//    a URL cannot make a client install anything — which is why every value
+//    here is safe in a plain env var. `releaseUrl` is informational for the
+//    same reason: the CLI ignores it when resolving.
+//
+//    Rides on fleetOperatorGrants: the whole fleetOperations block renders only
+//    when operators are configured, so a skill advertised on its own is
+//    refused at deploy time rather than silently dropped.
+// param fleetOperatorSkill = {
+//   name: 'cyrus-fleet-operator'
+//   version: '0.2.70'
+//   releaseUrl: 'https://github.com/cyrusagents/cyrus/releases/download/v0.2.70/cyrus-fleet-operator-0.2.70.tar.gz'
+//   checksum: 'sha256:<64 lowercase hex digits, from the published .sha256>'
+//   minCliVersion: '0.2.70'
+// }
+
 // ---- Setup management UI (/setup) — STAGED, see README §11 ------------------
 // TWO SEPARATE DEPLOYMENTS with a live verification gate between them.
 // `authConfigs` is a child of the Container App, so a single flag would

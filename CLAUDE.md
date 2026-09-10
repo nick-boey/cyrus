@@ -767,6 +767,13 @@ The agent automatically moves issues to the "started" state when assigned. Linea
         guaranteed to be evaluated. Do not "simplify" it out of the tags, and do
         not replace it with `assert`: assertions require an experimental feature
         flag and emit `languageVersion: 2.1-experimental`.
+        **`what-if` does not evaluate the guard; `validate` does.** A
+        violating parameter file previews perfectly clean and then fails at
+        apply, so every rule here was invisible to the gate routine CD runs.
+        That is why `scripts/deploy-azure.sh` runs `az deployment sub validate`
+        on the preview path AND the apply path — a new invariant is a gate only
+        because that call is there. Test a new rule with `validate`; a green
+        `what-if` proves nothing about it.
      Run `./scripts/check-bicep.sh` after any template change; it compiles every
      template, type-checks `main.bicepparam.example` against `main.bicep`, and
      treats warnings as failures.

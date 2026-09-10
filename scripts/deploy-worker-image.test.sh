@@ -806,6 +806,42 @@ else
   fail "accepted --build-only with --image"
 fi
 
+# 23. a manifest read that FAILS reports what failed, not a media-type verdict
+#
+# The regression this pins ran for 36 consecutive CD runs: `az acr manifest show`
+# failed, its stderr went to /dev/null, and the empty stdout was reported as
+# "could not read the manifest media type" — sending everyone to look at an image
+# whose type was correct all along. The assertion is on the stderr reaching the
+# operator, and on the message NOT claiming a media-type problem.
+cat >"$E2E/bin/az" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "account show")
+    [[ "$*" == *"--query id"* ]] && { echo "sub-1234"; exit 0; }
+    exit 0 ;;
+  "acr manifest")
+    echo "ERROR: (Unauthorized) authentication required, visit https://aka.ms/acr/authorization" >&2
+    exit 1 ;;
+esac
+exit 0
+STUB
+chmod +x "$E2E/bin/az"
+e2e_rc=0
+env PATH="$E2E/bin:$PATH" PARAMS="$other_params" \
+    bash "$E2E/bin/deploy-worker-image.sh" --image "$other_ref" >"$e2e_out" 2>&1 || e2e_rc=$?
+if [[ "$e2e_rc" -eq 0 ]]; then
+  fail "accepted an image whose manifest could not be read"
+  sed 's/^/       /' "$e2e_out" >&2
+elif ! grep -qF 'authentication required' "$e2e_out"; then
+  fail "discarded the stderr that says why the manifest read failed"
+  sed 's/^/       /' "$e2e_out" >&2
+elif grep -qF 'media type is' "$e2e_out"; then
+  fail "reported a media-type verdict for a manifest it never read"
+  sed 's/^/       /' "$e2e_out" >&2
+else
+  ok "surfaces the real error when the manifest cannot be read"
+fi
+
 if [[ "$FAILURES" -gt 0 ]]; then
   echo "${FAILURES} test(s) failed" >&2
   exit 1

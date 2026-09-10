@@ -236,6 +236,20 @@ and drops any grant that had no other role (the router schema requires at least
 one). The Entra app-role assignment is untouched, so re-enabling is a parameter
 flip rather than a directory round trip.
 
+It renders **two** things from that one parameter, and both are needed. The
+strip decides who could *ask*; `fleetOperations.recovery.enabled` decides
+whether the router builds a `RecoveryService` at all. Without the second, a
+`fleet.recover` grant reaches a router that advertises no `recoveries.request`
+capability and refuses every request — the deployment would authorize a
+principal for a mutation the router had already declined to serve.
+
+`fleetOperatorSkill` advertises the operator skill a client should run, and
+rides on the same block: with no grants there is nothing to render it into, so
+the template refuses the combination rather than dropping it silently.
+Advertising is not trust — the CLI resolves the download from its own trusted
+registry and verifies the published checksum, so `releaseUrl` is informational
+and none of these values is a credential.
+
 Entra app roles themselves are **not** created here. App registrations are
 Microsoft Graph objects, not ARM resources; `az ad app update --app-roles` is
 the documented path (infra/azure/README.md § "Optional: fleet operator access"),
@@ -256,7 +270,15 @@ Those live in `main.bicep` as a `parameterViolations` array plus a
 `parameterGuard` variable. The guard indexes `{ valid: {} }` with `'valid'` when
 every rule holds and with the **violation text** when one does not — a key ARM
 cannot resolve, so the deployment fails before touching a resource and the error
-message names the broken rule. The guard is folded into `defaultTags` via
+message names the broken rule.
+
+**`az deployment sub what-if` does not evaluate the guard.** A violating
+parameter file previews clean — the OTel-pair rule was measured on 2026-09-10
+reporting `8 to create` rather than a violation — and then fails at apply. That
+made every rule here invisible to the preview routine CD gates on, so
+`scripts/deploy-azure.sh` runs `az deployment sub validate` before the what-if
+and before an apply. Invoking `az deployment` directly skips it, which is one
+more reason not to. The guard is folded into `defaultTags` via
 `union(…, {})` because a variable nothing reads is not guaranteed to be
 evaluated, and a validation that might not run is not a validation.
 

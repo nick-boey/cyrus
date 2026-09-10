@@ -250,6 +250,25 @@ the non-secret deployment configuration. Bootstrap secret values are opt-in."
     deployment_parameters+=("routerImage=${router_image_override}")
   fi
 
+  # `az deployment sub what-if` does NOT evaluate `main.bicep`'s parameterGuard,
+  # and `validate` does. That is not a nicety: the guard is how all fifteen
+  # cross-parameter invariants are enforced, and every one of them was invisible
+  # to the preview that routine CD gates on — a violating parameter file produced
+  # a clean, green what-if and then failed at apply. Verified on 2026-09-10
+  # against the pre-existing `enableOtelTraces requires enableOtelLogs` rule,
+  # which what-if reported as 8-to-create and validate rejected by name.
+  #
+  # Runs on BOTH paths. On the preview path it is the whole point; on the apply
+  # path it costs one call to fail on the parameters before ARM begins ordering
+  # resources.
+  echo "==> validating parameters (cross-parameter invariants)"
+  az deployment sub validate \
+    --name "$name" \
+    --location "$location" \
+    --template-file "$TEMPLATE" \
+    --parameters "${deployment_parameters[@]}" \
+    --output none
+
   if [[ "$apply" -eq 0 ]]; then
     echo "==> what-if (no changes will be made)"
     az deployment sub what-if \
