@@ -45,3 +45,14 @@ param fleetOperatorLogReaderPrincipalIds = [
   '44444444-4444-4444-4444-444444444444'
   '55555555-5555-5555-5555-555555555555'
 ]
+
+// An advertised operator skill. Pins the release shape: every field the router's
+// Zod schema requires is present, and the checksum is the `sha256:` + 64 hex
+// digits both the template guard and the CLI insist on.
+param fleetOperatorSkill = {
+  name: 'cyrus-fleet-operator'
+  version: '1.2.3'
+  releaseUrl: 'https://github.com/cyrusagents/cyrus/releases/download/v1.2.3/cyrus-fleet-operator-1.2.3.tar.gz'
+  checksum: 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+  minCliVersion: '1.2.3'
+}

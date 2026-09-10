@@ -422,7 +422,14 @@ REGISTRY=<acr-name> to match the image."
   # failure into a day and a half of runs that all reported the manifest as
   # unreadable and none of which said why.
   media_type="$(az acr manifest show "$ref" --query mediaType -o tsv || true)"
-  [[ -n "$media_type" ]] || die "could not read the manifest media type for ${ref}"
+  # And the message must not name the media type either. By this point the
+  # digest is already in the registry, so a failure here is never about the
+  # image's kind — saying so sent everyone to inspect an image that was correct
+  # all along, for 36 consecutive runs.
+  [[ -n "$media_type" ]] || die "could not read the manifest for ${ref}.
+This is NOT a media-type problem: the image was built and pushed by the time
+this runs, and the command failed before reporting any type. az's own error is
+above."
   [[ "$media_type" == "$EXPECTED_MEDIA_TYPE" ]] || die "manifest media type is '${media_type}', expected '${EXPECTED_MEDIA_TYPE}'.
 The ACA disk importer cannot consume an OCI image index. Recent 'docker buildx
 --push' produces one by default because it attaches provenance/SBOM

@@ -5,6 +5,22 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Fixed
+- **`scripts/deploy-worker-image.sh` reports why the manifest read failed
+  instead of blaming the media type**
+  ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery)).
+  The check ran `az acr manifest show ... 2>/dev/null || true` and attributed an
+  empty stdout to the media type, so every way the command can fail — a
+  throttle, a credential problem, a change in the preview command group —
+  surfaced as `could not read the manifest media type`, pointing at an image
+  whose type was correct. It stalled the private deployment repository's
+  `Update Cyrus Pin` through 36 consecutive runs from 2026-09-09T11:50Z before
+  anyone read the manifest by hand. Stderr is now captured into `$SCRATCH` and
+  included in the failure, and the message states that the image was built and
+  pushed so the reader stops looking at the image. Case 23 in
+  `deploy-worker-image.test.sh` pins it: it asserts the real stderr reaches the
+  operator AND that the message makes no media-type claim. The root cause of
+  the CD failure itself is not addressed here — capturing the evidence is what
+  makes the next occurrence diagnosable at all.
 - **The worker image now carries the Bicep, PowerShell, pnpm and .NET 8
   toolchains, and the sandbox can reach the three registries their gates need
   ([CYR-88](https://linear.app/northrop-digital/issue/CYR-88/sandbox-cannot-run-the-bicep-powershell-pnpm-or-net-8-repository-gates),

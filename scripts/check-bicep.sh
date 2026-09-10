@@ -131,6 +131,20 @@ assert_arm() {
 assert_arm main.bicep   "if(parameters('enableFleetRecovery'), lambdaVariables('grant').roles, filter(lambdaVariables('grant').roles"   "enableFleetRecovery=false strips roles rather than failing the deployment"
 assert_arm main.bicep   "not(equals(lambdaVariables('role'), 'fleet.recover'))"   "the stripped role is fleet.recover, leaving fleet.read intact"
 
+# Stripping the role decides who could ASK. This decides whether the router
+# builds a RecoveryService at all — without it the capability is never
+# advertised and every request is refused, so a template that emitted only the
+# strip authorized a principal for a mutation the router had already declined
+# to serve. Both halves must come from the same parameter.
+assert_arm main.bicep   "'recovery', createObject('enabled', parameters('enableFleetRecovery'))"   "enableFleetRecovery also renders the router's own recovery switch"
+
+# The skill rides on the grants block, so an unconfigured deployment advertises
+# nothing. Pinning the union rather than the key alone is what catches the
+# skill being folded in unconditionally, which would render `skill: null` into
+# a config the router's Zod schema rejects at startup.
+assert_arm main.bicep   "if(equals(parameters('fleetOperatorSkill'), null()), createObject('logSource'"   "no skill parameter renders no skill key"
+assert_arm main.bicep   "union(createObject('logSource'"   "an advertised skill is unioned into the same fleetOperations block"
+
 # No operators configured means no workspace metadata is published at all —
 # there is nobody the router could disclose the log source to.
 assert_arm main.bicep   "string(if(empty(parameters('fleetOperatorGrants')), createObject()"   "an unconfigured deployment renders no fleetOperations block"
@@ -139,5 +153,17 @@ assert_arm main.bicep   "if(empty(parameters('fleetOperationsJson')), createArra
 # Workspace scope, not subscription or resource-group scope: an operator gets to
 # read this stack's logs, not everything in the subscription.
 assert_arm modules/role-assignments.bicep   "\"scope\": \"[resourceId('Microsoft.OperationalInsights/workspaces', format('log-{0}', parameters('namePrefix')))]\""   "Log Analytics Reader is assigned at the workspace scope"
+
+# The parameterGuard is only a GATE because deploy-azure.sh validates. what-if
+# evaluates no violation at all, so deleting this call returns all fifteen
+# cross-parameter invariants to "fails at apply, previews clean" without
+# breaking anything a test would notice.
+if grep -q 'az deployment sub validate' "$REPO_ROOT/scripts/deploy-azure.sh"; then
+  echo "ok   — deploy-azure.sh validates parameters (what-if does not evaluate parameterGuard)"
+else
+  echo "FAIL — deploy-azure.sh no longer runs 'az deployment sub validate'"
+  echo "       Without it a parameterGuard violation previews clean and fails at apply."
+  status=1
+fi
 
 exit "$status"
