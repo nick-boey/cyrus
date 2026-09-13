@@ -5,6 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- Merged canonical `cyrusagents/cyrus` changes through `035cfccc` while preserving the fork's downstream router, Azure fleet, workspace-sync, and observability work; the merge was validated with the package suite and an F1 end-to-end drive. ([CYR-97](https://linear.app/northrop-digital/issue/CYR-97/merge-in-latest-changes-from-upstream), [#89](https://github.com/nick-boey/cyrus/pull/89))
 - **CYR-89 dev-fleet drive record**
   ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery)).
   `apps/f1/test-drives/2026-09-10-cyr-89-operator-surface.md` records the
