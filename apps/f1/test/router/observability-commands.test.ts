@@ -1143,7 +1143,10 @@ describe("log commands read the router's descriptor and nothing else", () => {
 				{
 					schemaVersion: 1 as const,
 					recordId: "record-1",
-					timestamp: new Date().toISOString(),
+					// The query range is half-open (`record.timestamp < range.to`). Keep
+					// the fixture safely behind the command's independently captured clock
+					// so millisecond scheduling cannot put it exactly on the upper bound.
+					timestamp: new Date(Date.now() - 1_000).toISOString(),
 					level: "info" as const,
 					message: `authorized with ${token}`,
 					component: "router",

@@ -5,6 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- Merged canonical `cyrusagents/cyrus` changes through `035cfccc` while preserving the fork's downstream router, Azure fleet, workspace-sync, and observability work; the merge was validated with the package suite and an F1 end-to-end drive. ([CYR-97](https://linear.app/northrop-digital/issue/CYR-97/merge-in-latest-changes-from-upstream), [#89](https://github.com/nick-boey/cyrus/pull/89))
 - **CYR-89 dev-fleet drive record**
   ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery)).
   `apps/f1/test-drives/2026-09-10-cyr-89-operator-surface.md` records the
@@ -1765,6 +1766,7 @@ This changelog documents internal development changes, refactors, tooling update
 
 ### Removed
 - Reverted multi-user env-var credential injection (UserCredentialResolver, credential-env scrub, cyrus users CLI); SessionCreator threading and F1 creator payloads retained for the router architecture.
+## [0.2.71] - 2026-09-04
 
 ### Changed
 - Recorded, after the fact, why #1426 removed the `linear_agent_session_create` and `linear_agent_session_create_on_comment` cyrus-tools: they allowed concurrent child sessions to be started on the same issue. That removal also silently dropped the only runtime caller of `GlobalSessionRegistry.setParentSession`, breaking parent resumption. `EdgeWorker.linkChildSessionToParentIssueSession` now derives the child-to-parent session link from Linear's issue hierarchy on `AgentSessionEvent/created` (and after repository selection), so the removed tools stay removed. ([#1454](https://github.com/cyrusagents/cyrus/pull/1454))

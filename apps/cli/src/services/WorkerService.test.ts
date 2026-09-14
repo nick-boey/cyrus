@@ -88,6 +88,19 @@ describe("WorkerService", () => {
 	}
 
 	it("forwards every EdgeConfig field into the EdgeWorker config (no silent drops)", async () => {
+		// This test verifies file-config forwarding, not environment precedence.
+		// Router test environments may provide global runner/model defaults.
+		vi.stubEnv("CYRUS_CLAUDE_DEFAULT_MODEL", undefined);
+		vi.stubEnv("CYRUS_CLAUDE_DEFAULT_FALLBACK_MODEL", undefined);
+		vi.stubEnv("CYRUS_DEFAULT_MODEL", undefined);
+		vi.stubEnv("CYRUS_DEFAULT_FALLBACK_MODEL", undefined);
+		vi.stubEnv("CYRUS_GEMINI_DEFAULT_MODEL", undefined);
+		vi.stubEnv("CYRUS_CODEX_DEFAULT_MODEL", undefined);
+		vi.stubEnv("CYRUS_OPENCODE_DEFAULT_MODEL", undefined);
+		vi.stubEnv("CYRUS_OPENCODE_DEFAULT_FALLBACK_MODEL", undefined);
+		vi.stubEnv("CYRUS_INFER_OPENCODE_RUNNER_FROM_PROVIDER_MODEL", undefined);
+		vi.stubEnv("CYRUS_DEFAULT_RUNNER", undefined);
+
 		// One distinctive value per top-level EdgeConfigSchema key. The
 		// completeness assertion below forces this fixture to grow whenever a
 		// field is added to the schema, and the per-key equality loop then
@@ -118,6 +131,7 @@ describe("WorkerService", () => {
 			slackAllowedTools: ["Read"],
 			githubAllowedTools: ["Bash"],
 			slackMcpConfigs: ["~/slack.json"],
+			zulipMcpConfigs: ["~/zulip.json"],
 			linearMcpConfigs: ["~/linear.json"],
 			githubMcpConfigs: ["~/github.json"],
 			strictMcpConfig: false,
@@ -139,6 +153,7 @@ describe("WorkerService", () => {
 					},
 				},
 			},
+			maxConcurrentSessions: 3,
 		});
 
 		// Fixture-completeness tripwire: adding a field to EdgeConfigSchema
