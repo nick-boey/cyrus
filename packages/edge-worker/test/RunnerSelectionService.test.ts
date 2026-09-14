@@ -129,7 +129,7 @@ describe("RunnerSelectionService", () => {
 
 		expect(selection.runnerType).toBe("codex");
 		expect(selection.modelOverride).toBe("gpt-6-astra");
-		expect(selection.fallbackModelOverride).toBe("gpt-5.2-codex");
+		expect(selection.fallbackModelOverride).toBe("gpt-5.5");
 	});
 
 	it("lets description selectors override provider/model labels", () => {
