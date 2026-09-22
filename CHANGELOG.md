@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
-- Claude sessions now run on Opus 5.5 by default. The `opus` model and label (and the default when no model is configured) resolve to `claude-opus-5-5`; set `claudeDefaultModel` to pin a different model.
+- Claude sessions now run on Opus 5.5 by default. The `opus` model and label (and the default when no model is configured) resolve to `claude-opus-5-5`; set `claudeDefaultModel` to pin a different model. ([#91](https://github.com/nick-boey/cyrus/pull/91))
 
 ### Fixed
 - If you run the Azure router, `enableFleetRecovery = true` now actually enables guarded recovery. It only ever did half the job: it added `fleet.recover` to the operator grants, so a principal was authorized to ask — but it never told the router to accept, so the router built no recovery service, advertised no recovery capability, and refused every request. The result was a deployment that looked configured for recovery from the parameter file and, from the operator's side, was indistinguishable from one where recovery had been left off. Both halves now come from that one parameter. It remains `false` by default and stripping the role while it is false is unchanged. ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery), [#80](https://github.com/nick-boey/cyrus/pull/80))
