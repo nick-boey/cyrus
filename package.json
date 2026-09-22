@@ -37,7 +37,7 @@
 		"@biomejs/biome": "^2.5.5",
 		"husky": "^9.1.7",
 		"lint-staged": "^16.4.0",
-		"typescript": "^5.9.3"
+		"@typescript/native-preview": "7.0.0-dev.20260707.2"
 	},
 	"dependencies": {
 		"@linear/sdk": "60.0.0"

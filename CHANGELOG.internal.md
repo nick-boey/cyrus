@@ -5,6 +5,7 @@ This changelog documents internal development changes, refactors, tooling update
 ## [Unreleased]
 
 ### Added
+- Merged canonical `cyrusagents/cyrus` changes through `e9e1e53d` (v0.2.72, tsgo migration, multi-org GitHub credentials, Linear webhook IP allowlist). The fork-only packages (`router`, `router-*`, `otel-*`, `operator-protocol`, `workspace-sync`) moved to `tsgo` with the rest of the monorepo. Bumped `@anthropic-ai/claude-agent-sdk` 0.3.268 → 0.3.280 so the `opus` alias resolves to `claude-opus-5-5`; the bundled CLI no longer exposes `TaskOutput`, so it was dropped from the tool allow lists. `@cursor/sdk` 1.0.24 narrowed `local.cwd` to `string`. ([#91](https://github.com/nick-boey/cyrus/pull/91))
 - Merged canonical `cyrusagents/cyrus` changes through `035cfccc` while preserving the fork's downstream router, Azure fleet, workspace-sync, and observability work; the merge was validated with the package suite and an F1 end-to-end drive. ([CYR-97](https://linear.app/northrop-digital/issue/CYR-97/merge-in-latest-changes-from-upstream), [#89](https://github.com/nick-boey/cyrus/pull/89))
 - **CYR-89 dev-fleet drive record**
   ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery)).
@@ -1766,6 +1767,17 @@ This changelog documents internal development changes, refactors, tooling update
 
 ### Removed
 - Reverted multi-user env-var credential injection (UserCredentialResolver, credential-env scrub, cyrus users CLI); SessionCreator threading and F1 creator payloads retained for the router architecture.
+### Changed
+- Switched builds, type checking, and development watch commands to the native TypeScript compiler, reducing measured local build time by 74% and type-check time by 68%. Prompt-assembly tests now use mock Linear trackers reliably, preventing network-dependent CI timeouts. ([CYPACK-1520](https://linear.app/ceedar/issue/CYPACK-1520), [#1485](https://github.com/cyrusagents/cyrus/pull/1485))
+
+### Fixed
+- Release recovery now compares complete uncompressed package archives, retaining mixed-commit protection while allowing an approved first publish packed by a different gzip implementation to resume safely. ([#1483](https://github.com/cyrusagents/cyrus/pull/1483))
+- The release workflow now submits fresh packages in dependency order before checking npm visibility and archive integrity as a batch, avoiding registry propagation delays being multiplied across the package graph while retaining the pre-tag verification boundary. ([CYPACK-1521](https://linear.app/ceedar/issue/CYPACK-1521), [#1486](https://github.com/cyrusagents/cyrus/pull/1486))
+
+## [0.2.72] - 2026-09-15
+
+_No internal-only changes._
+
 ## [0.2.71] - 2026-09-04
 
 ### Changed

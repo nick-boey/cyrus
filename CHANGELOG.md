@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Claude sessions now run on Opus 5.5 by default. The `opus` model and label (and the default when no model is configured) resolve to `claude-opus-5-5`; set `claudeDefaultModel` to pin a different model. ([#91](https://github.com/nick-boey/cyrus/pull/91))
+
 ### Fixed
 - If you run the Azure router, `enableFleetRecovery = true` now actually enables guarded recovery. It only ever did half the job: it added `fleet.recover` to the operator grants, so a principal was authorized to ask — but it never told the router to accept, so the router built no recovery service, advertised no recovery capability, and refused every request. The result was a deployment that looked configured for recovery from the parameter file and, from the operator's side, was indistinguishable from one where recovery had been left off. Both halves now come from that one parameter. It remains `false` by default and stripping the role while it is false is unchanged. ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery), [#80](https://github.com/nick-boey/cyrus/pull/80))
 - If you run the Azure router, a parameter file that breaks one of the template's cross-parameter rules is now caught when you preview it, not when you apply it. Fifteen rules are enforced this way — "`enableSetupUi` requires `enableSetupAuth`", "traces require logs", and so on — and every one of them was invisible to `what-if`, which reported a perfectly ordinary change list and then let the deployment fail partway in. The preview now validates the parameters first, so a broken combination stops before anything is described as changing, and names the rule it broke. ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery), [#80](https://github.com/nick-boey/cyrus/pull/80))
@@ -17,6 +20,12 @@ All notable changes to this project will be documented in this file.
 - Prompting an issue whose cloud sandbox has been parked for a couple of days no longer starts a session that runs invisibly. The router reclaims the locks of machines that have gone dark, and a parked sandbox looks dark by definition — so once one had been idle longer than the event lifetime, the very next sweep tore the lock off a session that had been routed to it seconds earlier, while its sandbox was still booting. The session then started anyway and ran disowned: everything it did was refused on the way to Linear, and the idle sweep suspended its sandbox mid-work because the issue no longer looked claimed. On one issue that meant three and a half hours of implementation work with no visible output, followed by a second session starting alongside the first in the same worktree, each editing the other's uncommitted files. A cloud sandbox now keeps its claim on the issue while work it was just handed is still on its way to it. A sandbox that genuinely died mid-session is still reclaimed exactly as before, and nothing changes for sessions running on your own machine. ([CYR-81](https://linear.app/northrop-digital/issue/CYR-81/dont-reclaim-a-devices-locks-while-a-boot-it-was-just-routed-to-is-in), [#69](https://github.com/nick-boey/cyrus/pull/69))
 - `cyrus runs list` now shows one row per agent session rather than one per turn. Stopping a session in Linear and restarting it with Continue ends one run and opens another under the same session, so the listing showed a `stopped` row beside an `active` one and read as two agents working the same issue — the state you would escalate. The listing keeps each session's current turn; `--all-runs` shows every turn when you want the history. Runs are still recorded per turn, because a run's team and project are the ones it was routed under and rewriting them across a stop would falsify what already happened. ([#65](https://github.com/nick-boey/cyrus/pull/65))
 - A running session now reports which agent is running it. `runner` was only ever sent when a run paused for a question, ended a turn holding background work, or finished, so an ordinary run showed as `unknown` for its whole life and the column was blank exactly while the work was in flight. The runner is now reported as soon as it is attached. The model still appears only once the agent has started — it is left absent rather than guessed, and fills in on the next report. ([#65](https://github.com/nick-boey/cyrus/pull/65))
+- Linear webhooks from all twelve published outbound IP addresses are now accepted, preventing missed events as Linear rolls out new source addresses. ([CYPACK-1518](https://linear.app/ceedar/issue/CYPACK-1518), [#1481](https://github.com/cyrusagents/cyrus/pull/1481))
+
+## [0.2.72] - 2026-09-15
+
+### Fixed
+- GitHub CLI commands that view, clone, or fork an explicitly named repository now use that repository's installation token when run from another organization's directory. Repository overrides through `GH_REPO` and attached `-R` arguments are also honored. ([CYHOST-913](https://linear.app/ceedar/issue/CYHOST-913), [#1307](https://github.com/cyrusagents/cyrus/pull/1307))
 
 ### Added
 - If you run the Azure router, you can now advertise which `cyrus-fleet-operator` release your operators should install, with the new `fleetOperatorSkill` parameter. There was no way to do it before, so `cyrus skills list` reported nothing advertised on every Azure deployment and there was nothing for `cyrus skills install` to resolve against. Advertising is not trust: the CLI still resolves the download from its own built-in registry and verifies the published checksum, so naming a release cannot make a client install anything it would not otherwise accept. That is also the current limit of the feature — the CLI builds its download URL from the official `cyrusagents/cyrus` releases, so advertising a release published anywhere else will resolve to a URL that does not exist. ([CYR-89](https://linear.app/northrop-digital/issue/CYR-89/verify-the-operator-surface-post-deployment-and-decide-the-recovery), [#80](https://github.com/nick-boey/cyrus/pull/80))
@@ -89,6 +98,59 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 - Patched five newly reported Cyrus CLI dependency advisories by updating the Vitest toolchain and enforcing a safe Hono release, so `pnpm audit` again reports no known vulnerabilities. ([CYPACK-1503](https://linear.app/ceedar/issue/CYPACK-1503/address-open-security-patches-for-cyrus-cli), [#1466](https://github.com/cyrusagents/cyrus/pull/1466))
+
+### Packages
+
+#### cyrus-cloudflare-tunnel-client
+- cyrus-cloudflare-tunnel-client@0.2.72
+
+#### cyrus-mcp-tools
+- cyrus-mcp-tools@0.2.72
+
+#### cyrus-core
+- cyrus-core@0.2.72
+
+#### cyrus-claude-runner
+- cyrus-claude-runner@0.2.72
+
+#### cyrus-config-updater
+- cyrus-config-updater@0.2.72
+
+#### cyrus-linear-event-transport
+- cyrus-linear-event-transport@0.2.72
+
+#### cyrus-github-event-transport
+- cyrus-github-event-transport@0.2.72
+
+#### cyrus-gitlab-event-transport
+- cyrus-gitlab-event-transport@0.2.72
+
+#### cyrus-slack-event-transport
+- cyrus-slack-event-transport@0.2.72
+
+#### cyrus-zulip-event-transport
+- cyrus-zulip-event-transport@0.2.72
+
+#### cyrus-simple-agent-runner
+- cyrus-simple-agent-runner@0.2.72
+
+#### cyrus-opencode-runner
+- cyrus-opencode-runner@0.2.72
+
+#### cyrus-codex-runner
+- cyrus-codex-runner@0.2.72
+
+#### cyrus-cursor-runner
+- cyrus-cursor-runner@0.2.72
+
+#### cyrus-gemini-runner
+- cyrus-gemini-runner@0.2.72
+
+#### cyrus-edge-worker
+- cyrus-edge-worker@0.2.72
+
+#### cyrus-ai
+- cyrus-ai@0.2.72 ([CYPACK-1519](https://linear.app/ceedar/issue/CYPACK-1519/run-a-release), [#1482](https://github.com/cyrusagents/cyrus/pull/1482))
 
 ## [0.2.71] - 2026-09-04
 
@@ -763,6 +825,9 @@ All notable changes to this project will be documented in this file.
 
 #### cyrus-ai (CLI)
 - cyrus-ai@0.2.64
+
+### Added
+- Cyrus now supports multiple GitHub organizations per team: git and `gh` operations automatically use the right credentials for each repository's org. Tokens are pushed by the Cyrus control plane and a git credential helper picks the matching one per repository, so concurrent sessions across different GitHub orgs no longer share a single login. ([CYHOST-913](https://linear.app/ceedar/issue/CYHOST-913), [#1307](https://github.com/cyrusagents/cyrus/pull/1307))
 
 ## [0.2.63] - 2026-06-09
 

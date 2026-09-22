@@ -14,11 +14,11 @@
 		"dist"
 	],
 	"scripts": {
-		"build": "tsc",
-		"dev": "tsc --watch",
+		"build": "tsgo",
+		"dev": "tsgo --watch",
 		"test": "vitest",
 		"test:run": "vitest run",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsgo --noEmit"
 	},
 	"dependencies": {
 		"@azure/identity": "^4.11.1",
@@ -47,7 +47,7 @@
 		"@types/node": "^20.19.43",
 		"@types/ws": "^8.18.1",
 		"cyrus-router-client": "workspace:*",
-		"typescript": "^5.9.3",
+		"@typescript/native-preview": "7.0.0-dev.20260707.2",
 		"vitest": "^4.1.10"
 	},
 	"publishConfig": {
