@@ -59,7 +59,6 @@ export const availableTools = [
 	// Monitoring and task lifecycle
 	"Monitor",
 	"RemoteTrigger",
-	"TaskOutput",
 	"TaskStop",
 
 	// Tool discovery
@@ -94,7 +93,6 @@ export const readOnlyTools: ToolName[] = [
 	"ListAgents",
 	"Skill",
 	"Monitor",
-	"TaskOutput",
 	"ToolSearch",
 ];
 

@@ -38,14 +38,13 @@ describe("config", () => {
 				"ScheduleWakeup",
 				"Monitor",
 				"RemoteTrigger",
-				"TaskOutput",
 				"TaskStop",
 				"ToolSearch",
 				"DesignSync",
 				"Workflow",
 				"ReportFindings",
 			]);
-			expect(availableTools).toHaveLength(30);
+			expect(availableTools).toHaveLength(29);
 		});
 
 		it("should define read-only tools", () => {
@@ -61,10 +60,9 @@ describe("config", () => {
 				"ListAgents",
 				"Skill",
 				"Monitor",
-				"TaskOutput",
 				"ToolSearch",
 			]);
-			expect(readOnlyTools).toHaveLength(13);
+			expect(readOnlyTools).toHaveLength(12);
 		});
 
 		it("should define write tools", () => {
